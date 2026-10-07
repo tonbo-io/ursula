@@ -323,7 +323,11 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 
     fn should_initialize_membership(&self, raft_group_id: RaftGroupId) -> bool {
-        if !self.initialize_membership || self.registry.control_state().is_some() {
+        if !self.initialize_membership
+            || (self.registry.control_state().is_some()
+                && !self.registry.genesis_initialization_allowed(raft_group_id))
+            || self.registry.replica_genesis_prefix(raft_group_id) > 0
+        {
             return false;
         }
         if !self.per_group_voters.is_empty()
@@ -582,6 +586,66 @@ mod tests {
 
         assert!(node_3.should_initialize_membership(RaftGroupId(1)));
         assert!(!node_1.should_initialize_membership(RaftGroupId(1)));
+    }
+
+    #[cfg(not(madsim))]
+    #[test]
+    fn certified_replacement_prefix_never_reinitializes_static_membership() {
+        let root = tempfile::tempdir().unwrap();
+        for peer_count in [1, 3] {
+            let registry = RaftGroupHandleRegistry::default();
+            let factory = StaticGrpcRaftGroupEngineFactory::new(
+                1,
+                (1..=peer_count).map(|node| (node, format!("http://node-{node}"))),
+                true,
+                registry.clone(),
+                RaftWal::start(
+                    root.path().join(format!("cohort-{peer_count}")),
+                    WalFsync::Never,
+                    &ursula_shard::StaticShardMap::new(1, 1).unwrap(),
+                )
+                .unwrap(),
+            );
+            // Both singleton genesis and the original multi-node initializer
+            // are still permitted before any group has a certified prefix.
+            assert!(registry.control_state().is_none());
+            assert!(factory.should_initialize_membership(RaftGroupId(0)));
+            let mut state = ursula_control::ControlPlaneState::default();
+            let mut placement = ursula_control::DataGroupPlacement::empty(RaftGroupId(0));
+            placement.voters = (1..=peer_count).collect();
+            state.placements.insert(RaftGroupId(0), placement);
+            let (topology, receiver) = tokio::sync::watch::channel(state.clone());
+            registry.set_control_topology(receiver);
+            assert!(
+                !factory.should_initialize_membership(RaftGroupId(0)),
+                "live authority requires explicit genesis permission"
+            );
+            registry.set_genesis_initialization_groups(BTreeSet::from([RaftGroupId(0)]));
+            assert!(
+                factory.should_initialize_membership(RaftGroupId(0)),
+                "first-boot genesis including singleton remains allowed"
+            );
+            registry.set_replica_genesis_prefixes(BTreeMap::from([(RaftGroupId(0), 7)]));
+            // Whole-PV replacement cannot initialize even if a stale explicit
+            // genesis permission were retained alongside init_membership=true.
+            assert!(!factory.should_initialize_membership(RaftGroupId(0)));
+            registry.set_replica_genesis_prefixes(BTreeMap::new());
+            registry.set_genesis_initialization_groups(BTreeSet::new());
+            assert!(
+                !factory.should_initialize_membership(RaftGroupId(0)),
+                "ordinary restart cannot repeat genesis"
+            );
+            // A joined node may still have static peers containing itself, but
+            // live placement controls hosting before any group is warmed.
+            state.placements.get_mut(&RaftGroupId(0)).unwrap().voters = BTreeSet::from([2, 3]);
+            topology.send_replace(state);
+            assert!(!factory.hosts_group(ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0)
+            }));
+            assert!(!factory.should_initialize_membership(RaftGroupId(0)));
+        }
     }
 
     #[test]

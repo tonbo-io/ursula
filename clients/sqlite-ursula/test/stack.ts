@@ -252,12 +252,14 @@ async function resolveS3(): Promise<S3Target> {
 async function startCluster(): Promise<Stack> {
 	const s3 = await resolveS3();
 	const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-cluster-"));
+	const metaAuthTokenFile = join(dir, "meta-auth.token");
+	writeFileSync(metaAuthTokenFile, randomBytes(32).toString("hex"), { mode: 0o600 });
 	// Defaults are the e2e shape; the soak (test/soak.e2e.ts) raises them with E2E_GROUPS and
 	// E2E_CORES.
 	const groups = Number(process.env.E2E_GROUPS ?? 4);
 	const cores = Number(process.env.E2E_CORES ?? 2);
-	const nodes: { id: number; port: number; admin: string }[] = [];
-	for (const id of [1, 2, 3]) nodes.push({ id, port: await freePort(), admin: `http://127.0.0.1:${await freePort()}` });
+	const nodes: { id: number; port: number; metaPort: number; admin: string }[] = [];
+	for (const id of [1, 2, 3]) nodes.push({ id, port: await freePort(), metaPort: await freePort(), admin: `http://127.0.0.1:${await freePort()}` });
 	const procs: Proc[] = [];
 	const logs = (): string => procs.map((p, i) => `--- ${i < 3 ? `node${i + 1}` : "gateway"}\n${p.logs()}`).join("\n");
 	const stop = async (): Promise<void> => {
@@ -287,6 +289,8 @@ async function startCluster(): Promise<Stack> {
 				`path = "${join(nodeDir, "wal")}"`,
 			];
 			for (const peer of nodes) lines.push("", "[[raft.peers]]", `node_id = ${peer.id}`, `url = "http://127.0.0.1:${peer.port}"`);
+			lines.push("", "[raft.meta]", "enabled = true", `listen = "127.0.0.1:${node.metaPort}"`, `auth_token_file = ${JSON.stringify(metaAuthTokenFile)}`);
+			for (const peer of nodes) lines.push("", "[[raft.meta.peers]]", `node_id = ${peer.id}`, `url = "http://127.0.0.1:${peer.metaPort}"`);
 			lines.push(
 				"",
 				"[storage.cold]",

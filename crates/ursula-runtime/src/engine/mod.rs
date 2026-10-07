@@ -810,6 +810,10 @@ pub struct StreamEngineError {
 /// structured source, so it keeps an owned `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
+    #[error("replica fence commands require the Raft state machine")]
+    ReplicaFenceRequiresRaft,
+    #[error("initialized Raft group {group:?} is missing its durable replica identity map")]
+    ReplicaFenceMissingMetadata { group: ursula_shard::RaftGroupId },
     #[error("{operation:?}: {source}")]
     Backend {
         operation: BackendOperation,

@@ -96,3 +96,7 @@ pub mod diagnostics {
     pub use crate::log_store::journal_segment_path;
     pub use crate::log_store::journal_segments;
 }
+
+pub use crate::log_store::REPLICA_IDENTITY_FILE;
+pub use crate::log_store::ReplicaIdentityError;
+pub use crate::log_store::ReplicaIdentityStore;

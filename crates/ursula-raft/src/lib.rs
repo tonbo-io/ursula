@@ -1,6 +1,7 @@
 //! OpenRaft integration for Ursula.
 //!
 //! Module map:
+//! - `replica_fence`: durable group-local replica admission.
 //!
 //! - [`apply_failure`]: typed group-local fatal application failures.
 //! - [`types`]: shared `UrsulaRaftTypeConfig`, type aliases, and the
@@ -74,6 +75,8 @@ mod meta_transport;
 mod read_index;
 mod recovery_transport;
 mod registry;
+mod replica_fence;
+pub use replica_fence::ReplicaFenceError;
 mod registry_error;
 mod rejoin;
 mod rt;
@@ -208,3 +211,9 @@ pub use meta_transport::meta_peer_recovery_status;
 
 #[cfg(all(test, not(madsim)))]
 mod process_fence_measurement;
+
+pub use meta_transport::MetaRpcAuth;
+pub use meta_transport::meta_authorize_genesis_authenticated;
+pub use meta_transport::meta_peer_initialized_authenticated;
+pub use meta_transport::meta_peer_recovery_floor_authenticated;
+pub use meta_transport::meta_peer_recovery_status_authenticated;

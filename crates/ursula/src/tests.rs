@@ -5412,6 +5412,7 @@ fn raft_metrics_snapshot(
 ) -> RaftGroupMetricsSnapshot {
     let progress = |index: u64| RaftLogProgressSnapshot { term: 1, index };
     RaftGroupMetricsSnapshot {
+        installed_replica_identities: Default::default(),
         apply_failure: None,
         raft_group_id: group_id,
         node_id,

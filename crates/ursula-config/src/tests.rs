@@ -419,6 +419,21 @@ core_count = 2
     }
 
     #[test]
+    fn durable_standalone_defaults_to_implicit_local_meta() {
+        let tmp = temp_config(".toml", "[raft.wal]\npath = \"/tmp/ursula-wal\"\n");
+        let config = load_config(Some(tmp.path()), None, Some(7)).unwrap();
+        assert!(config.raft.uses_implicit_single_node_meta());
+        assert!(!config.raft.init_membership);
+        let disabled = temp_config(
+            ".toml",
+            "[raft.meta]\nenabled = false\n[raft.wal]\npath = \"/tmp/ursula-wal\"\n",
+        );
+        let config = load_config(Some(disabled.path()), None, Some(7)).unwrap();
+        assert!(!config.raft.uses_meta_authority());
+        assert!(!config.raft.uses_implicit_single_node_meta());
+    }
+
+    #[test]
     fn static_durable_clusters_require_meta_configuration_by_default() {
         let tmp = temp_config(
             ".toml",
@@ -434,7 +449,7 @@ url = "http://127.0.0.1:4437"
             .expect_err("static production defaults to meta authority");
         assert!(matches!(
             error,
-            crate::ConfigError::Validation(crate::validate::ValidationError::Other(_))
+            crate::ConfigError::Validation(crate::validate::ValidationError::MetaAuthTokenRequired)
         ));
         let tmp = temp_config(
             ".toml",
@@ -444,6 +459,8 @@ path = "/tmp/ursula-wal"
 [[raft.peers]]
 node_id = 1
 url = "http://127.0.0.1:4437"
+[raft.meta]
+auth_token_file = "/tmp/ursula-meta-token"
 [[raft.meta.peers]]
 node_id = 1
 url = "http://127.0.0.1:4439"
@@ -457,6 +474,8 @@ url = "http://127.0.0.1:4439"
             r#"
 [raft.wal]
 path = "/tmp/ursula-wal"
+[raft.meta]
+auth_token_file = "/tmp/ursula-meta-token"
 [[raft.meta.peers]]
 node_id = 1
 url = "http://127.0.0.1:4439"

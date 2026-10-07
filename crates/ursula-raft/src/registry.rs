@@ -171,6 +171,7 @@ pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStor
 /// All resources are published atomically after engine construction.
 #[derive(Debug, Clone)]
 struct GroupEntry {
+    replica_fences: Arc<crate::replica_fence::ReplicaFences>,
     snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     apply_failure: Arc<Mutex<Option<ursula_proto::admin::RaftApplyFailure>>>,
     raft: OwnerRaftHandle,
@@ -181,6 +182,10 @@ struct GroupEntry {
 
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
+    genesis_initialization_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
+    replica_genesis_prefixes: Arc<Mutex<BTreeMap<RaftGroupId, u64>>>,
+    replica_authority: Arc<Mutex<Option<(u64, ursula_proto::admin::ReplicaIdentity)>>>,
+    replica_genesis: Arc<Mutex<Option<BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>>>>,
     process_authority:
         Arc<Mutex<Option<(u64, ursula_control::ProcessIdentity, crate::MetaRaftHandle)>>>,
     control_topology: Arc<Mutex<Option<watch::Receiver<ursula_control::ControlPlaneState>>>>,
@@ -201,6 +206,10 @@ impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
         let (transport_shutdown, _) = watch::channel(false);
         Self {
+            genesis_initialization_groups: Arc::default(),
+            replica_genesis_prefixes: Arc::default(),
+            replica_authority: Arc::default(),
+            replica_genesis: Arc::default(),
             process_authority: Arc::default(),
             append_send_budget: Default::default(),
             append_receive_budget: Default::default(),
@@ -293,20 +302,201 @@ impl RaftGroupHandleRegistry {
             .lock()
             .expect("process authority lock") = Some((node_id, identity, meta));
     }
-    pub(crate) async fn confirm_process_authority(&self) -> Result<(), crate::MetaRaftError> {
-        let Some((node, identity, meta)) = self.process_authority() else {
-            return Ok(());
+    pub fn set_replica_authority(
+        &self,
+        node_id: u64,
+        identity: ursula_proto::admin::ReplicaIdentity,
+    ) {
+        *self
+            .replica_authority
+            .lock()
+            .expect("replica authority mutex") = Some((node_id, identity));
+    }
+
+    /// Only bootstrap may install the immutable genesis map, before opening groups.
+    pub fn set_replica_genesis(
+        &self,
+        identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
+    ) {
+        *self.replica_genesis.lock().expect("replica genesis mutex") = Some(identities);
+    }
+
+    /// Startup grants this only for first-boot members of fresh placements.
+    /// It is independent of static peer configuration and is empty on restart.
+    pub fn set_genesis_initialization_groups(&self, groups: BTreeSet<RaftGroupId>) {
+        *self
+            .genesis_initialization_groups
+            .lock()
+            .expect("genesis initialization mutex") = groups;
+    }
+
+    pub(crate) fn genesis_initialization_allowed(&self, group: RaftGroupId) -> bool {
+        self.genesis_initialization_groups
+            .lock()
+            .expect("genesis initialization mutex")
+            .contains(&group)
+    }
+
+    pub fn set_replica_genesis_prefixes(&self, prefixes: BTreeMap<RaftGroupId, u64>) {
+        *self
+            .replica_genesis_prefixes
+            .lock()
+            .expect("replica genesis prefix mutex") = prefixes;
+    }
+    pub(crate) fn replica_genesis_prefix(&self, group: RaftGroupId) -> u64 {
+        self.replica_genesis_prefixes
+            .lock()
+            .expect("replica genesis prefix mutex")
+            .get(&group)
+            .copied()
+            .unwrap_or_default()
+    }
+    pub fn replica_fence_required_index(&self, group: RaftGroupId) -> u64 {
+        self.groups
+            .load()
+            .get(&group.0)
+            .map(|entry| entry.replica_fences.required_index())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn replica_genesis(
+        &self,
+    ) -> Option<BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>> {
+        self.replica_genesis
+            .lock()
+            .expect("replica genesis mutex")
+            .clone()
+    }
+
+    pub(crate) fn replica_authority(&self) -> Option<(u64, ursula_proto::admin::ReplicaIdentity)> {
+        self.replica_authority
+            .lock()
+            .expect("replica authority mutex")
+            .clone()
+    }
+
+    pub fn installed_replica_identity(
+        &self,
+        group: RaftGroupId,
+        node: u64,
+    ) -> Option<ursula_proto::admin::ReplicaIdentity> {
+        self.groups
+            .load()
+            .get(&group.0)
+            .and_then(|entry| entry.replica_fences.snapshot().get(&node).cloned())
+    }
+
+    pub(crate) fn replica_sender_is_voter(&self, group: RaftGroupId, node: u64) -> bool {
+        self.groups.load().get(&group.0).is_some_and(|entry| {
+            let metrics = entry.raft.metrics();
+            let current = metrics.borrow_watched();
+            let membership = current.membership_config.membership();
+            // An uninitialized learner must receive its first membership. Its
+            // independent recovery gate still forbids voting or campaigning.
+            membership.voter_ids().next().is_none() || membership.voter_ids().any(|id| id == node)
+        })
+    }
+
+    /// A uniform membership entry can remove its own leader before its ACK
+    /// returns. Permit that already accepted committed vote to finish the
+    /// transition; a removed process cannot introduce another term or vote.
+    pub(crate) fn replica_sender_has_accepted_vote(
+        &self,
+        group: RaftGroupId,
+        vote: crate::UrsulaVote,
+    ) -> bool {
+        vote.is_committed()
+            && self
+                .groups
+                .load()
+                .get(&group.0)
+                .is_some_and(|entry| entry.raft.metrics().borrow_watched().vote == vote)
+    }
+
+    pub(crate) fn admits_replica(
+        &self,
+        group: RaftGroupId,
+        node: u64,
+        identity: &ursula_proto::admin::ReplicaIdentity,
+    ) -> bool {
+        self.groups
+            .load()
+            .get(&group.0)
+            .is_some_and(|entry| entry.replica_fences.accepts(node, identity))
+    }
+
+    pub(crate) async fn confirm_process_authority(
+        &self,
+        group: RaftGroupId,
+    ) -> Result<(), crate::MetaRaftError> {
+        let Some((node, identity)) = self.replica_authority() else {
+            return if self.process_authority().is_none() {
+                Ok(())
+            } else {
+                Err(crate::MetaRaftError::new(
+                    "replica fence",
+                    "durable replica identity not installed",
+                ))
+            };
         };
-        if meta.read_linearizable_processes().await?.get(&node)
-            != Some(&ursula_control::ProcessState::Active(identity))
-        {
+        if !self.admits_replica(group, node, &identity) {
             return Err(crate::MetaRaftError::new(
-                "data process fence",
-                "process is retired or superseded",
+                "replica fence",
+                "local WAL identity is not admitted by the group",
             ));
         }
         Ok(())
     }
+
+    pub async fn install_replica_identity(
+        &self,
+        group: RaftGroupId,
+        node_id: u64,
+        expected: Option<ursula_proto::admin::ReplicaIdentity>,
+        replacement: ursula_proto::admin::ReplicaIdentity,
+    ) -> Result<u64, ursula_runtime::GroupEngineError> {
+        let owner = self.get(group).ok_or_else(|| {
+            ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::MissingGroupMembership { group },
+            )
+        })?;
+        owner
+            .call(move |raft| async move {
+                let response = raft
+                    .client_write(ursula_runtime::GroupWriteCommand::InstallReplicaIdentity {
+                        node_id,
+                        expected,
+                        replacement,
+                    })
+                    .await
+                    .map_err(|error| {
+                        crate::forward::group_engine_client_write_error(
+                            error,
+                            raft.metrics().borrow_watched().id,
+                        )
+                    })?;
+                match response.data {
+                    crate::RaftGroupResponse::ReplicaFence(Ok(())) => Ok(response.log_id.index()),
+                    crate::RaftGroupResponse::ReplicaFence(Err(error)) => {
+                        Err(ursula_runtime::GroupEngineError::backend(
+                            ursula_runtime::BackendOperation::Write,
+                            error,
+                        ))
+                    }
+                    _ => Err(ursula_runtime::GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::ReplicaFenceRequiresRaft,
+                    )),
+                }
+            })
+            .await
+            .map_err(|error| {
+                ursula_runtime::GroupEngineError::backend(
+                    ursula_runtime::BackendOperation::Write,
+                    error,
+                )
+            })?
+    }
+
     pub(crate) fn process_authority(
         &self,
     ) -> Option<(u64, ursula_control::ProcessIdentity, crate::MetaRaftHandle)> {
@@ -436,6 +626,7 @@ impl RaftGroupHandleRegistry {
         recovery: Option<Arc<GroupRejoin>>,
     ) {
         let entry = Arc::new(GroupEntry {
+            replica_fences: engine.replica_fences.clone(),
             snapshot_installs: engine.snapshot_installs.clone(),
             apply_failure: engine.apply_failure.clone(),
             raft: engine.read_barrier.owner().clone(),
@@ -459,6 +650,7 @@ impl RaftGroupHandleRegistry {
         recovery: Option<Arc<GroupRejoin>>,
     ) {
         let entry = Arc::new(GroupEntry {
+            replica_fences: Arc::default(),
             snapshot_installs: Arc::default(),
             apply_failure: Arc::default(),
             raft: barrier.owner().clone(),
@@ -780,12 +972,19 @@ impl RaftGroupHandleRegistry {
             .groups
             .load()
             .iter()
-            .map(|(id, entry)| (*id, entry.raft.clone(), entry.apply_failure.clone()))
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    entry.raft.clone(),
+                    entry.apply_failure.clone(),
+                    entry.replica_fences.clone(),
+                )
+            })
             .collect::<Vec<_>>();
 
         let log_progress = self.snapshot_build_coordinator().log_progress();
         let mut snapshots = Vec::with_capacity(groups.len());
-        for (raft_group_id, raft, failure) in groups {
+        for (raft_group_id, raft, failure, fences) in groups {
             let log = log_progress
                 .get(&raft_group_id)
                 .copied()
@@ -797,6 +996,7 @@ impl RaftGroupHandleRegistry {
                 .clone();
             let membership = metrics.membership_config.membership();
             snapshots.push(RaftGroupMetricsSnapshot {
+                installed_replica_identities: fences.snapshot(),
                 raft_group_id,
                 node_id: metrics.id,
                 current_term: metrics.current_term,
@@ -1641,6 +1841,8 @@ mod tests {
 
     fn group_snapshot_bytes() -> Vec<u8> {
         crate::snapshot_codec::group_snapshot_frames(Arc::new(GroupSnapshot {
+            replica_fence_index: 0,
+            replica_identities: Default::default(),
             placement: ShardPlacement {
                 core_id: ursula_shard::CoreId(0),
                 shard_id: ursula_shard::ShardId(0),

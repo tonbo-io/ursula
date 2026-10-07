@@ -43,6 +43,14 @@ fn canonical_identity(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Durable identity of one data replica across ordinary process restarts.
+/// A new WAL lifetime receives a new token and a greater meta-assigned generation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReplicaIdentity {
+    pub generation: u64,
+    pub incarnation: ProcessIncarnation,
+}
+
 /// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
 /// the replica's log as the operator saw it in `GET /__ursula/metrics`
 /// (`last_log_index` and `current_term` of the group) when deciding to
@@ -400,6 +408,8 @@ pub struct NodeMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaftGroupMetrics {
+    #[serde(default)]
+    pub installed_replica_identities: BTreeMap<u64, ReplicaIdentity>,
     #[serde(default)]
     pub apply_failure: Option<RaftApplyFailure>,
     pub raft_group_id: u64,

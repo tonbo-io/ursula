@@ -48,6 +48,8 @@ message SnapshotHeaderV1 {
   // Largest stream created_at_ms the group assigned (C7). Restore raises it
   // to every live stream's created_at_ms.
   uint64 last_created_at_ms = 11;
+  repeated ReplicaIdentityV1 replica_identities = 12;
+  uint64 replica_fence_index = 13;
 }
 
 message BucketUsageV1 {
@@ -200,4 +202,10 @@ message ColdGcEntryV1 {
 
 message ColdGcPathsV1 {
   repeated string paths = 1;
+}
+
+message ReplicaIdentityV1 {
+  uint64 node_id = 1;
+  uint64 generation = 2;
+  string incarnation = 3;
 }

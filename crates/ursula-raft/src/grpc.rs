@@ -200,12 +200,6 @@ pub(crate) enum RecoveryProbeError {
     NotLeader,
     #[error("recovery peer changed its vote across the ReadIndex proof")]
     LeadershipChanged,
-    #[error("recovery peer has no log")]
-    MissingLog,
-    #[error("recovery HEAD unexpectedly found an empty-named stream")]
-    UnexpectedHead,
-    #[error("recovery HEAD did not confirm leadership: {0}")]
-    HeadRejected(#[source] ursula_runtime::GroupEngineError),
 }
 
 /// Confirm a group's current quorum without issuing an application write.
@@ -235,14 +229,8 @@ pub(crate) async fn confirm_quorum_prefix(
     })
 }
 
-/// Fresh recovery evidence. Negotiate the explicit barrier RPC through the
-/// existing Vote response before calling it: an unknown RPC on a 0.6.2
-/// HTTP/gRPC mux falls through to the HTTP append route. For a 0.6.2
-/// leader during rolling upgrade, a linearizable HEAD of an impossible HTTP
-/// name confirms leadership before validating the name. A subsequent low-term
-/// vote probe supplies a conservative catch-up bound (the leader's last log,
-/// which includes its confirmed read index). Reject a peer reporting another
-/// leader: its HEAD may have been forwarded and its own prefix may be behind.
+/// Fresh recovery evidence from the explicit current-protocol barrier RPC.
+/// Unsupported protocol versions fail closed; there is no legacy HEAD fallback.
 ///
 /// ReadIndexBarrier only coalesces rounds whose confirmation has not started;
 /// an inbound request never joins an already-started confirmation round.
@@ -292,79 +280,27 @@ pub(crate) async fn probe_rejoin_vote_barrier_fenced(
     let observed_vote = response.vote;
     // Capability metadata is only a routing hint, never fresh quorum or
     // catch-up evidence. Do not cache it across peer replacements.
-    if explicit_barrier {
-        let mut barrier_request =
-            tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
-                process_identity: network.process_identity(),
-                requester_id: node_id,
-                raft_group_id: placement.raft_group_id.0,
-                protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            });
-        barrier_request.set_timeout(timeout);
-        match client.rejoin_barrier(barrier_request).await {
-            Ok(response) => {
-                let response = response.into_inner();
-                let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
-                if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
-                    return Err(RecoveryProbeError::NotLeader);
-                }
-                if vote != observed_vote {
-                    return Err(RecoveryProbeError::LeadershipChanged);
-                }
-                return Ok((vote, response.index));
-            }
-            Err(status) if status.code() == tonic::Code::Unimplemented => {}
-            Err(status) => return Err(status.into()),
-        }
+    if !explicit_barrier {
+        return Err(
+            tonic::Status::failed_precondition("peer lacks recovery barrier capability").into(),
+        );
     }
-    let mut request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
+    let mut barrier_request = tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
+        process_identity: network.process_identity(),
+        requester_id: node_id,
         raft_group_id: placement.raft_group_id.0,
-        core_id: u32::from(placement.core_id.0),
-        shard_id: placement.shard_id.0,
-        // Neither empty name can be created through the HTTP API. This probe
-        // performs no application write or TTL renewal.
-        bucket_id: String::new(),
-        stream_id: String::new(),
-        now_ms: 0,
-        read: Some(raft_internal_proto::group_read_request_v1::Read::Head(
-            raft_internal_proto::HeadStreamReadV1 {
-                applied_state_only: false,
-            },
-        )),
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     });
-    request.set_timeout(timeout);
-    let response = client.group_read(request).await?.into_inner();
-    if response.ok {
-        return Err(RecoveryProbeError::UnexpectedHead);
-    }
-    let error: ursula_runtime::GroupEngineError =
-        decode_wire(&response.payload, "rejoin HEAD error")?;
-    if !matches!(
-        error.code(),
-        Some(ursula_stream::StreamErrorCode::InvalidBucketId)
-    ) {
-        return Err(RecoveryProbeError::HeadRejected(error));
-    }
-    let response = network
-        .vote(
-            crate::rejoin::bootstrap_probe_vote(),
-            RPCOption::new(timeout),
-        )
-        .await?;
-    if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
+    barrier_request.set_timeout(timeout);
+    let response = client.rejoin_barrier(barrier_request).await?.into_inner();
+    let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
+    if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
         return Err(RecoveryProbeError::NotLeader);
     }
-    if response.vote != observed_vote {
+    if vote != observed_vote {
         return Err(RecoveryProbeError::LeadershipChanged);
     }
-    Ok((
-        response.vote,
-        response
-            .last_log_id
-            .ok_or(RecoveryProbeError::MissingLog)?
-            .index(),
-    ))
+    Ok((vote, response.index))
 }
 
 #[derive(Debug, Clone)]
@@ -638,31 +574,53 @@ pub fn raft_grpc_service(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FencedProcess {
     pub(crate) node_id: u64,
-    pub(crate) identity: ursula_control::ProcessIdentity,
+    pub(crate) identity: ursula_proto::admin::ReplicaIdentity,
 }
 
 pub(crate) async fn validate_process_fence(
     registry: &crate::RaftGroupHandleRegistry,
+    group: u32,
     bytes: &[u8],
 ) -> Result<(), tonic::Status> {
-    let Some((local_node, local_identity, meta)) = registry.process_authority() else {
+    if registry.process_authority().is_none() && registry.replica_authority().is_none() {
         return Ok(());
-    };
-    let sender: FencedProcess = rmp_serde::from_slice(bytes).map_err(|error| {
-        tonic::Status::failed_precondition(format!("missing or invalid process epoch: {error}"))
-    })?;
-    // A stale meta follower cannot certify a retired data process. This read
-    // goes to the meta leader and confirms quorum before accepting the RPC.
-    let processes = meta
-        .read_linearizable_processes()
+    }
+    let group = ursula_shard::RaftGroupId(group);
+    registry
+        .confirm_process_authority(group)
         .await
-        .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
-    if processes.get(&local_node) != Some(&ursula_control::ProcessState::Active(local_identity))
-        || processes.get(&sender.node_id)
-            != Some(&ursula_control::ProcessState::Active(sender.identity))
-    {
+        .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+    let sender: FencedProcess = rmp_serde::from_slice(bytes).map_err(|error| {
+        tonic::Status::failed_precondition(format!("missing or invalid replica identity: {error}"))
+    })?;
+    if !registry.admits_replica(group, sender.node_id, &sender.identity) {
         return Err(tonic::Status::failed_precondition(
-            "data RPC process epoch is retired or superseded",
+            "data RPC replica identity is not installed for this group",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replica_leader(
+    registry: &RaftGroupHandleRegistry,
+    group: ursula_shard::RaftGroupId,
+    bytes: &[u8],
+    leader: u64,
+    continuing_vote: Option<UrsulaVote>,
+) -> Result<(), GrpcRpcError> {
+    if registry.replica_authority().is_none() && registry.process_authority().is_none() {
+        return Ok(());
+    }
+    let sender: FencedProcess = rmp_serde::from_slice(bytes)
+        .map_err(|error| GrpcRpcError::failed_precondition(error.to_string()))?;
+    let admitted = registry.replica_sender_is_voter(group, sender.node_id)
+        || continuing_vote.is_some_and(|vote| {
+            *vote.leader_id().node_id() == sender.node_id
+                && registry.replica_sender_has_accepted_vote(group, vote)
+        });
+    if sender.node_id != leader || !admitted {
+        return Err(GrpcRpcError::failed_precondition(
+            "replica is not the requested leader/candidate in the group membership",
         ));
     }
     Ok(())
@@ -672,16 +630,42 @@ async fn handle_append_envelope(
     registry: RaftGroupHandleRegistry,
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
 ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
-    validate_process_fence(&registry, &envelope.process_identity).await?;
+    validate_process_fence(
+        &registry,
+        envelope.raft_group_id,
+        &envelope.process_identity,
+    )
+    .await?;
     let raft_group_id =
         validate_raft_rpc_preamble(&registry, envelope.protocol_version, envelope.raft_group_id)?;
     let request: UrsulaAppendEntriesRequest =
         decode_rpc_payload(&envelope.payload, "raft append request")?;
+    let vote = request.vote;
+    let leader_id = *vote.leader_id().node_id();
+    validate_replica_leader(
+        &registry,
+        raft_group_id,
+        &envelope.process_identity,
+        leader_id,
+        Some(vote),
+    )?;
     let response = registry
         .append_entries(raft_group_id, request)
         .await
         .map_err(tonic::Status::from)?;
-    validate_process_fence(&registry, &envelope.process_identity).await?;
+    validate_process_fence(
+        &registry,
+        envelope.raft_group_id,
+        &envelope.process_identity,
+    )
+    .await?;
+    validate_replica_leader(
+        &registry,
+        raft_group_id,
+        &envelope.process_identity,
+        leader_id,
+        Some(vote),
+    )?;
     Ok(raft_internal_proto::RaftRpcAckV1 {
         payload: encode_wire(&response),
     })
@@ -851,7 +835,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
-        validate_process_fence(&self.registry, &envelope.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            envelope.raft_group_id,
+            &envelope.process_identity,
+        )
+        .await?;
         let raft_group_id = validate_raft_rpc_preamble(
             &self.registry,
             envelope.protocol_version,
@@ -859,12 +848,27 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         )?;
         let request: UrsulaVoteRequest =
             decode_rpc_payload(&envelope.payload, "raft vote request")?;
+        // The minimum vote is a read-only bootstrap/recovery probe, not a candidacy.
+        if request.vote.leader_id().term() != 0 || *request.vote.leader_id().node_id() != 0 {
+            validate_replica_leader(
+                &self.registry,
+                raft_group_id,
+                &envelope.process_identity,
+                *request.vote.leader_id().node_id(),
+                None,
+            )?;
+        }
         let response = self
             .registry
             .vote(raft_group_id, request)
             .await
             .map_err(tonic::Status::from)?;
-        validate_process_fence(&self.registry, &envelope.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            envelope.raft_group_id,
+            &envelope.process_identity,
+        )
+        .await?;
         let mut response = tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         });
@@ -880,7 +884,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
         let request = request.into_inner();
-        validate_process_fence(&self.registry, &request.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            request.raft_group_id,
+            &request.process_identity,
+        )
+        .await?;
         let raft_group_id = validate_raft_rpc_preamble(
             &self.registry,
             request.protocol_version,
@@ -888,6 +897,13 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         )?;
         let vote: VoteOf<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.vote, "full snapshot vote")?;
+        validate_replica_leader(
+            &self.registry,
+            raft_group_id,
+            &request.process_identity,
+            *vote.leader_id().node_id(),
+            Some(vote),
+        )?;
         let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.snapshot_meta, "full snapshot meta")?;
         let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
@@ -899,7 +915,19 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .install_full_snapshot(raft_group_id, vote, snapshot)
             .await
             .map_err(tonic::Status::from)?;
-        validate_process_fence(&self.registry, &request.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            request.raft_group_id,
+            &request.process_identity,
+        )
+        .await?;
+        validate_replica_leader(
+            &self.registry,
+            raft_group_id,
+            &request.process_identity,
+            *vote.leader_id().node_id(),
+            Some(vote),
+        )?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
@@ -935,7 +963,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
             self.registry
-                .confirm_process_authority()
+                .confirm_process_authority(placement.raft_group_id)
                 .await
                 .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             let results = raft
@@ -944,7 +972,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .map_err(|err| tonic::Status::unavailable(err.to_string()))?
                 .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
             self.registry
-                .confirm_process_authority()
+                .confirm_process_authority(placement.raft_group_id)
                 .await
                 .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
             let results = results
@@ -973,7 +1001,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RejoinBarrierRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RejoinBarrierResponseV1>, tonic::Status> {
         let request = request.into_inner();
-        validate_process_fence(&self.registry, &request.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            request.raft_group_id,
+            &request.process_identity,
+        )
+        .await?;
         let group = validate_raft_rpc_preamble(
             &self.registry,
             request.protocol_version,
@@ -995,7 +1028,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 }
                 _ => tonic::Status::failed_precondition(error.to_string()),
             })?;
-        validate_process_fence(&self.registry, &request.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            request.raft_group_id,
+            &request.process_identity,
+        )
+        .await?;
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&vote),
@@ -1009,7 +1047,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
         let request = request.into_inner();
-        validate_process_fence(&self.registry, &request.process_identity).await?;
+        validate_process_fence(
+            &self.registry,
+            request.raft_group_id,
+            &request.process_identity,
+        )
+        .await?;
         let raft_group_id = validate_raft_rpc_preamble(
             &self.registry,
             request.protocol_version,
@@ -1017,10 +1060,23 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         )?;
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
+        validate_replica_leader(
+            &self.registry,
+            raft_group_id,
+            &request.process_identity,
+            *openraft_request.from_leader().leader_id().node_id(),
+            None,
+        )?;
         self.registry
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
             .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+        validate_process_fence(
+            &self.registry,
+            request.raft_group_id,
+            &request.process_identity,
+        )
+        .await?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {},
         ))
@@ -1074,6 +1130,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
+                        replica_fences: Arc::default(),
                         snapshot_installs: Arc::default(),
                         metadata_serial: Arc::default(),
                         process_authority,
@@ -1296,7 +1353,7 @@ impl Debug for GrpcRaftNetwork {
 impl GrpcRaftNetwork {
     async fn confirm_live_process(&self) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
         if let Some(registry) = &self.registry {
-            validate_process_fence(registry, &self.process_identity())
+            validate_process_fence(registry, self.raft_group_id.0, &self.process_identity())
                 .await
                 .map_err(raft_rpc_network_error)?;
         }
@@ -1310,8 +1367,8 @@ impl GrpcRaftNetwork {
     fn process_identity(&self) -> bytes::Bytes {
         self.registry
             .as_ref()
-            .and_then(|registry| registry.process_authority())
-            .map(|(node_id, identity, _)| encode_wire(&FencedProcess { node_id, identity }))
+            .and_then(|registry| registry.replica_authority())
+            .map(|(node_id, identity)| encode_wire(&FencedProcess { node_id, identity }))
             .unwrap_or_default()
     }
 

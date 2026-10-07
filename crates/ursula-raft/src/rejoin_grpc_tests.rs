@@ -284,6 +284,61 @@ async fn recovery_driver_retries_a_proof_that_arrived_before_its_vote_floor() {
 }
 
 #[tokio::test]
+async fn recovery_barrier_resolves_leader_outside_startup_peer_inventory() {
+    let registry = RaftGroupHandleRegistry::default();
+    let (engine, _store, gate, _root) =
+        new_recovery_engine(4, Arc::new(Config::default()), &registry).await;
+    let current_address = "http://current-membership-leader";
+    engine
+        .raft_handle()
+        .initialize(BTreeMap::from([(
+            4,
+            openraft::BasicNode::new(current_address),
+        )]))
+        .await
+        .unwrap();
+    engine
+        .wait_for_current_leader(4, Duration::from_secs(3))
+        .await
+        .unwrap();
+    engine
+        .raft_handle()
+        .wait(Some(Duration::from_secs(3)))
+        .applied_index_at_least(Some(1), "membership applied")
+        .await
+        .unwrap();
+    let metrics = engine.raft_handle().metrics().borrow_watched().clone();
+    let vote = metrics.vote;
+    let index = metrics.last_applied.unwrap().index;
+    gate.establish_vote_floor(vote).await.unwrap();
+    let (sent, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(crate::run_rejoin_vote_barrier(
+        engine.read_barrier.owner().clone(),
+        gate.clone(),
+        registry.election_policy(),
+        BTreeMap::from([(1, openraft::BasicNode::new("http://old-startup-peer"))]),
+        move |leader, address| {
+            sent.send((leader, address)).unwrap();
+            async move { Ok::<_, std::convert::Infallible>((vote, index)) }
+        },
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+        Duration::from_secs(3600),
+    ));
+    let observed = tokio::time::timeout(Duration::from_secs(2), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, (4, current_address.to_owned()));
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(gate.vote_gate_open());
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn retired_static_peer_votes_cannot_establish_a_recovery_floor() {
     #[derive(Clone)]
     struct Transport {
@@ -663,7 +718,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .unwrap_err();
     assert!(matches!(
         changed_vote,
-        crate::grpc::RecoveryProbeError::LeadershipChanged
+        crate::grpc::RecoveryProbeError::Rpc(status) if status.code() == tonic::Code::FailedPrecondition
     ));
     for legacy in [false, true, false] {
         services[1].legacy.store(legacy, Ordering::SeqCst);
@@ -690,6 +745,14 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                 services[1].unknown_rpc_requests.swap(0, Ordering::SeqCst),
                 1
             );
+            let rejected =
+                crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(rejected, crate::grpc::RecoveryProbeError::Rpc(status) if status.code() == tonic::Code::FailedPrecondition)
+            );
+            continue;
         }
         let proof = probe_rejoin_vote_barrier(
             Arc::default(),
@@ -700,7 +763,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             Duration::from_secs(1),
         )
         .await
-        .expect("fresh recovery proof, including legacy bridge");
+        .expect("fresh explicit recovery proof");
         assert!(proof.1 >= acked.log_id.index());
         let observed =
             crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))

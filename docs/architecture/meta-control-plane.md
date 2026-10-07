@@ -1,13 +1,15 @@
 # Meta Raft membership and maintenance
 
-Meta Raft stores desired data-group placement, process incarnations and epochs,
-and the single active maintenance operation. Its journal and snapshots are under
+Meta Raft stores desired data-group placement, durable replica identities, boot
+incarnations and epochs, and the single active maintenance operation. Its journal and snapshots are under
 `<raft.wal.path>/meta-raft`, separate from the per-core data journals. Metadata is
 checksummed, exclusively locked, and fsynced independently of the data WAL's
 `fsync` policy.
 
-A process claims an epoch before serving data Raft traffic. Incoming data RPCs
-are bound to that process identity, including each frame of an append stream.
+A process claims a boot epoch for maintenance actions before serving traffic.
+Data RPCs instead carry the durable WAL-lifetime replica identity, including each
+frame of an append stream. Group-local durable identity fences reject retired
+replicas without a metadata quorum read on every data RPC.
 The live placement view drives routing and engine ownership; removing a replica
 from committed placement prevents the startup configuration from reopening it.
 
@@ -20,14 +22,17 @@ caller-provided prefix evidence. The server obtains a leader ReadIndex proof and
 checks the pinned replicas against that fixed prefix through their configured
 private cluster endpoints.
 
-- `MoveReplicas` prepares target engines, adds learners, changes voters and
-  commits placement after evidence confirms all desired voters have caught up.
+- `MoveReplicas` first commits each new target identity into the existing group's
+  Raft log and certifies durable quorum application. It then prepares target
+  engines, adds learners, changes voters and commits placement after evidence
+  confirms all desired voters have caught up.
 - `RebuildReplica` first proves the surviving data quorum, removes the source
   from data and meta voters while retaining it as a learner, and retires its process
   epoch. The replacement claims a new epoch after metadata catch-up. Reconciliation
-  restores its meta voter role; completion requires data-group recovery too.
-- `DecommissionNode` also removes the source from meta membership. Completion
-  records the node as removed only after the desired data memberships are proved.
+  restores its previous meta membership role; completion requires data-group recovery too.
+- `DecommissionNode` first prepares replacements, catches them up and commits the
+  desired data voter sets. Only then may `RetireSource` remove the source from meta
+  membership. Completion records the node as removed after fresh data evidence.
   A node whose last data replicas were already moved can still be decommissioned.
 
 A normal restart using its existing persistent volume claims a new process epoch;
@@ -56,6 +61,22 @@ already admitted mutation. An unreachable executor without this proof leaves the
 operation pending; timeout or a newer watch value is not proof that an old queued
 membership mutation cannot execute.
 
+## Joining a new node
+
+Submit `JoinNode` to an existing node's admin operation endpoint with a new
+`node_id`, `client_url`, `cluster_url` and `meta_url`. Registration adds a non-voting
+meta learner; it does not increase the voting quorum or assign any data group.
+Configure the new process with fresh storage, the same meta credential and the
+existing meta peers plus its own listener. Start it after registration. Its fresh
+meta ingress opens only after a current quorum supplies a durable vote floor;
+metadata catches up before its boot and WAL identities register. Use `MoveReplicas`
+to prepare data learners, certify catch-up and place data on the new node.
+
+The meta credential authorizes peer replication and control writes. Every peer
+must load the same secret from `raft.meta.auth_token_file`; treat possession of
+this credential as cluster administrator access, keep port 4439 private, and do
+not expose the secret in config repositories or logs.
+
 ## Whole-volume replacement
 
 A fresh meta replica in an explicitly retired `RebuildReplica` operation keeps
@@ -68,28 +89,39 @@ to fresh process nonces. Configuration alone cannot restore an initialized
 cluster after all metadata disks, or the surviving quorum needed for recovery,
 have been lost.
 
-## Migration from a cluster without meta Raft
+Automatic data-group initialization is restricted to the original replica's
+first admitted boot. An interrupted initial bootstrap does not authorize a later
+boot to initialize an existing group from static configuration.
 
-This is a coordinated restart with an availability gap. An ordinary ordered
-rolling upgrade is not supported for this cutover: the first new pod would wait
-for a meta quorum while old pods do not serve the metadata transport.
+## Upgrading an older storage layout
 
-1. Stop incoming writes, verify the current cluster and retain a backup and the
-   exact original persistent-volume bindings. Record stream offsets and content
-   checks to verify after restart.
-2. Disable automatic rollout jobs and stop all server pods cleanly. Preserve the
-   data PVCs; do not delete or replace their contents.
-3. Render the new chart with meta enabled, the same data group count and node
-   identities, persistent WAL paths, and the complete meta peer list. Meta port
-   4439 must be reachable between pods. The headless Service publishes unready
-   addresses, and StatefulSet pod management must be `Parallel`.
-4. Start the complete voter set together. The new metadata journals perform the
-   all-empty metadata bootstrap; the existing data journals are reopened rather
-   than initialized as new data groups.
-5. Require serving readiness and the separate admin maintenance-readiness check,
-   then verify the recorded streams and offsets before restoring traffic.
+In-place adoption of pre-identity WALs is unsupported. Startup rejects an
+existing journal without its durable replica identity; it must not rewrite
+artifact versions, synthesize identity markers, or modify journal data to bypass
+that refusal. This release provides no automatic migration from those prerelease
+layouts. Preserve the original volumes and cold objects; do not delete them to
+bypass startup validation. Matching `FORMAT_EPOCH` alone does not establish compatibility among
+unreleased builds.
 
-Kubernetes serving readiness checks local initialized, recovered voter replicas,
-catch-up, disk watermarks and format epoch. Remote membership completeness is
-checked separately at `/__ursula/maintenance/ready`; a healthy surviving quorum
-therefore remains in Service endpoints while a rebuilding learner stays unready.
+Current identity-bearing WALs support ordinary same-volume restart, including a
+coordinated stop and restart of all nodes. Persistent replica identities and
+placements remain unchanged while boot process epochs advance. This does not
+convert an older storage format.
+
+### Durable replica identity migration
+
+Data RPC admission uses a persistent replica identity belonging to the data WAL
+lifetime. Ordinary process restarts retain that identity; maintenance process
+claims still use a new boot incarnation. The identity and its required marker
+are fsynced under `raft-log` before data startup, including with WAL fsync policy
+`never`. A marked WAL with a missing or corrupt identity fails closed.
+
+A pre-identity WAL is rejected without modification. Missing identity on a marked
+WAL is corruption, and whole-volume replacement uses the explicit rebuild
+protocol. Neither case can be repaired by an adoption configuration flag.
+
+A replacement starts its meta listener and registers its persisted token, then
+waits for the surviving data groups to durably install their replacement fences
+and for meta activation before creating data actors. Activation seeds certified
+identity maps and required applied-prefix indices but does not bypass the normal
+unknown-history vote-floor and current-leader recovery barrier.

@@ -224,7 +224,7 @@ async fn meta_grpc_follower_forwards_reads_writes_and_publishes_committed_watch(
 }
 
 #[tokio::test]
-async fn meta_process_fence_rejects_old_rpc_after_replacement_claim() {
+async fn meta_boot_claim_supersedes_maintenance_identity() {
     let root = tempfile::tempdir().unwrap();
     let meta = MetaRaftHandle::new_durable(1, root.path().to_owned(), config())
         .await
@@ -253,26 +253,21 @@ async fn meta_process_fence_rejects_old_rpc_after_replacement_claim() {
     else {
         panic!("remote claim");
     };
-    let registry = crate::RaftGroupHandleRegistry::default();
-    registry.set_process_authority(1, local, meta.clone());
-    let request_identity = crate::codec::encode_wire(&crate::grpc::FencedProcess {
-        node_id: 2,
-        identity: old,
-    });
-    crate::grpc::validate_process_fence(&registry, &request_identity)
-        .await
-        .unwrap();
-    meta.write(claim(2, 1, 3)).await.unwrap();
-    let rejected = crate::grpc::validate_process_fence(&registry, &request_identity)
-        .await
-        .unwrap_err();
-    assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        crate::grpc::validate_process_fence(&registry, &[])
+    assert!(
+        meta.read_linearizable_processes()
             .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
+            .unwrap()
+            .get(&1)
+            .is_some_and(|state| state == &ursula_control::ProcessState::Active(local))
+    );
+    assert_eq!(
+        meta.read_linearizable_processes().await.unwrap().get(&2),
+        Some(&ursula_control::ProcessState::Active(old.clone()))
+    );
+    meta.write(claim(2, 1, 3)).await.unwrap();
+    assert_ne!(
+        meta.read_linearizable_processes().await.unwrap().get(&2),
+        Some(&ursula_control::ProcessState::Active(old))
     );
     meta.shutdown().await.unwrap();
 }

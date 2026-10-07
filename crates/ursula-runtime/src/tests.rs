@@ -1415,6 +1415,8 @@ async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
 async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
     let runtime = runtime(2, 8);
     let snapshot = GroupSnapshot {
+        replica_fence_index: 0,
+        replica_identities: Default::default(),
         placement: ShardPlacement {
             core_id: CoreId(1),
             shard_id: ShardId(0),
@@ -3934,6 +3936,8 @@ impl GroupEngine for BlockingReadEngine {
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
         Box::pin(async move {
             Ok(GroupSnapshot {
+                replica_fence_index: 0,
+                replica_identities: Default::default(),
                 placement,
                 group_commit_index: 0,
                 stream_snapshot: StreamSnapshot {
@@ -4132,6 +4136,8 @@ impl GroupEngine for RecordingEngine {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
             Ok(GroupSnapshot {
+                replica_fence_index: 0,
+                replica_identities: Default::default(),
                 placement,
                 group_commit_index: self.commit_index,
                 stream_snapshot: StreamSnapshot {

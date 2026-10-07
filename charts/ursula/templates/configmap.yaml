@@ -113,6 +113,9 @@ data:
 
     [raft.meta]
     enabled = {{ .Values.raft.meta.enabled }}
+{{- if .Values.raft.meta.enabled }}
+    auth_token_file = "/run/ursula-meta-auth/token"
+{{- end }}
     listen = "0.0.0.0:{{ $metaPort }}"
 {{- range $metaPeers }}
     [[raft.meta.peers]]

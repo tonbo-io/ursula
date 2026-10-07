@@ -136,6 +136,11 @@ spec:
               mountPath: /tmp
             - name: raft-data
               mountPath: {{ .Values.raft.logDir }}
+            {{- if .Values.raft.meta.enabled }}
+            - name: meta-auth
+              mountPath: /run/ursula-meta-auth
+              readOnly: true
+            {{- end }}
       volumes:
         - name: entrypoint
           configMap:
@@ -145,6 +150,15 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.raft.meta.enabled }}
+        - name: meta-auth
+          secret:
+            secretName: {{ include "ursula.metaAuthSecretName" . }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.raft.meta.auth.key | quote }}
+                path: token
+        {{- end }}
       {{- with .Values.server.scheduling.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

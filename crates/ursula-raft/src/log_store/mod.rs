@@ -16,6 +16,7 @@
 //! - `topology`: immutable core and group counts of the WAL root.
 //! - `run_state`: the node's run-state file and how the journals open after
 //!   the previous run (the replay-mode decision and the recovery state).
+//! - `replica_identity`: durable data replica identity and migration boundary.
 //! - `state_file`: the atomically replaced, checksummed state-file format.
 //! - `disk`: the I/O seam every journal file operation goes through.
 //! - `sim_disk`: the simulated disk behind the seam under `cfg(madsim)`.
@@ -32,6 +33,7 @@ mod journal_tests;
 #[cfg(test)]
 mod meta_test_store;
 mod reclaim;
+mod replica_identity;
 mod run_state;
 mod segment;
 #[cfg(madsim)]
@@ -63,6 +65,9 @@ use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::entry::RaftEntry;
+pub use replica_identity::REPLICA_IDENTITY_FILE;
+pub use replica_identity::ReplicaIdentityError;
+pub use replica_identity::ReplicaIdentityStore;
 pub use run_state::BootId;
 pub use run_state::JournalHistory;
 pub use run_state::JournalSync;

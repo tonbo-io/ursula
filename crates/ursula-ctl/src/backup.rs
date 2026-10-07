@@ -936,7 +936,9 @@ mod tests {
                 get(|| async {
                     Json(ursula_proto::admin::NodeMetrics {
                         process_node_id: Some(1),
-                        process_incarnation: Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                        process_incarnation: Some(
+                            ursula_proto::admin::ProcessIncarnation::from_bits(1),
+                        ),
                         raft_groups: Vec::new(),
                         raft_maintenance: None,
                         diagnostics: Default::default(),

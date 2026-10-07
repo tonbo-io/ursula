@@ -73,7 +73,11 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
             && last_probe.is_none_or(|(vote, at): (_, crate::rt::time::Instant)| {
                 vote != metrics.vote || at.elapsed() >= interval
             })
-            && let Some(node) = nodes.get(&leader_id)
+            && let Some(node) = metrics
+                .membership_config
+                .membership()
+                .get_node(&leader_id)
+                .or_else(|| nodes.get(&leader_id))
         {
             // A failed probe can itself publish metrics. Wake on those changes
             // to observe progress, but do not let them create a retry loop.

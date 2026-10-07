@@ -1644,6 +1644,24 @@
           "properties": {
             "enabled": {
               "type": "boolean"
+            },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-zA-Z0-9._-]+$"
+                }
+              },
+              "required": [
+                "existingSecret",
+                "key"
+              ]
             }
           },
           "required": [

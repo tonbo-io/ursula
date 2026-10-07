@@ -86,6 +86,26 @@ def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
+    def test_meta_credential_is_mounted_without_putting_token_in_config(self) -> None:
+        config = render_config()
+        self.assertIn('auth_token_file = "/run/ursula-meta-auth/token"', config)
+        rendered = render_chart()
+        self.assertIn("# Source: ursula/templates/secret-meta-auth.yaml", rendered)
+        self.assertIn("secretName: test-ursula-meta-auth", rendered)
+        self.assertIn("mountPath: /run/ursula-meta-auth", rendered)
+
+    def test_existing_meta_credential_is_referenced_without_generating_another(self) -> None:
+        rendered = render_chart("--set", "raft.meta.auth.existingSecret=cluster-credential", "--set", "raft.meta.auth.key=shared")
+        self.assertNotIn("# Source: ursula/templates/secret-meta-auth.yaml", rendered)
+        self.assertIn("secretName: cluster-credential", rendered)
+        self.assertIn('key: "shared"', rendered)
+
+    def test_disabled_meta_does_not_mount_or_generate_credentials(self) -> None:
+        rendered = render_chart("--set", "raft.meta.enabled=false")
+        self.assertNotIn("# Source: ursula/templates/secret-meta-auth.yaml", rendered)
+        self.assertNotIn("mountPath: /run/ursula-meta-auth", rendered)
+        self.assertNotIn("auth_token_file", rendered)
+
     def test_matching_deployment_contract_renders(self) -> None:
         render_chart(*deployment_contract_values())
 

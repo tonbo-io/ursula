@@ -52,6 +52,10 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{- define "ursula.metaAuthSecretName" -}}
+{{- default (printf "%s-meta-auth" (include "ursula.fullname" . | trunc 53 | trimSuffix "-")) .Values.raft.meta.auth.existingSecret -}}
+{{- end -}}
+
 {{- define "ursula.hasInlineS3Credentials" -}}
 {{- or .Values.s3.credentials.accessKeyId .Values.s3.credentials.secretAccessKey .Values.s3.credentials.sessionToken -}}
 {{- end -}}

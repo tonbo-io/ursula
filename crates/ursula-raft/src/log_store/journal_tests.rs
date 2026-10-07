@@ -584,6 +584,9 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
         for index in 1..=30 {
             append(&mut store, [payload_entry(index, 512)]).await;
         }
+        let mut sibling = core.store(&writer, 2);
+        append(&mut sibling, [blank_entry(1)]).await;
+        drop(sibling);
         drop(store);
         drop(writer);
         let newest = *core.segments().last().expect("segments");
@@ -592,6 +595,17 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
 
         let writer = core.open(mode).expect("recover a torn tail");
         let store = core.store(&writer, 1);
+        let sibling = core.store(&writer, 2);
+        assert_eq!(
+            store.log_state(),
+            GroupLogState::Initialized,
+            "an unacknowledged partial frame cannot gate a healthy group"
+        );
+        assert_eq!(
+            sibling.log_state(),
+            GroupLogState::Initialized,
+            "a sibling sharing the journal stays available"
+        );
         assert_eq!(
             log_ids(&store).await,
             (1..=30).collect::<Vec<_>>(),

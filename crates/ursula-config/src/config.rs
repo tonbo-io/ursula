@@ -218,6 +218,12 @@ impl RaftConfig {
     pub fn uses_meta_authority(&self) -> bool {
         self.meta.enabled && (self.wal.path.is_some() || !self.peers.is_empty())
     }
+
+    /// A standalone durable node needs no network membership configuration.
+    /// Its one-voter meta authority uses a private ephemeral loopback listener.
+    pub fn uses_implicit_single_node_meta(&self) -> bool {
+        self.uses_meta_authority() && self.peers.is_empty() && self.meta.peers.is_empty()
+    }
 }
 
 impl Default for RaftConfig {
@@ -255,6 +261,8 @@ impl Default for RaftConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetaRaftConfig {
+    /// Shared cluster credential read from a mounted secret; never embedded in config.
+    pub auth_token_file: Option<std::path::PathBuf>,
     pub enabled: bool,
     pub listen: String,
     pub peers: Vec<RaftPeerConfig>,
@@ -262,6 +270,7 @@ pub struct MetaRaftConfig {
 impl Default for MetaRaftConfig {
     fn default() -> Self {
         Self {
+            auth_token_file: None,
             enabled: true,
             listen: "127.0.0.1:4439".to_owned(),
             peers: Vec::new(),

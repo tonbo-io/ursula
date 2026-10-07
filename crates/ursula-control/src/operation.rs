@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_proto::admin::ProcessIncarnation;
+use ursula_proto::admin::ReplicaIdentity;
 use ursula_shard::RaftGroupId;
 
 use crate::DataGroupPlacement;
@@ -28,6 +29,23 @@ pub enum ProcessState {
     Retired {
         epoch: u64,
         reason: RetirementReason,
+    },
+}
+
+/// Data admission follows the durable WAL lifetime, independently of each boot.
+/// A replacement remains pending until every affected group has ordered its
+/// new identity after the old replica's removal from the voter configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicaState {
+    Active {
+        identity: ReplicaIdentity,
+        installed_groups: BTreeMap<RaftGroupId, u64>,
+    },
+    Retired(ReplicaIdentity),
+    Pending {
+        previous: ReplicaIdentity,
+        replacement: ReplicaIdentity,
+        installed_groups: BTreeMap<RaftGroupId, u64>,
     },
 }
 
@@ -89,6 +107,8 @@ pub enum OperationPhase {
 pub struct ReplicaEvidence {
     pub process: ProcessIdentity,
     pub applied_index: u64,
+    #[serde(default)]
+    pub installed_replica_identities: BTreeMap<NodeId, ReplicaIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,10 +161,33 @@ pub enum OperationCommand {
         token: OperationToken,
         sequence: u64,
     },
+    FinishReplicaFence {
+        token: OperationToken,
+        sequence: u64,
+        committed_index: u64,
+    },
     ClaimProcess {
         node_id: NodeId,
         expected_epoch: u64,
         incarnation: ProcessIncarnation,
+    },
+    /// A boot using the same exclusively owned WAL may refresh maintenance
+    /// observations without changing the data replica's admission identity.
+    RestartProcess {
+        node_id: NodeId,
+        previous: ProcessIdentity,
+        incarnation: ProcessIncarnation,
+        replica: ReplicaIdentity,
+    },
+    RegisterReplica {
+        node_id: NodeId,
+        process: ProcessIdentity,
+        identity: ReplicaIdentity,
+    },
+    ActivateReplica {
+        token: OperationToken,
+        node_id: NodeId,
+        identity: ReplicaIdentity,
     },
     Begin {
         kind: OperationKind,
@@ -174,6 +217,8 @@ pub enum OperationOutcome {
     ActionPrepared(OperationAction),
     ActionFinished,
     ProcessClaimed(ProcessIdentity),
+    ReplicaRegistered,
+    ReplicaActivated,
     Acquired(OperationToken),
     EvidenceRecorded,
     SourceRetired,
@@ -188,6 +233,8 @@ pub enum OperationError {
     UnknownNode { node_id: NodeId },
     #[error("process epoch precondition failed for node {node_id}")]
     ProcessChanged { node_id: NodeId },
+    #[error("durable replica identity precondition failed for node {node_id}")]
+    ReplicaChanged { node_id: NodeId },
     #[error("operation executor precondition failed")]
     StaleExecutor,
     #[error("maintenance operation does not cover the exact affected inventory")]
@@ -203,6 +250,8 @@ pub enum OperationError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationState {
     pub processes: BTreeMap<NodeId, ProcessState>,
+    #[serde(default)]
+    pub replicas: BTreeMap<NodeId, ReplicaState>,
     pub active: Option<MaintenanceOperation>,
     pub last_operation_id: u64,
 }
@@ -340,6 +389,7 @@ impl OperationState {
                 leader,
                 action,
             } => {
+                self.validate_replica_action(&token, group, leader, &action)?;
                 let current_process = match self.processes.get(&leader) {
                     Some(ProcessState::Active(identity)) => identity.clone(),
                     _ => return Err(OperationError::ProcessChanged { node_id: leader }),
@@ -407,22 +457,45 @@ impl OperationState {
             }
             OperationCommand::FinishAction { token, sequence } => {
                 let operation = self.authorized(&token)?;
-                if !operation
-                    .pending_action
-                    .as_ref()
-                    .is_some_and(|action| action.sequence == sequence)
-                {
+                if !operation.pending_action.as_ref().is_some_and(|action| {
+                    action.sequence == sequence
+                        && !matches!(
+                            action.action,
+                            MembershipAction::InstallReplicaIdentity { .. }
+                        )
+                }) {
                     return Err(OperationError::InvalidTransition);
                 }
                 operation.pending_action = None;
                 operation.evidence.clear();
                 Ok(OperationOutcome::ActionFinished)
             }
+            OperationCommand::FinishReplicaFence {
+                token,
+                sequence,
+                committed_index,
+            } => self.finish_replica_fence(&token, sequence, committed_index, now_ms),
             OperationCommand::ClaimProcess {
                 node_id,
                 expected_epoch,
                 incarnation,
             } => self.claim_process(node_id, expected_epoch, incarnation, nodes),
+            OperationCommand::RestartProcess {
+                node_id,
+                previous,
+                incarnation,
+                replica,
+            } => self.restart_process(node_id, &previous, incarnation, &replica),
+            OperationCommand::RegisterReplica {
+                node_id,
+                process,
+                identity,
+            } => self.register_replica(node_id, &process, identity, nodes),
+            OperationCommand::ActivateReplica {
+                token,
+                node_id,
+                identity,
+            } => self.activate_replica(&token, node_id, identity),
             OperationCommand::Begin {
                 kind,
                 executor,
@@ -446,6 +519,241 @@ impl OperationState {
         }
     }
 
+    fn finish_replica_fence(
+        &mut self,
+        token: &OperationToken,
+        sequence: u64,
+        committed_index: u64,
+        now_ms: u64,
+    ) -> Result<OperationOutcome, OperationError> {
+        let operation = self.authorized(token)?;
+        let Some(OperationAction {
+            group,
+            sequence: expected_sequence,
+            action: MembershipAction::InstallReplicaIdentity { node_id, identity },
+            ..
+        }) = operation.pending_action.as_ref()
+        else {
+            return Err(OperationError::InvalidTransition);
+        };
+        if sequence != *expected_sequence || committed_index == 0 {
+            return Err(OperationError::InvalidTransition);
+        }
+        let missing = || OperationError::MissingEvidence {
+            raft_group_id: *group,
+        };
+        let evidence = operation.evidence.get(group).ok_or_else(missing)?;
+        let survivors: BTreeSet<_> = operation
+            .previous
+            .get(group)
+            .ok_or_else(missing)?
+            .iter()
+            .copied()
+            .filter(|voter| voter != node_id)
+            .collect();
+        let installed = survivors
+            .iter()
+            .filter(|voter| {
+                evidence.replicas.get(voter).is_some_and(|replica| {
+                    replica.installed_replica_identities.get(node_id) == Some(identity)
+                        && replica.applied_index >= committed_index
+                })
+            })
+            .count();
+        if evidence.joint
+            || evidence.voters != survivors
+            || evidence.committed_index < committed_index
+            || evidence.observed_at_ms > now_ms
+            || now_ms.saturating_sub(evidence.observed_at_ms) > EVIDENCE_MAX_AGE_MS
+            || installed <= survivors.len() / 2
+        {
+            return Err(missing());
+        }
+        let group = *group;
+        let node_id = *node_id;
+        let identity = identity.clone();
+        match self.replicas.get_mut(&node_id) {
+            Some(ReplicaState::Pending {
+                replacement,
+                installed_groups,
+                ..
+            }) if replacement == &identity => {
+                installed_groups.insert(group, committed_index);
+            }
+            Some(ReplicaState::Active {
+                identity: current,
+                installed_groups,
+            }) if current == &identity => {
+                installed_groups
+                    .entry(group)
+                    .and_modify(|index| *index = (*index).max(committed_index))
+                    .or_insert(committed_index);
+            }
+            _ => return Err(OperationError::ReplicaChanged { node_id }),
+        }
+        let operation = self.authorized(token)?;
+        operation.pending_action = None;
+        operation.evidence.clear();
+        Ok(OperationOutcome::ActionFinished)
+    }
+
+    fn register_replica(
+        &mut self,
+        node_id: NodeId,
+        process: &ProcessIdentity,
+        identity: ReplicaIdentity,
+        nodes: &BTreeSet<NodeId>,
+    ) -> Result<OperationOutcome, OperationError> {
+        if !nodes.contains(&node_id) {
+            return Err(OperationError::UnknownNode { node_id });
+        }
+        if !self.accepts_process(node_id, process) {
+            return Err(OperationError::ProcessChanged { node_id });
+        }
+        if identity.generation == 0 || identity.generation > process.epoch {
+            return Err(OperationError::ReplicaChanged { node_id });
+        }
+        match self.replicas.get(&node_id) {
+            Some(ReplicaState::Active {
+                identity: current, ..
+            }) if current == &identity => {
+                return Ok(OperationOutcome::ReplicaRegistered);
+            }
+            Some(ReplicaState::Pending { replacement, .. }) if replacement == &identity => {
+                return Ok(OperationOutcome::ReplicaRegistered);
+            }
+            Some(ReplicaState::Retired(previous)) => {
+                let operation = self
+                    .active
+                    .as_ref()
+                    .ok_or(OperationError::InvalidTransition)?;
+                if !matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == node_id)
+                    || operation.phase != OperationPhase::Retired
+                    || identity.generation <= previous.generation
+                    || identity.incarnation == previous.incarnation
+                {
+                    return Err(OperationError::ReplicaChanged { node_id });
+                }
+                self.replicas.insert(node_id, ReplicaState::Pending {
+                    previous: previous.clone(),
+                    replacement: identity,
+                    installed_groups: BTreeMap::new(),
+                });
+            }
+            Some(_) => return Err(OperationError::ReplicaChanged { node_id }),
+            None => {
+                if self.active.is_some() {
+                    return Err(OperationError::Busy);
+                }
+                if identity.generation != process.epoch {
+                    return Err(OperationError::ReplicaChanged { node_id });
+                }
+                self.replicas.insert(node_id, ReplicaState::Active {
+                    identity,
+                    installed_groups: BTreeMap::new(),
+                });
+            }
+        }
+        Ok(OperationOutcome::ReplicaRegistered)
+    }
+
+    fn validate_replica_action(
+        &self,
+        token: &OperationToken,
+        group: RaftGroupId,
+        leader: NodeId,
+        action: &MembershipAction,
+    ) -> Result<(), OperationError> {
+        let operation = self
+            .active
+            .as_ref()
+            .filter(|operation| &operation.token == token)
+            .ok_or(OperationError::StaleExecutor)?;
+        match action {
+            MembershipAction::InstallReplicaIdentity { node_id, identity } => {
+                let replacement = operation.phase == OperationPhase::Retired
+                    && matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == *node_id)
+                    && matches!(self.replicas.get(node_id), Some(ReplicaState::Pending { replacement, .. }) if replacement == identity);
+                let admission = operation.phase == OperationPhase::Preparing
+                    && matches!(
+                        operation.kind,
+                        OperationKind::MoveReplicas { .. } | OperationKind::DecommissionNode { .. }
+                    )
+                    && operation
+                        .desired
+                        .get(&group)
+                        .is_some_and(|voters| voters.contains(node_id))
+                    && operation
+                        .previous
+                        .get(&group)
+                        .is_some_and(|voters| !voters.contains(node_id))
+                    && matches!(self.replicas.get(node_id), Some(ReplicaState::Active { identity: current, .. }) if current == identity);
+                if leader == *node_id || !(replacement || admission) {
+                    return Err(OperationError::ReplicaChanged { node_id: *node_id });
+                }
+            }
+            MembershipAction::ChangeVoters => {
+                if let OperationKind::RebuildReplica { node_id } = operation.kind
+                    && self
+                        .replicas
+                        .get(&node_id)
+                        .is_some_and(|state| !matches!(state, ReplicaState::Active { .. }))
+                {
+                    return Err(OperationError::ReplicaChanged { node_id });
+                }
+                if let (Some(previous), Some(desired)) = (
+                    operation.previous.get(&group),
+                    operation.desired.get(&group),
+                ) {
+                    for node_id in desired.difference(previous) {
+                        if let Some(state) = self.replicas.get(node_id)
+                            && !matches!(state, ReplicaState::Active { installed_groups, .. } if installed_groups.contains_key(&group))
+                        {
+                            return Err(OperationError::ReplicaChanged { node_id: *node_id });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn activate_replica(
+        &mut self,
+        token: &OperationToken,
+        node_id: NodeId,
+        identity: ReplicaIdentity,
+    ) -> Result<OperationOutcome, OperationError> {
+        let operation = self.authorized(token)?;
+        if operation.phase != OperationPhase::Retired
+            || !matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == node_id)
+            || operation.pending_action.is_some()
+        {
+            return Err(OperationError::InvalidTransition);
+        }
+        let required: BTreeSet<_> = operation.previous.keys().copied().collect();
+        match self.replicas.get(&node_id) {
+            Some(ReplicaState::Active {
+                identity: current, ..
+            }) if current == &identity => {}
+            Some(ReplicaState::Pending {
+                replacement,
+                installed_groups,
+                ..
+            }) if replacement == &identity
+                && installed_groups.keys().copied().collect::<BTreeSet<_>>() == required =>
+            {
+                self.replicas.insert(node_id, ReplicaState::Active {
+                    identity,
+                    installed_groups: installed_groups.clone(),
+                });
+            }
+            _ => return Err(OperationError::ReplicaChanged { node_id }),
+        }
+        Ok(OperationOutcome::ReplicaActivated)
+    }
+
     fn authorized(
         &mut self,
         token: &OperationToken,
@@ -454,6 +762,47 @@ impl OperationState {
             .as_mut()
             .filter(|operation| &operation.token == token)
             .ok_or(OperationError::StaleExecutor)
+    }
+
+    fn restart_process(
+        &mut self,
+        node_id: NodeId,
+        previous: &ProcessIdentity,
+        incarnation: ProcessIncarnation,
+        replica: &ReplicaIdentity,
+    ) -> Result<OperationOutcome, OperationError> {
+        if !self.accepts_process(node_id, previous) {
+            return Err(OperationError::ProcessChanged { node_id });
+        }
+        let admitted = match self.replicas.get(&node_id) {
+            Some(ReplicaState::Active { identity, .. }) => identity == replica,
+            Some(ReplicaState::Pending { replacement, .. }) => replacement == replica,
+            _ => false,
+        };
+        if !admitted {
+            return Err(OperationError::ReplicaChanged { node_id });
+        }
+        if let Some(operation) = &self.active
+            && operation.participants.get(&node_id) != Some(previous)
+        {
+            return Err(OperationError::ProcessChanged { node_id });
+        }
+        let identity = ProcessIdentity {
+            epoch: previous
+                .epoch
+                .checked_add(1)
+                .ok_or(OperationError::EpochExhausted)?,
+            incarnation,
+        };
+        self.processes
+            .insert(node_id, ProcessState::Active(identity.clone()));
+        if let Some(operation) = &mut self.active {
+            operation.participants.insert(node_id, identity.clone());
+            operation.evidence.clear();
+            // Keep any unresolved action bound to its old process. Reassignment
+            // must explicitly resolve that receipt; a reboot cannot erase it.
+        }
+        Ok(OperationOutcome::ProcessClaimed(identity))
     }
 
     fn claim_process(
@@ -481,15 +830,22 @@ impl OperationState {
         {
             return Err(OperationError::InvalidTransition);
         }
-        // During an operation only its explicitly retired rebuild target can
-        // claim a new process. A lost executor cannot refresh survivor identities.
-        if let Some(operation) = &self.active
-            && (!(matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == node_id)
-                && operation.phase == OperationPhase::Retired
-                || operation.recovering_processes.contains(&node_id))
-                || !matches!(current, Some(ProcessState::Retired { .. })))
-        {
-            return Err(OperationError::Busy);
+        // A pending replacement has no data authority yet and can restart while
+        // waiting for its fences. Its WAL identity still has to match exactly.
+        // An active executor cannot silently refresh its action's process pins.
+        if let Some(operation) = &self.active {
+            let rebuild = matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == node_id)
+                && operation.phase == OperationPhase::Retired;
+            let retired = matches!(current, Some(ProcessState::Retired { .. }));
+            let pending = matches!(
+                self.replicas.get(&node_id),
+                Some(ReplicaState::Pending { .. })
+            );
+            if !(rebuild && (retired || pending)
+                || operation.recovering_processes.contains(&node_id) && retired)
+            {
+                return Err(OperationError::Busy);
+            }
         }
         let identity = ProcessIdentity {
             epoch: expected_epoch
@@ -579,7 +935,7 @@ impl OperationState {
             .copied()
             .collect::<BTreeSet<_>>();
         required.insert(source);
-        if meta_voters.is_empty() || !meta_voters.contains(&source) {
+        if meta_voters.is_empty() || !meta_voters.is_subset(nodes) {
             return Err(OperationError::InventoryMismatch);
         }
         if participants.keys().copied().collect::<BTreeSet<_>>() != required {
@@ -669,29 +1025,37 @@ impl OperationState {
             if now_ms.saturating_sub(evidence.observed_at_ms) > EVIDENCE_MAX_AGE_MS {
                 return Err(missing());
             }
-            let required = if retiring {
-                let previous = operation.previous.get(group).ok_or_else(missing)?;
-                let survivors = previous
-                    .iter()
-                    .filter(|id| **id != operation.kind.source())
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                if &evidence.voters != previous
-                    && (!matches!(operation.kind, OperationKind::RebuildReplica { .. })
-                        || evidence.voters != survivors)
-                {
-                    return Err(missing());
-                }
-                if survivors.len() <= previous.len() / 2 {
-                    return Err(missing());
-                }
-                survivors
-            } else {
-                if &evidence.voters != desired {
-                    return Err(missing());
-                }
-                desired.clone()
-            };
+            let required =
+                if retiring && matches!(operation.kind, OperationKind::DecommissionNode { .. }) {
+                    // Drain a node only after its replacements are already voters
+                    // and have applied a fresh committed prefix in every group.
+                    if &evidence.voters != desired {
+                        return Err(missing());
+                    }
+                    desired.clone()
+                } else if retiring {
+                    let previous = operation.previous.get(group).ok_or_else(missing)?;
+                    let survivors = previous
+                        .iter()
+                        .filter(|id| **id != operation.kind.source())
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    if &evidence.voters != previous
+                        && (!matches!(operation.kind, OperationKind::RebuildReplica { .. })
+                            || evidence.voters != survivors)
+                    {
+                        return Err(missing());
+                    }
+                    if survivors.len() <= previous.len() / 2 {
+                        return Err(missing());
+                    }
+                    survivors
+                } else {
+                    if &evidence.voters != desired {
+                        return Err(missing());
+                    }
+                    desired.clone()
+                };
             if !required.iter().all(|id| evidence.replicas.contains_key(id)) {
                 return Err(missing());
             }
@@ -729,6 +1093,10 @@ impl OperationState {
         operation.evidence.clear();
         self.processes
             .insert(source, ProcessState::Retired { epoch, reason });
+        if let Some(ReplicaState::Active { identity, .. }) = self.replicas.get(&source) {
+            self.replicas
+                .insert(source, ReplicaState::Retired(identity.clone()));
+        }
         Ok(OperationOutcome::SourceRetired)
     }
 
@@ -738,6 +1106,15 @@ impl OperationState {
         now_ms: u64,
         placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
     ) -> Result<OperationOutcome, OperationError> {
+        if let Some(operation) = &self.active
+            && let OperationKind::RebuildReplica { node_id } = operation.kind
+            && self
+                .replicas
+                .get(&node_id)
+                .is_some_and(|state| !matches!(state, ReplicaState::Active { .. }))
+        {
+            return Err(OperationError::ReplicaChanged { node_id });
+        }
         let operation = self.authorized(token)?;
         if !matches!(operation.kind, OperationKind::MoveReplicas { .. })
             && operation.phase != OperationPhase::Retired
@@ -841,6 +1218,7 @@ mod tests {
                     (*id, ReplicaEvidence {
                         process: identity(1, *id),
                         applied_index: index,
+                        installed_replica_identities: BTreeMap::new(),
                     })
                 })
                 .collect(),
@@ -1159,6 +1537,30 @@ mod tests {
                 OperationCommand::Observe {
                     token: token.clone(),
                     evidence: evidence(&[1, 2, 3], &[2, 3], 100),
+                },
+                10,
+                &nodes,
+                &mut placements,
+            )
+            .unwrap();
+        assert_eq!(
+            state.apply(
+                OperationCommand::RetireSource {
+                    token: token.clone()
+                },
+                10,
+                &nodes,
+                &mut placements
+            ),
+            Err(OperationError::MissingEvidence {
+                raft_group_id: RaftGroupId(0)
+            })
+        );
+        state
+            .apply(
+                OperationCommand::Observe {
+                    token: token.clone(),
+                    evidence: evidence(&[2, 3, 4], &[2, 3, 4], 100),
                 },
                 10,
                 &nodes,
@@ -1499,7 +1901,7 @@ mod tests {
 
     proptest::proptest! {
         #[test]
-        fn rejected_commands_preserve_the_entire_replicated_state(actions in proptest::collection::vec(0_u8..4, 1..64)) {
+        fn rejected_commands_preserve_the_entire_replicated_state(actions in proptest::collection::vec(0_u8..7, 1..64)) {
             let (mut state, nodes, mut placements) = setup();
             let token = begin(&mut state, &nodes, &mut placements, OperationKind::RebuildReplica { node_id: 1 }, &[1, 2, 3]);
             for action in actions {
@@ -1507,6 +1909,9 @@ mod tests {
                     0 => OperationCommand::ClaimProcess { node_id: 2, expected_epoch: 1, incarnation: ProcessIncarnation::from_bits(100) },
                     1 => OperationCommand::RetireSource { token: token.clone() },
                     2 => OperationCommand::Complete { token: token.clone() },
+                    3 => OperationCommand::RegisterReplica { node_id: 1, process: identity(1, 1), identity: ReplicaIdentity { generation: 2, incarnation: ProcessIncarnation::from_bits(100) } },
+                    4 => OperationCommand::ActivateReplica { token: token.clone(), node_id: 1, identity: ReplicaIdentity { generation: 2, incarnation: ProcessIncarnation::from_bits(100) } },
+                    5 => OperationCommand::FinishReplicaFence { token: token.clone(), sequence: 1, committed_index: 100 },
                     _ => OperationCommand::TakeOver { expected: OperationToken { generation: token.generation.saturating_add(1), ..token.clone() }, executor: ProcessIncarnation::from_bits(100) },
                 };
                 let before = state.clone();
@@ -1525,6 +1930,13 @@ mod tests {
 /// Thin adapters submit intent; prefix evidence is collected by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationRequest {
+    /// Register a fresh node and its non-voting meta replica before data moves.
+    JoinNode {
+        node_id: NodeId,
+        client_url: String,
+        cluster_url: String,
+        meta_url: String,
+    },
     RecoverAction {
         token: OperationToken,
     },
@@ -1564,9 +1976,15 @@ pub struct OperationAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipAction {
     PrepareReplica,
-    AddLearner { node_id: NodeId },
+    AddLearner {
+        node_id: NodeId,
+    },
     ChangeVoters,
     RetireReplica,
+    InstallReplicaIdentity {
+        node_id: NodeId,
+        identity: ReplicaIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

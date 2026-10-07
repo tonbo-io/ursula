@@ -54,8 +54,61 @@ pub struct MetaRecoveryStatus {
     pub nonce: Option<ursula_proto::admin::ProcessIncarnation>,
 }
 
+/// Shared cluster credential. Debug output never reveals the token.
+#[derive(Clone, Default)]
+pub struct MetaRpcAuth {
+    token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    digest: Option<blake3::Hash>,
+}
+impl std::fmt::Debug for MetaRpcAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetaRpcAuth")
+            .field("configured", &self.token.is_some())
+            .finish()
+    }
+}
+impl MetaRpcAuth {
+    pub fn from_token_file(path: &std::path::Path) -> Result<Self, MetaRaftError> {
+        let token = std::fs::read_to_string(path)
+            .map_err(|error| MetaRaftError::with_source("read meta credential file", error))?;
+        Self::from_token(token.trim())
+    }
+    fn from_token(token: &str) -> Result<Self, MetaRaftError> {
+        if token.len() < 32
+            || token.len() > 256
+            || !token.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(MetaRaftError::new(
+                "meta credential",
+                "credential must contain 32..256 printable ASCII bytes",
+            ));
+        }
+        let value = format!("Bearer {token}");
+        let mut metadata: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = value
+            .parse()
+            .map_err(|error| MetaRaftError::with_source("meta credential encoding", error))?;
+        metadata.set_sensitive(true);
+        Ok(Self {
+            token: Some(metadata),
+            digest: Some(blake3::hash(value.as_bytes())),
+        })
+    }
+    fn authorized(&self, metadata: &tonic::metadata::MetadataMap) -> bool {
+        self.digest.is_none_or(|expected| {
+            metadata
+                .get("authorization")
+                .is_some_and(|supplied| blake3::hash(supplied.as_encoded_bytes()) == expected)
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum MetaRequest {
+    JoinNode {
+        registration: crate::MetaNodeRegistration,
+        meta_url: String,
+        now_ms: u64,
+    },
     AuthenticatedReplication {
         identity: Option<ursula_control::ProcessIdentity>,
         request: Box<MetaRequest>,
@@ -124,6 +177,11 @@ impl pb::meta_internal_server::MetaInternal for MetaGrpcService {
         &self,
         request: Request<pb::MetaRpcEnvelopeV1>,
     ) -> Result<Response<pb::MetaRpcEnvelopeV1>, Status> {
+        if !self.handle.rpc_auth().authorized(request.metadata()) {
+            return Err(Status::unauthenticated(
+                "valid meta cluster credential required",
+            ));
+        }
         let envelope = request.into_inner();
         if envelope.protocol_version != VERSION {
             return Err(Status::failed_precondition(
@@ -168,6 +226,16 @@ impl pb::meta_internal_server::MetaInternal for MetaGrpcService {
         }
         let raft = self.handle.raft_handle();
         let response = match request {
+            MetaRequest::JoinNode {
+                registration,
+                meta_url,
+                now_ms,
+            } => MetaResponse::Written(
+                self.handle
+                    .join_node_local(registration, meta_url, now_ms)
+                    .await
+                    .map_err(unavailable)?,
+            ),
             MetaRequest::AuthenticatedReplication { .. } => {
                 return Err(Status::invalid_argument("nested meta identity envelope"));
             }
@@ -217,17 +285,24 @@ impl pb::meta_internal_server::MetaInternal for MetaGrpcService {
                     .read_linearizable_local()
                     .await
                     .map_err(unavailable)?;
-                let authorized = snapshot.operations.active.as_ref().is_some_and(|operation|
+                let rebuild = snapshot.operations.active.as_ref().is_some_and(|operation|
                     operation.phase == ursula_control::OperationPhase::Retired
                     && matches!(operation.kind, ursula_control::OperationKind::RebuildReplica { node_id: source } if source == node_id))
                     && matches!(snapshot.operations.processes.get(&node_id), Some(ursula_control::ProcessState::Retired { reason: ursula_control::RetirementReason::Rebuild, .. }));
+                let joining = snapshot.operations.active.is_none()
+                    && snapshot
+                        .nodes
+                        .get(&node_id)
+                        .is_some_and(|node| node.state != ursula_control::NodeState::Removed)
+                    && !snapshot.operations.processes.contains_key(&node_id)
+                    && !snapshot.operations.replicas.contains_key(&node_id);
                 let membership = before.membership_config.membership();
-                if !authorized
+                if !(rebuild || joining)
                     || membership.voter_ids().any(|voter| voter == node_id)
                     || membership.get_node(&node_id).is_none()
                 {
                     return Err(Status::failed_precondition(
-                        "fresh meta disk requires an authorized retired rebuild learner",
+                        "fresh meta disk requires an authorized rebuild or registered new learner",
                     ));
                 }
                 raft.trigger()
@@ -324,6 +399,7 @@ fn is_removed_sender(state: &ControlPlaneState, request: &MetaRequest) -> bool {
         | MetaRequest::Initialized
         | MetaRequest::Write(_)
         | MetaRequest::ReconcileMembership { .. }
+        | MetaRequest::JoinNode { .. }
         | MetaRequest::RecoveryStatus
         | MetaRequest::RecoveryFloor { .. }
         | MetaRequest::AuthorizeGenesis(_) => return false,
@@ -368,6 +444,14 @@ fn unavailable(error: impl std::fmt::Display) -> Status {
 }
 
 async fn exchange(endpoint: &str, request: MetaRequest) -> Result<MetaResponse, MetaRaftError> {
+    exchange_authenticated(endpoint, request, &MetaRpcAuth::default()).await
+}
+
+async fn exchange_authenticated(
+    endpoint: &str,
+    request: MetaRequest,
+    auth: &MetaRpcAuth,
+) -> Result<MetaResponse, MetaRaftError> {
     static CHANNELS: OnceLock<Mutex<BTreeMap<String, tonic::transport::Channel>>> = OnceLock::new();
     let channel = {
         let mut channels = CHANNELS
@@ -391,11 +475,15 @@ async fn exchange(endpoint: &str, request: MetaRequest) -> Result<MetaResponse, 
         .max_encoding_message_size(MAX_BYTES);
     let payload = rmp_serde::to_vec_named(&request)
         .map_err(|error| MetaRaftError::with_source("encode meta request", error))?;
+    let mut wire = Request::new(pb::MetaRpcEnvelopeV1 {
+        protocol_version: VERSION,
+        payload: payload.into(),
+    });
+    if let Some(token) = &auth.token {
+        wire.metadata_mut().insert("authorization", token.clone());
+    }
     let response = client
-        .exchange(pb::MetaRpcEnvelopeV1 {
-            protocol_version: VERSION,
-            payload: payload.into(),
-        })
+        .exchange(wire)
         .await
         .map_err(|error| MetaRaftError::with_source("meta RPC", error))?
         .into_inner();
@@ -422,10 +510,54 @@ pub async fn meta_peer_recovery_floor(
     }
 }
 
+pub async fn meta_peer_recovery_floor_authenticated(
+    endpoint: &str,
+    auth: &MetaRpcAuth,
+    node_id: u64,
+) -> Result<VoteOf<MetaRaftTypeConfig>, MetaRaftError> {
+    match exchange_authenticated(endpoint, MetaRequest::RecoveryFloor { node_id }, auth).await? {
+        MetaResponse::RecoveryFloor(vote) => Ok(vote),
+        _ => Err(mismatch()),
+    }
+}
+
+pub(crate) async fn forward_join(
+    endpoint: &str,
+    auth: &MetaRpcAuth,
+    registration: crate::MetaNodeRegistration,
+    meta_url: String,
+    now_ms: u64,
+) -> Result<ControlResponse, MetaRaftError> {
+    match exchange_authenticated(
+        endpoint,
+        MetaRequest::JoinNode {
+            registration,
+            meta_url,
+            now_ms,
+        },
+        auth,
+    )
+    .await?
+    {
+        MetaResponse::Written(response) => Ok(response),
+        _ => Err(mismatch()),
+    }
+}
+
 pub async fn meta_peer_recovery_status(
     endpoint: &str,
 ) -> Result<MetaRecoveryStatus, MetaRaftError> {
     match exchange(endpoint, MetaRequest::RecoveryStatus).await? {
+        MetaResponse::RecoveryStatus(status) => Ok(status),
+        _ => Err(mismatch()),
+    }
+}
+
+pub async fn meta_peer_recovery_status_authenticated(
+    endpoint: &str,
+    auth: &MetaRpcAuth,
+) -> Result<MetaRecoveryStatus, MetaRaftError> {
+    match exchange_authenticated(endpoint, MetaRequest::RecoveryStatus, auth).await? {
         MetaResponse::RecoveryStatus(status) => Ok(status),
         _ => Err(mismatch()),
     }
@@ -441,6 +573,17 @@ pub async fn meta_authorize_genesis(
     }
 }
 
+pub async fn meta_authorize_genesis_authenticated(
+    endpoint: &str,
+    auth: &MetaRpcAuth,
+    nonce: ursula_proto::admin::ProcessIncarnation,
+) -> Result<(), MetaRaftError> {
+    match exchange_authenticated(endpoint, MetaRequest::AuthorizeGenesis(nonce), auth).await? {
+        MetaResponse::GenesisAuthorized => Ok(()),
+        _ => Err(mismatch()),
+    }
+}
+
 pub async fn meta_peer_initialized(endpoint: &str) -> Result<bool, MetaRaftError> {
     match exchange(endpoint, MetaRequest::Initialized).await? {
         MetaResponse::Initialized(initialized) => Ok(initialized),
@@ -448,15 +591,27 @@ pub async fn meta_peer_initialized(endpoint: &str) -> Result<bool, MetaRaftError
     }
 }
 
+pub async fn meta_peer_initialized_authenticated(
+    endpoint: &str,
+    auth: &MetaRpcAuth,
+) -> Result<bool, MetaRaftError> {
+    match exchange_authenticated(endpoint, MetaRequest::Initialized, auth).await? {
+        MetaResponse::Initialized(initialized) => Ok(initialized),
+        _ => Err(mismatch()),
+    }
+}
+
 pub(crate) async fn forward_membership(
     endpoint: &str,
+    auth: &MetaRpcAuth,
     token: ursula_control::OperationToken,
     restore: bool,
 ) -> Result<(), MetaRaftError> {
-    match exchange(endpoint, MetaRequest::ReconcileMembership {
-        token,
-        restore,
-    })
+    match exchange_authenticated(
+        endpoint,
+        MetaRequest::ReconcileMembership { token, restore },
+        auth,
+    )
     .await?
     {
         MetaResponse::MembershipReconciled => Ok(()),
@@ -466,8 +621,9 @@ pub(crate) async fn forward_membership(
 
 pub(crate) async fn forward_processes(
     endpoint: &str,
+    auth: &MetaRpcAuth,
 ) -> Result<crate::meta::ProcessEpochs, MetaRaftError> {
-    match exchange(endpoint, MetaRequest::Processes).await? {
+    match exchange_authenticated(endpoint, MetaRequest::Processes, auth).await? {
         MetaResponse::Processes(processes) => Ok(processes),
         _ => Err(mismatch()),
     }
@@ -475,24 +631,29 @@ pub(crate) async fn forward_processes(
 
 pub(crate) async fn forward_topology(
     endpoint: &str,
+    auth: &MetaRpcAuth,
 ) -> Result<(ControlPlaneState, std::collections::BTreeSet<u64>), MetaRaftError> {
-    match exchange(endpoint, MetaRequest::Topology).await? {
+    match exchange_authenticated(endpoint, MetaRequest::Topology, auth).await? {
         MetaResponse::Topology { state, voters } => Ok((*state, voters)),
         _ => Err(mismatch()),
     }
 }
 
-pub(crate) async fn forward_read(endpoint: &str) -> Result<ControlPlaneState, MetaRaftError> {
-    match exchange(endpoint, MetaRequest::Read).await? {
+pub(crate) async fn forward_read(
+    endpoint: &str,
+    auth: &MetaRpcAuth,
+) -> Result<ControlPlaneState, MetaRaftError> {
+    match exchange_authenticated(endpoint, MetaRequest::Read, auth).await? {
         MetaResponse::State(state) => Ok(*state),
         _ => Err(mismatch()),
     }
 }
 pub(crate) async fn forward_write(
     endpoint: &str,
+    auth: &MetaRpcAuth,
     command: ControlCommand,
 ) -> Result<ControlResponse, MetaRaftError> {
-    match exchange(endpoint, MetaRequest::Write(command)).await? {
+    match exchange_authenticated(endpoint, MetaRequest::Write(command), auth).await? {
         MetaResponse::Written(response) => Ok(response),
         MetaResponse::NotLeader(endpoint) => Err(MetaRaftError::not_leader(endpoint)),
         _ => Err(mismatch()),
@@ -501,9 +662,11 @@ pub(crate) async fn forward_write(
 
 #[derive(Clone, Default)]
 pub struct MetaGrpcNetworkFactory {
+    pub(crate) auth: MetaRpcAuth,
     pub(crate) identity: Arc<Mutex<Option<ursula_control::ProcessIdentity>>>,
 }
 pub struct MetaGrpcNetwork {
+    auth: MetaRpcAuth,
     endpoint: String,
     identity: Arc<Mutex<Option<ursula_control::ProcessIdentity>>>,
 }
@@ -511,6 +674,7 @@ impl RaftNetworkFactory<MetaRaftTypeConfig> for MetaGrpcNetworkFactory {
     type Network = MetaGrpcNetwork;
     async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
         MetaGrpcNetwork {
+            auth: self.auth.clone(),
             endpoint: node.addr.clone(),
             identity: self.identity.clone(),
         }
@@ -523,10 +687,14 @@ impl MetaGrpcNetwork {
             .lock()
             .map_err(|_poisoned| MetaRaftError::new("meta sender identity", "lock poisoned"))?
             .clone();
-        exchange(&self.endpoint, MetaRequest::AuthenticatedReplication {
-            identity,
-            request: Box::new(request),
-        })
+        exchange_authenticated(
+            &self.endpoint,
+            MetaRequest::AuthenticatedReplication {
+                identity,
+                request: Box::new(request),
+            },
+            &self.auth,
+        )
         .await
     }
 }
@@ -619,6 +787,67 @@ mod tests {
     use super::pb;
     use crate::MetaRaftHandle;
     use crate::raft_internal_proto::meta_internal_server::MetaInternal;
+
+    #[tokio::test]
+    async fn meta_credentials_are_checked_before_payload_decode_and_write() {
+        let root = tempfile::tempdir().unwrap();
+        let auth = super::MetaRpcAuth::from_token("0123456789abcdef0123456789abcdef").unwrap();
+        let handle = MetaRaftHandle::new_durable_with_auth(
+            1,
+            root.path().to_owned(),
+            std::sync::Arc::new(openraft::Config::default()),
+            auth.clone(),
+        )
+        .await
+        .unwrap();
+        let service = MetaGrpcService {
+            handle: handle.clone(),
+        };
+        let wire = || pb::MetaRpcEnvelopeV1 {
+            protocol_version: VERSION,
+            payload: bytes::Bytes::from_static(b"invalid"),
+        };
+        let error = service.exchange(Request::new(wire())).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let mut wrong = Request::new(wire());
+        wrong
+            .metadata_mut()
+            .insert("authorization", "Bearer wrong".parse().unwrap());
+        assert_eq!(
+            service.exchange(wrong).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut allowed = Request::new(wire());
+        allowed
+            .metadata_mut()
+            .insert("authorization", auth.token.clone().unwrap());
+        assert_eq!(
+            service.exchange(allowed).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        let write = MetaRequest::Write(ControlCommand::RegisterNode {
+            node_id: 42,
+            client_url: "http://outside".to_owned(),
+            cluster_url: "http://outside".to_owned(),
+            labels: Default::default(),
+            now_ms: 0,
+        });
+        let error = service
+            .exchange(Request::new(pb::MetaRpcEnvelopeV1 {
+                protocol_version: VERSION,
+                payload: rmp_serde::to_vec_named(&write).unwrap().into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert!(
+            !handle
+                .read_state(|state| state.nodes.contains_key(&42))
+                .await
+                .unwrap()
+        );
+        handle.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn fresh_meta_replica_rejects_rpc_until_durable_vote_floor_and_rejects_stale_genesis() {

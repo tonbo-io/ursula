@@ -92,6 +92,10 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         None => Persistence::InMemory,
     };
+    // Meta startup persists its identity inside the journal directory. Refuse
+    // incompatible storage before that write, and stamp a fresh directory
+    // before its first identity record makes it nonempty.
+    crate::bootstrap::check_and_stamp_format_epoch(&config, persistence.log_dir()).await?;
     let meta_authority = if config.raft.uses_meta_authority() {
         let root = config.raft.wal.path.as_ref().ok_or_else(|| {
             std::io::Error::other("meta authority requires a persistent WAL path")
@@ -107,10 +111,7 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let mut state = init_state(&config, persistence, start_maintenance_drained)
-        .await?
-        .with_process_incarnation(boot);
-    let live_cleanup = if let Some(authority) = &meta_authority {
+    if let Some(authority) = &meta_authority {
         let topology = authority.handle.committed_state();
         let mut applied = topology.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -127,6 +128,17 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
             Ok::<(), std::io::Error>(())
         })
         .await??;
+    }
+    let mut state = init_state(
+        &config,
+        persistence,
+        start_maintenance_drained,
+        meta_authority.as_ref(),
+    )
+    .await?
+    .with_process_incarnation(boot);
+    let live_cleanup = if let Some(authority) = &meta_authority {
+        let topology = authority.handle.committed_state();
         state = state
             .with_meta_control(authority.handle.clone())
             .with_live_topology(topology.clone());
@@ -134,6 +146,9 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
             .raft_registry()
             .ok_or_else(|| std::io::Error::other("meta authority requires data Raft registry"))?
             .clone();
+        registry.set_replica_authority(config.raft.node_id, authority.replica.clone());
+        registry.set_replica_genesis(authority.replica_genesis.clone());
+        registry.set_replica_genesis_prefixes(authority.replica_genesis_prefixes.clone());
         registry.set_process_authority(
             config.raft.node_id,
             authority.process.clone(),
@@ -174,7 +189,9 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Whether the server runs Raft. Only the zero-config development mode (the
 /// `default` preset on a single node) runs the in-memory engine without it.
 fn runs_raft(config: &ursula_config::UrsulaConfig, preset: Option<Preset>) -> bool {
-    preset != Some(Preset::Default) || !config.raft.peers.is_empty()
+    preset != Some(Preset::Default)
+        || !config.raft.peers.is_empty()
+        || config.raft.wal.path.is_some()
 }
 
 /// Where this process keeps its Raft WAL.
@@ -256,13 +273,23 @@ async fn init_state(
     config: &ursula_config::UrsulaConfig,
     persistence: Persistence,
     start_maintenance_drained: bool,
+    meta_authority: Option<&crate::bootstrap::meta::MetaAuthority>,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
-    let raft_peers: Vec<(u64, String)> = config
+    let implicit_single_meta = config.raft.uses_implicit_single_node_meta();
+    let mut raft_peers: Vec<(u64, String)> = config
         .raft
         .peers
         .iter()
         .map(|p| (p.node_id, p.url.clone()))
         .collect();
+    // Durable standalone meta uses the same registered group engines as a
+    // distributed node, preserving the configured node ID and WAL identity.
+    if implicit_single_meta {
+        raft_peers.push((
+            config.raft.node_id,
+            format!("http://{}", config.server.listen),
+        ));
+    }
     if start_maintenance_drained && raft_peers.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -292,9 +319,10 @@ async fn init_state(
             config.raft.node_id,
             raft_peers.clone(),
             config.raft.group_count,
-            config.raft.init_membership,
+            config.raft.init_membership || implicit_single_meta,
             ursula_raft::StaticGrpcRaftMembershipConfig {
-                initialize_membership_per_group: config.raft.init_membership_per_group,
+                initialize_membership_per_group: config.raft.init_membership_per_group
+                    || implicit_single_meta,
                 per_group_voters: per_group_voters.clone(),
             },
         )?
@@ -313,9 +341,57 @@ async fn init_state(
     )?;
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal;
+    // Attach committed placement and certified identities before opening any
+    // group. Only an original replica's first boot may initialize genesis;
+    // stale static configuration must not initialize a replacement or newcomer.
+    if let Some(authority) = meta_authority {
+        let registry = spawned
+            .raft_registry
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("meta authority requires data Raft registry"))?;
+        registry.set_replica_authority(config.raft.node_id, authority.replica.clone());
+        registry.set_replica_genesis(authority.replica_genesis.clone());
+        registry.set_replica_genesis_prefixes(authority.replica_genesis_prefixes.clone());
+        let topology = authority.handle.committed_state();
+        let genesis_groups = if authority.process.epoch == 1 && authority.replica.generation == 1 {
+            topology
+                .borrow()
+                .placements
+                .iter()
+                .filter(|(group, placement)| {
+                    placement.voters.contains(&config.raft.node_id)
+                        && !authority.replica_genesis_prefixes.contains_key(*group)
+                })
+                .map(|(group, _)| *group)
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        registry.set_genesis_initialization_groups(genesis_groups);
+        registry.set_control_topology(topology);
+        registry.set_process_authority(
+            config.raft.node_id,
+            authority.process.clone(),
+            authority.handle.clone(),
+        );
+    }
 
     if !raft_peers.is_empty() {
-        if per_group_voters.is_empty() {
+        if let Some(registry) = spawned
+            .raft_registry
+            .as_ref()
+            .filter(|_| meta_authority.is_some())
+        {
+            for raw_group_id in 0..config.raft.group_count {
+                let group = RaftGroupId(
+                    u32::try_from(raw_group_id)
+                        .expect("runtime config validates raft group ids fit u32"),
+                );
+                if registry.control_hosts_group(group, config.raft.node_id) == Some(true) {
+                    runtime.warm_group(group).await?;
+                }
+            }
+        } else if per_group_voters.is_empty() {
             runtime.warm_all_groups().await?;
         } else {
             for raw_group_id in 0..config.raft.group_count {
@@ -690,7 +766,7 @@ mod tests {
         let persistence = crate::Persistence::Raft {
             log_dir: wal.path().join("raft-log"),
         };
-        let state = super::init_state(&config, persistence, false)
+        let state = super::init_state(&config, persistence, false, None)
             .await
             .unwrap();
         let response = crate::admin_router(state)
@@ -731,7 +807,7 @@ mod tests {
         let persistence = crate::Persistence::Raft {
             log_dir: wal_dir.log_dir(),
         };
-        let state = super::init_state(&config, persistence, false)
+        let state = super::init_state(&config, persistence, false, None)
             .await
             .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
@@ -788,6 +864,12 @@ mod tests {
         ));
         assert!(super::runs_raft(&config, Some(ursula_config::Preset::Tiny)));
         assert!(super::runs_raft(&config, None));
+        config.raft.wal.path = Some(std::path::PathBuf::from("/tmp/explicit-wal"));
+        assert!(super::runs_raft(
+            &config,
+            Some(ursula_config::Preset::Default)
+        ));
+        config.raft.wal.path = None;
 
         let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
         let super::RaftWalDir::Temporary(root) = &wal_dir else {
@@ -802,6 +884,7 @@ mod tests {
                 log_dir: log_dir.clone(),
             },
             false,
+            None,
         )
         .await
         .unwrap();

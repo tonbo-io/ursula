@@ -189,6 +189,9 @@ impl InMemoryGroupEngine {
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match command {
             GroupWriteCommand::Stream(command) => self.apply_stream_command(command, placement),
+            GroupWriteCommand::InstallReplicaIdentity { .. } => Err(GroupEngineError::Infra(
+                crate::GroupInfraError::ReplicaFenceRequiresRaft,
+            )),
         }
     }
 
@@ -1065,6 +1068,8 @@ impl InMemoryGroupEngine {
         let stream_snapshot = self.state_machine.snapshot();
         let stream_append_counts = self.stream_append_counts_snapshot();
         GroupSnapshot {
+            replica_fence_index: 0,
+            replica_identities: Default::default(),
             placement,
             group_commit_index: self.commit_index,
             stream_snapshot,
@@ -1321,6 +1326,8 @@ impl InMemoryGroupEngine {
         snapshot: GroupSnapshot,
     ) -> Result<(), GroupEngineError> {
         let GroupSnapshot {
+            replica_fence_index: _,
+            replica_identities: _,
             placement: _,
             group_commit_index,
             stream_snapshot,

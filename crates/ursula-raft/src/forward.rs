@@ -264,6 +264,14 @@ pub(crate) async fn write_commands_on_raft(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     commands: Vec<GroupWriteCommand>,
 ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
+    if commands
+        .iter()
+        .any(|command| matches!(command, GroupWriteCommand::InstallReplicaIdentity { .. }))
+    {
+        return Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ReplicaFenceRequiresRaft,
+        ));
+    }
     if commands.is_empty() {
         return Ok(Vec::new());
     }
@@ -315,6 +323,9 @@ pub(crate) fn write_result_from_raft_response(
 ) -> Result<Result<GroupWriteResponse, GroupEngineError>, GroupEngineError> {
     match response {
         RaftGroupResponse::Write(result) => Ok(result),
+        RaftGroupResponse::ReplicaFence(_) => Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ReplicaFenceRequiresRaft,
+        )),
         RaftGroupResponse::Blank => Err(GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::UnexpectedResponse {
                 expected: ursula_runtime::GroupResponseKind::Write,

@@ -129,12 +129,28 @@ fn meta_replica_caught_up(
         .is_some_and(|matched| metrics.last_applied.is_some_and(|prefix| matched >= prefix))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetaNodeRegistration {
     pub node_id: NodeId,
     pub client_url: String,
     pub cluster_url: String,
     pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MetaJoinError {
+    #[error("node {node_id} registration differs from its existing identity or is retired")]
+    RegistrationConflict { node_id: NodeId },
+    #[error("node {node_id} meta endpoint differs from its existing membership")]
+    EndpointConflict { node_id: NodeId },
+    #[error("node {node_id} has replica history and cannot join as a fresh learner")]
+    ExistingReplica { node_id: NodeId },
+    #[error("a maintenance operation is active")]
+    Busy,
+    #[error("meta authority is shutting down")]
+    ShuttingDown,
+    #[error("node registration rejected: {response}")]
+    RegistrationRejected { response: ControlResponse },
 }
 
 impl MetaNodeRegistration {
@@ -169,6 +185,7 @@ impl MetaNodeRegistration {
 
 #[derive(Clone)]
 pub struct MetaRaftHandle {
+    rpc_auth: crate::meta_transport::MetaRpcAuth,
     raft: MetaRaft,
     process_identity: Arc<Mutex<Option<ursula_control::ProcessIdentity>>>,
     committed: watch::Receiver<ControlPlaneState>,
@@ -210,6 +227,25 @@ impl MetaRaftHandle {
         node_id: u64,
         root: PathBuf,
         config: Arc<Config>,
+    ) -> Result<Self, MetaRaftError> {
+        Self::new_durable_with_auth(
+            node_id,
+            root,
+            config,
+            crate::meta_transport::MetaRpcAuth::default(),
+        )
+        .await
+    }
+
+    pub(crate) fn rpc_auth(&self) -> &crate::meta_transport::MetaRpcAuth {
+        &self.rpc_auth
+    }
+
+    pub async fn new_durable_with_auth(
+        node_id: u64,
+        root: PathBuf,
+        config: Arc<Config>,
+        auth: crate::meta_transport::MetaRpcAuth,
     ) -> Result<Self, MetaRaftError> {
         let store = crate::MetaDiskLogStore::open(root.clone())
             .await
@@ -254,7 +290,10 @@ impl MetaRaftHandle {
         let enable_elect = config.enable_elect;
         let mut quiet_config = (*config).clone();
         quiet_config.enable_elect = false;
-        let network = crate::MetaGrpcNetworkFactory::default();
+        let network = crate::MetaGrpcNetworkFactory {
+            auth: auth.clone(),
+            ..Default::default()
+        };
         let process_identity = network.identity.clone();
         let mut handle = Self::new_node_with_state_machine(
             node_id,
@@ -264,6 +303,7 @@ impl MetaRaftHandle {
             machine,
         )
         .await?;
+        handle.rpc_auth = auth;
         handle.durable_store = Some(store);
         handle.process_identity = process_identity;
         let restored_identity = match handle.committed.borrow().operations.processes.get(&node_id) {
@@ -285,9 +325,25 @@ impl MetaRaftHandle {
         config: Arc<Config>,
         nonce: ursula_proto::admin::ProcessIncarnation,
     ) -> Result<Self, MetaRaftError> {
+        Self::new_durable_recovering_with_auth(
+            node_id,
+            root,
+            config,
+            nonce,
+            crate::meta_transport::MetaRpcAuth::default(),
+        )
+        .await
+    }
+    pub async fn new_durable_recovering_with_auth(
+        node_id: u64,
+        root: PathBuf,
+        config: Arc<Config>,
+        nonce: ursula_proto::admin::ProcessIncarnation,
+        auth: crate::meta_transport::MetaRpcAuth,
+    ) -> Result<Self, MetaRaftError> {
         let mut config = (*config).clone();
         config.enable_elect = false;
-        let mut handle = Self::new_durable(node_id, root, Arc::new(config)).await?;
+        let mut handle = Self::new_durable_with_auth(node_id, root, Arc::new(config), auth).await?;
         handle.recovery_nonce = Some(nonce);
         let initialized =
             handle.raft.is_initialized().await.map_err(|error| {
@@ -426,6 +482,7 @@ impl MetaRaftHandle {
             .map_err(|err| MetaRaftError::with_source("create meta OpenRaft group", err))?;
 
         Ok(Self {
+            rpc_auth: Default::default(),
             raft,
             process_identity: Arc::default(),
             committed,
@@ -515,7 +572,8 @@ impl MetaRaftHandle {
             let mut metrics = self.raft.metrics();
             loop {
                 let result = if let Some(target) = &endpoint {
-                    crate::meta_transport::forward_write(target, command.clone()).await
+                    crate::meta_transport::forward_write(target, &self.rpc_auth, command.clone())
+                        .await
                 } else {
                     self.write_local(command.clone()).await
                 };
@@ -565,7 +623,13 @@ impl MetaRaftHandle {
         restore: bool,
     ) -> Result<(), MetaRaftError> {
         if let Some(endpoint) = self.remote_leader_endpoint() {
-            return crate::meta_transport::forward_membership(&endpoint, token, restore).await;
+            return crate::meta_transport::forward_membership(
+                &endpoint,
+                &self.rpc_auth,
+                token,
+                restore,
+            )
+            .await;
         }
         self.reconcile_operation_membership_local(token, restore)
             .await
@@ -643,11 +707,6 @@ impl MetaRaftHandle {
                 let _action = handle.meta_actions.lock().await;
                 handle.checked_membership_operation(&token, restore).await?;
                 let metrics = handle.raft.metrics().borrow_watched().clone();
-                if metrics.membership_config.membership().get_joint_config()
-                    == &vec![desired.clone()]
-                {
-                    return Ok(());
-                }
                 if restore
                     && (!meta_replica_caught_up(&metrics, source)
                         || metrics
@@ -661,13 +720,44 @@ impl MetaRaftHandle {
                         "retained learner is not caught up with current committed prefix",
                     ));
                 }
-                handle
-                    .raft
-                    .change_membership(desired, rebuild && !restore)
-                    .await
-                    .map_err(|error| {
-                        MetaRaftError::with_source("change operation meta membership", error)
-                    })?;
+                if metrics.membership_config.membership().get_joint_config()
+                    != &vec![desired.clone()]
+                {
+                    // Retain unrelated learners and the rebuilding source. The
+                    // pinned original voter set never promotes a source that
+                    // joined meta only as a learner.
+                    handle
+                        .raft
+                        .change_membership(desired, true)
+                        .await
+                        .map_err(|error| {
+                            MetaRaftError::with_source("change operation meta membership", error)
+                        })?;
+                }
+                if !rebuild
+                    && !restore
+                    && handle
+                        .raft
+                        .metrics()
+                        .borrow_watched()
+                        .membership_config
+                        .membership()
+                        .get_node(&source)
+                        .is_some()
+                {
+                    // Voter equality is not enough: a decommissioned source
+                    // may already be a learner. Remove exactly that node.
+                    handle
+                        .raft
+                        .change_membership(
+                            openraft::ChangeMembers::RemoveNodes(BTreeSet::from([source])),
+                            true,
+                        )
+                        .await
+                        .map_err(|error| {
+                            MetaRaftError::with_source("remove decommissioned meta learner", error)
+                        })?;
+                }
                 Ok(())
             })
             .map(|joined| {
@@ -732,6 +822,110 @@ impl MetaRaftHandle {
         now_ms: u64,
     ) -> Result<ControlResponse, MetaRaftError> {
         self.write(registration.into_command(now_ms)).await
+    }
+
+    /// Register an empty node and add only a nonvoting meta replica. Data
+    /// placement changes remain separate, explicit maintenance operations.
+    pub async fn join_node(
+        &self,
+        registration: MetaNodeRegistration,
+        meta_url: String,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        if let Some(endpoint) = self.remote_leader_endpoint() {
+            return crate::meta_transport::forward_join(
+                &endpoint,
+                &self.rpc_auth,
+                registration,
+                meta_url,
+                now_ms,
+            )
+            .await;
+        }
+        self.join_node_local(registration, meta_url, now_ms).await
+    }
+
+    pub(crate) async fn join_node_local(
+        &self,
+        registration: MetaNodeRegistration,
+        meta_url: String,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        let task = {
+            let mut tasks = self
+                .membership_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if tasks.closed {
+                return Err(MetaRaftError::with_source(
+                    "join meta learner",
+                    MetaJoinError::ShuttingDown,
+                ));
+            }
+            tasks
+                .tasks
+                .retain(|task| task.clone().now_or_never().is_none());
+            let handle = self.clone();
+            let task = crate::rt::spawn(async move {
+                let _action = handle.meta_actions.lock().await;
+                let state = handle.read_linearizable_local().await?;
+                let node_id = registration.node_id;
+                let reject = |error| MetaRaftError::with_source("join meta learner", error);
+                if state.operations.active.is_some() || state.active_migration.is_some() {
+                    return Err(reject(MetaJoinError::Busy));
+                }
+                if let Some(node) = state.nodes.get(&node_id)
+                    && (node.state == ursula_control::NodeState::Removed
+                        || node.client_url != registration.client_url
+                        || node.cluster_url != registration.cluster_url
+                        || node.labels != registration.labels)
+                {
+                    return Err(reject(MetaJoinError::RegistrationConflict { node_id }));
+                }
+                let metrics = handle.raft.metrics().borrow_watched().clone();
+                if let Some(node) = metrics.membership_config.membership().get_node(&node_id) {
+                    if node.addr != meta_url {
+                        return Err(reject(MetaJoinError::EndpointConflict { node_id }));
+                    }
+                    if state.nodes.contains_key(&node_id) {
+                        return Ok(());
+                    }
+                }
+                if state.operations.processes.contains_key(&node_id)
+                    || state.operations.replicas.contains_key(&node_id)
+                {
+                    return Err(reject(MetaJoinError::ExistingReplica { node_id }));
+                }
+                let response = handle
+                    .raft
+                    .client_write(registration.into_command(now_ms))
+                    .await
+                    .map_err(|error| {
+                        MetaRaftError::with_source("register joining meta learner", error)
+                    })?
+                    .data;
+                if response != ControlResponse::Ok {
+                    return Err(reject(MetaJoinError::RegistrationRejected { response }));
+                }
+                handle
+                    .raft
+                    .add_learner(node_id, BasicNode::new(meta_url), false)
+                    .await
+                    .map_err(|error| {
+                        MetaRaftError::with_source("add joining meta learner", error)
+                    })?;
+                Ok(())
+            })
+            .map(|joined| {
+                joined.map_err(|error| MetaRaftError::with_source("join learner task", error))?
+            })
+            .boxed()
+            .shared();
+            tasks.tasks.push(task.clone());
+            task
+        };
+        task.await?;
+        Ok(ControlResponse::Ok)
     }
 
     pub async fn begin_migration(
@@ -887,6 +1081,7 @@ impl MetaRaftHandle {
         } else {
             None
         };
+        let rpc_auth = self.rpc_auth.clone();
         let round = async move {
             if let Some(previous) = previous {
                 let _previous = previous.await;
@@ -898,7 +1093,7 @@ impl MetaRaftHandle {
                     .open = false;
             }
             if let Some(endpoint) = endpoint {
-                return crate::meta_transport::forward_read(&endpoint)
+                return crate::meta_transport::forward_read(&endpoint, &rpc_auth)
                     .await
                     .map(Arc::new);
             }
@@ -920,6 +1115,7 @@ impl MetaRaftHandle {
     }
 
     /// Fresh process authority only: no placements are copied or sent on data RPCs.
+    #[cfg(test)]
     pub(crate) async fn read_linearizable_processes(
         &self,
     ) -> Result<Arc<ProcessEpochs>, MetaRaftError> {
@@ -954,6 +1150,7 @@ impl MetaRaftHandle {
         } else {
             None
         };
+        let rpc_auth = self.rpc_auth.clone();
         let round = async move {
             if let Some(previous) = previous {
                 let _previous = previous.await;
@@ -965,7 +1162,7 @@ impl MetaRaftHandle {
                     .open = false;
             }
             if let Some(endpoint) = endpoint {
-                return crate::meta_transport::forward_processes(&endpoint)
+                return crate::meta_transport::forward_processes(&endpoint, &rpc_auth)
                     .await
                     .map(Arc::new);
             }
@@ -991,7 +1188,7 @@ impl MetaRaftHandle {
         &self,
     ) -> Result<(ControlPlaneState, BTreeSet<u64>), MetaRaftError> {
         if let Some(endpoint) = self.remote_leader_endpoint() {
-            return crate::meta_transport::forward_topology(&endpoint).await;
+            return crate::meta_transport::forward_topology(&endpoint, &self.rpc_auth).await;
         }
         self.read_linearizable_topology_local().await
     }
@@ -1665,6 +1862,126 @@ mod owned_membership_tests {
     use super::*;
 
     #[tokio::test]
+    async fn maintenance_of_a_meta_learner_preserves_other_learners_and_voters() {
+        for rebuild in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let handle = MetaRaftHandle::new_durable(
+                1,
+                root.path().to_owned(),
+                Arc::new(Config::default().validate().unwrap()),
+            )
+            .await
+            .unwrap();
+            handle
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("http://local"))]))
+                .await
+                .unwrap();
+            handle
+                .wait_for_current_leader(1, Duration::from_secs(3))
+                .await
+                .unwrap();
+            let mut participants = BTreeMap::new();
+            for node in 1..=3 {
+                handle
+                    .write(ControlCommand::RegisterNode {
+                        node_id: node,
+                        client_url: format!("http://node{node}"),
+                        cluster_url: format!("http://node{node}"),
+                        labels: BTreeMap::new(),
+                        now_ms: 0,
+                    })
+                    .await
+                    .unwrap();
+                let incarnation =
+                    ursula_proto::admin::ProcessIncarnation::from_bits(u128::from(node));
+                let response = handle
+                    .write(ControlCommand::Operation {
+                        command: ursula_control::OperationCommand::ClaimProcess {
+                            node_id: node,
+                            expected_epoch: 0,
+                            incarnation,
+                        },
+                        now_ms: 0,
+                    })
+                    .await
+                    .unwrap();
+                let ControlResponse::Operation(Ok(
+                    ursula_control::OperationOutcome::ProcessClaimed(identity),
+                )) = response
+                else {
+                    panic!("claim")
+                };
+                participants.insert(node, identity);
+                if node != 1 {
+                    handle
+                        .raft
+                        .add_learner(
+                            node,
+                            BasicNode::new(format!("http://127.0.0.1:{}", 19000 + node)),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            handle
+                .write(ControlCommand::SeedPlacement {
+                    raft_group_id: ursula_shard::RaftGroupId(0),
+                    voters: BTreeSet::from([1, 2]),
+                    now_ms: 0,
+                })
+                .await
+                .unwrap();
+            if rebuild {
+                participants.remove(&3);
+            }
+            let kind = if rebuild {
+                ursula_control::OperationKind::RebuildReplica { node_id: 2 }
+            } else {
+                ursula_control::OperationKind::DecommissionNode {
+                    node_id: 2,
+                    replacements: BTreeMap::from([(ursula_shard::RaftGroupId(0), 3)]),
+                }
+            };
+            let response = handle
+                .write(ControlCommand::Operation {
+                    command: ursula_control::OperationCommand::Begin {
+                        kind,
+                        executor: ursula_proto::admin::ProcessIncarnation::from_bits(10),
+                        participants,
+                        meta_voters: BTreeSet::from([1]),
+                    },
+                    now_ms: 0,
+                })
+                .await
+                .unwrap();
+            let ControlResponse::Operation(Ok(ursula_control::OperationOutcome::Acquired(token))) =
+                response
+            else {
+                panic!("begin learner maintenance: {response:?}")
+            };
+            handle
+                .reconcile_operation_membership_local(token.clone(), false)
+                .await
+                .unwrap();
+            // A retried decommission also succeeds after source removal.
+            handle
+                .reconcile_operation_membership_local(token, false)
+                .await
+                .unwrap();
+            let metrics = handle.raft.metrics().borrow_watched().clone();
+            let membership = metrics.membership_config.membership();
+            assert_eq!(membership.get_joint_config(), &vec![BTreeSet::from([1])]);
+            assert!(
+                membership.get_node(&3).is_some(),
+                "unrelated learner retained"
+            );
+            assert_eq!(membership.get_node(&2).is_some(), rebuild);
+            handle.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn shutdown_drains_membership_work_after_its_caller_is_cancelled() {
         let config = Arc::new(
             Config {
@@ -1699,6 +2016,23 @@ mod owned_membership_tests {
             })
             .await
             .unwrap();
+        // The operation pins a known meta voter inventory even though this
+        // fixture holds execution before the membership mutation itself.
+        for node_id in [2, 3] {
+            assert_eq!(
+                handle
+                    .write(ControlCommand::RegisterNode {
+                        node_id,
+                        client_url: format!("http://node{node_id}"),
+                        cluster_url: format!("http://node{node_id}"),
+                        labels: BTreeMap::new(),
+                        now_ms: 0,
+                    })
+                    .await
+                    .unwrap(),
+                ControlResponse::Ok
+            );
+        }
         handle
             .write(ControlCommand::SeedPlacement {
                 raft_group_id: ursula_shard::RaftGroupId(0),
@@ -1733,7 +2067,7 @@ mod owned_membership_tests {
         let ControlResponse::Operation(Ok(ursula_control::OperationOutcome::Acquired(token))) =
             result
         else {
-            panic!("operation acquisition");
+            panic!("operation acquisition: {result:?}");
         };
         let gate = handle.meta_actions.lock().await;
         let caller_handle = handle.clone();

@@ -67,6 +67,18 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node |
 | `raft.init_membership_per_group` | `false` | One-time per-group membership bootstrap. Set `true` on the very first start of a fresh cluster, then flip back to `false` |
 
+Persistent standalone nodes with no `raft.peers` or `raft.meta.peers` automatically
+bootstrap a durable one-voter meta authority on a private ephemeral loopback
+listener. No meta configuration or `init_membership` flag is needed. Explicit
+static clusters must list every meta voter, including self, and expose the private
+meta port to those peers. Set `raft.meta.auth_token_file` to a service-readable
+file containing the same secret on every peer. Generate it once with
+`umask 077; openssl rand -hex 32 > meta-auth.token`, install it with mode `0600`,
+and keep it out of configuration repositories and logs. `raft.meta.enabled = false` explicitly disables that
+authority for a fixed-topology development fixture; it does not enable membership
+operations. Setting `raft.wal.path` keeps Raft persistence enabled even with the
+`default` preset.
+
 The Raft WAL is always the per-core disk journal. A node with `raft.peers` set
 refuses to start without `raft.wal.path`. A single node without a path creates a
 fresh `ursula-wal-*` directory under the system temporary directory, logs its
@@ -191,6 +203,23 @@ url = "http://10.0.0.2:4437"
 [[raft.peers]]
 node_id = 3
 url = "http://10.0.0.3:4437"
+
+[raft.meta]
+enabled = true
+listen = "0.0.0.0:4439"
+auth_token_file = "/etc/ursula/meta-auth.token"
+
+[[raft.meta.peers]]
+node_id = 1
+url = "http://10.0.0.1:4439"
+
+[[raft.meta.peers]]
+node_id = 2
+url = "http://10.0.0.2:4439"
+
+[[raft.meta.peers]]
+node_id = 3
+url = "http://10.0.0.3:4439"
 ```
 
 ```bash

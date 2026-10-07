@@ -42,6 +42,8 @@ pub(crate) const EVIDENCE_PATH: &str = "/__ursula/control/group/{group}/evidence
 enum ControlHttpError {
     #[error("meta Raft is not configured")]
     Unavailable,
+    #[error("no data leader with a fresh quorum proof for group {group:?}")]
+    NoDataLeader { group: RaftGroupId },
     #[error("meta Raft request failed: {0}")]
     Meta(#[from] ursula_raft::MetaRaftError),
     #[error("prepare replica failed: {0}")]
@@ -170,6 +172,21 @@ async fn apply_request(
         .as_ref()
         .ok_or(ControlHttpError::Unavailable)?;
     let command = match request {
+        OperationRequest::JoinNode {
+            node_id,
+            client_url,
+            cluster_url,
+            meta_url,
+        } => {
+            return Ok(meta
+                .join_node(
+                    ursula_raft::MetaNodeRegistration::new(node_id, client_url, cluster_url),
+                    meta_url,
+                    state.wall_clock.unix_time_ms(),
+                )
+                .await?);
+        }
+
         OperationRequest::RecoverAction { token } => {
             let bound = snapshot
                 .operations
@@ -452,14 +469,15 @@ async fn peer_observation(
 
 async fn collect_evidence_with_retry(
     state: &HttpState,
-    snapshot: &ControlPlaneState,
+    _snapshot: &ControlPlaneState,
     token: &OperationToken,
     exclude: Option<u64>,
     only_group: Option<RaftGroupId>,
 ) -> Result<Vec<PrefixEvidence>, ControlHttpError> {
     let started = tokio::time::Instant::now();
     loop {
-        match collect_evidence(state, snapshot, token, exclude, only_group).await {
+        let snapshot = linear_state(state).await?;
+        match collect_evidence(state, &snapshot, token, exclude, only_group).await {
             Ok(evidence) => return Ok(evidence),
             Err(error) => {
                 if started.elapsed() >= Duration::from_secs(30)
@@ -494,9 +512,16 @@ async fn collect_evidence(
         .as_ref()
         .filter(|operation| &operation.token == token)
         .ok_or(OperationError::StaleExecutor)?;
+    let installing_fence = operation.pending_action.as_ref().is_some_and(|action| {
+        matches!(
+            action.action,
+            ursula_control::MembershipAction::InstallReplicaIdentity { .. }
+        )
+    });
     let retiring = exclude.is_some()
+        || (installing_fence && matches!(operation.kind, OperationKind::RebuildReplica { .. }))
         || (operation.phase == OperationPhase::Preparing
-            && !matches!(operation.kind, OperationKind::MoveReplicas { .. }));
+            && matches!(operation.kind, OperationKind::RebuildReplica { .. }));
     let source = match operation.kind {
         OperationKind::MoveReplicas { source, .. } => source,
         OperationKind::RebuildReplica { node_id }
@@ -517,7 +542,7 @@ async fn collect_evidence(
         .iter()
         .filter(|(group, _)| only_group.is_none_or(|selected| selected == **group))
     {
-        let voters = if retiring {
+        let voters = if retiring || installing_fence {
             operation
                 .previous
                 .get(group)
@@ -586,6 +611,19 @@ async fn collect_evidence(
         for node_id in &required {
             let observation = peer_observation(&client, snapshot, *node_id, *group).await?;
             let health = &observation.metrics.maintenance;
+            if let Some(ursula_control::OperationAction {
+                action:
+                    ursula_control::MembershipAction::InstallReplicaIdentity { node_id, identity },
+                ..
+            }) = operation.pending_action.as_ref()
+                && observation
+                    .metrics
+                    .installed_replica_identities
+                    .get(node_id)
+                    != Some(identity)
+            {
+                return Err(ControlHttpError::MissingPeer { node_id: *node_id });
+            }
             if observation.metrics.current_leader != Some(leader)
                 || observation.metrics.current_term != Some(prefix.leader_term)
                 || observation
@@ -607,6 +645,10 @@ async fn collect_evidence(
             }
             replicas.insert(*node_id, ReplicaEvidence {
                 process: observation.process,
+                installed_replica_identities: observation
+                    .metrics
+                    .installed_replica_identities
+                    .clone(),
                 applied_index: observation
                     .metrics
                     .last_applied_index
@@ -633,8 +675,15 @@ pub(crate) const ACTION_DRAIN_PATH: &str = "/__ursula/control/action/drain";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LocalActionState {
     Idle,
-    Applied { operation_id: u64, sequence: u64 },
-    Fenced { operation_id: u64, sequence: u64 },
+    Applied {
+        operation_id: u64,
+        sequence: u64,
+        fence_index: Option<u64>,
+    },
+    Fenced {
+        operation_id: u64,
+        sequence: u64,
+    },
 }
 
 pub(crate) async fn drain_action(
@@ -676,6 +725,11 @@ async fn fence_action(
     Ok(request.action)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActionResult {
+    fence_index: Option<u64>,
+}
+
 pub(crate) async fn action(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -687,7 +741,7 @@ pub(crate) async fn action(
     // An admitted effect survives a disconnected executor. The mutex orders
     // delayed duplicates before authorization is checked again.
     match tokio::spawn(async move { execute_action(&state, request).await }).await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(error)) => error.into_response(),
         Err(error) => {
             tracing::error!(%error, "control action task failed");
@@ -699,7 +753,7 @@ pub(crate) async fn action(
 async fn execute_action(
     state: &HttpState,
     request: ursula_control::ActionRequest,
-) -> Result<(), ControlHttpError> {
+) -> Result<ActionResult, ControlHttpError> {
     let mut completed = state.control_action_gate.lock().await;
     let snapshot = linear_state(state).await?;
     let operation = snapshot
@@ -720,6 +774,7 @@ async fn execute_action(
     let applied = LocalActionState::Applied {
         operation_id: request.token.operation_id,
         sequence: request.action.sequence,
+        fence_index: None,
     };
     let fenced = LocalActionState::Fenced {
         operation_id: request.token.operation_id,
@@ -728,8 +783,17 @@ async fn execute_action(
     if *completed == fenced {
         return Err(ControlHttpError::ActionDrained);
     }
-    if *completed == applied {
-        return Ok(());
+    if let LocalActionState::Applied {
+        operation_id,
+        sequence,
+        fence_index,
+    } = &*completed
+        && *operation_id == request.token.operation_id
+        && *sequence == request.action.sequence
+    {
+        return Ok(ActionResult {
+            fence_index: *fence_index,
+        });
     }
     if matches!(
         request.action.action,
@@ -741,7 +805,7 @@ async fn execute_action(
             .allow_dynamic_group_hosting(request.action.group);
         state.runtime.warm_group(request.action.group).await?;
         *completed = applied;
-        return Ok(());
+        return Ok(ActionResult { fence_index: None });
     }
     let raft = state
         .raft_registry()
@@ -763,6 +827,44 @@ async fn execute_action(
             )
             .await
             .map_err(|source| action_raft_error("operation add learner", source))?;
+        }
+        ursula_control::MembershipAction::InstallReplicaIdentity {
+            node_id,
+            ref identity,
+        } => {
+            let expected = match snapshot.operations.replicas.get(&node_id) {
+                Some(ursula_control::ReplicaState::Pending {
+                    previous,
+                    replacement,
+                    ..
+                }) if replacement == identity => Some(previous.clone()),
+                Some(ursula_control::ReplicaState::Active {
+                    identity: active, ..
+                }) if active == identity => None,
+                _ => return Err(OperationError::InvalidTransition.into()),
+            };
+            let registry = state.raft_registry().ok_or(ControlHttpError::Unavailable)?;
+            let fence_index = registry
+                .install_replica_identity(request.action.group, node_id, expected, identity.clone())
+                .await
+                .map_err(|source| {
+                    let forwarded = source.leader_hint().is_some();
+                    let error =
+                        ursula_raft::MetaRaftError::with_source("install replica fence", source);
+                    if forwarded {
+                        ControlHttpError::LeadershipChanged(error)
+                    } else {
+                        ControlHttpError::Meta(error)
+                    }
+                })?;
+            *completed = LocalActionState::Applied {
+                operation_id: request.token.operation_id,
+                sequence: request.action.sequence,
+                fence_index: Some(fence_index),
+            };
+            return Ok(ActionResult {
+                fence_index: Some(fence_index),
+            });
         }
         ursula_control::MembershipAction::RetireReplica => {
             let OperationKind::RebuildReplica { node_id } = operation.kind else {
@@ -814,7 +916,7 @@ async fn execute_action(
         }
     }
     *completed = applied;
-    Ok(())
+    Ok(ActionResult { fence_index: None })
 }
 
 async fn retire_data_replica(
@@ -924,7 +1026,7 @@ async fn reconcile(
         .ok_or(OperationError::StaleExecutor)?
         .clone();
     if operation.phase == OperationPhase::Preparing
-        && !matches!(operation.kind, OperationKind::MoveReplicas { .. })
+        && matches!(operation.kind, OperationKind::RebuildReplica { .. })
     {
         return Err(OperationError::InvalidTransition.into());
     }
@@ -983,7 +1085,13 @@ async fn reconcile(
         run_action(state, &client, &snapshot, &token, receipt).await?;
         snapshot = linear_state(state).await?;
     }
+    // A replacement process waits in meta-only bootstrap. Order and durably
+    // certify every survivor fence before activating its new data identity;
+    // only then can the existing learner preparation/catch-up path proceed.
+    install_replacement_fences(state, &client, &mut snapshot, &token).await?;
+    install_new_target_fences(state, &client, &mut snapshot, &token).await?;
     for (group, desired) in &operation.desired {
+        snapshot = linear_state(state).await?;
         let previous = operation
             .previous
             .get(group)
@@ -1003,7 +1111,8 @@ async fn reconcile(
                 break;
             }
         }
-        let observation = leader_observation.ok_or(ControlHttpError::Unavailable)?;
+        let observation =
+            leader_observation.ok_or(ControlHttpError::NoDataLeader { group: *group })?;
         let leader = observation.metrics.node_id;
         let mut targets = desired
             .difference(previous)
@@ -1013,6 +1122,7 @@ async fn reconcile(
             targets.insert(node_id);
         }
         for target in &targets {
+            wait_target_process(state, &client, &token, *target).await?;
             let response = meta
                 .write(ControlCommand::Operation {
                     command: OperationCommand::PrepareAction {
@@ -1059,7 +1169,7 @@ async fn reconcile(
             run_action(state, &client, &snapshot, &token, receipt).await?;
         }
         if !targets.is_empty() {
-            wait_replica_prefix(&client, &snapshot, *group, desired).await?;
+            wait_replica_prefix(Some(state), &client, &snapshot, *group, desired).await?;
         }
         if observation
             .metrics
@@ -1096,7 +1206,231 @@ async fn reconcile(
     )))
 }
 
+async fn wait_target_process(
+    state: &HttpState,
+    client: &reqwest::Client,
+    token: &OperationToken,
+    node_id: u64,
+) -> Result<(), ControlHttpError> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = linear_state(state).await?;
+            if !snapshot
+                .operations
+                .active
+                .as_ref()
+                .is_some_and(|op| &op.token == token)
+            {
+                return Err(OperationError::StaleExecutor.into());
+            }
+            let node = snapshot
+                .nodes
+                .get(&node_id)
+                .ok_or(ControlHttpError::MissingPeer { node_id })?;
+            let Some(ProcessState::Active(process)) = snapshot.operations.processes.get(&node_id)
+            else {
+                return Err(OperationError::ProcessChanged { node_id }.into());
+            };
+            if let Ok(response) = client
+                .get(format!(
+                    "{}/__ursula/metrics",
+                    node.cluster_url.trim_end_matches('/')
+                ))
+                .send()
+                .await
+                && response.status().is_success()
+                && let Ok(metrics) = response.json::<ursula_proto::admin::NodeMetrics>().await
+                && metrics.process_node_id == Some(node_id)
+                && metrics.process_incarnation.as_ref() == Some(&process.incarnation)
+            {
+                return Ok(());
+            }
+            // A draining old listener can outlive the committed new boot.
+            // Keep observing; never accept its metrics as the new process.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_elapsed| ControlHttpError::MissingPeer { node_id })?
+}
+
+async fn install_new_target_fences(
+    state: &HttpState,
+    client: &reqwest::Client,
+    snapshot: &mut ControlPlaneState,
+    token: &OperationToken,
+) -> Result<(), ControlHttpError> {
+    let operation = snapshot
+        .operations
+        .active
+        .as_ref()
+        .filter(|operation| &operation.token == token)
+        .ok_or(OperationError::StaleExecutor)?
+        .clone();
+    if matches!(operation.kind, OperationKind::RebuildReplica { .. }) {
+        return Ok(());
+    }
+    let meta = state
+        .meta_control
+        .as_ref()
+        .ok_or(ControlHttpError::Unavailable)?;
+    for (group, desired) in &operation.desired {
+        let previous = operation
+            .previous
+            .get(group)
+            .ok_or(OperationError::InventoryMismatch)?;
+        for target in desired.difference(previous) {
+            *snapshot = linear_state(state).await?;
+            let Some(ursula_control::ReplicaState::Active {
+                identity,
+                installed_groups,
+            }) = snapshot.operations.replicas.get(target)
+            else {
+                return Err(OperationError::ReplicaChanged { node_id: *target }.into());
+            };
+            if installed_groups.contains_key(group) {
+                continue;
+            }
+            let identity = identity.clone();
+            let mut leader = None;
+            for voter in previous {
+                match peer_observation(client, snapshot, *voter, *group).await {
+                    Ok(observation)
+                        if observation
+                            .quorum
+                            .as_ref()
+                            .is_some_and(|proof| proof.leader_id == *voter) =>
+                    {
+                        leader = Some(*voter);
+                        break;
+                    }
+                    Ok(observation) => {
+                        tracing::warn!(voter, ?group, leader = ?observation.metrics.current_leader, "replica admission candidate has no leader proof")
+                    }
+                    Err(error) => {
+                        tracing::warn!(voter, ?group, %error, "replica admission leader evidence unavailable")
+                    }
+                }
+            }
+            let response = meta
+                .write(ControlCommand::Operation {
+                    command: OperationCommand::PrepareAction {
+                        token: token.clone(),
+                        group: *group,
+                        leader: leader.ok_or(ControlHttpError::NoDataLeader { group: *group })?,
+                        action: ursula_control::MembershipAction::InstallReplicaIdentity {
+                            node_id: *target,
+                            identity,
+                        },
+                    },
+                    now_ms: state.wall_clock.unix_time_ms(),
+                })
+                .await?;
+            let receipt = match response {
+                ControlResponse::Operation(Ok(
+                    ursula_control::OperationOutcome::ActionPrepared(receipt),
+                )) => receipt,
+                ControlResponse::Operation(Err(error)) => return Err(error.into()),
+                _ => return Err(ControlHttpError::Unavailable),
+            };
+            *snapshot = linear_state(state).await?;
+            run_action(state, client, snapshot, token, receipt).await?;
+            *snapshot = linear_state(state).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn install_replacement_fences(
+    state: &HttpState,
+    client: &reqwest::Client,
+    snapshot: &mut ControlPlaneState,
+    token: &OperationToken,
+) -> Result<(), ControlHttpError> {
+    let operation = snapshot
+        .operations
+        .active
+        .as_ref()
+        .filter(|operation| &operation.token == token)
+        .ok_or(OperationError::StaleExecutor)?
+        .clone();
+    let OperationKind::RebuildReplica { node_id } = operation.kind else {
+        return Ok(());
+    };
+    let meta = state
+        .meta_control
+        .as_ref()
+        .ok_or(ControlHttpError::Unavailable)?;
+    let identity = match snapshot.operations.replicas.get(&node_id) {
+        Some(ursula_control::ReplicaState::Active { .. }) => return Ok(()),
+        Some(ursula_control::ReplicaState::Pending { replacement, .. }) => replacement.clone(),
+        _ => return Err(OperationError::InvalidTransition.into()),
+    };
+    for (group, previous) in &operation.previous {
+        if matches!(snapshot.operations.replicas.get(&node_id), Some(ursula_control::ReplicaState::Pending { installed_groups, .. }) if installed_groups.contains_key(group))
+        {
+            continue;
+        }
+        let mut leader = None;
+        for voter in previous.iter().filter(|voter| **voter != node_id) {
+            if let Ok(observation) = peer_observation(client, snapshot, *voter, *group).await
+                && observation
+                    .quorum
+                    .as_ref()
+                    .is_some_and(|proof| proof.leader_id == *voter)
+                && observation.metrics.voter_ids.contains(voter)
+            {
+                leader = Some(*voter);
+                break;
+            }
+        }
+        let leader = leader.ok_or(ControlHttpError::NoDataLeader { group: *group })?;
+        let response = meta
+            .write(ControlCommand::Operation {
+                command: OperationCommand::PrepareAction {
+                    token: token.clone(),
+                    group: *group,
+                    leader,
+                    action: ursula_control::MembershipAction::InstallReplicaIdentity {
+                        node_id,
+                        identity: identity.clone(),
+                    },
+                },
+                now_ms: state.wall_clock.unix_time_ms(),
+            })
+            .await?;
+        let receipt = match response {
+            ControlResponse::Operation(Ok(ursula_control::OperationOutcome::ActionPrepared(
+                receipt,
+            ))) => receipt,
+            ControlResponse::Operation(Err(error)) => return Err(error.into()),
+            _ => return Err(ControlHttpError::Unavailable),
+        };
+        *snapshot = linear_state(state).await?;
+        run_action(state, client, snapshot, token, receipt).await?;
+        *snapshot = linear_state(state).await?;
+    }
+    match meta
+        .write(ControlCommand::Operation {
+            command: OperationCommand::ActivateReplica {
+                token: token.clone(),
+                node_id,
+                identity,
+            },
+            now_ms: state.wall_clock.unix_time_ms(),
+        })
+        .await?
+    {
+        ControlResponse::Operation(Ok(_)) => {}
+        ControlResponse::Operation(Err(error)) => return Err(error.into()),
+        _ => return Err(ControlHttpError::Unavailable),
+    }
+    *snapshot = linear_state(state).await?;
+    Ok(())
+}
+
 async fn wait_replica_prefix(
+    state: Option<&HttpState>,
     client: &reqwest::Client,
     snapshot: &ControlPlaneState,
     group: RaftGroupId,
@@ -1104,7 +1438,7 @@ async fn wait_replica_prefix(
 ) -> Result<(), ControlHttpError> {
     tokio::time::timeout(
         Duration::from_secs(30),
-        wait_replica_prefix_inner(client, snapshot, group, targets),
+        wait_replica_prefix_inner(state, client, snapshot, group, targets),
     )
     .await
     .map_err(|_elapsed| OperationError::MissingEvidence {
@@ -1113,6 +1447,7 @@ async fn wait_replica_prefix(
 }
 
 async fn wait_replica_prefix_inner(
+    state: Option<&HttpState>,
     client: &reqwest::Client,
     snapshot: &ControlPlaneState,
     group: RaftGroupId,
@@ -1121,8 +1456,23 @@ async fn wait_replica_prefix_inner(
     let deadline = tokio::time::Instant::now()
         .checked_add(Duration::from_secs(30))
         .ok_or(ControlHttpError::Unavailable)?;
+    let token = snapshot
+        .operations
+        .active
+        .as_ref()
+        .map(|op| op.token.clone());
     let mut prefix = None;
     loop {
+        let refreshed;
+        let snapshot = if let Some(state) = state {
+            refreshed = linear_state(state).await?;
+            if refreshed.operations.active.as_ref().map(|op| &op.token) != token.as_ref() {
+                return Err(OperationError::StaleExecutor.into());
+            }
+            &refreshed
+        } else {
+            snapshot
+        };
         if prefix.is_none() {
             for target in targets {
                 if let Ok(observed) = peer_observation(client, snapshot, *target, group).await {
@@ -1330,15 +1680,62 @@ async fn run_action_once(
             body,
         });
     }
+    let result: ActionResult = peer_response
+        .json()
+        .await
+        .map_err(|source| ControlHttpError::Peer { node_id, source })?;
+    let command = if matches!(
+        action.action,
+        ursula_control::MembershipAction::InstallReplicaIdentity { .. }
+    ) {
+        let committed_index = result.fence_index.ok_or(ControlHttpError::Unavailable)?;
+        let snapshot = linear_state(state).await?;
+        let proofs =
+            collect_evidence_with_retry(state, &snapshot, token, None, Some(action.group)).await?;
+        let proof = proofs
+            .into_iter()
+            .next()
+            .ok_or(ControlHttpError::Unavailable)?;
+        if proof.committed_index < committed_index {
+            return Err(OperationError::MissingEvidence {
+                raft_group_id: action.group,
+            }
+            .into());
+        }
+        let observed = state
+            .meta_control
+            .as_ref()
+            .ok_or(ControlHttpError::Unavailable)?
+            .write(ControlCommand::Operation {
+                command: OperationCommand::Observe {
+                    token: token.clone(),
+                    evidence: proof,
+                },
+                now_ms: state.wall_clock.unix_time_ms(),
+            })
+            .await?;
+        match observed {
+            ControlResponse::Operation(Ok(_)) => {}
+            ControlResponse::Operation(Err(error)) => return Err(error.into()),
+            _ => return Err(ControlHttpError::Unavailable),
+        }
+        OperationCommand::FinishReplicaFence {
+            token: token.clone(),
+            sequence: action.sequence,
+            committed_index,
+        }
+    } else {
+        OperationCommand::FinishAction {
+            token: token.clone(),
+            sequence: action.sequence,
+        }
+    };
     let response = state
         .meta_control
         .as_ref()
         .ok_or(ControlHttpError::Unavailable)?
         .write(ControlCommand::Operation {
-            command: OperationCommand::FinishAction {
-                token: token.clone(),
-                sequence: action.sequence,
-            },
+            command,
             now_ms: state.wall_clock.unix_time_ms(),
         })
         .await?;
@@ -1406,6 +1803,7 @@ mod tests {
                 },
                 metrics: RaftGroupMetrics {
                     apply_failure: None,
+                    installed_replica_identities: BTreeMap::new(),
                     raft_group_id: 0,
                     node_id,
                     current_term: Some(2),
@@ -1451,6 +1849,7 @@ mod tests {
             }));
         }
         wait_replica_prefix(
+            None,
             &reqwest::Client::new(),
             &state,
             RaftGroupId(0),
@@ -1497,6 +1896,264 @@ mod tests {
             router.hosted_group_base(&error),
             Some((3, "http://client-3".to_owned()))
         );
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn pending_prepare_survives_participant_restart_and_operator_takeover() {
+        use std::sync::Arc;
+
+        use ursula_control::OperationOutcome;
+        use ursula_proto::admin::ProcessIncarnation;
+        use ursula_proto::admin::ReplicaIdentity;
+
+        // Every case runs through the durable meta dispatcher and production
+        // action admission/engine preparation; no action receipt is fabricated.
+        for restarted in [Some(1_u64), Some(2), Some(4), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta = ursula_raft::MetaRaftHandle::new_durable(
+                1,
+                dir.path().to_path_buf(),
+                Arc::new(openraft::Config::default().validate().unwrap()),
+            )
+            .await
+            .unwrap();
+            meta.initialize_membership(BTreeMap::from([(1, openraft::BasicNode::new("local"))]))
+                .await
+                .unwrap();
+            meta.wait_for_current_leader(1, Duration::from_secs(5))
+                .await
+                .unwrap();
+            for node_id in [1_u64, 2, 4] {
+                assert_eq!(
+                    meta.write(ControlCommand::RegisterNode {
+                        node_id,
+                        client_url: format!("http://node{node_id}"),
+                        cluster_url: format!("http://node{node_id}"),
+                        labels: BTreeMap::new(),
+                        now_ms: 1,
+                    })
+                    .await
+                    .unwrap(),
+                    ControlResponse::Ok
+                );
+                let boot = ProcessIncarnation::from_bits(u128::from(node_id));
+                let claimed = meta
+                    .write(ControlCommand::Operation {
+                        command: OperationCommand::ClaimProcess {
+                            node_id,
+                            expected_epoch: 0,
+                            incarnation: boot.clone(),
+                        },
+                        now_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+                let ControlResponse::Operation(Ok(OperationOutcome::ProcessClaimed(process))) =
+                    claimed
+                else {
+                    panic!("claim rejected")
+                };
+                assert!(matches!(
+                    meta.write(ControlCommand::Operation {
+                        command: OperationCommand::RegisterReplica {
+                            node_id,
+                            process,
+                            identity: ReplicaIdentity {
+                                generation: 1,
+                                incarnation: boot
+                            }
+                        },
+                        now_ms: 1,
+                    })
+                    .await
+                    .unwrap(),
+                    ControlResponse::Operation(Ok(OperationOutcome::ReplicaRegistered))
+                ));
+            }
+            assert_eq!(
+                meta.write(ControlCommand::SeedPlacement {
+                    raft_group_id: RaftGroupId(0),
+                    voters: BTreeSet::from([1, 2]),
+                    now_ms: 1
+                })
+                .await
+                .unwrap(),
+                ControlResponse::Ok
+            );
+            let initial = meta.read_linearizable_state().await.unwrap();
+            let kind = OperationKind::MoveReplicas {
+                source: 1,
+                target: 4,
+                groups: BTreeSet::from([RaftGroupId(0)]),
+            };
+            let acquired = meta
+                .write(ControlCommand::Operation {
+                    command: OperationCommand::Begin {
+                        participants: participants(&initial, &kind).unwrap(),
+                        kind,
+                        executor: ProcessIncarnation::from_bits(50),
+                        meta_voters: BTreeSet::from([1]),
+                    },
+                    now_ms: 1,
+                })
+                .await
+                .unwrap();
+            let ControlResponse::Operation(Ok(OperationOutcome::Acquired(mut token))) = acquired
+            else {
+                panic!("begin rejected")
+            };
+            let prepared = meta
+                .write(ControlCommand::Operation {
+                    command: OperationCommand::PrepareAction {
+                        token: token.clone(),
+                        group: RaftGroupId(0),
+                        leader: 4,
+                        action: ursula_control::MembershipAction::PrepareReplica,
+                    },
+                    now_ms: 1,
+                })
+                .await
+                .unwrap();
+            let ControlResponse::Operation(Ok(OperationOutcome::ActionPrepared(mut receipt))) =
+                prepared
+            else {
+                panic!("prepare rejected")
+            };
+            let original = ursula_control::ActionRequest {
+                token: token.clone(),
+                action: receipt.clone(),
+            };
+            let mut config = ursula_config::UrsulaConfig::default();
+            config.runtime.core_count = 1;
+            let runtime = ursula_runtime::ShardRuntime::spawn(
+                ursula_runtime::RuntimeConfig::from_ursula_config(&config.runtime, 1),
+            )
+            .unwrap();
+            let mut old_http = HttpState::with_raft_registry(runtime.clone(), Default::default())
+                .with_meta_control(meta.clone());
+            old_http.configured_node_id = Some(4);
+            old_http.process_incarnation = receipt.process.incarnation.clone();
+            execute_action(&old_http, ursula_control::ActionRequest {
+                token: token.clone(),
+                action: receipt.clone(),
+            })
+            .await
+            .unwrap();
+            // Lose the success response before FinishAction. The prepared group
+            // exists, while durable meta still retains the unresolved receipt.
+            drop(old_http);
+            if let Some(node_id) = restarted {
+                let previous = match &initial.operations.processes[&node_id] {
+                    ProcessState::Active(process) => process.clone(),
+                    other => panic!("{other:?}"),
+                };
+                let replica = match &initial.operations.replicas[&node_id] {
+                    ursula_control::ReplicaState::Active { identity, .. } => identity.clone(),
+                    other => panic!("{other:?}"),
+                };
+                assert!(matches!(
+                    meta.write(ControlCommand::Operation {
+                        command: OperationCommand::RestartProcess {
+                            node_id,
+                            previous,
+                            incarnation: ProcessIncarnation::from_bits(100 + u128::from(node_id)),
+                            replica
+                        },
+                        now_ms: 2,
+                    })
+                    .await
+                    .unwrap(),
+                    ControlResponse::Operation(Ok(OperationOutcome::ProcessClaimed(_)))
+                ));
+                assert_eq!(
+                    meta.read_linearizable_state()
+                        .await
+                        .unwrap()
+                        .operations
+                        .active
+                        .unwrap()
+                        .pending_action,
+                    Some(receipt.clone())
+                );
+                if node_id == 4 {
+                    let reassigned = meta
+                        .write(ControlCommand::Operation {
+                            command: OperationCommand::ReassignAction {
+                                token: token.clone(),
+                                leader: 4,
+                                drained: None,
+                            },
+                            now_ms: 2,
+                        })
+                        .await
+                        .unwrap();
+                    let ControlResponse::Operation(Ok(OperationOutcome::ActionPrepared(next))) =
+                        reassigned
+                    else {
+                        panic!("reassign rejected")
+                    };
+                    assert!(next.sequence > receipt.sequence);
+                    receipt = next;
+                }
+            } else {
+                let takeover = meta
+                    .write(ControlCommand::Operation {
+                        command: OperationCommand::TakeOver {
+                            expected: token.clone(),
+                            executor: ProcessIncarnation::from_bits(99),
+                        },
+                        now_ms: 2,
+                    })
+                    .await
+                    .unwrap();
+                let ControlResponse::Operation(Ok(OperationOutcome::Acquired(next))) = takeover
+                else {
+                    panic!("takeover rejected")
+                };
+                token = next;
+            }
+            let mut http = HttpState::with_raft_registry(runtime.clone(), Default::default())
+                .with_meta_control(meta.clone());
+            http.configured_node_id = Some(4);
+            http.process_incarnation = receipt.process.incarnation.clone();
+            if restarted == Some(4) || restarted.is_none() {
+                assert!(matches!(
+                    execute_action(&http, original).await,
+                    Err(ControlHttpError::Operation(OperationError::StaleExecutor))
+                ));
+            }
+            execute_action(&http, ursula_control::ActionRequest {
+                token: token.clone(),
+                action: receipt.clone(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                meta.write(ControlCommand::Operation {
+                    command: OperationCommand::FinishAction {
+                        token,
+                        sequence: receipt.sequence
+                    },
+                    now_ms: 3
+                })
+                .await
+                .unwrap(),
+                ControlResponse::Operation(Ok(OperationOutcome::ActionFinished))
+            );
+            assert!(
+                meta.read_linearizable_state()
+                    .await
+                    .unwrap()
+                    .operations
+                    .active
+                    .unwrap()
+                    .pending_action
+                    .is_none()
+            );
+            assert!(runtime.shutdown_owners().await.is_empty());
+            meta.shutdown().await.unwrap();
+        }
     }
 
     #[test]

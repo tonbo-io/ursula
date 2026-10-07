@@ -383,6 +383,7 @@ pub(crate) fn raft_group_metrics(
 ) -> ursula_proto::admin::RaftGroupMetrics {
     ursula_proto::admin::RaftGroupMetrics {
         apply_failure: value.apply_failure.clone(),
+        installed_replica_identities: value.installed_replica_identities.clone(),
         raft_group_id: u64::from(value.raft_group_id),
         node_id: value.node_id,
         current_term: Some(value.current_term),

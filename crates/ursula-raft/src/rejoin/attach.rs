@@ -480,6 +480,7 @@ impl RecoveryGate {
         transport: T,
         config: RecoveryConfig,
     ) {
+        rejoin.set_replica_fence_required_index(engine.replica_fences.required_index());
         rejoin.bind(&engine.raft_handle());
         registry.register_engine(engine, Some(rejoin.clone()));
         let election = registry.election_policy();
@@ -491,7 +492,7 @@ impl RecoveryGate {
         let mut floor_metrics = engine.raft_handle().metrics();
         let mut floor_changes = rejoin.changes.subscribe();
         self.push(crate::rt::spawn(async move {
-            while !floor_rejoin.vote_gate_open() {
+            while !floor_rejoin.vote_gate_open() && floor_rejoin.needs_vote_floor() {
                 let authoritative = if floor_registry.process_authority().is_some() {
                     authoritative_vote_floor(
                         &floor_registry,
@@ -530,7 +531,9 @@ impl RecoveryGate {
                 // leader can produce ReadIndex. This exception requires every
                 // configured peer to report no initialized history, never a
                 // quorum sample. Existing groups use the current-leader proof.
-                if config.membership_authority == RecoveryMembershipAuthority::ImmutableStatic
+                if (config.membership_authority == RecoveryMembershipAuthority::ImmutableStatic
+                    || (floor_registry.genesis_initialization_allowed(floor_rejoin.raft_group_id)
+                        && floor_registry.replica_genesis_prefix(floor_rejoin.raft_group_id) == 0))
                     && !floor_rejoin.holds_group_history()
                 {
                     let genesis = futures_util::future::join_all(

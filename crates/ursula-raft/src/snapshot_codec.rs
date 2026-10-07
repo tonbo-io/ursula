@@ -139,7 +139,25 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         )));
     }
 
+    let mut replica_identities = std::collections::BTreeMap::new();
+    for identity in header.replica_identities {
+        let node = identity.node_id;
+        let value = ursula_proto::admin::ReplicaIdentity {
+            generation: identity.generation,
+            incarnation: identity
+                .incarnation
+                .try_into()
+                .map_err(|error: &str| SnapshotStoreError::Deserialize(error.to_owned()))?,
+        };
+        if replica_identities.insert(node, value).is_some() {
+            return Err(SnapshotStoreError::Deserialize(
+                "duplicate snapshot replica identity".to_owned(),
+            ));
+        }
+    }
     Ok(GroupSnapshot {
+        replica_fence_index: header.replica_fence_index,
+        replica_identities,
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
         group_commit_index: header.group_commit_index,
         stream_snapshot: StreamSnapshot {
@@ -227,6 +245,16 @@ impl GroupSnapshotFrameIter {
                 .collect(),
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: stream_snapshot.last_created_at_ms,
+            replica_fence_index: snapshot.replica_fence_index,
+            replica_identities: snapshot
+                .replica_identities
+                .iter()
+                .map(|(node, identity)| proto::ReplicaIdentityV1 {
+                    node_id: *node,
+                    generation: identity.generation,
+                    incarnation: identity.incarnation.as_str().to_owned(),
+                })
+                .collect(),
         }
     }
 }
@@ -593,6 +621,14 @@ mod tests {
     #[test]
     fn empty_group_snapshot_round_trips() {
         let snapshot = GroupSnapshot {
+            replica_fence_index: 41,
+            replica_identities: std::collections::BTreeMap::from([(
+                2,
+                ursula_proto::admin::ReplicaIdentity {
+                    generation: 7,
+                    incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(12),
+                },
+            )]),
             placement: ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -715,6 +751,8 @@ mod tests {
         let error = stream_from_proto(entry).expect_err("absent retained_offset");
         assert!(error.to_string().contains("retained_offset"), "{error}");
         let snapshot = GroupSnapshot {
+            replica_fence_index: 0,
+            replica_identities: Default::default(),
             placement: ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -749,6 +787,8 @@ mod tests {
 
     fn header_v1() -> proto::SnapshotHeaderV1 {
         proto::SnapshotHeaderV1 {
+            replica_fence_index: 0,
+            replica_identities: Vec::new(),
             placement: Some(placement_to_proto(ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),
@@ -827,6 +867,8 @@ mod tests {
         let header = encode_frame(proto::SnapshotFrameV1 {
             frame: Some(proto::snapshot_frame_v1::Frame::Header(
                 proto::SnapshotHeaderV1 {
+                    replica_fence_index: 0,
+                    replica_identities: Vec::new(),
                     placement: Some(placement_to_proto(ShardPlacement {
                         core_id: CoreId(0),
                         shard_id: ShardId(0),
@@ -862,6 +904,8 @@ mod tests {
 
     fn write_unit_snapshot(committed_write_unit_bytes: Option<u64>) -> Vec<u8> {
         let header = proto::SnapshotHeaderV1 {
+            replica_fence_index: 0,
+            replica_identities: Vec::new(),
             placement: Some(placement_to_proto(ShardPlacement {
                 core_id: CoreId(0),
                 shard_id: ShardId(0),

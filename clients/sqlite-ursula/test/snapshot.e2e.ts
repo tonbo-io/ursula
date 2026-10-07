@@ -71,7 +71,10 @@ it("snapshots + retention bound the stream; fresh and lagging hosts rebuild from
 	for (let i = 0, still = 0; i < 200 && still < 5; i++) {
 		await new Promise((r) => setTimeout(r, 100));
 		const next = await head(url);
-		still = next.snapshot === h.snapshot && next.retained === h.retained && next.retained > laggingOffset ? still + 1 : 0;
+		// An S3 upload can leave HEAD unchanged for more than 500 ms while
+		// the worker is still catching up. Stability alone is not completion.
+		const bounded = bytes(next.snapshot, next.tail) < 9 * MiB && bytes(next.retained, next.tail) < 40 * MiB;
+		still = bounded && next.snapshot === h.snapshot && next.retained === h.retained && next.retained > laggingOffset ? still + 1 : 0;
 		h = next;
 	}
 	console.log(`settled: tail ${h.tail}, snapshot ${h.snapshot}, retained ${h.retained}`);

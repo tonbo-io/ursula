@@ -594,8 +594,22 @@ impl CoreFileLogWriter {
         let mut metadata_changed = metadata.set_verified_epoch(options.recovery_epoch);
         // A verified prefix may discard acknowledged frames even under Always
         // (media corruption). Gate every group sharing this journal before
-        // exposing the repaired prefix to Raft.
-        let damaged = recovered.end != RecoveryEnd::Clean || metadata_missing;
+        // exposing the repaired prefix to Raft. An incomplete final frame or
+        // newest segment header was never acknowledged; truncating only that
+        // tail does not invalidate healthy groups sharing the core.
+        let damaged = metadata_missing
+            || matches!(
+                recovered.end,
+                RecoveryEnd::Dropped { .. }
+                    | RecoveryEnd::Truncated {
+                        tail: super::journal::ReplayTail::Unverified { .. },
+                        ..
+                    }
+                    | RecoveryEnd::Truncated {
+                        dropped_segments: 1..,
+                        ..
+                    }
+            );
         let repaired = match (options.node_recovery, damaged) {
             (RecoveryState::Normal, false) => GroupLogState::Initialized,
             _ => GroupLogState::Recovering,

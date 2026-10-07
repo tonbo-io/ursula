@@ -437,6 +437,7 @@ pub(crate) struct CurrentSnapshot {
 const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 
 pub struct RaftGroupStateMachine {
+    pub(crate) replica_fences: Arc<crate::replica_fence::ReplicaFences>,
     pub(crate) apply_failure: Arc<Mutex<Option<ursula_proto::admin::RaftApplyFailure>>>,
     #[cfg(test)]
     pub(crate) fail_apply_at: Option<u64>,
@@ -532,6 +533,7 @@ impl RaftGroupStateMachine {
     ) -> Self {
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         Self {
+            replica_fences: Arc::default(),
             apply_failure: Arc::default(),
             #[cfg(test)]
             fail_apply_at: None,
@@ -554,6 +556,10 @@ impl RaftGroupStateMachine {
     }
 
     pub(crate) async fn restore_persisted_snapshot(&mut self) -> Result<(), io::Error> {
+        self.replica_fences = crate::replica_fence::ReplicaFences::load(
+            crate::replica_fence::ReplicaFences::path(self.snapshot_metadata_path.as_ref())
+                .as_ref(),
+        )?;
         let Some(path) = &self.snapshot_metadata_path else {
             return Ok(());
         };
@@ -585,6 +591,11 @@ impl RaftGroupStateMachine {
                 .map_err(|err| err.into_io())?,
         };
         let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| err.into_io())?;
+        self.restore_replica_fences(
+            group_snapshot.replica_identities.clone(),
+            group_snapshot.replica_fence_index,
+        )
+        .await?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -614,10 +625,14 @@ impl RaftGroupStateMachine {
     }
 
     pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, io::Error> {
-        self.engine
+        let mut snapshot = self
+            .engine
             .snapshot(self.placement)
             .await
-            .map_err(group_engine_io_error)
+            .map_err(group_engine_io_error)?;
+        snapshot.replica_identities = self.replica_fences.snapshot();
+        snapshot.replica_fence_index = self.replica_fences.required_index();
+        Ok(snapshot)
     }
 
     pub async fn head_stream(
@@ -727,10 +742,49 @@ impl RaftGroupStateMachine {
         Ok(())
     }
 
+    pub(crate) async fn restore_replica_fences(
+        &self,
+        identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
+        required_index: u64,
+    ) -> io::Result<()> {
+        let identities = self
+            .replica_fences
+            .merge(identities)
+            .map_err(io::Error::other)?;
+        self.replica_fences
+            .persist(
+                self.metadata_serial.clone(),
+                crate::replica_fence::ReplicaFences::path(self.snapshot_metadata_path.as_ref()),
+                identities,
+                required_index,
+            )
+            .await
+    }
+
+    pub(crate) async fn seed_replica_fences(
+        &self,
+        identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
+        required_index: u64,
+    ) -> io::Result<()> {
+        if self.replica_fences.snapshot().is_empty() {
+            self.restore_replica_fences(identities, required_index)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn install_group_snapshot(
         &mut self,
         snapshot: GroupSnapshot,
     ) -> Result<(), GroupEngineError> {
+        self.restore_replica_fences(
+            snapshot.replica_identities.clone(),
+            snapshot.replica_fence_index,
+        )
+        .await
+        .map_err(|error| {
+            GroupEngineError::backend(ursula_runtime::BackendOperation::RestoreSnapshot, error)
+        })?;
         self.engine.install_snapshot(snapshot).await
     }
 
@@ -804,6 +858,39 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             let entry_bytes = crate::types::entry_log_bytes(&entry);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
+                EntryPayload::Normal(
+                    ursula_runtime::GroupWriteCommand::InstallReplicaIdentity {
+                        node_id,
+                        expected,
+                        replacement,
+                    },
+                ) => {
+                    let response = if entry.log_id.index() <= self.replica_fences.required_index() {
+                        Ok(())
+                    } else {
+                        match self.replica_fences.replacement(
+                            node_id,
+                            expected.as_ref(),
+                            replacement,
+                        ) {
+                            Ok(identities) => {
+                                self.replica_fences
+                                    .persist(
+                                        self.metadata_serial.clone(),
+                                        crate::replica_fence::ReplicaFences::path(
+                                            self.snapshot_metadata_path.as_ref(),
+                                        ),
+                                        identities,
+                                        entry.log_id.index(),
+                                    )
+                                    .await?;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+                    RaftGroupResponse::ReplicaFence(response)
+                }
                 EntryPayload::Normal(command) => {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
@@ -960,6 +1047,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 }
             },
         };
+        self.restore_replica_fences(
+            group_snapshot.replica_identities.clone(),
+            group_snapshot.replica_fence_index,
+        )
+        .await?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -1268,6 +1360,8 @@ mod tests {
     #[cfg(not(madsim))]
     fn test_group_snapshot(placement: ShardPlacement, commit_index: u64) -> GroupSnapshot {
         GroupSnapshot {
+            replica_fence_index: 0,
+            replica_identities: Default::default(),
             placement,
             group_commit_index: commit_index,
             stream_snapshot: Default::default(),
@@ -1299,6 +1393,80 @@ mod tests {
         // Running blocking metadata work inline would time out before reaching it.
         release.send(()).unwrap();
         metadata.await.unwrap().unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn durable_replica_floor_survives_lost_applied_pointer_and_historical_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let placement = ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: ursula_shard::RaftGroupId(0),
+        };
+        let path = root.path().join("group-0.snapshot.json");
+        let old = ursula_proto::admin::ReplicaIdentity {
+            generation: 1,
+            incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
+        };
+        let new = ursula_proto::admin::ReplicaIdentity {
+            generation: 2,
+            incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(2),
+        };
+        let mut state = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            default_snapshot_store(),
+            Default::default(),
+            Default::default(),
+            Some(path.clone()),
+        );
+        state
+            .restore_replica_fences(BTreeMap::from([(2, new.clone())]), 20)
+            .await
+            .unwrap();
+        // No current snapshot/applied pointer was persisted. Only the forced-durable fence survived.
+        assert!(!path.exists());
+        state = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            default_snapshot_store(),
+            Default::default(),
+            Default::default(),
+            Some(path),
+        );
+        state.restore_persisted_snapshot().await.unwrap();
+        assert_eq!(state.last_applied_log_id, None);
+        state
+            .seed_replica_fences(BTreeMap::from([(2, new.clone()), (4, old.clone())]), 30)
+            .await
+            .unwrap();
+        assert!(!state.replica_fences.accepts(4, &old));
+        assert_eq!(state.replica_fences.required_index(), 20);
+        let historical = openraft::alias::EntryOf::<UrsulaRaftTypeConfig> {
+            log_id: test_log_id(10),
+            payload: EntryPayload::Normal(
+                ursula_runtime::GroupWriteCommand::InstallReplicaIdentity {
+                    node_id: 2,
+                    expected: None,
+                    replacement: old.clone(),
+                },
+            ),
+        };
+        state
+            .apply(futures_util::stream::iter([Ok((historical, None))]))
+            .await
+            .unwrap();
+        assert!(state.replica_fences.accepts(2, &new));
+        assert_eq!(state.replica_fences.required_index(), 20);
+        assert_eq!(state.last_applied_log_id, Some(test_log_id(10)));
+        let mut snapshot = test_group_snapshot(placement, 10);
+        snapshot.replica_identities.insert(2, old);
+        state.install_group_snapshot(snapshot).await.unwrap();
+        assert!(state.replica_fences.accepts(2, &new));
+        assert_eq!(state.replica_fences.required_index(), 20);
     }
 
     #[cfg(not(madsim))]

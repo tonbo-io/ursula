@@ -146,6 +146,25 @@ init_membership_per_group = false
 # node_id = 3
 # url = "http://10.0.0.3:4437"
 
+# A persistent standalone node (no data/meta peers) automatically bootstraps
+# private one-voter meta authority. For an explicit static cluster, configure
+# every meta peer as well as the data peers above; 4439 is private to the cluster.
+# Generate once: umask 077; openssl rand -hex 32 > meta-auth.token
+# Install the same secret on all peers, owned by the service user, mode 0600.
+# [raft.meta]
+# enabled = true
+# listen = "0.0.0.0:4439"
+# auth_token_file = "/etc/ursula/meta-auth.token"
+# [[raft.meta.peers]]
+# node_id = 1
+# url = "http://10.0.0.1:4439"
+# [[raft.meta.peers]]
+# node_id = 2
+# url = "http://10.0.0.2:4439"
+# [[raft.meta.peers]]
+# node_id = 3
+# url = "http://10.0.0.3:4439"
+
 # ------------------------------------------------------------------------------
 # [raft.groups]  — Per-group voter assignments (repeatable table, optional)
 # ------------------------------------------------------------------------------

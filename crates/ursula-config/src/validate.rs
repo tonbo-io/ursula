@@ -12,6 +12,10 @@ pub enum ValidationError {
     AppendTransportBudget,
     #[error("raft.wal.path is required when raft.peers is set")]
     RaftWalPathRequired,
+    #[error(
+        "distributed meta Raft requires raft.meta.auth_token_file pointing to a shared cluster credential"
+    )]
+    MetaAuthTokenRequired,
     #[error("storage.cold.s3.bucket is required when cold backend is 's3'")]
     ColdS3BucketRequired,
     #[error("raft.node_id {0} must be present in raft.peers")]
@@ -48,6 +52,11 @@ impl UrsulaConfig {
             return Err(ValidationError::RaftWalPathRequired);
         }
         if self.raft.uses_meta_authority() {
+            if !self.raft.uses_implicit_single_node_meta()
+                && self.raft.meta.auth_token_file.is_none()
+            {
+                return Err(ValidationError::MetaAuthTokenRequired);
+            }
             let ids: BTreeSet<_> = self
                 .raft
                 .meta
@@ -55,9 +64,10 @@ impl UrsulaConfig {
                 .iter()
                 .map(|peer| peer.node_id)
                 .collect();
-            if ids.len() != self.raft.meta.peers.len()
-                || !ids.contains(&self.raft.node_id)
-                || self.raft.wal.path.is_none()
+            if self.raft.wal.path.is_none()
+                || (!self.raft.uses_implicit_single_node_meta()
+                    && (ids.len() != self.raft.meta.peers.len()
+                        || !ids.contains(&self.raft.node_id)))
             {
                 return Err(ValidationError::Other("enabled meta Raft requires a persistent WAL and unique meta peers including this node".to_owned()));
             }

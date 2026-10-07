@@ -62,6 +62,7 @@ pub type UrsulaVoteResponse = VoteResponse<UrsulaRaftTypeConfig>;
 /// membership entries have no application payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftGroupResponse {
+    ReplicaFence(Result<(), crate::ReplicaFenceError>),
     Blank,
     Membership,
     Write(Result<GroupWriteResponse, GroupEngineError>),
@@ -75,6 +76,8 @@ pub struct RaftLogProgressSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaftGroupMetricsSnapshot {
+    #[serde(default)]
+    pub installed_replica_identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
     #[serde(default)]
     pub apply_failure: Option<ursula_proto::admin::RaftApplyFailure>,
     pub raft_group_id: u32,

@@ -2,7 +2,6 @@
 # (6a0bebe): forks are not implemented, JSON streams read as NDJSON rather than
 # a JSON array, and Location is relative. One test name per line.
 Caching and ETag > should allow If-None-Match in CORS preflight responses
-Content-Type Validation > should enforce content-type match on append
 Content-Type Validation > should return stream content-type on GET
 Fork - Appending > should append to a fork
 Fork - Appending > should append to source after fork — source independent
@@ -61,11 +60,9 @@ Fork - Recursive > should fork at mid-point of inherited data
 Fork - Recursive > should read correctly across three levels
 Fork - TTL and Expiry > should expire source with living forks (source goes 410)
 Fork - TTL and Expiry > should inherit source TTL value when none specified
-HTTP Protocol > should return 409 on content-type mismatch
 Idempotent Producer Operations > duplicate response should return highest accepted seq, not request seq
 Idempotent Producer Operations > JSON duplicate should not corrupt data
 Idempotent Producer Operations > should preserve order of JSON appends with producer
-Idempotent Producer Operations > should return 409 for content-type mismatch
 Idempotent Producer Operations > should store and read back JSON object correctly
 JSON Mode > should allow PUT with empty array body (creates empty stream)
 JSON Mode > should concatenate multiple appends into single array

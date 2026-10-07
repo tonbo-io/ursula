@@ -108,6 +108,20 @@ Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer
 
 The same static-membership model works by hand. Every node runs the same config file, and only the node ID differs:
 
+Before starting a distributed cluster, generate one shared meta authentication
+secret on a trusted host:
+
+```bash
+umask 077
+openssl rand -hex 32 > meta-auth.token
+```
+
+Install this same file at `/etc/ursula/meta-auth.token` on every peer, owned by the
+Ursula service user with mode `0600`. Keep it out of source control and application
+logs. The private meta listener requires this credential for peer RPCs and control
+writes; expose port 4439 only to cluster peers. A standalone node's implicit local
+meta listener does not require a configured secret.
+
 ```toml
 [server]
 listen = "0.0.0.0:4437"
@@ -138,6 +152,23 @@ url = "http://10.0.0.2:4437"
 [[raft.peers]]
 node_id = 3
 url = "http://10.0.0.3:4437"
+
+[raft.meta]
+enabled = true
+listen = "0.0.0.0:4439"
+auth_token_file = "/etc/ursula/meta-auth.token"
+
+[[raft.meta.peers]]
+node_id = 1
+url = "http://10.0.0.1:4439"
+
+[[raft.meta.peers]]
+node_id = 2
+url = "http://10.0.0.2:4439"
+
+[[raft.meta.peers]]
+node_id = 3
+url = "http://10.0.0.3:4439"
 ```
 
 Start each node with its own ID:

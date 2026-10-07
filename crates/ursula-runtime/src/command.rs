@@ -20,6 +20,10 @@ use crate::request::StreamAppendCount;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSnapshot {
+    #[serde(default)]
+    pub replica_fence_index: u64,
+    #[serde(default)]
+    pub replica_identities: std::collections::BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
     pub placement: ShardPlacement,
     pub group_commit_index: u64,
     pub stream_snapshot: StreamSnapshot,
@@ -31,6 +35,11 @@ pub struct GroupSnapshot {
 /// the Raft log payload; there is no separate wire mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupWriteCommand {
+    InstallReplicaIdentity {
+        node_id: u64,
+        expected: Option<ursula_proto::admin::ReplicaIdentity>,
+        replacement: ursula_proto::admin::ReplicaIdentity,
+    },
     Stream(StreamCommand),
 }
 
@@ -39,6 +48,7 @@ impl GroupWriteCommand {
     pub fn log_bytes_estimate(&self) -> u64 {
         match self {
             Self::Stream(command) => command.log_bytes_estimate(),
+            Self::InstallReplicaIdentity { .. } => ursula_stream::COMMAND_LOG_OVERHEAD_BYTES,
         }
     }
 }
@@ -241,6 +251,9 @@ impl fmt::Display for GroupWriteCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stream(command) => command.fmt(f),
+            Self::InstallReplicaIdentity { node_id, .. } => {
+                write!(f, "install replica identity for node {node_id}")
+            }
         }
     }
 }

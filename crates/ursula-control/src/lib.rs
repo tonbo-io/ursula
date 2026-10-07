@@ -44,10 +44,13 @@ pub use operation::PrefixEvidence;
 pub use operation::ProcessIdentity;
 pub use operation::ProcessState;
 pub use operation::ReplicaEvidence;
+pub use operation::ReplicaState;
 pub use operation::RetirementReason;
 pub use state::ControlPlaneState;
 pub use view::GroupPlacementView;
 pub use view::PlacementNode;
 
+#[cfg(test)]
+mod replica_identity_tests;
 #[cfg(test)]
 mod tests;

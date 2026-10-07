@@ -16,14 +16,21 @@ use ursula_control::OperationCommand;
 use ursula_control::OperationOutcome;
 use ursula_control::ProcessIdentity;
 use ursula_control::ProcessState;
+use ursula_control::ReplicaState;
 use ursula_proto::admin::ProcessIncarnation;
+use ursula_proto::admin::ReplicaIdentity;
 use ursula_raft::MetaRaftError;
 use ursula_raft::MetaRaftHandle;
+use ursula_raft::wal::ReplicaIdentityStore;
 use ursula_shard::RaftGroupId;
 
 pub(crate) struct MetaAuthority {
     pub handle: MetaRaftHandle,
     pub process: ProcessIdentity,
+    pub replica: ReplicaIdentity,
+    pub replica_genesis: BTreeMap<u64, ReplicaIdentity>,
+    pub replica_genesis_prefixes: BTreeMap<RaftGroupId, u64>,
+    _replica_store: ReplicaIdentityStore,
     shutdown: oneshot::Sender<()>,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
 }
@@ -48,6 +55,21 @@ pub(crate) async fn start_meta_authority(
     root: PathBuf,
     incarnation: ProcessIncarnation,
 ) -> Result<MetaAuthority, MetaRaftError> {
+    let identity_root = config
+        .raft
+        .wal
+        .path
+        .as_ref()
+        .ok_or_else(|| MetaRaftError::new("replica identity", "persistent WAL path required"))?
+        .join(ursula_config::WalConfig::LOG_SUBDIR);
+    let node_id = config.raft.node_id;
+    let replica_store = tokio::task::spawn_blocking(move || {
+        let fresh = ProcessIncarnation::from_bits(rand::random());
+        ReplicaIdentityStore::open(&identity_root, node_id, fresh)
+    })
+    .await
+    .map_err(|error| MetaRaftError::with_source("join replica identity load", error))?
+    .map_err(|error| MetaRaftError::with_source("load replica identity", error))?;
     let raft_config = Arc::new(
         openraft::Config {
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
@@ -57,14 +79,44 @@ pub(crate) async fn start_meta_authority(
         .validate()
         .map_err(|error| MetaRaftError::with_source("meta raft configuration", error))?,
     );
-    let listener = tokio::net::TcpListener::bind(&config.raft.meta.listen)
+    let implicit_single = config.raft.uses_implicit_single_node_meta();
+    let listen = if implicit_single {
+        "127.0.0.1:0"
+    } else {
+        &config.raft.meta.listen
+    };
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|error| MetaRaftError::with_source("bind meta listener", error))?;
-    let handle = MetaRaftHandle::new_durable_recovering(
+    let meta_peers = if implicit_single {
+        vec![ursula_config::RaftPeerConfig {
+            node_id: config.raft.node_id,
+            url: format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .map_err(|error| MetaRaftError::with_source("meta listener address", error))?
+            ),
+        }]
+    } else {
+        config.raft.meta.peers.clone()
+    };
+    let rpc_auth = match &config.raft.meta.auth_token_file {
+        Some(path) => ursula_raft::MetaRpcAuth::from_token_file(path)?,
+        None if implicit_single => ursula_raft::MetaRpcAuth::default(),
+        None => {
+            return Err(MetaRaftError::new(
+                "meta authentication",
+                "distributed meta requires a credential file",
+            ));
+        }
+    };
+    let handle = MetaRaftHandle::new_durable_recovering_with_auth(
         config.raft.node_id,
         root,
         raft_config,
         incarnation.clone(),
+        rpc_auth.clone(),
     )
     .await?;
     let (shutdown, stopped) = oneshot::channel();
@@ -77,11 +129,9 @@ pub(crate) async fn start_meta_authority(
             })
             .await
     });
-    let start = async {
-        let peers: BTreeMap<_, _> = config
-            .raft
-            .meta
-            .peers
+    let stored_replica = replica_store.identity().cloned();
+    let claim = async {
+        let peers: BTreeMap<_, _> = meta_peers
             .iter()
             .map(|peer| (peer.node_id, BasicNode::new(&peer.url)))
             .collect();
@@ -96,8 +146,10 @@ pub(crate) async fn start_meta_authority(
         let initializer = peers.keys().next().copied() == Some(config.raft.node_id);
         while !handle.replication_enabled() {
             let mut statuses = BTreeMap::new();
-            for peer in &config.raft.meta.peers {
-                if let Ok(status) = ursula_raft::meta_peer_recovery_status(&peer.url).await {
+            for peer in &meta_peers {
+                if let Ok(status) =
+                    ursula_raft::meta_peer_recovery_status_authenticated(&peer.url, &rpc_auth).await
+                {
                     statuses.insert(peer.node_id, status);
                 }
             }
@@ -106,19 +158,22 @@ pub(crate) async fn start_meta_authority(
                     .values()
                     .all(|status| !status.initialized && status.vote.is_none());
             if initializer
-                && (config.raft.init_membership || config.raft.init_membership_per_group)
+                && (implicit_single
+                    || config.raft.init_membership
+                    || config.raft.init_membership_per_group)
                 && all_empty
             {
                 // Permits bind to each receiver's fresh boot. A delayed genesis
                 // RPC cannot open a replacement process after a disk loss.
-                for peer in &config.raft.meta.peers {
+                for peer in &meta_peers {
                     let nonce = statuses
                         .get(&peer.node_id)
                         .and_then(|status| status.nonce.clone())
                         .ok_or_else(|| {
                             MetaRaftError::new("meta genesis", "peer lacks recovery nonce")
                         })?;
-                    ursula_raft::meta_authorize_genesis(&peer.url, nonce).await?;
+                    ursula_raft::meta_authorize_genesis_authenticated(&peer.url, &rpc_auth, nonce)
+                        .await?;
                 }
                 handle.initialize_membership(peers.clone()).await?;
                 break;
@@ -126,12 +181,16 @@ pub(crate) async fn start_meta_authority(
             // A leader ReadIndex uses the current (possibly joint) membership.
             // Sampling a count from static bootstrap peers would be unsafe after
             // decommission, because a removed stale voter is no longer evidence.
-            for peer in &config.raft.meta.peers {
+            for peer in &meta_peers {
                 if peer.node_id == config.raft.node_id {
                     continue;
                 }
-                if let Ok(floor) =
-                    ursula_raft::meta_peer_recovery_floor(&peer.url, config.raft.node_id).await
+                if let Ok(floor) = ursula_raft::meta_peer_recovery_floor_authenticated(
+                    &peer.url,
+                    &rpc_auth,
+                    config.raft.node_id,
+                )
+                .await
                 {
                     handle.install_recovery_vote_floor(floor).await?;
                     break;
@@ -206,6 +265,16 @@ pub(crate) async fn start_meta_authority(
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
+            if let (Some(stored), Some(ReplicaState::Retired(retired))) = (
+                stored_replica.as_ref(),
+                state.operations.replicas.get(&config.raft.node_id),
+            ) && stored == retired
+            {
+                return Err(MetaRaftError::new(
+                    "claim process boot",
+                    "the stored replica identity is retired; its WAL cannot reclaim this node",
+                ));
+            }
             // An RPC may lose its response after committing our claim. Observe
             // that exact boot identity before retrying, never increment blindly.
             if let Some(ProcessState::Active(identity)) =
@@ -230,10 +299,32 @@ pub(crate) async fn start_meta_authority(
             claim_epoch = Some(expected_epoch);
             match handle
                 .write(ControlCommand::Operation {
-                    command: OperationCommand::ClaimProcess {
-                        node_id: config.raft.node_id,
-                        expected_epoch,
-                        incarnation: incarnation.clone(),
+                    command: match (
+                        stored_replica.as_ref(),
+                        state.operations.processes.get(&config.raft.node_id),
+                        state.operations.replicas.get(&config.raft.node_id),
+                    ) {
+                        (
+                            Some(replica),
+                            Some(ProcessState::Active(previous)),
+                            Some(
+                                ReplicaState::Active { identity, .. }
+                                | ReplicaState::Pending {
+                                    replacement: identity,
+                                    ..
+                                },
+                            ),
+                        ) if identity == replica => OperationCommand::RestartProcess {
+                            node_id: config.raft.node_id,
+                            previous: previous.clone(),
+                            incarnation: incarnation.clone(),
+                            replica: replica.clone(),
+                        },
+                        _ => OperationCommand::ClaimProcess {
+                            node_id: config.raft.node_id,
+                            expected_epoch,
+                            incarnation: incarnation.clone(),
+                        },
                     },
                     now_ms: now_ms(),
                 })
@@ -260,13 +351,115 @@ pub(crate) async fn start_meta_authority(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
+    let start = async {
+        let process = claim.await?;
+        let generation = process.epoch;
+        let (replica_store, replica) = tokio::task::spawn_blocking(move || {
+            let mut store = replica_store;
+            let identity = store.bind_initial_generation(generation)?;
+            Ok::<_, ursula_raft::wal::ReplicaIdentityError>((store, identity))
+        })
+        .await
+        .map_err(|error| MetaRaftError::with_source("join replica identity bind", error))?
+        .map_err(|error| MetaRaftError::with_source("bind replica identity", error))?;
+        loop {
+            let state = match handle.read_linearizable_state().await {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::debug!(%error, "waiting for replica admission authority");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            match state.operations.replicas.get(&node_id) {
+                Some(ReplicaState::Active { identity, .. }) if identity == &replica => {
+                    // Initial genesis waits for every placement voter to publish
+                    // its durable identity. Restarts reuse already registered
+                    // identities and do not require those peers to be online.
+                    let complete = state.placements.values().all(|placement| {
+                        placement
+                            .voters
+                            .iter()
+                            .all(|node| state.operations.replicas.contains_key(node))
+                    });
+                    if complete {
+                        let identities = state
+                            .operations
+                            .replicas
+                            .iter()
+                            .map(|(node, state)| {
+                                let identity = match state {
+                                    ReplicaState::Active { identity, .. }
+                                    | ReplicaState::Retired(identity) => identity,
+                                    ReplicaState::Pending { previous, .. } => previous,
+                                };
+                                (*node, identity.clone())
+                            })
+                            .collect();
+                        let mut prefixes = BTreeMap::<RaftGroupId, u64>::new();
+                        for state in state.operations.replicas.values() {
+                            if let ReplicaState::Active {
+                                installed_groups, ..
+                            } = state
+                            {
+                                for (group, index) in installed_groups {
+                                    prefixes
+                                        .entry(*group)
+                                        .and_modify(|current| *current = (*current).max(*index))
+                                        .or_insert(*index);
+                                }
+                            }
+                        }
+                        return Ok((process, replica, identities, prefixes, replica_store));
+                    }
+                }
+                Some(ReplicaState::Pending { replacement, .. }) if replacement == &replica => {
+                    // Survivors first durably install all group fences. Starting
+                    // data actors earlier could let a blank disk count as the
+                    // old voter; activation alone does not open its rejoin gate.
+                }
+                _ => {
+                    match handle
+                        .write(ControlCommand::Operation {
+                            command: OperationCommand::RegisterReplica {
+                                node_id,
+                                process: process.clone(),
+                                identity: replica.clone(),
+                            },
+                            now_ms: now_ms(),
+                        })
+                        .await
+                    {
+                        Ok(ControlResponse::Operation(Ok(OperationOutcome::ReplicaRegistered))) => {
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "checking whether replica registration committed")
+                        }
+                        Ok(response) => {
+                            return Err(MetaRaftError::new(
+                                "register replica identity",
+                                format!("{response:?}"),
+                            ));
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
     match tokio::time::timeout(Duration::from_secs(120), start).await {
-        Ok(Ok(process)) => Ok(MetaAuthority {
-            handle,
-            process,
-            shutdown,
-            server,
-        }),
+        Ok(Ok((process, replica, replica_genesis, replica_genesis_prefixes, replica_store))) => {
+            Ok(MetaAuthority {
+                handle,
+                process,
+                replica,
+                replica_genesis,
+                replica_genesis_prefixes,
+                _replica_store: replica_store,
+                shutdown,
+                server,
+            })
+        }
         outcome => {
             let _closed = shutdown.send(());
             let _stopped = handle.shutdown().await;

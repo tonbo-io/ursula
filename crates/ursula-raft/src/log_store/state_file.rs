@@ -40,6 +40,10 @@ const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub enum StateFileKind {
     /// The votes and `initialized` flags of one core's raft groups.
     CoreMetadata,
+    /// Stable replica token for one WAL lifetime.
+    ReplicaIdentity,
+    /// A WAL has entered the stable replica identity protocol.
+    ReplicaIdentityRequired,
     /// The node's run state.
     RunState,
     /// The immutable routing configuration of this WAL root.
@@ -50,6 +54,8 @@ impl StateFileKind {
     fn magic(self) -> [u8; 8] {
         match self {
             Self::CoreMetadata => *b"URSWMETA",
+            Self::ReplicaIdentity => *b"URSWRPID",
+            Self::ReplicaIdentityRequired => *b"URSWRPRQ",
             Self::RunState => *b"URSWRUN\0",
             Self::Topology => *b"URSWTOPO",
         }

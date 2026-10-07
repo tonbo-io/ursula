@@ -1009,7 +1009,7 @@ fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
 }
 
 #[test]
-fn mutable_membership_recovery_requires_authority_and_does_not_flatten_the_joint() {
+fn mutable_membership_recovery_preserves_and_completes_the_joint() {
     let _guard = sim_test_guard();
     // With owner mailbox dispatch, seed 5 drops both tails. Keep the loss and
     // joint-membership preconditions asserted so scheduling drift cannot skip the scenario.
@@ -1062,6 +1062,7 @@ fn mutable_membership_recovery_requires_authority_and_does_not_flatten_the_joint
             // Keep B alive, but prevent it from acknowledging RemoveVoter(A).
             cluster.policy.partition_bidirectional(leader, b);
             cluster.policy.partition_bidirectional(a, b);
+            cluster.policy.partition_bidirectional(leader, a);
             power_loss_and_restart(&mut cluster, a).await;
             // A recovering replica now waits for peer vote floors before it
             // can return a lost-log conflict. Initiate the same RemoveVoter
@@ -1096,31 +1097,31 @@ fn mutable_membership_recovery_requires_authority_and_does_not_flatten_the_joint
             // static bootstrap peers, even if this crash retains every page.
             power_loss_and_restart(&mut cluster, b).await;
             cluster.policy.clear();
-            madsim::time::sleep(Duration::from_secs(1)).await;
-            assert_gated(&cluster, a, &context);
-            assert_gated(&cluster, b, &context);
-            let after = metrics(&cluster, joint_group, leader);
+            // Both durable votes survived. Recovery must admit replication
+            // under the current leader's vote, repair both suffixes, and let
+            // OpenRaft finish the existing joint transition without inventing
+            // another membership configuration.
+            wait_healed(&cluster, &context, Duration::from_secs(10)).await;
+            madsim::time::timeout(Duration::from_secs(10), remove)
+                .await
+                .expect("joint transition completes after both prefixes repair")
+                .expect("membership task joins")
+                .expect("membership transition succeeds");
+            let final_membership = metrics(&cluster, joint_group, leader);
             assert_eq!(
-                *after.membership_config.log_id(),
-                *joint.membership_config.log_id()
-            );
-            assert!(
-                after
+                final_membership
                     .membership_config
                     .membership()
-                    .get_joint_config()
-                    .len()
-                    > 1
+                    .get_joint_config(),
+                &vec![std::collections::BTreeSet::from([leader, b])]
             );
-            assert_no_vote_while_gated(&cluster, &context);
             for group in JOURNAL_GROUPS {
                 assert_eq!(
                     read_local(&cluster, group, leader).await,
                     cluster.acknowledged[&group]
                 );
+                cluster.append(group, 1).await;
             }
-            remove.abort();
-            let _ = remove.await;
         });
     }
 }

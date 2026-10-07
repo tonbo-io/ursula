@@ -23,6 +23,7 @@ use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
 use openraft::rt::WatchReceiver;
+use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
@@ -130,6 +131,7 @@ pub struct RaftGroupEngineOptions {
 }
 
 pub struct RaftGroupEngine {
+    pub(crate) replica_fences: Arc<crate::replica_fence::ReplicaFences>,
     pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
     pub(crate) process_authority: Option<crate::RaftGroupHandleRegistry>,
@@ -314,7 +316,7 @@ impl RaftGroupEngine {
         node_id: u64,
         config: Arc<Config>,
         network_factory: NF,
-        log_store: LS,
+        mut log_store: LS,
         options: RaftGroupEngineOptions,
     ) -> Result<Self, GroupEngineError>
     where
@@ -351,6 +353,66 @@ impl RaftGroupEngine {
         // One page cache per group, shared by the read path and the state
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.
+        if let Some(registry) = &process_authority
+            && let Some(genesis) = registry.replica_genesis()
+        {
+            if state_machine.replica_fences.snapshot().is_empty() {
+                let persisted_vote =
+                    log_store
+                        .get_log_reader()
+                        .await
+                        .read_vote()
+                        .await
+                        .map_err(|error| {
+                            GroupEngineError::backend(
+                                ursula_runtime::BackendOperation::RestoreSnapshot,
+                                error,
+                            )
+                        })?;
+                let persisted_log = log_store.get_log_state().await.map_err(|error| {
+                    GroupEngineError::backend(
+                        ursula_runtime::BackendOperation::RestoreSnapshot,
+                        error,
+                    )
+                })?;
+                if persisted_vote.is_some()
+                    || persisted_log.last_log_id.is_some()
+                    || persisted_log.last_purged_log_id.is_some()
+                    || state_machine.last_applied_log_id.is_some()
+                {
+                    return Err(GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::ReplicaFenceMissingMetadata {
+                            group: placement.raft_group_id,
+                        },
+                    ));
+                }
+            }
+            state_machine
+                .seed_replica_fences(
+                    genesis,
+                    registry.replica_genesis_prefix(placement.raft_group_id),
+                )
+                .await
+                .map_err(|error| {
+                    GroupEngineError::backend(
+                        ursula_runtime::BackendOperation::RestoreSnapshot,
+                        error,
+                    )
+                })?;
+        }
+        let config = if state_machine.replica_fences.required_index()
+            > state_machine
+                .last_applied_log_id
+                .map(|log| log.index())
+                .unwrap_or_default()
+        {
+            let mut gated = (*config).clone();
+            gated.enable_elect = false;
+            Arc::new(gated)
+        } else {
+            config
+        };
+        let replica_fences = state_machine.replica_fences.clone();
         let cold_index_cache = state_machine.engine.cold_index_cache();
         let apply_failure = state_machine.apply_failure.clone();
         let metadata_serial = state_machine.metadata_serial.clone();
@@ -367,6 +429,7 @@ impl RaftGroupEngine {
         })?;
 
         Ok(Self {
+            replica_fences,
             snapshot_installs: Arc::default(),
             metadata_serial,
             process_authority,
@@ -489,9 +552,14 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        if matches!(command, GroupWriteCommand::InstallReplicaIdentity { .. }) {
+            return Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::ReplicaFenceRequiresRaft,
+            ));
+        }
         if let Some(authority) = &self.process_authority {
             authority
-                .confirm_process_authority()
+                .confirm_process_authority(self.placement.raft_group_id)
                 .await
                 .map_err(|error| {
                     GroupEngineError::backend(ursula_runtime::BackendOperation::Write, error)
@@ -506,7 +574,7 @@ impl RaftGroupEngine {
         };
         if let Some(authority) = &self.process_authority {
             authority
-                .confirm_process_authority()
+                .confirm_process_authority(self.placement.raft_group_id)
                 .await
                 .map_err(|error| {
                     GroupEngineError::backend(ursula_runtime::BackendOperation::Write, error)

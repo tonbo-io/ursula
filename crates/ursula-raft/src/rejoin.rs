@@ -491,6 +491,7 @@ pub enum RecoveryGateError {
 /// One replica's recovery state for one group: the inbound vote gate and,
 /// while it leads, the followers it saw lose entries.
 pub struct GroupRejoin {
+    replica_fence_required_index: std::sync::atomic::AtomicU64,
     node_id: u64,
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
@@ -567,7 +568,8 @@ impl GroupRejoin {
             raft_group_id,
             metrics: OnceLock::new(),
             gate: Mutex::new(gate),
-            vote_floor: Mutex::new(None),
+            replica_fence_required_index: std::sync::atomic::AtomicU64::new(0),
+            vote_floor: Mutex::new(store.vote()),
             reverted: Mutex::new(RevertedFollowers::default()),
             response_epochs: Mutex::new(BTreeMap::new()),
             store: Arc::downgrade(store),
@@ -575,8 +577,16 @@ impl GroupRejoin {
         })
     }
 
-    /// Replication cannot count this replica until it has sampled an intersecting
-    /// set of peers after restart. Open gates retain their normal Raft vote check.
+    pub(crate) fn needs_vote_floor(&self) -> bool {
+        self.vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// A retained durable vote fences replication without consulting meta.
+    /// Only a replica that lost its vote must recover a certified floor first;
+    /// a closed election gate can still receive entries needed to repair it.
     pub fn replication_allowed(&self, vote: UrsulaVote) -> bool {
         self.vote_floor
             .lock()
@@ -668,13 +678,35 @@ impl GroupRejoin {
     }
 
     /// Whether the vote gate is open.
+    pub fn set_replica_fence_required_index(&self, index: u64) {
+        self.replica_fence_required_index
+            .fetch_max(index, std::sync::atomic::Ordering::AcqRel);
+        self.changes.send_if_modified(|()| true);
+    }
+
+    fn replica_prefix_applied(&self) -> bool {
+        let required = self
+            .replica_fence_required_index
+            .load(std::sync::atomic::Ordering::Acquire);
+        required == 0
+            || self
+                .metrics()
+                .and_then(|metrics| metrics.last_applied)
+                .is_some_and(|log| log.index() >= required)
+    }
+
     pub fn vote_gate_open(&self) -> bool {
-        self.gate().is_open()
+        self.replica_prefix_applied() && self.gate().is_open()
     }
 
     /// The gate as status reports show it.
     pub fn status(&self) -> RecoveryGateStatus {
-        self.gate().status()
+        let status = self.gate().status();
+        if status == RecoveryGateStatus::Open && !self.replica_prefix_applied() {
+            RecoveryGateStatus::AwaitingBarrier
+        } else {
+            status
+        }
     }
 
     /// Whether this replica ever held the group's log, as far as it knows:
@@ -739,6 +771,9 @@ impl GroupRejoin {
         let Some(metrics) = self.metrics() else {
             return Ok(self.vote_gate_open());
         };
+        if !self.replica_prefix_applied() {
+            return Ok(false);
+        }
         {
             let gate = self.gate();
             if gate.is_open() {
@@ -845,7 +880,8 @@ impl GroupRejoin {
         let current_vote = floor
             .filter(|floor| *floor > metrics.vote)
             .unwrap_or(metrics.vote);
-        let screen = if request.vote < current_vote
+        let screen = if !self.replica_prefix_applied()
+            || request.vote < current_vote
             || (!self.vote_gate_open() && floor.is_none() && request.vote.leader_id().term() > 0)
         {
             VoteScreen::Refuse
@@ -1439,6 +1475,29 @@ mod tests {
         // entry records the group initialized.
         gate.allow_fresh_bootstrap().await.expect("fresh bootstrap");
         assert!(gate.vote_gate_open());
+        // A separately fsynced replica fence can survive a Never-mode lost
+        // suffix. Even an otherwise open gate must apply its certified prefix
+        // before this replica can count in an election again.
+        let (metrics_tx, metrics_rx) =
+            <UrsulaRaftTypeConfig as openraft::type_config::TypeConfigExt>::watch_channel(
+                openraft::RaftMetrics::new_initial(1),
+            );
+        assert!(matches!(gate.metrics.set(metrics_rx), Ok(())));
+        gate.set_replica_fence_required_index(1);
+        let request = crate::types::UrsulaVoteRequest {
+            vote: vote(2, 2),
+            last_log_id: Some(log_id(2, 2, 2)),
+        };
+        assert!(!gate.vote_gate_open());
+        assert!(!gate.may_campaign());
+        assert!(gate.screen_vote(&request).is_some());
+        openraft::rt::WatchSender::send_if_modified(&metrics_tx, |metrics| {
+            metrics.last_applied = Some(log_id(1, 1, 1));
+            true
+        });
+        assert!(gate.vote_gate_open());
+        assert!(gate.may_campaign());
+        assert!(gate.screen_vote(&request).is_none());
         store.save_vote(&leader(1, 1)).await.expect("vote");
         let (flushed, result) =
             <UrsulaRaftTypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
@@ -1485,6 +1544,12 @@ mod tests {
             .await
             .expect("open the gate");
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
+        assert!(
+            !gate.needs_vote_floor(),
+            "durable votes do not require a meta quorum to receive replication"
+        );
+        assert!(gate.replication_allowed(leader(2, 2)));
+        assert!(!gate.replication_allowed(vote(0, 0)));
         assert!(gate.holds_group_history(), "it never initializes again");
         assert_eq!(gate.gate().screen(Some(0)), VoteScreen::Refuse);
         // Its refusals report the log it holds, so a bootstrap probe sees

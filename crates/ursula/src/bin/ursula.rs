@@ -36,7 +36,7 @@ struct LegacyServerCli {
 #[tokio::main]
 async fn main() {
     let result = match parse_command() {
-        Command::Server(args) => ursula::server::run(args).await,
+        Command::Server(args) => Box::pin(ursula::server::run(args)).await,
         Command::Gateway(args) => ursula_gateway::service::run(*args).await,
         Command::Indexer(args) => ursula_index::service::run(*args).await.map_err(Into::into),
     };

@@ -22,6 +22,18 @@ use std::time::UNIX_EPOCH;
 
 use ursula_runtime::ColdStore;
 
+fn meta_auth_token_file(config: &Path) -> PathBuf {
+    let path = config
+        .parent()
+        .expect("config parent")
+        .join("meta-auth.token");
+    if !path.exists() {
+        std::fs::write(&path, format!("{:032x}", rand::random::<u128>()))
+            .expect("write shared meta authentication token");
+    }
+    path
+}
+
 struct ChildGuard {
     child: Child,
     label: String,
@@ -660,6 +672,8 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
             .replace("meta = { enabled = false }\n", "")
             .replace("flush_interval = \"1s\"", "flush_interval = \"1h\"");
         contents.push_str(&format!("\n[[raft.groups]]\nraft_group_id = 0\nvoters = [1, 2]\n\n[raft.meta]\nenabled = true\nlisten = \"127.0.0.1:{}\"\n", meta_ports[index]));
+        let auth_token = meta_auth_token_file(config.as_ref());
+        contents.push_str(&format!("auth_token_file = {:?}\n", auth_token));
         for (peer_index, port) in meta_ports.iter().enumerate() {
             let id = peer_index.saturating_add(1);
             contents.push_str(&format!(
@@ -725,21 +739,58 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     // Purge the other original owner too, so leadership movement cannot let
     // the target catch up solely through retained logs instead of a snapshot.
     let node2_admin = format!("http://127.0.0.1:{node2_admin_port}");
+    let started = std::time::Instant::now();
+    loop {
+        let metrics: ursula_proto::admin::NodeMetrics = client
+            .get(format!("{node2_admin}/__ursula/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if metrics.raft_groups.iter().any(|group| {
+            group.raft_group_id == 0 && group.last_applied_index >= Some(snapshot_index)
+        }) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "second owner did not apply snapshot prefix {snapshot_index}: {metrics:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let snapshot2 = admin_test_post(&client, format!("{node2_admin}/__ursula/raft/0/snapshot"))
         .await
         .send()
         .await
         .unwrap();
-    assert_eq!(snapshot2.status(), reqwest::StatusCode::OK);
+    let snapshot2_status = snapshot2.status();
+    let snapshot2_body = snapshot2.text().await.unwrap();
+    assert_eq!(
+        snapshot2_status,
+        reqwest::StatusCode::OK,
+        "{snapshot2_body}"
+    );
+    let snapshot2_index =
+        serde_json::from_str::<serde_json::Value>(&snapshot2_body).unwrap()["snapshot_index"]
+            .as_u64()
+            .unwrap();
+    assert!(
+        snapshot2_index >= snapshot_index,
+        "snapshot2={snapshot2_body}, required={snapshot_index}"
+    );
     let purge2 = admin_test_post(
         &client,
-        format!("{node2_admin}/__ursula/raft/0/purge?upto={snapshot_index}"),
+        format!("{node2_admin}/__ursula/raft/0/purge?upto={snapshot2_index}"),
     )
     .await
     .send()
     .await
     .unwrap();
-    assert_eq!(purge2.status(), reqwest::StatusCode::OK);
+    let purge2_status = purge2.status();
+    let purge2_body = purge2.text().await.unwrap();
+    assert_eq!(purge2_status, reqwest::StatusCode::OK, "{purge2_body}");
     wait_until_ready(&client, &peers[2].1, &mut children).await;
     let before: ursula_proto::admin::NodeMetrics = client
         .get(format!("{}/__ursula/metrics", peers[2].1))
@@ -1635,20 +1686,25 @@ async fn put_with_body_until_created(
     url: &str,
     payload: &'static str,
 ) -> reqwest::Response {
+    let mut last_failure = String::new();
     for _ in 0..100 {
-        if let Ok(response) = client
+        match client
             .put(url)
             .header("content-type", "text/plain")
             .body(payload)
             .send()
             .await
-            && response.status() == reqwest::StatusCode::CREATED
         {
-            return response;
+            Ok(response) if response.status() == reqwest::StatusCode::CREATED => return response,
+            Ok(response) => {
+                let status = response.status();
+                last_failure = format!("{status}: {:?}", response.text().await);
+            }
+            Err(error) => last_failure = format!("{error:?}"),
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("create with payload did not succeed at {url}");
+    panic!("create with payload did not succeed at {url}: {last_failure}");
 }
 
 async fn post_until_no_content(client: &reqwest::Client, url: &str, payload: &'static str) {
@@ -1795,6 +1851,308 @@ fn core_journal_record_bytes(core_dir: &Path) -> u64 {
         .sum()
 }
 
+/// The common single-node TOML/CI shape needs only a WAL path. Independent
+/// local servers auto-bootstrap private one-voter meta groups without4439 clashes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_durable_standalone_automatically_bootstraps_meta_and_restarts() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let root = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let mut configs = Vec::new();
+    let mut urls = Vec::new();
+    let mut admins = Vec::new();
+    for node in [7, 9] {
+        let port = free_port();
+        let admin = free_port();
+        let config = root.path().join(format!("standalone-{node}.toml"));
+        let wal = root.path().join(format!("wal-{node}"));
+        std::fs::write(
+            &config,
+            format!(
+                r#"[server]
+listen = "127.0.0.1:{port}"
+admin_listen = "127.0.0.1:{admin}"
+[runtime]
+core_count = 1
+[raft]
+node_id = {node}
+group_count = 1
+[raft.wal]
+path = "{}"
+[storage.cold]
+flush_interval = "1h"
+"#,
+                wal.display()
+            ),
+        )
+        .unwrap();
+        configs.push(config);
+        urls.push(format!("http://127.0.0.1:{port}"));
+        admins.push(format!("http://127.0.0.1:{admin}"));
+    }
+    let mut children: Vec<_> = configs
+        .iter()
+        .map(|path| spawn_node_with_cluster_config(binary, path))
+        .collect();
+    let client = reqwest::Client::new();
+    for (index, url) in urls.iter().enumerate() {
+        wait_until_ready(&client, url, &mut children).await;
+        put_with_body_until_created(
+            &client,
+            &format!("{url}/standalone/persisted"),
+            "durable-single",
+        )
+        .await;
+        let state: ursula_control::ControlPlaneState = client
+            .get(format!("{}/__ursula/control/state", admins[index]))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(state.operations.processes.len(), 1);
+        assert_eq!(state.placements.len(), 1);
+    }
+    sigterm_and_wait_for_clean_exit(&mut children[0]).await;
+    children[0] = spawn_node_with_cluster_config(binary, &configs[0]);
+    wait_until_ready(&client, &urls[0], &mut children).await;
+    read_until_matches(
+        &client,
+        &format!("{}/standalone/persisted?offset=-1", urls[0]),
+        b"durable-single",
+    )
+    .await;
+    post_until_no_content(
+        &client,
+        &format!("{}/standalone/persisted", urls[0]),
+        "-restarted",
+    )
+    .await;
+    read_until_matches(
+        &client,
+        &format!("{}/standalone/persisted?offset=-1", urls[0]),
+        b"durable-single-restarted",
+    )
+    .await;
+}
+
+/// Pre-identity WALs require logical backup/restore; startup cannot adopt them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_meta_activation_rejects_legacy_identity_wals_without_modification() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let root = tempfile::tempdir().unwrap();
+    let ports = [free_port(), free_port(), free_port()];
+    let meta_ports = [free_port(), free_port(), free_port()];
+    let peers: Vec<_> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, node)| (node, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let mut configs = Vec::new();
+    let mut nodes = Vec::new();
+    let mut wal_dirs = Vec::new();
+    for (index, (node_id, base)) in peers.iter().enumerate() {
+        let config = root.path().join(format!("node-{node_id}.toml"));
+        let wal = root.path().join(format!("wal-{node_id}"));
+        let admin = write_cluster_config(&config, ports[index], *node_id, 4, &peers, true, &wal);
+        let contents = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace(
+                "init_membership_per_group = false",
+                "init_membership_per_group = true",
+            )
+            .replace("flush_interval = \"1s\"", "flush_interval = \"1h\"");
+        assert!(contents.contains("meta = { enabled = false }"));
+        std::fs::write(&config, contents).unwrap();
+        nodes.push(ctl_node(*node_id, admin, base));
+        configs.push(config);
+        wal_dirs.push(wal);
+    }
+    let mut children: Vec<_> = configs
+        .iter()
+        .map(|path| spawn_node_with_cluster_config(binary, path))
+        .collect();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    for (_, base) in &peers {
+        wait_until_ready(&client, base, &mut children).await;
+    }
+    let metrics_client = ursula_ctl::MetricsClient::new(Duration::from_secs(10)).unwrap();
+    ursula_ctl::wait_ready(
+        &metrics_client,
+        &nodes,
+        4,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+    let stream = format!("{}/cutover/preserved", peers[0].1);
+    put_with_body_until_created(&client, &stream, "before-meta").await;
+    let before_head = client.head(&stream).send().await.unwrap();
+    assert_eq!(before_head.status(), reqwest::StatusCode::OK);
+    let offset = before_head.headers()["stream-next-offset"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(offset.parse::<usize>().unwrap(), b"before-meta".len());
+    for (_, base) in &peers {
+        read_until_matches(
+            &client,
+            &format!("{base}/cutover/preserved?offset=-1"),
+            b"before-meta",
+        )
+        .await;
+    }
+    let identities: Vec<_> = wal_dirs
+        .iter()
+        .map(|wal| {
+            assert!(!wal.join("meta-raft").exists());
+            (
+                std::fs::metadata(wal).unwrap().ino(),
+                std::fs::read(wal.join("raft-log/FORMAT_EPOCH")).unwrap(),
+            )
+        })
+        .collect();
+
+    // Stop every old listener before starting any meta-enabled process. This
+    // avoids the first upgraded pod waiting on peers without meta transport.
+    for child in &mut children {
+        assert!(
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(child.child.id().to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut all_stopped = true;
+        for child in &mut children {
+            if let Some(status) = child.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "unclean coordinated shutdown: {}",
+                    child_report(child)
+                );
+            } else {
+                all_stopped = false;
+            }
+        }
+        if all_stopped {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "coordinated stop exceeded budget"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    fn wal_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+    let preserved: Vec<_> = wal_dirs
+        .iter()
+        .map(|wal| wal_bytes(&wal.join("raft-log")))
+        .collect();
+    drop(children);
+    for (index, config) in configs.iter().enumerate() {
+        let mut contents = std::fs::read_to_string(config)
+            .unwrap()
+            .replace("meta = { enabled = false }\n", "");
+        contents.push_str(&format!(
+            "\n[raft.meta]\nenabled = true\nlisten = \"127.0.0.1:{}\"\n",
+            meta_ports[index]
+        ));
+        let auth_token = meta_auth_token_file(config.as_ref());
+        contents.push_str(&format!("auth_token_file = {:?}\n", auth_token));
+        for (peer_index, port) in meta_ports.iter().enumerate() {
+            let node_id = peer_index.saturating_add(1);
+            contents.push_str(&format!(
+                "\n[[raft.meta.peers]]\nnode_id = {node_id}\nurl = \"http://127.0.0.1:{port}\"\n"
+            ));
+        }
+        std::fs::write(config, contents).unwrap();
+    }
+    let mut children: Vec<_> = configs
+        .iter()
+        .map(|path| spawn_node_with_cluster_config(binary, path))
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    for child in &mut children {
+        loop {
+            if let Some(status) = child.child.try_wait().unwrap() {
+                assert!(!status.success(), "legacy WAL was silently adopted");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "legacy startup did not reject: {}",
+                child_report(child)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    for (index, wal) in wal_dirs.iter().enumerate() {
+        assert_eq!(std::fs::metadata(wal).unwrap().ino(), identities[index].0);
+        assert_eq!(
+            std::fs::read(wal.join("raft-log/FORMAT_EPOCH")).unwrap(),
+            identities[index].1
+        );
+        let after = wal_bytes(&wal.join("raft-log"));
+        let before = &preserved[index];
+        let changed = before
+            .keys()
+            .chain(after.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|path| before.get(*path) != after.get(*path))
+            .map(|path| {
+                (
+                    path,
+                    before.get(path).map(Vec::len),
+                    after.get(path).map(Vec::len),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            changed.is_empty(),
+            "rejected startup changed legacy WAL files (path, before length, after length): {changed:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     use std::collections::BTreeMap;
@@ -1877,7 +2235,20 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     for (index, (node_id, _)) in peers.iter().enumerate() {
         let config = root.path().join(format!("node-{node_id}.toml"));
         let wal = root.path().join(format!("wal-{node_id}"));
-        let admin = write_cluster_config(&config, ports[index], *node_id, 1, &peers, true, &wal);
+        let bootstrap_peers = if *node_id == 4 {
+            &peers[..]
+        } else {
+            &peers[..3]
+        };
+        let admin = write_cluster_config(
+            &config,
+            ports[index],
+            *node_id,
+            1,
+            bootstrap_peers,
+            *node_id != 4,
+            &wal,
+        );
         let mut contents = std::fs::read_to_string(&config)
             .expect("read generated config")
             .replace("meta = { enabled = false }\n", "")
@@ -1885,7 +2256,13 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             // memory cold backend is private; shared S3 recovery has its own suite.
             .replace("flush_interval = \"1s\"", "flush_interval = \"1h\"");
         contents.push_str(&format!("\n[[raft.groups]]\nraft_group_id = 0\nvoters = [1, 2, 3]\n\n[raft.meta]\nenabled = true\nlisten = \"127.0.0.1:{}\"\n", meta_ports[index]));
-        for (peer_index, port) in meta_ports.iter().enumerate() {
+        let auth_token = meta_auth_token_file(config.as_ref());
+        contents.push_str(&format!("auth_token_file = {:?}\n", auth_token));
+        for (peer_index, port) in meta_ports
+            .iter()
+            .take(if *node_id == 4 { 4 } else { 3 })
+            .enumerate()
+        {
             let id = peer_index.saturating_add(1);
             contents.push_str(&format!(
                 "\n[[raft.meta.peers]]\nnode_id = {id}\nurl = \"http://127.0.0.1:{port}\"\n"
@@ -1898,21 +2275,70 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     let binary = env!("CARGO_BIN_EXE_ursula");
     let mut children: Vec<_> = configs
         .iter()
+        .take(3)
         .map(|config| spawn_node_with_cluster_config(binary, config))
         .collect();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .expect("client");
-    for (_, url) in &peers {
+    for (_, url) in peers.iter().take(3) {
         wait_until_ready(&client, url, &mut children).await;
     }
     let admin = &admins[0];
+    let genesis = state(&client, admin).await;
+    assert_eq!(genesis.operations.processes.len(), 3);
+    assert!(!genesis.nodes.contains_key(&4));
+    let stream = format!("{}/meta/drill", peers[0].1);
+    let read = format!("{stream}?offset=-1");
+    put_with_body_until_created(&client, &stream, "durable-before-maintenance").await;
+    // A coordinated clean restart preserves Never WAL durability. Killing all
+    // voters on a platform without a boot ID correctly requires loss recovery.
+    futures_util::future::join_all(children.iter_mut().map(sigterm_and_wait_for_clean_exit)).await;
+    children = configs
+        .iter()
+        .take(3)
+        .map(|config| spawn_node_with_cluster_config(binary, config))
+        .collect();
+    for (_, url) in peers.iter().take(3) {
+        wait_until_ready(&client, url, &mut children).await;
+    }
+    let restarted_genesis = state(&client, admin).await;
+    assert_eq!(restarted_genesis.placements, genesis.placements);
+    assert_eq!(
+        restarted_genesis.operations.replicas,
+        genesis.operations.replicas
+    );
+    for node_id in [1, 2, 3] {
+        assert!(
+            restarted_genesis.operations.processes[&node_id].epoch()
+                > genesis.operations.processes[&node_id].epoch()
+        );
+    }
+    read_until_matches(&client, &read, b"durable-before-maintenance").await;
+    let response = admin_test_post(&client, format!("{admin}/__ursula/control/operation"))
+        .await
+        .json(&OperationRequest::JoinNode {
+            node_id: 4,
+            client_url: peers[3].1.clone(),
+            cluster_url: peers[3].1.clone(),
+            meta_url: format!("http://127.0.0.1:{}", meta_ports[3]),
+        })
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "join: {status}: {body}");
+    assert_eq!(
+        serde_json::from_str::<ControlResponse>(&body).unwrap(),
+        ControlResponse::Ok
+    );
+    children.push(spawn_node_with_cluster_config(binary, &configs[3]));
+    wait_until_ready(&client, &peers[3].1, &mut children).await;
     let initial = state(&client, admin).await;
     assert_eq!(initial.operations.processes.len(), 4);
-    let stream = format!("{}/meta/drill", peers[0].1);
-    put_with_body_until_created(&client, &stream, "durable-before-maintenance").await;
-    let read = format!("{stream}?offset=-1");
+    assert_eq!(initial.placements, genesis.placements);
     read_until_matches(&client, &read, b"durable-before-maintenance").await;
 
     // An ordinary same-PV restart is a CAS boot claim, not a rebuild intent.
@@ -1924,6 +2350,36 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     assert!(restarted.operations.processes[&2].epoch() > initial.operations.processes[&2].epoch());
     assert_eq!(restarted.placements, initial.placements);
     read_until_matches(&client, &read, b"durable-before-maintenance").await;
+    let started = std::time::Instant::now();
+    loop {
+        let metrics: ursula_proto::admin::NodeMetrics = client
+            .get(format!("{}/__ursula/metrics", admins[1]))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if metrics
+            .diagnostics
+            .recovery_gates
+            .as_ref()
+            .is_some_and(|report| report.gated.is_empty())
+            && metrics
+                .raft_groups
+                .iter()
+                .any(|group| group.raft_group_id == 0)
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "node2 did not recover before maintenance: {metrics:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     for (sequence, kind) in [
         OperationKind::MoveReplicas {
@@ -1932,9 +2388,14 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             groups: BTreeSet::from([RaftGroupId(0)]),
         },
         OperationKind::RebuildReplica { node_id: 2 },
+        OperationKind::MoveReplicas {
+            source: 1,
+            target: 3,
+            groups: BTreeSet::from([RaftGroupId(0)]),
+        },
         OperationKind::DecommissionNode {
             node_id: 3,
-            replacements: BTreeMap::new(),
+            replacements: BTreeMap::from([(RaftGroupId(0), 1)]),
         },
     ]
     .into_iter()
@@ -1943,7 +2404,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         if matches!(kind, OperationKind::RebuildReplica { .. }) {
             // Exercise demotion of the actual leader, not only a follower:
             // retain=true can otherwise leave a learner sending heartbeats.
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let started = std::time::Instant::now();
             loop {
                 let metrics: ursula_proto::admin::NodeMetrics = client
                     .get(format!("{}/__ursula/metrics", admins[1]))
@@ -1962,11 +2423,11 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                     break;
                 }
                 assert!(
-                    std::time::Instant::now() < deadline,
+                    started.elapsed() < Duration::from_secs(30),
                     "source never became leader"
                 );
                 if let Some(leader) = leader {
-                    let index = usize::try_from(leader - 1).unwrap();
+                    let index = usize::try_from(leader).unwrap().checked_sub(1).unwrap();
                     let response = admin_test_post(
                         &client,
                         format!("{}/__ursula/raft/0/leader/transfer/2", admins[index]),
@@ -1995,6 +2456,91 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         let OperationOutcome::Acquired(token) = outcome else {
             panic!("expected acquired operation")
         };
+        if matches!(kind, OperationKind::MoveReplicas { source: 3, .. }) {
+            // Same-WAL restarts of source, target and survivor during Preparing
+            // must refresh boot pins without changing the durable replica token.
+            for index in [2_usize, 3, 1] {
+                let before = state(&client, admin).await;
+                children[index]
+                    .child
+                    .kill()
+                    .expect("restart operation participant");
+                children[index]
+                    .child
+                    .wait()
+                    .expect("join operation participant");
+                children[index] = spawn_node_with_cluster_config(binary, &configs[index]);
+                wait_until_ready(&client, &peers[index].1, &mut children).await;
+                let after = state(&client, admin).await;
+                let node_id = u64::try_from(index).unwrap().saturating_add(1);
+                assert!(
+                    after.operations.processes[&node_id].epoch()
+                        > before.operations.processes[&node_id].epoch()
+                );
+                assert_eq!(
+                    after.operations.replicas[&node_id],
+                    before.operations.replicas[&node_id]
+                );
+                assert_eq!(after.operations.active.as_ref().unwrap().token, token);
+                // Metrics HTTP availability does not mean a Never-mode crash
+                // has passed its survivor barrier. Recover this participant
+                // before removing another member of the same quorum.
+                let process = match &after.operations.processes[&node_id] {
+                    ursula_control::ProcessState::Active(process) => process,
+                    other => panic!("restarted participant is not active: {other:?}"),
+                };
+                let started = std::time::Instant::now();
+                loop {
+                    let metrics: ursula_proto::admin::NodeMetrics = client
+                        .get(format!("{}/__ursula/metrics", admins[index]))
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let recovery_ready = if node_id == 4 {
+                        // This target has never joined a data membership. Its
+                        // closed gate persists until Reconcile adds the learner.
+                        metrics.raft_groups.iter().all(|group| {
+                            group.voter_ids.is_empty()
+                                && group.learner_ids.is_empty()
+                                && group.last_log_index.is_none()
+                        })
+                    } else {
+                        metrics
+                            .diagnostics
+                            .recovery_gates
+                            .as_ref()
+                            .is_some_and(|report| report.gated.is_empty())
+                            && metrics
+                                .raft_groups
+                                .iter()
+                                .any(|group| group.raft_group_id == 0)
+                    };
+                    if metrics.process_incarnation.as_ref() == Some(&process.incarnation)
+                        && recovery_ready
+                    {
+                        break;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "participant {node_id} did not recover: {metrics:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                read_until_matches(&client, &read, b"durable-before-maintenance").await;
+            }
+        }
+        if matches!(kind, OperationKind::DecommissionNode { .. }) {
+            // Populate and promote replacements while the source still serves.
+            operation(&client, admin, OperationRequest::Reconcile {
+                token: token.clone(),
+            })
+            .await;
+        }
         if !matches!(kind, OperationKind::MoveReplicas { .. }) {
             operation(&client, admin, OperationRequest::CollectEvidence {
                 token: token.clone(),
@@ -2008,18 +2554,107 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         if matches!(kind, OperationKind::RebuildReplica { .. }) {
             children[1].child.kill().expect("stop retired node2");
             children[1].child.wait().expect("join retired node2");
+            let retired = state(&client, admin).await;
+            // Restarting the revoked old WAL is not a replacement. It must
+            // fail before changing the retired process/replica authority.
+            children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = children[1].child.try_wait().unwrap() {
+                    assert!(!status.success(), "retired WAL unexpectedly booted");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "retired WAL did not fail closed"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let rejected = state(&client, admin).await;
+            assert_eq!(
+                rejected.operations.processes[&2],
+                retired.operations.processes[&2]
+            );
+            assert_eq!(
+                rejected.operations.replicas[&2],
+                retired.operations.replicas[&2]
+            );
             // Remove the entire retired PV, including meta votes/snapshots and
             // data journals. The meta survivor quorum must authorize a fresh
             // durable vote floor before this replica can participate again.
             std::fs::remove_dir_all(root.path().join("wal-2"))
                 .expect("remove retired whole-node storage");
             children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
-            wait_until_ready(&client, &peers[1].1, &mut children).await;
+            // A new WAL remains meta-only until Reconcile durably fences its
+            // replacement identity on every survivor group and activates it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let observed = state(&client, admin).await;
+                if matches!(
+                    observed.operations.replicas.get(&2),
+                    Some(ursula_control::ReplicaState::Pending { .. })
+                ) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "replacement never registered pending identity"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let pending = state(&client, admin).await;
+            children[1]
+                .child
+                .kill()
+                .expect("restart pending replacement");
+            children[1].child.wait().expect("join pending replacement");
+            children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let restarted = state(&client, admin).await;
+                if restarted.operations.processes[&2].epoch()
+                    > pending.operations.processes[&2].epoch()
+                {
+                    assert_eq!(
+                        restarted.operations.replicas[&2],
+                        pending.operations.replicas[&2]
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pending replacement restart did not reclaim its boot"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
         operation(&client, admin, OperationRequest::Reconcile {
             token: token.clone(),
         })
         .await;
+        if matches!(kind, OperationKind::RebuildReplica { .. }) {
+            // A survivor may restart in Retired after the replacement has been
+            // fenced and promoted, before final evidence is collected.
+            let before = state(&client, admin).await;
+            children[3]
+                .child
+                .kill()
+                .expect("restart retired-phase survivor");
+            children[3]
+                .child
+                .wait()
+                .expect("join retired-phase survivor");
+            children[3] = spawn_node_with_cluster_config(binary, &configs[3]);
+            wait_until_ready(&client, &peers[3].1, &mut children).await;
+            let after = state(&client, admin).await;
+            assert!(
+                after.operations.processes[&4].epoch() > before.operations.processes[&4].epoch()
+            );
+            assert_eq!(
+                after.operations.replicas[&4],
+                before.operations.replicas[&4]
+            );
+        }
         operation(&client, admin, OperationRequest::CollectEvidence {
             token: token.clone(),
         })
@@ -2029,7 +2664,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             OperationOutcome::Completed
         );
         read_until_matches(&client, &read, b"durable-before-maintenance").await;
-        if matches!(kind, OperationKind::MoveReplicas { .. }) {
+        if matches!(kind, OperationKind::MoveReplicas { source: 3, .. }) {
             // The on-disk config still names voters 1/2/3. Committed meta placement
             // must reopen node4's new replica after an ordinary same-PV restart.
             children[3]

@@ -32,6 +32,8 @@ pub fn group_snapshot(
     group_commit_index: u64,
 ) -> GroupSnapshot {
     GroupSnapshot {
+        replica_fence_index: 0,
+        replica_identities: Default::default(),
         placement: placement0(),
         group_commit_index,
         stream_snapshot,

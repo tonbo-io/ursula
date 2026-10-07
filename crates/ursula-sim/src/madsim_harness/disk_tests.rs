@@ -2043,3 +2043,40 @@ fn failed_poison_marker_preserves_acknowledged_prefix_on_process_restart() {
         );
     });
 }
+
+#[test]
+fn replica_identity_generation_survives_host_power_loss() {
+    let _guard = sim_test_guard();
+    for seed in 0..16 {
+        run_with_madsim(seed, async move {
+            let dir = sim_dir("replica-identity");
+            let mut store = ursula_raft::wal::ReplicaIdentityStore::open(
+                &dir,
+                7,
+                ursula_proto::admin::ProcessIncarnation::from_bits(10),
+            )
+            .unwrap();
+            let identity = store.bind_initial_generation(4).unwrap();
+            drop(store);
+            SimDisk::power_loss(&dir).unwrap();
+            let mut reopened = ursula_raft::wal::ReplicaIdentityStore::open(
+                &dir,
+                7,
+                ursula_proto::admin::ProcessIncarnation::from_bits(11),
+            )
+            .unwrap();
+            assert_eq!(reopened.identity(), Some(&identity));
+            assert_eq!(reopened.bind_initial_generation(99).unwrap(), identity);
+            drop(reopened);
+            SimDisk::remove_file(&dir.join(ursula_raft::wal::REPLICA_IDENTITY_FILE)).unwrap();
+            assert!(matches!(
+                ursula_raft::wal::ReplicaIdentityStore::open(
+                    &dir,
+                    7,
+                    ursula_proto::admin::ProcessIncarnation::from_bits(12),
+                ),
+                Err(ursula_raft::wal::ReplicaIdentityError::MissingForExistingWal { .. })
+            ));
+        });
+    }
+}
