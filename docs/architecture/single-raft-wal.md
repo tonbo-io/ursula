@@ -194,7 +194,8 @@ stops the group until an operator accepts it.
 2. Fail-stop on I/O errors, format epoch 3 and reclaim fixes (#396).
 3. The `fsync` policy, the metadata and run-state files and the shutdown path
    (#397), the recovery gate and the default `never` (#398), then removal of
-   the memory backend.
-4. Segments, rewrite-based reclaim and bounded memory.
+   the memory backend (#399). Deterministic replay of journal simulations
+   (#400) followed.
+4. Segments, rewrite-based reclaim and bounded memory (#401).
 
 The meta-Raft control plane work starts after step 3.
