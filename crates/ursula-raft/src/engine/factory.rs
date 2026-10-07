@@ -352,11 +352,13 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
             let store = self.log_stores.open(placement, metrics.clone())?;
-            let rejoin = Arc::new(GroupRejoin::durable(
-                self.node_id,
-                placement.raft_group_id,
-                &store,
-            ));
+            let rejoin = Arc::new(
+                GroupRejoin::durable(self.node_id, placement.raft_group_id, &store)
+                    .await
+                    .map_err(|err| {
+                        GroupEngineError::new(format!("open the recovery gate: {err}"))
+                    })?,
+            );
             let mut raft_config = Config {
                 cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
                 // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.

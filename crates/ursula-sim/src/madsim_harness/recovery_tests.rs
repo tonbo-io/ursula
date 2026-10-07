@@ -8,6 +8,8 @@
 //! core journal (`JournalCluster`), with the production gate, barrier
 //! driver, heal driver and bootstrap on every node. The simulated network
 //! records every vote answer with the target's gate at that moment.
+//! Schedules that once broke the gate or the run state live in
+//! `regression`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -17,7 +19,10 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
+use ursula_proto::admin::AcceptUnsyncedLossRequest;
 use ursula_raft::AcceptUnsyncedLossOutcome;
+use ursula_raft::AcceptUnsyncedLossReport;
+use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaAppendEntriesRequest;
@@ -46,6 +51,9 @@ use super::seeds_from_env;
 use super::sim_test_guard;
 use crate::madsim_harness::run_with_madsim;
 use crate::madsim_harness::sim_wal::SimNodeWal;
+
+#[path = "recovery_regression_tests.rs"]
+mod regression;
 
 const NODES: [u64; 3] = [1, 2, 3];
 
@@ -151,6 +159,45 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
                 .collect::<Vec<_>>()
         );
         madsim::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The operator's acceptance of the unsynced loss on `node_id`'s replica of
+/// `group`, naming the log the group's metrics show there.
+async fn accept_observed_loss(
+    cluster: &JournalCluster,
+    group: u32,
+    node_id: u64,
+) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
+    let replica = metrics(cluster, group, node_id);
+    cluster.rejoins[&(group, node_id)]
+        .accept_unsynced_loss(&AcceptUnsyncedLossRequest {
+            expected_last_log_index: replica.last_log_index,
+            expected_current_term: replica.current_term,
+        })
+        .await
+}
+
+/// Moves the leadership of every group to `leader`.
+async fn lead_every_group(cluster: &JournalCluster, leader: u64, context: &str) {
+    for group in JOURNAL_GROUPS {
+        let current = wait_leader(cluster, group, context).await;
+        if current != leader {
+            cluster.engines[&(group, current)]
+                .raft_handle()
+                .trigger()
+                .transfer_leader(leader)
+                .await
+                .expect("transfer the leadership");
+        }
+        let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+        while leader_by_state(cluster, group) != Some(leader) {
+            assert!(
+                madsim::time::Instant::now() < deadline,
+                "{context}: group {group} never moved to node {leader}"
+            );
+            madsim::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 
@@ -434,25 +481,7 @@ fn a_surviving_leader_rewinds_a_majority_of_followers_that_lost_their_tail() {
             }
             // One node leads every group.
             let leader = wait_leader(&cluster, 0, &context).await;
-            for group in JOURNAL_GROUPS {
-                let current = wait_leader(&cluster, group, &context).await;
-                if current != leader {
-                    cluster.engines[&(group, current)]
-                        .raft_handle()
-                        .trigger()
-                        .transfer_leader(leader)
-                        .await
-                        .expect("transfer the leadership");
-                }
-                let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
-                while leader_by_state(&cluster, group) != Some(leader) {
-                    assert!(
-                        madsim::time::Instant::now() < deadline,
-                        "{context}: group {group} never moved to node {leader}"
-                    );
-                    madsim::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
+            lead_every_group(&cluster, leader, &context).await;
             let followers = NODES
                 .into_iter()
                 .filter(|node_id| *node_id != leader)
@@ -687,10 +716,10 @@ fn a_majority_power_loss_stops_until_the_operator_accepts_the_loss() {
                 let needed = 2_usize.saturating_sub(survivors.len());
                 for (_, node_id) in gated.into_iter().take(needed) {
                     assert_eq!(
-                        cluster.rejoins[&(group, node_id)]
-                            .accept_unsynced_loss()
+                        accept_observed_loss(&cluster, group, node_id)
                             .await
-                            .expect("accept the unsynced loss"),
+                            .expect("accept the unsynced loss")
+                            .outcome,
                         AcceptUnsyncedLossOutcome::GateOpened,
                         "{context}: node {node_id} group {group}"
                     );

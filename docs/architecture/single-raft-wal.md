@@ -115,6 +115,16 @@ Verification therefore cannot skip a bad frame. Because frame checksums cover
 the header, the payload and the segment sequence number, the kept frames form
 a valid log prefix.
 
+The run state records the current run's policy, and a later host crash is
+read by it, so that policy must hold for every write the journals hold. A
+process crash under `never` leaves acknowledged writes in the page cache only.
+A run that starts with `always` after such a crash therefore `fsync`s the
+newest segment of every core journal and its directory before it records
+itself. Older segments were `fsync`ed when they were sealed. If the host
+crashes before that record, the run state still names the `never` run and the
+next start gates every group. A run that keeps `never` has nothing to sync,
+since a host crash after it gates every group anyway.
+
 ## Recovery gate
 
 A replica whose log may be missing entries it acknowledged must not help
@@ -129,7 +139,13 @@ recovering replica still rejects appends from a leader with a stale term. A
 recovering replica that led its group starts as a follower: OpenRaft restores a
 replica whose committed vote names itself as that term's leader without an
 election, and with a truncated log it would reuse the log ids of entries it
-lost and fork the group.
+lost and fork the group. Before its Raft core starts, the replica records its
+vote for itself uncommitted in the metadata file, with the same `fsync`ed
+write as any vote, and only then runs with it. A failed write stops the group
+from starting. The committed vote is then gone from disk, so no later start
+restores the leadership, whether it follows a clean shutdown or comes after
+the gate opened, by a barrier or by an operator. A vote for another replica is
+never changed, and nothing is written for it.
 
 On the leader, a follower whose log moved backwards is rebuilt through the
 existing remove, learner and promote steps. If a majority of the followers
@@ -147,6 +163,27 @@ on more replicas than needed lets election choose any log at least as long as
 a majority's. This replaces `adopt-survivor` and `reinitialize`. A group whose
 state is `Initialized` or `Recovering` never runs `Initialize`, which replaces
 the S3 initialized markers and the restart guard.
+
+An acceptance is a compare-and-act on what the operator saw. Its request names
+the replica's last log index and current term, as the group's metrics showed
+them. The replica refuses it with `409 Conflict`, and changes nothing, unless
+its gate is stalled and it still holds that log. A gate that awaits or
+applies a barrier may still open without losing anything, and a replica whose
+log moved since the operator looked is no longer the one the operator chose.
+The admin incarnation precondition still applies, so a restarted process
+refuses a plan made against the one before it.
+
+### Known gap: a wiped voter accepts appends from a stale leader
+
+The gate screens votes but not appends. A voter that lost its disk also lost
+its vote, so it accepts appends from any leader, including one of a term it
+had already voted past. A leader of an older term that reaches only that
+voter can then commit an entry at an index a newer leader also committed.
+Closing the gap needs the replica to refuse such leaders before its gate
+opens, which this design does not do yet
+([#405](https://github.com/tonbo-io/ursula/issues/405)). The DST schedule that shows it,
+`a_wiped_voter_never_lets_a_stale_leader_commit`, asserts that no index is
+committed with two different entries and stays ignored until then.
 
 ## Journal hardening
 
@@ -175,7 +212,11 @@ DST then exercises the production journal, and `memory.rs` is deleted.
 
 For each policy, invariants check that no acknowledged write is lost within
 the contract above, that gated replicas never vote, and that majority loss
-stops the group until an operator accepts it.
+stops the group until an operator accepts it. Regression scenarios check that
+an accepted leader that restarts never forks the log, that a switch from
+`never` to `always` across a process crash keeps every acknowledged write or
+gates the group, and that an acceptance opens only a stalled gate for the log
+the operator saw.
 
 ## Removed
 

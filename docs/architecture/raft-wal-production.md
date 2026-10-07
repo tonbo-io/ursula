@@ -294,9 +294,10 @@ group stalled: a majority of the voters may be gated, so the group has no
 leader and refuses writes. Readiness answers `recovery_stalled`, and
 `recovery_gates` in the metrics JSON and the `ursula.raft.recovery_gates`
 gauge list it. `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
-opens the gate on one replica, recording `initialized`; run on the gated
-replicas with the longest logs until the open ones are a majority, an
-election then needs a candidate whose log is at least as long as theirs.
+opens the gate on one stalled replica whose `last_log_index` and
+`current_term` still match the request body, recording `initialized`; run on
+the gated replicas with the longest logs until the open ones are a majority,
+an election then needs a candidate whose log is at least as long as theirs.
 
 Bootstrap follows the log state. A replica that ever held its group never runs
 `Initialize`. The group's initializer that holds nothing runs it only when

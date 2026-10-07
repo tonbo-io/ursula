@@ -13,6 +13,9 @@ description = "Shared protobuf wire types for Ursula (stream commands, cold chun
 prost = { workspace = true }
 serde = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [build-dependencies]
 prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }

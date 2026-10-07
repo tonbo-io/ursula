@@ -745,6 +745,7 @@ mod tests {
                 "replay_mode": "strict",
                 "recovery": {"state": "normal"},
                 "recovery_epoch": 0,
+                "journal_sync": "not_needed",
             })
         );
         assert_eq!(

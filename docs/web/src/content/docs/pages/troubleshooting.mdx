@@ -113,8 +113,17 @@ leader and refuses writes. The groups are listed under
 `recovery_stalled_groups`. The group recovers only when an operator accepts the
 loss of writes acknowledged after the last `fsync`, with
 `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated
-replicas with the longest logs. See
+replicas with the longest logs. The request body names the replica's
+`last_log_index` and `current_term` from `/__ursula/metrics`. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
+
+### `accept-unsynced-loss` answers `409 Conflict`
+
+Nothing changed. The body says why. Either the replica's recovery gate is not
+stalled, so it may still open through a leader's barrier without losing
+anything, or the replica no longer holds the `last_log_index` and
+`current_term` the request names. Wait for `recovery_stalled`, read
+`/__ursula/metrics` on the replica again, and decide again with what it shows.
 
 ### I/O error on `raft.wal.path`
 

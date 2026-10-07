@@ -2615,15 +2615,19 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
 }
 
 /// Operator recovery when a majority of a group's voters are gated after a
-/// crash may have cost them their unsynced tail: open this node's recovery
-/// gate for the group, accepting that its replica may be missing entries it
-/// acknowledged, so it votes and campaigns with the log it holds. Run it on
-/// the gated replicas with the longest logs until a leader is elected.
+/// crash may have cost them their unsynced tail: open this node's stalled
+/// recovery gate for the group, accepting that its replica may be missing
+/// entries it acknowledged, so it votes and campaigns with the log it holds.
+/// The body names the replica's log as the operator saw it in the metrics;
+/// a gate that is not stalled, or a replica whose log changed since, is
+/// refused with `409 Conflict`. Run it on the gated replicas with the longest
+/// logs until a leader is elected.
 pub(crate) async fn accept_unsynced_loss(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
+    axum::Json(expected): axum::Json<ursula_proto::admin::AcceptUnsyncedLossRequest>,
 ) -> Response {
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+    let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
@@ -2634,29 +2638,23 @@ pub(crate) async fn accept_unsynced_loss(
         )
             .into_response();
     };
-    match registry.accept_unsynced_loss(raft_group_id).await {
-        Ok(outcome) => {
-            let metrics = raft.metrics().borrow_watched().clone();
-            (
-                StatusCode::OK,
-                axum::Json(ursula_raft::AcceptUnsyncedLossReport {
-                    raft_group_id: raft_group_id.0,
-                    node_id: metrics.id,
-                    outcome,
-                    last_log_index: metrics.last_log_index,
-                }),
-            )
-                .into_response()
-        }
+    match registry
+        .accept_unsynced_loss(raft_group_id, &expected)
+        .await
+    {
+        Ok(report) => (StatusCode::OK, axum::Json(report)).into_response(),
         Err(err @ ursula_raft::RecoveryGateError::NotRegistered { .. }) => {
             (StatusCode::NOT_FOUND, err.to_string()).into_response()
         }
-        Err(err @ ursula_raft::RecoveryGateError::StoreClosed { .. }) => {
-            (StatusCode::CONFLICT, err.to_string()).into_response()
-        }
-        Err(err @ ursula_raft::RecoveryGateError::Record { .. }) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(
+            err @ (ursula_raft::RecoveryGateError::StoreClosed { .. }
+            | ursula_raft::RecoveryGateError::NotStalled { .. }
+            | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
+        ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
+        Err(
+            err @ (ursula_raft::RecoveryGateError::Record { .. }
+            | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
 

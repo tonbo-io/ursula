@@ -159,6 +159,11 @@ impl RaftGroupFileLogStore {
         lock(&self.log).last_log_id()
     }
 
+    /// The vote the replica runs with.
+    pub(crate) fn vote(&self) -> Option<VoteOf<UrsulaRaftTypeConfig>> {
+        *lock(&self.vote)
+    }
+
     fn store_log(&self) -> StoreLog {
         *lock(&self.store_log)
     }
@@ -182,19 +187,48 @@ impl RaftGroupFileLogStore {
     /// replica whose vote is a committed vote for itself as the leader of
     /// that term, which would append new entries under the log ids of those
     /// lost ones and silently fork the group's log. The replica's vote for
-    /// itself is therefore presented uncommitted, so it starts as a follower
-    /// that already voted in that term; the metadata file keeps the vote.
-    pub(crate) fn start_as_follower(&self, node_id: u64) {
-        let mut vote = lock(&self.vote);
-        if let Some(current) = *vote
-            && current.is_committed()
-            && *current.leader_id().node_id() == node_id
-        {
-            *vote = Some(VoteOf::<UrsulaRaftTypeConfig>::new(
-                current.leader_id().term(),
-                node_id,
-            ));
+    /// itself is therefore replaced by the same vote uncommitted, so it
+    /// starts as a follower that already voted in that term.
+    ///
+    /// The demotion is recorded in the metadata file like any vote, and the
+    /// replica runs with it only once it is durable. Call it before the
+    /// group's Raft core starts. No later start finds the committed vote
+    /// again, whether it follows a clean shutdown or the gate opening. Any
+    /// other vote is left as it is, and nothing is written.
+    pub(crate) async fn start_as_follower(&self, node_id: u64) -> Result<(), CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        let Some(current) = self.vote() else {
+            return Ok(());
+        };
+        if !current.is_committed() || *current.leader_id().node_id() != node_id {
+            return Ok(());
         }
+        self.record_vote(VoteOf::<UrsulaRaftTypeConfig>::new(
+            current.leader_id().term(),
+            node_id,
+        ))
+        .await
+    }
+
+    /// Records `vote` in the metadata file, which is always `fsync`ed, and
+    /// then runs with it. Call with `write_order` held.
+    async fn record_vote(
+        &self,
+        vote: VoteOf<UrsulaRaftTypeConfig>,
+    ) -> Result<(), CoreJournalError> {
+        if self.vote() == Some(vote) {
+            return Ok(());
+        }
+        let timing = self
+            .core_writer
+            .write(CoreWriteOp::Vote {
+                group_id: self.placement.raft_group_id.0,
+                vote,
+            })
+            .await?;
+        self.record_timing(1, timing);
+        *lock(&self.vote) = Some(vote);
+        Ok(())
     }
 
     /// The group's recovery gate opened: a recovering group is durably
@@ -474,20 +508,8 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
 
     /// Votes go to the core's metadata file, which is always `fsync`ed.
     async fn save_vote(&mut self, vote: &VoteOf<UrsulaRaftTypeConfig>) -> Result<(), io::Error> {
-        let vote = *vote;
         let _order = self.write_order.lock().await;
-        if *lock(&self.vote) == Some(vote) {
-            return Ok(());
-        }
-        let timing = self
-            .core_writer
-            .write(CoreWriteOp::Vote {
-                group_id: self.placement.raft_group_id.0,
-                vote,
-            })
-            .await?;
-        self.record_timing(1, timing);
-        *lock(&self.vote) = Some(vote);
+        self.record_vote(*vote).await?;
         Ok(())
     }
 

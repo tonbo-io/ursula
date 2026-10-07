@@ -2650,11 +2650,11 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
         .unwrap();
     let registry = RaftGroupHandleRegistry::default();
     let (_root, store) = fresh_journal_store();
-    let gate = Arc::new(GroupRejoin::durable(
-        leader,
-        placement().raft_group_id,
-        &store,
-    ));
+    let gate = Arc::new(
+        GroupRejoin::durable(leader, placement().raft_group_id, &store)
+            .await
+            .expect("open the gate"),
+    );
     gate.bind(&raft);
     registry.register_rejoin(placement().raft_group_id, gate.clone());
     registry.register(placement(), raft.clone());

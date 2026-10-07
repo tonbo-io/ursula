@@ -25,6 +25,7 @@ pub mod diagnostics {
     pub use crate::log_store::JournalHistory;
     pub use crate::log_store::JournalOp;
     pub use crate::log_store::JournalReplayMode;
+    pub use crate::log_store::JournalSync;
     #[cfg(madsim)]
     pub use crate::log_store::LockAttempt;
     pub use crate::log_store::MarkRecoveringError;

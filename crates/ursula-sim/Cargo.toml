@@ -26,6 +26,7 @@ madsim = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 ursula = { workspace = true }
 ursula-ctl = { workspace = true }
+ursula-proto = { workspace = true }
 
 [lints]
 workspace = true

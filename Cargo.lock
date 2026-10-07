@@ -4511,6 +4511,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4607,6 +4608,7 @@ dependencies = [
  "ursula-config",
  "ursula-ctl",
  "ursula-observability",
+ "ursula-proto",
  "ursula-raft",
  "ursula-runtime",
  "ursula-shard",
