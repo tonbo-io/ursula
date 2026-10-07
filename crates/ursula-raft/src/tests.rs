@@ -1411,6 +1411,15 @@ where
     madsim::runtime::Runtime::check_determinism(seed, config, f)
 }
 
+/// The madsim OpenRaft runtime, its own watch channel included, behaves as
+/// OpenRaft's runtime suite expects.
+#[cfg(madsim)]
+#[test]
+fn madsim_openraft_runtime_passes_the_openraft_runtime_suite() {
+    let _guard = madsim_test_guard();
+    openraft_rt::testing::Suite::<crate::sim_runtime::MadsimRuntime>::test_all();
+}
+
 #[cfg(madsim)]
 #[test]
 fn madsim_three_node_openraft_group_replicates_group_writes_deterministically() {
