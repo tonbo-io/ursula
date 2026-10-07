@@ -78,6 +78,17 @@ const CORE_LOG_ONLINE_RECLAIM_MIN_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(madsim)]
 const CORE_LOG_ONLINE_RECLAIM_MIN_BYTES: u64 = 16 * 1024;
 
+/// Target encoded size of the entries in one Append frame of a rewritten
+/// journal, far below `MAX_FRAME_PAYLOAD_BYTES`. A single entry larger than
+/// this gets a frame of its own, which fits because it once fit in the frame
+/// that first journaled it.
+#[cfg(not(madsim))]
+const COMPACTION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Simulated logs stay small, so the simulator chunks rewrites at a lower
+/// size to exercise several Append frames per group.
+#[cfg(madsim)]
+const COMPACTION_CHUNK_BYTES: usize = 1024;
+
 /// Failure of the per-core journal.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreJournalError {
@@ -990,6 +1001,25 @@ fn write_next_generation(
             .map_err(|source| JournalError::io(&path, JournalOp::Remove, source))?;
     }
     let mut handle = JournalWriter::open(&path, live_sequence.wrapping_add(1))?;
+    append_live_state(&mut handle, groups, COMPACTION_CHUNK_BYTES)?;
+    // The rename and the directory `fsync` in `install_generation` publish
+    // the file, so its own directory entry needs no `fsync` first.
+    let fsyncs = handle.sync_data()?;
+    Ok(NextGeneration {
+        len: handle.len(),
+        path,
+        fsyncs,
+    })
+}
+
+/// Appends every group's live state to `handle`. Entries go in Append frames
+/// of about `chunk_bytes` each, so a group's live log of any size fits:
+/// one frame per group would exceed the frame limit for a large group.
+fn append_live_state(
+    handle: &mut JournalWriter,
+    groups: &BTreeMap<u32, RaftGroupLogStoreInner>,
+    chunk_bytes: usize,
+) -> Result<(), JournalError> {
     for (group_id, inner) in groups {
         let mut write = |record| -> Result<(), JournalError> {
             handle.append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
@@ -1010,20 +1040,43 @@ fn write_next_generation(
         if let Some(purged) = inner.last_purged_log_id {
             write(RaftGroupLogRecord::Purge(purged))?;
         }
-        if !inner.entries.is_empty() {
-            write(RaftGroupLogRecord::Append(
-                inner.entries.values().cloned().collect(),
-            ))?;
+        let mut chunk = Vec::new();
+        let mut chunk_len = 0_usize;
+        for entry in inner.entries.values() {
+            let entry_len = wire_len(entry);
+            if !chunk.is_empty() && chunk_len.saturating_add(entry_len) > chunk_bytes {
+                write(RaftGroupLogRecord::Append(std::mem::take(&mut chunk)))?;
+                chunk_len = 0;
+            }
+            chunk.push(entry.clone());
+            chunk_len = chunk_len.saturating_add(entry_len);
+        }
+        if !chunk.is_empty() {
+            write(RaftGroupLogRecord::Append(chunk))?;
         }
     }
-    // The rename and the directory `fsync` in `install_generation` publish
-    // the file, so its own directory entry needs no `fsync` first.
-    let fsyncs = handle.sync_data()?;
-    Ok(NextGeneration {
-        len: handle.len(),
-        path,
-        fsyncs,
-    })
+    Ok(())
+}
+
+/// The MessagePack size of `value`, measured without allocating it.
+fn wire_len<T: Serialize>(value: &T) -> usize {
+    struct Counter(usize);
+
+    impl io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    rmp_serde::encode::write_named(&mut counter, value)
+        .expect("wire value serializes to MessagePack");
+    counter.0
 }
 
 /// Removes a generation that would not shrink the journal.
@@ -1249,6 +1302,7 @@ mod tests {
     use ursula_shard::ShardId;
     use ursula_stream::StreamCommand;
 
+    use super::BTreeMap;
     use super::CORE_LOG_ONLINE_RECLAIM_MIN_BYTES;
     use super::CoreFileLogWriter;
     use super::CoreJournalError;
@@ -1265,14 +1319,17 @@ mod tests {
     use super::RaftGroupFileLogStore;
     use super::RaftGroupId;
     use super::RaftGroupLogRecord;
+    use super::RaftGroupLogStoreInner;
     use super::RaftLogStorage;
     use super::Reclaim;
+    use super::RecordTooLarge;
     use super::ShardPlacement;
     use super::UrsulaRaftTypeConfig;
     use super::VoteOf;
     use super::WalStorageSample;
     use super::WireCodec;
     use super::WriterState;
+    use super::append_live_state;
     use super::compact_core_journal;
     use super::io;
     use super::journal::ReplayTail;
@@ -1280,6 +1337,7 @@ mod tests {
     use super::reclaim_after_batch;
     use super::reclaim_core_journal;
     use super::recover_core_journal;
+    use super::wire_len;
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1551,6 +1609,66 @@ mod tests {
         );
         assert_eq!(storage.reclaim_failures, 1);
         assert_eq!(file_len(&path), len, "nothing is truncated");
+        crate::tests::remove_test_path(&path);
+    }
+
+    /// A rewrite writes a group's live entries in bounded chunks, so a group
+    /// whose live log exceeds the frame limit still compacts. One Append
+    /// frame per group (an unbounded chunk) fails.
+    #[test]
+    fn compaction_chunks_a_group_larger_than_the_frame_limit() {
+        const FRAME_LIMIT: usize = 4096;
+        let path = temp_journal_path("core-journal-chunked");
+        let entries = (1..=64)
+            .map(|index| payload_entry(index, 512))
+            .collect::<Vec<_>>();
+        let mut groups = BTreeMap::new();
+        let group = groups
+            .entry(7)
+            .or_insert_with(RaftGroupLogStoreInner::default);
+        group.vote = Some(committed_vote());
+        for entry in &entries {
+            group.entries.insert(entry.log_id.index, entry.clone());
+        }
+        let live_bytes = entries.iter().map(wire_len).sum::<usize>();
+        assert!(live_bytes > 8 * FRAME_LIMIT);
+
+        let mut unbounded = JournalWriter::open(&path, FIRST_SEQUENCE)
+            .expect("open journal")
+            .with_frame_limit(FRAME_LIMIT);
+        let err = append_live_state(&mut unbounded, &groups, usize::MAX)
+            .expect_err("one frame per group exceeds the limit");
+        assert!(matches!(
+            err,
+            JournalError::RecordTooLarge(RecordTooLarge {
+                limit: FRAME_LIMIT,
+                ..
+            })
+        ));
+        drop(unbounded);
+        crate::tests::remove_test_path(&path);
+
+        let mut chunked = JournalWriter::open(&path, FIRST_SEQUENCE)
+            .expect("open journal")
+            .with_frame_limit(FRAME_LIMIT);
+        append_live_state(&mut chunked, &groups, FRAME_LIMIT / 2)
+            .expect("chunks fit the frame limit");
+        chunked.sync().expect("sync");
+        drop(chunked);
+
+        let recovered = strict(&path);
+        assert!(
+            recovered.replayed.frames > 8,
+            "the entries span several frames: {:?}",
+            recovered.replayed
+        );
+        let group = recovered.groups.get(&7).expect("recovered group");
+        assert_eq!(group.vote, Some(committed_vote()));
+        assert_eq!(
+            group.entries.values().cloned().collect::<Vec<_>>(),
+            entries,
+            "chunking keeps every entry in order"
+        );
         crate::tests::remove_test_path(&path);
     }
 

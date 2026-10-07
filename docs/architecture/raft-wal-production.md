@@ -151,7 +151,9 @@ truncate once the core journal reaches 64 MiB:
 1. append and sync the purge/truncate record;
 2. replay the live journal into the current live state of every group,
    checking that it holds exactly the bytes the writer wrote;
-3. write and sync the next checksummed generation containing only that state;
+3. write and sync the next checksummed generation containing only that state,
+   with each group's entries in Append frames of about 8 MiB, so a group's
+   live log of any size stays below the 512 MiB frame limit;
 4. atomically replace `journal.bin` and sync its parent directory;
 5. reopen the append handle and continue batching.
 
