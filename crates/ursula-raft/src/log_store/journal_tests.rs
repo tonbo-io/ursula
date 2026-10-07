@@ -973,6 +973,58 @@ async fn a_recovering_leaders_demotion_survives_a_clean_restart() {
     }
 }
 
+/// An initialized group also needs durable demotion after a process crash.
+/// A clean stop before any election must not resurrect the old committed vote.
+#[tokio::test]
+async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
+    use super::run_state::PreviousRun;
+
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        for previous in [PreviousRun::ProcessCrash, PreviousRun::Clean] {
+            let core = Core::small(fsync);
+            let writer = core.writer();
+            let mut store = core.store(&writer, 1);
+            append(&mut store, [blank_entry(1)]).await;
+            store.save_vote(&committed_vote()).await.expect("vote");
+            drop(store);
+            writer.close().await.expect("persist the initial state");
+            drop(writer);
+
+            let open = |previous_run| {
+                let mut options = core.options(0, RecoveryState::Normal);
+                options.previous_run = previous_run;
+                CoreFileLogWriter::open(core.dir.clone(), options).expect("open writer")
+            };
+            let writer = open(previous);
+            let mut store = core.store(&writer, 1);
+            assert_eq!(store.log_state(), GroupLogState::Initialized);
+            let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+                .await
+                .expect("prepare the group before starting Raft");
+            let expected = if previous == PreviousRun::Clean {
+                committed_vote()
+            } else {
+                openraft::Vote::new(7, 1)
+            };
+            assert_eq!(store.read_vote().await.expect("vote"), Some(expected));
+            drop(gate);
+            drop(store);
+            writer
+                .close()
+                .await
+                .expect("clean stop before any election");
+            drop(writer);
+
+            let writer = open(PreviousRun::Clean);
+            let mut store = core.store(&writer, 1);
+            let _gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+                .await
+                .expect("clean restart");
+            assert_eq!(store.read_vote().await.expect("vote"), Some(expected));
+        }
+    }
+}
+
 /// A crash between a group's first journal write and the metadata write
 /// leaves entries without the flag; recovery restores it, as recovering
 /// when the node is recovering.

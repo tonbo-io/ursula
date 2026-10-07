@@ -533,7 +533,7 @@ impl RaftGroupHandleRegistry {
         let owner = self
             .get(raft_group_id)
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let expected = expected.clone();
+        let expected = *expected;
         let report = owner
             .call(move |_| async move { rejoin.accept_unsynced_loss(&expected).await })
             .await

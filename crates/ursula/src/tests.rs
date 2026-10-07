@@ -5194,7 +5194,7 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
     // No leader confirms a barrier: the production driver reports the group
     // stalled.
     let barrier = tokio::spawn(ursula_raft::run_rejoin_vote_barrier(
-        engine.raft_handle(),
+        registry.get(RaftGroupId(0)).expect("registered owner"),
         gate.clone(),
         registry.election_policy(),
         BTreeMap::new(),
