@@ -22,9 +22,11 @@ Useful jq selectors:
 | HTTP error counters | `.http.responses_by_status` |
 | WAL disk pressure | `{available: .wal_available_bytes, minimum: .wal_min_available_bytes, pressure: .wal_disk_pressure}` |
 | WAL reclaim/restart | `{physical: .wal_physical_bytes, reclaims: .wal_reclaims, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
+| WAL opening and recovery gates | `{opening: .wal_recovery, gates: .recovery_gates}` |
 
 `GET /__ursula/ready` is the process readiness probe: it returns `503` while
-the disk-WAL guard is active, and after a Raft protocol mismatch with a peer
+the disk-WAL guard is active, while a group's recovery gate is closed on this
+node, and after a Raft protocol mismatch with a peer
 (`"reason": "format_epoch_mismatch"`). Ursula does **not** expose `/healthz`, `/readyz`,
 Prometheus `/metrics`, or `/cluster/status`; use the JSON snapshot for detailed
 diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
@@ -49,8 +51,8 @@ Use `raft.wal.backend = "disk"` for a real cluster. Memory WAL remains available
 for development, benchmarks, and chaos tests, but more than one configured peer
 requires `raft.wal.allow_volatile_multi_peer = true` so the loss-on-restart
 contract is explicit. A memory-WAL node restarted alone is rebuilt by its group
-leaders; a group whose majority restarted at once stops accepting writes until an
-operator adopts the survivor (see
+leaders. A group whose majority restarted at once stops accepting writes until an
+operator accepts the loss (see
 [Restarting a memory-WAL node](/docs/operations#restarting-a-memory-wal-node)).
 
 ### `storage.cold.s3.bucket is required when cold backend is 's3'`
@@ -88,6 +90,28 @@ A configured peer runs Ursula 0.5.x. A 0.6 node cannot join a 0.5.x cluster; ins
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 
 The node exchanged a Raft RPC with a peer on another format epoch after it started (the peer was unreachable during the startup probe). The node stays not ready until it restarts. Remove the mismatched node from the cluster; see [Upgrading to 0.6](/docs/operations#upgrading-to-06).
+
+### `/__ursula/ready` answers `503` with `recovery_gate_closed`
+
+The node's logs may be missing entries it acknowledged: it started after a host
+crash or power loss under `raft.wal.fsync = "never"`, after a journal I/O error,
+or without its run state file, or it is a memory-WAL node that restarted. Each
+gated group waits until it has applied a fresh barrier from the group's leader,
+and its leader rebuilds the replica meanwhile. `recovery_gates` in
+`/__ursula/metrics` lists the gated groups. This normally clears in seconds
+once a leader is reachable. See
+[Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
+
+### `/__ursula/ready` answers `503` with `recovery_stalled`
+
+A gated group on this node has seen no leader barrier and applied nothing for
+`30s`. A majority of the group's voters are probably gated, so the group has no
+leader and refuses writes. The groups are listed under
+`recovery_stalled_groups`. The group recovers only when an operator accepts the
+loss of writes acknowledged after the last `fsync`, with
+`POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated
+replicas with the longest logs. See
+[Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### I/O error on `raft.wal.path`
 

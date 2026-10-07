@@ -142,12 +142,24 @@ touches the run state.
 ### Metadata and run-state files
 
 Votes are not journal records. Each core keeps `core-N/journal.meta` next to
-its journal with every group's vote and an `initialized` flag, which is set
-before a group's first entry or purge is acknowledged and is never cleared.
-Recovery reads votes from this file, and a group whose journal holds entries
-but whose flag is missing (a crash between the two writes) gets the flag back.
-The file also records the recovery epoch in which the journal was last read
-in full.
+its journal with every group's vote and log state:
+
+- `empty`: the replica never persisted an entry or a purge of the group.
+- `initialized`: its log holds every entry it acknowledged.
+- `recovering`: its log may be missing entries it acknowledged. The group's
+  recovery gate stays closed (below) until the state returns to
+  `initialized`.
+
+A group leaves `empty` in the batch that persists its first entry or purge,
+before either is acknowledged, and never returns to it. The first entry
+records `initialized`, unless the group's gate is closed while the replica
+holds nothing of it (its history is unknown, as for a wiped disk), in which
+case it records `recovering`. Recovery reads votes and log states from this
+file. A group whose journal holds entries but whose metadata says `empty` (a
+crash between the two writes) is repaired, as `recovering` when the node is
+recovering. A group that is `initialized` but whose journal holds nothing of
+it lost its log, and becomes `recovering`. The file also records the recovery
+epoch in which the journal was last read in full.
 
 The node keeps `run-state.bin` at the WAL root: the boot id of the run that
 last opened the journals (`/proc/sys/kernel/random/boot_id`, absent on other
@@ -165,7 +177,8 @@ journal write:
 
 | Previous run | Replay | Recovery state |
 | --- | --- | --- |
-| No run state | `Strict` | normal |
+| No run state, no core journal holds a record | `Strict` | normal |
+| No run state, a core journal holds records | `VerifiedPrefix` | recovering (unknown history) |
 | `clean` | `Strict` | normal |
 | `running`, same boot id (process crash) | `Strict` | normal |
 | `running`, other or unknown boot id (host crash), policy `always` | `VerifiedPrefix` | normal |
@@ -182,8 +195,72 @@ read as a verified prefix, however the runs in between ended.
 "Recovering" means the node's logs may be missing entries it acknowledged.
 The node logs it at warn, reports it in the metrics JSON (`wal_recovery`), as
 the `ursula.wal.recovering` gauge, and through
-`RaftGroupHandleRegistry::wal_recovery_state`. It does not yet change how the
-node votes.
+`RaftGroupHandleRegistry::wal_recovery_state`. Before it records itself as
+`running`, a recovering run moves every `initialized` group of every core into
+`recovering`, so a crash at any later point, a process crash or a clean
+shutdown before the gates open, comes back gated: the per-group state, not the
+node's run state, carries the recovery forward.
+
+### Recovery gate
+
+`rejoin` holds one gate per group and replica, for both log stores. A
+disk-WAL gate starts from the group's log state: open when `initialized`,
+closed when `recovering`, and closed with an unknown history when `empty`. A
+memory-WAL gate always starts closed with an unknown history.
+
+While closed, the replica does not campaign (its Raft core starts with
+elections disabled), refuses a leadership transfer to itself, and refuses
+every vote once it knows the group holds entries: its log state says so, a
+leader reported a commit index of 1 or more, or a candidate's log reached
+index 1. An unknown history passes candidates whose log is only the membership
+entry, so a new group's first election still works. The replica accepts
+appends from any leader whose vote is not lower than its own, which the
+metadata file restored before the Raft core started; an older-term leader
+gets `HigherVote`.
+
+OpenRaft restores a node whose persisted vote is a committed vote for itself
+as the leader of that term without an election. A recovering replica that led
+the group may have lost entries it appended while its followers kept them, so
+restored leadership would append new entries under their log ids and fork the
+log. A recovering replica's own committed vote is therefore presented
+uncommitted: it starts as a follower that already voted in that term. Under
+`always` the store hands OpenRaft only entries whose batch was `fsync`ed, so a
+replica that is not recovering keeps every entry it ever replicated.
+
+The barrier driver asks the current leader for a fresh outbound ReadIndex
+barrier (`RejoinBarrier`) and opens the gate once the replica applied the
+barrier's committed index. Inbound replication alone never opens it. A
+disk-WAL gate first records `initialized`, then opens, and the driver
+refreshes the group's election policy after the gate opened (refreshing
+before the final check could leave elections disabled).
+
+On the leader, a follower that answers `Conflict` at or below the index it
+had matched in this leadership lost entries. The network layer hands OpenRaft
+an error instead, and the heal driver removes the voter, adds it back as a
+learner and promotes it once it caught up. Desired voters come from the static
+configuration. When the followers that lost entries are a majority, no removal
+can commit; the leader holds every committed entry, so it allows OpenRaft one
+rewind per follower and replicates its log to them again. OpenRaft does not
+survive a rewind driven by a heartbeat's conflict while a replication stream's
+acknowledgements are in flight, so only the conflict of a request that carried
+entries reaches it, and an idle group gets an unchanged membership entry to
+replicate. The allowance ends once replication progress shows the old matched
+index reset or a later success confirms it.
+
+A gated replica that gets no barrier and applies nothing for 30 s reports its
+group stalled: a majority of the voters may be gated, so the group has no
+leader and refuses writes. Readiness answers `recovery_stalled`, and
+`recovery_gates` in the metrics JSON and the `ursula.raft.recovery_gates`
+gauge list it. `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
+opens the gate on one replica, recording `initialized`; run on the gated
+replicas with the longest logs until the open ones are a majority, an
+election then needs a candidate whose log is at least as long as theirs.
+
+Bootstrap follows the log state. A replica that ever held its group never runs
+`Initialize`. The group's initializer that holds nothing runs it only when
+every configured voter answers the bootstrap probe with an empty group and no
+leader, after opening its own gate so the membership entry records
+`initialized`.
 
 The journal header version is the format epoch, 3 since the single Raft WAL
 work. There is no migration: journals of epochs 1 and 2 and files without the
@@ -225,8 +302,9 @@ OpenRaft purge record that establishes the safe logical boundary.
 ## Durability and application boundary
 
 `raft.wal.fsync` chooses when appends reach stable storage. The default is
-`always` until replicas that lost acknowledged appends rejoin through a
-recovery gate.
+`never`: a replica that lost acknowledged appends rejoins through the
+recovery gate, so no acknowledged write is lost while at most a minority of a
+group's voters lose their unsynced tail.
 
 - `always`: a batch is acknowledged after its `fsync`. The writer collects a
   group commit: it keeps collecting while requests keep arriving, each within
@@ -237,7 +315,7 @@ recovery gate.
   nothing. A host crash can drop the unsynced tail, which the run state then
   reports.
 
-Under either policy votes and `initialized` flags are acknowledged only after
+Under either policy votes and log states are acknowledged only after
 the metadata file is replaced with an `fsync`, and the generation rewrites,
 the run state and a clean shutdown `fsync` as well. A graceful shutdown stops
 the Raft groups, closes every core writer (each `fsync`s its journal), and only
