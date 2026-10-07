@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use openraft::BasicNode;
 use openraft::Config;
@@ -19,6 +18,7 @@ use crate::RaftGroupHandleRegistry;
 use crate::grpc::FencedProcess;
 use crate::grpc::validate_process_fence;
 use crate::log_store::MetaTestLogStore;
+use crate::rt::time::Instant;
 
 #[derive(Serialize)]
 struct Measurement {

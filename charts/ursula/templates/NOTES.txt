@@ -51,15 +51,17 @@ Important bootstrap step:
 Static membership warning:
   server.replicaCount controls the initial voter set for a fresh cluster. Changing it
   on an initialized cluster is not safe Raft voter reconfiguration. Use the
-  future Ursula operator for safe learner add, voter promotion, and voter removal.
+  meta control-plane MoveReplicas, RebuildReplica, and DecommissionNode operations
+  through ursulactl for replica membership changes.
 {{- if eq .Values.server.updateStrategy "OnDelete" }}
 
 OnDelete rollout warning:
   Helm has staged the new StatefulSet pod template, but Kubernetes will not
-  replace any Ursula voter automatically. Your external rollout controller must
-  drain, delete, wait, undrain, and verify one voter at a time. A failed
-  replacement stays drained. Until that sequence finishes, helm status can be
-  deployed while pods still run the previous image.
+  replace any Ursula voter automatically. An operator must perform and verify
+  each same-PVC restart before proceeding to the next voter. Ordinary restarts
+  need no rebuild intent; disk replacement requires RebuildReplica. Helm status
+  can be deployed while pods still run the previous image. Enabling meta on an
+  existing meta-disabled cluster requires the documented coordinated stop/start.
 
   Inspect staged and running images:
     kubectl -n {{ .Release.Namespace }} get statefulset {{ include "ursula.fullname" . }} -o jsonpath='{.spec.template.spec.containers[?(@.name=="ursula")].image}{"\n"}'

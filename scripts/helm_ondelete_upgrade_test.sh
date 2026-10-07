@@ -36,6 +36,9 @@ before="$(kubectl get statefulset "${release}" \
   --namespace "${namespace}" \
   -o jsonpath='{.spec.updateStrategy.rollingUpdate.partition}')"
 test "${before}" = "2"
+kubectl wait --namespace "${namespace}" --for=create "pod/${release}-0" --timeout=30s >/dev/null
+source_uid="$(kubectl get pod "${release}-0" --namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
+source_image="$(kubectl get pod "${release}-0" --namespace "${namespace}" -o jsonpath='{.spec.containers[0].image}')"
 
 # This is the regression path from #180: Helm must execute the pre-upgrade
 # migration before its typed StatefulSet apply changes the strategy.
@@ -56,36 +59,23 @@ rolling="$(kubectl get statefulset "${release}" \
 test "${strategy}" = "OnDelete"
 test -z "${rolling}"
 
-# The hook also runs on later OnDelete upgrades and must remain idempotent.
+# The migration hook is idempotent. A second upgrade stages a distinct image
+# without replacing the existing unscheduled Pod: OnDelete does not run an
+# automatic voter rollout or require the removed maintenance shell hooks.
 # shellcheck disable=SC2086
 helm upgrade "${release}" "${chart}" \
   --namespace "${namespace}" \
   ${common_values} \
   --set server.updateStrategy=OnDelete \
+  --set global.image.tag=ondelete-staged-test \
   --timeout 3m >/dev/null
 
-# Real API regression: the stale source UID must not delete a second Pod that
-# the StatefulSet created under the same name. This Pod is unscheduled, so the
-# test does not start a process or bypass its configured termination grace.
-(
-  NAMESPACE=${namespace}
-  STATEFULSET=${release}
-  REPLICAS=1
-  EXPECTED_GROUPS=1
-  TARGET_IMAGE=unused
-  ROLLOUT_SOURCE_ONLY=1
-  export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE ROLLOUT_SOURCE_ONLY
-  . "${chart}/files/graceful-rollout.sh"
-  source_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.uid}')
-  replace_pod 0 "${source_uid}"
-  replacement_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.uid}')
-  test "${source_uid}" != "${replacement_uid}"
-  if replace_pod 0 "${source_uid}"; then
-    echo "stale source UID deleted a replacement Pod" >&2
-    exit 1
-  fi
-  test "$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.uid}')" = "${replacement_uid}"
-  test -z "$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-0" -o jsonpath='{.metadata.deletionTimestamp}')"
-)
+test "$(kubectl get statefulset "${release}" --namespace "${namespace}" -o jsonpath='{.spec.updateStrategy.type}')" = "OnDelete"
+test -z "$(kubectl get statefulset "${release}" --namespace "${namespace}" -o jsonpath='{.spec.updateStrategy.rollingUpdate}')"
+test "$(kubectl get pod "${release}-0" --namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${source_uid}"
+test "$(kubectl get pod "${release}-0" --namespace "${namespace}" -o jsonpath='{.spec.containers[0].image}')" = "${source_image}"
+test -z "$(kubectl get pod "${release}-0" --namespace "${namespace}" -o jsonpath='{.metadata.deletionTimestamp}')"
+staged_image="$(kubectl get statefulset "${release}" --namespace "${namespace}" -o jsonpath='{.spec.template.spec.containers[0].image}')"
+test "${staged_image}" != "${source_image}"
 
-echo "Helm cleared stale rollingUpdate state, switched to OnDelete, and repeated cleanly"
+echo "Helm cleared stale rollingUpdate state and staged repeated OnDelete upgrades without replacing the Pod"

@@ -54,8 +54,8 @@ server:
   # 5 seconds of leadership handoff, plus Kubernetes termination overhead.
   terminationGracePeriodSeconds: 30
   # RollingUpdate lets Kubernetes replace pods automatically. OnDelete stages
-  # new templates without restarting voters so an external graceful-rollout
-  # controller can drain and replace exactly one pod at a time.
+  # new templates without restarting voters. An operator performs each
+  # same-PVC restart and verifies maintenance readiness before proceeding.
   updateStrategy: RollingUpdate
   # Helm pre-upgrade migration used only when updateStrategy=OnDelete. It
   # removes a live StatefulSet's defaulted/stale rollingUpdate fields before

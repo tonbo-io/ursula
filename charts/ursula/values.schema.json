@@ -241,7 +241,7 @@
             "RollingUpdate",
             "OnDelete"
           ],
-          "description": "StatefulSet update strategy. OnDelete stages templates for an external graceful-rollout controller."
+          "description": "StatefulSet update strategy. OnDelete stages templates for explicit operator-controlled voter restarts."
         },
         "onDeleteMigration": {
           "type": "object",
