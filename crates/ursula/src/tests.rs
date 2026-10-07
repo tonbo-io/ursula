@@ -408,19 +408,40 @@ fn static_grpc_membership_config_rejects_partial_group_voters() {
 }
 
 /// Single-node groups on a fresh WAL under `wal_root`, registered in
-/// `registry`.
+/// `registry`, and that WAL. Shut it down with [`shutdown_test_wal`] before
+/// `wal_root` goes.
 fn registered_durable_factory(
     wal_root: &tempfile::TempDir,
     registry: &RaftGroupHandleRegistry,
-) -> ursula_raft::DurableRaftGroupEngineFactory {
-    ursula_raft::DurableRaftGroupEngineFactory::new(
-        ursula_raft::DurableRaftLogStoreFactory::start(
-            wal_root.path(),
-            ursula_config::WalFsync::Never,
-        )
-        .expect("start the Raft WAL"),
+) -> (
+    ursula_raft::DurableRaftGroupEngineFactory,
+    ursula_raft::DurableRaftLogStoreFactory,
+) {
+    let raft_wal = ursula_raft::DurableRaftLogStoreFactory::start(
+        wal_root.path(),
+        ursula_config::WalFsync::Never,
     )
-    .with_registry(registry.clone())
+    .expect("start the Raft WAL");
+    (
+        ursula_raft::DurableRaftGroupEngineFactory::new(raft_wal.clone())
+            .with_registry(registry.clone()),
+        raft_wal,
+    )
+}
+
+/// Stops `runtime`'s Raft groups and closes `raft_wal` as the server does,
+/// so the test may then remove the WAL directory. Removing it under a live
+/// core writer fails the writer's next journal write, which stops the
+/// process.
+async fn shutdown_test_wal(
+    runtime: &ShardRuntime,
+    raft_wal: &ursula_raft::DurableRaftLogStoreFactory,
+) {
+    assert_eq!(
+        crate::server::shutdown_raft_wal(runtime, Some(raft_wal)).await,
+        crate::server::WalShutdown::Clean,
+        "the Raft WAL shuts down cleanly"
+    );
 }
 
 struct StaticGrpcTestNode {
@@ -428,8 +449,10 @@ struct StaticGrpcTestNode {
     registry: RaftGroupHandleRegistry,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
+    raft_wal: ursula_raft::DurableRaftLogStoreFactory,
     /// The node's own WAL directory when the test gave it none: a fresh,
     /// empty one per start, as a node that lost its disk restarts.
+    /// [`StaticGrpcTestNode::shutdown`] closes the WAL before it goes.
     _wal_root: Option<tempfile::TempDir>,
 }
 
@@ -450,6 +473,7 @@ impl StaticGrpcTestNode {
                 panic!("test server failed: {err}");
             }
         }
+        shutdown_test_wal(&self.runtime, &self.raft_wal).await;
     }
 }
 
@@ -506,7 +530,7 @@ async fn spawn_static_grpc_test_node(
         factory_peers,
         initialize_membership,
         registry.clone(),
-        log_stores,
+        log_stores.clone(),
     );
     factory = factory.with_per_group_membership_initializers(storage.per_group_initializers);
     factory = factory.with_per_group_voters(storage.per_group_voters.clone());
@@ -541,6 +565,7 @@ async fn spawn_static_grpc_test_node(
         registry,
         shutdown: Some(shutdown_tx),
         server,
+        raft_wal: log_stores,
         _wal_root: wal_root,
     }
 }
@@ -1926,16 +1951,13 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     let registry = RaftGroupHandleRegistry::default();
     let mut config = RuntimeConfig::new(1, 1);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        config,
-        registered_durable_factory(&wal_root, &registry),
-    )
-    .expect("runtime");
+    let (factory, raft_wal) = registered_durable_factory(&wal_root, &registry);
+    let runtime = ShardRuntime::spawn_with_engine_factory(config, factory).expect("runtime");
     runtime
         .warm_group(RaftGroupId(0))
         .await
         .expect("warm raft group");
-    let app = router_with_raft_registry(runtime, registry);
+    let app = router_with_raft_registry(runtime.clone(), registry);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -1986,6 +2008,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
 
     shutdown_tx.send(()).expect("server is still running");
     server.await.expect("server task");
+    shutdown_test_wal(&runtime, &raft_wal).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7885,11 +7908,8 @@ async fn executor_activation_waits_for_the_actual_raft_api_queue() {
     let registry = RaftGroupHandleRegistry::default();
     let mut config = RuntimeConfig::new(1, 1);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        config,
-        registered_durable_factory(&wal_root, &registry),
-    )
-    .expect("runtime");
+    let (factory, raft_wal) = registered_durable_factory(&wal_root, &registry);
+    let runtime = ShardRuntime::spawn_with_engine_factory(config, factory).expect("runtime");
     runtime
         .warm_group(RaftGroupId(0))
         .await
@@ -7930,6 +7950,7 @@ async fn executor_activation_waits_for_the_actual_raft_api_queue() {
             .status(),
         StatusCode::OK
     );
+    shutdown_test_wal(&state.runtime, &raft_wal).await;
 }
 
 #[tokio::test]
