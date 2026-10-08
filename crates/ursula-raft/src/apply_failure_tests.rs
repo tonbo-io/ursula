@@ -198,6 +198,9 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         crate::apply_failure::ApplyFailureKind::Panic
     );
     assert!(!stopped.maintenance.running);
+    // Its last observed leadership is stale: balancing and stall recovery
+    // must not count it.
+    assert_eq!(stopped.current_leader, None);
     assert!(
         stopped
             .last_applied

@@ -846,13 +846,17 @@ impl RaftGroupHandleRegistry {
             let metrics = raft.metrics().borrow_watched().clone();
             let membership = metrics.membership_config.membership();
             let apply_failure = health.failure();
-            let apply_running = apply_failure.is_none();
+            let running = apply_failure.is_none()
+                && metrics.running_state.is_ok()
+                && metrics.state != openraft::ServerState::Shutdown;
             snapshots.push(RaftGroupMetricsSnapshot {
                 apply_failure,
                 raft_group_id,
                 node_id: metrics.id,
                 current_term: metrics.current_term,
-                current_leader: metrics.current_leader,
+                // A stopped replica leads nothing. Its last observation is
+                // stale, so leader counts and drains must not see it.
+                current_leader: metrics.current_leader.filter(|_| running),
                 last_log_index: metrics.last_log_index,
                 committed: metrics.local_committed.map(log_progress_snapshot),
                 last_applied: metrics.last_applied.map(log_progress_snapshot),
@@ -862,9 +866,7 @@ impl RaftGroupHandleRegistry {
                 voter_configurations: membership.get_joint_config().clone(),
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
-                    running: apply_running
-                        && metrics.running_state.is_ok()
-                        && metrics.state != openraft::ServerState::Shutdown,
+                    running,
                     recovery_ready: self
                         .rejoin(RaftGroupId(raft_group_id))
                         .is_none_or(|rejoin| rejoin.vote_gate_open()),
