@@ -197,7 +197,13 @@ fn failed_poison_marker_then_reack_and_power_loss_refuses_corrupt_history() {
                 .try_open(placement, standalone_wal_metrics(placement))
                 .await
                 .expect_err("corrupt acknowledged history must refuse startup");
-            assert!(matches!(error, ursula_runtime::GroupEngineError::Infra(_)));
+            assert!(
+                matches!(&error, ursula_raft::RaftWalError::OpenCore {
+                core: ursula_shard::CoreId(0),
+                source: ursula_raft::wal::diagnostics::CoreJournalError::Journal(source),
+            } if matches!(source.as_ref(), ursula_raft::wal::diagnostics::JournalError::CorruptFrame { .. })),
+                "startup must preserve the exact journal corruption refusal: {error:?}"
+            );
             assert_eq!(
                 SimDisk::read(&journal).unwrap(),
                 damaged,

@@ -9,7 +9,6 @@ use std::sync::Weak;
 
 use futures_util::future::join_all;
 use ursula_config::WalFsync;
-use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_shard::CoreId;
 use ursula_shard::ShardPlacement;
@@ -126,22 +125,24 @@ impl RaftWal {
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
-    ) -> Result<Arc<CoreFileLogWriter>, GroupEngineError> {
-        let poisoned = || GroupEngineError::new("core file log writer mutex poisoned");
-        let slot = match &mut *self.core_writers.lock().map_err(|_poisoned| poisoned())? {
+    ) -> Result<Arc<CoreFileLogWriter>, RaftWalError> {
+        let slot = match &mut *self
+            .core_writers
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+        {
             CoreWriterSlots::Running(slots) => {
                 slots.entry(placement.core_id.0).or_default().clone()
             }
             CoreWriterSlots::ShutDown => {
-                return Err(GroupEngineError::new(format!(
-                    "open OpenRaft core journal: {}",
-                    RaftWalError::ShutDown {
-                        root: self.root().to_owned(),
-                    }
-                )));
+                return Err(RaftWalError::ShutDown {
+                    root: self.root().to_owned(),
+                });
             }
         };
-        let mut slot = slot.lock().map_err(|_poisoned| poisoned())?;
+        let mut slot = slot
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?;
         if let Some(writer) = slot.writer.upgrade() {
             return Ok(writer);
         }
@@ -158,7 +159,10 @@ impl RaftWal {
                 lagging: self.lagging.clone(),
                 metrics: Some((placement, metrics)),
             })
-            .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
+            .map_err(|source| RaftWalError::OpenCore {
+                core: placement.core_id,
+                source,
+            })?;
         *slot = CoreWriterState {
             writer: Arc::downgrade(&writer),
             exited: Some(writer.exited()),
@@ -170,10 +174,10 @@ impl RaftWal {
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
-    ) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
+    ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
         let core_writer = self.core_writer(placement, metrics.clone())?;
         RaftGroupFileLogStore::open(placement, metrics, core_writer)
-            .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
+            .map_err(|source| RaftWalError::OpenGroup { placement, source })
     }
 
     /// Ends this run cleanly: closes every core writer, each of which
@@ -327,5 +331,62 @@ mod tests {
         drop(store);
         drop(held);
         crate::tests::remove_test_path(&root);
+    }
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn opening_a_group_preserves_typed_journal_and_shutdown_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = RaftWal::start(root.path(), WalFsync::Always, &topology).unwrap();
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let store = wal.open(placement, metrics.clone()).unwrap();
+        let duplicate = wal.open(placement, metrics.clone()).unwrap_err();
+        assert!(matches!(&duplicate, RaftWalError::OpenGroup {
+            placement: actual,
+            source: crate::log_store::CoreJournalError::GroupAlreadyOpen { raft_group_id, .. },
+        } if *actual == placement && *raft_group_id == placement.raft_group_id));
+        assert!(
+            std::error::Error::source(&duplicate)
+                .unwrap()
+                .downcast_ref::<crate::log_store::CoreJournalError>()
+                .is_some()
+        );
+        wal.shutdown().await.unwrap();
+        assert!(matches!(
+            wal.open(placement, metrics),
+            Err(RaftWalError::ShutDown { .. })
+        ));
+        drop(store);
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn opening_a_core_preserves_its_io_source() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = RaftWal::start(root.path(), WalFsync::Always, &topology).unwrap();
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        std::fs::write(wal.core_dir(CoreId(0)), b"not a directory").unwrap();
+        let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let error = wal.open(placement, metrics).unwrap_err();
+        assert!(matches!(&error, RaftWalError::OpenCore {
+            core: CoreId(0), source: crate::log_store::CoreJournalError::Io { source, .. },
+        } if source.kind() == std::io::ErrorKind::AlreadyExists));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<crate::log_store::CoreJournalError>()
+                .is_some()
+        );
+        wal.shutdown().await.unwrap();
     }
 }

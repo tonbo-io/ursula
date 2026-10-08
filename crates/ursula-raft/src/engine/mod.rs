@@ -7,6 +7,7 @@ mod external_index_after_commit_tests;
 mod factory;
 #[cfg(all(test, not(madsim)))]
 mod test_support;
+mod wal_error;
 
 use std::collections::BTreeMap;
 use std::io;

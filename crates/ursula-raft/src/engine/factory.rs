@@ -151,7 +151,10 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 .validate()
                 .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
             );
-            let log_store = self.log_stores.open(placement, metrics.clone())?;
+            let log_store = self
+                .log_stores
+                .open(placement, metrics.clone())
+                .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let apply_stop_signal = log_store.apply_stop_signal();
             let health = crate::apply_failure::ApplyHealth::default();
             let engine = RaftGroupEngine::new_single_node_observed(
@@ -394,7 +397,10 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             let nodes = self.peer_nodes_for_group(placement.raft_group_id)?;
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
-            let store = self.log_stores.open(placement, metrics.clone())?;
+            let store = self
+                .log_stores
+                .open(placement, metrics.clone())
+                .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let rejoin = Arc::new(
                 GroupRejoin::durable(self.node_id, placement.raft_group_id, &store)
                     .await
