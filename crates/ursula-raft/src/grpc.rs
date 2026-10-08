@@ -2469,6 +2469,7 @@ mod reconnect_tests {
 mod transfer_leader_codec_tests {
     use std::sync::Arc;
 
+    use openraft::vote::RaftLeaderId;
     use ursula_shard::RaftGroupId;
 
     use super::CoreRaftTransport;
