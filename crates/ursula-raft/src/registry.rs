@@ -351,7 +351,8 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn may_campaign(&self, group: RaftGroupId) -> bool {
-        self.election.may_campaign(self.rejoin(group).as_deref())
+        self.entry(group)
+            .is_ok_and(|entry| self.election.may_campaign(entry.recovery.as_deref()))
     }
 
     /// Submit a handoff after checking it against the handoff policy
@@ -826,7 +827,8 @@ impl RaftGroupHandleRegistry {
             let metrics = raft.metrics().borrow_watched().clone();
             let membership = metrics.membership_config.membership();
             let apply_failure = health.failure();
-            let running = apply_failure.is_none()
+            let apply_running = apply_failure.is_none();
+            let running = apply_running
                 && metrics.running_state.is_ok()
                 && metrics.state != openraft::ServerState::Shutdown;
             snapshots.push(RaftGroupMetricsSnapshot {
@@ -847,11 +849,13 @@ impl RaftGroupHandleRegistry {
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
                     running,
-                    recovery_ready: entry
-                        .recovery
-                        .as_ref()
-                        .is_none_or(|rejoin| rejoin.vote_gate_open()),
-                    accepting_transfers: self.election.may_campaign(entry.recovery.as_deref()),
+                    recovery_ready: apply_running
+                        && entry
+                            .recovery
+                            .as_ref()
+                            .is_none_or(|rejoin| rejoin.vote_gate_open()),
+                    accepting_transfers: apply_running
+                        && self.election.may_campaign(entry.recovery.as_deref()),
                     membership_joint: membership.get_joint_config().len() != 1,
                     membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
                     stopped_for_operator: entry

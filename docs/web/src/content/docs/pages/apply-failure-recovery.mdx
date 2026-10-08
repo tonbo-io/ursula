@@ -51,10 +51,15 @@ operation to bypass a poison record.
    failing index. Read and compare previously acknowledged payloads and the
    failed request using its original identity before deciding whether to retry.
 
-If the failure occurs during initial WAL replay, OpenRaft construction returns
-`ApplyStopped`, and startup may refuse to complete. Live failure isolation does not
-provide a dormant failed-group handle across a restart of the faulty binary.
-Use the corrected binary before resuming that server.
+If the failure occurs during initial WAL replay, the owner retains an
+`ApplyStopped` terminal group instead of a live Raft handle. Other groups can
+start and serve. Metrics retain the failing committed term and index and the
+last successfully applied prefix. Node and maintenance readiness stay unready.
+Requests to the stopped group return `ApplyStopped` without repeatedly opening
+its WAL. A corrected compatible binary must restart and replay the original
+history before that group can serve again. Ordinary configuration, WAL-open
+and snapshot-restore errors still fail startup. They are not application
+failures and are not silently converted to isolated groups.
 
 There is no online skip/quarantine command in this recovery contract. Repair
 requires a corrected compatible binary. If none is available, keep the group
@@ -67,7 +72,7 @@ Run `cargo test -p ursula-raft --lib apply_failure_tests`. It uses real disk WAL
 with `fsync=always`, a partial-mutation panic and an invariant violation,
 and a three-replica in-process Raft network. It verifies stopped-group
 isolation, unchanged applied boundary, retained records, same-code replay
-failure, and payload preservation after corrected-code replay. The
+failure with healthy-group reads/writes on the same owner thread, and payload preservation after corrected-code replay. The
 three-replica drill waits for a surviving follower to elect a new leader and
 encounter the committed poison through normal Raft replication. This is an
 application-failure drill, not a power-loss or Kubernetes Chaos qualification.

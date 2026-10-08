@@ -307,6 +307,10 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .ready()
     );
     assert!(!restarted_registry.recovery_barriers_ready());
+    let participation = restarted_registry.participation_status();
+    assert!(!participation.should_campaign);
+    assert!(!participation.should_accept_transfer);
+    assert!(!restarted_registry.may_campaign(RaftGroupId(999)));
     assert!(!restarted_registry.may_campaign(RaftGroupId(0)));
     assert!(restarted_registry.get(RaftGroupId(0)).is_none());
     let healthy_stream = (0..1000)
@@ -344,20 +348,20 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
                 .await,
             Err(ursula_runtime::RuntimeError::GroupEngine {
                 error: ursula_runtime::GroupEngineError::Infra(
-                    ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                    ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
                 ),
                 ..
-            })
+            }) if index == poison_index
         ));
     }
     assert!(matches!(
         runtime.warm_group(RaftGroupId(0)).await,
         Err(ursula_runtime::RuntimeError::GroupEngine {
             error: ursula_runtime::GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
             ),
             ..
-        })
+        }) if index == poison_index
     ));
     runtime.shutdown_group_engines().await.unwrap();
     drop(runtime);

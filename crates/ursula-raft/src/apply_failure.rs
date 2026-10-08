@@ -32,9 +32,6 @@ pub(crate) struct StoppedApply {
     pub(crate) last_applied: Option<openraft::alias::LogIdOf<crate::types::UrsulaRaftTypeConfig>>,
 }
 impl ApplyHealth {
-    pub(crate) fn from_stopped(stopped: StoppedApply) -> Self {
-        Self(Arc::new(Mutex::new(Some(stopped))))
-    }
     pub(crate) fn failure(&self) -> Option<ApplyFailure> {
         self.stopped().map(|stopped| stopped.failure)
     }
