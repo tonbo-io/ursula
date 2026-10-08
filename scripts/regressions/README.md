@@ -49,8 +49,11 @@ Stream-generation fix: databendlabs/openraft commit
 through progress notifications and rejects responses from replaced streams.
 Alpha28 includes this fix as well as the stale-inflight-ACK fix above.
 
-The Ursula codec test `alpha21_persisted_envelopes_remain_byte_compatible` uses
-named MessagePack bytes generated with published alpha21. It checks Vote, LogId,
-joint StoredMembership (including a learner and addresses), and a membership
-Entry, then requires byte-identical re-encoding. It does not assert that arbitrary
-future OpenRaft releases or mixed-version cluster operation are compatible.
+The Ursula codec test `epoch3_persisted_envelopes_are_stable` pins the named
+MessagePack bytes of format epoch 3 in
+`crates/ursula-raft/src/fixtures/persisted-envelopes-epoch3.json`. It checks
+Vote, LogId, joint StoredMembership (including a learner and addresses), a
+membership Entry and SnapshotMeta, then requires byte-identical re-encoding.
+The first four were generated with published alpha21, and alpha28 encodes them
+identically. It does not assert that later OpenRaft releases or mixed-version
+cluster operation are compatible.

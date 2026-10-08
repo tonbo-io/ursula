@@ -60,6 +60,7 @@ pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngin
 mod tests {
     use openraft::type_config::alias::EntryOf;
     use openraft::type_config::alias::LogIdOf;
+    use openraft::type_config::alias::SnapshotMetaOf;
     use openraft::type_config::alias::StoredMembershipOf;
     use openraft::type_config::alias::VoteOf;
 
@@ -68,11 +69,17 @@ mod tests {
     use crate::UrsulaRaftTypeConfig;
 
     #[test]
-    fn alpha21_persisted_envelopes_remain_byte_compatible() {
-        // Produced by rmp_serde::to_vec_named using crates.io OpenRaft alpha21.
-        // Includes a joint membership, its learner and node addresses.
+    fn epoch3_persisted_envelopes_are_stable() {
+        // Named MessagePack (rmp_serde::to_vec_named) of the OpenRaft types
+        // that format epoch 3 writes to disk and sends to peers: Vote, LogId,
+        // a joint StoredMembership with a learner and node addresses, a
+        // membership Entry, and SnapshotMeta (snapshot record and transfer).
+        // The SnapshotMeta bytes are the map {last_log_id, last_membership,
+        // snapshot_id} over the LogId and StoredMembership bytes, with a
+        // snapshot id in the state machine's format. Decoding and re-encoding
+        // must reproduce each value byte for byte.
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/openraft-alpha21.json")).unwrap();
+            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch3.json")).unwrap();
         fn check<T: serde::de::DeserializeOwned + serde::Serialize>(
             fixtures: &serde_json::Value,
             name: &str,
@@ -101,5 +108,9 @@ mod tests {
         assert!(
             matches!(entry.payload, openraft::EntryPayload::Membership(m) if &m == membership.membership())
         );
+        let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> = check(&fixtures, "snapshot_meta");
+        assert_eq!(meta.last_log_id, Some(log));
+        assert_eq!(meta.last_membership, membership);
+        assert_eq!(meta.snapshot_id, "group-7-T7-N2-19");
     }
 }
