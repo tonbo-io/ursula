@@ -1,14 +1,19 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+#[cfg(not(madsim))]
 use std::fs;
 use std::io;
+#[cfg(not(madsim))]
 use std::path::Path;
+#[cfg(not(madsim))]
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(madsim)]
 use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(not(madsim))]
 use std::time::SystemTime;
+#[cfg(not(madsim))]
 use std::time::UNIX_EPOCH;
 
 use futures_util::stream;
@@ -17,8 +22,11 @@ use openraft::Config;
 use openraft::Entry;
 use openraft::EntryPayload;
 use openraft::LogId;
+#[cfg(not(madsim))]
 use openraft::Raft;
+#[cfg(not(madsim))]
 use openraft::SnapshotPolicy;
+#[cfg(not(madsim))]
 use openraft::StorageError;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
@@ -27,30 +35,40 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+#[cfg(not(madsim))]
 use openraft::testing::log::StoreBuilder;
+#[cfg(not(madsim))]
 use openraft::testing::log::Suite;
+#[cfg(not(madsim))]
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
 use ursula_control::ControlCommand;
 use ursula_runtime::AppendRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::BootstrapStreamRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
+#[cfg(not(madsim))]
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ProducerRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
+#[cfg(not(madsim))]
 use ursula_runtime::RuntimeConfig;
+#[cfg(not(madsim))]
 use ursula_runtime::RuntimeThreading;
+#[cfg(not(madsim))]
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::StreamErrorContext;
@@ -64,6 +82,7 @@ use crate::codec::*;
 use crate::engine::*;
 use crate::forward::write_result_from_raft_response;
 use crate::log_store::*;
+#[cfg(not(madsim))]
 use crate::registry::*;
 use crate::types::*;
 
@@ -78,8 +97,14 @@ mod rejoin_grpc_tests;
 #[path = "forward_tests.rs"]
 mod forward_tests;
 
+#[cfg(madsim)]
+#[path = "sim_storage_tests.rs"]
+mod sim_storage_tests;
+
+#[cfg(not(madsim))]
 struct FileLogStoreBuilder;
 
+#[cfg(not(madsim))]
 impl
     StoreBuilder<
         UrsulaRaftTypeConfig,
@@ -108,6 +133,7 @@ impl
 
 /// Opens `placement()`'s store on a fresh per-core journal under `root`; the
 /// store owns the core writer, so dropping it closes the journal.
+#[cfg(not(madsim))]
 fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
     RaftWal::start(
         root,
@@ -122,6 +148,7 @@ fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, Gr
     )
 }
 
+#[cfg(not(madsim))]
 fn start_wal(root: &Path, cores: usize, groups: usize) -> RaftWal {
     RaftWal::start(
         root,
@@ -133,6 +160,7 @@ fn start_wal(root: &Path, cores: usize, groups: usize) -> RaftWal {
 
 /// `placement()`'s log store on a fresh WAL in a new temporary directory,
 /// which the caller keeps while the store is in use.
+#[cfg(not(madsim))]
 fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
     let root = tempfile::tempdir().expect("WAL root");
     let store = RaftWal::start(
@@ -167,6 +195,7 @@ fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
 }
 
 /// The frames of core 0's journal under the WAL `root`, all segments.
+#[cfg(not(madsim))]
 fn core_journal_frames(root: &Path) -> usize {
     crate::log_store::journal_segments(&root.join("core-0"))
         .expect("list the journal segments")
@@ -175,6 +204,7 @@ fn core_journal_frames(root: &Path) -> usize {
         .sum()
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_passes_openraft_conformance_suite() {
     Suite::test_all(FileLogStoreBuilder)
@@ -366,6 +396,7 @@ fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> Gr
     GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
 }
 
+#[cfg(not(madsim))]
 fn hosted_config(core_count: usize, raft_group_count: usize) -> RuntimeConfig {
     let mut config = RuntimeConfig::new(core_count, raft_group_count);
     config.threading = RuntimeThreading::HostedTokio;
@@ -381,6 +412,7 @@ async fn shutdown_all(engines: &[RaftGroupEngine]) {
 /// Build a three-node in-process cluster, initialize it, and wait for a
 /// leader. Returns the registry, the engines (index = node id - 1), the
 /// elected leader id and the WAL directories, which must outlive the engines.
+#[cfg(not(madsim))]
 async fn build_three_node_cluster(
     cluster_name: &str,
     policy: Option<InProcessRaftNetworkPolicy>,
@@ -593,6 +625,7 @@ fn raft_group_write_response_round_trips_through_wire_codec() {
     }
 }
 
+#[cfg(not(madsim))]
 fn temp_log_path(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -603,6 +636,7 @@ fn temp_log_path(name: &str) -> PathBuf {
         .join(format!("{name}-{}-{nonce}.bin", std::process::id()))
 }
 
+#[cfg(not(madsim))]
 fn wire_frame_count<T: serde::Serialize + serde::de::DeserializeOwned>(path: &Path) -> usize {
     let bytes = fs::read(path).expect("read log file");
     read_wire_frames::<T>(&bytes)
@@ -610,6 +644,7 @@ fn wire_frame_count<T: serde::Serialize + serde::de::DeserializeOwned>(path: &Pa
         .len()
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_log_store_appends_reads_truncates_and_purges() {
     let (_root, mut store) = fresh_journal_store();
@@ -671,6 +706,7 @@ async fn raft_log_store_appends_reads_truncates_and_purges() {
     assert_eq!(entries[0].log_id, log_id(3));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_log_store_persists_vote_and_committed_pointer() {
     let (_root, mut store) = fresh_journal_store();
@@ -690,6 +726,7 @@ async fn raft_log_store_persists_vote_and_committed_pointer() {
     );
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_log_store_rejects_holes() {
     let (_root, mut store) = fresh_journal_store();
@@ -838,6 +875,7 @@ async fn meta_raft_log_store_rejects_holes() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     let root = tempfile::tempdir().expect("journal root");
@@ -886,6 +924,7 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     assert_eq!(entries[1].log_id, log_id(2));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
     let root = tempfile::tempdir().expect("journal root");
@@ -918,6 +957,7 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
     );
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_store_recovers_truncate_and_purge() {
     let root = tempfile::tempdir().expect("journal root");
@@ -967,6 +1007,7 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
     assert_eq!(entries[0].log_id, log_id(3));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
     let root = tempfile::tempdir().expect("journal root");
@@ -1028,6 +1069,7 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
     assert_eq!(read.payload, b"committed");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn single_node_meta_raft_applies_node_registration() {
     let config = raft_config("ursula-meta-single-node-test", 30, 60);
@@ -1091,6 +1133,7 @@ async fn single_node_meta_raft_applies_node_registration() {
         .expect("shutdown single-node meta raft handle");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn meta_raft_handle_registers_initial_data_nodes() {
     let config = raft_config("ursula-meta-initial-data-nodes-test", 30, 60);
@@ -1139,6 +1182,7 @@ async fn meta_raft_handle_registers_initial_data_nodes() {
         .expect("shutdown single-node meta raft handle");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
     let config = raft_config("ursula-meta-invalid-initial-data-nodes-test", 30, 60);
@@ -1173,6 +1217,7 @@ async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
         .expect("shutdown single-node meta raft handle");
 }
 
+#[cfg(not(madsim))]
 #[test]
 fn dynamic_group_hosting_allows_non_voter_warmup() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -1204,6 +1249,7 @@ fn dynamic_group_hosting_allows_non_voter_warmup() {
     assert!(factory.hosts_group(placement));
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn single_node_openraft_group_applies_client_writes() {
     let config = raft_config("ursula-single-node-test", 30, 60);
@@ -1256,6 +1302,7 @@ async fn single_node_openraft_group_applies_client_writes() {
     raft.shutdown().await.expect("shutdown raft group");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn three_node_openraft_group_replicates_group_writes() {
     let (_registry, engines, leader_id, _wal_roots) =
@@ -1315,6 +1362,7 @@ async fn three_node_openraft_group_replicates_group_writes() {
 /// read or live-read registration from its own state: a new leader has
 /// acknowledged a write it never saw. Each answers a forward or a
 /// leader-unknown error (HTTP 307 or 503), never the stale view.
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn deposed_leader_refuses_linearizable_reads() {
     let policy = InProcessRaftNetworkPolicy::default();
@@ -1433,6 +1481,7 @@ async fn deposed_leader_refuses_linearizable_reads() {
 }
 
 #[track_caller]
+#[cfg(not(madsim))]
 fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
     match result {
         Ok(_) => panic!("{what}: the deposed leader served its stale view"),
@@ -2039,6 +2088,7 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
     (registry, engines, leader_id)
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn openraft_installs_snapshot_for_lagging_learner() {
     let registry = InProcessRaftRegistry::default();
@@ -2219,6 +2269,7 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     shutdown_all(&engines).await;
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     let (_wal_root, log_store) = fresh_journal_store();
@@ -2274,6 +2325,7 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_preserves_stream_error_next_offset() {
     let (_wal_root, log_store) = fresh_journal_store();
@@ -2325,6 +2377,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_recovers_client_writes_from_file_log() {
     let root = tempfile::tempdir().expect("journal root");
@@ -2380,6 +2433,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         .expect("shutdown recovered engine");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -2409,6 +2463,7 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     assert_eq!(read.payload, b"payload");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warm_group_registers_runtime_owned_raft_handle() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -2440,6 +2495,7 @@ async fn warm_group_registers_runtime_owned_raft_handle() {
         .expect("wait for registered leader");
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn durable_raft_group_engine_records_file_log_metrics() {
     let root = temp_log_path("raft-file-log-metrics-root").with_extension("");
@@ -2492,6 +2548,7 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     remove_test_path(&root);
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn durable_raft_group_engine_recovers_from_core_journal() {
     let root = temp_log_path("raft-core-journal-recover-root").with_extension("");
@@ -2658,6 +2715,7 @@ fn forwarded_reads_carry_linearizability_over_grpc() {
 }
 
 /// Remove a temporary test file or directory, tolerating its absence.
+#[cfg(not(madsim))]
 pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
     let path = path.as_ref();
     let removed = if path.is_dir() {
@@ -3107,6 +3165,7 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
     }
 }
 
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -3117,6 +3176,14 @@ async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries(
         .create(placement, metrics.group_engine_metrics())
         .await
         .unwrap();
+    assert_append_batch_reserves_hot_capacity(&mut *engine, placement).await;
+    engine.shutdown().await.unwrap();
+}
+
+async fn assert_append_batch_reserves_hot_capacity(
+    engine: &mut dyn GroupEngine,
+    placement: ShardPlacement,
+) {
     let stream = bsid("batch-capacity");
     engine
         .create_stream(
@@ -3147,7 +3214,6 @@ async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries(
             }
         ))
     ));
-    engine.shutdown().await.unwrap();
 }
 
 #[cfg(madsim)]

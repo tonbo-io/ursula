@@ -230,7 +230,7 @@ impl SnapshotBuildCoordinator {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(madsim)))]
     fn available_permits(&self) -> usize {
         self.inner.semaphore.available_permits()
     }

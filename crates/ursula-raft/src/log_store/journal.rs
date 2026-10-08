@@ -31,7 +31,7 @@
 
 use std::fmt;
 use std::io;
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
@@ -379,10 +379,10 @@ pub(crate) trait FrameCodec {
 }
 
 /// JSON frame codec for any owned, serde-serializable record.
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) struct JsonCodec<T>(PhantomData<T>);
 
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 impl<T> FrameCodec for JsonCodec<T>
 where T: serde::Serialize + serde::de::DeserializeOwned
 {
@@ -578,7 +578,7 @@ impl JournalWriter {
     }
 
     /// Lowers the frame limit, so tests can exceed it with small records.
-    #[cfg(test)]
+    #[cfg(all(test, not(madsim)))]
     pub(crate) fn with_frame_limit(mut self, frame_limit: usize) -> Self {
         self.frame_limit = frame_limit;
         self
@@ -747,7 +747,7 @@ pub(crate) fn recover_all<C: FrameCodec>(
 }
 
 /// Decodes the frames of an in-memory journal image in strict mode.
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn decode_frames<C: FrameCodec>(
     bytes: &[u8],
 ) -> Result<(Vec<C::Record>, Replayed), JournalError> {

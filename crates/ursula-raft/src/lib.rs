@@ -103,7 +103,7 @@ pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
 pub use grpc::RaftGrpcMetricsSnapshot;
 pub use grpc::RaftGrpcService;
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;

@@ -1803,6 +1803,10 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         engines.push(engine);
     }
     let leader = engines[0].raft_handle();
+    // initialize already starts an election. Allow only the intended leader
+    // to retry a vote RPC timeout during bootstrap; freeze ticks again before
+    // the paused-journal assertion so this test cannot elect a replacement.
+    leader.runtime_config().tick(true);
     leader.initialize(members).await.unwrap();
     leader.trigger().elect(false).await.unwrap();
     leader
@@ -1810,6 +1814,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .current_leader(1, "leader elected")
         .await
         .unwrap();
+    leader.runtime_config().tick(false);
     let response = leader
         .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
             stream_id: ursula_shard::BucketStreamId::new("before-pause", "events"),

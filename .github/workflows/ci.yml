@@ -113,6 +113,9 @@ jobs:
       - name: Audit DST guards (all 7 audits)
         run: python3 -m scripts.dst all
 
+      - name: Test Raft units under madsim
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib
+
       - name: Run madsim smoke corpus and PR seed set
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture

@@ -1,11 +1,11 @@
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 mod cold_drivers_tests;
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 mod compact_tests;
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 mod external_index_after_commit_tests;
 mod factory;
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 mod test_support;
 
 use std::collections::BTreeMap;

@@ -175,7 +175,7 @@ pub(crate) enum RecoveryProbeError {
 /// Confirm a group's current quorum without issuing an application write.
 /// This is a point-in-time observation, not a maintenance reservation or a
 /// promise that another participant cannot disrupt a voter immediately after.
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) async fn confirm_quorum_prefix(
     placement: ursula_shard::ShardPlacement,
     leader_id: u64,

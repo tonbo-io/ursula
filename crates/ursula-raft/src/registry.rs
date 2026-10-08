@@ -1142,6 +1142,7 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(madsim))]
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -1184,6 +1185,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    #[cfg(not(madsim))]
     struct FailingReferenceStore {
         fail_pin: std::sync::atomic::AtomicBool,
         fail_current: std::sync::atomic::AtomicBool,
@@ -1198,6 +1200,7 @@ mod tests {
         release_download: crate::rt::sync::Notify,
     }
 
+    #[cfg(not(madsim))]
     impl SnapshotStore for FailingReferenceStore {
         fn upload<'a>(
             &'a self,
@@ -1284,6 +1287,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(madsim))]
     async fn reference_failure_group(
         store: Arc<FailingReferenceStore>,
     ) -> (RaftGroupHandleRegistry, RaftGroupHandle, tempfile::TempDir) {
@@ -1291,6 +1295,7 @@ mod tests {
         (registry, engine.raft_handle(), root)
     }
 
+    #[cfg(not(madsim))]
     async fn reference_failure_engine(
         store: Arc<FailingReferenceStore>,
     ) -> (
@@ -1301,6 +1306,7 @@ mod tests {
         reference_failure_engine_for_group(store, RaftGroupId(7), Default::default()).await
     }
 
+    #[cfg(not(madsim))]
     async fn reference_failure_engine_for_group(
         store: Arc<FailingReferenceStore>,
         group: RaftGroupId,
@@ -1358,6 +1364,7 @@ mod tests {
         (registry, engine, wal_root)
     }
 
+    #[cfg(not(madsim))]
     fn reference_failure_snapshot() -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
         let mut snapshot = external_snapshot("reference-fault");
         let id = openraft::LogId::new(openraft::vote::RaftLeaderId::new(1, 2), 1);
@@ -1746,6 +1753,7 @@ mod tests {
             .unwrap();
         raft.shutdown().await.unwrap();
     }
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
         let store = Arc::new(FailingReferenceStore::default());
@@ -1770,6 +1778,7 @@ mod tests {
         raft.shutdown().await.unwrap();
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
         let store = Arc::new(FailingReferenceStore::default());

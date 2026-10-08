@@ -110,7 +110,7 @@ pub use writer::JournalTuning;
 pub use writer::LaggingGroups;
 pub(crate) use writer::WriterExited;
 pub(crate) use writer::elapsed_ns;
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) use writer::read_wire_frames;
 
 use crate::types::UrsulaRaftTypeConfig;

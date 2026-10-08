@@ -49,6 +49,30 @@ The main friction points are:
 - **Runtime-owned leader failover is still a simulation seam, not production rerouting.** The simulator can now shut down and install a group engine in a hosted `ShardRuntime`, which is enough to test runtime API behavior after OpenRaft leadership changes. Production HTTP/gRPC client routing and multi-process leader discovery are still outside the current simulator boundary.
 - **Production gRPC and full HTTP networking are not automatically in scope.** The first simulator should focus on the Raft/runtime/state-machine protocol plus selected in-process protocol-surface checks. Wire-format bugs in tonic/HTTP, real TCP behavior, and process-level routing remain covered by unit/e2e/EC2 tests unless we explicitly add a later full-node simulation mode.
 
+## Raft unit-test boundaries
+
+CI runs both `cargo test -p ursula-raft --lib` and
+`RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib`. The latter runs the
+whole crate, not a name-filtered subset. Native tests remain part of the regular
+workspace unit-test job.
+
+| Fixture | Native coverage | Simulation coverage |
+| --- | --- | --- |
+| Journal storage contract | OpenRaft storage suite on a real temporary WAL; reopen, truncate, purge, vote and commit persistence | The same OpenRaft storage suite on `SimDisk`; `ursula-sim` disk/recovery tests exercise page loss, reordered writes, fsync failure and gated restart |
+| Replication and linearizable reads | Real Tokio Raft actors, sockets and thread-per-core ownership | Raft unit strict append/read replay and partition/heal; smoke corpus `snapshot_catch_up`, leader-failover and leader-read-linearizability families |
+| Runtime-owned Raft and cold tier | Native factory, cold-index cache, compaction and object reference integration | Hosted runtime/Raft network, cold flush/restart and cold-write-failure smoke families |
+| Snapshot reference publication and host concurrency | Native cancellation, publication retries, install permits, OS threads and real filesystem metadata | Pure snapshot codec, state-machine install and prefetch contracts remain in the simulated crate suite; this does **not** simulate the native filesystem publication worker |
+| Batch hot-capacity reservation | Native factory and append batch | The same unapplied-entry capacity assertions on a SimDisk-backed engine |
+| Control state and wire formats | Pure state machines, log stores and codec tests | The same pure tests; native OpenRaft meta actor startup stays native |
+
+A fixture that opens `tempfile`/`std::fs`, real sockets or OS threads is marked
+`cfg(not(madsim))` together with its private helpers. Those dependencies are not
+simulated by merely starting a Tokio runtime. Simulator fixtures explicitly
+enter `MadsimOpenRaftRuntime::scope` and provision `SimDisk` paths. Do not gate
+pure tests with an entire mixed module, or remove native assertions to make the
+simulated suite pass. The existing ignored strict-replay diagnostic subprobes
+are unchanged; the full strict append/read replay runs by default.
+
 ## Approach
 
 Build the DST stack in three layers. Each layer should deliver standalone value.
