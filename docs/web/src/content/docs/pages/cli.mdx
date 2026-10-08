@@ -72,7 +72,7 @@ These commands install or retire the supplied token; they do not acquire a share
 
 Activation waits for admitted mutation handlers and then confirms prior messages were processed by each captured local Raft API queue. Caller cancellation leaves its admitted handler running; abnormal handler termination latches that process closed. Failed or cancelled activation/retirement stays closed until the same pending lifecycle completes or an externally admitted higher generation activates. Retirement retains its generation and cannot be reopened by the same token. This confirms submission ordering, not completion of asynchronous replication, snapshot work, or physical operations. Fresh all-replica prefix certification and external lifecycle reconciliation remain required before releasing the reservation.
 
-New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token; other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`; `verify-quorum` schema 4 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it; a mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
+New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token. Other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`. `verify-quorum` schema 4 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it. A mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
 
 ## The admin plane
 
@@ -168,13 +168,13 @@ node 3 (10.0.0.3): groups=4 leaders={1: 2, 2: 2}
 
 ## `wait-ready`
 
-Wait until every node reports `--expected-groups` initialized Raft groups with leaders, a complete uniform voter set in `raft_maintenance`, and no uncertain maintenance fence. Each node must also return 200 from the existing `/__ursula/ready` probe. This works against 0.7.0 servers without adding a new endpoint.
+Wait until every node reports `--expected-groups` initialized Raft groups with leaders, a complete uniform voter set in `raft_maintenance`, and no uncertain maintenance fence. Each node must also return 200 from the existing `/__ursula/ready` probe. The serving probe uses each node’s `http_url`, independently of its admin or metrics address.
 
 ```bash
 ursulactl wait-ready --config cluster.json --expected-groups 4
 ```
 
-Exits non-zero with the maintenance report or serving refusal when the timeout passes. Transport, decoding, and identity errors retain their original cause and stop the wait. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
+Exits non-zero with the maintenance report or serving refusal when the timeout passes. Transport failures are retried until the timeout, retaining the last error. Invalid responses and process identity changes stop the wait with their original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
 
 ## Underlying HTTP surface
 

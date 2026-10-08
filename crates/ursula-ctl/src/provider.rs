@@ -23,8 +23,9 @@ pub struct NodeInfo {
     pub admin_url: Url,
     /// Address shown in reports. Defaults to the admin URL's host.
     pub host: String,
-    /// Advertised public client/Raft address for learner attachment and
-    /// survivor handoff. Metrics use it when `metrics_url` is absent, then
+    /// Advertised public client/Raft address for learner attachment,
+    /// survivor handoff, and the serving probe required by `wait-ready`.
+    /// Metrics use it when `metrics_url` is absent, then
     /// fall back to `admin_url`.
     #[serde(default)]
     pub http_url: Option<Url>,

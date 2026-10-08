@@ -226,7 +226,16 @@ impl MetricsClient {
         &self,
         node: &NodeInfo,
     ) -> Result<(reqwest::StatusCode, ursula_proto::admin::ServingReadiness)> {
-        let url = metrics_base_url(node).join("/__ursula/ready")?;
+        let url = node
+            .http_url
+            .as_ref()
+            .with_context(|| {
+                format!(
+                    "node {} needs http_url for its serving readiness probe",
+                    node.id
+                )
+            })?
+            .join("/__ursula/ready")?;
         let response = self.client.get(url).send().await?;
         if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
             response.error_for_status_ref()?;

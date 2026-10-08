@@ -116,7 +116,7 @@ pub enum ReadinessRefusal {
     },
 }
 
-/// Check existing metrics, without requiring a newer admin endpoint.
+/// Check maintenance eligibility from complete metrics evidence.
 pub fn check_maintenance_snapshot(
     snapshot: &ClusterSnapshot,
     expected_nodes: usize,
@@ -151,7 +151,8 @@ pub fn check_maintenance_snapshot(
 }
 
 /// Wait for complete metrics evidence and the existing local serving probe.
-/// Transport, decoding, and identity errors retain their original source.
+/// Retry transport failures through the deadline. Decoding and identity failures
+/// are terminal. Every error retains its original source.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -161,28 +162,41 @@ pub async fn wait_ready(
 ) -> Result<ClusterSnapshot> {
     let started = Instant::now();
     loop {
-        let snapshot = client.fetch_cluster(nodes).await?;
-        let mut refusal = check_maintenance_snapshot(&snapshot, nodes.len(), expected_groups).err();
-        if refusal.is_none() {
+        let observation: Result<ClusterSnapshot> = async {
+            let snapshot = client.fetch_cluster(nodes).await?;
+            check_maintenance_snapshot(&snapshot, nodes.len(), expected_groups)?;
             for node in nodes {
                 let (status, report) = client.serving_readiness(node).await?;
                 if status != reqwest::StatusCode::OK || !report.ready {
-                    refusal = Some(ReadinessRefusal::Serving {
+                    return Err(ReadinessRefusal::Serving {
                         node_id: node.id,
                         status: status.as_u16(),
                         reason: report.reason,
-                    });
-                    break;
+                    }
+                    .into());
+                }
+            }
+            Ok(snapshot)
+        }
+        .await;
+        match observation {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => {
+                let retryable = error.downcast_ref::<ReadinessRefusal>().is_some()
+                    || error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(|source| {
+                            source.is_connect()
+                                || source.is_timeout()
+                                || source.is_body()
+                                || (source.is_request() && !source.is_builder())
+                        });
+                if !retryable || started.elapsed() >= timeout {
+                    return Err(error);
                 }
             }
         }
-        let Some(refusal) = refusal else {
-            return Ok(snapshot);
-        };
-        if started.elapsed() >= timeout {
-            return Err(refusal.into());
-        }
-        tokio::time::sleep(poll_interval).await;
+        tokio::time::sleep(poll_interval.min(timeout.saturating_sub(started.elapsed()))).await;
     }
 }
 
@@ -254,7 +268,7 @@ mod tests {
     async fn wait_ready_uses_existing_probes_and_preserves_refusal_causes() {
         use axum::response::IntoResponse;
         use ursula_proto::admin::ServingReadinessReason;
-        for mode in 0..7 {
+        for mode in 0..9 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let mut metrics = crate::metrics::test_metrics(
@@ -325,13 +339,31 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let mut node = node(1);
-            node.http_url = None;
+            node.http_url = Some(format!("http://{address}").parse().unwrap());
             node.admin_url = format!("http://{address}").parse().unwrap();
+            if mode >= 7 {
+                let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", unavailable.local_addr().unwrap())
+                    .parse()
+                    .unwrap();
+                drop(unavailable);
+                if mode == 7 {
+                    node.metrics_url = Some(url);
+                } else {
+                    node.http_url = Some(url);
+                }
+            }
+            let timeout = if mode >= 7 {
+                Duration::from_millis(40)
+            } else {
+                Duration::ZERO
+            };
+            let started = Instant::now();
             let result = wait_ready(
                 &MetricsClient::new(Duration::from_secs(1)).unwrap(),
                 &[node],
                 1,
-                Duration::ZERO,
+                timeout,
                 Duration::from_millis(1),
             )
             .await;
@@ -361,6 +393,10 @@ mod tests {
                         Some(reqwest::StatusCode::NOT_FOUND)
                     ),
                     5 => assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_decode()),
+                    7 | 8 => {
+                        assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_connect());
+                        assert!(started.elapsed() >= timeout);
+                    }
                     _ => assert!(matches!(
                         error.downcast_ref::<ReadinessRefusal>(),
                         Some(ReadinessRefusal::Serving {

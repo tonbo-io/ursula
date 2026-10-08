@@ -48,6 +48,99 @@ impl Drop for ChildGuard {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_wait_ready_uses_the_chart_generated_client_plane_through_startup() {
+    use ursula_ctl::provider::NodeProvider;
+    let _guard = static_cluster_cli_test_guard().await;
+    let root = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let config = root.path().join("server.toml");
+    let admin_port = write_single_node_cluster_config(
+        &config,
+        port,
+        1,
+        1,
+        &base,
+        true,
+        &root.path().join("wal"),
+    );
+    let manifest = root.path().join("cluster.json");
+    // Execute the production function embedded in Helm's rollout ConfigMap,
+    // rather than duplicating its manifest or stubbing strict_verify.
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../charts/ursula/files/graceful-rollout.sh");
+    let generated = Command::new("sh")
+        .args([
+            "-c",
+            ". \"$1\"; MANIFEST=\"$2\"; write_manifest",
+            "chart-manifest",
+        ])
+        .arg(script)
+        .arg(&manifest)
+        .env("ROLLOUT_SOURCE_ONLY", "1")
+        .env("NAMESPACE", "readiness-test")
+        .env("STATEFULSET", "ursula")
+        .env("REPLICAS", "1")
+        .env("EXPECTED_GROUPS", "1")
+        .env("TARGET_IMAGE", "local-readiness-test")
+        .env("CLIENT_PORT", port.to_string())
+        .env("FORWARD_PORT_BASE", admin_port.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let provider = ursula_ctl::provider::StaticNodeProvider::from_path(&manifest).unwrap();
+    let mut nodes = provider.list_nodes().await.unwrap();
+    assert_eq!(nodes.len(), 1);
+    let node = &mut nodes[0];
+    assert_eq!(
+        node.http_url.as_ref().unwrap().host_str(),
+        Some("ursula-0.ursula-headless.readiness-test.svc.cluster.local")
+    );
+    assert_eq!(node.http_url.as_ref().unwrap().port(), Some(port));
+    assert_eq!(node.metrics_url.as_ref().unwrap().port(), Some(admin_port));
+    assert_eq!(node.admin_url.port(), Some(admin_port));
+    assert_ne!(port, admin_port);
+    // Local processes have no Kubernetes DNS. Remap only its hostname,
+    // retaining every generated address role and port.
+    node.http_url
+        .as_mut()
+        .unwrap()
+        .set_host(Some("127.0.0.1"))
+        .unwrap();
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
+    let wait = ursula_ctl::observe::wait_ready(
+        &ctl,
+        &nodes,
+        1,
+        Duration::from_secs(30),
+        Duration::from_millis(25),
+    );
+    let start_server = async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ursula"));
+        command.arg("server").arg("--config").arg(&config);
+        spawn_child(command, "chart-readiness".to_owned())
+    };
+    let (result, child) = tokio::join!(wait, start_server);
+    assert_eq!(
+        result
+            .unwrap_or_else(|error| panic!("wait-ready: {error:#}; {}", child_report(&child)))
+            .per_node
+            .len(),
+        1
+    );
+    let response = reqwest::get(format!("http://127.0.0.1:{admin_port}/__ursula/ready"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_startup_admission_precedes_transport_and_publishes_its_fresh_boot() {
     use std::os::unix::fs::PermissionsExt;
     let _guard = static_cluster_cli_test_guard().await;
