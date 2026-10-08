@@ -1,7 +1,5 @@
 //! `ursula_status` and `ursula_stats` as JSON.
 
-use std::fmt::Write as _;
-
 use crate::db::attached;
 use crate::db::lock;
 use crate::error::Error;
@@ -13,9 +11,7 @@ fn json_str(s: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
             c => out.push(c),
         }
     }
@@ -23,8 +19,8 @@ fn json_str(s: &str) -> String {
     out
 }
 
-pub(crate) unsafe fn status(path: &str) -> Result<String, Error> {
-    let path = unsafe { full_pathname(path)? };
+pub(crate) fn status(path: &str) -> Result<String, Error> {
+    let path = full_pathname(path)?;
     let db = attached(&path)?;
     let db = lock(&db);
     Ok(format!(
@@ -43,48 +39,48 @@ pub(crate) unsafe fn status(path: &str) -> Result<String, Error> {
     ))
 }
 
-pub(crate) unsafe fn stats(path: &str) -> Result<String, Error> {
-    let path = unsafe { full_pathname(path)? };
+pub(crate) fn stats(path: &str) -> Result<String, Error> {
+    let path = full_pathname(path)?;
     let db = attached(&path)?;
     let mut db = lock(&db);
-    let mut out = String::from("{\"commits\":[");
-    for (i, s) in db.stats.drain(..).enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let _ = write!(
-            out,
-            "{{\"bytes\":{},\"raw\":{},\"pages\":{},\"attempts\":{},\"append_us\":{},\"vfs_us\":{}}}",
-            s.bytes,
-            s.raw,
-            s.pages,
-            s.attempts,
-            s.append.as_micros(),
-            s.vfs.as_micros()
-        );
-    }
-    out.push_str("],\"checkpoints_us\":[");
-    for (i, d) in db.checkpoints.drain(..).enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let _ = write!(out, "{}", d.as_micros());
-    }
-    out.push_str("],\"snapshots\":[");
-    for (i, s) in db.snapshot_stats.drain(..).enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let _ = write!(
-            out,
-            "{{\"offset\":{},\"bytes\":{},\"raw\":{},\"copy_us\":{},\"total_us\":{}}}",
-            json_str(&s.offset),
-            s.bytes,
-            s.raw,
-            s.copy.as_micros(),
-            s.total.as_micros()
-        );
-    }
-    out.push_str("]}");
-    Ok(out)
+    let commits: Vec<String> = db
+        .stats
+        .drain(..)
+        .map(|s| {
+            format!(
+                "{{\"bytes\":{},\"raw\":{},\"pages\":{},\"attempts\":{},\"append_us\":{},\"vfs_us\":{}}}",
+                s.bytes,
+                s.raw,
+                s.pages,
+                s.attempts,
+                s.append.as_micros(),
+                s.vfs.as_micros()
+            )
+        })
+        .collect();
+    let checkpoints: Vec<String> = db
+        .checkpoints
+        .drain(..)
+        .map(|d| d.as_micros().to_string())
+        .collect();
+    let snapshots: Vec<String> = db
+        .snapshot_stats
+        .drain(..)
+        .map(|s| {
+            format!(
+                "{{\"offset\":{},\"bytes\":{},\"raw\":{},\"copy_us\":{},\"total_us\":{}}}",
+                json_str(&s.offset),
+                s.bytes,
+                s.raw,
+                s.copy.as_micros(),
+                s.total.as_micros()
+            )
+        })
+        .collect();
+    Ok(format!(
+        "{{\"commits\":[{}],\"checkpoints_us\":[{}],\"snapshots\":[{}]}}",
+        commits.join(","),
+        checkpoints.join(","),
+        snapshots.join(",")
+    ))
 }

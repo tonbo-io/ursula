@@ -62,8 +62,15 @@ pub(crate) fn pause(
         return false;
     }
     std::thread::sleep(wait);
-    *backoff = (*backoff * 2).min(Duration::from_secs(1));
+    *backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
     true
+}
+
+/// When the retries of a request end: `retry_budget()` from now (now, for a budget past what
+/// `Instant` can hold).
+fn retry_deadline() -> Instant {
+    let now = Instant::now();
+    now.checked_add(retry_budget()).unwrap_or(now)
 }
 
 /// Sends a read, retrying 429 (rate limiting) and 503 (overload, or a `consistency=leader` read,
@@ -75,7 +82,7 @@ fn read_retrying(
     send: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     stopped: &dyn Fn() -> bool,
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-    let deadline = Instant::now() + retry_budget();
+    let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
     loop {
         let r = send()?;
@@ -131,11 +138,11 @@ pub(crate) fn append(
     epoch: u64,
     seq: u64,
 ) -> Append {
-    let deadline = Instant::now() + retry_budget();
+    let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
-    let mut attempts = 0;
+    let mut attempts: u32 = 0;
     loop {
-        attempts += 1;
+        attempts = attempts.saturating_add(1);
         let mut req = agent()
             .post(url)
             .header("content-type", CONTENT_TYPE)
@@ -423,7 +430,7 @@ pub(crate) fn put_idempotent(
     body: &[u8],
     stopped: &dyn Fn() -> bool,
 ) -> Result<(u16, ureq::http::Response<ureq::Body>), Error> {
-    let deadline = Instant::now() + retry_budget();
+    let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(50);
     loop {
         let unknown = match bulk_agent()
@@ -439,14 +446,18 @@ pub(crate) fn put_idempotent(
             },
             Err(e) => Attempt::Transport(Box::new(e)),
         };
-        if Instant::now() + backoff > deadline || stopped() {
+        if Instant::now()
+            .checked_add(backoff)
+            .is_none_or(|end| end > deadline)
+            || stopped()
+        {
             return Err(Error::PutUnknown {
                 url: url.to_owned(),
                 last: unknown,
             });
         }
         std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_secs(1));
+        backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
     }
 }
 

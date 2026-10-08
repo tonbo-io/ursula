@@ -2,7 +2,6 @@
 //! the boot it was written in, and the locks that keep other processes off the db file.
 
 use std::ffi::CStr;
-use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::ptr::null_mut;
@@ -33,10 +32,13 @@ fn read_boot_id() -> Option<String> {
 
 /// `kern.bootsessionuuid` (not `kern.uuid`, the kernel binary's, which never changes).
 #[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "sysctlbyname has no safe std API")]
 fn read_boot_id() -> Option<String> {
     let mut buf = [0u8; 64];
     let mut len = buf.len();
     let name = c"kern.bootsessionuuid";
+    // SAFETY: the name is NUL-terminated, `buf` holds `len` writable bytes and `len` is updated in
+    // place; no new value is set.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -61,7 +63,7 @@ fn read_boot_id() -> Option<String> {
 /// The stream's identity in a sidecar: its URL path (the host may differ: a gateway, another node).
 pub(crate) fn stream_key(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    rest.find('/').map_or("", |i| &rest[i..])
+    rest.find('/').and_then(|i| rest.get(i..)).unwrap_or("")
 }
 
 /// The db file's identity, when it exists: its inode. Not the device: an overlay root filesystem
@@ -82,9 +84,9 @@ pub(crate) fn stamp(path: &str, url: &str, boot: Option<&str>, incarnation: &str
         stream_key(url)
     );
     if let Some(id) = file_id(path) {
-        let _ = write!(s, " file={id}");
+        s.push_str(&format!(" file={id}"));
     }
-    let _ = write!(s, " incarnation={incarnation}");
+    s.push_str(&format!(" incarnation={incarnation}"));
     s
 }
 
@@ -264,14 +266,20 @@ pub(crate) fn remove_if_exists(f: &str) -> Result<(), Error> {
 /// of this process is open or can open (attach refuses otherwise, and `x_open` refuses the main db
 /// while it attaches), so closing `f` drops only this lock. Another *attached* process is excluded
 /// by the host lock already held.
+#[expect(
+    unsafe_code,
+    reason = "POSIX byte-range locks (fcntl), which SQLite uses, have no safe std API"
+)]
 pub(crate) fn lock_unused(path: &str, f: &fs::File) -> Result<(), Error> {
     use std::os::fd::AsRawFd;
+    // SAFETY: `flock` is a C struct of integers, for which all zeros is a valid value.
     let mut l: libc::flock = unsafe { std::mem::zeroed() };
     l.l_type = libc::F_WRLCK as _;
     l.l_whence = libc::SEEK_SET as _;
     l.l_start = 0x4000_0000; // PENDING_BYTE; RESERVED and the SHARED range follow (512 bytes)
     l.l_len = 512;
-    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &l) } == 0 {
+    // SAFETY: `f` is an open descriptor and F_SETLK reads the `flock` at the pointer.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &raw const l) } == 0 {
         return Ok(());
     }
     let e = std::io::Error::last_os_error();
@@ -283,7 +291,8 @@ pub(crate) fn lock_unused(path: &str, f: &fs::File) -> Result<(), Error> {
         });
     }
     // Name the holder, if it still holds the range.
-    let held = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } == 0
+    // SAFETY: `f` is an open descriptor and F_GETLK reads and writes the `flock` at the pointer.
+    let held = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &raw mut l) } == 0
         && l.l_type != libc::F_UNLCK as _;
     Err(Error::OpenElsewhere {
         path: path.to_owned(),
@@ -406,8 +415,8 @@ mod tests {
         // `:0` only without a commit; folding it leaves the last image, cut to its db size.
         let sum = |mut s: (u32, u32), b: &[u8]| {
             for c in b.chunks_exact(8) {
-                s.0 = s.0.wrapping_add(be32(c)).wrapping_add(s.1);
-                s.1 = s.1.wrapping_add(be32(&c[4..])).wrapping_add(s.0);
+                s.0 = s.0.wrapping_add(be32(c, 0).unwrap()).wrapping_add(s.1);
+                s.1 = s.1.wrapping_add(be32(c, 4).unwrap()).wrapping_add(s.0);
             }
             s
         };

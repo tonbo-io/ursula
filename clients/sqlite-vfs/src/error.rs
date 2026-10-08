@@ -88,8 +88,8 @@ pub(crate) enum Error {
     DbFileHandle(c_int),
     #[error("read db file pages: {code} (file shorter than {pages} pages?)")]
     ReadPages { code: c_int, pages: u32 },
-    #[error("journal_mode=WAL on {path}: {code}")]
-    WalFormat { path: String, code: c_int },
+    #[error("the host's SQLite has no {0}")]
+    MissingRoutine(&'static str),
 
     // The stream.
     #[error("{op} {url}: {source}")]
@@ -317,7 +317,11 @@ mod tests {
             current: Some(3),
         });
         assert!(superseded.is_fenced() && !superseded.is_recreated());
-        assert!(superseded.to_string().ends_with("superseded by Some(3) (403)"));
+        assert!(
+            superseded
+                .to_string()
+                .ends_with("superseded by Some(3) (403)")
+        );
         let gone = Error::Gone(Gone::SnapshotSuperseded { offset: "7".into() });
         assert!(gone.is_gone() && !gone.is_fenced() && !gone.is_recreated());
         let local = Error::LocalWalWrite(10);

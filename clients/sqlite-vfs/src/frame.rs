@@ -51,13 +51,24 @@ pub enum FrameError {
     PageOutside { pgno: u32, size: u32 },
     #[error("unknown record")]
     UnknownRecord,
+    #[error("a frame of {0} bytes or pages is too large")]
+    TooLarge(usize),
+    #[error("page {pgno}: an image of {len} bytes")]
+    PageImage { pgno: u32, len: usize },
 }
+
+/// A commit record's kind, db size and page count.
+const COMMIT_HEADER: usize = 9;
+/// A commit record's page entry: the page number and the image.
+const ENTRY: usize = 4 + PAGE;
 
 fn wrap(record: &[u8]) -> Result<Vec<u8>, FrameError> {
     let payload = zstd::bulk::compress(record, ZSTD_LEVEL).map_err(FrameError::Compress)?;
-    let mut out = Vec::with_capacity(HEADER + payload.len());
+    let len =
+        u32::try_from(payload.len()).map_err(|_too_long| FrameError::TooLarge(payload.len()))?;
+    let mut out = Vec::with_capacity(payload.len().saturating_add(HEADER));
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
@@ -68,13 +79,25 @@ pub fn encode_commit(
     size: u32,
     pages: &BTreeMap<u32, Vec<u8>>,
 ) -> Result<(Vec<u8>, usize), FrameError> {
-    let mut record = Vec::with_capacity(9 + pages.len() * (4 + PAGE));
+    let n = u32::try_from(pages.len()).map_err(|_too_many| FrameError::TooLarge(pages.len()))?;
+    let mut record = Vec::with_capacity(
+        pages
+            .len()
+            .saturating_mul(ENTRY)
+            .saturating_add(COMMIT_HEADER),
+    );
     record.push(0);
     record.extend_from_slice(&size.to_le_bytes());
-    record.extend_from_slice(&(pages.len() as u32).to_le_bytes());
-    for (pgno, data) in pages {
+    record.extend_from_slice(&n.to_le_bytes());
+    for (&pgno, image) in pages {
+        if image.len() != PAGE {
+            return Err(FrameError::PageImage {
+                pgno,
+                len: image.len(),
+            });
+        }
         record.extend_from_slice(&pgno.to_le_bytes());
-        record.extend_from_slice(data);
+        record.extend_from_slice(image);
     }
     Ok((wrap(&record)?, record.len()))
 }
@@ -86,64 +109,101 @@ pub fn encode_claim(epoch: u64, nonce: &[u8; 16]) -> Result<Vec<u8>, FrameError>
     wrap(&record)
 }
 
-fn le32(b: &[u8]) -> u32 {
-    u32::from_le_bytes(b[..4].try_into().unwrap())
+/// The little-endian u32 at the start of `b`, and the rest.
+fn take_u32(b: &[u8]) -> Option<(u32, &[u8])> {
+    let (n, rest) = b.split_first_chunk::<4>()?;
+    Some((u32::from_le_bytes(*n), rest))
 }
 
 /// Decodes the frame at the start of `buf`.
 pub fn decode(buf: &[u8]) -> Result<Decoded, FrameError> {
-    if buf.len() < HEADER {
-        if !MAGIC.starts_with(&buf[..buf.len().min(4)]) {
-            return Err(FrameError::Magic);
-        }
-        return Ok(Decoded::Partial);
-    }
-    if &buf[..4] != MAGIC {
+    let Some((magic, rest)) = buf.split_first_chunk::<4>() else {
+        // Shorter than the magic: what there is must be its start.
+        return if MAGIC.iter().zip(buf).all(|(m, b)| m == b) {
+            Ok(Decoded::Partial)
+        } else {
+            Err(FrameError::Magic)
+        };
+    };
+    if magic != MAGIC {
         return Err(FrameError::Magic);
     }
-    let len = le32(&buf[4..]) as usize;
-    let Some(payload) = buf.get(HEADER..HEADER + len) else {
+    let Some((len, rest)) = take_u32(rest) else {
         return Ok(Decoded::Partial);
     };
-    if crc32c::crc32c(payload) != le32(&buf[8..]) {
+    let Some((crc, rest)) = take_u32(rest) else {
+        return Ok(Decoded::Partial);
+    };
+    let len = len as usize;
+    let Some(payload) = rest.get(..len) else {
+        return Ok(Decoded::Partial);
+    };
+    if crc32c::crc32c(payload) != crc {
         return Err(FrameError::Checksum);
     }
     let record = zstd::stream::decode_all(payload).map_err(FrameError::Zstd)?;
-    let record = match record.first() {
-        Some(0) if record.len() >= 9 => {
-            let (size, n) = (le32(&record[1..]), le32(&record[5..]) as usize);
-            let body = &record[9..];
-            if body.len() != n * (4 + PAGE) {
+    Ok(Decoded::Frame {
+        record: record_of(&record)?,
+        // The payload is within `buf`: no overflow.
+        len: HEADER.saturating_add(len),
+    })
+}
+
+fn record_of(record: &[u8]) -> Result<Record, FrameError> {
+    match record.split_first() {
+        Some((0, rest)) => {
+            let Some((size, rest)) = take_u32(rest) else {
+                return Err(FrameError::UnknownRecord);
+            };
+            let Some((n, body)) = take_u32(rest) else {
+                return Err(FrameError::UnknownRecord);
+            };
+            let n = n as usize;
+            if n.checked_mul(ENTRY) != Some(body.len()) {
                 return Err(FrameError::CommitLength {
                     bytes: body.len(),
                     pages: n,
                 });
             }
             let mut pages = Vec::with_capacity(n);
-            for chunk in body.chunks_exact(4 + PAGE) {
-                let pgno = le32(chunk);
+            for entry in body.chunks_exact(ENTRY) {
+                let Some((pgno, image)) = take_u32(entry) else {
+                    return Err(FrameError::UnknownRecord);
+                };
                 if pgno == 0 || pgno > size {
                     return Err(FrameError::PageOutside { pgno, size });
                 }
-                pages.push((pgno, chunk[4..].to_vec()));
+                pages.push((pgno, image.to_vec()));
             }
-            Record::Commit { size, pages }
+            Ok(Record::Commit { size, pages })
         }
-        Some(1) if record.len() == 25 => Record::Claim {
-            epoch: u64::from_le_bytes(record[1..9].try_into().unwrap()),
-            nonce: record[9..25].try_into().unwrap(),
-        },
-        _ => return Err(FrameError::UnknownRecord),
-    };
-    Ok(Decoded::Frame {
-        record,
-        len: HEADER + len,
-    })
+        Some((1, rest)) => {
+            let Some((epoch, nonce)) = rest.split_first_chunk::<8>() else {
+                return Err(FrameError::UnknownRecord);
+            };
+            let Ok(nonce) = <[u8; 16]>::try_from(nonce) else {
+                return Err(FrameError::UnknownRecord);
+            };
+            Ok(Record::Claim {
+                epoch: u64::from_le_bytes(*epoch),
+                nonce,
+            })
+        }
+        _ => Err(FrameError::UnknownRecord),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeMap;
+
+    use super::Decoded;
+    use super::FrameError;
+    use super::PAGE;
+    use super::Record;
+    use super::decode;
+    use super::encode_claim;
+    use super::encode_commit;
 
     // Reads cut frames anywhere: every prefix of a frame is Partial, the whole frame decodes, and a
     // flipped payload byte is a checksum error rather than a different record.

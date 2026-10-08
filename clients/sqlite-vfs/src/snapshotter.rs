@@ -84,7 +84,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
     // A pinned or busy checkpoint clears up quickly; a failing server may not.
     let (mut busy, mut failing) = (Duration::from_millis(10), Duration::from_millis(100));
     while snapper.wait() {
-        let (backoff, cap) = match unsafe { snapshot_once(db, snapper) } {
+        let (backoff, cap) = match snapshot_once(db, snapper) {
             Ok(true) => {
                 (busy, failing) = (Duration::from_millis(10), Duration::from_millis(100));
                 continue;
@@ -101,7 +101,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
         if !snapper.pause(*backoff) {
             return;
         }
-        *backoff = (*backoff * 2).min(cap);
+        *backoff = backoff.saturating_mul(2).min(cap);
         if lock(db).snapshot_due() {
             snapper.request();
         }
@@ -121,16 +121,16 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 /// frames into the db file (a reader at mark 0 blocks backfill, one at a later mark caps it) and no
 /// closing connection can checkpoint (that needs an EXCLUSIVE lock), so the pages copied are those
 /// of `offset`. Commits wait only for the checkpoint and the start of the read transaction.
-unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
+fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     let stopped = || snapper.stopped();
     let started = Instant::now();
     let path = lock(db).path.clone();
-    let conn = unsafe { Private::open(&path)? };
+    let conn = Private::open(&path, false)?;
     // Closing as the last connection keeps the WAL (as the attached connections do).
-    unsafe { conn.persist_wal()? };
+    conn.persist_wal()?;
     // Backfill outside the window, so the checkpoint inside it (which commits wait for) only
     // covers the frames committed in between.
-    unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? };
+    conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")?;
     let (url, incarnation, offset, epoch, pages, log) = {
         let mut d = lock(db);
         loop {
@@ -167,24 +167,22 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error
     let window = Window(db);
     // A checkpoint started by another connection after the window opened makes this one busy
     // (it gets no busy handler): retry briefly, it only covers frames up to `offset` too.
-    let mut tries = 0;
+    let mut tries: u32 = 0;
     loop {
-        match unsafe { conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? } {
+        match conn.checkpoint(c"PRAGMA wal_checkpoint(PASSIVE)")? {
             Checkpoint::Done => break,
             Checkpoint::Busy if tries < 50 => {
-                tries += 1;
+                tries = tries.saturating_add(1);
                 std::thread::sleep(Duration::from_millis(2));
             }
             _ => return Ok(false),
         }
     }
-    unsafe {
-        conn.query(c"BEGIN")?;
-        conn.query(c"SELECT count(*) FROM sqlite_schema")?;
-    }
+    conn.query(c"BEGIN")?;
+    conn.query(c"SELECT count(*) FROM sqlite_schema")?;
     drop(window);
     let copy_started = Instant::now();
-    let image = unsafe { conn.read_pages(pages)? };
+    let image = conn.read_pages(pages)?;
     drop(conn); // ends the read transaction
     let copy = copy_started.elapsed();
     let body = snapshot::encode(&offset, epoch, &image).map_err(|source| Error::Snapshot {
@@ -266,7 +264,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error
             }
             Err(e) => return Err(e),
         }
-        std::thread::sleep(Duration::from_millis(25 * i));
+        std::thread::sleep(Duration::from_millis(25_u64.saturating_mul(i)));
     }
     if !verified {
         return Err(Error::SnapshotNotReadBack { offset });

@@ -50,6 +50,8 @@ pub enum SnapshotError {
     OffsetTooLong(usize),
     #[error("zstd compress: {0}")]
     Compress(#[source] std::io::Error),
+    #[error("an image of {0} bytes is too large")]
+    TooLarge(usize),
 }
 
 pub fn encode(offset: &str, epoch: u64, image: &[u8]) -> Result<Vec<u8>, SnapshotError> {
@@ -58,34 +60,57 @@ pub fn encode(offset: &str, epoch: u64, image: &[u8]) -> Result<Vec<u8>, Snapsho
     }
     let n = u8::try_from(offset.len())
         .map_err(|_too_long| SnapshotError::OffsetTooLong(offset.len()))?;
+    let pages = u32::try_from(image.len() / PAGE)
+        .map_err(|_too_many| SnapshotError::TooLarge(image.len()))?;
     let payload = zstd::bulk::compress(image, ZSTD_LEVEL).map_err(SnapshotError::Compress)?;
-    let mut out = Vec::with_capacity(HEADER + offset.len() + payload.len());
+    let mut out = Vec::with_capacity(
+        payload
+            .len()
+            .saturating_add(HEADER)
+            .saturating_add(offset.len()),
+    );
     out.extend_from_slice(MAGIC);
     out.push(n);
     out.extend_from_slice(offset.as_bytes());
     out.extend_from_slice(&epoch.to_le_bytes());
-    out.extend_from_slice(&((image.len() / PAGE) as u32).to_le_bytes());
+    out.extend_from_slice(&pages.to_le_bytes());
     out.extend_from_slice(&crc32c::crc32c(image).to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
 }
 
 pub fn decode(body: &[u8]) -> Result<Snapshot, SnapshotError> {
-    let n = body.get(4).map_or(0, |&n| n as usize);
-    if body.len() < HEADER + n || &body[..4] != MAGIC {
+    let Some((magic, rest)) = body.split_first_chunk::<4>() else {
+        return Err(SnapshotError::Header);
+    };
+    let Some((&n, rest)) = rest.split_first() else {
+        return Err(SnapshotError::Header);
+    };
+    let Some((offset, rest)) = rest.split_at_checked(usize::from(n)) else {
+        return Err(SnapshotError::Header);
+    };
+    let Some((epoch, rest)) = rest.split_first_chunk::<8>() else {
+        return Err(SnapshotError::Header);
+    };
+    let Some((pages, rest)) = rest.split_first_chunk::<4>() else {
+        return Err(SnapshotError::Header);
+    };
+    let Some((crc, payload)) = rest.split_first_chunk::<4>() else {
+        return Err(SnapshotError::Header);
+    };
+    if magic != MAGIC {
         return Err(SnapshotError::Header);
     }
-    let offset = std::str::from_utf8(&body[5..5 + n])
+    let offset = std::str::from_utf8(offset)
         .map_err(SnapshotError::OffsetUtf8)?
         .to_owned();
-    let body = &body[5 + n..];
-    let u64_at = |i: usize| u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
-    let u32_at = |i: usize| u32::from_le_bytes(body[i..i + 4].try_into().unwrap());
-    let (epoch, pages, crc) = (u64_at(0), u32_at(8) as usize, u32_at(12));
+    let epoch = u64::from_le_bytes(*epoch);
+    let crc = u32::from_le_bytes(*crc);
     // The header is not checksummed: size the buffer only once the zstd frame's own content size
     // agrees with it, and allocate fallibly, so a damaged body is an error rather than an abort.
-    let payload = &body[HEADER - 5..];
-    let len = pages * PAGE;
+    let Some(len) = (u32::from_le_bytes(*pages) as usize).checked_mul(PAGE) else {
+        return Err(SnapshotError::PageCount);
+    };
     match zstd::zstd_safe::get_frame_content_size(payload) {
         Ok(Some(n)) if n == len as u64 => {}
         _ => return Err(SnapshotError::PageCount),
@@ -95,10 +120,10 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, SnapshotError> {
         .try_reserve_exact(len)
         .map_err(|source| SnapshotError::Alloc { len, source })?;
     image.resize(len, 0); // within the reserved capacity
-    let n =
-        zstd::bulk::decompress_to_buffer(payload, &mut image[..]).map_err(SnapshotError::Zstd)?;
+    let n = zstd::bulk::decompress_to_buffer(payload, image.as_mut_slice())
+        .map_err(SnapshotError::Zstd)?;
     image.truncate(n);
-    if image.len() != pages * PAGE || crc32c::crc32c(&image) != crc {
+    if image.len() != len || crc32c::crc32c(&image) != crc {
         return Err(SnapshotError::Checksum);
     }
     Ok(Snapshot {
@@ -110,7 +135,12 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, SnapshotError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::HEADER;
+    use super::PAGE;
+    use super::Snapshot;
+    use super::SnapshotError;
+    use super::decode;
+    use super::encode;
 
     // A snapshot carries its offset and epoch through, and a damaged body is refused rather than
     // installed.

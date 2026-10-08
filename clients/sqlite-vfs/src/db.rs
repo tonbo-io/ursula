@@ -17,9 +17,9 @@ use libsqlite3_sys as ffi;
 use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
 use crate::error::Error;
-use crate::frame::PAGE;
 use crate::host::OK;
 use crate::snapshotter::Snapper;
+use crate::wal::db_len;
 
 pub(crate) struct CommitStat {
     pub(crate) bytes: usize,
@@ -108,14 +108,14 @@ impl Db {
     /// snapshot it started from (plus, from trusted local files, the sidecar's count), and every
     /// frame acknowledged since; a snapshot taken subtracts what it covers.
     pub(crate) fn snapshot_due(&self) -> bool {
-        self.log > (self.pages as u64 * PAGE as u64).max(snapshot_min_bytes())
+        self.log > db_len(self.pages).max(snapshot_min_bytes())
     }
 
     pub(crate) fn overlay_end(&self) -> i64 {
         self.overlay
             .iter()
             .next_back()
-            .map(|(o, d)| o + d.len() as i64)
+            .map(|(&o, d)| o.saturating_add(i64::try_from(d.len()).unwrap_or(i64::MAX)))
             .unwrap_or(0)
     }
 

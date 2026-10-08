@@ -140,6 +140,18 @@ jobs:
           rustflags: ""
           cache-workspaces: clients/sqlite-vfs
 
+      # The extension is its own workspace, so it carries a copy of the workspace's lint tables.
+      - name: The extension's lint tables match the workspace's
+        run: |
+          python3 - <<'EOF'
+          import sys
+          def lints(path):
+              s = open(path).read()
+              return s[s.index("[workspace.lints.rust]"):s.index("[profile.release]")].strip()
+          if lints("Cargo.toml") != lints("clients/sqlite-vfs/Cargo.toml"):
+              sys.exit("clients/sqlite-vfs/Cargo.toml: the lint tables differ from the root manifest's")
+          EOF
+
       - name: Lint, unit-test and build the extension
         run: |
           cd clients/sqlite-vfs

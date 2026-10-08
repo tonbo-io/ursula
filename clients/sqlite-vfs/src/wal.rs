@@ -8,11 +8,41 @@ use std::os::unix::fs::FileExt;
 use crate::error::Error;
 use crate::frame::PAGE;
 
-pub(crate) const WAL_HDR: i64 = 32;
+/// The WAL header's size, a frame header's, and a frame's (header and page), as file offsets.
+pub(crate) const WAL_HDR: i64 = WAL_HDR_LEN as i64;
+pub(crate) const FRAME_HDR: i64 = FRAME_HDR_LEN as i64;
+pub(crate) const FRAME: i64 = FRAME_LEN as i64;
 
-pub(crate) const FRAME_HDR: i64 = 24;
+/// Where frame 0's page starts in the WAL file.
+pub(crate) const FIRST_PAGE: i64 = WAL_HDR + FRAME_HDR;
 
-pub(crate) const FRAME: i64 = FRAME_HDR + PAGE as i64;
+/// The same sizes, as buffer lengths.
+const WAL_HDR_LEN: usize = 32;
+pub(crate) const FRAME_HDR_LEN: usize = 24;
+pub(crate) const FRAME_LEN: usize = FRAME_HDR_LEN + PAGE;
+const FIRST_PAGE_AT: u64 = (WAL_HDR_LEN + FRAME_HDR_LEN) as u64;
+
+/// The db file offset of page `pgno` (1-based).
+pub(crate) fn page_offset(pgno: u32) -> u64 {
+    db_len(pgno.saturating_sub(1))
+}
+
+/// The whole pages in a db file of `len` bytes.
+pub(crate) fn pages_in(len: u64) -> u32 {
+    const PAGE_LEN: u64 = PAGE as u64;
+    u32::try_from(len / PAGE_LEN).unwrap_or(u32::MAX)
+}
+
+/// The length of a db file of `pages` pages.
+pub(crate) fn db_len(pages: u32) -> u64 {
+    u64::from(pages).saturating_mul(PAGE as u64)
+}
+
+/// The big-endian u32 at `at` in `b`.
+pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
+    let w = b.get(at..)?.first_chunk::<4>()?;
+    Some(u32::from_be_bytes(*w))
+}
 
 /// What a sidecar needs of the local WAL, so attach can check it against the files instead of
 /// inferring it: the WAL's generation (the salts of its header, which SQLite changes at every
@@ -61,21 +91,41 @@ struct WalScan {
     pub(crate) pages: Vec<u32>,
 }
 
+/// A WAL frame's header.
+struct FrameHeader {
+    pgno: u32,
+    /// The db size after a commit (0: not a commit frame).
+    commit_size: u32,
+    salts: [u8; 8],
+    checksum: (u32, u32),
+}
+
+fn frame_header(h: &[u8; FRAME_HDR_LEN]) -> Option<FrameHeader> {
+    let (salts, _) = h.get(8..)?.split_first_chunk::<8>()?;
+    Some(FrameHeader {
+        pgno: be32(h, 0)?,
+        commit_size: be32(h, 4)?,
+        salts: *salts,
+        checksum: (be32(h, 16)?, be32(h, 20)?),
+    })
+}
+
 /// `None` without a valid header (missing, short, torn, or not 4 KiB pages).
 fn wal_recover(path: &str) -> Option<WalScan> {
     use std::io::Read;
     let mut r = std::io::BufReader::new(fs::File::open(path).ok()?);
-    let mut hdr = [0u8; WAL_HDR as usize];
+    let mut hdr = [0u8; WAL_HDR_LEN];
     r.read_exact(&mut hdr).ok()?;
-    let magic = be32(&hdr);
-    if magic & !1 != 0x377f_0682 || be32(&hdr[4..]) != 3_007_000 || be32(&hdr[8..]) as usize != PAGE
-    {
+    let (summed, _) = hdr.split_first_chunk::<24>()?;
+    let (salts, _) = hdr.get(16..)?.split_first_chunk::<8>()?;
+    let magic = be32(&hdr, 0)?;
+    if magic & !1 != 0x377f_0682 || be32(&hdr, 4)? != 3_007_000 || be32(&hdr, 8)? as usize != PAGE {
         return None;
     }
     // The checksum reads 32-bit words big-endian when the magic's low bit is set.
-    let word = |b: &[u8]| {
-        let w = [b[0], b[1], b[2], b[3]];
-        if magic & 1 == 1 {
+    let big_endian = magic & 1 == 1;
+    let word = |w: [u8; 4]| {
+        if big_endian {
             u32::from_be_bytes(w)
         } else {
             u32::from_le_bytes(w)
@@ -83,34 +133,45 @@ fn wal_recover(path: &str) -> Option<WalScan> {
     };
     let sum = |mut s: (u32, u32), b: &[u8]| {
         for c in b.chunks_exact(8) {
-            s.0 = s.0.wrapping_add(word(c)).wrapping_add(s.1);
-            s.1 = s.1.wrapping_add(word(&c[4..])).wrapping_add(s.0);
+            if let (Some(w0), Some(w1)) = (c.first_chunk::<4>(), c.last_chunk::<4>()) {
+                s.0 = s.0.wrapping_add(word(*w0)).wrapping_add(s.1);
+                s.1 = s.1.wrapping_add(word(*w1)).wrapping_add(s.0);
+            }
         }
         s
     };
-    let mut s = sum((0, 0), &hdr[..24]);
-    if s != (be32(&hdr[24..]), be32(&hdr[28..])) {
+    let mut s = sum((0, 0), summed);
+    if s != (be32(&hdr, 24)?, be32(&hdr, 28)?) {
         return None;
     }
     let (mut last, mut size, mut pages) = (0, 0, Vec::new());
-    let mut f = vec![0u8; FRAME as usize];
+    let mut f = vec![0u8; FRAME_LEN];
     while r.read_exact(&mut f).is_ok() {
-        if be32(&f) == 0 || f[8..16] != hdr[16..24] {
+        let Some((h, page)) = f.split_first_chunk::<FRAME_HDR_LEN>() else {
+            break;
+        };
+        let Some(h_summed) = h.first_chunk::<8>() else {
+            break;
+        };
+        let Some(h) = frame_header(h) else {
+            break;
+        };
+        if h.pgno == 0 || h.salts != *salts {
             break;
         }
-        s = sum(sum(s, &f[..8]), &f[FRAME_HDR as usize..]);
-        if s != (be32(&f[16..]), be32(&f[20..])) {
+        s = sum(sum(s, h_summed), page);
+        if s != h.checksum {
             break;
         }
-        pages.push(be32(&f));
-        if be32(&f[4..]) != 0 {
-            (last, size) = (pages.len() as u32, be32(&f[4..]));
+        pages.push(h.pgno);
+        if h.commit_size != 0 {
+            last = u32::try_from(pages.len()).ok()?;
+            size = h.commit_size;
         }
     }
     pages.truncate(last as usize);
-    let salts: [u8; 8] = hdr[16..24].try_into().unwrap();
     Some(WalScan {
-        salts: u64::from_be_bytes(salts),
+        salts: u64::from_be_bytes(*salts),
         last,
         size,
         pages,
@@ -135,17 +196,15 @@ pub(crate) fn fold_wal(path: &str, f: &fs::File) -> Result<(), Error> {
     };
     let w = fs::File::open(&wal).map_err(err)?;
     // Frame index per page, a later frame winning.
-    let latest: BTreeMap<u32, i64> = scan.pages.iter().copied().zip(0..).collect();
+    let latest: BTreeMap<u32, u64> = scan.pages.iter().copied().zip(0..).collect();
     let mut page = vec![0u8; PAGE];
-    for (pgno, i) in latest.range(1..=scan.size) {
-        let at = (WAL_HDR + i * FRAME + FRAME_HDR) as u64;
+    for (&pgno, &i) in latest.range(1..=scan.size) {
+        // Within the WAL file: no overflow.
+        let at = i
+            .saturating_mul(FRAME_LEN as u64)
+            .saturating_add(FIRST_PAGE_AT);
         w.read_exact_at(&mut page, at).map_err(err)?;
-        f.write_all_at(&page, (*pgno as u64 - 1) * PAGE as u64)
-            .map_err(err)?;
+        f.write_all_at(&page, page_offset(pgno)).map_err(err)?;
     }
-    f.set_len(scan.size as u64 * PAGE as u64).map_err(err)
-}
-
-pub(crate) fn be32(b: &[u8]) -> u32 {
-    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    f.set_len(db_len(scan.size)).map_err(err)
 }

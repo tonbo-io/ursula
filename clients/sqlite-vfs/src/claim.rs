@@ -121,7 +121,7 @@ pub(crate) fn find_claim(
     nonce: &[u8; 16],
 ) -> Result<Option<bool>, ClaimScanError> {
     let (mut used, mut found, mut last_ours) = (0, None, false);
-    while let Decoded::Frame { record, len } = frame::decode(&buf[used..])? {
+    while let Decoded::Frame { record, len } = frame::decode(buf.get(used..).unwrap_or_default())? {
         last_ours = record
             == Record::Claim {
                 epoch,
@@ -130,7 +130,8 @@ pub(crate) fn find_claim(
         if last_ours {
             found = Some(used == 0);
         }
-        used += len;
+        // Frames lie within `buf`: no overflow.
+        used = used.saturating_add(len);
     }
     if exact && used != buf.len() {
         return Err(ClaimScanError::NotAtBoundary);
@@ -156,8 +157,10 @@ pub(crate) fn claim(
     for _ in 0..16 {
         match claim_once(url, incarnation, producer, epoch, from)? {
             Claimed::Won { next, .. } => return Ok((epoch, next)),
-            Claimed::Lost => epoch += 1,
-            Claimed::Fenced(current) => epoch = current.unwrap_or(epoch).max(epoch) + 1,
+            Claimed::Lost => epoch = epoch.saturating_add(1),
+            Claimed::Fenced(current) => {
+                epoch = current.unwrap_or(epoch).max(epoch).saturating_add(1);
+            }
             Claimed::Recreated => return Err(recreated(url, incarnation)),
         }
     }
@@ -180,7 +183,7 @@ pub(crate) fn reclaim(db: &mut Db) -> Result<(), Error> {
             offset: db.offset.clone(),
         }));
     }
-    let epoch = db.epoch + 1;
+    let epoch = db.epoch.saturating_add(1);
     match claim_once(&db.url, &db.incarnation, &db.producer, epoch, &db.offset)? {
         Claimed::Won { first: true, next } => {
             db.epoch = epoch;

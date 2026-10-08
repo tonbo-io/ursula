@@ -87,7 +87,6 @@
 //! - `status`: `ursula_status` and `ursula_stats`.
 //! - `vfs`: the VFS file methods and the commit path.
 //! - `wal`: the local WAL's format, recovery scan and fold.
-#![allow(non_snake_case, clippy::missing_safety_doc)]
 
 mod attach;
 mod claim;
