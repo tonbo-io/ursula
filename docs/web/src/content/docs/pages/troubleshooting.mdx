@@ -94,7 +94,10 @@ The node exchanged a Raft RPC with a peer on another format epoch: a peer that w
 
 The node's logs may be missing entries it acknowledged: it started after a host
 crash or power loss under `raft.wal.fsync = "never"`, after a journal I/O error,
-or without its run state file, or with an emptied WAL directory. Each
+or without its run state file, or with an emptied WAL directory. Under
+`raft.wal.fsync = "always"`, a host crash gates the groups of a core whose newest
+journal segment ended in a complete invalid frame, although no acknowledged
+write was lost. Each
 gated group waits until it has applied a fresh barrier from the group's leader,
 and its leader rebuilds the replica meanwhile. `recovery_gates` in
 `/__ursula/metrics` lists the gated groups. This normally clears in seconds
@@ -118,8 +121,8 @@ refuses this call and still needs a fresh quorum proof. The request body names t
 ### `accept-unsynced-loss` answers `409 Conflict`
 
 Nothing changed. A replica that lost its voting history must first obtain a
-durable vote floor from a fresh quorum proof; the call cannot bypass that
-requirement. Restore connectivity to intact voters.
+durable vote floor from a fresh quorum proof, and the call cannot replace that
+proof. Restore connectivity to intact voters.
 
 The call also refuses when the replica's recovery gate is not
 stalled, so it may still open through a leader's barrier without losing
