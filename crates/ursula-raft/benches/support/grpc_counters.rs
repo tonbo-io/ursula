@@ -34,6 +34,10 @@ struct Measurement {
     elapsed_ns: Vec<u64>,
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "benchmark setup and worker failures invalidate the measurement"
+)]
 fn trial(workload: Workload, threads: usize, operations: u64) -> u64 {
     let start = Barrier::new(threads);
     let budget = Arc::new(Semaphore::new(1024));
