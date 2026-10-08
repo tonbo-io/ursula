@@ -284,25 +284,7 @@ mod tests {
     }
 
     fn view(node_id: u64, groups: Vec<RaftGroupView>) -> NodeMetricsView {
-        {
-            let fixture_node = node(node_id);
-            let fixture_groups = groups;
-            let fixture_report = Some(crate::metrics::test_maintenance_report(
-                fixture_node.id,
-                &fixture_groups,
-            ));
-            NodeMetricsView {
-                node: fixture_node.clone(),
-                metrics: ursula_proto::admin::NodeMetrics {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                    maintenance_fence_uncertain: false,
-                    process_node_id: Some(fixture_node.id),
-                    groups: fixture_groups,
-                    raft_maintenance: fixture_report,
-                },
-            }
-        }
+        crate::metrics::test_view(node(node_id), groups)
     }
 
     fn group(
@@ -313,77 +295,19 @@ mod tests {
         committed: Option<u64>,
         voters: Vec<u64>,
     ) -> RaftGroupView {
-        {
-            let fixture_term = 1;
-            let fixture_committed = committed;
-            let fixture_applied = applied;
-            RaftGroupView {
-                raft_group_id,
-                node_id: reporting_node,
-                current_term: fixture_term,
-                current_leader: leader,
-                committed_index: fixture_committed,
-                last_applied_index: fixture_applied,
-                voter_ids: voters,
-                learner_ids: vec![],
-                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
-                    running: true,
-                    recovery_ready: true,
-                    accepting_transfers: true,
-                    membership_joint: false,
-                    membership_log_index: Some(0),
-                    stopped_for_operator: false,
-                },
-                last_log_index: fixture_committed.into_iter().chain(fixture_applied).max(),
-                committed_term: fixture_committed.map(|_| fixture_term),
-                last_applied_term: fixture_applied.map(|_| fixture_term),
-                snapshot_term: None,
-                snapshot_index: None,
-                purged_term: None,
-                purged_index: None,
-                log_bytes_since_snapshot: 0,
-                log_entries_since_snapshot: 0,
-                last_snapshot_bytes: 0,
-                has_snapshot: false,
-            }
-        }
+        crate::metrics::test_group(
+            raft_group_id,
+            reporting_node,
+            1,
+            leader,
+            committed,
+            applied,
+            voters,
+        )
     }
 
     fn empty_group(raft_group_id: u64, reporting_node: u64) -> RaftGroupView {
-        {
-            let fixture_term = 0;
-            let fixture_committed = None;
-            let fixture_applied = None;
-            RaftGroupView {
-                raft_group_id,
-                node_id: reporting_node,
-                current_term: fixture_term,
-                current_leader: None,
-                committed_index: fixture_committed,
-                last_applied_index: fixture_applied,
-                voter_ids: vec![],
-                learner_ids: vec![],
-                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
-                    running: true,
-                    recovery_ready: true,
-                    accepting_transfers: true,
-                    membership_joint: false,
-                    membership_log_index: Some(0),
-                    stopped_for_operator: false,
-                },
-                last_log_index: fixture_committed.into_iter().chain(fixture_applied).max(),
-                committed_term: fixture_committed.map(|_| fixture_term),
-                last_applied_term: fixture_applied.map(|_| fixture_term),
-                snapshot_term: None,
-                snapshot_index: None,
-                purged_term: None,
-                purged_index: None,
-                log_bytes_since_snapshot: 0,
-                log_entries_since_snapshot: 0,
-                last_snapshot_bytes: 0,
-                has_snapshot: false,
-            }
-        }
+        crate::metrics::test_group(raft_group_id, reporting_node, 0, None, None, None, vec![])
     }
 
     #[test]

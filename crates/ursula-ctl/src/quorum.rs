@@ -364,14 +364,12 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
-    use crate::metrics::NodeMetricsView;
-    use crate::metrics::RaftGroupView;
 
     fn snapshot() -> ClusterSnapshot {
         ClusterSnapshot {
             per_node: (1..=3)
                 .map(|id| {
-                    let fixture_node = NodeInfo {
+                    let node = NodeInfo {
                         expected_process_incarnation: None,
                         expected_maintenance_fence: None,
                         id,
@@ -380,69 +378,20 @@ mod tests {
                         metrics_url: None,
                         host: format!("node-{id}"),
                     };
-                    let fixture_groups = (0..2)
+                    let groups = (0..2)
                         .map(|raft_group_id| {
-                            let fixture_term = 7;
-                            let fixture_committed = Some(25);
-                            let fixture_applied = Some(20);
-                            RaftGroupView {
+                            crate::metrics::test_group(
                                 raft_group_id,
-                                node_id: id,
-                                current_term: fixture_term,
-                                current_leader: Some(1),
-                                committed_index: fixture_committed,
-                                last_applied_index: fixture_applied,
-                                voter_ids: vec![1, 2, 3],
-                                learner_ids: vec![],
-                                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
-                                    running: true,
-                                    recovery_ready: true,
-                                    membership_joint: false,
-                                    membership_log_index: Some(2),
-                                    stopped_for_operator: false,
-                                    accepting_transfers: true,
-                                },
-                                last_log_index: fixture_committed
-                                    .into_iter()
-                                    .chain(fixture_applied)
-                                    .max(),
-                                committed_term: fixture_committed.map(|_| fixture_term),
-                                last_applied_term: fixture_applied.map(|_| fixture_term),
-                                snapshot_term: None,
-                                snapshot_index: None,
-                                purged_term: None,
-                                purged_index: None,
-                                log_bytes_since_snapshot: 0,
-                                log_entries_since_snapshot: 0,
-                                last_snapshot_bytes: 0,
-                                has_snapshot: false,
-                            }
+                                id,
+                                7,
+                                Some(1),
+                                Some(25),
+                                Some(20),
+                                vec![1, 2, 3],
+                            )
                         })
                         .collect();
-                    let fixture_report = Some(ursula_proto::admin::RaftMaintenanceReport {
-                        version: ursula_proto::admin::SchemaVersion,
-                        node_id: id,
-                        lag_tolerance: 16,
-                        expected_groups: (0..2)
-                            .map(|group| (group, BTreeSet::from([1, 2, 3])))
-                            .collect(),
-                        node_issues: vec![],
-                        group_issues: BTreeMap::new(),
-                    });
-                    NodeMetricsView {
-                        node: fixture_node.clone(),
-                        metrics: ursula_proto::admin::NodeMetrics {
-                            process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(
-                                1,
-                            ),
-                            maintenance_fence:
-                                ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                            maintenance_fence_uncertain: false,
-                            process_node_id: Some(fixture_node.id),
-                            groups: fixture_groups,
-                            raft_maintenance: fixture_report,
-                        },
-                    }
+                    crate::metrics::test_view(node, groups)
                 })
                 .collect(),
         }

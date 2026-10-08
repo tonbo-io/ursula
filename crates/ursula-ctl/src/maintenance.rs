@@ -470,7 +470,6 @@ mod tests {
 
     use super::*;
     use crate::metrics::ClusterSnapshot;
-    use crate::metrics::NodeMetricsView;
     use crate::metrics::RaftGroupView;
     use crate::provider::NodeInfo;
 
@@ -686,112 +685,26 @@ mod tests {
         applied: u64,
         committed: u64,
     ) -> RaftGroupView {
-        {
-            let fixture_term = 1;
-            let fixture_committed = Some(committed);
-            let fixture_applied = Some(applied);
-            RaftGroupView {
-                raft_group_id,
-                node_id,
-                current_term: fixture_term,
-                current_leader,
-                committed_index: fixture_committed,
-                last_applied_index: fixture_applied,
-                voter_ids: vec![1, 2, 3],
-                learner_ids: vec![],
-                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
-                    running: true,
-                    recovery_ready: true,
-                    accepting_transfers: true,
-                    membership_joint: false,
-                    membership_log_index: Some(0),
-                    stopped_for_operator: false,
-                },
-                last_log_index: fixture_committed.into_iter().chain(fixture_applied).max(),
-                committed_term: fixture_committed.map(|_| fixture_term),
-                last_applied_term: fixture_applied.map(|_| fixture_term),
-                snapshot_term: None,
-                snapshot_index: None,
-                purged_term: None,
-                purged_index: None,
-                log_bytes_since_snapshot: 0,
-                log_entries_since_snapshot: 0,
-                last_snapshot_bytes: 0,
-                has_snapshot: false,
-            }
-        }
+        crate::metrics::test_group(
+            raft_group_id,
+            node_id,
+            1,
+            current_leader,
+            Some(committed),
+            Some(applied),
+            vec![1, 2, 3],
+        )
     }
 
     #[test]
     fn cluster_readiness_formats_each_unready_node() {
-        let snapshot =
-            ClusterSnapshot {
-                per_node: vec![
-                    {
-                        let fixture_node = n(1, "10.0.0.1");
-                        let fixture_groups = vec![group(7, 1, Some(1), 50, 50)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                    {
-                        let fixture_node = n(2, "10.0.0.2");
-                        let fixture_groups = vec![group(7, 2, Some(1), 100, 100)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                    {
-                        let fixture_node = n(3, "10.0.0.3");
-                        let fixture_groups = vec![group(7, 3, Some(1), 95, 100)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                ],
-            };
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(7, 1, Some(1), 50, 50)]),
+                crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(1), 100, 100)]),
+                crate::metrics::test_view(n(3, "10.0.0.3"), vec![group(7, 3, Some(1), 95, 100)]),
+            ],
+        };
 
         let report = check_readiness(&snapshot, 1, 5);
 
@@ -803,25 +716,13 @@ mod tests {
     #[test]
     fn missing_target_timeout_hint_points_to_the_leaders_rebuild() {
         let snapshot = ClusterSnapshot {
-            per_node: vec![{
-                let fixture_node = n(2, "10.0.0.2");
-                let fixture_groups = vec![group(7, 2, Some(2), 100, 100)];
-                let fixture_report = Some(crate::metrics::test_maintenance_report(
-                    fixture_node.id,
-                    &fixture_groups,
-                ));
-                NodeMetricsView {
-                    node: fixture_node.clone(),
-                    metrics: ursula_proto::admin::NodeMetrics {
-                        process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                        maintenance_fence: ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                        maintenance_fence_uncertain: false,
-                        process_node_id: Some(fixture_node.id),
-                        groups: fixture_groups,
-                        raft_maintenance: fixture_report,
-                    },
-                }
-            }],
+            per_node: vec![crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(
+                7,
+                2,
+                Some(2),
+                100,
+                100,
+            )])],
         };
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
@@ -908,53 +809,12 @@ mod tests {
 
     #[test]
     fn missing_target_timeout_hint_absent_when_target_has_applied_entries() {
-        let snapshot =
-            ClusterSnapshot {
-                per_node: vec![
-                    {
-                        let fixture_node = n(1, "10.0.0.1");
-                        let fixture_groups = vec![group(7, 1, Some(2), 50, 50)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                    {
-                        let fixture_node = n(2, "10.0.0.2");
-                        let fixture_groups = vec![group(7, 2, Some(2), 100, 100)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                ],
-            };
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(7, 1, Some(2), 50, 50)]),
+                crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(2), 100, 100)]),
+            ],
+        };
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
         assert!(missing_target_timeout_hint(&report).is_none());
@@ -962,74 +822,13 @@ mod tests {
 
     #[test]
     fn drain_uses_every_nodes_leader_reports() {
-        let snapshot =
-            ClusterSnapshot {
-                per_node: vec![
-                    {
-                        let fixture_node = n(1, "10.0.0.1");
-                        let fixture_groups = vec![group(7, 1, Some(2), 100, 100)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                    {
-                        let fixture_node = n(2, "10.0.0.2");
-                        let fixture_groups = vec![group(7, 2, Some(2), 100, 100)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                    {
-                        let fixture_node = n(3, "10.0.0.3");
-                        let fixture_groups = vec![group(7, 3, Some(1), 100, 100)];
-                        let fixture_report = Some(crate::metrics::test_maintenance_report(
-                            fixture_node.id,
-                            &fixture_groups,
-                        ));
-                        NodeMetricsView {
-                            node: fixture_node.clone(),
-                            metrics: ursula_proto::admin::NodeMetrics {
-                                process_incarnation:
-                                    ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                                maintenance_fence:
-                                    ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                                maintenance_fence_uncertain: false,
-                                process_node_id: Some(fixture_node.id),
-                                groups: fixture_groups,
-                                raft_maintenance: fixture_report,
-                            },
-                        }
-                    },
-                ],
-            };
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(7, 1, Some(2), 100, 100)]),
+                crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(2), 100, 100)]),
+                crate::metrics::test_view(n(3, "10.0.0.3"), vec![group(7, 3, Some(1), 100, 100)]),
+            ],
+        };
 
         assert!(snapshot.groups_led_by(1).is_empty());
 

@@ -689,6 +689,63 @@ pub(crate) fn test_maintenance_report(
     }
 }
 
+/// A healthy group replica for unit fixtures. Terms follow the reported indexes.
+#[cfg(test)]
+pub(crate) fn test_group(
+    raft_group_id: u64,
+    node_id: u64,
+    current_term: u64,
+    current_leader: Option<u64>,
+    committed_index: Option<u64>,
+    last_applied_index: Option<u64>,
+    voter_ids: Vec<u64>,
+) -> RaftGroupView {
+    RaftGroupView {
+        raft_group_id,
+        node_id,
+        current_term,
+        current_leader,
+        committed_index,
+        last_applied_index,
+        voter_ids,
+        learner_ids: vec![],
+        maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
+            running: true,
+            recovery_ready: true,
+            accepting_transfers: true,
+            membership_joint: false,
+            membership_log_index: Some(0),
+            stopped_for_operator: false,
+        },
+        last_log_index: committed_index.max(last_applied_index),
+        committed_term: committed_index.map(|_| current_term),
+        last_applied_term: last_applied_index.map(|_| current_term),
+        snapshot_term: None,
+        snapshot_index: None,
+        purged_term: None,
+        purged_index: None,
+        log_bytes_since_snapshot: 0,
+        log_entries_since_snapshot: 0,
+        last_snapshot_bytes: 0,
+        has_snapshot: false,
+    }
+}
+
+/// An unclaimed node whose maintenance report expects exactly its groups.
+#[cfg(test)]
+pub(crate) fn test_view(node: NodeInfo, groups: Vec<RaftGroupView>) -> NodeMetricsView {
+    let raft_maintenance = Some(test_maintenance_report(node.id, &groups));
+    let process_node_id = Some(node.id);
+    NodeMetricsView::new(node, ursula_proto::admin::NodeMetrics {
+        process_incarnation: ProcessIncarnation::from_bits(1),
+        process_node_id,
+        maintenance_fence: MaintenanceFenceState::Unclaimed,
+        maintenance_fence_uncertain: false,
+        groups,
+        raft_maintenance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
