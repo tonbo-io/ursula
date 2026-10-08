@@ -219,6 +219,17 @@ impl GroupEntry {
             Self::ApplyStopped { .. } => None,
         }
     }
+
+    /// The recovery gate that governs this node's participation. A group
+    /// stopped by an apply failure reports the stop instead: its gate can no
+    /// longer open, and it must not hold back the node's other groups.
+    fn participating_gate(&self) -> Option<&Arc<GroupRejoin>> {
+        let active = self.active()?;
+        if active.apply_health.failure().is_some() {
+            return None;
+        }
+        active.recovery.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -595,13 +606,7 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| {
-                entry
-                    .active()?
-                    .recovery
-                    .as_ref()
-                    .map(|gate| (*id, gate.status()))
-            })
+            .filter_map(|(id, entry)| entry.participating_gate().map(|gate| (*id, gate.status())))
             .collect()
     }
 
@@ -771,8 +776,7 @@ impl RaftGroupHandleRegistry {
     pub fn recovery_barriers_ready(&self) -> bool {
         self.groups.load().values().all(|entry| {
             entry
-                .active()
-                .and_then(|entry| entry.recovery.as_ref())
+                .participating_gate()
                 .is_none_or(|gate| gate.may_campaign())
         })
     }
