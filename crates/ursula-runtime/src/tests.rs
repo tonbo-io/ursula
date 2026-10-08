@@ -3382,6 +3382,56 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
     assert_eq!(second.payload, b"ready");
 }
 
+/// A read the engine forwards to its group leader waits for the answer
+/// outside the group actor, and is dropped once its caller stops waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_read_waits_outside_the_group_actor_and_ends_with_its_caller() {
+    let factory = BlockingReadFactory::forward_reads();
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 128), factory.clone())
+        .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "forwarded-read");
+    create_stream(&runtime, &stream).await;
+
+    let read = tokio::spawn({
+        let runtime = runtime.clone();
+        let request = read_req(stream.clone(), 0, 16);
+        async move { runtime.read_stream(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), factory.entered.notified())
+        .await
+        .expect("the read was forwarded");
+    let head = tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.head_stream(HeadStreamRequest {
+            stream_id: stream.clone(),
+            now_ms: 0,
+            linearizable: false,
+            read_index: None,
+        }),
+    )
+    .await
+    .expect("the group actor serves the next command while the leader answers")
+    .expect("head stream");
+    assert_eq!(head.placement.raft_group_id, RaftGroupId(0));
+    assert!(!read.is_finished());
+    factory.release.notify_one();
+    let read = read.await.expect("read task").expect("the leader's answer");
+    assert_eq!(read.payload, b"leader");
+
+    let abandoned = tokio::spawn({
+        let runtime = runtime.clone();
+        let request = read_req(stream, 0, 16);
+        async move { runtime.read_stream(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), factory.entered.notified())
+        .await
+        .expect("the read was forwarded");
+    abandoned.abort();
+    tokio::time::timeout(Duration::from_secs(1), factory.forward_abandoned.notified())
+        .await
+        .expect("a caller that stops waiting drops its forwarded RPC");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_engine_errors_include_group_context_and_do_not_record_success_metrics() {
     let runtime = ShardRuntime::spawn_with_engine_factory(test_config(2, 8, 128), FailingFactory)
@@ -3623,6 +3673,10 @@ struct BlockingReadFactory {
     release: Arc<Notify>,
     read_count: Arc<AtomicU64>,
     block_parts: bool,
+    /// Every read is forwarded to a leader that answers once `release`d.
+    forward_reads: bool,
+    /// Notified when a forwarded read is dropped unanswered.
+    forward_abandoned: Arc<Notify>,
 }
 
 impl Default for BlockingReadFactory {
@@ -3633,6 +3687,8 @@ impl Default for BlockingReadFactory {
             release: Arc::new(Notify::new()),
             read_count: Arc::new(AtomicU64::new(0)),
             block_parts: false,
+            forward_reads: false,
+            forward_abandoned: Arc::new(Notify::new()),
         }
     }
 }
@@ -3642,6 +3698,24 @@ impl BlockingReadFactory {
         Self {
             block_parts: true,
             ..Self::default()
+        }
+    }
+
+    fn forward_reads() -> Self {
+        Self {
+            forward_reads: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Notifies when dropped while armed: a forwarded read dropped unanswered.
+struct AbandonedForward(Option<Arc<Notify>>);
+
+impl Drop for AbandonedForward {
+    fn drop(&mut self) {
+        if let Some(abandoned) = self.0.take() {
+            abandoned.notify_one();
         }
     }
 }
@@ -3661,6 +3735,8 @@ impl GroupEngineFactory for BlockingReadFactory {
                 release: self.release.clone(),
                 read_count: self.read_count.clone(),
                 block_parts: self.block_parts,
+                forward_reads: self.forward_reads,
+                forward_abandoned: self.forward_abandoned.clone(),
             });
             Ok(engine)
         })
@@ -3675,6 +3751,8 @@ struct BlockingReadEngine {
     release: Arc<Notify>,
     read_count: Arc<AtomicU64>,
     block_parts: bool,
+    forward_reads: bool,
+    forward_abandoned: Arc<Notify>,
 }
 
 impl GroupEngine for BlockingReadEngine {
@@ -3722,6 +3800,41 @@ impl GroupEngine for BlockingReadEngine {
                 closed: false,
                 incarnation: 0,
             })
+        })
+    }
+
+    fn route_read_stream<'a>(
+        &'a mut self,
+        request: ReadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteReadStreamFuture<'a> {
+        if !self.forward_reads {
+            return Box::pin(async move {
+                self.read_stream_parts(request, placement)
+                    .await
+                    .map(GroupReadRoute::Local)
+            });
+        }
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        let abandoned = self.forward_abandoned.clone();
+        Box::pin(async move {
+            Ok(GroupReadRoute::Leader(Box::pin(async move {
+                let mut abandoned = AbandonedForward(Some(abandoned));
+                entered.notify_one();
+                release.notified().await;
+                abandoned.0 = None;
+                Ok(GroupReadStreamParts::from_response(ReadStreamResponse {
+                    placement,
+                    offset: request.offset,
+                    next_offset: request.offset.saturating_add(6),
+                    content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                    payload: b"leader".to_vec(),
+                    up_to_date: true,
+                    closed: false,
+                    incarnation: 0,
+                }))
+            })))
         })
     }
 

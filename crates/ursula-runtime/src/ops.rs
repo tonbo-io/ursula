@@ -106,7 +106,16 @@ macro_rules! runtime_operations {
                 fields { request: HeadStreamRequest }
                 reply { response_tx: HeadStreamResponse }
                 guard { none }
-                handle { call head_stream(engine, metrics, request, placement) }
+                handle {
+                    tail head_stream(
+                        engine,
+                        metrics,
+                        read_materialization,
+                        request,
+                        placement,
+                        response_tx
+                    )
+                }
                 client { stream fn queue_head_stream }
             }
             op ReadStream {
