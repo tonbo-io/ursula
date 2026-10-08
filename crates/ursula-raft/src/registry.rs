@@ -1041,7 +1041,7 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
-) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, GroupEngineError>
+    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, GroupEngineError>
     {
         let raft = self.require_group(raft_group_id)?;
         if *request.to_node_id() == raft.metrics().borrow_watched().id
