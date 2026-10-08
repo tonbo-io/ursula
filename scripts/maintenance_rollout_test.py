@@ -57,7 +57,7 @@ def proof(db, nodes):
     now = time.time_ns() // 1_000_000
     retired = all(db['nodes'][str(n['id'])]['phase'] == 'retired' for n in nodes)
     return {'started_ms': now, 'completed_ms': now, 'verification': {
-        'version': 3, 'participation_certified': True,
+        'version': 3,
         'process_incarnations': {str(n['id']): n['expected_process_incarnation'] for n in nodes},
         'maintenance_executor_certified': bool(nodes[0].get('expected_maintenance_fence')) and not retired,
         'maintenance_executor_retired_certified': bool(nodes[0].get('expected_maintenance_fence')) and retired,
