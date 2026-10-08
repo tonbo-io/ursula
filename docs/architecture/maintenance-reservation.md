@@ -207,9 +207,9 @@ The state retains at most eight retired replacements and the existing 32 Pod UID
 
 `maintenanceReservation=false` uses the rollout controller for clusters without
 an initialized shared maintenance store. It reads and writes only rollout-state
-schema 3; older or unknown state versions are refused rather than migrated.
+schema 3. Older or unknown state versions are refused rather than migrated.
 Once the persistent store exists, this unreserved Job refuses to run even if a
-later values change disables the reserved path; a failed store GET also fails
+later values change disables the reserved path. A failed store GET also fails
 closed. Store bootstrap requires every unreserved executor to have stopped.
 Both planned rollouts and managed-node writers must eventually use the common
 reservation before they can share one exclusion boundary. External uncoordinated
