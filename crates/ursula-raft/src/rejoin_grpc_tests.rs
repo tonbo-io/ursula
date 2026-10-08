@@ -169,7 +169,7 @@ async fn new_recovery_engine(
     )
     .await
     .expect("new engine on an empty WAL");
-    engine.publish_recovery(gate.clone(), &registry).unwrap();
+    engine.publish_recovery(gate.clone(), registry).unwrap();
     (engine, store, gate, wal_root)
 }
 
