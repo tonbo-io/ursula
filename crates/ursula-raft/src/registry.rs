@@ -691,7 +691,7 @@ impl RaftGroupHandleRegistry {
     fn set_registered_group_elections(&self) {
         let groups = self.groups.load();
         for entry in groups.values() {
-            self.election.refresh(&entry.raft(), entry.recovery.clone());
+            self.election.refresh(entry.raft(), entry.recovery.clone());
         }
     }
 
@@ -699,7 +699,7 @@ impl RaftGroupHandleRegistry {
     pub(crate) fn refresh_group_elections(&self, group: RaftGroupId) {
         let groups = self.groups.load();
         if let Some(entry) = groups.get(&group.0) {
-            self.election.refresh(&entry.raft(), entry.recovery.clone());
+            self.election.refresh(entry.raft(), entry.recovery.clone());
         }
     }
 
