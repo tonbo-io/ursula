@@ -124,10 +124,7 @@ fn candidate_retirement_requires_current_fresh_survivors_and_retains_the_new_pre
         let mut observation = survivors(&state, 3200, 100);
         match mutation {
             0 => {
-                observation
-                    .verification
-                    .verification
-                    .participation_certified = false;
+                observation.verification.verification.prefixes.clear();
             }
             1 => {
                 observation

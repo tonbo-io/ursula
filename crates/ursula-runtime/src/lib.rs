@@ -259,6 +259,7 @@ pub use ursula_stream::ColdGcPlanEntry;
 pub use ursula_stream::ColdGcTarget;
 pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FORMAT_EPOCH;
+pub use ursula_stream::GroupStateGauges;
 pub use ursula_stream::MAX_COLD_SNAPSHOT_BYTES;
 pub use ursula_stream::ProducerRequest;
 pub use ursula_stream::SnapshotDigest;

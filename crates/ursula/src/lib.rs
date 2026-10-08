@@ -521,7 +521,14 @@ impl HttpMetrics {
     }
 }
 
-pub use ursula_proto::telemetry::HttpMetricsSnapshot;
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct HttpMetricsSnapshot {
+    sse_streams_opened: u64,
+    sse_read_iterations: u64,
+    sse_data_events: u64,
+    sse_control_events: u64,
+    sse_error_events: u64,
+}
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
@@ -1737,49 +1744,65 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+struct WalRecoveryReport {
+    fsync: ursula_config::WalFsync,
+    #[serde(flatten)]
+    opening: ursula_raft::WalOpening,
+}
+
+impl WalRecoveryReport {
+    fn new(raft_wal: &ursula_raft::RaftWal) -> Self {
+        Self {
+            fsync: raft_wal.fsync(),
+            opening: raft_wal.opening(),
+        }
+    }
+}
+
 pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let raft_groups = state
         .raft_registry()
         .map(RaftGroupHandleRegistry::metrics_snapshot)
         .unwrap_or_default();
-    let mut diagnostics = render_metrics(
-        state.runtime.metrics().snapshot(),
-        state.runtime.mailbox_snapshot(),
-        state.http_metrics.snapshot(),
-        &raft_groups,
-        state.runtime.cold_store_info().as_ref(),
-    );
-    diagnostics.configured_raft_group_count = state.runtime.raft_group_count();
-    diagnostics.group_state_gauges = group_state_gauges_json(&state).await;
-    diagnostics.process_rss_bytes = state.node_memory.last_rss_bytes();
-    diagnostics.node_memory_abort_cap_bytes =
-        state.node_memory.abort_cap_bytes().unwrap_or_default();
-    diagnostics.wal_recovery = state.raft_wal.as_ref().map(render::wal_recovery_metrics);
-    diagnostics.recovery_gates = state
-        .raft_registry()
-        .map(RaftGroupHandleRegistry::recovery_report);
     let wal_disk = state.wal_disk.snapshot();
-    diagnostics.wal_available_bytes = wal_disk.available_bytes;
-    diagnostics.wal_min_available_bytes = wal_disk.min_available_bytes;
-    diagnostics.wal_resume_available_bytes = wal_disk.resume_available_bytes;
-    diagnostics.wal_disk_pressure = wal_disk.pressure;
-    diagnostics.wal_disk_stat_errors = wal_disk.stat_errors;
-    axum::Json(ursula_proto::admin::NodeMetrics {
-        maintenance_fence: Some(state.admin_fence.snapshot().await),
-        maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
-        process_incarnation: state.process_incarnation.clone(),
-        process_node_id: state
-            .configured_node_id
-            .or_else(|| {
-                state
-                    .client_write_router
-                    .as_ref()
-                    .and_then(|topology| topology.node_id)
-            })
-            .or_else(|| raft_groups.first().map(|group| group.node_id)),
-        raft_groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
-        raft_maintenance: state.raft_maintenance_report(),
-        diagnostics,
+    axum::Json(render::MetricsResponse {
+        node: ursula_proto::admin::NodeMetrics {
+            maintenance_fence: state.admin_fence.snapshot().await,
+            maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
+            process_incarnation: state.process_incarnation.clone(),
+            process_node_id: state
+                .configured_node_id
+                .or_else(|| {
+                    state
+                        .client_write_router
+                        .as_ref()
+                        .and_then(|topology| topology.node_id)
+                })
+                .or_else(|| raft_groups.first().map(|group| group.node_id)),
+            groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
+            raft_maintenance: state.raft_maintenance_report(),
+        },
+        runtime: render_metrics(
+            state.runtime.metrics().snapshot(),
+            state.runtime.mailbox_snapshot(),
+            state.http_metrics.snapshot(),
+            &raft_groups,
+            state.runtime.cold_store_info().as_ref(),
+        ),
+        configured_raft_group_count: state.runtime.raft_group_count(),
+        group_state_gauges: group_state_gauges_json(&state).await,
+        process_rss_bytes: state.node_memory.last_rss_bytes(),
+        node_memory_abort_cap_bytes: state.node_memory.abort_cap_bytes().unwrap_or_default(),
+        wal_recovery: state.raft_wal.as_ref().map(WalRecoveryReport::new),
+        recovery_gates: state
+            .raft_registry()
+            .map(RaftGroupHandleRegistry::recovery_report),
+        wal_available_bytes: wal_disk.available_bytes,
+        wal_min_available_bytes: wal_disk.min_available_bytes,
+        wal_resume_available_bytes: wal_disk.resume_available_bytes,
+        wal_disk_pressure: wal_disk.pressure,
+        wal_disk_stat_errors: wal_disk.stat_errors,
     })
     .into_response()
 }
@@ -1791,11 +1814,9 @@ const GROUP_STATE_GAUGES_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
 /// §7.5) for `/__ursula/metrics`: one object per Raft group with the group id,
 /// whether this node hosts it, and either the gauges or an error.
-async fn group_state_gauges_json(
-    state: &HttpState,
-) -> ursula_proto::telemetry::GroupGaugeCollection {
-    use ursula_proto::telemetry::GroupGaugeCollection;
-    use ursula_proto::telemetry::GroupGaugeMetrics;
+async fn group_state_gauges_json(state: &HttpState) -> render::GroupGaugeCollection {
+    use crate::render::GroupGaugeCollection;
+    use crate::render::GroupGaugeMetrics;
     let Ok(groups) = http_time::timeout(
         GROUP_STATE_GAUGES_TIMEOUT,
         state.runtime.state_gauges_all_groups(),
@@ -1810,23 +1831,16 @@ async fn group_state_gauges_json(
         groups
             .into_iter()
             .map(|(group, result)| match result {
-                Ok(gauges) => GroupGaugeMetrics {
+                Ok(gauges) => GroupGaugeMetrics::Hosted {
                     raft_group_id: group.0,
-                    hosted: true,
-                    gauges: Some(gauges),
-                    error: None,
+                    gauges,
                 },
-                Err(RuntimeError::GroupNotHosted { .. }) => GroupGaugeMetrics {
+                Err(RuntimeError::GroupNotHosted { .. }) => GroupGaugeMetrics::NotHosted {
                     raft_group_id: group.0,
-                    hosted: false,
-                    gauges: None,
-                    error: None,
                 },
-                Err(error) => GroupGaugeMetrics {
+                Err(error) => GroupGaugeMetrics::Failed {
                     raft_group_id: group.0,
-                    hosted: true,
-                    gauges: None,
-                    error: Some(error.to_string()),
+                    error: error.to_string(),
                 },
             })
             .collect(),

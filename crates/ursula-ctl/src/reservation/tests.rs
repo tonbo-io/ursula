@@ -346,8 +346,7 @@ fn observation(
         started_ms: start,
         completed_ms: start.checked_add(100).unwrap(),
         verification: crate::quorum::QuorumVerification {
-            version: 3,
-            participation_certified: true,
+            version: ursula_proto::admin::SchemaVersion,
             process_incarnations: operation
                 .process_plan
                 .iter()
@@ -510,14 +509,14 @@ fn incomplete_or_uncertified_healthy_inventory_cannot_anchor_host_recovery() {
             9 => {
                 request.observation.verification.applied.remove(&3);
             }
-            10 => request.observation.verification.participation_certified = false,
-            11 => {
-                request
-                    .observation
-                    .verification
-                    .process_incarnations
-                    .remove(&3);
+            10 => {
+                request.observation.verification.prefixes.clear();
             }
+            11 => request
+                .observation
+                .verification
+                .process_incarnations
+                .clear(),
             12 => {
                 request
                     .observation

@@ -106,10 +106,7 @@ fn pick_successor(
         .filter(|id| {
             peer_views.get(id).is_some_and(|peer| {
                 peer.participation_ready()
-                    && peer
-                        .maintenance
-                        .as_ref()
-                        .is_none_or(|health| health.accepting_transfers)
+                    && peer.maintenance.accepting_transfers
                     && peer.voter_ids.contains(id)
                     && peer.last_applied_index.is_some()
                     && peer.last_applied_index >= required_applied
@@ -185,7 +182,7 @@ pub fn check_readiness(
     let mut per_group = BTreeMap::new();
     let mut all_ready = !all_group_ids.is_empty()
         && target_view.is_some()
-        && maintenance.is_none_or(|report| report.node_id == target_node_id && report.ready());
+        && maintenance.is_some_and(|report| report.node_id == target_node_id && report.ready());
     for group_id in all_group_ids {
         let peers = snapshot.peer_views(group_id, target_node_id);
         let target_group = target_view.and_then(|v| v.group(group_id));
@@ -197,7 +194,7 @@ pub fn check_readiness(
         let catch_up_gap = match (peer_max_committed, target_applied) {
             (Some(peer), Some(target)) => Some(peer.saturating_sub(target)),
             (Some(peer), None) => Some(peer),
-            (None, _) => Some(0),
+            (None, _) => None,
         };
         let within_lag = catch_up_gap
             .map(|gap| gap <= lag_tolerance)
@@ -236,7 +233,7 @@ pub fn check_readiness(
                             .map(|(id, issues)| format!("group {id}: {issues:?}")),
                     )
                     .chain(
-                        (report.node_id != target_node_id || report.version != 1)
+                        (report.node_id != target_node_id)
                             .then(|| "invalid maintenance report identity or version".to_owned()),
                     )
                     .collect()
@@ -272,13 +269,24 @@ mod tests {
     }
 
     fn view(node_id: u64, groups: Vec<RaftGroupView>) -> NodeMetricsView {
-        NodeMetricsView {
-            process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-            maintenance_fence: None,
-            maintenance_fence_uncertain: false,
-            node: node(node_id),
-            groups,
-            raft_maintenance: None,
+        {
+            let fixture_node = node(node_id);
+            let fixture_groups = groups;
+            let fixture_report = Some(crate::metrics::test_maintenance_report(
+                fixture_node.id,
+                &fixture_groups,
+            ));
+            NodeMetricsView {
+                node: fixture_node.clone(),
+                metrics: ursula_proto::admin::NodeMetrics {
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
+                    maintenance_fence: ursula_proto::admin::MaintenanceFenceState::Unclaimed,
+                    maintenance_fence_uncertain: false,
+                    process_node_id: Some(fixture_node.id),
+                    groups: fixture_groups,
+                    raft_maintenance: fixture_report,
+                },
+            }
         }
     }
 
@@ -290,30 +298,76 @@ mod tests {
         committed: Option<u64>,
         voters: Vec<u64>,
     ) -> RaftGroupView {
-        RaftGroupView {
-            raft_group_id,
-            node_id: reporting_node,
-            current_term: Some(1),
-            current_leader: leader,
-            committed_index: committed,
-            last_applied_index: applied,
-            voter_ids: voters,
-            learner_ids: vec![],
-            maintenance: None,
+        {
+            let fixture_term = 1;
+            let fixture_committed = committed;
+            let fixture_applied = applied;
+            RaftGroupView {
+                raft_group_id,
+                node_id: reporting_node,
+                current_term: fixture_term,
+                current_leader: leader,
+                committed_index: fixture_committed,
+                last_applied_index: fixture_applied,
+                voter_ids: voters,
+                learner_ids: vec![],
+                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
+                    running: true,
+                    recovery_ready: true,
+                    accepting_transfers: true,
+                    membership_joint: false,
+                    membership_log_index: Some(0),
+                    stopped_for_operator: false,
+                },
+                last_log_index: fixture_committed.into_iter().chain(fixture_applied).max(),
+                committed_term: fixture_committed.map(|_| fixture_term),
+                last_applied_term: fixture_applied.map(|_| fixture_term),
+                snapshot_term: None,
+                snapshot_index: None,
+                purged_term: None,
+                purged_index: None,
+                log_bytes_since_snapshot: 0,
+                log_entries_since_snapshot: 0,
+                last_snapshot_bytes: 0,
+                has_snapshot: false,
+            }
         }
     }
 
     fn empty_group(raft_group_id: u64, reporting_node: u64) -> RaftGroupView {
-        RaftGroupView {
-            raft_group_id,
-            node_id: reporting_node,
-            current_term: Some(0),
-            current_leader: None,
-            committed_index: None,
-            last_applied_index: None,
-            voter_ids: vec![],
-            learner_ids: vec![],
-            maintenance: None,
+        {
+            let fixture_term = 0;
+            let fixture_committed = None;
+            let fixture_applied = None;
+            RaftGroupView {
+                raft_group_id,
+                node_id: reporting_node,
+                current_term: fixture_term,
+                current_leader: None,
+                committed_index: fixture_committed,
+                last_applied_index: fixture_applied,
+                voter_ids: vec![],
+                learner_ids: vec![],
+                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
+                    running: true,
+                    recovery_ready: true,
+                    accepting_transfers: true,
+                    membership_joint: false,
+                    membership_log_index: Some(0),
+                    stopped_for_operator: false,
+                },
+                last_log_index: fixture_committed.into_iter().chain(fixture_applied).max(),
+                committed_term: fixture_committed.map(|_| fixture_term),
+                last_applied_term: fixture_applied.map(|_| fixture_term),
+                snapshot_term: None,
+                snapshot_index: None,
+                purged_term: None,
+                purged_index: None,
+                log_bytes_since_snapshot: 0,
+                log_entries_since_snapshot: 0,
+                last_snapshot_bytes: 0,
+                has_snapshot: false,
+            }
         }
     }
 
@@ -353,25 +407,19 @@ mod tests {
         assert!(plan_drain(&snapshot, 1).is_empty());
         let peer = &mut snapshot.per_node[1].groups[0];
         peer.last_applied_index = Some(100);
-        peer.maintenance = Some(ursula_proto::admin::RaftGroupMaintenanceState {
+        peer.maintenance = ursula_proto::admin::RaftGroupMaintenanceState {
             running: true,
             recovery_ready: false,
             accepting_transfers: true,
             membership_joint: false,
             membership_log_index: Some(0),
             stopped_for_operator: false,
-        });
+        };
         assert!(plan_drain(&snapshot, 1).is_empty());
-        snapshot.per_node[1].groups[0]
-            .maintenance
-            .as_mut()
-            .unwrap()
-            .recovery_ready = true;
+        snapshot.per_node[1].groups[0].maintenance.recovery_ready = true;
         assert_eq!(plan_drain(&snapshot, 1).transfers[0].preferred_successor, 2);
         snapshot.per_node[1].groups[0]
             .maintenance
-            .as_mut()
-            .unwrap()
             .accepting_transfers = false;
         assert!(plan_drain(&snapshot, 1).is_empty());
     }
@@ -406,7 +454,7 @@ mod tests {
                 .collect(),
         };
         snapshot.per_node[0].raft_maintenance = Some(ursula_proto::admin::RaftMaintenanceReport {
-            version: 1,
+            version: ursula_proto::admin::SchemaVersion,
             node_id: 1,
             lag_tolerance: 16,
             expected_groups: BTreeMap::from([
@@ -528,7 +576,24 @@ mod tests {
     }
 
     #[test]
-    fn readiness_ignores_uninitialized_empty_groups() {
+    fn readiness_cannot_infer_zero_lag_from_unknown_peer_commit() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                view(1, vec![group(7, 1, Some(2), Some(99), Some(99), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(2), Some(100), None, vec![
+                    1, 2, 3,
+                ])]),
+            ],
+        };
+        let report = check_readiness(&snapshot, 1, 5);
+        assert!(!report.all_ready);
+        assert_eq!(report.per_group[&7].catch_up_gap, None);
+    }
+
+    #[test]
+    fn readiness_rejects_configured_uninitialized_groups() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 view(1, vec![
@@ -542,8 +607,8 @@ mod tests {
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
-        assert!(report.all_ready, "{report:?}");
-        assert!(!report.per_group.contains_key(&8));
+        assert!(!report.all_ready, "{report:?}");
+        assert!(!report.per_group[&8].ready);
     }
 
     #[test]

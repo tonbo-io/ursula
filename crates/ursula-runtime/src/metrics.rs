@@ -2,11 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-pub use ursula_proto::telemetry::RuntimeMetricsSnapshot;
-pub use ursula_proto::telemetry::WalJournalSample;
-pub use ursula_proto::telemetry::WalMemorySample;
-pub use ursula_proto::telemetry::WalReadSample;
-pub use ursula_proto::telemetry::WalStorageSample;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -298,6 +293,11 @@ macro_rules! runtime_metrics {
             }
         }
 
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+        pub struct RuntimeMetricsSnapshot {
+            $($fields)*
+        }
+
         impl RuntimeMetrics {
             pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
                 let $ir = &self.inner;
@@ -332,7 +332,103 @@ fn max_or_zero(values: &[u64]) -> u64 {
     values.iter().copied().max().unwrap_or(0)
 }
 
-ursula_proto::runtime_metrics_manifest!(runtime_metrics);
+runtime_metrics! {
+    sum accepted_appends: core per_core_appends, group per_group_appends;
+    sum applied_mutations:
+        core per_core_applied_mutations, group per_group_applied_mutations;
+    sum mutation_apply_ns:
+        core per_core_mutation_apply_ns, group per_group_mutation_apply_ns;
+    sum append_post_commit_ns:
+        core per_core_append_post_commit_ns, group per_group_append_post_commit_ns;
+    sum read_watcher_notify_calls:
+        core per_core_read_watcher_notify_calls, group per_group_read_watcher_notify_calls;
+    sum read_watcher_notify_ns:
+        core per_core_read_watcher_notify_ns, group per_group_read_watcher_notify_ns;
+    sum read_watcher_replans:
+        core per_core_read_watcher_replans, group per_group_read_watcher_replans;
+    sum group_lock_wait_ns:
+        core per_core_group_lock_wait_ns, group per_group_group_lock_wait_ns;
+    sum group_engine_exec_ns:
+        core per_core_group_engine_exec_ns, group per_group_group_engine_exec_ns;
+    sum group_mailbox_depth: group per_group_group_mailbox_depth;
+    max group_mailbox_max_depth: group per_group_group_mailbox_max_depth;
+    sum group_mailbox_full_events: group per_group_group_mailbox_full_events;
+    sum raft_apply_entries: core per_core_raft_apply_entries, group per_group_raft_apply_entries;
+    sum raft_apply_ns: core per_core_raft_apply_ns, group per_group_raft_apply_ns;
+    sum raft_snapshot_builds: group per_group_raft_snapshot_builds;
+    sum raft_snapshot_build_ns: group per_group_raft_snapshot_build_ns;
+    summax raft_snapshot_body_bytes, raft_snapshot_body_bytes_max:
+        group per_group_raft_snapshot_body_bytes;
+    summax raft_snapshot_pointer_bytes, raft_snapshot_pointer_bytes_max:
+        group per_group_raft_snapshot_pointer_bytes;
+    summax raft_snapshot_streams, raft_snapshot_streams_max:
+        group per_group_raft_snapshot_streams;
+    sum raft_snapshot_external_uploads: group per_group_raft_snapshot_external_uploads;
+    sum raft_snapshot_inline_fallbacks: group per_group_raft_snapshot_inline_fallbacks;
+    sum live_read_waiters: core per_core_live_read_waiters;
+    sum live_read_backpressure_events: core per_core_live_read_backpressure_events;
+    sum routed_requests: core per_core_routed_requests;
+    sum mailbox_send_wait_ns: core per_core_mailbox_send_wait_ns;
+    sum mailbox_full_events: core per_core_mailbox_full_events;
+    sum wal_batches: core per_core_wal_batches, group per_group_wal_batches;
+    sum wal_records: core per_core_wal_records, group per_group_wal_records;
+    sum wal_write_ns: core per_core_wal_write_ns, group per_group_wal_write_ns;
+    sum wal_sync_ns: core per_core_wal_sync_ns, group per_group_wal_sync_ns;
+    sum wal_fsyncs: core per_core_wal_fsyncs, group per_group_wal_fsyncs;
+    sum wal_fsync_records:
+        core per_core_wal_fsync_records, group per_group_wal_fsync_records;
+    sum wal_reclaims: core per_core_wal_reclaims;
+    sum wal_reclaimed_bytes: core per_core_wal_reclaimed_bytes;
+    sum wal_reclaim_ns: core per_core_wal_reclaim_ns;
+    sum wal_reclaim_failures: core per_core_wal_reclaim_failures;
+    sum wal_rewritten_bytes: core per_core_wal_rewritten_bytes;
+    sum wal_rotations: core per_core_wal_rotations;
+    sum wal_physical_bytes: core per_core_wal_physical_bytes;
+    sum wal_segments: core per_core_wal_segments;
+    sum wal_pinned_segments: core per_core_wal_pinned_segments;
+    sum wal_lagging_groups: core per_core_wal_lagging_groups;
+    sum wal_cache_hits: core per_core_wal_cache_hits, group per_group_wal_cache_hits;
+    sum wal_cache_misses: core per_core_wal_cache_misses, group per_group_wal_cache_misses;
+    sum wal_disk_reads: core per_core_wal_disk_reads, group per_group_wal_disk_reads;
+    sum wal_disk_read_bytes:
+        core per_core_wal_disk_read_bytes, group per_group_wal_disk_read_bytes;
+    sum wal_cache_bytes: group per_group_wal_cache_bytes;
+    sum wal_indexed_entries: group per_group_wal_indexed_entries;
+    sum wal_recovery_ns: core per_core_wal_recovery_ns;
+    sum wal_recovery_records: core per_core_wal_recovery_records;
+    sum wal_recovery_bytes: core per_core_wal_recovery_bytes;
+    sum wal_recovery_live_entries: core per_core_wal_recovery_live_entries;
+    counter cold_flush_uploads;
+    counter cold_flush_upload_bytes;
+    counter cold_flush_upload_ns;
+    counter cold_pack_uploads;
+    counter cold_pack_bytes;
+    counter cold_pack_slices;
+    counter cold_flush_publishes;
+    counter cold_flush_publish_bytes;
+    counter cold_flush_publish_ns;
+    counter cold_orphan_cleanup_attempts;
+    counter cold_orphan_cleanup_errors;
+    counter cold_orphan_uncovered_chunks_kept;
+    counter cold_orphan_bytes;
+    counter cold_gc_reclaimed;
+    counter cold_gc_errors;
+    counter cold_flush_write_errors;
+    counter cold_pressure_flush_passes;
+    counter cold_pressure_flush_candidates;
+    counter raft_snapshot_pressure_passes;
+    counter raft_snapshot_pressure_groups;
+    sum cold_hot_bytes: group per_group_cold_hot_bytes;
+    // Current largest per-group backlog. Cold-health consumes this gauge and
+    // must be able to recover after a flush. The separate per-group `*_max`
+    // series remains the lifetime high-water mark for diagnostics.
+    max cold_hot_group_bytes_max: group per_group_cold_hot_bytes_current_max;
+    max cold_hot_group_bytes_high_watermark: group per_group_cold_hot_bytes_max;
+    counter cold_hot_stream_bytes_max;
+    sum cold_backpressure_events:
+        core per_core_cold_backpressure_events, group per_group_cold_backpressure_events;
+    counter cold_backpressure_bytes;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeMailboxSnapshot {
@@ -1129,4 +1225,62 @@ mod metric_manifest_tests {
         assert_eq!(snapshot.raft_snapshot_body_bytes, 16);
         assert_eq!(snapshot.raft_snapshot_body_bytes_max, 11);
     }
+}
+
+/// What one journal write reports beyond its own latency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalStorageSample {
+    /// `fsync` calls the write issued, on files and directories.
+    pub fsyncs: u64,
+    /// Records made durable by those `fsync`s.
+    pub fsync_records: u64,
+    /// The current size of the core's journal, all segments.
+    pub physical_bytes: u64,
+}
+
+/// What a core journal's writer did besides writing batches: rotating
+/// segments and reclaiming old ones. Counters add up; gauges replace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalJournalSample {
+    /// `fsync` calls of rotations and reclaim passes, on files and
+    /// directories.
+    pub fsyncs: u64,
+    pub rotations: u64,
+    /// Segments deleted, and their bytes.
+    pub reclaims: u64,
+    pub reclaimed_bytes: u64,
+    pub reclaim_ns: u64,
+    /// Reclaim passes that stopped on an error and left the journal correct.
+    pub reclaim_failures: u64,
+    /// Live entry bytes copied out of old segments.
+    pub rewritten_bytes: u64,
+    /// Gauge: the journal's size, all segments.
+    pub physical_bytes: u64,
+    /// Gauge: the journal's segments.
+    pub segments: u64,
+    /// Gauge: sealed segments kept only for lagging groups.
+    pub pinned_segments: u64,
+    /// Gauge: groups reported lagging to the snapshot driver.
+    pub lagging_groups: u64,
+}
+
+/// What a read of a group's log cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalReadSample {
+    /// Entries served from the group's cache.
+    pub cache_hits: u64,
+    /// Entries read from disk.
+    pub cache_misses: u64,
+    /// Frames read from disk, and their bytes.
+    pub disk_reads: u64,
+    pub disk_read_bytes: u64,
+}
+
+/// The size of a group's log in memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalMemorySample {
+    /// Bytes of cached entries.
+    pub cache_bytes: u64,
+    /// Entries the group's index holds.
+    pub indexed_entries: u64,
 }

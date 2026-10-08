@@ -1215,9 +1215,11 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     let decoded: ursula_proto::admin::NodeMetrics = serde_json::from_str(body).unwrap();
-    assert_eq!(decoded.diagnostics.runtime.accepted_appends, 2);
     assert!(!decoded.maintenance_fence_uncertain);
-    assert!(decoded.maintenance_fence.is_some());
+    assert_eq!(
+        decoded.maintenance_fence,
+        ursula_proto::admin::MaintenanceFenceState::Unclaimed
+    );
     assert!(body.contains("\"accepted_appends\":2"));
     assert!(body.contains("\"applied_mutations\":3"));
     assert!(body.contains("\"active_cores\":1"));
@@ -2000,7 +2002,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .expect("shared server/client metrics schema");
     assert_eq!(observed.groups.len(), 1);
     assert_eq!(observed.groups[0].voter_ids, vec![1]);
-    assert!(observed.groups[0].maintenance.as_ref().unwrap().running);
+    assert!(observed.groups[0].maintenance.running);
     assert!(!observed.maintenance_fence_uncertain);
 
     let mut network = ursula_raft::GrpcRaftNetwork::new(
@@ -2122,7 +2124,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
     let proof = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
         .await
         .unwrap();
-    assert!(proof.participation_certified);
+    assert_eq!(proof.process_incarnations.len(), 3);
     assert_eq!(proof.prefixes.len(), 6);
     assert_eq!(proof.applied.len(), 3);
     for (id, prefix) in proof.prefixes {

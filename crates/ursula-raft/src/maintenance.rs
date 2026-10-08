@@ -24,7 +24,7 @@ pub fn check_raft_maintenance(
     use RaftMaintenanceIssue as Issue;
 
     let mut report = RaftMaintenanceReport {
-        version: 1,
+        version: ursula_proto::admin::SchemaVersion,
         node_id,
         lag_tolerance,
         expected_groups,

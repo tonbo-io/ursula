@@ -300,7 +300,51 @@ fn append_budget_charge(encoded_len: usize, budget: usize) -> u32 {
     u32::try_from(charge).unwrap_or(u32::MAX)
 }
 
-pub use ursula_proto::telemetry::RaftGrpcMetricsSnapshot;
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RaftGrpcMetricsSnapshot {
+    pub raft_grpc_append_stream_sessions_opened: u64,
+    pub raft_grpc_append_stream_session_failures: u64,
+    pub raft_grpc_append_stream_requests: u64,
+    pub raft_grpc_append_stream_responses: u64,
+    pub raft_grpc_append_stream_request_bytes: u64,
+    pub raft_grpc_append_stream_response_bytes: u64,
+    pub raft_grpc_append_stream_request_frames: u64,
+    pub raft_grpc_append_stream_response_frames: u64,
+    pub raft_grpc_append_stream_batch_frames: u64,
+    pub raft_grpc_append_stream_batch_items_max: u64,
+    pub raft_grpc_append_stream_inflight: u64,
+    pub raft_grpc_append_stream_inflight_max: u64,
+    /// Leader side: bytes of Append calls queued for peers but not yet taken by the HTTP/2
+    /// encoder, bounded per peer by `RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES`.
+    pub raft_grpc_append_stream_queued_bytes: u64,
+    pub raft_grpc_append_stream_queued_bytes_max: u64,
+    /// Append calls refused because the peer's queue was full (the replication
+    /// stream backs off instead of piling up more copies of its entries).
+    pub raft_grpc_append_stream_backpressure_rejections: u64,
+    /// Queued Append calls dropped unsent because their caller had already timed out.
+    pub raft_grpc_append_stream_expired_unsent: u64,
+    /// Append sessions closed because the peer stopped answering.
+    pub raft_grpc_append_stream_stalls: u64,
+    /// Follower side: decoded inbound Append frames not yet answered.
+    pub raft_grpc_append_stream_server_buffered_bytes: u64,
+    pub raft_grpc_append_stream_server_buffered_bytes_max: u64,
+    /// Logical protobuf bytes before tonic's optional ZSTD compression and
+    /// HTTP/2 framing. Compare these counters with VPC/CUR bytes to calculate
+    /// transport and billing amplification.
+    pub raft_grpc_append_heartbeat_requests: u64,
+    pub raft_grpc_append_heartbeat_request_bytes: u64,
+    pub raft_grpc_append_replication_requests: u64,
+    pub raft_grpc_append_replication_request_bytes: u64,
+    pub raft_grpc_append_replication_entries: u64,
+    pub raft_grpc_append_response_bytes: u64,
+    pub raft_grpc_vote_requests: u64,
+    pub raft_grpc_vote_request_bytes: u64,
+    pub raft_grpc_vote_response_bytes: u64,
+    pub raft_grpc_snapshot_requests: u64,
+    pub raft_grpc_snapshot_request_bytes: u64,
+    pub raft_grpc_snapshot_payload_bytes: u64,
+    pub raft_grpc_snapshot_response_bytes: u64,
+}
 
 pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
     RaftGrpcMetricsSnapshot {

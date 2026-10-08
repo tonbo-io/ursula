@@ -281,16 +281,113 @@ pub(crate) fn insert_static(headers: &mut HeaderMap, name: &'static str, value: 
     headers.insert(name, HeaderValue::from_static(value));
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct MetricsResponse {
+    #[serde(flatten)]
+    pub node: ursula_proto::admin::NodeMetrics,
+    #[serde(flatten)]
+    pub runtime: RuntimeDiagnostics,
+    pub configured_raft_group_count: u32,
+    pub group_state_gauges: GroupGaugeCollection,
+    pub process_rss_bytes: u64,
+    pub node_memory_abort_cap_bytes: u64,
+    pub wal_recovery: Option<crate::WalRecoveryReport>,
+    pub recovery_gates: Option<ursula_proto::admin::RecoveryGatesReport>,
+    pub wal_available_bytes: u64,
+    pub wal_min_available_bytes: u64,
+    pub wal_resume_available_bytes: u64,
+    pub wal_disk_pressure: bool,
+    pub wal_disk_stat_errors: u64,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct RuntimeDiagnostics {
+    #[serde(flatten)]
+    runtime: RuntimeMetricsSnapshot,
+    #[serde(flatten)]
+    http: HttpMetricsSnapshot,
+    #[serde(flatten)]
+    raft_grpc: ursula_raft::RaftGrpcMetricsSnapshot,
+    active_cores: usize,
+    active_groups: usize,
+    mailbox_depths: Vec<usize>,
+    mailbox_capacities: Vec<usize>,
+    cold_store: ColdStoreInfo,
+    raft_group_count: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum GroupGaugeCollection {
+    Groups(Vec<GroupGaugeMetrics>),
+    Error { error: String },
+}
+pub(crate) enum GroupGaugeMetrics {
+    Hosted {
+        raft_group_id: u32,
+        gauges: ursula_runtime::GroupStateGauges,
+    },
+    NotHosted {
+        raft_group_id: u32,
+    },
+    Failed {
+        raft_group_id: u32,
+        error: String,
+    },
+}
+impl serde::Serialize for GroupGaugeMetrics {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Hosted<'a> {
+            raft_group_id: u32,
+            hosted: bool,
+            #[serde(flatten)]
+            gauges: &'a ursula_runtime::GroupStateGauges,
+        }
+        #[derive(serde::Serialize)]
+        struct Unavailable<'a> {
+            raft_group_id: u32,
+            hosted: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a str>,
+        }
+        match self {
+            Self::Hosted {
+                raft_group_id,
+                gauges,
+            } => Hosted {
+                raft_group_id: *raft_group_id,
+                hosted: true,
+                gauges,
+            }
+            .serialize(serializer),
+            Self::NotHosted { raft_group_id } => Unavailable {
+                raft_group_id: *raft_group_id,
+                hosted: false,
+                error: None,
+            }
+            .serialize(serializer),
+            Self::Failed {
+                raft_group_id,
+                error,
+            } => Unavailable {
+                raft_group_id: *raft_group_id,
+                hosted: true,
+                error: Some(error),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
 pub(crate) fn render_metrics(
     snapshot: RuntimeMetricsSnapshot,
     mailbox: RuntimeMailboxSnapshot,
     http: HttpMetricsSnapshot,
     raft_groups: &[RaftGroupMetricsSnapshot],
     cold_store: Option<&ColdStoreInfo>,
-) -> ursula_proto::telemetry::NodeDiagnostics {
-    use ursula_proto::telemetry::ColdStoreMetrics;
-    use ursula_proto::telemetry::NodeDiagnostics;
-    NodeDiagnostics {
+) -> RuntimeDiagnostics {
+    RuntimeDiagnostics {
         active_cores: snapshot
             .per_core_appends
             .iter()
@@ -306,75 +403,15 @@ pub(crate) fn render_metrics(
         raft_grpc: raft_grpc_metrics_snapshot(),
         mailbox_depths: mailbox.depths,
         mailbox_capacities: mailbox.capacities,
-        cold_store: cold_store
-            .map(|store| ColdStoreMetrics {
-                backend: store.backend.to_owned(),
-                root: store.root.clone(),
-                bucket: store.bucket.clone(),
-                region: store.region.clone(),
-                endpoint: store.endpoint.clone(),
-                encryption: store.encryption.map(str::to_owned),
-            })
-            .unwrap_or_else(|| ColdStoreMetrics {
-                backend: "none".to_owned(),
-                ..Default::default()
-            }),
-        raft_group_count: raft_groups.len(),
-        ..Default::default()
-    }
-}
-
-pub(crate) fn wal_recovery_metrics(
-    wal: &ursula_raft::wal::RaftWal,
-) -> ursula_proto::telemetry::WalRecoveryMetrics {
-    use ursula_proto::telemetry::PreviousWalRun;
-    use ursula_proto::telemetry::WalJournalSync;
-    use ursula_proto::telemetry::WalRecoveryMetrics;
-    use ursula_proto::telemetry::WalRecoveryReason;
-    use ursula_proto::telemetry::WalRecoveryState;
-    use ursula_proto::telemetry::WalReplayMode;
-    use ursula_proto::telemetry::WalSyncPolicy;
-    use ursula_raft::wal::RecoveryState;
-    use ursula_raft::wal::diagnostics::JournalReplayMode;
-    use ursula_raft::wal::diagnostics::JournalSync;
-    use ursula_raft::wal::diagnostics::PreviousRun;
-    use ursula_raft::wal::diagnostics::RecoveryReason;
-    let policy = |value| match value {
-        ursula_config::WalFsync::Always => WalSyncPolicy::Always,
-        ursula_config::WalFsync::Never => WalSyncPolicy::Never,
-    };
-    let opening = wal.opening();
-    WalRecoveryMetrics {
-        fsync: policy(wal.fsync()),
-        previous_run: match opening.previous_run {
-            PreviousRun::Absent => PreviousWalRun::Absent,
-            PreviousRun::Unrecorded => PreviousWalRun::Unrecorded,
-            PreviousRun::Clean => PreviousWalRun::Clean,
-            PreviousRun::ProcessCrash => PreviousWalRun::ProcessCrash,
-            PreviousRun::HostCrash { fsync } => PreviousWalRun::HostCrash {
-                fsync: policy(fsync),
-            },
-            PreviousRun::Poisoned => PreviousWalRun::Poisoned,
-        },
-        replay_mode: match opening.replay_mode {
-            JournalReplayMode::Strict => WalReplayMode::Strict,
-            JournalReplayMode::VerifiedPrefix => WalReplayMode::VerifiedPrefix,
-        },
-        recovery: match opening.recovery {
-            RecoveryState::Normal => WalRecoveryState::Normal,
-            RecoveryState::Recovering { reason } => WalRecoveryState::Recovering {
-                reason: match reason {
-                    RecoveryReason::HostCrash => WalRecoveryReason::HostCrash,
-                    RecoveryReason::Poisoned => WalRecoveryReason::Poisoned,
-                    RecoveryReason::UnknownHistory => WalRecoveryReason::UnknownHistory,
-                },
-            },
-        },
-        recovery_epoch: opening.recovery_epoch,
-        journal_sync: Some(match opening.journal_sync {
-            JournalSync::NotNeeded => WalJournalSync::NotNeeded,
-            JournalSync::BeforeRecording => WalJournalSync::BeforeRecording,
+        cold_store: cold_store.cloned().unwrap_or(ColdStoreInfo {
+            backend: "none",
+            root: None,
+            bucket: None,
+            region: None,
+            endpoint: None,
+            encryption: None,
         }),
+        raft_group_count: raft_groups.len(),
     }
 }
 
@@ -384,7 +421,7 @@ pub(crate) fn raft_group_metrics(
     ursula_proto::admin::RaftGroupMetrics {
         raft_group_id: u64::from(value.raft_group_id),
         node_id: value.node_id,
-        current_term: Some(value.current_term),
+        current_term: value.current_term,
         current_leader: value.current_leader,
         committed_index: value.committed.map(|progress| progress.index),
         last_applied_index: value.last_applied.map(|progress| progress.index),

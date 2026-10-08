@@ -608,8 +608,6 @@ fn validate_observed_prefix(
         usize::try_from(cell.group_count).context("group inventory exceeds address space")?;
     if observation.started_ms == 0
         || observation.completed_ms < observation.started_ms
-        || proof.version != 3
-        || !proof.participation_certified
         || proof
             .process_incarnations
             .keys()
