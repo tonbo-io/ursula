@@ -826,7 +826,104 @@ async fn wait_writable(cluster: &mut JournalCluster, group: u32, context: &str) 
     }
 }
 
-/// (e2) Both followers of every group lose power at once while the leader
+/// Three nodes whose journals rotate no segment during the test, so a power
+/// loss drops exactly what followed the last clean restart. One node leads
+/// every group, every group then commits six more entries, and both
+/// followers lose power and those entries with it. Returns the cluster with
+/// the followers down, the surviving leader and the followers.
+async fn followers_lose_a_committed_tail(
+    name: &str,
+    context: &str,
+) -> (JournalCluster, u64, Vec<u64>) {
+    // Segments larger than the test writes: no rotation `fsync`s the tail.
+    let mut cluster = JournalCluster::start_with_tuning(name, JournalTuning {
+        segment_bytes: 1024 * 1024,
+        ..JournalTuning::new(WalFsync::Never)
+    })
+    .await;
+    for group in JOURNAL_GROUPS {
+        cluster.append(group, 4).await;
+    }
+    // The fsync point: a clean restart of each node `fsync`s its journal, so
+    // the followers lose exactly what follows it.
+    for node_id in NODES {
+        let wal = cluster.wals[&node_id].clone();
+        wal.clean_shutdown(cluster.stop_node(node_id)).await;
+        cluster.start_node(node_id).await;
+        wait_healed(&cluster, context, Duration::from_secs(5)).await;
+    }
+    let survivor = wait_leader(&cluster, 0, context).await;
+    lead_every_group(&cluster, survivor, context).await;
+    for group in JOURNAL_GROUPS {
+        cluster.append(group, 6).await;
+    }
+    let followers = NODES
+        .into_iter()
+        .filter(|node_id| *node_id != survivor)
+        .collect::<Vec<_>>();
+    cluster.votes.clear();
+    for node_id in &followers {
+        cluster.stop_node(*node_id).await;
+    }
+    for node_id in &followers {
+        cluster.wals[node_id].power_loss_losing_unsynced().await;
+    }
+    (cluster, survivor, followers)
+}
+
+/// Restarts the followers of [`followers_lose_a_committed_tail`]: they come
+/// back gated, each with a shorter log than the survivor in every group.
+async fn restart_shorter_followers(
+    cluster: &mut JournalCluster,
+    survivor: u64,
+    followers: &[u64],
+    context: &str,
+) {
+    for node_id in followers {
+        cluster.start_node(*node_id).await;
+        assert_gated(cluster, *node_id, context);
+    }
+    for group in JOURNAL_GROUPS {
+        let survivor_log = metrics(cluster, group, survivor).last_log_index;
+        for node_id in followers {
+            let mut store = cluster.wals[node_id]
+                .store(RaftGroupId(group))
+                .expect("running store");
+            let last = store.get_log_state().await.expect("log state").last_log_id;
+            assert!(
+                last.map(|log_id| log_id.index) < survivor_log,
+                "{context}: node {node_id} group {group} kept its unsynced tail"
+            );
+        }
+    }
+}
+
+/// (e2) Both followers of every idle group lose a tail of committed entries
+/// at once while the leader survives, and nothing is written afterwards.
+/// They are a majority, so the leader cannot remove them: it rewinds their
+/// replication and sends them its log again, with an unchanged membership
+/// entry to carry the rewind. Every group heals without an operator and
+/// keeps every acknowledged write.
+#[test]
+fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let (mut cluster, survivor, followers) =
+                followers_lose_a_committed_tail("gate-idle-majority", &context).await;
+            restart_shorter_followers(&mut cluster, survivor, &followers, &context).await;
+            wait_healed(&cluster, &context, Duration::from_secs(15)).await;
+            assert_no_vote_while_gated(&cluster, &context);
+            for group in JOURNAL_GROUPS {
+                wait_writable(&mut cluster, group, &context).await;
+            }
+            cluster.verify_reads().await;
+        });
+    }
+}
+
+/// (e3) Both followers of every group lose power at once while the leader
 /// survives, and their unsynced tail of committed entries with it. While
 /// they are down, the survivor hands every group to one of them through the
 /// production handoff entry point, as the cluster-egress yield and the
@@ -847,42 +944,8 @@ fn a_handoff_to_a_powered_off_follower_never_parks_the_survivor() {
     for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
         run_with_madsim(seed, async move {
             let context = format!("seed {seed}");
-            // Segments larger than the test writes: no rotation `fsync`s
-            // the tail.
-            let mut cluster =
-                JournalCluster::start_with_tuning("gate-parked-handoff", JournalTuning {
-                    segment_bytes: 1024 * 1024,
-                    ..JournalTuning::new(WalFsync::Never)
-                })
-                .await;
-            for group in JOURNAL_GROUPS {
-                cluster.append(group, 4).await;
-            }
-            // The fsync point: a clean restart of each node `fsync`s its
-            // journal, so the followers lose exactly what follows it.
-            for node_id in NODES {
-                let wal = cluster.wals[&node_id].clone();
-                wal.clean_shutdown(cluster.stop_node(node_id)).await;
-                cluster.start_node(node_id).await;
-                wait_healed(&cluster, &context, Duration::from_secs(5)).await;
-            }
-            let survivor = wait_leader(&cluster, 0, &context).await;
-            lead_every_group(&cluster, survivor, &context).await;
-            for group in JOURNAL_GROUPS {
-                cluster.append(group, 6).await;
-            }
-
-            let followers = NODES
-                .into_iter()
-                .filter(|node_id| *node_id != survivor)
-                .collect::<Vec<_>>();
-            cluster.votes.clear();
-            for node_id in &followers {
-                cluster.stop_node(*node_id).await;
-            }
-            for node_id in &followers {
-                cluster.wals[node_id].power_loss_losing_unsynced().await;
-            }
+            let (mut cluster, survivor, followers) =
+                followers_lose_a_committed_tail("gate-parked-handoff", &context).await;
 
             // The survivor reaches no peer for a few probe ticks and hands
             // every group it leads to a follower.
@@ -909,23 +972,7 @@ fn a_handoff_to_a_powered_off_follower_never_parks_the_survivor() {
                 );
             }
 
-            for node_id in &followers {
-                cluster.start_node(*node_id).await;
-                assert_gated(&cluster, *node_id, &context);
-            }
-            for group in JOURNAL_GROUPS {
-                let survivor_log = metrics(&cluster, group, survivor).last_log_index;
-                for node_id in &followers {
-                    let mut store = cluster.wals[node_id]
-                        .store(RaftGroupId(group))
-                        .expect("running store");
-                    let last = store.get_log_state().await.expect("log state").last_log_id;
-                    assert!(
-                        last.map(|log_id| log_id.index) < survivor_log,
-                        "{context}: node {node_id} group {group} kept its unsynced tail"
-                    );
-                }
-            }
+            restart_shorter_followers(&mut cluster, survivor, &followers, &context).await;
 
             // The runbook: once every gated replica either opened or
             // reports its group stalled, accept the loss on the longest
