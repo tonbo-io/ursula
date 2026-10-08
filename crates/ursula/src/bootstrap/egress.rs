@@ -228,7 +228,7 @@ pub fn spawn_egress_gate(
                 yielded = true;
                 registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
                 let handoffs = plan_cluster_egress_shed(&snaps, node_id, |group, target| {
-                    !registry.is_reverted_follower(group, target)
+                    registry.check_handoff(group, target).is_ok()
                 });
                 for handoff in handoffs {
                     if let Err(err) = registry

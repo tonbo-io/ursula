@@ -11,6 +11,7 @@ use futures_util::future::join_all;
 use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::Raft;
+use openraft::RaftMetrics;
 use openraft::RaftNetworkFactory;
 use openraft::RaftNetworkV2;
 use openraft::alias::LogIdOf;
@@ -348,23 +349,69 @@ impl RaftGroupHandleRegistry {
         self.election.may_campaign(self.rejoin(group).as_deref())
     }
 
-    /// Submit a handoff after checking current leadership, membership and recovery.
-    /// The receiver independently checks its own recovery gate.
+    /// Submit a handoff after checking it against the handoff policy
+    /// ([`Self::check_handoff`]). The receiver independently checks its own
+    /// recovery gate and OpenRaft never reports its refusal, so a handoff
+    /// that has not moved the leadership by its deadline is abandoned.
     pub async fn transfer_leader(
         &self,
         group: RaftGroupId,
         target: u64,
     ) -> Result<(), LeadershipTransferError> {
+        let (raft, metrics) = self.handoff_view(group)?;
+        self.validate_handoff(group, target, &raft, &metrics)?;
+        raft.trigger()
+            .transfer_leader(target)
+            .await
+            .map_err(|source| LeadershipTransferError::Raft { group, source })?;
+        raft.abandon_stalled_transfer(metrics.vote, target);
+        Ok(())
+    }
+
+    /// Whether this node could hand its leadership of `group` to `target`
+    /// now, by the policy [`Self::transfer_leader`] enforces. Handoff
+    /// planners pick their targets with it.
+    pub fn check_handoff(
+        &self,
+        group: RaftGroupId,
+        target: u64,
+    ) -> Result<(), LeadershipTransferError> {
+        let (raft, metrics) = self.handoff_view(group)?;
+        self.validate_handoff(group, target, &raft, &metrics)
+    }
+
+    fn handoff_view(
+        &self,
+        group: RaftGroupId,
+    ) -> Result<(OwnerRaftHandle, RaftMetrics<UrsulaRaftTypeConfig>), LeadershipTransferError> {
         let raft = self
             .get(group)
             .ok_or(LeadershipTransferError::NotRegistered { group })?;
         let metrics = raft.metrics().borrow_watched().clone();
-        self.election
-            .validate_handoff(group, target, &metrics, self.rejoin(group).as_deref())?;
-        raft.trigger()
-            .transfer_leader(target)
-            .await
-            .map_err(|source| LeadershipTransferError::Raft { group, source })
+        Ok((raft, metrics))
+    }
+
+    fn validate_handoff(
+        &self,
+        group: RaftGroupId,
+        target: u64,
+        raft: &OwnerRaftHandle,
+        metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
+    ) -> Result<(), LeadershipTransferError> {
+        let target_ack_age = metrics
+            .heartbeat
+            .as_ref()
+            .and_then(|acks| acks.get(&target))
+            .and_then(|acked| acked.as_ref())
+            .map(|acked| openraft::Instant::elapsed(&**acked));
+        self.election.validate_handoff(
+            group,
+            target,
+            metrics,
+            self.rejoin(group).as_deref(),
+            target_ack_age,
+            raft.handoff_ack_window(),
+        )
     }
 
     pub async fn confirm_quorum_prefix(
@@ -542,13 +589,6 @@ impl RaftGroupHandleRegistry {
             .load()
             .get(&raft_group_id.0)
             .and_then(|entry| entry.resources().recovery.clone())
-    }
-
-    /// Whether `target` lost its log under this node's leadership of the
-    /// group (leadership handoffs skip such a follower).
-    pub fn is_reverted_follower(&self, raft_group_id: RaftGroupId, target: u64) -> bool {
-        self.rejoin(raft_group_id)
-            .is_some_and(|rejoin| rejoin.is_reverted_follower(target))
     }
 
     /// Operator recovery when a majority of the group's voters are gated:

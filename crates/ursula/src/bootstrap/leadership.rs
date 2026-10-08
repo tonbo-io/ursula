@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use openraft::rt::WatchReceiver;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::RaftGroupId;
@@ -21,8 +20,9 @@ use ursula_shard::RaftGroupId;
 /// peer that cannot safely lead. Cold-health remains campaign-eligible because
 /// it is a cluster-wide pressure signal under backlog: excluding every hot
 /// peer can deadlock leadership movement. A planned handoff fires only when
-/// the leader's replication metrics show the target matched its last log;
-/// otherwise the group is retried on a later tick.
+/// the registry's handoff policy accepts the target (it answered recently,
+/// holds every committed entry and did not lose its log); otherwise the
+/// group is retried on a later tick.
 /// One planned leader handoff for the M1 balancer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LeadershipBalanceAction {
@@ -166,20 +166,6 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
     actions
 }
 
-/// A handoff target is caught up when the leader's replication metrics show it
-/// matched the leader's last log entry. OpenRaft submits a transfer even when
-/// the target never catches up, and the leader then stops heartbeating the
-/// group until a new leader appears; a target that cannot win (an empty or
-/// lagging voter) would strand the group.
-pub(crate) fn handoff_target_caught_up(
-    leader_last_log_index: Option<u64>,
-    target_matched_index: Option<u64>,
-) -> bool {
-    leader_last_log_index
-        .zip(target_matched_index)
-        .is_some_and(|(last, matched)| matched >= last)
-}
-
 /// Best-effort shutdown handoff while Raft transport is still available.
 /// The caller bounds the whole operation, including peer discovery and waiting
 /// for observed leadership changes. Enqueuing a transfer is not completion.
@@ -242,27 +228,10 @@ pub(crate) async fn handoff_shutdown_leadership(
                 continue;
             }
             let group = RaftGroupId(snapshot.raft_group_id);
-            let Some(raft) = registry.get(group) else {
-                continue;
-            };
             for target in
                 crate::bootstrap::util::prioritized_transfer_targets(&snapshot, node_id, &counts)
             {
-                if !eligible.contains(&target) || registry.is_reverted_follower(group, target) {
-                    continue;
-                }
-                let caught_up = {
-                    let metrics_rx = raft.metrics();
-                    let metrics = metrics_rx.borrow_watched();
-                    let matched = metrics
-                        .replication
-                        .as_ref()
-                        .and_then(|replication| replication.get(&target))
-                        .and_then(|matched| matched.as_ref())
-                        .map(|log_id| log_id.index());
-                    handoff_target_caught_up(metrics.last_log_index, matched)
-                };
-                if !caught_up {
+                if !eligible.contains(&target) || registry.check_handoff(group, target).is_err() {
                     continue;
                 }
                 match registry
@@ -330,27 +299,11 @@ pub fn spawn_leadership_balancer(
                 &eligible_nodes,
             );
             for action in actions {
-                let Some(raft) = registry.get(RaftGroupId(action.group_id)) else {
-                    continue;
-                };
-                let caught_up = {
-                    let metrics_rx = raft.metrics();
-                    let metrics = metrics_rx.borrow_watched();
-                    let matched = metrics
-                        .replication
-                        .as_ref()
-                        .and_then(|replication| replication.get(&action.target))
-                        .and_then(|matched| matched.as_ref())
-                        .map(|log_id| log_id.index());
-                    handoff_target_caught_up(metrics.last_log_index, matched)
-                };
-                // A follower that lost its log still shows the matched index
-                // it reached before its restart until it is rebuilt.
-                if !caught_up
-                    || registry.is_reverted_follower(RaftGroupId(action.group_id), action.target)
+                if let Err(err) =
+                    registry.check_handoff(RaftGroupId(action.group_id), action.target)
                 {
                     tracing::debug!(
-                        "leadership-balance: node {my_id} skips group {} -> node {}: target has not matched the leader's last log",
+                        "leadership-balance: node {my_id} skips group {} -> node {}: {err}",
                         action.group_id,
                         action.target
                     );

@@ -92,8 +92,9 @@ The membership endpoint has the same leader-only contract: it answers `409 Confl
 
 On the first SIGTERM or Ctrl-C, the voter marks itself maintenance-drained to
 prevent re-acquiring leadership. It keeps Raft transport available while attempting
-to hand off each leadership to an eligible voter whose replication has matched the
-leader's last log, skipping followers known to have lost their logs. It waits for
+to hand off each leadership to an eligible voter that answered the leader within an
+election timeout and holds every committed entry, skipping followers known to have
+lost their logs. It waits for
 observed leadership changes for up to five seconds, then closes Raft transport and
 drains HTTP listeners. It then stops its Raft groups, `fsync`s every journal and
 records a clean shutdown, so the next start reads the journals strictly and the
@@ -157,7 +158,9 @@ With the default `raft.wal.fsync = "never"`, a node acknowledges ordinary data a
 
 - The node does not campaign, takes no leadership transfer and grants no vote. A node that led the group starts as a follower. It still accepts appends from a leader of its current term or a later one.
 - It asks the group's leader for a fresh ReadIndex barrier, applies the log up to the barrier's index and then opens the gate. Until then readiness answers `503` with reason `recovery_gate_closed`, and `recovery_gates` in `GET /__ursula/metrics` lists the gated groups.
-- The leader sees that the node lost entries it had acknowledged and rebuilds it: it removes the voter, adds it back as a learner and promotes it once it caught up. If the voters that lost entries are a majority, no removal can commit, so the leader resends its own log to them instead.
+- The leader sees that the node lost entries it had acknowledged and rebuilds it: it removes the voter, adds it back as a learner and promotes it once it caught up. If the voters that lost entries are a majority, or the voters that answered it since they restarted are not, no removal can commit, so the leader resends its own log to them instead.
+
+Leadership handoffs (draining, balancing, a node that sheds its leaderships, the commit-stall watchdog) go only to a voter that answered the leader within an election timeout and holds every committed entry. A handoff whose target has not taken over within two election timeouts is abandoned: the leader steps down and campaigns again.
 
 While at most a minority of a group's voters lost their tail, the other voters hold every acknowledged write and nothing is lost. Wait for every group to open the gate on a node before you stop another voter.
 
@@ -166,6 +169,8 @@ While at most a minority of a group's voters lost their tail, the other voters h
 1. Read `last_log_index` and `current_term` for the group from `GET /__ursula/metrics` on every voter.
 2. On the gated replica with the longest log, run the call below through its admin listener. Its body names the `last_log_index` and `current_term` you read on that replica. Repeat on the next longest until the replicas whose gate is open form a majority of the voters. A replica that was not gated counts as open.
 3. The group elects a leader among the open replicas, preferring the longest log, and the remaining gated replicas catch up from it and open their gates.
+
+Stop once the open replicas form a majority, even if the election takes a while. A replica that was not gated may hold the longest log, and then only it can win. Accepting the loss on one more gated replica can let two replicas with shorter logs elect each other and discard the writes only that replica holds.
 
 ```bash
 # group 42 on this node

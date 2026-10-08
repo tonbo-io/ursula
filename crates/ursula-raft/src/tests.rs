@@ -2739,12 +2739,226 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
     )))
     .await
     .unwrap();
+    wait_matched_committed(&raft, healthy).await;
     registry
         .transfer_leader(placement().raft_group_id, healthy)
         .await
         .unwrap();
     raft.wait(Some(Duration::from_secs(5)))
         .current_leader(healthy, "healthy voter becomes leader")
+        .await
+        .unwrap();
+    shutdown_all(&engines).await;
+}
+
+/// Waits until the leader's replication metrics show `target` holding every
+/// entry the leader committed.
+#[cfg(not(madsim))]
+async fn wait_matched_committed(raft: &crate::RaftGroupHandle, target: u64) {
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                let matched = metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|replication| replication.get(&target))
+                    .and_then(|matched| matched.as_ref())
+                    .map(|log_id| log_id.index);
+                matched >= metrics.local_committed.as_ref().map(|log_id| log_id.index)
+            },
+            "target matched the committed log",
+        )
+        .await
+        .unwrap();
+}
+
+/// OpenRaft parks a leader whose transfer cannot complete: it forwards every
+/// write to the target, stops heartbeats and never campaigns. The handoff
+/// policy refuses a target that lacks committed entries or has not answered
+/// recently, and the leader keeps leading.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn registry_handoff_refuses_a_lagging_or_unreachable_target() {
+    use openraft::rt::WatchReceiver;
+    let policy = InProcessRaftNetworkPolicy::default();
+    let (_network, engines, leader, _roots) =
+        build_three_node_cluster("handoff-unready", Some(policy.clone())).await;
+    let raft = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == leader)
+        .unwrap()
+        .raft_handle();
+    let target = (1..=3).find(|id| *id != leader).unwrap();
+    let write = |name: &'static str| {
+        raft.client_write(create_command(ursula_shard::BucketStreamId::new(
+            "default", name,
+        )))
+    };
+    write("first").await.unwrap();
+    wait_matched_committed(&raft, target).await;
+    let registry = RaftGroupHandleRegistry::default();
+    registry.register(placement(), raft.clone());
+    let group = placement().raft_group_id;
+
+    // Cut off, the target misses an entry the other voter commits.
+    policy.partition_bidirectional(leader, target);
+    write("lagging").await.unwrap();
+    assert!(matches!(
+        registry.check_handoff(group, target),
+        Err(LeadershipTransferError::LaggingTarget { target: refused, .. }) if refused == target
+    ));
+    // Silent for longer than the minimum election timeout, it may be down.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(matches!(
+        registry.transfer_leader(group, target).await,
+        Err(LeadershipTransferError::UnreachableTarget { target: refused, .. }) if refused == target
+    ));
+    // The refused handoff left the leader writable.
+    write("still-leading").await.unwrap();
+    assert_eq!(raft.metrics().borrow_watched().current_leader, Some(leader));
+
+    // Once it answers again and holds the committed log, it takes over.
+    policy.clear();
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .heartbeat
+                    .as_ref()
+                    .and_then(|acks| acks.get(&target))
+                    .and_then(|acked| acked.as_ref())
+                    .is_some_and(|acked| {
+                        openraft::Instant::elapsed(&**acked) < Duration::from_millis(100)
+                    })
+            },
+            "the target answers again",
+        )
+        .await
+        .unwrap();
+    wait_matched_committed(&raft, target).await;
+    registry.transfer_leader(group, target).await.unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(target, "the target takes over")
+        .await
+        .unwrap();
+    shutdown_all(&engines).await;
+}
+
+/// A handoff the target never takes over (here it is cut off right after
+/// it answered, and the other voter does not campaign) is abandoned: the
+/// parked leader steps down and campaigns, shed or not, and leads again.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn registry_handoff_abandons_a_transfer_nobody_takes_over() {
+    use openraft::rt::WatchReceiver;
+    let policy = InProcessRaftNetworkPolicy::default();
+    let (_network, engines, leader, _roots) =
+        build_three_node_cluster("handoff-parked", Some(policy.clone())).await;
+    let raft = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == leader)
+        .unwrap()
+        .raft_handle();
+    let target = (1..=3).find(|id| *id != leader).unwrap();
+    let other = (1..=3).find(|id| *id != leader && *id != target).unwrap();
+    let write = |name: &'static str| {
+        raft.client_write(create_command(ursula_shard::BucketStreamId::new(
+            "default", name,
+        )))
+    };
+    write("first").await.unwrap();
+    wait_matched_committed(&raft, target).await;
+    let registry = RaftGroupHandleRegistry::default();
+    registry.register(placement(), raft.clone());
+    for engine in &engines {
+        engine.raft_handle().runtime_config().elect(false);
+    }
+    let vote = raft.metrics().borrow_watched().vote;
+    policy.partition_bidirectional(leader, target);
+    policy.partition_bidirectional(other, target);
+    registry
+        .transfer_leader(placement().raft_group_id, target)
+        .await
+        .unwrap();
+    let forwarded = write("forwarded").await;
+    assert!(matches!(
+        forwarded,
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(ref forward)
+        )) if forward.leader_id == Some(target)
+    ));
+    raft.wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| {
+                metrics.state == openraft::ServerState::Leader
+                    && metrics.vote.leader_id().term() > vote.leader_id().term()
+            },
+            "the leader abandons the parked transfer",
+        )
+        .await
+        .unwrap();
+    write("resumed").await.unwrap();
+    shutdown_all(&engines).await;
+}
+
+/// A leader steps down from a stalled transfer through a vote it grants
+/// itself. The vote is marked a leadership transfer, so the leader's own
+/// lease, which runs for a maximum election timeout after its election,
+/// cannot refuse it.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_transfer_step_down_is_not_refused_by_the_leaders_own_lease() {
+    use openraft::rt::WatchReceiver;
+    let (_network, engines, first, _roots) =
+        build_three_node_cluster("step-down-lease", None).await;
+    let first_raft = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == first)
+        .unwrap()
+        .raft_handle();
+    // A leader elected a moment ago: its lease is still running.
+    let leader = (1..=3).find(|id| *id != first).unwrap();
+    first_raft.trigger().transfer_leader(leader).await.unwrap();
+    first_raft
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(leader, "a fresh leader")
+        .await
+        .unwrap();
+    let raft = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == leader)
+        .unwrap()
+        .raft_handle();
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.state == openraft::ServerState::Leader,
+            "the fresh leader leads",
+        )
+        .await
+        .unwrap();
+    let vote = raft.metrics().borrow_watched().vote;
+    let last_log_id = raft.data_metrics().borrow_watched().last_log;
+    let target = first;
+
+    let mut plain = crate::owner::transfer_step_down(vote, target, last_log_id);
+    plain.leadership_transfer = false;
+    let refused = raft.vote(plain).await.unwrap();
+    assert!(
+        !refused.vote_granted,
+        "the lease refuses a plain vote request"
+    );
+    assert_eq!(raft.metrics().borrow_watched().vote, vote);
+
+    let stepped_down = raft
+        .vote(crate::owner::transfer_step_down(vote, target, last_log_id))
+        .await
+        .unwrap();
+    assert!(stepped_down.vote_granted);
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.state != openraft::ServerState::Leader && metrics.vote != vote,
+            "the leader stepped down",
+        )
         .await
         .unwrap();
     shutdown_all(&engines).await;

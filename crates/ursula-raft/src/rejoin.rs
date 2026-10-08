@@ -859,29 +859,41 @@ impl GroupRejoin {
                 floor.is_some(),
             ));
         }
-        let screen = if floor.is_some_and(|floor| request.vote < floor) || floor.is_none() {
-            VoteScreen::Refuse
-        } else {
-            self.gate().screen(candidate_index)
-        };
-        match screen {
-            VoteScreen::Pass => None,
-            VoteScreen::Refuse => {
-                tracing::info!(
+        let last_applied = metrics.last_applied.as_ref().map(|log_id| log_id.index());
+        match floor {
+            None => tracing::info!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                candidate,
+                "recovery gate: refusing a vote until a quorum proves this replica's lost vote"
+            ),
+            // Any replica, gated or not, refuses a candidate whose vote is
+            // older than its own; the answer carries the newer vote.
+            Some(floor) if request.vote < floor => tracing::debug!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                candidate,
+                candidate_vote = %request.vote,
+                vote = %floor,
+                "refusing a vote request older than this replica's vote"
+            ),
+            Some(_) => match self.gate().screen(candidate_index) {
+                VoteScreen::Pass => return None,
+                VoteScreen::Refuse => tracing::info!(
                     node_id = self.node_id,
                     raft_group_id = self.raft_group_id.0,
                     candidate,
                     candidate_last_log_index = ?candidate_index,
-                    last_applied = ?metrics.last_applied.as_ref().map(|log_id| log_id.index()),
+                    last_applied = ?last_applied,
                     "recovery gate: refusing a vote until this replica has caught up"
-                );
-                Some(UrsulaVoteResponse::new(
-                    floor.unwrap_or(metrics.vote),
-                    self.last_log_id().or(metrics.last_applied),
-                    false,
-                ))
-            }
+                ),
+            },
         }
+        Some(UrsulaVoteResponse::new(
+            floor.unwrap_or(metrics.vote),
+            self.last_log_id().or(metrics.last_applied),
+            false,
+        ))
     }
 
     /// The last entry this replica holds, which a refusal reports so that a
@@ -1319,6 +1331,7 @@ mod tests {
             stale_joint: false,
             voters: voters.iter().copied().collect(),
             learners: learners.iter().copied().collect(),
+            answering: voters.iter().copied().collect(),
             reverted: reverted.iter().copied().collect(),
             awaiting_rewind: BTreeSet::new(),
             matched: BTreeMap::new(),
@@ -1357,6 +1370,30 @@ mod tests {
             Some(HealStep::RemoveLearner { target: 3 })
         );
         assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[], &[])), None);
+    }
+
+    #[test]
+    fn the_heal_driver_removes_a_voter_only_with_a_quorum_that_answered() {
+        // 3 lost entries and 2 has not answered since it restarted: 2 may
+        // have lost entries too, so a removal could need it and never
+        // commit. Rewind 3 instead.
+        let mut silent = view(&[1, 2, 3], &[], &[3]);
+        silent.answering = BTreeSet::from([1]);
+        assert_eq!(
+            plan_heal_step(&silent),
+            Some(HealStep::RewindVoters {
+                targets: BTreeSet::from([3]),
+            })
+        );
+        // Once 2 answers, it holds its log and the removal can commit.
+        silent.answering.insert(2);
+        assert_eq!(
+            plan_heal_step(&silent),
+            Some(HealStep::RemoveVoter {
+                target: 3,
+                voters: BTreeSet::from([1, 2]),
+            })
+        );
     }
 
     #[test]

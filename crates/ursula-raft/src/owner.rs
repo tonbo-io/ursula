@@ -24,6 +24,7 @@ use openraft::raft::TransferLeaderRequest;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::alias::SnapshotOf;
 use openraft::type_config::alias::WatchReceiverOf;
+use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 
@@ -56,7 +57,14 @@ impl Drop for Mailbox {
 pub struct OwnerRaftHandle {
     mailbox: Arc<Mailbox>,
     metrics: WatchReceiverOf<C, RaftMetrics<C>>,
+    handoff_ack_window: Duration,
+    transfer_deadline: Duration,
 }
+
+/// How many maximum election timeouts a submitted leadership transfer may
+/// take before the leader abandons it. The target waits at most one minimum
+/// election timeout for its log, then campaigns.
+const TRANSFER_DEADLINE_ELECTION_TIMEOUTS: u64 = 2;
 
 impl std::fmt::Debug for OwnerRaftHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -67,6 +75,12 @@ impl std::fmt::Debug for OwnerRaftHandle {
 impl OwnerRaftHandle {
     pub(crate) fn new(raft: RaftGroupHandle) -> Self {
         let metrics = raft.metrics();
+        let handoff_ack_window = Duration::from_millis(raft.config().election_timeout_min);
+        let transfer_deadline = Duration::from_millis(
+            raft.config()
+                .election_timeout_max
+                .saturating_mul(TRANSFER_DEADLINE_ELECTION_TIMEOUTS),
+        );
         let (sender, mut receiver) = mpsc::unbounded_channel::<Job>();
         let task = crate::rt::spawn(async move {
             let mut jobs = FuturesUnordered::new();
@@ -85,6 +99,90 @@ impl OwnerRaftHandle {
         Self {
             mailbox: Arc::new(Mailbox { sender, task }),
             metrics,
+            handoff_ack_window,
+            transfer_deadline,
+        }
+    }
+
+    /// How recently a handoff target must have acknowledged this leader:
+    /// a follower that has not answered for a minimum election timeout may
+    /// be down, and a transfer to it cannot complete.
+    pub(crate) fn handoff_ack_window(&self) -> Duration {
+        self.handoff_ack_window
+    }
+
+    /// Abandons the leadership transfer to `target` this leader submitted at
+    /// `vote` if it still leads at `vote` once the transfer deadline passed.
+    ///
+    /// OpenRaft never abandons a transfer: until it sees a higher vote, the
+    /// leader forwards every write to `target`, sends no heartbeats, never
+    /// campaigns, and refuses a candidate with a shorter log without adopting
+    /// its term. Its `elect` keeps that leader state behind a new candidacy.
+    /// So the leader steps down as a follower would ([`transfer_step_down`]),
+    /// which drops the leader state, then campaigns, shed or not. A refused
+    /// step-down is retried every minimum election timeout until the
+    /// leadership or the vote changes.
+    pub(crate) fn abandon_stalled_transfer(&self, vote: UrsulaVote, target: u64) {
+        let deadline = self.transfer_deadline;
+        let retry = self.handoff_ack_window;
+        let job: Job = Box::new(move |raft| {
+            Box::pin(async move {
+                let mut wait = deadline;
+                loop {
+                    let settled = raft
+                        .wait(Some(wait))
+                        .metrics(
+                            |metrics| {
+                                metrics.vote != vote
+                                    || metrics.state != openraft::ServerState::Leader
+                            },
+                            "leadership transfer settles",
+                        )
+                        .await;
+                    if !matches!(settled, Err(openraft::metrics::WaitError::Timeout(..))) {
+                        return;
+                    }
+                    let last_log_id = raft.data_metrics().borrow_watched().last_log;
+                    match raft
+                        .vote(transfer_step_down(vote, target, last_log_id))
+                        .await
+                    {
+                        Ok(stepped_down) if stepped_down.vote_granted => {
+                            tracing::warn!(
+                                node_id = raft.metrics().borrow_watched().id,
+                                target,
+                                %vote,
+                                ?deadline,
+                                "leadership transfer did not complete; stepping down and \
+                                 campaigning"
+                            );
+                            if let Err(error) = raft.trigger().elect(false).await {
+                                tracing::warn!(
+                                    %error,
+                                    "campaign after abandoning a leadership transfer"
+                                );
+                            }
+                            return;
+                        }
+                        Ok(refused) => {
+                            tracing::debug!(
+                                target,
+                                %vote,
+                                refused_by = %refused.vote,
+                                "step-down from a stalled leadership transfer refused; retrying"
+                            );
+                            wait = retry;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, target, "abandon a stalled leadership transfer");
+                            return;
+                        }
+                    }
+                }
+            })
+        });
+        if self.mailbox.sender.send(job).is_err() {
+            tracing::debug!("owner Raft stopped before bounding a leadership transfer");
         }
     }
 
@@ -254,6 +352,25 @@ impl OwnerRaftHandle {
             .await
             .map_err(owner_stopped)?
     }
+}
+
+/// The vote a leader that is stuck in a transfer to `target` at `vote` grants
+/// itself to step down: a vote for `target` in the next term, at the leader's
+/// own last log id, so its log check passes. It is marked a leadership
+/// transfer, which this leader authorizes, so its own leader lease cannot
+/// refuse it. Granting it drops the leader state as for any follower; the
+/// target's own vote request in that term is still judged by its log.
+pub(crate) fn transfer_step_down(
+    vote: UrsulaVote,
+    target: u64,
+    last_log_id: Option<openraft::alias::LogIdOf<C>>,
+) -> UrsulaVoteRequest {
+    let mut request = UrsulaVoteRequest::new(
+        UrsulaVote::new(vote.leader_id().term().saturating_add(1), target),
+        last_log_id,
+    );
+    request.leadership_transfer = true;
+    request
 }
 
 /// Administrative triggers execute on the owner, including their task creation.
