@@ -38,6 +38,7 @@ sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 core_affinity = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 tempfile = { workspace = true }
 
