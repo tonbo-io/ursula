@@ -331,6 +331,36 @@ async fn verify_observed_quorum(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proof_has_one_schema_and_no_vacuous_certification_fields() {
+        let proof = super::QuorumVerification {
+            version: ursula_proto::admin::SchemaVersion,
+            process_incarnations: Default::default(),
+            maintenance_executor_certified: false,
+            maintenance_executor_retired_certified: false,
+            maintenance_fence: None,
+            prefixes: Default::default(),
+            applied: Default::default(),
+        };
+        let value = serde_json::to_value(proof).unwrap();
+        assert_eq!(value["version"], 3);
+        for field in ["participation_certified", "process_incarnations_certified"] {
+            assert!(value.get(field).is_none());
+            let mut legacy = value.clone();
+            legacy[field] = serde_json::Value::Bool(true);
+            let error = serde_json::from_value::<super::QuorumVerification>(legacy).unwrap_err();
+            assert_eq!(error.classify(), serde_json::error::Category::Data);
+        }
+        for version in [0, 1, 2, 4, u32::MAX] {
+            let mut unknown = value.clone();
+            unknown["version"] = serde_json::Value::from(version);
+            let error = serde_json::from_value::<super::QuorumVerification>(unknown).unwrap_err();
+            assert_eq!(error.classify(), serde_json::error::Category::Data);
+        }
+        let decoded: super::QuorumVerification = serde_json::from_value(value).unwrap();
+        assert_eq!(u32::from(decoded.version), 3);
+    }
+
     use tokio::time::Instant;
 
     use super::*;

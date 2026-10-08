@@ -152,6 +152,7 @@ pub struct GroupReadiness {
 /// A target node is ready when, in every raft group that any peer reports:
 ///   1. The target is listed in voter_ids (membership intact).
 ///   2. The target's last_applied_index >= max peer committed_index - lag_tolerance.
+///      For an expected single-voter group, use its own committed prefix.
 ///   3. The target has applied something once any peer has committed past the
 ///      initial membership entry. An empty voter (a replica that lost its log
 ///      and has not been rebuilt yet) is never ready, whatever the lag
@@ -191,7 +192,21 @@ pub fn check_readiness(
             .unwrap_or(false);
         let target_applied = target_group.and_then(|g| g.last_applied_index);
         let peer_max_committed = peers.values().filter_map(|v| v.committed_index).max();
-        let catch_up_gap = match (peer_max_committed, target_applied) {
+        let expected_voters = u32::try_from(group_id)
+            .ok()
+            .and_then(|group| maintenance.and_then(|report| report.expected_groups.get(&group)));
+        let only_target_votes = target_group
+            .is_some_and(|group| group.voter_ids.as_slice() == [target_node_id])
+            && expected_voters
+                .is_some_and(|voters| voters.len() == 1 && voters.contains(&target_node_id));
+        // A sole voter has no peer observation. Its own committed prefix is
+        // the reference only when both membership and expected inventory agree.
+        let reference_committed = if only_target_votes {
+            target_group.and_then(|group| group.committed_index)
+        } else {
+            peer_max_committed
+        };
+        let catch_up_gap = match (reference_committed, target_applied) {
             (Some(peer), Some(target)) => Some(peer.saturating_sub(target)),
             (Some(peer), None) => Some(peer),
             (None, _) => None,
@@ -200,7 +215,7 @@ pub fn check_readiness(
             .map(|gap| gap <= lag_tolerance)
             .unwrap_or(false);
         let empty_replica =
-            target_applied.is_none() && peer_max_committed.is_some_and(|committed| committed > 0);
+            target_applied.is_none() && reference_committed.is_some_and(|committed| committed > 0);
         let ready = voter_member
             && within_lag
             && target_group.is_some_and(RaftGroupView::participation_ready)
@@ -573,6 +588,47 @@ mod tests {
         assert!(!report.all_ready);
         let g = &report.per_group[&7];
         assert_eq!(g.catch_up_gap, Some(50));
+    }
+
+    #[test]
+    fn single_voter_readiness_uses_its_own_committed_prefix() {
+        let mut snapshot = ClusterSnapshot {
+            per_node: vec![view(1, vec![group(
+                7,
+                1,
+                Some(1),
+                Some(9),
+                Some(10),
+                vec![1],
+            )])],
+        };
+        let lagging = check_readiness(&snapshot, 1, 0);
+        assert!(!lagging.all_ready);
+        assert_eq!(lagging.per_group[&7].catch_up_gap, Some(1));
+        snapshot.per_node[0].metrics.groups[0].last_applied_index = Some(10);
+        assert!(check_readiness(&snapshot, 1, 0).all_ready);
+        snapshot.per_node[0].metrics.groups[0].committed_index = None;
+        assert!(!check_readiness(&snapshot, 1, 0).all_ready);
+    }
+
+    #[test]
+    fn absent_expected_peers_do_not_become_a_single_voter_baseline() {
+        let mut snapshot = ClusterSnapshot {
+            per_node: vec![view(1, vec![group(
+                7,
+                1,
+                Some(1),
+                Some(10),
+                Some(10),
+                vec![1, 2, 3],
+            )])],
+        };
+        let report = check_readiness(&snapshot, 1, 0);
+        assert!(!report.all_ready);
+        assert_eq!(report.per_group[&7].catch_up_gap, None);
+        // An incomplete local membership cannot override the expected voters.
+        snapshot.per_node[0].metrics.groups[0].voter_ids = vec![1];
+        assert!(!check_readiness(&snapshot, 1, 0).all_ready);
     }
 
     #[test]

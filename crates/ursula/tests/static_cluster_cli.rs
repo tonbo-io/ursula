@@ -566,6 +566,54 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// Exercise the production paths used by verify-cluster and wait --node
+/// against a real single-voter server, not a synthetic metrics response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_single_voter_passes_verify_cluster_and_wait_node() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let root = tempfile::tempdir().expect("single-voter root");
+    let config = root.path().join("cluster.toml");
+    let admin_port = write_single_node_cluster_config(
+        &config,
+        port,
+        1,
+        1,
+        &base_url,
+        true,
+        &root.path().join("wal"),
+    );
+    let mut child = spawn_node_with_cluster_config(env!("CARGO_BIN_EXE_ursula"), &config);
+    let http = reqwest::Client::new();
+    wait_until_ready(&http, &base_url, std::slice::from_mut(&mut child)).await;
+    let stream = format!("{base_url}/benchcmp/single-voter-readiness");
+    put_until_created(&http, &stream).await;
+    post_until_no_content(&http, &stream, "committed-before-verification").await;
+    let node = ctl_node(1, admin_port, &base_url);
+    let nodes = std::slice::from_ref(&node);
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).unwrap();
+    ursula_ctl::wait_cluster_ready(
+        "single-voter verification",
+        nodes,
+        &client,
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        0,
+    )
+    .await
+    .expect("verify-cluster accepts a caught-up single voter");
+    let outcome = ursula_ctl::wait_node_ready(nodes, &node, &client, &ursula_ctl::CatchUpOptions {
+        stall_timeout: Duration::from_secs(2),
+        ready_timeout: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(20),
+        lag_tolerance: 0,
+    })
+    .await
+    .expect("wait --node observes the actual server");
+    assert!(matches!(outcome, ursula_ctl::CatchUpOutcome::Ready));
+}
+
 /// A single voter whose run state is gone while its journal holds records
 /// cannot know whether it lost acknowledged writes: it comes back gated, its
 /// group has no leader and readiness says why. Once the gate reports the
