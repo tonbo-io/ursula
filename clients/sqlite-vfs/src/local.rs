@@ -1,10 +1,8 @@
 //! The local files of an attached database besides the WAL: the sidecar (`<db>-ursula`),
 //! the boot it was written in, and the locks that keep other processes off the db file.
 
-use std::ffi::CStr;
 use std::fs::OpenOptions;
 use std::fs::{self};
-use std::ptr::null_mut;
 
 use crate::client::offset_token;
 use crate::error::Error;
@@ -34,6 +32,8 @@ fn read_boot_id() -> Option<String> {
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code, reason = "sysctlbyname has no safe std API")]
 fn read_boot_id() -> Option<String> {
+    use std::ffi::CStr;
+    use std::ptr::null_mut;
     let mut buf = [0u8; 64];
     let mut len = buf.len();
     let name = c"kern.bootsessionuuid";
