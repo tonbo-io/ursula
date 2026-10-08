@@ -52,9 +52,18 @@ pub fn check_raft_maintenance(
         if group.node_id != node_id {
             issues.push(Issue::WrongNodeIdentity);
         }
+        // A stopped group's Raft observations are stale. The stop is its
+        // only issue, so serving and maintenance policy can each decide on it.
         if group.apply_failure.is_some() {
             issues.push(Issue::ApplyStopped);
-        } else if !group.maintenance.running {
+            report
+                .group_issues
+                .entry(group.raft_group_id)
+                .or_default()
+                .extend(issues);
+            continue;
+        }
+        if !group.maintenance.running {
             issues.push(Issue::RaftStopped);
         }
         if !group.maintenance.recovery_ready {
@@ -205,10 +214,13 @@ mod tests {
             kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
             message: "invariant".to_owned(),
         });
+        group.current_leader = None;
+        group.maintenance.recovery_ready = false;
         let report = report(&[group]);
-        let issues = &report.group_issues[&0];
-        assert!(issues.contains(&RaftMaintenanceIssue::ApplyStopped));
-        assert!(!issues.contains(&RaftMaintenanceIssue::RaftStopped));
+        assert_eq!(report.group_issues[&0], vec![
+            RaftMaintenanceIssue::ApplyStopped
+        ]);
+        assert!(!report.ready());
     }
 
     #[test]
