@@ -960,14 +960,9 @@ fn a_handoff_to_a_powered_off_follower_never_parks_the_survivor() {
             // hands every group it leads to a follower.
             let handoffs = ursula_raft::RaftGroupHandleRegistry::default();
             for group in JOURNAL_GROUPS {
-                handoffs.register(
-                    group_placement(group),
-                    cluster.engines[&(group, survivor)].raft_handle(),
-                );
-                handoffs.register_rejoin(
-                    RaftGroupId(group),
-                    cluster.rejoins[&(group, survivor)].clone(),
-                );
+                cluster.engines[&(group, survivor)]
+                    .publish_recovery(cluster.rejoins[&(group, survivor)].clone(), &handoffs)
+                    .expect("publish the survivor's bound engine");
                 let handoff = handoffs
                     .transfer_leader(RaftGroupId(group), followers[0])
                     .await;
