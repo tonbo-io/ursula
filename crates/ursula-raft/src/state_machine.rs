@@ -1302,7 +1302,7 @@ mod tests {
         stopped.stop_apply();
         assert_eq!(
             coordinator
-                .log_progress()
+                .reclaimable_log_progress()
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
