@@ -3170,7 +3170,9 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     state.apply_fault = Some(if seed == 19 { crate::apply_failure::ApplyFault::InvariantAfterMutation { index } } else { crate::apply_failure::ApplyFault::PanicAfterMutation { index } });
                 })).await.unwrap();
                 let error = leader.write(append_command(stream.clone(), b"committed-poison")).await.unwrap_err();
-                assert!(matches!(error, GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index: failed, .. }) if failed == index));
+                assert!(matches!(error, GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)));
+                let refused = leader.write(append_command(stream.clone(), b"after-stop")).await.unwrap_err();
+                assert!(matches!(refused, GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index: failed, .. }) if failed == index));
                 let candidates = engines.iter().filter(|engine| engine.raft.metrics().borrow_watched().id != leader_id).map(|engine| Box::pin(async move {
                     engine.raft.wait(Some(Duration::from_secs(5))).metrics(|m| m.state == openraft::ServerState::Leader, "replacement elected").await.map(|_| engine)
                 })).collect::<Vec<_>>();

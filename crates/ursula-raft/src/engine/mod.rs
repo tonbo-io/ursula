@@ -499,12 +499,14 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        // Refused before proposal: nothing was written.
         self.apply_health.check(self.placement.raft_group_id)?;
         crate::forward::validate_proposal(&command)?;
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
+            // Once submitted, a group that stops may already have committed
+            // the command and applies it after repair: the outcome is unknown.
             Err(err) => {
-                self.apply_health.check(self.placement.raft_group_id)?;
                 let self_id = self.raft.metrics().borrow_watched().id;
                 return Err(group_engine_client_write_error(err, self_id));
             }

@@ -145,9 +145,20 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     )
     .await
     .unwrap();
-    assert!(
-        matches!(result, Err(ursula_runtime::GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index, .. })) if index == poison_index)
-    );
+    // The stopped command is committed and applies after repair.
+    assert!(matches!(
+        result,
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::OutcomeUnknown
+        ))
+    ));
+    // A later command is refused before proposal and names the failure.
+    assert!(matches!(
+        poisoned.write(create_stream("after-stop")).await,
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ApplyStopped { index, .. }
+        )) if index == poison_index
+    ));
     assert!(
         poisoned_log
             .apply_stop_signal()
