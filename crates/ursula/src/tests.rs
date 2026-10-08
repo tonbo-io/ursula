@@ -5749,6 +5749,32 @@ mod snapshot_driver {
     }
 
     #[test]
+    fn snapshot_driver_excludes_apply_stopped_groups_even_under_pressure() {
+        let mut stopped = snap(0, Some(9), None, log(16 * MIB, 0));
+        stopped.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 1,
+            index: 10,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "diagnostic".to_owned(),
+        });
+        let healthy = snap(1, Some(9), None, log(MIB, 0));
+        let groups = [stopped, healthy];
+        let (_, selected) = plan_snapshot_drive(
+            &groups,
+            &SnapshotCadence::new(MIB, 2, 100),
+            2,
+            &std::collections::BTreeSet::from([ursula_shard::RaftGroupId(0)]),
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|group| group.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn snapshot_driver_default_interval_follows_external_store() {
         // F12e: the inline backend runs the byte-based driver too.
         assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 1_000);

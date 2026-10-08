@@ -123,8 +123,9 @@ use crate::types::UrsulaRaftTypeConfig;
 /// Optional capabilities of a group engine, independent of its transport and log store.
 #[derive(Default)]
 pub struct RaftGroupEngineOptions {
+    pub(crate) apply_stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
-    pub(crate) fail_apply_at: Option<u64>,
+    pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub metrics: Option<GroupEngineMetrics>,
     pub cold_store: Option<ColdStoreHandle>,
     pub snapshot_store: Option<SharedSnapshotStore>,
@@ -321,8 +322,9 @@ impl RaftGroupEngine {
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let RaftGroupEngineOptions {
+            apply_stop_signal,
             #[cfg(test)]
-            fail_apply_at,
+            apply_fault,
             metrics,
             cold_store,
             snapshot_store,
@@ -342,9 +344,10 @@ impl RaftGroupEngine {
             snapshot_install,
             snapshot_metadata_path,
         );
+        state_machine.apply_stop_signal = apply_stop_signal;
         #[cfg(test)]
         {
-            state_machine.fail_apply_at = fail_apply_at;
+            state_machine.apply_fault = apply_fault;
         }
         state_machine
             .restore_persisted_snapshot()
@@ -365,6 +368,7 @@ impl RaftGroupEngine {
         )
         .await
         .map_err(|err| {
+            tracing::error!(raft_group_id = placement.raft_group_id.0, error = %err, "Raft initialization failed");
             apply_health
                 .check(placement.raft_group_id)
                 .err()
@@ -495,9 +499,12 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        self.apply_health.check(self.placement.raft_group_id)?;
+        crate::forward::validate_proposal(&command)?;
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             Err(err) => {
+                self.apply_health.check(self.placement.raft_group_id)?;
                 let self_id = self.raft.metrics().borrow_watched().id;
                 return Err(group_engine_client_write_error(err, self_id));
             }

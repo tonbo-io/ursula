@@ -235,6 +235,7 @@ impl RollingRestartValidator {
                             log_entries_since_snapshot: 0,
                             last_snapshot_bytes: 0,
                             has_snapshot: metrics.snapshot.is_some(),
+                            apply_failure: None,
                         }
                     }],
                     raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {

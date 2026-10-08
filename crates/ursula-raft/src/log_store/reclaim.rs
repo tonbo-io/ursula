@@ -44,6 +44,8 @@ impl ReclaimLimits {
 /// A group that holds live records in a sealed segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupPin {
+    /// Stopped apply cannot snapshot. Rewrite under the usual pass budget.
+    pub(crate) apply_stopped: bool,
     pub(crate) group_id: u32,
     /// The oldest segment holding one of the group's live records.
     pub(crate) oldest: SegmentId,
@@ -105,7 +107,7 @@ pub(crate) fn plan(shape: JournalShape<'_>, limits: ReclaimLimits) -> ReclaimPla
     }
     let mut rewrite = Vec::new();
     for pin in shape.pins.iter().filter(|pin| pin.oldest == oldest) {
-        if pin.live_in_oldest <= limits.group_rewrite_bytes {
+        if pin.apply_stopped || pin.live_in_oldest <= limits.group_rewrite_bytes {
             rewrite.push(pin.group_id);
         } else {
             plan.lagging.insert(pin.group_id);
@@ -153,6 +155,7 @@ mod tests {
 
     fn pin(group_id: u32, oldest: u64, live_in_oldest: u64) -> GroupPin {
         GroupPin {
+            apply_stopped: false,
             group_id,
             oldest: SegmentId(oldest),
             live_in_oldest,

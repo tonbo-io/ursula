@@ -71,6 +71,14 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
         RuntimeError::GroupEngine { error, .. } if error.is_backpressure() => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        RuntimeError::GroupEngine {
+            error:
+                ursula_runtime::GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                    | ursula_runtime::GroupInfraError::OutcomeUnknown,
+                ),
+            ..
+        } => StatusCode::SERVICE_UNAVAILABLE,
         RuntimeError::GroupEngine { error, .. } => match error.code() {
             Some(code) => stream_error_code_status(code),
             None => StatusCode::INTERNAL_SERVER_ERROR,
@@ -439,6 +447,7 @@ pub(crate) fn raft_group_metrics(
         log_entries_since_snapshot: value.log.log_entries,
         last_snapshot_bytes: value.log.last_snapshot_bytes,
         has_snapshot: value.log.has_snapshot,
+        apply_failure: value.apply_failure.clone(),
     }
 }
 
@@ -779,10 +788,13 @@ pub(crate) fn sse_safe_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;
+    use axum::http::StatusCode;
     use axum::http::header::CACHE_CONTROL;
+    use ursula_runtime::RuntimeError;
 
     use super::insert_cache_control;
     use super::insert_default_response_headers;
+    use super::runtime_error_status;
 
     /// Every response path calls this helper, so pinning the set here is what
     /// makes a newly added path inherit the defaults rather than quietly ship
@@ -813,5 +825,28 @@ mod tests {
         insert_cache_control(&mut headers, "no-cache");
 
         assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-cache");
+    }
+    #[test]
+    fn stopped_apply_and_uncertain_write_render_service_unavailable() {
+        for error in [
+            ursula_runtime::GroupInfraError::ApplyStopped {
+                raft_group_id: ursula_shard::RaftGroupId(2),
+                term: 3,
+                index: 7,
+                kind: ursula_proto::admin::ApplyFailureKind::Panic,
+            },
+            ursula_runtime::GroupInfraError::OutcomeUnknown,
+        ] {
+            let error = RuntimeError::GroupEngine {
+                core_id: ursula_shard::CoreId(0),
+                raft_group_id: ursula_shard::RaftGroupId(2),
+                error: ursula_runtime::GroupEngineError::Infra(error),
+            };
+            assert_eq!(
+                runtime_error_status(&error),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(!error.to_string().contains("panic payload"));
+        }
     }
 }

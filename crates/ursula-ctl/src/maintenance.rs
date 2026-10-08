@@ -521,6 +521,7 @@ mod tests {
             log_entries_since_snapshot: 0,
             last_snapshot_bytes: 0,
             has_snapshot: false,
+            apply_failure: None,
         });
         metrics.raft_maintenance = Some(ursula_proto::admin::RaftMaintenanceReport {
             version: ursula_proto::admin::SchemaVersion,

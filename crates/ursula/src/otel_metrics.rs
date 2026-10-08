@@ -44,6 +44,16 @@ pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
 /// this node is closed, by status. `stalled` groups see no leader that could
 /// confirm a barrier and wait for an operator.
 pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegistry) {
+    let apply_registry = registry.clone();
+    let _ = global::meter("ursula-raft")
+        .u64_observable_gauge("ursula.raft.apply_stopped")
+        .with_description("1 for a group stopped by committed application failure; retain its WAL and repair the binary")
+        .with_callback(move |observer| {
+            for group in apply_registry.metrics_snapshot() {
+                observer.observe(u64::from(group.apply_failure.is_some()), &[KeyValue::new("group_id", i64::from(group.raft_group_id))]);
+            }
+        }).build();
+
     let _ = global::meter("ursula-raft")
         .u64_observable_gauge("ursula.raft.recovery_gates")
         .with_description(

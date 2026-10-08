@@ -131,13 +131,15 @@ impl SnapshotBuildCoordinator {
         Arc::clone(gauges.entry(raft_group_id).or_default())
     }
 
-    /// The log progress of every group with a gauge (F12e).
+    /// Snapshot-reclaimable progress. Stopped groups retain their WAL but must
+    /// not keep the node-wide write pressure gate permanently closed.
     pub fn log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
         self.inner
             .log_gauges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
+            .filter(|(_, gauge)| !gauge.apply_stopped())
             .map(|(group, gauge)| (*group, gauge.progress()))
             .collect()
     }
@@ -430,11 +432,10 @@ pub(crate) struct CurrentSnapshot {
 const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 
 pub struct RaftGroupStateMachine {
+    pub(crate) apply_stop_signal: Option<Arc<AtomicBool>>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
     #[cfg(test)]
-    pub(crate) fail_apply_at: Option<u64>,
-    #[cfg(test)]
-    pub(crate) fail_apply_infra: bool,
+    pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub(crate) placement: ShardPlacement,
     pub(crate) engine: InMemoryGroupEngine,
     pub(crate) metrics: Option<GroupEngineMetrics>,
@@ -473,6 +474,10 @@ impl RaftGroupStateMachine {
         };
         tracing::error!(raft_group_id = self.placement.raft_group_id.0, log_index = failure.index, error = %error, "stopping failed group; preserve WAL for corrected-code replay");
         self.apply_health.stop(failure);
+        self.log_gauge.stop_apply();
+        if let Some(signal) = &self.apply_stop_signal {
+            signal.store(true, Ordering::Release);
+        }
         // OpenRaft's state-machine interface requires io::Error at this boundary.
         io::Error::other(error)
     }
@@ -525,10 +530,9 @@ impl RaftGroupStateMachine {
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         Self {
             apply_health: Default::default(),
+            apply_stop_signal: None,
             #[cfg(test)]
-            fail_apply_at: None,
-            #[cfg(test)]
-            fail_apply_infra: false,
+            apply_fault: None,
             placement,
             engine: match cold_store {
                 Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
@@ -608,9 +612,6 @@ impl RaftGroupStateMachine {
     }
 
     pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, io::Error> {
-        self.apply_health
-            .check(self.placement.raft_group_id)
-            .map_err(group_engine_io_error)?;
         self.engine
             .snapshot(self.placement)
             .await
@@ -622,7 +623,6 @@ impl RaftGroupStateMachine {
         request: HeadStreamRequest,
         placement: ShardPlacement,
     ) -> Result<HeadStreamResponse, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.head_stream(request, placement).await
     }
 
@@ -631,7 +631,6 @@ impl RaftGroupStateMachine {
         request: ReadStreamRequest,
         placement: ShardPlacement,
     ) -> Result<ReadStreamResponse, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.read_stream(request, placement).await
     }
 
@@ -640,7 +639,6 @@ impl RaftGroupStateMachine {
         request: ReadSnapshotRequest,
         placement: ShardPlacement,
     ) -> Result<ReadSnapshotResponse, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.read_snapshot(request, placement).await
     }
 
@@ -649,7 +647,6 @@ impl RaftGroupStateMachine {
         request: BootstrapStreamRequest,
         placement: ShardPlacement,
     ) -> Result<BootstrapStreamResponse, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.bootstrap_stream(request, placement).await
     }
 
@@ -659,7 +656,6 @@ impl RaftGroupStateMachine {
         now_ms: u64,
         renew_ttl: bool,
     ) -> Result<bool, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine
             .access_requires_write(stream_id, now_ms, renew_ttl)
     }
@@ -669,7 +665,6 @@ impl RaftGroupStateMachine {
         request: PlanColdFlushRequest,
         placement: ShardPlacement,
     ) -> Result<Option<ColdFlushCandidate>, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.plan_cold_flush(request, placement).await
     }
 
@@ -679,7 +674,6 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         max_candidates: usize,
     ) -> Result<Vec<ColdFlushCandidate>, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine
             .plan_next_cold_flush_batch(request, placement, max_candidates)
             .await
@@ -690,7 +684,6 @@ impl RaftGroupStateMachine {
         stream_id: BucketStreamId,
         placement: ShardPlacement,
     ) -> Result<ColdHotBacklog, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.cold_hot_backlog(stream_id, placement).await
     }
 
@@ -699,7 +692,6 @@ impl RaftGroupStateMachine {
         max: usize,
         placement: ShardPlacement,
     ) -> Result<Vec<ColdGcPlanEntry>, GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.plan_cold_gc(max, placement).await
     }
 
@@ -709,7 +701,6 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         let _ = placement;
         self.engine.check_cold_write_admission(
             &request.stream_id,
@@ -725,7 +716,6 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         let _ = placement;
         self.engine.check_cold_write_admission(
             &request.stream_id,
@@ -739,7 +729,6 @@ impl RaftGroupStateMachine {
         &mut self,
         snapshot: GroupSnapshot,
     ) -> Result<(), GroupEngineError> {
-        self.apply_health.check(self.placement.raft_group_id)?;
         self.engine.install_snapshot(snapshot).await
     }
 
@@ -747,10 +736,7 @@ impl RaftGroupStateMachine {
         &mut self,
         build_permit: OwnedSemaphorePermit,
     ) -> RaftGroupSnapshotBuilder {
-        let snapshot = match self.apply_health.check(self.placement.raft_group_id) {
-            Ok(()) => self.engine.snapshot(self.placement).await.map(Arc::new),
-            Err(error) => Err(error),
-        };
+        let snapshot = self.engine.snapshot(self.placement).await.map(Arc::new);
         RaftGroupSnapshotBuilder {
             apply_health: self.apply_health.clone(),
             placement: self.placement,
@@ -810,9 +796,6 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             + openraft::OptionalSend {
         let mut applied_entries = 0usize;
         let mut apply_ns = 0u64;
-        self.apply_health
-            .check(self.placement.raft_group_id)
-            .map_err(group_engine_io_error)?;
         while let Some((entry, responder)) = entries.try_next().await? {
             let entry_bytes = crate::types::entry_log_bytes(&entry);
             let response = match entry.payload {
@@ -824,27 +807,32 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                         let result = self.engine.apply_committed_write(command, self.placement);
                         // Inject AFTER mutation to prove partial state cannot escape.
                         #[cfg(test)]
-                        if self.fail_apply_at == Some(entry.log_id.index()) && self.fail_apply_infra
-                        {
-                            return Err(GroupEngineError::Infra(
-                                ursula_runtime::GroupInfraError::ProtoDecode {
-                                    field: "injected-after-mutation".to_owned(),
-                                },
-                            ));
+                        match self.apply_fault {
+                            Some(crate::apply_failure::ApplyFault::InvariantAfterMutation {
+                                index,
+                            }) if index == entry.log_id.index() => {
+                                return Err(GroupEngineError::Infra(
+                                    ursula_runtime::GroupInfraError::ProtoDecode {
+                                        field: "injected-after-mutation".to_owned(),
+                                    },
+                                ));
+                            }
+                            Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
+                                index,
+                            }) => assert_ne!(
+                                index,
+                                entry.log_id.index(),
+                                "injected deterministic apply failure"
+                            ),
+                            _ => {}
                         }
-                        #[cfg(test)]
-                        assert_ne!(
-                            self.fail_apply_at,
-                            Some(entry.log_id.index()),
-                            "injected deterministic apply failure"
-                        );
                         result
                     }));
                     let response = match outcome {
                         Ok(Err(error @ GroupEngineError::Infra(_))) => {
                             return Err(self.stop_apply(
                                 entry.log_id,
-                                crate::apply_failure::ApplyError::Infrastructure(error),
+                                crate::apply_failure::ApplyError::InvariantViolation(error),
                             ));
                         }
                         Ok(result) => RaftGroupResponse::Write(result),
@@ -938,9 +926,6 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
         snapshot: SnapshotDataOf<UrsulaRaftTypeConfig>,
     ) -> Result<(), io::Error> {
-        self.apply_health
-            .check(self.placement.raft_group_id)
-            .map_err(group_engine_io_error)?;
         let mut pointer_bytes = snapshot.into_inner();
         // A publication retry still passes through Raft's vote checks, but the
         // already durable snapshot needs neither download nor installation.
@@ -1295,6 +1280,30 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
+    #[test]
+    fn stopped_log_does_not_hold_healthy_group_write_pressure_closed() {
+        let coordinator = SnapshotBuildCoordinator::default();
+        let stopped = coordinator.log_gauge(0);
+        let healthy = coordinator.log_gauge(1);
+        stopped.record_applied(10_000);
+        healthy.record_applied(1);
+        assert_eq!(coordinator.log_progress().len(), 2);
+        stopped.stop_apply();
+        assert_eq!(
+            coordinator
+                .log_progress()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            stopped.progress().log_bytes,
+            10_000,
+            "diagnostics retain the actual byte count"
+        );
+    }
+
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn canceled_metadata_waiter_retains_serial_until_publication() {

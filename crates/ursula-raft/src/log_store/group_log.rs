@@ -103,6 +103,7 @@ impl SegmentRecords {
 /// A raft group's log in its core journal; see the module documentation.
 #[derive(Debug)]
 pub(crate) struct GroupLog {
+    pub(crate) apply_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_purged: Option<LogId>,
     committed: Option<LogId>,
     /// The segment of the latest committed record, if any was written.
@@ -118,6 +119,7 @@ pub(crate) struct GroupLog {
 impl GroupLog {
     pub(crate) fn new(cache_budget: u64) -> Self {
         Self {
+            apply_stopped: Default::default(),
             last_purged: None,
             committed: None,
             committed_at: None,

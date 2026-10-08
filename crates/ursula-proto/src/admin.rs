@@ -47,6 +47,20 @@ impl<const V: u32> From<SchemaVersion<V>> for u32 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApplyFailure {
+    pub term: u64,
+    pub index: u64,
+    pub kind: ApplyFailureKind,
+    pub message: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyFailureKind {
+    Panic,
+    InvariantViolation,
+}
+
 /// A mutation must carry the incarnation observed before its maintenance plan.
 pub const PROCESS_INCARNATION_HEADER: &str = "x-ursula-process-incarnation";
 
@@ -433,6 +447,7 @@ pub enum RaftMaintenanceIssue {
     DuplicateGroup,
     WrongNodeIdentity,
     RaftStopped,
+    ApplyStopped,
     RecoveryBarrier,
     StoppedForOperator,
     JointMembership,
@@ -658,11 +673,15 @@ pub struct RaftGroupMetrics {
     pub log_entries_since_snapshot: u64,
     pub last_snapshot_bytes: u64,
     pub has_snapshot: bool,
+    /// Set once a committed command failed to apply: the replica stopped.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub apply_failure: Option<ApplyFailure>,
 }
 impl RaftGroupMetrics {
     pub fn participation_ready(&self) -> bool {
         let health = &self.maintenance;
-        health.running
+        self.apply_failure.is_none()
+            && health.running
             && health.recovery_ready
             && !health.membership_joint
             && !health.stopped_for_operator
@@ -718,6 +737,7 @@ mod metrics_contract_tests {
                 log_entries_since_snapshot: 0,
                 last_snapshot_bytes: 0,
                 has_snapshot: false,
+                apply_failure: None,
             }],
         }
     }

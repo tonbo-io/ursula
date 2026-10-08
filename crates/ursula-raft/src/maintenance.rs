@@ -52,7 +52,9 @@ pub fn check_raft_maintenance(
         if group.node_id != node_id {
             issues.push(Issue::WrongNodeIdentity);
         }
-        if !group.maintenance.running {
+        if group.apply_failure.is_some() {
+            issues.push(Issue::ApplyStopped);
+        } else if !group.maintenance.running {
             issues.push(Issue::RaftStopped);
         }
         if !group.maintenance.recovery_ready {
@@ -191,6 +193,22 @@ mod tests {
             ]),
             16,
         )
+    }
+
+    #[test]
+    fn apply_failure_has_a_distinct_maintenance_reason() {
+        let mut group = healthy(0);
+        group.maintenance.running = false;
+        group.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 2,
+            index: 9,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "invariant".to_owned(),
+        });
+        let report = report(&[group]);
+        let issues = &report.group_issues[&0];
+        assert!(issues.contains(&RaftMaintenanceIssue::ApplyStopped));
+        assert!(!issues.contains(&RaftMaintenanceIssue::RaftStopped));
     }
 
     #[test]

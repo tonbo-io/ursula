@@ -378,6 +378,7 @@ runtime_metrics! {
     sum wal_fsync_records:
         core per_core_wal_fsync_records, group per_group_wal_fsync_records;
     sum wal_reclaims: core per_core_wal_reclaims;
+    sum wal_stopped_rewritten_bytes: core per_core_wal_stopped_rewritten_bytes;
     sum wal_reclaimed_bytes: core per_core_wal_reclaimed_bytes;
     sum wal_reclaim_ns: core per_core_wal_reclaim_ns;
     sum wal_reclaim_failures: core per_core_wal_reclaim_failures;
@@ -653,6 +654,8 @@ impl RuntimeMetricsInner {
             .add_at(core_index, sample.rotations);
         self.per_core_wal_reclaims
             .add_at(core_index, sample.reclaims);
+        self.per_core_wal_stopped_rewritten_bytes
+            .add_at(core_index, sample.stopped_rewritten_bytes);
         self.per_core_wal_reclaimed_bytes
             .add_at(core_index, sample.reclaimed_bytes);
         self.per_core_wal_reclaim_ns
@@ -1096,6 +1099,8 @@ mod metric_manifest_tests {
         "per_group_wal_fsync_records",
         "wal_reclaims",
         "per_core_wal_reclaims",
+        "wal_stopped_rewritten_bytes",
+        "per_core_wal_stopped_rewritten_bytes",
         "wal_reclaimed_bytes",
         "per_core_wal_reclaimed_bytes",
         "wal_reclaim_ns",
@@ -1254,6 +1259,8 @@ pub struct WalJournalSample {
     pub reclaim_failures: u64,
     /// Live entry bytes copied out of old segments.
     pub rewritten_bytes: u64,
+    /// Subset copied for groups stopped by committed application failure.
+    pub stopped_rewritten_bytes: u64,
     /// Gauge: the journal's size, all segments.
     pub physical_bytes: u64,
     /// Gauge: the journal's segments.

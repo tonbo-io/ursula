@@ -815,7 +815,14 @@ pub enum GroupInfraError {
     #[error(
         "raft group {raft_group_id:?} stopped after a committed apply failure; retain WAL for corrected-code replay"
     )]
-    ApplyStopped { raft_group_id: RaftGroupId },
+    ApplyStopped {
+        raft_group_id: RaftGroupId,
+        term: u64,
+        index: u64,
+        kind: ursula_proto::admin::ApplyFailureKind,
+    },
+    #[error("command {command} cannot be proposed to a data Raft group")]
+    InvalidRaftCommand { command: String },
     #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
     RecoveryVoteFloor { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]

@@ -77,7 +77,10 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         openraft::BasicNode::new("local"),
         config.clone(),
         poisoned_log.clone(),
-        RaftGroupEngineOptions::default(),
+        RaftGroupEngineOptions {
+            apply_stop_signal: Some(poisoned_log.apply_stop_signal()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -107,21 +110,49 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .last_applied
         .unwrap();
     let poison_index = previous.index().checked_add(1).unwrap();
+    let rejected = poisoned
+        .write(GroupWriteCommand::Stream(
+            ursula_stream::StreamCommand::CreateBucket {
+                bucket_id: "not-a-data-command".to_owned(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejected,
+        ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::InvalidRaftCommand { .. }
+        )
+    ));
+    assert_eq!(
+        poisoned.raft.metrics().borrow_watched().last_applied,
+        Some(previous)
+    );
+
     poisoned
         .with_state_machine(move |state| {
             Box::pin(async move {
-                state.fail_apply_at = Some(poison_index);
+                state.apply_fault = Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
+                    index: poison_index,
+                });
             })
         })
         .await
         .unwrap();
     let result = crate::rt::time::timeout(
         Duration::from_secs(5),
-        poisoned.raft.client_write(create_stream("poison-record")),
+        poisoned.write(create_stream("poison-record")),
     )
     .await
     .unwrap();
-    result.expect_err("poison command must not receive a success response");
+    assert!(
+        matches!(result, Err(ursula_runtime::GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index, .. })) if index == poison_index)
+    );
+    assert!(
+        poisoned_log
+            .apply_stop_signal()
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     healthy
         .raft
         .client_write(create_stream("healthy-after-failure"))
@@ -209,7 +240,9 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         wal.open(placement(0), metrics.group_engine_metrics())
             .unwrap(),
         RaftGroupEngineOptions {
-            fail_apply_at: Some(poison_index),
+            apply_fault: Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
+                index: poison_index,
+            }),
             ..Default::default()
         },
     )
@@ -285,14 +318,14 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
 }
 
 #[tokio::test]
-async fn partially_mutated_apply_stops_reads_snapshots_and_later_apply() {
+async fn partially_mutated_apply_does_not_advance_and_cannot_build_a_snapshot() {
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::storage::RaftStateMachine;
     use ursula_runtime::GroupEngine;
     use ursula_runtime::GroupEngineError;
     use ursula_runtime::GroupInfraError;
     let mut state = crate::RaftGroupStateMachine::new(placement(0));
-    state.fail_apply_at = Some(1);
+    state.apply_fault = Some(crate::apply_failure::ApplyFault::PanicAfterMutation { index: 1 });
     let entry = openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
         log_id: openraft::LogId::new(
             openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
@@ -324,34 +357,6 @@ async fn partially_mutated_apply_stops_reads_snapshots_and_later_apply() {
         1
     );
     assert_eq!(state.last_applied_log_id, None);
-    assert!(matches!(
-        state
-            .head_stream(
-                ursula_runtime::HeadStreamRequest {
-                    stream_id: ursula_shard::BucketStreamId::new("partially-mutated", "events"),
-                    now_ms: 0,
-                    linearizable: false,
-                    read_index: None,
-                },
-                placement(0)
-            )
-            .await
-            .unwrap_err(),
-        GroupEngineError::Infra(GroupInfraError::ApplyStopped { .. })
-    ));
-
-    assert!(matches!(
-        state
-            .group_snapshot()
-            .await
-            .unwrap_err()
-            .get_ref()
-            .unwrap()
-            .downcast_ref::<GroupEngineError>(),
-        Some(GroupEngineError::Infra(
-            GroupInfraError::ApplyStopped { .. }
-        ))
-    ));
     let mut builder = state.get_snapshot_builder().await;
     assert!(matches!(
         builder
@@ -366,22 +371,10 @@ async fn partially_mutated_apply_stops_reads_snapshots_and_later_apply() {
         ))
     ));
     assert!(state.current_snapshot.lock().unwrap().is_none());
-    assert!(matches!(
-        state
-            .apply(futures_util::stream::iter([Ok((entry, None))]))
-            .await
-            .unwrap_err()
-            .get_ref()
-            .unwrap()
-            .downcast_ref::<GroupEngineError>(),
-        Some(GroupEngineError::Infra(
-            GroupInfraError::ApplyStopped { .. }
-        ))
-    ));
 }
 
 #[tokio::test]
-async fn infrastructure_failure_is_fatal_but_business_rejection_is_applied() {
+async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
     use openraft::storage::RaftStateMachine;
     let mut state = crate::RaftGroupStateMachine::new(placement(0));
     let entry = |index, command| openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
@@ -407,8 +400,7 @@ async fn infrastructure_failure_is_fatal_but_business_rejection_is_applied() {
         .unwrap();
     assert_eq!(state.last_applied_log_id.unwrap().index(), 1);
     assert!(state.apply_health.failure().is_none());
-    state.fail_apply_at = Some(2);
-    state.fail_apply_infra = true;
+    state.apply_fault = Some(crate::apply_failure::ApplyFault::InvariantAfterMutation { index: 2 });
     let error = state
         .apply(futures_util::stream::iter([Ok((
             entry(2, create_stream("infra-poison")),
@@ -421,7 +413,7 @@ async fn infrastructure_failure_is_fatal_but_business_rejection_is_applied() {
             .get_ref()
             .unwrap()
             .downcast_ref::<crate::apply_failure::ApplyError>(),
-        Some(crate::apply_failure::ApplyError::Infrastructure(
+        Some(crate::apply_failure::ApplyError::InvariantViolation(
             ursula_runtime::GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::ProtoDecode { .. }
             )
@@ -430,7 +422,7 @@ async fn infrastructure_failure_is_fatal_but_business_rejection_is_applied() {
     assert_eq!(state.last_applied_log_id.unwrap().index(), 1);
     assert_eq!(
         state.apply_health.failure().unwrap().kind,
-        crate::apply_failure::ApplyFailureKind::Infrastructure
+        crate::apply_failure::ApplyFailureKind::InvariantViolation
     );
 }
 
@@ -543,54 +535,61 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
                 engine
                     .with_state_machine(move |state| {
                         Box::pin(async move {
-                            state.fail_apply_at = Some(next);
+                            state.apply_fault =
+                                Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
+                                    index: next,
+                                });
                         })
                     })
                     .await
                     .unwrap();
             }
-            let vote = leader.raft.metrics().borrow_watched().vote;
             let result = crate::rt::time::timeout(
                 Duration::from_secs(5),
                 leader.raft.client_write(create_stream("poison-payload")),
             )
             .await
             .unwrap();
-            result.expect_err("committed poison must not ACK successful apply");
-            // Deliver the committed leader's final commit notification to each
-            // surviving follower. This makes the drill independent of whether
-            // the leader's apply failure races its last heartbeat broadcast.
-            let committed = leader.raft.metrics().borrow_watched().committed.unwrap();
-            assert_eq!(committed.index(), next);
-            let retained = logs[index].try_get_log_entries(next..=next).await.unwrap();
-            assert_eq!(retained.len(), 1);
+            assert!(matches!(result, Err(openraft::error::RaftError::Fatal(_))));
+            // A surviving follower must elect a new leader and learn the
+            // committed poison through Raft replication, not a test-delivered ACK.
+            let waits = engines
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, engine)| {
+                    Box::pin(async move {
+                        engine
+                            .raft
+                            .wait(Some(Duration::from_secs(5)))
+                            .metrics(
+                                |m| m.running_state.is_err(),
+                                "re-election applies committed poison",
+                            )
+                            .await
+                    })
+                })
+                .collect::<Vec<_>>();
+            futures_util::future::select_all(waits).await.0.unwrap();
+            assert!(
+                engines
+                    .iter()
+                    .filter(|engine| engine.apply_health.failure().is_some())
+                    .count()
+                    >= 2
+            );
             for engine in &engines {
-                if engine.apply_health.failure().is_none() {
-                    let _response = engine
-                        .raft
-                        .append_entries(openraft::raft::AppendEntriesRequest {
-                            vote,
-                            prev_log_id: Some(previous),
-                            entries: retained.clone(),
-                            leader_commit: Some(committed),
-                        })
-                        .await;
+                if let Some(failure) = engine.apply_health.failure() {
+                    assert_eq!(failure.index, next);
+                    assert!(
+                        engine
+                            .raft
+                            .metrics()
+                            .borrow_watched()
+                            .last_applied
+                            .is_none_or(|id| id.index() < next)
+                    );
                 }
-                engine
-                    .raft
-                    .wait(Some(Duration::from_secs(5)))
-                    .metrics(|m| m.running_state.is_err(), "poison stops each replica")
-                    .await
-                    .unwrap();
-                assert_eq!(engine.apply_health.failure().unwrap().index, next);
-                assert!(
-                    engine
-                        .raft
-                        .metrics()
-                        .borrow_watched()
-                        .last_applied
-                        .is_none_or(|id| id.index() < next)
-                );
             }
         } else {
             let response = leader

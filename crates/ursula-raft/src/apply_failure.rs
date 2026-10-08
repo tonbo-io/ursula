@@ -2,35 +2,24 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+pub use ursula_proto::admin::ApplyFailure;
+pub use ursula_proto::admin::ApplyFailureKind;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_shard::RaftGroupId;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ApplyFailure {
-    pub term: u64,
-    pub index: u64,
-    pub kind: ApplyFailureKind,
-    pub message: String,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApplyFailureKind {
-    Panic,
-    Infrastructure,
-}
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplyError {
     #[error("committed application panicked: {message}")]
     Panic { message: String },
     #[error("committed application failed: {0}")]
-    Infrastructure(#[source] GroupEngineError),
+    InvariantViolation(#[source] GroupEngineError),
 }
 impl ApplyError {
     pub(crate) fn kind(&self) -> ApplyFailureKind {
         match self {
             Self::Panic { .. } => ApplyFailureKind::Panic,
-            Self::Infrastructure(_) => ApplyFailureKind::Infrastructure,
+            Self::InvariantViolation(_) => ApplyFailureKind::InvariantViolation,
         }
     }
 }
@@ -50,12 +39,22 @@ impl ApplyHealth {
             .get_or_insert(failure);
     }
     pub(crate) fn check(&self, raft_group_id: RaftGroupId) -> Result<(), GroupEngineError> {
-        if self.failure().is_some() {
+        if let Some(failure) = self.failure() {
             Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped {
                 raft_group_id,
+                term: failure.term,
+                index: failure.index,
+                kind: failure.kind,
             }))
         } else {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ApplyFault {
+    PanicAfterMutation { index: u64 },
+    InvariantAfterMutation { index: u64 },
 }

@@ -1,4 +1,8 @@
-# Recovering a group stopped by a committed application failure
+---
+title: Recovering stopped Raft groups
+group: Operate
+order: 3
+---
 
 A panic or invariant violation while applying a committed command stops that
 local Raft group. Other groups remain running. This uses Rust panic unwinding;

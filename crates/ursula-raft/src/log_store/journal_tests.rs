@@ -412,6 +412,57 @@ async fn purge_deletes_the_segments_no_group_needs() {
     );
 }
 
+/// A stopped group's retained committed history must not pin the journal's
+/// ever-growing suffix, even when it exceeds the normal rewrite threshold.
+#[tokio::test]
+async fn apply_stopped_group_rewrites_within_budget_and_preserves_replay() {
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let mut healthy = core.store(&writer, 2);
+    append(&mut stopped, (1..=8).map(|index| payload_entry(index, 700))).await;
+    stopped.save_committed(Some(log_id(8))).await.unwrap();
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    for index in 1..=400_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    healthy.save_committed(Some(log_id(400))).await.unwrap();
+    writer.close().await.unwrap();
+    let metrics = core.metrics.snapshot();
+    assert!(metrics.wal_stopped_rewritten_bytes > 0);
+    assert!(metrics.wal_reclaims > 20);
+    assert!(core.lagging.groups().is_empty());
+    assert!(
+        core.segments().len() < 16,
+        "bounded retained WAL: {:?}",
+        core.segments()
+    );
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    drop(stopped);
+    drop(healthy);
+    drop(writer);
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let healthy = core.store(&writer, 2);
+    assert!(
+        !stopped
+            .apply_stop_signal()
+            .load(std::sync::atomic::Ordering::Acquire),
+        "replay, not a persistent failure marker, reestablishes stopped state"
+    );
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    assert_eq!(stopped.read_committed().await.unwrap(), Some(log_id(8)));
+    assert_eq!(log_ids(&healthy).await, (397..=400).collect::<Vec<_>>());
+}
+
 /// A quiet group's few entries keep the oldest segment alive. Once the
 /// journal outgrows twice its live bytes they are rewritten into the newest
 /// segment in chunks, with the group's markers, and the old segments go.

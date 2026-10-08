@@ -159,7 +159,16 @@ pub(crate) fn plan_snapshot_drive<'a>(
     max_groups: usize,
     lagging: &BTreeSet<RaftGroupId>,
 ) -> (SnapshotPlan, Vec<&'a RaftGroupMetricsSnapshot>) {
-    let progress = snapshots.iter().map(group_log_progress).collect::<Vec<_>>();
+    let progress = snapshots
+        .iter()
+        .map(|snapshot| {
+            if snapshot.apply_failure.is_some() {
+                GroupLogProgress::default()
+            } else {
+                group_log_progress(snapshot)
+            }
+        })
+        .collect::<Vec<_>>();
     let lagging = snapshots
         .iter()
         .map(|snapshot| lagging.contains(&RaftGroupId(snapshot.raft_group_id)))

@@ -1213,6 +1213,7 @@ impl CoreJournal {
                 && oldest < active
             {
                 pins.push(GroupPin {
+                    apply_stopped: log.apply_stopped.load(std::sync::atomic::Ordering::Acquire),
                     group_id,
                     oldest,
                     live_in_oldest: log.live_in(oldest),
@@ -1294,6 +1295,7 @@ impl CoreJournal {
         let chunk_bytes = self.context.tuning.rewrite_chunk_bytes();
         let mut moves = Vec::<Moved>::new();
         let mut copied = 0_u64;
+        let mut stopped_copied = 0_u64;
         let mut outcome = Reclaim::Done;
         for group_id in groups {
             if copied >= budget {
@@ -1350,6 +1352,12 @@ impl CoreJournal {
                     }
                 }
                 copied = copied.saturating_add(bytes);
+                if lock_log(&log)
+                    .apply_stopped
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    stopped_copied = stopped_copied.saturating_add(bytes);
+                }
                 if let Err(error) = self.rotate_if_full(sample) {
                     return Reclaim::Poisoned(error);
                 }
@@ -1400,6 +1408,9 @@ impl CoreJournal {
             }
         }
         sample.rewritten_bytes = sample.rewritten_bytes.saturating_add(copied);
+        sample.stopped_rewritten_bytes = sample
+            .stopped_rewritten_bytes
+            .saturating_add(stopped_copied);
         self.reclaim_due = true;
         outcome
     }
