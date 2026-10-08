@@ -23,14 +23,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY third_party/ ./third_party/
 
-# Build with buildx cache mounts for cargo registry, git deps, and build
-# artifacts. sharing=locked prevents concurrent writes during parallel builds.
-# Because target/ is mounted as a cache and not persisted to the layer, install
-# the final binaries into a persistent path within the same RUN so they can be
-# extracted in the runtime stage.
+# Cache only the cargo registry and git checkouts, which are keyed by content.
+# target/ is not a cache mount: builds of other branches share the builder,
+# and cargo judges workspace sources fresh by mtime, so a shared target/ can
+# link another branch's artifacts into this image. sharing=locked prevents
+# concurrent writes during parallel builds.
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
-  --mount=type=cache,sharing=locked,target=/ursula/target \
   cargo build --profile "${CARGO_PROFILE}" --locked --bin ursula --bin ursulactl \
   && strip --strip-debug "target/${CARGO_PROFILE}/ursula" \
   && strip --strip-debug "target/${CARGO_PROFILE}/ursulactl" \
