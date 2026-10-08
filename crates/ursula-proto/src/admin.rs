@@ -817,8 +817,11 @@ pub enum ServingReadinessReason {
     WalDiskPressure,
     RecoveryStalled,
     RecoveryGateClosed,
-    #[serde(alias = "raft_maintenance_unready")]
     RaftReplicaUnready,
+    /// A reason a newer server of the same minor version reports that this
+    /// build does not know. The response status still decides readiness.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,14 +846,32 @@ mod serving_readiness_tests {
     use super::*;
 
     #[test]
-    fn previous_readiness_reason_decodes_but_serialization_uses_current_name() {
-        let reason: ServingReadinessReason =
-            serde_json::from_str("\"raft_maintenance_unready\"").unwrap();
-        assert_eq!(reason, ServingReadinessReason::RaftReplicaUnready);
-        assert_eq!(
-            serde_json::to_string(&reason).unwrap(),
-            "\"raft_replica_unready\""
-        );
+    fn readiness_reasons_keep_their_wire_names_and_unknown_reasons_decode() {
+        for (reason, name) in [
+            (
+                ServingReadinessReason::FormatEpochMismatch,
+                "format_epoch_mismatch",
+            ),
+            (ServingReadinessReason::WalDiskPressure, "wal_disk_pressure"),
+            (ServingReadinessReason::RecoveryStalled, "recovery_stalled"),
+            (
+                ServingReadinessReason::RecoveryGateClosed,
+                "recovery_gate_closed",
+            ),
+            (
+                ServingReadinessReason::RaftReplicaUnready,
+                "raft_replica_unready",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&reason).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<ServingReadinessReason>(name.into()).unwrap(),
+                reason
+            );
+        }
+        let newer: ServingReadinessReason =
+            serde_json::from_str("\"reason_from_a_newer_server\"").unwrap();
+        assert_eq!(newer, ServingReadinessReason::Unknown);
     }
 
     #[test]
