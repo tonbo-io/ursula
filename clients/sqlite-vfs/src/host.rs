@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use libsqlite3_sys as ffi;
 
+use crate::error::Error;
 use crate::frame::PAGE;
 
 pub(crate) const OK: c_int = ffi::SQLITE_OK;
@@ -28,10 +29,18 @@ pub(crate) fn unix() -> *mut ffi::sqlite3_vfs {
     UNIX.load(Ordering::Acquire)
 }
 
-pub(crate) unsafe fn full_pathname(path: &str) -> Result<String, String> {
+/// `path` as a C string.
+fn c_path(path: &str) -> Result<CString, Error> {
+    CString::new(path).map_err(|source| Error::NulInPath {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+pub(crate) unsafe fn full_pathname(path: &str) -> Result<String, Error> {
     unsafe {
         let u = unix();
-        let c = CString::new(path).map_err(|e| e.to_string())?;
+        let c = c_path(path)?;
         let mut buf = vec![0u8; (*u).mxPathname as usize + 1];
         let rc = ((*u).xFullPathname.unwrap())(
             u,
@@ -40,7 +49,10 @@ pub(crate) unsafe fn full_pathname(path: &str) -> Result<String, String> {
             buf.as_mut_ptr() as *mut c_char,
         );
         if rc != OK {
-            return Err(format!("xFullPathname({path}): {rc}"));
+            return Err(Error::FullPathname {
+                path: path.to_owned(),
+                code: rc,
+            });
         }
         Ok(CStr::from_ptr(buf.as_ptr() as *const c_char)
             .to_string_lossy()
@@ -66,9 +78,9 @@ pub(crate) struct Private {
 }
 
 impl Private {
-    pub(crate) unsafe fn open(path: &str) -> Result<Self, String> {
+    pub(crate) unsafe fn open(path: &str) -> Result<Self, Error> {
         unsafe {
-            let c = CString::new(path).map_err(|e| e.to_string())?;
+            let c = c_path(path)?;
             let mut db: *mut ffi::sqlite3 = null_mut();
             let rc = (api().open_v2.unwrap())(
                 c.as_ptr(),
@@ -78,7 +90,10 @@ impl Private {
             );
             let conn = Private { db };
             if rc != OK {
-                return Err(format!("open {path}: {}", conn.errmsg()));
+                return Err(Error::SqliteOpen {
+                    path: path.to_owned(),
+                    message: conn.errmsg(),
+                });
             }
             conn.query(c"PRAGMA synchronous=OFF")?;
             Ok(conn)
@@ -97,19 +112,25 @@ impl Private {
     }
 
     /// Runs `sql` and returns the integer columns of its first row (empty without a row).
-    pub(crate) unsafe fn query(&self, sql: &CStr) -> Result<Vec<i64>, String> {
+    pub(crate) unsafe fn query(&self, sql: &'static CStr) -> Result<Vec<i64>, Error> {
         unsafe {
             let a = api();
             let mut stmt: *mut ffi::sqlite3_stmt = null_mut();
             if (a.prepare_v2.unwrap())(self.db, sql.as_ptr(), -1, &mut stmt, null_mut()) != OK {
-                return Err(format!("{sql:?}: {}", self.errmsg()));
+                return Err(Error::SqliteQuery {
+                    sql,
+                    message: self.errmsg(),
+                });
             }
             let r = match (a.step.unwrap())(stmt) {
                 ffi::SQLITE_ROW => Ok((0..(a.column_count.unwrap())(stmt))
                     .map(|i| (a.column_int64.unwrap())(stmt, i))
                     .collect()),
                 ffi::SQLITE_DONE => Ok(Vec::new()),
-                _ => Err(format!("{sql:?}: {}", self.errmsg())),
+                _ => Err(Error::SqliteQuery {
+                    sql,
+                    message: self.errmsg(),
+                }),
             };
             (a.finalize.unwrap())(stmt);
             r
@@ -117,18 +138,18 @@ impl Private {
     }
 
     /// `PRAGMA wal_checkpoint(mode)`.
-    pub(crate) unsafe fn checkpoint(&self, sql: &CStr) -> Result<Checkpoint, String> {
+    pub(crate) unsafe fn checkpoint(&self, sql: &'static CStr) -> Result<Checkpoint, Error> {
         let row = unsafe { self.query(sql)? };
         match row[..] {
             [0, log, done] if log == done => Ok(Checkpoint::Done),
             [0, ..] => Ok(Checkpoint::Pinned),
             [_, ..] => Ok(Checkpoint::Busy),
-            _ => Err(format!("{sql:?}: no result row")),
+            _ => Err(Error::NoResultRow { sql }),
         }
     }
 
     /// Keeps the WAL when this connection closes last (see `x_file_control`).
-    pub(crate) unsafe fn persist_wal(&self) -> Result<(), String> {
+    pub(crate) unsafe fn persist_wal(&self) -> Result<(), Error> {
         let mut on: c_int = 1;
         let rc = unsafe {
             (api().file_control.unwrap())(
@@ -139,14 +160,14 @@ impl Private {
             )
         };
         if rc != OK {
-            return Err(format!("persist WAL: {rc}"));
+            return Err(Error::PersistWal(rc));
         }
         Ok(())
     }
 
     /// Pages `1..=n` of the db file, read through the connection's own file handle (closing a
     /// descriptor of our own would drop the process's POSIX locks on the file).
-    pub(crate) unsafe fn read_pages(&self, n: u32) -> Result<Vec<u8>, String> {
+    pub(crate) unsafe fn read_pages(&self, n: u32) -> Result<Vec<u8>, Error> {
         unsafe {
             let mut f: *mut ffi::sqlite3_file = null_mut();
             let rc = (api().file_control.unwrap())(
@@ -156,7 +177,7 @@ impl Private {
                 &mut f as *mut *mut ffi::sqlite3_file as *mut c_void,
             );
             if rc != OK || f.is_null() || (*f).pMethods.is_null() {
-                return Err(format!("db file handle: {rc}"));
+                return Err(Error::DbFileHandle(rc));
             }
             const CHUNK: usize = 256 * PAGE;
             let mut image = vec![0u8; n as usize * PAGE];
@@ -168,9 +189,7 @@ impl Private {
                     (i * CHUNK) as i64,
                 );
                 if rc != OK {
-                    return Err(format!(
-                        "read db file pages: {rc} (file shorter than {n} pages?)"
-                    ));
+                    return Err(Error::ReadPages { code: rc, pages: n });
                 }
             }
             Ok(image)
@@ -186,10 +205,10 @@ impl Drop for Private {
 
 /// Gives an empty file its WAL-format page 1 through a private "unix" connection, so no
 /// connection ever commits through a rollback journal (the main-db write guard refuses that).
-pub(crate) unsafe fn init_wal_format(path: &str) -> Result<(), String> {
+pub(crate) unsafe fn init_wal_format(path: &str) -> Result<(), Error> {
+    let c = c_path(path)?;
     unsafe {
         let a = api();
-        let c = CString::new(path).unwrap();
         let mut db: *mut ffi::sqlite3 = null_mut();
         let flags = ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE;
         let mut rc = (a.open_v2.unwrap())(c.as_ptr(), &mut db, flags, c"unix".as_ptr());
@@ -204,7 +223,10 @@ pub(crate) unsafe fn init_wal_format(path: &str) -> Result<(), String> {
         }
         (a.close.unwrap())(db);
         if rc != OK {
-            return Err(format!("journal_mode=WAL on {path}: {rc}"));
+            return Err(Error::WalFormat {
+                path: path.to_owned(),
+                code: rc,
+            });
         }
     }
     Ok(())

@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 
 use crate::db::attached;
 use crate::db::lock;
+use crate::error::Error;
 use crate::host::full_pathname;
 
 fn json_str(s: &str) -> String {
@@ -22,7 +23,7 @@ fn json_str(s: &str) -> String {
     out
 }
 
-pub(crate) unsafe fn status(path: &str) -> Result<String, String> {
+pub(crate) unsafe fn status(path: &str) -> Result<String, Error> {
     let path = unsafe { full_pathname(path)? };
     let db = attached(&path)?;
     let db = lock(&db);
@@ -31,8 +32,10 @@ pub(crate) unsafe fn status(path: &str) -> Result<String, String> {
         json_str(&db.offset),
         db.epoch,
         db.poisoned.is_some(),
-        db.fenced,
-        db.poisoned.as_deref().map_or("null".to_owned(), json_str),
+        db.fenced(),
+        db.poisoned
+            .as_ref()
+            .map_or("null".to_owned(), |e| json_str(&e.to_string())),
         json_str(&db.snapshot),
         json_str(&db.retained),
         json_str(&db.attached_from),
@@ -40,7 +43,7 @@ pub(crate) unsafe fn status(path: &str) -> Result<String, String> {
     ))
 }
 
-pub(crate) unsafe fn stats(path: &str) -> Result<String, String> {
+pub(crate) unsafe fn stats(path: &str) -> Result<String, Error> {
     let path = unsafe { full_pathname(path)? };
     let db = attached(&path)?;
     let mut db = lock(&db);

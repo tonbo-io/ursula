@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self};
 use std::os::unix::fs::FileExt;
 
+use crate::error::Error;
 use crate::frame::PAGE;
 
 pub(crate) const WAL_HDR: i64 = 32;
@@ -122,12 +123,16 @@ fn wal_recover(path: &str) -> Option<WalScan> {
 /// holds the state at the sidecar's offset or a later commit's, not that SQLite can read the file
 /// (a disk image may hold a torn page 1 that replay rewrites). The caller holds `f` locked against
 /// other processes (`lock_unused`).
-pub(crate) fn fold_wal(path: &str, f: &fs::File) -> Result<(), String> {
+pub(crate) fn fold_wal(path: &str, f: &fs::File) -> Result<(), Error> {
     let wal = format!("{path}-wal");
     let Some(scan) = wal_recover(&wal).filter(|w| w.last > 0) else {
         return Ok(());
     };
-    let err = |e: std::io::Error| format!("fold {wal} into {path}: {e}");
+    let err = |source| Error::Io {
+        op: "fold its WAL into",
+        path: path.to_owned(),
+        source,
+    };
     let w = fs::File::open(&wal).map_err(err)?;
     // Frame index per page, a later frame winning.
     let latest: BTreeMap<u32, i64> = scan.pages.iter().copied().zip(0..).collect();

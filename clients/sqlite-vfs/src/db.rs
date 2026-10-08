@@ -16,6 +16,7 @@ use libsqlite3_sys as ffi;
 
 use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
+use crate::error::Error;
 use crate::frame::PAGE;
 use crate::host::OK;
 use crate::snapshotter::Snapper;
@@ -48,8 +49,8 @@ pub(crate) struct Db {
     pub(crate) offset: String,
     /// Frame bytes since the latest snapshot, counted locally (see `snapshot_due`).
     pub(crate) log: u64,
-    pub(crate) poisoned: Option<String>,
-    pub(crate) fenced: bool,
+    /// Why the database is poisoned (re-attach to recover); [`Db::fenced`] tells the fenced ones.
+    pub(crate) poisoned: Option<Error>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
@@ -118,7 +119,13 @@ impl Db {
             .unwrap_or(0)
     }
 
-    pub(crate) fn poison(&mut self, why: String) -> c_int {
+    /// Another owner, a writer outside the protocol, or another incarnation of the stream holds
+    /// the stream (the poison's class, [`Error::is_fenced`]).
+    pub(crate) fn fenced(&self) -> bool {
+        self.poisoned.as_ref().is_some_and(Error::is_fenced)
+    }
+
+    pub(crate) fn poison(&mut self, why: Error) -> c_int {
         eprintln!(
             "sqlite-ursula-vfs: {}: {why}; database poisoned (re-attach to recover)",
             self.url
@@ -132,11 +139,9 @@ impl Db {
     /// A local operation of an acknowledged transaction (the rest of its WAL writes, -shm growth)
     /// failed: SQLite rolls the transaction back locally, so the file no longer
     /// reflects the stream offset; poison it (re-attach replays the commit from the stream).
-    pub(crate) fn post_ack(&mut self, what: &str, rc: c_int) -> c_int {
+    pub(crate) fn post_ack(&mut self, what: &'static str, rc: c_int) -> c_int {
         if rc != OK && self.committed {
-            self.poison(format!(
-                "{what} failed ({rc}) after the commit was acknowledged"
-            ));
+            self.poison(Error::PostAck { what, code: rc });
         }
         rc
     }
@@ -170,7 +175,7 @@ pub(crate) struct Registry {
     pub(crate) attaching: HashSet<String>,
     /// Paths whose last attach failed, with the reason (`ursula_status`, and the refusal `x_open`
     /// logs: see `refused`).
-    pub(crate) failed: HashMap<String, String>,
+    pub(crate) failed: HashMap<String, Arc<Error>>,
     /// Host locks held for the process lifetime.
     pub(crate) locks: HashMap<String, fs::File>,
     /// Snapshot thread per attached database.
@@ -191,14 +196,14 @@ pub(crate) fn lookup(path: &str) -> Option<Arc<Mutex<Db>>> {
 }
 
 /// The attachment of `path`, for `ursula_status` and `ursula_stats`.
-pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, String> {
+pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, Error> {
     let reg = registry();
     if let Some(db) = reg.dbs.get(path) {
         return Ok(db.clone());
     }
-    Err(match reg.failed.get(path) {
-        Some(why) => format!("{path} is not attached: its last attach failed ({why})"),
-        None => format!("{path} is not attached"),
+    Err(Error::NotAttached {
+        path: path.to_owned(),
+        last_failure: reg.failed.get(path).cloned(),
     })
 }
 
@@ -207,14 +212,23 @@ pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, String> {
 /// (in a process that never attached it, or after its attach failed: the files may hold anything
 /// between their old state and the stream's). A path without a sidecar passes through. No WAL open
 /// can follow a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
-pub(crate) fn refused(reg: &Registry, path: &str) -> Option<String> {
+pub(crate) fn refused(reg: &Registry, path: &str) -> Option<Refusal> {
     if !fs::exists(format!("{path}-ursula")).unwrap_or(true) {
         return None;
     }
     Some(match reg.failed.get(path) {
-        Some(why) => format!("its last attach failed ({why}); attach it again"),
-        None => "it is the cache of an Ursula stream (it has a sidecar); attach it first".into(),
+        Some(why) => Refusal::AttachFailed(why.clone()),
+        None => Refusal::NotAttached,
     })
+}
+
+/// Why `x_open` refuses a main db (`refused`), for its log line.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Refusal {
+    #[error("its last attach failed ({0}); attach it again")]
+    AttachFailed(Arc<Error>),
+    #[error("it is the cache of an Ursula stream (it has a sidecar); attach it first")]
+    NotAttached,
 }
 
 pub(crate) fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {

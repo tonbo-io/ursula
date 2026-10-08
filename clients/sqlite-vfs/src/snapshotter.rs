@@ -8,12 +8,12 @@ use std::time::Instant;
 use crate::client::get_snapshot;
 use crate::client::head;
 use crate::client::header_offset;
-use crate::client::is_recreated;
 use crate::client::put_idempotent;
-use crate::client::recreated_error;
+use crate::client::recreated;
 use crate::db::Db;
 use crate::db::SnapshotStat;
 use crate::db::lock;
+use crate::error::Error;
 use crate::host::Checkpoint;
 use crate::host::Private;
 use crate::snapshot;
@@ -121,7 +121,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 /// frames into the db file (a reader at mark 0 blocks backfill, one at a later mark caps it) and no
 /// closing connection can checkpoint (that needs an EXCLUSIVE lock), so the pages copied are those
 /// of `offset`. Commits wait only for the checkpoint and the start of the read transaction.
-unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, String> {
+unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     let stopped = || snapper.stopped();
     let started = Instant::now();
     let path = lock(db).path.clone();
@@ -187,22 +187,23 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
     let image = unsafe { conn.read_pages(pages)? };
     drop(conn); // ends the read transaction
     let copy = copy_started.elapsed();
-    let body = snapshot::encode(&offset, epoch, &image);
+    let body = snapshot::encode(&offset, epoch, &image).map_err(|source| Error::Snapshot {
+        offset: offset.clone(),
+        source,
+    })?;
     // This state is a prefix of the incarnation it was attached to, not of a stream recreated at
     // the same path since: the publish and the retention move carry the incarnation, so the
     // server refuses them there (412), and this owner's commits stop now rather than at its next
     // append (which the recreated stream refuses the same way).
-    let fence = |what: String, e: String| {
+    let fence = |what: String, e: Error| {
         // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
-        let why = format!("fenced: {what}: {e}");
         let mut d = lock(db);
         eprintln!(
-            "sqlite-ursula-vfs: {}: {why}; database poisoned (re-attach to recover)",
+            "sqlite-ursula-vfs: {}: {what}: {e}; database poisoned (re-attach to recover)",
             d.url
         );
-        d.fenced = true;
-        d.poisoned = Some(why);
+        d.poisoned = Some(e);
     };
     match put_idempotent(
         &format!("{url}/snapshot/{offset}"),
@@ -214,7 +215,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         (412, _) => {
             fence(
                 format!("snapshot at {offset} not published"),
-                recreated_error(&url, &incarnation),
+                recreated(&url, &incarnation),
             );
             return Ok(true);
         }
@@ -226,7 +227,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
             if head.incarnation.as_deref() != Some(incarnation.as_str()) {
                 fence(
                     format!("snapshot at {offset} not published"),
-                    recreated_error(&url, &incarnation),
+                    recreated(&url, &incarnation),
                 );
                 return Ok(true);
             }
@@ -239,10 +240,12 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
             return Ok(true);
         }
         (status, mut r) => {
-            return Err(format!(
-                "publish at {offset}: {status} {}",
-                r.body_mut().read_to_string().unwrap_or_default()
-            ));
+            return Err(Error::Status {
+                op: "publish snapshot",
+                url: format!("{url}/snapshot/{offset}"),
+                status,
+                body: r.body_mut().read_to_string().unwrap_or_default(),
+            });
         }
     }
     // Nothing relies on the snapshot before it reads back intact (a follower may not show it yet).
@@ -257,7 +260,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
                 break;
             }
             Ok(_) => {}
-            Err(e) if is_recreated(&e) => {
+            Err(e) if e.is_recreated() => {
                 fence(format!("snapshot at {offset} not read back"), e);
                 return Ok(true);
             }
@@ -266,7 +269,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
         std::thread::sleep(Duration::from_millis(25 * i));
     }
     if !verified {
-        return Err(format!("the snapshot at {offset} does not read back"));
+        return Err(Error::SnapshotNotReadBack { offset });
     }
     let (previous, retained) = {
         let mut d = lock(db);
@@ -298,7 +301,7 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
             (412, _) => {
                 fence(
                     format!("retention not moved to {previous}"),
-                    recreated_error(&url, &incarnation),
+                    recreated(&url, &incarnation),
                 );
                 return Ok(true);
             }
@@ -312,10 +315,12 @@ unsafe fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Strin
             // Already past it (another owner, or this file before a re-attach).
             (409 | 410, _) => {}
             (status, mut r) => {
-                return Err(format!(
-                    "retention to {previous}: {status} {}",
-                    r.body_mut().read_to_string().unwrap_or_default()
-                ));
+                return Err(Error::Status {
+                    op: "move retention",
+                    url: format!("{url}/retention/{previous}"),
+                    status,
+                    body: r.body_mut().read_to_string().unwrap_or_default(),
+                });
             }
         }
     }

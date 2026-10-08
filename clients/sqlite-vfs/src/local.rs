@@ -8,6 +8,7 @@ use std::fs::{self};
 use std::ptr::null_mut;
 
 use crate::client::offset_token;
+use crate::error::Error;
 use crate::wal::WalClaim;
 
 /// The sidecar format (`sidecar_line`): 2 records offsets as the server's strings.
@@ -105,8 +106,12 @@ pub(crate) fn sidecar_line(
 /// Replaces the sidecar (`sidecar_line`) atomically against a process crash: temp file, rename. No
 /// fsync: `Sidecar::trusted` checks it against the files (a sidecar ahead of its WAL is rebuilt;
 /// one behind it replays from its offset).
-pub(crate) fn write_sidecar(path: &str, line: &str) -> Result<(), String> {
-    let err = |e: std::io::Error| format!("sidecar {path}: {e}");
+pub(crate) fn write_sidecar(path: &str, line: &str) -> Result<(), Error> {
+    let err = |source| Error::Io {
+        op: "write sidecar",
+        path: path.to_owned(),
+        source,
+    };
     let tmp = format!("{path}.tmp");
     fs::write(&tmp, line).map_err(err)?;
     fs::rename(&tmp, path).map_err(err)
@@ -149,11 +154,17 @@ impl Sidecar {
 
 /// `Ok(None)`: the sidecar exists but does not parse (torn by a power loss, or garbage). `Err`: it
 /// cannot be read (missing included).
-pub(crate) fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
+pub(crate) fn read_sidecar(path: &str) -> Result<Option<Sidecar>, Error> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
-        Err(e) => return Err(format!("sidecar {path}: {e}")),
+        Err(source) => {
+            return Err(Error::Io {
+                op: "read sidecar",
+                path: path.to_owned(),
+                source,
+            });
+        }
     };
     let mut it = text.split_whitespace();
     let offset = it.next().and_then(offset_token);
@@ -212,17 +223,25 @@ pub(crate) fn read_sidecar(path: &str) -> Result<Option<Sidecar>, String> {
 /// inode. Every attach then removes `-journal`, and the fresh path `-wal` and `-shm`, and rewrites
 /// the sidecar: until then the sidecar marks whatever is left untrusted, so a crash midway discards
 /// again. A snapshot temp file an older version may have left is removed too.
-pub(crate) fn discard_local(path: &str) -> Result<fs::File, String> {
+pub(crate) fn discard_local(path: &str) -> Result<fs::File, Error> {
     let f = open_locked(path)?;
     remove_if_exists(&format!("{path}-ursula.snap"))?;
-    f.set_len(0).map_err(|e| format!("truncate {path}: {e}"))?;
+    f.set_len(0).map_err(|source| Error::Io {
+        op: "truncate",
+        path: path.to_owned(),
+        source,
+    })?;
     Ok(f)
 }
 
 /// Fails loudly: a stale WAL or journal left next to a rebuilt db file would be applied to it.
-pub(crate) fn remove_if_exists(f: &str) -> Result<(), String> {
+pub(crate) fn remove_if_exists(f: &str) -> Result<(), Error> {
     match fs::remove_file(f) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("remove {f}: {e}")),
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => Err(Error::Io {
+            op: "remove",
+            path: f.to_owned(),
+            source,
+        }),
         _ => Ok(()),
     }
 }
@@ -245,7 +264,7 @@ pub(crate) fn remove_if_exists(f: &str) -> Result<(), String> {
 /// of this process is open or can open (attach refuses otherwise, and `x_open` refuses the main db
 /// while it attaches), so closing `f` drops only this lock. Another *attached* process is excluded
 /// by the host lock already held.
-pub(crate) fn lock_unused(path: &str, f: &fs::File) -> Result<(), String> {
+pub(crate) fn lock_unused(path: &str, f: &fs::File) -> Result<(), Error> {
     use std::os::fd::AsRawFd;
     let mut l: libc::flock = unsafe { std::mem::zeroed() };
     l.l_type = libc::F_WRLCK as _;
@@ -257,25 +276,29 @@ pub(crate) fn lock_unused(path: &str, f: &fs::File) -> Result<(), String> {
     }
     let e = std::io::Error::last_os_error();
     if !matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
-        return Err(format!("lock {path}: {e}"));
+        return Err(Error::Io {
+            op: "lock",
+            path: path.to_owned(),
+            source: e,
+        });
     }
     // Name the holder, if it still holds the range.
     let held = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut l) } == 0
         && l.l_type != libc::F_UNLCK as _;
-    let pid = if held {
-        l.l_pid.to_string()
-    } else {
-        "unknown".into()
-    };
-    Err(format!(
-        "{path} is open by another process (pid {pid}); close it before attaching"
-    ))
+    Err(Error::OpenElsewhere {
+        path: path.to_owned(),
+        pid: held.then_some(l.l_pid),
+    })
 }
 
 /// Opens the db file and locks it (`lock_unused`); the lock lasts while the descriptor is open.
-fn open_locked(path: &str) -> Result<fs::File, String> {
+fn open_locked(path: &str) -> Result<fs::File, Error> {
     let f = OpenOptions::new().read(true).write(true).open(path);
-    let f = f.map_err(|e| format!("open {path}: {e}"))?;
+    let f = f.map_err(|source| Error::Io {
+        op: "open",
+        path: path.to_owned(),
+        source,
+    })?;
     lock_unused(path, &f)?;
     Ok(f)
 }

@@ -35,13 +35,18 @@ pub(crate) unsafe fn arg(argv: *mut *mut ffi::sqlite3_value, i: usize) -> String
     }
 }
 
+/// `s` as a C string, NUL bytes replaced (SQLite takes the text up to the first one).
+fn c_text(s: &str) -> CString {
+    CString::new(s.replace('\0', " ")).unwrap_or_default()
+}
+
 unsafe fn result_error(ctx: *mut ffi::sqlite3_context, msg: &str) {
-    let c = CString::new(msg.replace('\0', " ")).unwrap();
+    let c = c_text(msg);
     unsafe { (api().result_error.unwrap())(ctx, c.as_ptr(), -1) };
 }
 
-unsafe fn result_text(ctx: *mut ffi::sqlite3_context, s: String) {
-    let c = CString::new(s).unwrap();
+unsafe fn result_text(ctx: *mut ffi::sqlite3_context, s: &str) {
+    let c = c_text(s);
     unsafe { (api().result_text.unwrap())(ctx, c.as_ptr(), -1, ffi::SQLITE_TRANSIENT()) };
 }
 
@@ -52,7 +57,7 @@ pub(crate) unsafe extern "C" fn fn_attach(
 ) {
     unsafe {
         match attach(&arg(argv, 0), &arg(argv, 1)) {
-            Ok(offset) => result_text(ctx, offset),
+            Ok(offset) => result_text(ctx, &offset),
             Err(e) => result_error(ctx, &format!("ursula_attach: {e}")),
         }
     }
@@ -65,7 +70,7 @@ unsafe extern "C" fn fn_status(
 ) {
     unsafe {
         match status(&arg(argv, 0)) {
-            Ok(s) => result_text(ctx, s),
+            Ok(s) => result_text(ctx, &s),
             Err(e) => result_error(ctx, &format!("ursula_status: {e}")),
         }
     }
@@ -78,7 +83,7 @@ unsafe extern "C" fn fn_stats(
 ) {
     unsafe {
         match stats(&arg(argv, 0)) {
-            Ok(s) => result_text(ctx, s),
+            Ok(s) => result_text(ctx, &s),
             Err(e) => result_error(ctx, &format!("ursula_stats: {e}")),
         }
     }

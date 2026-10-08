@@ -79,6 +79,7 @@
 //! - `client`: the stream over blocking HTTP, with the retries.
 //! - `config`: settings and test hooks from the environment.
 //! - `db`: attached databases and the process-wide registry.
+//! - `error`: the error type, and the classes callers act on (gone, recreated, fenced).
 //! - `extension`: the entry point and the SQL functions.
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
@@ -93,6 +94,7 @@ mod claim;
 mod client;
 mod config;
 mod db;
+mod error;
 mod extension;
 pub mod frame;
 mod host;

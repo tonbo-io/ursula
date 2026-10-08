@@ -7,20 +7,27 @@ use std::sync::atomic::Ordering;
 use crate::client::Append;
 use crate::client::advanced;
 use crate::client::append;
-use crate::client::is_recreated;
 use crate::client::read_from;
-use crate::client::recreated_error;
+use crate::client::recreated;
 use crate::config::first_claim_epoch;
 use crate::db::Db;
+use crate::error::ClaimScanError;
+use crate::error::Error;
+use crate::error::Fence;
 use crate::frame;
 use crate::frame::Decoded;
 use crate::frame::Record;
 
-pub(crate) fn nonce() -> Result<[u8; 16], String> {
+pub(crate) fn nonce() -> Result<[u8; 16], Error> {
+    const URANDOM: &str = "/dev/urandom";
     let mut n = [0u8; 16];
-    fs::File::open("/dev/urandom")
+    fs::File::open(URANDOM)
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut n))
-        .map_err(|e| format!("/dev/urandom: {e}"))?;
+        .map_err(|source| Error::Io {
+            op: "read",
+            path: URANDOM.to_owned(),
+            source,
+        })?;
     Ok(n)
 }
 
@@ -52,37 +59,48 @@ pub(crate) fn claim_once(
     producer: &str,
     epoch: u64,
     from: &str,
-) -> Result<Claimed, String> {
+) -> Result<Claimed, Error> {
     let nonce = nonce()?;
-    let frame = frame::encode_claim(epoch, &nonce);
+    let frame = frame::encode_claim(epoch, &nonce).map_err(Error::EncodeFrame)?;
     let next = match append(url, incarnation, producer, &frame, epoch, 0) {
         Append::Acked {
             next: Some(next), ..
         } => next,
         Append::Acked { next: None, .. } => {
-            return Err(format!("claim {url}: no Stream-Next-Offset"));
+            return Err(Error::NoNextOffset {
+                op: "claim",
+                url: url.to_owned(),
+            });
         }
         Append::Fenced { current } => return Ok(Claimed::Fenced(current)),
         Append::Recreated => return Ok(Claimed::Recreated),
-        Append::ProducerExpired | Append::SeqConflict(_) => {
-            unreachable!("a claim has sequence 0 and no Stream-Seq")
+        // A claim has sequence 0 and no `Stream-Seq`: the server answered something else.
+        Append::ProducerExpired | Append::SeqConflict { .. } => {
+            return Err(Error::ClaimAnswer {
+                url: url.to_owned(),
+            });
         }
-        Append::Failed(e) => return Err(format!("claim {url}: {e}")),
+        Append::Failed(e) => return Err(e),
     };
     let (mut buf, mut at) = (Vec::new(), from.to_owned());
     while at.as_str() < next.as_str() {
-        let (bytes, n) = read_from(url, incarnation, &at).map_err(String::from)?;
+        let (bytes, n) = read_from(url, incarnation, &at)?;
         if bytes.is_empty() {
-            return Err(format!(
-                "claim {url}: the stream ends at {at}, before the claim's end {next}"
-            ));
+            return Err(Error::ClaimCut {
+                url: url.to_owned(),
+                at,
+                next,
+            });
         }
         advanced(url, &at, bytes.len(), &n)?;
         buf.extend_from_slice(&bytes);
         at = n;
     }
     let exact = at == next;
-    let found = find_claim(&buf, exact, epoch, &nonce).map_err(|e| format!("claim {url}: {e}"))?;
+    let found = find_claim(&buf, exact, epoch, &nonce).map_err(|source| Error::ClaimScan {
+        url: url.to_owned(),
+        source,
+    })?;
     Ok(match found {
         Some(first) => Claimed::Won { first, next },
         None => Claimed::Lost,
@@ -101,7 +119,7 @@ pub(crate) fn find_claim(
     exact: bool,
     epoch: u64,
     nonce: &[u8; 16],
-) -> Result<Option<bool>, String> {
+) -> Result<Option<bool>, ClaimScanError> {
     let (mut used, mut found, mut last_ours) = (0, None, false);
     while let Decoded::Frame { record, len } = frame::decode(&buf[used..])? {
         last_ours = record
@@ -115,7 +133,7 @@ pub(crate) fn find_claim(
         used += len;
     }
     if exact && used != buf.len() {
-        return Err("the answered offset is not a frame boundary".into());
+        return Err(ClaimScanError::NotAtBoundary);
     }
     Ok(found.filter(|_| !exact || last_ours))
 }
@@ -128,7 +146,7 @@ pub(crate) fn claim(
     producer: &str,
     epoch: u64,
     from: &str,
-) -> Result<(u64, String), String> {
+) -> Result<(u64, String), Error> {
     // Test hook URSULA_VFS_FIRST_CLAIM_EPOCH: the process's first claim uses this epoch.
     static HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut epoch = match first_claim_epoch() {
@@ -140,52 +158,38 @@ pub(crate) fn claim(
             Claimed::Won { next, .. } => return Ok((epoch, next)),
             Claimed::Lost => epoch += 1,
             Claimed::Fenced(current) => epoch = current.unwrap_or(epoch).max(epoch) + 1,
-            Claimed::Recreated => return Err(recreated_error(url, incarnation)),
+            Claimed::Recreated => return Err(recreated(url, incarnation)),
         }
     }
-    Err(format!("claim {url}: lost 16 claim races"))
+    Err(Error::ClaimRaces {
+        url: url.to_owned(),
+    })
 }
 
 /// The server does not know this owner's producer: it expired it (7 days without a write) and
 /// forgot its epoch. Taking the stream back is safe only if nobody wrote since this owner's last
 /// frame: the stream must end at our offset, and our new claim (one epoch up, fencing any later
 /// owner's older epochs) must be ours (verified) and be the first frame after it. Otherwise
-/// another owner wrote or claimed, and this one is fenced; so it is when the stream turns out to
-/// be another incarnation (every request here carries ours as a precondition).
-pub(crate) fn reclaim(db: &mut Db) -> Result<(), String> {
-    let fenced = |db: &mut Db, e: String| {
-        if is_recreated(&e) {
-            db.fenced = true;
-        }
-        e
-    };
-    let (bytes, _) =
-        read_from(&db.url, &db.incarnation, &db.offset).map_err(|e| fenced(db, String::from(e)))?;
+/// another owner wrote or claimed, and this one is fenced ([`Error::is_fenced`]); so it is when the
+/// stream turns out to be another incarnation (every request here carries ours as a
+/// precondition).
+pub(crate) fn reclaim(db: &mut Db) -> Result<(), Error> {
+    let (bytes, _) = read_from(&db.url, &db.incarnation, &db.offset)?;
     if !bytes.is_empty() {
-        db.fenced = true;
-        return Err(format!(
-            "fenced: producer expired and the stream moved past {}",
-            db.offset
-        ));
+        return Err(Error::Fenced(Fence::ProducerExpiredMoved {
+            offset: db.offset.clone(),
+        }));
     }
     let epoch = db.epoch + 1;
-    let claimed = claim_once(&db.url, &db.incarnation, &db.producer, epoch, &db.offset)
-        .map_err(|e| fenced(db, e))?;
-    match claimed {
+    match claim_once(&db.url, &db.incarnation, &db.producer, epoch, &db.offset)? {
         Claimed::Won { first: true, next } => {
             db.epoch = epoch;
             db.seq = 0;
             db.offset = next;
             Ok(())
         }
-        Claimed::Recreated => {
-            db.fenced = true;
-            Err(recreated_error(&db.url, &db.incarnation))
-        }
-        _ => {
-            db.fenced = true;
-            Err("fenced: another owner wrote or claimed while re-claiming".into())
-        }
+        Claimed::Recreated => Err(recreated(&db.url, &db.incarnation)),
+        _ => Err(Error::Fenced(Fence::Reclaim)),
     }
 }
 
@@ -194,6 +198,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::find_claim;
+    use crate::error::ClaimScanError;
     use crate::frame;
     use crate::frame::PAGE;
 
@@ -204,21 +209,27 @@ mod tests {
     #[test]
     fn claims_are_found_by_their_nonce() {
         let (ours, theirs) = ([1u8; 16], [2u8; 16]);
-        let commit = frame::encode_commit(1, &BTreeMap::from([(1, vec![0u8; PAGE])])).0;
+        let commit = frame::encode_commit(1, &BTreeMap::from([(1, vec![0u8; PAGE])]))
+            .unwrap()
+            .0;
         let (mine, other) = (
-            frame::encode_claim(7, &ours),
-            frame::encode_claim(7, &theirs),
+            frame::encode_claim(7, &ours).unwrap(),
+            frame::encode_claim(7, &theirs).unwrap(),
         );
         let find = |frames: &[&[u8]], exact: bool| find_claim(&frames.concat(), exact, 7, &ours);
-        assert_eq!(find(&[&mine[..]], true), Ok(Some(true)));
-        assert_eq!(find(&[&commit[..], &mine[..]], true), Ok(Some(false)));
-        assert_eq!(find(&[&commit[..], &other[..]], true), Ok(None));
-        assert_eq!(find(&[&frame::encode_claim(6, &ours)[..]], true), Ok(None));
+        assert_eq!(find(&[&mine[..]], true).unwrap(), Some(true));
+        assert_eq!(find(&[&commit[..], &mine[..]], true).unwrap(), Some(false));
+        assert_eq!(find(&[&commit[..], &other[..]], true).unwrap(), None);
+        let older = frame::encode_claim(6, &ours).unwrap();
+        assert_eq!(find(&[&older[..]], true).unwrap(), None);
         // Read past the answered offset: ours, then another owner's claim and a partial frame.
         let past: [&[u8]; 3] = [&mine[..], &other[..], &commit[..9]];
-        assert_eq!(find(&past, false), Ok(Some(true)));
-        assert_eq!(find(&[&other[..], &commit[..]], false), Ok(None));
+        assert_eq!(find(&past, false).unwrap(), Some(true));
+        assert_eq!(find(&[&other[..], &commit[..]], false).unwrap(), None);
         // Read exactly to it, but not on a frame boundary.
-        assert!(find(&past, true).is_err());
+        assert!(matches!(
+            find(&past, true),
+            Err(ClaimScanError::NotAtBoundary)
+        ));
     }
 }

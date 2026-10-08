@@ -34,18 +34,40 @@ pub enum Decoded {
     Partial,
 }
 
-fn wrap(record: &[u8]) -> Vec<u8> {
-    let payload = zstd::bulk::compress(record, ZSTD_LEVEL).expect("zstd compress");
+/// A frame that cannot be encoded or decoded.
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("bad frame magic")]
+    Magic,
+    #[error("frame checksum mismatch")]
+    Checksum,
+    #[error("zstd: {0}")]
+    Zstd(#[source] std::io::Error),
+    #[error("zstd compress: {0}")]
+    Compress(#[source] std::io::Error),
+    #[error("commit record: {bytes} bytes for {pages} pages")]
+    CommitLength { bytes: usize, pages: usize },
+    #[error("commit record: page {pgno} outside db size {size}")]
+    PageOutside { pgno: u32, size: u32 },
+    #[error("unknown record")]
+    UnknownRecord,
+}
+
+fn wrap(record: &[u8]) -> Result<Vec<u8>, FrameError> {
+    let payload = zstd::bulk::compress(record, ZSTD_LEVEL).map_err(FrameError::Compress)?;
     let mut out = Vec::with_capacity(HEADER + payload.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc32c::crc32c(&payload).to_le_bytes());
     out.extend_from_slice(&payload);
-    out
+    Ok(out)
 }
 
 /// A commit frame and the uncompressed record size.
-pub fn encode_commit(size: u32, pages: &BTreeMap<u32, Vec<u8>>) -> (Vec<u8>, usize) {
+pub fn encode_commit(
+    size: u32,
+    pages: &BTreeMap<u32, Vec<u8>>,
+) -> Result<(Vec<u8>, usize), FrameError> {
     let mut record = Vec::with_capacity(9 + pages.len() * (4 + PAGE));
     record.push(0);
     record.extend_from_slice(&size.to_le_bytes());
@@ -54,10 +76,10 @@ pub fn encode_commit(size: u32, pages: &BTreeMap<u32, Vec<u8>>) -> (Vec<u8>, usi
         record.extend_from_slice(&pgno.to_le_bytes());
         record.extend_from_slice(data);
     }
-    (wrap(&record), record.len())
+    Ok((wrap(&record)?, record.len()))
 }
 
-pub fn encode_claim(epoch: u64, nonce: &[u8; 16]) -> Vec<u8> {
+pub fn encode_claim(epoch: u64, nonce: &[u8; 16]) -> Result<Vec<u8>, FrameError> {
     let mut record = vec![1];
     record.extend_from_slice(&epoch.to_le_bytes());
     record.extend_from_slice(nonce);
@@ -69,36 +91,39 @@ fn le32(b: &[u8]) -> u32 {
 }
 
 /// Decodes the frame at the start of `buf`.
-pub fn decode(buf: &[u8]) -> Result<Decoded, String> {
+pub fn decode(buf: &[u8]) -> Result<Decoded, FrameError> {
     if buf.len() < HEADER {
         if !MAGIC.starts_with(&buf[..buf.len().min(4)]) {
-            return Err("bad frame magic".into());
+            return Err(FrameError::Magic);
         }
         return Ok(Decoded::Partial);
     }
     if &buf[..4] != MAGIC {
-        return Err("bad frame magic".into());
+        return Err(FrameError::Magic);
     }
     let len = le32(&buf[4..]) as usize;
     let Some(payload) = buf.get(HEADER..HEADER + len) else {
         return Ok(Decoded::Partial);
     };
     if crc32c::crc32c(payload) != le32(&buf[8..]) {
-        return Err("frame checksum mismatch".into());
+        return Err(FrameError::Checksum);
     }
-    let record = zstd::stream::decode_all(payload).map_err(|e| format!("zstd: {e}"))?;
+    let record = zstd::stream::decode_all(payload).map_err(FrameError::Zstd)?;
     let record = match record.first() {
         Some(0) if record.len() >= 9 => {
             let (size, n) = (le32(&record[1..]), le32(&record[5..]) as usize);
             let body = &record[9..];
             if body.len() != n * (4 + PAGE) {
-                return Err(format!("commit record: {} bytes for {n} pages", body.len()));
+                return Err(FrameError::CommitLength {
+                    bytes: body.len(),
+                    pages: n,
+                });
             }
             let mut pages = Vec::with_capacity(n);
             for chunk in body.chunks_exact(4 + PAGE) {
                 let pgno = le32(chunk);
                 if pgno == 0 || pgno > size {
-                    return Err(format!("commit record: page {pgno} outside db size {size}"));
+                    return Err(FrameError::PageOutside { pgno, size });
                 }
                 pages.push((pgno, chunk[4..].to_vec()));
             }
@@ -108,7 +133,7 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, String> {
             epoch: u64::from_le_bytes(record[1..9].try_into().unwrap()),
             nonce: record[9..25].try_into().unwrap(),
         },
-        _ => return Err("unknown record".into()),
+        _ => return Err(FrameError::UnknownRecord),
     };
     Ok(Decoded::Frame {
         record,
@@ -125,34 +150,32 @@ mod tests {
     #[test]
     fn frames_decode_only_whole_and_intact() {
         let pages = BTreeMap::from([(1, vec![7u8; PAGE]), (3, vec![9u8; PAGE])]);
-        let (mut buf, _) = encode_commit(3, &pages);
+        let (mut buf, _) = encode_commit(3, &pages).unwrap();
         let first = buf.len();
-        buf.extend(encode_claim(5, &[3; 16]));
+        buf.extend(encode_claim(5, &[3; 16]).unwrap());
         for cut in 0..first {
-            assert_eq!(decode(&buf[..cut]), Ok(Decoded::Partial), "cut at {cut}");
+            assert_eq!(
+                decode(&buf[..cut]).unwrap(),
+                Decoded::Partial,
+                "cut at {cut}"
+            );
         }
         let commit = Record::Commit {
             size: 3,
             pages: pages.into_iter().collect(),
         };
-        assert_eq!(
-            decode(&buf),
-            Ok(Decoded::Frame {
-                record: commit,
-                len: first
-            })
-        );
-        assert_eq!(
-            decode(&buf[first..]),
-            Ok(Decoded::Frame {
-                record: Record::Claim {
-                    epoch: 5,
-                    nonce: [3; 16]
-                },
-                len: buf.len() - first
-            })
-        );
+        assert_eq!(decode(&buf).unwrap(), Decoded::Frame {
+            record: commit,
+            len: first
+        });
+        assert_eq!(decode(&buf[first..]).unwrap(), Decoded::Frame {
+            record: Record::Claim {
+                epoch: 5,
+                nonce: [3; 16]
+            },
+            len: buf.len() - first
+        });
         buf[first - 1] ^= 1;
-        assert_eq!(decode(&buf), Err("frame checksum mismatch".into()));
+        assert!(matches!(decode(&buf), Err(FrameError::Checksum)));
     }
 }

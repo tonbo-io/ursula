@@ -17,7 +17,7 @@ use libsqlite3_sys as ffi;
 use crate::claim::reclaim;
 use crate::client::Append;
 use crate::client::append;
-use crate::client::recreated_error;
+use crate::client::recreated;
 use crate::client::stream_seq;
 use crate::config::abort_after_ack;
 use crate::db::CommitStat;
@@ -26,6 +26,8 @@ use crate::db::lock;
 use crate::db::lookup;
 use crate::db::refused;
 use crate::db::registry;
+use crate::error::Error;
+use crate::error::Fence;
 use crate::frame;
 use crate::frame::PAGE;
 use crate::host::OK;
@@ -61,16 +63,14 @@ impl Db {
     /// generation or is truncated to nothing, so a disk image that shows the new WAL holds every
     /// page checkpointed from the old one (see `WalClaim`). Rare: once per WAL wrap. A failure
     /// poisons.
-    pub(crate) unsafe fn sync_db(&mut self, before: &str) -> c_int {
+    pub(crate) unsafe fn sync_db(&mut self, before: &'static str) -> c_int {
         let h = [self.writer, self.exclusive].into_iter().find(|&h| h != 0);
         let rc = match h {
             Some(h) => unsafe { fwd!(h as *mut ffi::sqlite3_file, xSync, ffi::SQLITE_SYNC_NORMAL) },
             None => ffi::SQLITE_IOERR_FSYNC,
         };
         if rc != OK {
-            self.poison(format!(
-                "fsync of the db file before {before} failed ({rc})"
-            ));
+            self.poison(Error::Fsync { before, code: rc });
         }
         rc
     }
@@ -109,10 +109,10 @@ impl Db {
             // Already poisoned (the snapshot thread's fence fails the rest of the transaction's
             // WAL writes): keep that reason.
             if self.poisoned.is_none() {
-                self.poison(format!(
-                    "commit acknowledged but not published locally (mxFrame {mx_frame} < frame {})",
-                    self.commit_frame_no
-                ));
+                self.poison(Error::NotPublished {
+                    mx_frame,
+                    frame: self.commit_frame_no,
+                });
             }
             return;
         }
@@ -357,9 +357,7 @@ pub(crate) unsafe extern "C" fn x_write(
             if let Some(db) = main_db(file) {
                 let mut db = lock(&db);
                 if !db.db_write_allowed() {
-                    return db.poison(
-                        "db file write outside a checkpoint (journal_mode must stay WAL)".into(),
-                    );
+                    return db.poison(Error::DbWriteOutsideCheckpoint);
                 }
             }
             return fwd!(file, xWrite, buf, amt, off);
@@ -374,14 +372,11 @@ pub(crate) unsafe extern "C" fn x_write(
             return db.post_ack("local WAL write", rc);
         }
         if db.writer == 0 {
-            return db.poison("WAL write outside a write-locked transaction (locking_mode=EXCLUSIVE is not supported)".into());
+            return db.poison(Error::WalWriteOutsideTransaction);
         }
         let data = std::slice::from_raw_parts(buf as *const u8, amt as usize);
         if off == 0 && data.len() >= 12 && be32(&data[8..12]) as usize != PAGE {
-            return db.poison(format!(
-                "page size {} (only {PAGE} is supported)",
-                be32(&data[8..12])
-            ));
+            return db.poison(Error::PageSize(be32(&data[8..12])));
         }
         db.overlay.insert(off, data.to_vec());
         // The commit point: the page data of a frame whose header carries "db size after commit".
@@ -491,9 +486,12 @@ pub(crate) unsafe fn commit(
     // (`x_file_control`) and commits page 1 in rollback format (bytes 18/19 = 1) through it: every
     // copy rebuilt from the stream would then need a rollback journal to be written.
     if pages.get(&1).is_some_and(|p| p[18] != 2 || p[19] != 2) {
-        return db.poison("a commit leaves WAL format (journal_mode must stay WAL)".into());
+        return db.poison(Error::LeavesWal);
     }
-    let (body, raw) = frame::encode_commit(size, &pages);
+    let (body, raw) = match frame::encode_commit(size, &pages) {
+        Ok(encoded) => encoded,
+        Err(e) => return db.poison(Error::EncodeFrame(e)),
+    };
     let t = Instant::now();
     let mut outcome = append(
         &db.url,
@@ -525,50 +523,44 @@ pub(crate) unsafe fn commit(
             attempts,
         } if n > db.offset => (n, attempts),
         Append::Acked { next: Some(n), .. } => {
-            return db.poison(format!(
-                "append after {} acknowledged with next offset {n}, not past it",
-                db.offset
-            ));
+            return db.poison(Error::AckNotPast {
+                offset: db.offset.clone(),
+                next: n,
+            });
         }
         // A duplicate answered without its receipt: the server evicted it (more than its receipt
         // window ago). Never our own retry: this owner is the only writer of its producer at its
         // epoch (verified claim) with one append in flight, the newest, and the server never
         // evicts a producer's newest receipt. So another writer appended at this epoch past `seq`.
         Append::Acked { next: None, .. } => {
-            db.fenced = true;
-            return db.poison(format!(
-                "fenced: append at {} answered as a duplicate without a receipt: another writer \
-                 (a foreign one using this Producer-Id?) holds producer {} at epoch {} past seq \
-                 {seq}",
-                db.offset, db.producer, db.epoch
-            ));
+            return db.poison(Error::Fenced(Fence::DuplicateWithoutReceipt {
+                offset: db.offset.clone(),
+                producer: db.producer.clone(),
+                epoch: db.epoch,
+                seq,
+            }));
         }
         Append::Fenced { current } => {
-            db.fenced = true;
-            return db.poison(format!(
-                "fenced: epoch {} superseded by {current:?} (403)",
-                db.epoch
-            ));
+            return db.poison(Error::Fenced(Fence::Superseded {
+                epoch: db.epoch,
+                current,
+            }));
         }
         // The stream at the path is another incarnation: this commit reached nothing.
         Append::Recreated => {
-            db.fenced = true;
-            return db.poison(recreated_error(&db.url, &db.incarnation));
+            return db.poison(recreated(&db.url, &db.incarnation));
         }
         // Not this owner's own retry (that is a duplicate, answered before `Stream-Seq` is
         // checked), nor an older owner's (fenced by epoch): a writer outside this protocol.
-        Append::SeqConflict(e) => {
-            db.fenced = true;
-            return db.poison(format!(
-                "fenced: append after {} refused its Stream-Seq {}: another writer appended with \
-                 a higher one ({})",
-                db.offset,
-                stream_seq((db.epoch, seq)),
-                e.trim()
-            ));
+        Append::SeqConflict { body } => {
+            return db.poison(Error::Fenced(Fence::SeqConflict {
+                offset: db.offset.clone(),
+                stream_seq: stream_seq((db.epoch, seq)),
+                body: body.trim().to_owned(),
+            }));
         }
         Append::ProducerExpired => {
-            return db.poison("producer expired again right after a re-claim".into());
+            return db.poison(Error::ProducerExpiredAgain);
         }
         Append::Failed(e) => return db.poison(e),
     };
@@ -600,7 +592,7 @@ pub(crate) unsafe fn commit(
             }
         };
         if rc != OK {
-            db.poison(format!("local WAL write: {rc}"));
+            db.poison(Error::LocalWalWrite(rc));
             return rc;
         }
     }
@@ -623,9 +615,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
         if let Some(db) = main_db(file) {
             let mut db = lock(&db);
             if !db.db_write_allowed() {
-                return db.poison(
-                    "db file truncate outside a checkpoint (journal_mode must stay WAL)".into(),
-                );
+                return db.poison(Error::DbTruncateOutsideCheckpoint);
             }
         }
         let Some(db) = wal_db(file) else {

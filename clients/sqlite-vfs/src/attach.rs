@@ -10,20 +10,21 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::claim::claim;
-use crate::client::Fail;
 use crate::client::START;
 use crate::client::advanced;
 use crate::client::create_stream;
 use crate::client::get_snapshot;
 use crate::client::head;
-use crate::client::is_recreated;
 use crate::client::producer_id;
 use crate::client::read_from;
-use crate::client::recreated_error;
+use crate::client::recreated;
 use crate::config::abort_in_replay;
 use crate::db::Db;
 use crate::db::SnapshotThread;
 use crate::db::registry;
+use crate::error::Error;
+use crate::error::Fence;
+use crate::error::Gone;
 use crate::frame;
 use crate::frame::Decoded;
 use crate::frame::PAGE;
@@ -79,6 +80,15 @@ pub(crate) struct Applier {
 }
 
 impl Applier {
+    /// A failed operation on the db file.
+    fn io(&self, op: &'static str, source: std::io::Error) -> Error {
+        Error::Io {
+            op,
+            path: self.path.clone(),
+            source,
+        }
+    }
+
     fn apply(&mut self, record: Record) {
         match record {
             Record::Claim { epoch, .. } => self.epoch = self.epoch.max(epoch),
@@ -105,7 +115,7 @@ impl Applier {
     /// leaves files the next attach trusts and replays again from the same offset (folded pages
     /// hold the state at the WAL's last commit, replayed ones later commits). A crash between that
     /// sidecar and the delete leaves a WAL with commits next to a claim of none: a rebuild.
-    pub(crate) unsafe fn file(&mut self) -> Result<&fs::File, String> {
+    pub(crate) unsafe fn file(&mut self) -> Result<&fs::File, Error> {
         if self.file.is_none() {
             let existing = fs::metadata(&self.path).is_ok_and(|m| m.len() > 0);
             let f = OpenOptions::new()
@@ -114,12 +124,11 @@ impl Applier {
                 .create(true)
                 .truncate(false)
                 .open(&self.path);
-            let f = f.map_err(|e| format!("open {}: {e}", self.path))?;
+            let f = f.map_err(|source| self.io("open", source))?;
             lock_unused(&self.path, &f)?;
             if existing {
                 fold_wal(&self.path, &f)?;
-                f.sync_all()
-                    .map_err(|e| format!("fsync {}: {e}", self.path))?;
+                f.sync_all().map_err(|source| self.io("fsync", source))?;
                 let (offset, epoch, log) = &self.from;
                 let line = sidecar_line(offset, *epoch, *log, &self.stamp, WalClaim::NONE);
                 write_sidecar(&self.sidecar, &line)?;
@@ -132,29 +141,33 @@ impl Applier {
     }
 
     /// Writes the batch: truncate to its smallest size, write the final page images, set the size.
-    unsafe fn flush(&mut self) -> Result<(), String> {
+    unsafe fn flush(&mut self) -> Result<(), Error> {
         let (Some(min), Some(size)) = (self.min_size.take(), self.size) else {
             return Ok(());
         };
         let pages = std::mem::take(&mut self.pages);
         let mut written = self.written;
+        let path = self.path.clone();
+        let err = |source| Error::Io {
+            op: "replay into",
+            path: path.clone(),
+            source,
+        };
         let f = unsafe { self.file()? };
-        let len = f.metadata().map_err(|e| e.to_string())?.len();
+        let len = f.metadata().map_err(err)?.len();
         if len > min as u64 * PAGE as u64 {
-            f.set_len(min as u64 * PAGE as u64)
-                .map_err(|e| e.to_string())?;
+            f.set_len(min as u64 * PAGE as u64).map_err(err)?;
         }
         for (pgno, data) in pages {
             f.write_all_at(&data, (pgno as u64 - 1) * PAGE as u64)
-                .map_err(|e| e.to_string())?;
+                .map_err(err)?;
             written += 1;
             if abort_in_replay() == Some(written) {
                 eprintln!("sqlite-ursula-vfs: URSULA_VFS_ABORT_IN_REPLAY: aborting mid-replay");
                 std::process::abort();
             }
         }
-        f.set_len(size as u64 * PAGE as u64)
-            .map_err(|e| e.to_string())?;
+        f.set_len(size as u64 * PAGE as u64).map_err(err)?;
         self.written = written;
         Ok(())
     }
@@ -165,8 +178,13 @@ impl Applier {
     /// file's pages and the image's (a state past the sidecar's offset): if the sidecar claims no
     /// WAL frame the next attach trusts it and installs the snapshot again (every page holds the
     /// state at its offset or a later one), otherwise the deleted WAL is behind it: a rebuild.
-    pub(crate) unsafe fn install(&mut self, snap: snapshot::Snapshot) -> Result<(), String> {
-        let err = |e: std::io::Error| format!("install snapshot into {}: {e}", self.path);
+    pub(crate) unsafe fn install(&mut self, snap: snapshot::Snapshot) -> Result<(), Error> {
+        let path = self.path.clone();
+        let err = |source| Error::Io {
+            op: "install snapshot into",
+            path: path.clone(),
+            source,
+        };
         let f = match self.file.take() {
             Some(f) => f,
             None => {
@@ -206,7 +224,7 @@ unsafe fn catch_up(
     pos: &mut String,
     until: Option<&str>,
     applier: &mut Applier,
-) -> Result<(), Fail> {
+) -> Result<(), Error> {
     let (mut buf, mut at) = (Vec::new(), pos.clone());
     loop {
         if buf.is_empty() && until.is_some_and(|u| pos.as_str() >= u) {
@@ -215,9 +233,11 @@ unsafe fn catch_up(
         let (bytes, next) = read_from(url, incarnation, &at)?;
         if bytes.is_empty() {
             if !buf.is_empty() || until.is_some() {
-                return Err(Fail::Other(format!(
-                    "stream {url} ends at {at} inside a frame or before {until:?}"
-                )));
+                return Err(Error::StreamEnded {
+                    url: url.to_owned(),
+                    at,
+                    until: until.map(str::to_owned),
+                });
             }
             break;
         }
@@ -226,7 +246,11 @@ unsafe fn catch_up(
         at = next;
         let mut used = 0;
         while let Decoded::Frame { record, len } =
-            frame::decode(&buf[used..]).map_err(|e| format!("{url}: a frame after {pos}: {e}"))?
+            frame::decode(&buf[used..]).map_err(|source| Error::Frame {
+                url: url.to_owned(),
+                after: pos.clone(),
+                source,
+            })?
         {
             applier.apply(record);
             used += len;
@@ -245,7 +269,7 @@ unsafe fn catch_up(
 /// snapshot when the file is behind it (or below the stream's retention), replays the frames after
 /// it, claims, and replays up to the claim, all from the stream's `incarnation` (every request
 /// carries it as a precondition: a stream deleted and recreated meanwhile fails this round with
-/// `recreated_error`, and `attach_files_rebuilding` rebuilds against the new one; a newer owner's
+/// [`Error::Recreated`], and `attach_files_rebuilding` rebuilds against the new one; a newer owner's
 /// claim replayed after ours fails the attach). Returns the epoch claimed and the latest
 /// snapshot's offset (`START` for none).
 pub(crate) unsafe fn sync(
@@ -253,31 +277,36 @@ pub(crate) unsafe fn sync(
     incarnation: &str,
     pos: &mut String,
     applier: &mut Applier,
-) -> Result<(u64, String), Fail> {
+) -> Result<(u64, String), Error> {
     let head = head(url, &|| false)?;
     if head.incarnation.as_deref() != Some(incarnation) {
-        return Err(Fail::Other(recreated_error(url, incarnation)));
+        return Err(recreated(url, incarnation));
     }
     if let Some(s) = head.snapshot.as_deref()
         && pos.as_str() < s
     {
         let Some(body) = get_snapshot(url, incarnation, s, &|| false)? else {
-            return Err(Fail::Gone(format!("snapshot {s} superseded")));
+            return Err(Error::Gone(Gone::SnapshotSuperseded {
+                offset: s.to_owned(),
+            }));
         };
-        let snap = snapshot::decode(&body)?;
+        let snap = snapshot::decode(&body).map_err(|source| Error::Snapshot {
+            offset: s.to_owned(),
+            source,
+        })?;
         if snap.offset != s {
-            return Err(Fail::Other(format!(
-                "snapshot at {s} reflects offset {}",
-                snap.offset
-            )));
+            return Err(Error::SnapshotOffset {
+                at: s.to_owned(),
+                reflects: snap.offset,
+            });
         }
         unsafe { applier.install(snap)? };
         s.clone_into(pos);
     } else if *pos != START && *pos < head.retained {
-        return Err(Fail::Gone(format!(
-            "{pos} is below the retention {} and no newer snapshot is visible",
-            head.retained
-        )));
+        return Err(Error::Gone(Gone::RetentionPassed {
+            offset: pos.clone(),
+            retained: head.retained,
+        }));
     }
     // From the beginning (`START`), a stream trimmed with no snapshot visible answers 410: `Gone`.
     unsafe { catch_up(url, incarnation, pos, None, applier)? };
@@ -291,26 +320,23 @@ pub(crate) unsafe fn sync(
     // this owner is fenced, and a snapshot it took would record an epoch below the highest
     // claimed before it.
     if applier.epoch > epoch {
-        return Err(Fail::Other(format!(
-            "fenced: another owner claimed epoch {} during attach; attach again",
-            applier.epoch
-        )));
+        return Err(Error::Fenced(Fence::ClaimedDuringAttach {
+            epoch: applier.epoch,
+        }));
     }
     Ok((epoch, head.snapshot.unwrap_or_else(|| START.into())))
 }
 
-pub(crate) unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
+pub(crate) unsafe fn attach(path: &str, url: &str) -> Result<String, Arc<Error>> {
     let path = unsafe { full_pathname(path)? };
     let url = url.trim_end_matches('/').to_owned();
     let previous = {
         let mut reg = registry();
         if reg.open.get(&path).copied().unwrap_or(0) > 0 {
-            return Err(format!(
-                "{path} has open connections; close them before attaching"
-            ));
+            return Err(Arc::new(Error::OpenConnections { path }));
         }
         if reg.attaching.contains(&path) {
-            return Err(format!("{path} is being attached by another thread"));
+            return Err(Arc::new(Error::AttachInProgress { path }));
         }
         if !reg.locks.contains_key(&path) {
             let lock_path = format!("{path}-ursula.lock");
@@ -320,9 +346,16 @@ pub(crate) unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
                 .create(true)
                 .truncate(false)
                 .open(&lock_path);
-            let f = f.map_err(|e| format!("open {lock_path}: {e}"))?;
-            f.try_lock()
-                .map_err(|e| format!("{path} is attached by another process ({lock_path}: {e})"))?;
+            let f = f.map_err(|source| Error::Io {
+                op: "open",
+                path: lock_path.clone(),
+                source,
+            })?;
+            f.try_lock().map_err(|source| Error::AttachedElsewhere {
+                path: path.clone(),
+                lock_path,
+                source,
+            })?;
             reg.locks.insert(path.clone(), f);
         }
         // The path keeps its binding (refused to `x_open` meanwhile) until the outcome replaces
@@ -349,8 +382,9 @@ pub(crate) unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
             // The binding no longer describes the files (they may hold anything between its state
             // and the stream's, the stream a newer claim): without it, `x_open` refuses the path
             // while it has a sidecar (`refused`) until an attach succeeds.
+            let e = Arc::new(e);
             reg.dbs.remove(&path);
-            reg.failed.insert(path, e.clone());
+            reg.failed.insert(path, Arc::clone(&e));
             Err(e)
         }
     }
@@ -362,11 +396,11 @@ pub(crate) unsafe fn attach(path: &str, url: &str) -> Result<String, String> {
 unsafe fn attach_files_rebuilding(
     path: &str,
     url: &str,
-) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), String> {
+) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), Error> {
     let mut tries = 0;
     loop {
         match unsafe { attach_files(path, url) } {
-            Err(e) if is_recreated(&e) && tries < 3 => {
+            Err(e) if e.is_recreated() && tries < 3 => {
                 tries += 1;
                 eprintln!("sqlite-ursula-vfs: {path}: attach: {e}; rebuilding");
             }
@@ -380,27 +414,31 @@ unsafe fn attach_files_rebuilding(
 unsafe fn attach_files(
     path: &str,
     url: &str,
-) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), String> {
+) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), Error> {
     create_stream(url)?;
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
     let boot = boot.as_deref();
-    let incarnation = head(url, &|| false)?.incarnation.ok_or_else(|| {
-        format!("{url} reports no Stream-Incarnation (an older server?); refusing to attach")
-    })?;
+    let incarnation = head(url, &|| false)?
+        .incarnation
+        .ok_or_else(|| Error::NoIncarnation {
+            url: url.to_owned(),
+        })?;
     let (mut local, mut emptied) = (None, None);
     if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
-        let s = read_sidecar(&sidecar).map_err(|e| {
-            format!("{path} has content but no readable sidecar ({e}); refusing to attach")
+        let s = read_sidecar(&sidecar).map_err(|e| Error::NoSidecar {
+            path: path.to_owned(),
+            source: Box::new(e),
         })?;
         if let Some(k) = s.as_ref().and_then(|s| s.stream.as_deref())
             && k != stream_key(url)
         {
-            return Err(format!(
-                "{path} is a cache of stream {k}, not {}; delete it to attach it there",
-                stream_key(url)
-            ));
+            return Err(Error::OtherStream {
+                path: path.to_owned(),
+                cached: k.to_owned(),
+                wanted: stream_key(url).to_owned(),
+            });
         }
         match s {
             Some(s) if s.trusted(path, boot, &incarnation) => local = Some(s),
@@ -427,7 +465,8 @@ unsafe fn attach_files(
                     // snapshot.
                     Some((old, version, offset)) => {
                         if offset != START
-                            && let Err(Fail::Other(e)) = read_from(url, &incarnation, offset)
+                            && let Err(e) = read_from(url, &incarnation, offset)
+                            && !e.is_gone()
                         {
                             return Err(e);
                         }
@@ -491,12 +530,12 @@ unsafe fn attach_files(
     let (epoch, snapshot) = loop {
         match unsafe { sync(url, &incarnation, &mut pos, &mut applier) } {
             Ok(r) => break r,
-            Err(Fail::Gone(e)) if tries < 10 => {
+            Err(e) if e.is_gone() && tries < 10 => {
                 tries += 1;
                 eprintln!("sqlite-ursula-vfs: {url}: attach: {e}; retrying");
                 std::thread::sleep(Duration::from_millis(50 * tries));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     };
     let (installed, log) = (std::mem::take(&mut applier.installed), applier.log);
@@ -514,7 +553,11 @@ unsafe fn attach_files(
         None => {
             fs::File::open(path)
                 .and_then(|f| f.sync_all())
-                .map_err(|e| format!("fsync {path}: {e}"))?;
+                .map_err(|source| Error::Io {
+                    op: "fsync",
+                    path: path.to_owned(),
+                    source,
+                })?;
             WalClaim::NONE
         }
     };
@@ -535,7 +578,6 @@ unsafe fn attach_files(
         offset: pos.clone(),
         log,
         poisoned: None,
-        fenced: false,
         overlay: BTreeMap::new(),
         committed: false,
         commit_frame_no: 0,
@@ -562,7 +604,7 @@ unsafe fn attach_files(
         std::thread::Builder::new()
             .name("ursula-snapshot".into())
             .spawn(move || snapshot_loop(&db, &snapper))
-            .map_err(|e| format!("spawn the snapshot thread: {e}"))?
+            .map_err(Error::SpawnSnapshotThread)?
     };
     Ok((pos, db, (snapper, thread)))
 }

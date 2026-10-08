@@ -25,10 +25,40 @@ pub struct Snapshot {
     pub image: Vec<u8>,
 }
 
-pub fn encode(offset: &str, epoch: u64, image: &[u8]) -> Vec<u8> {
-    assert_eq!(image.len() % PAGE, 0, "snapshot image of whole pages");
-    let n = u8::try_from(offset.len()).expect("an offset of at most 255 bytes");
-    let payload = zstd::bulk::compress(image, ZSTD_LEVEL).expect("zstd compress");
+/// A snapshot body that cannot be encoded or decoded.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    #[error("bad header")]
+    Header,
+    #[error("the offset is not UTF-8: {0}")]
+    OffsetUtf8(#[source] std::str::Utf8Error),
+    #[error("page count does not match the compressed image")]
+    PageCount,
+    #[error("{len} bytes: {source}")]
+    Alloc {
+        len: usize,
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+    #[error("zstd: {0}")]
+    Zstd(#[source] std::io::Error),
+    #[error("image does not match its size and checksum")]
+    Checksum,
+    #[error("an image of {0} bytes is not whole pages")]
+    PartialPage(usize),
+    #[error("an offset of {0} bytes (at most 255)")]
+    OffsetTooLong(usize),
+    #[error("zstd compress: {0}")]
+    Compress(#[source] std::io::Error),
+}
+
+pub fn encode(offset: &str, epoch: u64, image: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+    if !image.len().is_multiple_of(PAGE) {
+        return Err(SnapshotError::PartialPage(image.len()));
+    }
+    let n = u8::try_from(offset.len())
+        .map_err(|_too_long| SnapshotError::OffsetTooLong(offset.len()))?;
+    let payload = zstd::bulk::compress(image, ZSTD_LEVEL).map_err(SnapshotError::Compress)?;
     let mut out = Vec::with_capacity(HEADER + offset.len() + payload.len());
     out.extend_from_slice(MAGIC);
     out.push(n);
@@ -37,16 +67,16 @@ pub fn encode(offset: &str, epoch: u64, image: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&((image.len() / PAGE) as u32).to_le_bytes());
     out.extend_from_slice(&crc32c::crc32c(image).to_le_bytes());
     out.extend_from_slice(&payload);
-    out
+    Ok(out)
 }
 
-pub fn decode(body: &[u8]) -> Result<Snapshot, String> {
+pub fn decode(body: &[u8]) -> Result<Snapshot, SnapshotError> {
     let n = body.get(4).map_or(0, |&n| n as usize);
     if body.len() < HEADER + n || &body[..4] != MAGIC {
-        return Err("snapshot: bad header".into());
+        return Err(SnapshotError::Header);
     }
     let offset = std::str::from_utf8(&body[5..5 + n])
-        .map_err(|_| "snapshot: bad header".to_owned())?
+        .map_err(SnapshotError::OffsetUtf8)?
         .to_owned();
     let body = &body[5 + n..];
     let u64_at = |i: usize| u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
@@ -58,18 +88,18 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, String> {
     let len = pages * PAGE;
     match zstd::zstd_safe::get_frame_content_size(payload) {
         Ok(Some(n)) if n == len as u64 => {}
-        _ => return Err("snapshot: page count does not match the compressed image".into()),
+        _ => return Err(SnapshotError::PageCount),
     }
     let mut image = Vec::new();
     image
         .try_reserve_exact(len)
-        .map_err(|e| format!("snapshot: {len} bytes: {e}"))?;
+        .map_err(|source| SnapshotError::Alloc { len, source })?;
     image.resize(len, 0); // within the reserved capacity
-    let n = zstd::bulk::decompress_to_buffer(payload, &mut image[..])
-        .map_err(|e| format!("snapshot: zstd: {e}"))?;
+    let n =
+        zstd::bulk::decompress_to_buffer(payload, &mut image[..]).map_err(SnapshotError::Zstd)?;
     image.truncate(n);
     if image.len() != pages * PAGE || crc32c::crc32c(&image) != crc {
-        return Err("snapshot: image does not match its size and checksum".into());
+        return Err(SnapshotError::Checksum);
     }
     Ok(Snapshot {
         offset,
@@ -87,18 +117,22 @@ mod tests {
     #[test]
     fn snapshots_round_trip_and_damage_is_refused() {
         let image: Vec<u8> = (0..3 * PAGE).map(|i| (i * 7 % 251) as u8).collect();
-        let body = encode("00000000000000004242", 9, &image);
-        assert_eq!(
-            decode(&body),
-            Ok(Snapshot {
-                offset: "00000000000000004242".into(),
-                epoch: 9,
-                image: image.clone()
-            })
-        );
+        let body = encode("00000000000000004242", 9, &image).unwrap();
+        assert_eq!(decode(&body).unwrap(), Snapshot {
+            offset: "00000000000000004242".into(),
+            epoch: 9,
+            image: image.clone()
+        });
         let mut bad = body.clone();
         bad[HEADER + 20 - 1] ^= 1; // the checksum
-        assert!(decode(&bad).is_err());
-        assert!(decode(&body[..body.len() - 1]).is_err());
+        assert!(matches!(decode(&bad), Err(SnapshotError::Checksum)));
+        assert!(matches!(
+            decode(&body[..body.len() - 1]),
+            Err(SnapshotError::Zstd(_))
+        ));
+        assert!(matches!(
+            encode("o", 1, &image[1..]),
+            Err(SnapshotError::PartialPage(_))
+        ));
     }
 }

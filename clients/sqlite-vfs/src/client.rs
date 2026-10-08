@@ -6,6 +6,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::config::retry_budget;
+use crate::error::Attempt;
+use crate::error::Error;
+use crate::error::Gone;
 
 /// `Producer-Id` prefix; the stream incarnation follows (`producer_id`).
 const PRODUCER: &str = "sqlite-ursula-vfs";
@@ -98,10 +101,10 @@ pub(crate) enum Append {
     /// idle days (a recreated stream answers 412 first).
     ProducerExpired,
     /// 409 refusing the commit's `Stream-Seq` (not above the stream's last one): another writer
-    /// appended with a higher one (see `stream_seq`).
-    SeqConflict(String),
+    /// appended with a higher one (see `stream_seq`). `body` is the server's explanation.
+    SeqConflict { body: String },
     /// A definite rejection, or no answer within the retry budget.
-    Failed(String),
+    Failed(Error),
 }
 
 /// The `Producer-Id` of every owner of one stream incarnation: owners of the same incarnation fence
@@ -173,92 +176,94 @@ pub(crate) fn append(
                         && !r.headers().contains_key("producer-expected-seq")
                         && !r.headers().contains_key("stream-closed") =>
                     {
-                        let text = r.body_mut().read_to_string().unwrap_or_default();
-                        return Append::SeqConflict(text);
+                        return Append::SeqConflict {
+                            body: body_text(&mut r),
+                        };
                     }
-                    429 => format!(
-                        "append: 429 {}",
-                        r.body_mut().read_to_string().unwrap_or_default()
-                    ),
+                    429 => Attempt::Status {
+                        status,
+                        body: body_text(&mut r),
+                    },
                     400..=499 => {
-                        let text = r.body_mut().read_to_string().unwrap_or_default();
-                        return Append::Failed(format!("append rejected: {status} {text}"));
+                        return Append::Failed(Error::AppendRejected {
+                            status,
+                            body: body_text(&mut r),
+                        });
                     }
-                    _ => format!(
-                        "append: {status} {}",
-                        r.body_mut().read_to_string().unwrap_or_default()
-                    ),
+                    _ => Attempt::Status {
+                        status,
+                        body: body_text(&mut r),
+                    },
                 }
             }
-            Err(e) => format!("append: {e}"),
+            Err(e) => Attempt::Transport(Box::new(e)),
         };
         if !pause(retry_after, &mut backoff, deadline) {
-            return Append::Failed(format!(
-                "{unknown} (outcome unknown after {attempts} attempts)"
-            ));
+            return Append::Failed(Error::AppendUnknown {
+                attempts,
+                last: unknown,
+            });
         }
     }
 }
 
-pub(crate) fn create_stream(url: &str) -> Result<(), String> {
+pub(crate) fn create_stream(url: &str) -> Result<(), Error> {
     let mut r = agent()
         .put(url)
         .header("content-type", CONTENT_TYPE)
         .send_empty()
-        .map_err(|e| format!("create {url}: {e}"))?;
+        .map_err(|e| http_error("create", url, e))?;
     let status = r.status().as_u16();
-    let text = r.body_mut().read_to_string().unwrap_or_default();
+    let body = body_text(&mut r);
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(format!("create {url}: {status} {text}"))
+        Err(Error::Status {
+            op: "create",
+            url: url.to_owned(),
+            status,
+            body,
+        })
     }
 }
 
-/// A failed stream operation: `Gone` when the data lies below the stream's retention (or a
-/// snapshot was superseded), which a re-attach answers by installing the latest snapshot.
-pub(crate) enum Fail {
-    Gone(String),
-    Other(String),
-}
-
-impl From<String> for Fail {
-    fn from(e: String) -> Self {
-        Fail::Other(e)
+/// A request that got no answer.
+fn http_error(op: &'static str, url: &str, e: ureq::Error) -> Error {
+    Error::Http {
+        op,
+        url: url.to_owned(),
+        source: Box::new(e),
     }
 }
 
-impl From<Fail> for String {
-    fn from(f: Fail) -> Self {
-        match f {
-            Fail::Gone(e) => format!("gone: {e}"),
-            Fail::Other(e) => e,
-        }
-    }
+/// A response's body as text, for an error message (empty when it cannot be read).
+fn body_text(r: &mut ureq::http::Response<ureq::Body>) -> String {
+    r.body_mut().read_to_string().unwrap_or_default()
 }
 
 /// One read from `offset` of stream incarnation `incarnation` (a 412 when it is not, see
-/// `recreated_error`): the bytes and the server's offset after them (empty at the tail). Reads
+/// `recreated`): the bytes and the server's offset after them (empty at the tail). Reads
 /// the leader's applied state: a follower may lag behind an acknowledged append (a claim, a
 /// commit). A 200 without a usable `Stream-Next-Offset` is an error: offsets are never computed.
 pub(crate) fn read_from(
     url: &str,
     incarnation: &str,
     offset: &str,
-) -> Result<(Vec<u8>, String), Fail> {
+) -> Result<(Vec<u8>, String), Error> {
+    let request = format!("{url}?offset={offset}&consistency=leader");
     let mut r = read_retrying(
         || {
             agent()
-                .get(format!("{url}?offset={offset}&consistency=leader"))
+                .get(request.as_str())
                 .header("stream-incarnation", incarnation)
                 .call()
         },
         &|| false,
     )
-    .map_err(|e| format!("read {url} at {offset}: {e}"))?;
+    .map_err(|e| http_error("read", &request, e))?;
     let status = r.status().as_u16();
     if status == 412 {
-        return Err(Fail::Other(recreated_error(url, incarnation)));
+        return Err(recreated(url, incarnation));
     }
     let next = header_offset(&r, "stream-next-offset");
     if status == 204 {
@@ -269,33 +274,37 @@ pub(crate) fn read_from(
         .with_config()
         .limit(1 << 30)
         .read_to_vec()
-        .map_err(|e| format!("read body: {e}"))?;
+        .map_err(|e| http_error("read the body of", &request, e))?;
     if status == 410 {
-        return Err(Fail::Gone(format!(
-            "read {url} at {offset}: below the stream's retention"
-        )));
+        return Err(Error::Gone(Gone::BelowRetention {
+            url: url.to_owned(),
+            offset: offset.to_owned(),
+        }));
     }
     if status == 416 {
         // The server answers 416, not 412, for a stream recreated shorter than `offset` (RFC 9110
         // §13.2.1): only a HEAD tells the two apart, and a recreate rebuilds.
         if head(url, &|| false).is_ok_and(|h| h.incarnation.as_deref() != Some(incarnation)) {
-            return Err(Fail::Other(recreated_error(url, incarnation)));
+            return Err(recreated(url, incarnation));
         }
-        return Err(Fail::Other(format!(
-            "read {url} at {offset}: beyond the end of the stream that acknowledged it (the \
-             server lost acknowledged data?); the local files are kept (delete them to rebuild)"
-        )));
+        return Err(Error::LostData {
+            url: url.to_owned(),
+            offset: offset.to_owned(),
+        });
     }
     if status != 200 {
-        return Err(Fail::Other(format!(
-            "read {url} at {offset}: {status} {}",
-            String::from_utf8_lossy(&body)
-        )));
+        return Err(Error::Status {
+            op: "read",
+            url: request,
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
     }
     let Some(next) = next else {
-        return Err(Fail::Other(format!(
-            "read {url} at {offset}: no Stream-Next-Offset"
-        )));
+        return Err(Error::NoNextOffset {
+            op: "read",
+            url: request,
+        });
     };
     Ok((body, next))
 }
@@ -303,11 +312,14 @@ pub(crate) fn read_from(
 /// A read loop's step: `next`, answered by a read at `at` that returned bytes, must sort past `at`.
 /// Checked in the loops only, where both are server offsets (or `START`): an older sidecar's
 /// unpadded offset, read once to probe for a 416, compares meaninglessly.
-pub(crate) fn advanced(url: &str, at: &str, len: usize, next: &str) -> Result<(), String> {
+pub(crate) fn advanced(url: &str, at: &str, len: usize, next: &str) -> Result<(), Error> {
     if next <= at {
-        return Err(format!(
-            "read {url} at {at}: {len} bytes but next offset {next}"
-        ));
+        return Err(Error::OffsetNotAdvanced {
+            url: url.to_owned(),
+            at: at.to_owned(),
+            len,
+            next: next.to_owned(),
+        });
     }
     Ok(())
 }
@@ -336,12 +348,17 @@ pub(crate) struct Head {
 }
 
 /// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
-pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, String> {
+pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
     let r = read_retrying(|| agent().head(url).call(), stopped)
-        .map_err(|e| format!("head {url}: {e}"))?;
+        .map_err(|e| http_error("head", url, e))?;
     let status = r.status().as_u16();
     if status != 200 {
-        return Err(format!("head {url}: {status}"));
+        return Err(Error::Status {
+            op: "head",
+            url: url.to_owned(),
+            status,
+            body: String::new(),
+        });
     }
     Ok(Head {
         retained: header_offset(&r, "stream-retained-offset").unwrap_or_else(|| START.into()),
@@ -363,20 +380,21 @@ pub(crate) fn get_snapshot(
     incarnation: &str,
     offset: &str,
     stopped: &dyn Fn() -> bool,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<Vec<u8>>, Error> {
+    let request = format!("{url}/snapshot/{offset}");
     let mut r = read_retrying(
         || {
             bulk_agent()
-                .get(format!("{url}/snapshot/{offset}"))
+                .get(request.as_str())
                 .header("stream-incarnation", incarnation)
                 .call()
         },
         stopped,
     )
-    .map_err(|e| format!("get snapshot {offset}: {e}"))?;
+    .map_err(|e| http_error("get snapshot", &request, e))?;
     let status = r.status().as_u16();
     if status == 412 {
-        return Err(recreated_error(url, incarnation));
+        return Err(recreated(url, incarnation));
     }
     // A body cut short: the snapshot was superseded and its cold object deleted (after its grace)
     // while it was streaming, or the connection dropped. Either way, start again from `HEAD`.
@@ -386,10 +404,12 @@ pub(crate) fn get_snapshot(
     match status {
         200 => Ok(Some(body)),
         404 | 410 => Ok(None),
-        _ => Err(format!(
-            "get snapshot {offset}: {status} {}",
-            String::from_utf8_lossy(&body)
-        )),
+        _ => Err(Error::Status {
+            op: "get snapshot",
+            url: request,
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }),
     }
 }
 
@@ -402,7 +422,7 @@ pub(crate) fn put_idempotent(
     incarnation: &str,
     body: &[u8],
     stopped: &dyn Fn() -> bool,
-) -> Result<(u16, ureq::http::Response<ureq::Body>), String> {
+) -> Result<(u16, ureq::http::Response<ureq::Body>), Error> {
     let deadline = Instant::now() + retry_budget();
     let mut backoff = Duration::from_millis(50);
     loop {
@@ -413,33 +433,29 @@ pub(crate) fn put_idempotent(
             .send(body)
         {
             Ok(r) if r.status().as_u16() < 500 => return Ok((r.status().as_u16(), r)),
-            Ok(mut r) => format!(
-                "{} {}",
-                r.status(),
-                r.body_mut().read_to_string().unwrap_or_default()
-            ),
-            Err(e) => e.to_string(),
+            Ok(mut r) => Attempt::Status {
+                status: r.status().as_u16(),
+                body: body_text(&mut r),
+            },
+            Err(e) => Attempt::Transport(Box::new(e)),
         };
         if Instant::now() + backoff > deadline || stopped() {
-            return Err(format!("put {url}: {unknown}"));
+            return Err(Error::PutUnknown {
+                url: url.to_owned(),
+                last: unknown,
+            });
         }
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
-/// Marks the error of a request refused because the stream is no longer the incarnation it was
-/// sent to (`is_recreated`): state built from one incarnation never reaches another.
-const RECREATED: &str = "deleted and recreated";
-
 /// The error for a 412: `url` is no longer stream incarnation `incarnation`.
-pub(crate) fn recreated_error(url: &str, incarnation: &str) -> String {
-    format!("fenced: {url} was {RECREATED} (no longer incarnation {incarnation}, 412)")
-}
-
-/// Whether `e` reports the stream deleted and recreated (`recreated_error`).
-pub(crate) fn is_recreated(e: &str) -> bool {
-    e.contains(RECREATED)
+pub(crate) fn recreated(url: &str, incarnation: &str) -> Error {
+    Error::Recreated {
+        url: url.to_owned(),
+        incarnation: incarnation.to_owned(),
+    }
 }
 
 /// A commit's `Stream-Seq`: the owner's (epoch, producer sequence), each zero-padded to 20 digits,
@@ -462,6 +478,7 @@ mod tests {
     use super::get_snapshot;
     use super::head;
     use super::read_from;
+    use crate::error::Error;
 
     // A leader read the server could not confirm with a quorum in time answers 503 (Retry-After),
     // and a gateway may rate-limit with 429: catch-up reads and HEAD retry both, as appends do,
@@ -511,13 +528,19 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         });
-        let (bytes, next) = read_from(&url, "1", "4").map_err(String::from).unwrap();
+        let (bytes, next) = read_from(&url, "1", "4").unwrap();
         assert_eq!((&bytes[..], next.as_str()), (&b"abc"[..], "7"));
         assert_eq!(head(&url, &|| false).unwrap().retained, "2");
         let refused = get_snapshot(&url, "1", "9", &|| false).unwrap_err();
-        assert!(refused.contains("503"), "{refused}");
+        assert!(
+            matches!(refused, Error::Status { status: 503, .. }),
+            "{refused}"
+        );
         let refused = head(&url, &|| true).err().unwrap();
-        assert!(refused.contains("503"), "{refused}");
+        assert!(
+            matches!(refused, Error::Status { status: 503, .. }),
+            "{refused}"
+        );
         let read = "GET /b/s?offset=4&consistency=leader";
         assert_eq!(server.join().unwrap(), [
             read,
