@@ -829,8 +829,10 @@ async fn wait_writable(cluster: &mut JournalCluster, group: u32, context: &str) 
 /// Three nodes whose journals rotate no segment during the test, so a power
 /// loss drops exactly what followed the last clean restart. One node leads
 /// every group, every group then commits six more entries, and both
-/// followers lose power and those entries with it. Returns the cluster with
-/// the followers down, the surviving leader and the followers.
+/// followers lose power and those entries with it. They stay down for a
+/// second, long enough for the leader's replication to them to back off, so
+/// their conflicts reach it one at a time once they are back. Returns the
+/// cluster with the followers down, the surviving leader and the followers.
 async fn followers_lose_a_committed_tail(
     name: &str,
     context: &str,
@@ -868,6 +870,7 @@ async fn followers_lose_a_committed_tail(
     for node_id in &followers {
         cluster.wals[node_id].power_loss_losing_unsynced().await;
     }
+    madsim::time::sleep(Duration::from_secs(1)).await;
     (cluster, survivor, followers)
 }
 
@@ -902,8 +905,11 @@ async fn restart_shorter_followers(
 /// at once while the leader survives, and nothing is written afterwards.
 /// They are a majority, so the leader cannot remove them: it rewinds their
 /// replication and sends them its log again, with an unchanged membership
-/// entry to carry the rewind. Every group heals without an operator and
-/// keeps every acknowledged write.
+/// entry to carry the rewind. The first conflict to arrive must not make the
+/// leader remove that follower while the other one has not answered yet: a
+/// joint config that only the other follower could commit would wedge the
+/// group. Every group heals without an operator and keeps every acknowledged
+/// write.
 #[test]
 fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
     let _guard = sim_test_guard();
@@ -947,9 +953,8 @@ fn a_handoff_to_a_powered_off_follower_never_parks_the_survivor() {
             let (mut cluster, survivor, followers) =
                 followers_lose_a_committed_tail("gate-parked-handoff", &context).await;
 
-            // The survivor reaches no peer for a few probe ticks and hands
-            // every group it leads to a follower.
-            madsim::time::sleep(Duration::from_secs(1)).await;
+            // The survivor has reached no peer for a few probe ticks and
+            // hands every group it leads to a follower.
             let handoffs = ursula_raft::RaftGroupHandleRegistry::default();
             for group in JOURNAL_GROUPS {
                 handoffs.register(
