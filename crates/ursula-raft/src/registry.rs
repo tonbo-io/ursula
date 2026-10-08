@@ -41,6 +41,7 @@ use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
 use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
+#[cfg(test)]
 use ursula_shard::ShardPlacement;
 
 use crate::election::ElectionPolicy;
@@ -172,48 +173,34 @@ pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
 /// A group's shared cold-index page cache.
 pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>;
 
-/// Resources staged before publication of a group handle. Optional resources
-/// describe supported capabilities (single-node groups need no recovery gate).
-#[derive(Debug, Default, Clone)]
-struct GroupResources {
-    apply_health: crate::apply_failure::ApplyHealth,
-    snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
-    cache: Option<GroupColdIndexCache>,
-    barrier: Option<Arc<ReadIndexBarrier>>,
-    recovery: Option<Arc<GroupRejoin>>,
-}
-
+/// Resources published atomically with a live owner handle. Only cache and
+/// recovery are optional capabilities; every registered group has a barrier.
 #[derive(Debug, Clone)]
-enum GroupEntry {
-    Preparing(GroupResources),
-    Active {
-        raft: OwnerRaftHandle,
-        resources: GroupResources,
-    },
+pub(crate) struct GroupEntry {
+    pub(crate) apply_health: crate::apply_failure::ApplyHealth,
+    pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
+    pub(crate) cache: Option<GroupColdIndexCache>,
+    pub(crate) barrier: Arc<ReadIndexBarrier>,
+    pub(crate) recovery: Option<Arc<GroupRejoin>>,
 }
-
-impl Default for GroupEntry {
-    fn default() -> Self {
-        Self::Preparing(GroupResources::default())
-    }
-}
-
 impl GroupEntry {
-    fn resources(&self) -> &GroupResources {
-        match self {
-            Self::Preparing(resources) | Self::Active { resources, .. } => resources,
-        }
+    pub(crate) fn raft(&self) -> &OwnerRaftHandle {
+        self.barrier.owner()
     }
-    fn resources_mut(&mut self) -> &mut GroupResources {
-        match self {
-            Self::Preparing(resources) | Self::Active { resources, .. } => resources,
-        }
-    }
-    fn raft(&self) -> Option<&OwnerRaftHandle> {
-        match self {
-            Self::Preparing(_) => None,
-            Self::Active { raft, .. } => Some(raft),
-        }
+    fn check_recovery_vote(
+        &self,
+        group: RaftGroupId,
+        vote: crate::UrsulaVote,
+    ) -> Result<Option<crate::UrsulaVote>, GroupEngineError> {
+        let Some(rejoin) = &self.recovery else {
+            return Ok(None);
+        };
+        let floor = rejoin.recovery_vote().ok_or(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryVoteFloor {
+                raft_group_id: group,
+            },
+        ))?;
+        Ok((vote < floor).then_some(floor))
     }
 }
 
@@ -253,7 +240,7 @@ impl Default for RaftGroupHandleRegistry {
 /// Failure of snapshot admission, owned installation, or reference publication.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotInstallError {
-    #[error("snapshot group {group:?} is not registered or active")]
+    #[error("snapshot group {group:?} is not registered")]
     NotRegistered { group: RaftGroupId },
     #[error("snapshot group {group:?} is shutting down")]
     ShuttingDown { group: RaftGroupId },
@@ -296,7 +283,7 @@ impl Drop for PrefetchedSnapshotGuard {
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuorumProofError {
-    #[error("Raft group {group:?} has no registered ReadIndex barrier")]
+    #[error("Raft group {group:?} is not registered on this node")]
     NotRegistered { group: RaftGroupId },
     #[error("Raft group {group:?} is not led by this node")]
     NotLeader { group: RaftGroupId },
@@ -335,14 +322,6 @@ pub(crate) async fn confirm_recovery_barrier(
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
-    pub(crate) fn apply_health(&self, group: RaftGroupId) -> crate::apply_failure::ApplyHealth {
-        self.groups
-            .load()
-            .get(&group.0)
-            .map(|entry| entry.resources().apply_health.clone())
-            .unwrap_or_default()
-    }
-
     /// Configure the node-wide budget for each direction before constructing transports.
     pub fn with_append_transport_budget_bytes(mut self, bytes: usize) -> Self {
         self.append_send_budget = crate::grpc::AppendTransportBudget::new(bytes);
@@ -367,8 +346,9 @@ impl RaftGroupHandleRegistry {
         group: RaftGroupId,
         target: u64,
     ) -> Result<(), LeadershipTransferError> {
-        let (raft, metrics) = self.handoff_view(group)?;
-        self.validate_handoff(group, target, &raft, &metrics)?;
+        let (entry, metrics) = self.handoff_view(group)?;
+        self.validate_handoff(group, target, &entry, &metrics)?;
+        let raft = entry.raft();
         raft.trigger()
             .transfer_leader(target)
             .await
@@ -385,26 +365,31 @@ impl RaftGroupHandleRegistry {
         group: RaftGroupId,
         target: u64,
     ) -> Result<(), LeadershipTransferError> {
-        let (raft, metrics) = self.handoff_view(group)?;
-        self.validate_handoff(group, target, &raft, &metrics)
+        let (entry, metrics) = self.handoff_view(group)?;
+        self.validate_handoff(group, target, &entry, &metrics)
     }
 
+    /// One registry entry, so the gate checked is the gate of the Raft that
+    /// transfers.
     fn handoff_view(
         &self,
         group: RaftGroupId,
-    ) -> Result<(OwnerRaftHandle, RaftMetrics<UrsulaRaftTypeConfig>), LeadershipTransferError> {
-        let raft = self
-            .get(group)
+    ) -> Result<(Arc<GroupEntry>, RaftMetrics<UrsulaRaftTypeConfig>), LeadershipTransferError> {
+        let entry = self
+            .groups
+            .load()
+            .get(&group.0)
+            .cloned()
             .ok_or(LeadershipTransferError::NotRegistered { group })?;
-        let metrics = raft.metrics().borrow_watched().clone();
-        Ok((raft, metrics))
+        let metrics = entry.raft().metrics().borrow_watched().clone();
+        Ok((entry, metrics))
     }
 
     fn validate_handoff(
         &self,
         group: RaftGroupId,
         target: u64,
-        raft: &OwnerRaftHandle,
+        entry: &GroupEntry,
         metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
     ) -> Result<(), LeadershipTransferError> {
         let target_ack_age = metrics
@@ -417,9 +402,9 @@ impl RaftGroupHandleRegistry {
             group,
             target,
             metrics,
-            self.rejoin(group).as_deref(),
+            entry.recovery.as_deref(),
             target_ack_age,
-            raft.handoff_ack_window(),
+            entry.raft().handoff_ack_window(),
         )
     }
 
@@ -445,15 +430,8 @@ impl RaftGroupHandleRegistry {
             let entry = groups
                 .get(&group.0)
                 .ok_or(QuorumProofError::NotRegistered { group })?;
-            let raft = entry
-                .raft()
-                .cloned()
-                .ok_or(QuorumProofError::NotRegistered { group })?;
-            let barrier = entry
-                .resources()
-                .barrier
-                .clone()
-                .ok_or(QuorumProofError::NotRegistered { group })?;
+            let raft = entry.raft().clone();
+            let barrier = entry.barrier.clone();
             (raft, barrier)
         };
         confirm_recovery_barrier(group, &raft, barrier.as_ref()).await
@@ -491,7 +469,7 @@ impl RaftGroupHandleRegistry {
             .groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| entry.raft().map(|raft| (*id, raft.clone())))
+            .map(|(id, entry)| (*id, entry.raft().clone()))
             .collect::<Vec<_>>();
         let results = join_all(groups.into_iter().map(|(id, raft)| async move {
             match raft.with_raft_state(|_| ()).await {
@@ -516,21 +494,17 @@ impl RaftGroupHandleRegistry {
     }
 
     /// Publish all group resources together, before any transport can find its Raft handle.
-    pub(crate) fn register_engine(
-        &self,
-        engine: &crate::RaftGroupEngine,
-        recovery: Option<Arc<GroupRejoin>>,
-    ) {
-        let handle = engine.read_barrier.owner().clone();
-        let entry = Arc::new(GroupEntry::Active {
-            raft: handle,
-            resources: GroupResources {
-                apply_health: engine.apply_health.clone(),
-                snapshot_installs: engine.snapshot_installs.clone(),
-                cache: engine.cold_index_cache.clone(),
-                barrier: Some(engine.read_barrier.clone()),
-                recovery,
-            },
+    pub(crate) fn register_engine(&self, engine: &crate::RaftGroupEngine) {
+        let entry = Arc::new(GroupEntry {
+            apply_health: engine.apply_health.clone(),
+            snapshot_installs: engine.snapshot_installs.clone(),
+            cache: engine.cold_index_cache.clone(),
+            barrier: engine.read_barrier.clone(),
+            recovery: engine
+                .rejoin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         });
         self.groups.rcu(|groups| {
             let mut groups = (**groups).clone();
@@ -540,65 +514,12 @@ impl RaftGroupHandleRegistry {
         self.refresh_group_elections(engine.placement.raft_group_id);
     }
 
-    fn update_group(&self, group: RaftGroupId, update: impl Fn(&mut GroupEntry)) {
-        self.groups.rcu(|groups| {
-            let mut groups = (**groups).clone();
-            let entry = groups.entry(group.0).or_default();
-            update(Arc::make_mut(entry));
-            groups
-        });
-    }
-
-    pub fn register(&self, placement: ShardPlacement, raft: RaftGroupHandle) {
-        let owner = self
-            .read_barrier(placement.raft_group_id)
-            .map(|barrier| barrier.owner().clone())
-            .unwrap_or_else(|| OwnerRaftHandle::new(raft));
-        self.update_group(placement.raft_group_id, |entry| {
-            let resources = std::mem::take(entry.resources_mut());
-            *entry = GroupEntry::Active {
-                raft: owner.clone(),
-                resources,
-            };
-        });
-        self.refresh_group_elections(placement.raft_group_id);
-    }
-
-    pub fn register_cold_index_cache(
-        &self,
-        group: RaftGroupId,
-        cache: Option<GroupColdIndexCache>,
-    ) {
-        self.update_group(group, |entry| entry.resources_mut().cache = cache.clone());
-    }
-
-    #[cfg(any(test, madsim))]
-    pub(crate) fn register_read_barrier(&self, group: RaftGroupId, barrier: Arc<ReadIndexBarrier>) {
-        self.update_group(group, |entry| {
-            entry.resources_mut().barrier = Some(barrier.clone())
-        });
-    }
-
-    pub(crate) fn read_barrier(&self, group: RaftGroupId) -> Option<Arc<ReadIndexBarrier>> {
-        self.groups
-            .load()
-            .get(&group.0)
-            .and_then(|entry| entry.resources().barrier.clone())
-    }
-
-    pub fn register_rejoin(&self, group: RaftGroupId, rejoin: Arc<GroupRejoin>) {
-        self.update_group(group, |entry| {
-            entry.resources_mut().recovery = Some(rejoin.clone())
-        });
-        self.refresh_group_elections(group);
-    }
-
     /// The group's recovery gate, if it has one.
     pub fn rejoin(&self, raft_group_id: RaftGroupId) -> Option<Arc<GroupRejoin>> {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.resources().recovery.clone())
+            .and_then(|entry| entry.recovery.clone())
     }
 
     /// Operator recovery when a majority of the group's voters are gated:
@@ -610,13 +531,17 @@ impl RaftGroupHandleRegistry {
         raft_group_id: RaftGroupId,
         expected: &AcceptUnsyncedLossRequest,
     ) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
-        let rejoin = self
-            .rejoin(raft_group_id)
-            .filter(|_| self.contains_group(raft_group_id))
+        let entry = self
+            .groups
+            .load()
+            .get(&raft_group_id.0)
+            .cloned()
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let owner = self
-            .get(raft_group_id)
+        let rejoin = entry
+            .recovery
+            .clone()
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+        let owner = entry.raft().clone();
         let expected = *expected;
         let report = owner
             .call(move |_| async move { rejoin.accept_unsynced_loss(&expected).await })
@@ -634,13 +559,7 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| {
-                entry
-                    .resources()
-                    .recovery
-                    .as_ref()
-                    .map(|gate| (*id, gate.status()))
-            })
+            .filter_map(|(id, entry)| entry.recovery.as_ref().map(|gate| (*id, gate.status())))
             .collect()
     }
 
@@ -660,14 +579,14 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.resources().cache.clone())
+            .and_then(|entry| entry.cache.clone())
     }
 
     pub fn get(&self, raft_group_id: RaftGroupId) -> Option<OwnerRaftHandle> {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.raft().cloned())
+            .map(|entry| entry.raft().clone())
     }
 
     pub fn contains_group(&self, raft_group_id: RaftGroupId) -> bool {
@@ -689,11 +608,7 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.groups
-            .load()
-            .values()
-            .filter(|entry| entry.raft().is_some())
-            .count()
+        self.groups.load().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -776,21 +691,15 @@ impl RaftGroupHandleRegistry {
     fn set_registered_group_elections(&self) {
         let groups = self.groups.load();
         for entry in groups.values() {
-            if let Some(raft) = entry.raft() {
-                self.election
-                    .refresh(raft, entry.resources().recovery.clone());
-            }
+            self.election.refresh(entry.raft(), entry.recovery.clone());
         }
     }
 
     /// Serialize recovery-barrier changes with maintenance policy updates.
     pub(crate) fn refresh_group_elections(&self, group: RaftGroupId) {
         let groups = self.groups.load();
-        if let Some(entry) = groups.get(&group.0)
-            && let Some(raft) = entry.raft()
-        {
-            self.election
-                .refresh(raft, entry.resources().recovery.clone());
+        if let Some(entry) = groups.get(&group.0) {
+            self.election.refresh(entry.raft(), entry.recovery.clone());
         }
     }
 
@@ -817,7 +726,6 @@ impl RaftGroupHandleRegistry {
     pub fn recovery_barriers_ready(&self) -> bool {
         self.groups.load().values().all(|entry| {
             entry
-                .resources()
                 .recovery
                 .as_ref()
                 .is_none_or(|gate| gate.may_campaign())
@@ -829,16 +737,14 @@ impl RaftGroupHandleRegistry {
             .groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| {
-                entry
-                    .raft()
-                    .map(|raft| (*id, raft.clone(), entry.resources().apply_health.clone()))
-            })
+            .map(|(id, entry)| (*id, entry.clone()))
             .collect::<Vec<_>>();
 
         let log_progress = self.snapshot_build_coordinator().log_progress();
         let mut snapshots = Vec::with_capacity(groups.len());
-        for (raft_group_id, raft, health) in groups {
+        for (raft_group_id, entry) in groups {
+            let raft = entry.raft();
+            let health = &entry.apply_health;
             let log = log_progress
                 .get(&raft_group_id)
                 .copied()
@@ -867,14 +773,16 @@ impl RaftGroupHandleRegistry {
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
                     running,
-                    recovery_ready: self
-                        .rejoin(RaftGroupId(raft_group_id))
+                    recovery_ready: entry
+                        .recovery
+                        .as_ref()
                         .is_none_or(|rejoin| rejoin.vote_gate_open()),
-                    accepting_transfers: self.may_campaign(RaftGroupId(raft_group_id)),
+                    accepting_transfers: self.election.may_campaign(entry.recovery.as_deref()),
                     membership_joint: membership.get_joint_config().len() != 1,
                     membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
-                    stopped_for_operator: self
-                        .rejoin(RaftGroupId(raft_group_id))
+                    stopped_for_operator: entry
+                        .recovery
+                        .as_ref()
                         .is_some_and(|rejoin| rejoin.status().is_stalled()),
                 },
                 log,
@@ -883,20 +791,16 @@ impl RaftGroupHandleRegistry {
         snapshots
     }
 
-    pub(crate) fn check_recovery_vote(
-        &self,
-        group: RaftGroupId,
-        vote: crate::types::UrsulaVote,
-    ) -> Result<Option<crate::types::UrsulaVote>, GroupEngineError> {
-        let Some(rejoin) = self.rejoin(group) else {
-            return Ok(None);
-        };
-        let floor = rejoin.recovery_vote().ok_or({
-            GroupEngineError::Infra(ursula_runtime::GroupInfraError::RecoveryVoteFloor {
-                raft_group_id: group,
-            })
-        })?;
-        Ok((vote < floor).then_some(floor))
+    pub(crate) fn entry(&self, group: RaftGroupId) -> Result<Arc<GroupEntry>, GroupEngineError> {
+        self.groups
+            .load()
+            .get(&group.0)
+            .cloned()
+            .ok_or(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RaftGroupNotRegistered {
+                    raft_group_id: group,
+                },
+            ))
     }
 
     pub async fn append_entries(
@@ -904,11 +808,12 @@ impl RaftGroupHandleRegistry {
         raft_group_id: RaftGroupId,
         request: AppendEntriesRequest<UrsulaRaftTypeConfig>,
     ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
-        if let Some(floor) = self.check_recovery_vote(raft_group_id, request.vote)? {
+        let entry = self.entry(raft_group_id)?;
+        if let Some(floor) = entry.check_recovery_vote(raft_group_id, request.vote)? {
             return Ok(AppendEntriesResponse::HigherVote(floor));
         }
-        let raft = self.require_group(raft_group_id)?;
-        let rejoin = self.rejoin(raft_group_id);
+        let raft = entry.raft().clone();
+        let rejoin = entry.recovery.clone();
         raft.call(move |raft| async move {
             if let Some(rejoin) = rejoin {
                 rejoin.observe_inbound_append(&request);
@@ -925,8 +830,9 @@ impl RaftGroupHandleRegistry {
         raft_group_id: RaftGroupId,
         request: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
-        let raft = self.require_group(raft_group_id)?;
-        let rejoin = self.rejoin(raft_group_id);
+        let entry = self.entry(raft_group_id)?;
+        let raft = entry.raft().clone();
+        let rejoin = entry.recovery.clone();
         raft.call(move |raft| async move {
             if let Some(refusal) = rejoin.and_then(|rejoin| rejoin.screen_vote(&request)) {
                 return Ok(refusal);
@@ -948,36 +854,24 @@ impl RaftGroupHandleRegistry {
         // node's permit. The floor only rises and the Raft core's vote never
         // falls below it, so Raft refuses a vote the floor overtakes while
         // this request waits.
-        if let Some(floor) = self.check_recovery_vote(raft_group_id, vote)? {
+        let entry = self.entry(raft_group_id)?;
+        if let Some(floor) = entry.check_recovery_vote(raft_group_id, vote)? {
             return Ok(SnapshotResponse::new(floor));
         }
         // Wait in the RPC future, so canceled queued requests retain neither
-        // an owned task nor shutdown-drain admission. Recheck the active engine
-        // only after both bounded installation resources are available.
+        // an owned task nor shutdown-drain admission. Admit the captured engine
+        // only after both resources are available; shutdown rejects stale waiters.
         let lock = self.snapshot_install.install_lock(raft_group_id.0);
         let serial = lock.lock_owned().await;
         let permit = self.snapshot_install.acquire().await?;
-        let (raft, lifetime) = {
-            let groups = self.groups.load();
-            let entry = groups.get(&raft_group_id.0).ok_or_else(|| {
-                SnapshotInstallError::NotRegistered {
+        let raft = entry.raft().clone();
+        let lifetime =
+            entry
+                .snapshot_installs
+                .admit()
+                .ok_or(SnapshotInstallError::ShuttingDown {
                     group: raft_group_id,
-                }
-            })?;
-            let raft =
-                entry
-                    .raft()
-                    .cloned()
-                    .ok_or_else(|| SnapshotInstallError::NotRegistered {
-                        group: raft_group_id,
-                    })?;
-            let lifetime = entry.resources().snapshot_installs.admit().ok_or_else(|| {
-                SnapshotInstallError::ShuttingDown {
-                    group: raft_group_id,
-                }
-            })?;
-            (raft, lifetime)
-        };
+                })?;
         let registry = self.clone();
         // The admitted task retains prefetch and permits through Raft consumption,
         // even when the RPC waiter disconnects or is canceled.
@@ -1104,9 +998,10 @@ impl RaftGroupHandleRegistry {
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
     ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, GroupEngineError>
     {
-        let raft = self.require_group(raft_group_id)?;
+        let entry = self.entry(raft_group_id)?;
+        let raft = entry.raft();
         if *request.to_node_id() == raft.metrics().borrow_watched().id
-            && !self.may_campaign(raft_group_id)
+            && !self.election.may_campaign(entry.recovery.as_deref())
         {
             return Err(GroupEngineError::new(
                 "the recovery gate is closed; refusing leadership transfer",
@@ -1135,16 +1030,8 @@ impl RaftGroupHandleRegistry {
         Ok(snapshot)
     }
 
-    fn require_group(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Result<OwnerRaftHandle, GroupEngineError> {
-        self.get(raft_group_id).ok_or_else(|| {
-            GroupEngineError::new(format!(
-                "raft group {} is not registered on this node",
-                raft_group_id.0
-            ))
-        })
+    fn require_group(&self, group: RaftGroupId) -> Result<OwnerRaftHandle, GroupEngineError> {
+        Ok(self.entry(group)?.raft().clone())
     }
 }
 
@@ -1169,23 +1056,30 @@ mod tests {
 
     use super::*;
 
-    /// F13: forwarded gRPC reads look up the group's shared page cache here.
-    #[test]
-    fn registry_hands_out_the_registered_group_page_cache() {
-        let registry = RaftGroupHandleRegistry::default();
-        let group = ursula_shard::RaftGroupId(3);
-        assert!(registry.cold_index_cache(group).is_none());
-        let cache: GroupColdIndexCache = Arc::new(ColdIndexPageCache::new(
-            Arc::new(ColdStoreColdIndexPageStore::new(Arc::new(
-                ursula_runtime::ColdStore::memory().expect("memory cold store"),
-            ))),
-            8,
-        ));
-        registry.register_cold_index_cache(group, Some(cache.clone()));
-        let shared = registry.cold_index_cache(group).expect("registered cache");
-        assert!(Arc::ptr_eq(&shared, &cache));
-        registry.register_cold_index_cache(group, None);
-        assert!(registry.cold_index_cache(group).is_none());
+    /// A real engine publishes its shared resources in one step.
+    #[cfg_attr(madsim, madsim::test)]
+    #[cfg_attr(not(madsim), tokio::test)]
+    async fn registry_hands_out_the_registered_group_page_cache() {
+        let check = async {
+            let (registry, engine, _root) = reference_failure_engine(Arc::default()).await;
+            let group = engine.placement.raft_group_id;
+            let shared = registry.cold_index_cache(group).expect("registered cache");
+            assert!(Arc::ptr_eq(
+                &shared,
+                engine.cold_index_cache.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &registry.entry(group).unwrap().barrier,
+                &engine.read_barrier
+            ));
+            assert_eq!(registry.len(), 1);
+            assert!(registry.get(group).is_some());
+            engine.shutdown().await.unwrap();
+        };
+        #[cfg(madsim)]
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, check).await;
+        #[cfg(not(madsim))]
+        check.await;
     }
 
     #[derive(Debug)]
@@ -1364,7 +1258,7 @@ mod tests {
         )
         .await
         .unwrap();
-        registry.register_engine(&engine, None);
+        registry.register_engine(&engine);
         (registry, engine, wal_root)
     }
 
@@ -1382,6 +1276,45 @@ mod tests {
                 .unwrap(),
             );
         snapshot
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn queued_snapshot_cannot_switch_to_a_replacement_engine() {
+        let store = Arc::new(FailingReferenceStore::default());
+        let (registry, old, _old_root) = reference_failure_engine(store.clone()).await;
+        let serial = registry.snapshot_install.install_lock(7).lock_owned().await;
+        let request = registry.install_full_snapshot(
+            RaftGroupId(7),
+            crate::UrsulaVote::new_committed(1, 2),
+            reference_failure_snapshot(),
+        );
+        tokio::pin!(request);
+        assert!(futures_util::poll!(&mut request).is_pending());
+        old.shutdown().await.unwrap();
+        let (_, replacement, _new_root) = reference_failure_engine_for_group(
+            store,
+            RaftGroupId(7),
+            registry.snapshot_install_coordinator(),
+        )
+        .await;
+        registry.register_engine(&replacement);
+        drop(serial);
+        assert!(matches!(
+            request.await,
+            Err(SnapshotInstallError::ShuttingDown {
+                group: RaftGroupId(7)
+            })
+        ));
+        assert!(
+            replacement
+                .raft_handle()
+                .get_snapshot()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        replacement.shutdown().await.unwrap();
     }
 
     #[tokio::test]

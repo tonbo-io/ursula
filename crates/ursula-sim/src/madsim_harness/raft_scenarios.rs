@@ -365,7 +365,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
         log_index: appended_log_index,
     });
 
-    registry.register(learner_id, engines[learner_index].raft_handle());
+    registry.register(learner_id, &engines[learner_index]);
     let learner_added = leader
         .add_learner(learner_id, BasicNode::new("node-3"), true)
         .await
@@ -806,7 +806,7 @@ pub(super) async fn run_restart_follower_inner(
     )
     .await
     .expect("restart follower from its journal");
-    registry.register(restarted_id, restarted.raft_handle());
+    registry.register(restarted_id, &restarted);
     engines[restarted_index] = restarted;
     trace.push(SimEvent::NodeRestarted {
         node_id: restarted_id,
@@ -1011,7 +1011,7 @@ pub(super) async fn run_leader_failover_inner(
     )
     .await
     .expect("restart old leader from its journal");
-    registry.register(old_leader_id, restarted.raft_handle());
+    registry.register(old_leader_id, &restarted);
     engines[old_leader_index] = restarted;
     trace.push(SimEvent::FaultApplied {
         phase: "after_failover_append".to_owned(),

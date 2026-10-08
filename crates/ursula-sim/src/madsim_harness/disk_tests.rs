@@ -493,7 +493,7 @@ impl JournalCluster {
                 &self.policy,
                 &voters,
             );
-            registry.register(node_id, engine.raft_handle());
+            registry.register(node_id, &engine);
             self.engines.insert((group, node_id), engine);
             self.rejoins.insert((group, node_id), rejoin);
         }

@@ -148,9 +148,8 @@ impl RecoveryGate {
         nodes: BTreeMap<u64, BasicNode>,
         transport: T,
         config: RecoveryConfig,
-    ) {
-        rejoin.bind(&engine.raft_handle());
-        registry.register_engine(engine, Some(rejoin.clone()));
+    ) -> Result<(), ursula_runtime::GroupEngineError> {
+        engine.publish_recovery(rejoin.clone(), registry)?;
         let election = registry.election_policy();
         let barrier_transport = transport.clone();
         self.push(crate::rt::spawn(run_rejoin_heal(
@@ -221,5 +220,6 @@ impl RecoveryGate {
                 .await;
             }));
         }
+        Ok(())
     }
 }

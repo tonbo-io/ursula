@@ -109,25 +109,26 @@ pub(super) fn wire_recovery(
     policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
 ) {
-    registry.register_rejoin(node_id, rejoin.clone());
-    engine.attach_recovery(
-        rejoin.clone(),
-        &RaftGroupHandleRegistry::default(),
-        voters.clone(),
-        InProcessRecoveryTransport {
-            registry: registry.clone(),
-            policy: policy.clone(),
-            node_id,
-        },
-        ursula_raft::RecoveryConfig {
-            initialize: node_id == 1,
-            interval: RECOVERY_DRIVER_INTERVAL,
-            barrier_timeout: Duration::from_secs(1),
-            stall_after: RECOVERY_STALL_AFTER,
-            bootstrap_interval: RECOVERY_DRIVER_INTERVAL,
-            bootstrap_warn_after: Duration::from_secs(5),
-        },
-    );
+    engine
+        .attach_recovery(
+            rejoin.clone(),
+            &RaftGroupHandleRegistry::default(),
+            voters.clone(),
+            InProcessRecoveryTransport {
+                registry: registry.clone(),
+                policy: policy.clone(),
+                node_id,
+            },
+            ursula_raft::RecoveryConfig {
+                initialize: node_id == 1,
+                interval: RECOVERY_DRIVER_INTERVAL,
+                barrier_timeout: Duration::from_secs(1),
+                stall_after: RECOVERY_STALL_AFTER,
+                bootstrap_interval: RECOVERY_DRIVER_INTERVAL,
+                bootstrap_warn_after: Duration::from_secs(5),
+            },
+        )
+        .expect("bind and publish recovery before network registration");
 }
 
 #[derive(Clone)]

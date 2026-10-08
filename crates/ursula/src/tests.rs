@@ -5090,15 +5090,35 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store");
-    let registry = RaftGroupHandleRegistry::default();
-    registry.register_rejoin(
-        RaftGroupId(0),
-        Arc::new(
-            ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
-                .await
-                .expect("open the gate"),
-        ),
+    let placement = ursula_shard::ShardPlacement {
+        core_id: ursula_shard::CoreId(0),
+        shard_id: ursula_shard::ShardId(0),
+        raft_group_id: RaftGroupId(0),
+    };
+    let gate = Arc::new(
+        ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
+            .await
+            .expect("open the gate"),
     );
+    let engine = ursula_raft::RaftGroupEngine::new_node(
+        placement,
+        1,
+        Arc::new(
+            openraft::Config {
+                enable_tick: false,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        ),
+        ursula_raft::SingleNodeRaftNetworkFactory,
+        store,
+        ursula_raft::RaftGroupEngineOptions::default(),
+    )
+    .await
+    .expect("recovering engine");
+    let registry = RaftGroupHandleRegistry::default();
+    engine.publish_recovery(gate, &registry).unwrap();
     let runtime = spawn_runtime(
         &test_config(1, 1),
         Persistence::InMemory,
@@ -5119,6 +5139,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
     assert_eq!(body["reason"], json!("recovery_gate_closed"));
     assert_eq!(body["recovery_barriers_ready"], json!(false));
+    engine.shutdown().await.unwrap();
 }
 
 /// `accept-unsynced-loss` is an incarnation-bound admin mutation: it opens
@@ -5190,10 +5211,8 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
                 .await
                 .expect("restore retained vote");
         }
-        gate.bind(&engine.raft_handle());
         let registry = RaftGroupHandleRegistry::default();
-        registry.register_rejoin(RaftGroupId(0), gate.clone());
-        registry.register(placement, engine.raft_handle());
+        engine.publish_recovery(gate.clone(), &registry).unwrap();
         let runtime = spawn_runtime(
             &test_config(1, 1),
             Persistence::InMemory,

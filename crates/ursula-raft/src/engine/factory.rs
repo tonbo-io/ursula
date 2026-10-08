@@ -165,7 +165,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
             )
             .await?;
             if let Some(registry) = &self.registry {
-                registry.register_engine(&engine, None);
+                registry.register_engine(&engine);
             }
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
@@ -451,7 +451,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     bootstrap_interval: self.engine_config.bootstrap_peer_probe_interval,
                     bootstrap_warn_after: self.engine_config.bootstrap_peer_probe,
                 },
-            );
+            )?;
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
