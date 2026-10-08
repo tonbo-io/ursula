@@ -82,7 +82,7 @@ impl CommitStallTracker {
             if snap.current_leader != Some(my_id) {
                 continue;
             }
-            let last_log = snap.last_log_index;
+            let last_log = snap.last_log.map(|progress| progress.index);
             let committed = snap.committed.map(|c| c.index);
             let has_gap = match (last_log, committed) {
                 (Some(ll), Some(c)) => ll > c,

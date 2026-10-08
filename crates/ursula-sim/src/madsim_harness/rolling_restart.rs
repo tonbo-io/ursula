@@ -179,6 +179,7 @@ impl RollingRestartValidator {
                 continue;
             };
             let metrics = raft.metrics().borrow_watched().clone();
+            let last_log = raft.data_metrics().borrow_watched().last_log;
             let membership = metrics.membership_config.membership();
             let voter_ids: Vec<u64> = membership.voter_ids().collect();
             let learner_ids: Vec<u64> = membership.learner_ids().collect();
@@ -224,7 +225,8 @@ impl RollingRestartValidator {
                                     },
                                 ),
                             },
-                            last_log_index: metrics.last_log_index,
+                            last_log_index: last_log.map(|id| id.index),
+                            last_log_term: last_log.map(|id| id.leader_id.term),
                             committed_term: metrics.local_committed.map(|id| id.leader_id.term),
                             last_applied_term: metrics.last_applied.map(|id| id.leader_id.term),
                             snapshot_term: metrics.snapshot.map(|id| id.leader_id.term),

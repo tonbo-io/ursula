@@ -156,7 +156,7 @@ mod tests {
             node_id: 1,
             current_term: 1,
             current_leader: Some(2),
-            last_log_index: Some(20),
+            last_log: Some(progress),
             committed: Some(progress),
             last_applied: Some(progress),
             snapshot: None,

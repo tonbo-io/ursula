@@ -511,6 +511,7 @@ mod tests {
                 stopped_for_operator: false,
             },
             last_log_index: Some(100),
+            last_log_term: Some(1),
             committed_term: Some(1),
             last_applied_term: Some(1),
             snapshot_term: None,

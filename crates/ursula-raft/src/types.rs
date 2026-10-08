@@ -81,7 +81,8 @@ pub struct RaftGroupMetricsSnapshot {
     pub node_id: u64,
     pub current_term: u64,
     pub current_leader: Option<u64>,
-    pub last_log_index: Option<u64>,
+    /// The replica's last log id, `None` for an empty log.
+    pub last_log: Option<RaftLogProgressSnapshot>,
     pub committed: Option<RaftLogProgressSnapshot>,
     pub last_applied: Option<RaftLogProgressSnapshot>,
     pub snapshot: Option<RaftLogProgressSnapshot>,
