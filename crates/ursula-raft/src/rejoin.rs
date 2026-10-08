@@ -592,16 +592,31 @@ impl GroupRejoin {
 
     /// Attach the group's Raft metrics. Call once the Raft exists and before
     /// it is reachable from the network.
-    pub fn bind(&self, raft: &RaftGroupHandle) {
+    pub(crate) fn bind(
+        &self,
+        raft: &RaftGroupHandle,
+    ) -> Result<(), ursula_runtime::GroupEngineError> {
+        let expected = raft.metrics().borrow_watched().id;
+        if self.node_id != expected {
+            return Err(ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RecoveryNodeMismatch {
+                    raft_group_id: self.raft_group_id,
+                    expected,
+                    actual: self.node_id,
+                },
+            ));
+        }
         if !self.vote_gate_open() {
             raft.runtime_config().elect(false);
         }
-        if self.metrics.set(raft.metrics()).is_err() {
-            tracing::warn!(
-                raft_group_id = self.raft_group_id.0,
-                "recovery gate metrics were already bound"
-            );
-        }
+        self.metrics.set(raft.metrics()).map_err(|_already_bound| {
+            ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
+                    raft_group_id: self.raft_group_id,
+                },
+            )
+        })?;
+        Ok(())
     }
 
     fn metrics(&self) -> Option<RaftMetrics<UrsulaRaftTypeConfig>> {

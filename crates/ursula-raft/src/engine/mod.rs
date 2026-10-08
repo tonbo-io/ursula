@@ -135,6 +135,7 @@ pub struct RaftGroupEngineOptions {
 }
 
 pub struct RaftGroupEngine {
+    pub(crate) rejoin: std::sync::OnceLock<Arc<crate::GroupRejoin>>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
     pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
@@ -376,6 +377,7 @@ impl RaftGroupEngine {
         })?;
 
         Ok(Self {
+            rejoin: Default::default(),
             apply_health,
             recovery_tasks: crate::rejoin::RecoveryGate::default(),
             snapshot_installs: Arc::default(),
@@ -421,6 +423,41 @@ impl RaftGroupEngine {
         self.raft.clone()
     }
 
+    /// Bind one recovery gate to this exact engine and publish its complete
+    /// resources. Re-publication preserves that gate; another gate is refused.
+    pub fn publish_recovery(
+        &self,
+        gate: Arc<crate::GroupRejoin>,
+        registry: &crate::RaftGroupHandleRegistry,
+    ) -> Result<(), GroupEngineError> {
+        if gate.raft_group_id() != self.placement.raft_group_id {
+            return Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RecoveryGroupMismatch {
+                    expected: self.placement.raft_group_id,
+                    actual: gate.raft_group_id(),
+                },
+            ));
+        }
+        if let Some(bound) = self.rejoin.get() {
+            if !Arc::ptr_eq(bound, &gate) {
+                return Err(GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
+                        raft_group_id: self.placement.raft_group_id,
+                    },
+                ));
+            }
+        } else {
+            gate.bind(&self.raft_handle())?;
+            self.rejoin.set(gate).map_err(|_already_bound| {
+                GroupEngineError::Infra(ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
+                    raft_group_id: self.placement.raft_group_id,
+                })
+            })?;
+        }
+        registry.register_engine(self);
+        Ok(())
+    }
+
     /// Attach production recovery drivers with an injected transport.
     pub fn attach_recovery<T: crate::RecoveryTransport>(
         &self,
@@ -429,9 +466,9 @@ impl RaftGroupEngine {
         nodes: BTreeMap<u64, BasicNode>,
         transport: T,
         config: crate::RecoveryConfig,
-    ) {
+    ) -> Result<(), GroupEngineError> {
         self.recovery_tasks
-            .attach(self, gate, registry, nodes, transport, config);
+            .attach(self, gate, registry, nodes, transport, config)
     }
 
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {

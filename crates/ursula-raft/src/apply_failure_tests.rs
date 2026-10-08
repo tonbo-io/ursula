@@ -96,8 +96,8 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     .await
     .unwrap();
     let registry = RaftGroupHandleRegistry::default();
-    registry.register_engine(&poisoned, None);
-    registry.register_engine(&healthy, None);
+    registry.register_engine(&poisoned);
+    registry.register_engine(&healthy);
     poisoned
         .raft
         .client_write(create_stream("before-poison"))

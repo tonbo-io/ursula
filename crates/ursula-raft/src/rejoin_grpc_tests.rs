@@ -169,9 +169,77 @@ async fn new_recovery_engine(
     )
     .await
     .expect("new engine on an empty WAL");
-    gate.bind(&engine.raft_handle());
-    registry.register_engine(&engine, Some(gate.clone()));
+    engine.publish_recovery(gate.clone(), &registry).unwrap();
     (engine, store, gate, wal_root)
+}
+
+#[tokio::test]
+async fn recovery_publication_keeps_one_gate_bound_to_one_engine() {
+    let registry = RaftGroupHandleRegistry::default();
+    let config = Arc::new(
+        Config {
+            enable_tick: false,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let (engine, store, gate, _root) = new_recovery_engine(1, config.clone(), &registry).await;
+    let original = registry.entry(placement().raft_group_id).unwrap();
+    engine.publish_recovery(gate.clone(), &registry).unwrap();
+    registry.register_engine(&engine);
+    assert!(Arc::ptr_eq(
+        &registry.rejoin(placement().raft_group_id).unwrap(),
+        &gate
+    ));
+    let alternate = Arc::new(
+        GroupRejoin::durable(1, placement().raft_group_id, &store)
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        engine.publish_recovery(alternate, &registry),
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryAlreadyBound { .. }
+        ))
+    ));
+    let other_registry = RaftGroupHandleRegistry::default();
+    let (other, _, other_gate, _other_root) = new_recovery_engine(1, config, &other_registry).await;
+    assert!(matches!(
+        other.publish_recovery(gate.clone(), &other_registry),
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryAlreadyBound { .. }
+        ))
+    ));
+    registry.register_engine(&other);
+    assert!(Arc::ptr_eq(original.recovery.as_ref().unwrap(), &gate));
+    assert!(Arc::ptr_eq(
+        registry
+            .entry(placement().raft_group_id)
+            .unwrap()
+            .recovery
+            .as_ref()
+            .unwrap(),
+        &other_gate
+    ));
+    assert!(matches!(
+        registry
+            .append_entries(
+                placement().raft_group_id,
+                crate::UrsulaAppendEntriesRequest {
+                    vote: crate::UrsulaVote::new_committed(1, 2),
+                    prev_log_id: None,
+                    entries: Vec::new(),
+                    leader_commit: None
+                }
+            )
+            .await,
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
+        ))
+    ));
+    engine.shutdown().await.unwrap();
+    other.shutdown().await.unwrap();
 }
 
 const ELECTION_TIMEOUT_MIN_MS: u64 = 300;

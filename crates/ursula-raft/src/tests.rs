@@ -2705,8 +2705,7 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
             .await
             .expect("open the gate"),
     );
-    gate.bind(&raft);
-    registry.register_engine(engine, Some(gate.clone()));
+    engine.publish_recovery(gate.clone(), &registry).unwrap();
     let metrics = raft.metrics().borrow_watched().clone();
     let matched = metrics.replication.as_ref().unwrap()[&target];
     assert!(gate.follower_lost_log(

@@ -864,33 +864,26 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 "group_read_request",
             )
             .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-            let raft = self
+            let entry = self
                 .registry
-                .get(placement.raft_group_id)
-                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
-            // The group's barrier, so forwarded linearizable reads share
-            // confirmation rounds with its local reads. The factories register
-            // it before the raft handle.
-            let read_barrier = self
-                .registry
-                .read_barrier(placement.raft_group_id)
-                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
+                .entry(placement.raft_group_id)
+                .map_err(|error| tonic::Status::not_found(error.to_string()))?;
+            let raft = entry.raft().clone();
+            let read_barrier = entry.barrier.clone();
             let cold_store = self.cold_store.clone();
-            let cold_index_cache = self
-                .registry
-                .cold_index_cache(placement.raft_group_id)
-                .or_else(|| {
-                    cold_store.as_ref().map(|cold_store| {
-                        Arc::new(ColdIndexPageCache::new(
-                            Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
-                            1024,
-                        ))
-                    })
-                });
-            let apply_health = self.registry.apply_health(placement.raft_group_id);
+            let cold_index_cache = entry.cache.clone().or_else(|| {
+                cold_store.as_ref().map(|cold_store| {
+                    Arc::new(ColdIndexPageCache::new(
+                        Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                        1024,
+                    ))
+                })
+            });
+            let apply_health = entry.apply_health.clone();
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
+                        rejoin: Default::default(),
                         apply_health,
                         snapshot_installs: Arc::default(),
                         metadata_serial: Arc::default(),

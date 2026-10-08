@@ -5117,9 +5117,8 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     )
     .await
     .expect("recovering engine");
-    gate.bind(&engine.raft_handle());
     let registry = RaftGroupHandleRegistry::default();
-    registry.register_engine(&engine, Some(gate));
+    engine.publish_recovery(gate, &registry).unwrap();
     let runtime = spawn_runtime(
         &test_config(1, 1),
         Persistence::InMemory,
@@ -5212,9 +5211,8 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
                 .await
                 .expect("restore retained vote");
         }
-        gate.bind(&engine.raft_handle());
         let registry = RaftGroupHandleRegistry::default();
-        registry.register_engine(&engine, Some(gate.clone()));
+        engine.publish_recovery(gate.clone(), &registry).unwrap();
         let runtime = spawn_runtime(
             &test_config(1, 1),
             Persistence::InMemory,

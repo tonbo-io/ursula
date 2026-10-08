@@ -9,7 +9,7 @@ not open journal writers or individually wire recovery drivers.
 | `RaftWal` | Node run state, per-core writer lifetime, group log stores and shutdown. The seven primary WAL exports live in `ursula_raft::wal`; persisted-format inspection types live under `wal::diagnostics`. |
 | `RecoveryGate::attach` | Bind the follower gate, publish the group's resources, start bootstrap/heal/barrier drivers and retain their task handles. Engine shutdown aborts and joins them; drop cancels startup leftovers. Native gRPC and simulation inject `RecoveryTransport` into the same wiring. |
 | `ElectionPolicy` | Combine node shedding and per-group recovery eligibility, refresh OpenRaft's election switch, and validate outbound handoff targets. Transfers use campaign eligibility because receiving a transfer starts an election. Cold-health pressure alone remains electable. |
-| `GroupEntry` | Keep the active Raft handle, read barrier, recovery gate and cold-index cache together. Engine factories publish them together; legacy test registration still stages optional resources. The registry routes requests to these entries. |
+| `GroupEntry` | Keep the active Raft handle, read barrier, recovery gate and cold-index cache together. Engine factories and fixtures publish them together through the engine. A recovery gate is bound once to its engine and cannot be removed by re-publication. Each RPC retains one entry snapshot through dispatch. The registry routes requests to these entries. |
 | `ursula-proto` | Own shared admin requests, responses and recovery status. The complete WAL metric set, including its sample types, remains in runtime. The full metrics response has not yet been unified. |
 
 All server leadership handoffs enter through the registry. A target must be

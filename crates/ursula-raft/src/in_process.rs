@@ -40,9 +40,6 @@ pub struct InProcessRaftRegistry {
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
     barriers: Arc<Mutex<BTreeMap<u64, Arc<crate::read_index::ReadIndexBarrier>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
-    /// Each node's recovery gate, screening the votes and appends delivered
-    /// to it.
-    rejoins: Arc<Mutex<BTreeMap<u64, Arc<GroupRejoin>>>>,
 }
 
 impl InProcessRaftRegistry {
@@ -53,7 +50,7 @@ impl InProcessRaftRegistry {
             .expect("in-process barrier mutex")
             .insert(node_id, engine.read_barrier.clone());
         let endpoint = crate::RaftGroupHandleRegistry::default();
-        endpoint.register_engine(engine, self.rejoin(node_id));
+        endpoint.register_engine(engine);
         self.endpoints
             .lock()
             .expect("endpoint registry")
@@ -130,27 +127,9 @@ impl InProcessRaftRegistry {
         endpoint.vote(group, request).await
     }
 
-    /// Screen the votes and appends delivered to `node_id` through its
-    /// recovery gate (replaces a previous registration).
-    pub fn register_rejoin(
-        &self,
-        node_id: u64,
-        engine: &crate::RaftGroupEngine,
-        rejoin: Arc<GroupRejoin>,
-    ) {
-        self.rejoins
-            .lock()
-            .expect("in-process raft rejoin mutex")
-            .insert(node_id, rejoin);
-        self.register(node_id, engine);
-    }
-
     pub fn rejoin(&self, node_id: u64) -> Option<Arc<GroupRejoin>> {
-        self.rejoins
-            .lock()
-            .expect("in-process raft rejoin mutex")
-            .get(&node_id)
-            .cloned()
+        let (group, endpoint) = self.endpoint(node_id)?;
+        endpoint.rejoin(group)
     }
 
     pub fn full_snapshot_count(&self, node_id: u64) -> usize {

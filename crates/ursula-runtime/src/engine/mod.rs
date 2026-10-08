@@ -822,6 +822,23 @@ pub enum UnproposableCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
     #[error(
+        "recovery gate node {actual} differs from engine node {expected} for {raft_group_id:?}"
+    )]
+    RecoveryNodeMismatch {
+        raft_group_id: RaftGroupId,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("raft group {raft_group_id:?} is not registered on this node")]
+    RaftGroupNotRegistered { raft_group_id: RaftGroupId },
+    #[error("recovery gate for group {raft_group_id:?} is already bound")]
+    RecoveryAlreadyBound { raft_group_id: RaftGroupId },
+    #[error("recovery gate group {actual:?} differs from engine group {expected:?}")]
+    RecoveryGroupMismatch {
+        expected: RaftGroupId,
+        actual: RaftGroupId,
+    },
+    #[error(
         "raft group {raft_group_id:?} stopped after a committed apply failure; retain WAL for corrected-code replay"
     )]
     ApplyStopped {
