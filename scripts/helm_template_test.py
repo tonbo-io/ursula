@@ -268,6 +268,17 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn("app.kubernetes.io/name:", pod_labels)
         self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
 
+    def test_rollout_rbac_has_no_schema_one_controller_revision_permission(self) -> None:
+        for reserved in ("true", "false"):
+            with self.subTest(maintenance_reservation=reserved):
+                rendered = render_chart(
+                    "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
+                    "--set", "server.gracefulRollout.enabled=true", "--set",
+                    f"server.gracefulRollout.maintenanceReservation={reserved}",
+                )
+                self.assertNotIn("controllerrevisions", rendered)
+                self.assertIn('resources: ["statefulsets"]', rendered)
+
     def test_shared_maintenance_job_rbac_and_inventory(self) -> None:
         values = (
             "--namespace", "test", "--set", "s3.bucket=bkt", "--set",

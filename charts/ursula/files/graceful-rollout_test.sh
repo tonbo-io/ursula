@@ -21,7 +21,7 @@ original_wait_for_pod_started=$(declare -f wait_for_pod_started)
 wait_for_pod_started() { wait_for_pod_ready "$1"; }
 original_write_manifest=$(declare -f write_manifest)
 original_record_state=$(declare -f record_state)
-# Legacy state-machine fixtures below model ordering only. Instance-binding
+# State-machine fixtures below model ordering only. Instance-binding
 # regressions exercise the real function in their own source-only subshell.
 bind_replacement_incarnation() { :; }
 
@@ -35,9 +35,9 @@ kubectl() {
     *"get configmap ursula-rollout-state -o jsonpath={.data.target-revision}"*)
       printf '%s' ursula-stale
       ;;
-    *"get configmap ursula-rollout-state -o jsonpath={.data.state-schema-version}"*|\
-    *"get configmap ursula-rollout-state -o jsonpath={.data.source-pod-uid}"*)
-      ;;
+    *"get configmap ursula-rollout-state -o jsonpath={.data.state-schema-version}"*) printf '%s' 3 ;;
+    *"get configmap ursula-rollout-state -o jsonpath={.data.source-pod-uid}"*) printf '%s' source-pod ;;
+    *"get configmap ursula-rollout-state -o jsonpath={.data.process-manifest}"*) printf '%s' '{"nodes":[]}' ;;
     *"get configmap ursula-rollout-state -o jsonpath={.data.phase}"*)
       printf '%s' restarting
       ;;
@@ -108,108 +108,42 @@ resume_if_needed
 [ "${resumed_forward}" = "1" ]
 [ "${resumed_complete}" = "1" ]
 
-# A schema-v1 state can outlive more than one failed Helm attempt. If the
-# current Ready Pod has a strictly newer controller-owned sequence than the
-# saved target, wait for it to catch up, undrain it and close the stale
-# record without replacing it.
-legacy_ctl=$(mktemp)
-legacy_ctl_calls=$(mktemp)
-export legacy_ctl_calls
-cat >"${legacy_ctl}" <<'CTL'
-#!/bin/sh
-case "$1" in
-  wait|undrain)
-    printf '%s\n' "$1" >>"${legacy_ctl_calls}"
-    ;;
-  *)
-    printf 'unexpected legacy ursulactl invocation: %s\n' "$*" >&2
-    exit 1
-    ;;
-esac
-CTL
-chmod +x "${legacy_ctl}"
-CTL=${legacy_ctl}
-kubectl() {
-  case "$*" in
-    *"get configmap ursula-rollout-state -o jsonpath={.data.target-image}"*)
-      printf '%s' ghcr.io/tonbo-io/ursula@sha256:saved
-      ;;
-    *"get configmap ursula-rollout-state -o jsonpath={.data.target-revision}"*)
-      printf '%s' ursula-revision-13
-      ;;
-    *"get configmap ursula-rollout-state -o jsonpath={.data.state-schema-version}"*)
-      printf '%s' "${legacy_state_schema}"
-      ;;
-    *"get configmap ursula-rollout-state -o jsonpath={.data.source-pod-uid}"*)
-      printf '%s' "${legacy_source_pod_uid}"
-      ;;
-    *"get configmap ursula-rollout-state -o jsonpath={.data.phase}"*)
-      printf '%s' restarting
-      ;;
-    *"get configmap ursula-rollout-state -o jsonpath={.data.node-id}"*)
-      printf '%s' 3
-      ;;
-    *"get configmap ursula-rollout-state"*)
-      return 0
-      ;;
-    *"get pod ursula-2 -o jsonpath={.status.conditions"*)
-      printf '%s' True
-      ;;
-    *"get pod ursula-2 -o jsonpath={.metadata.uid}"*)
-      printf '%s' newer-pod-uid
-      ;;
-    *"get pod ursula-2 -o jsonpath={.metadata.labels.controller-revision-hash}"*)
-      printf '%s' ursula-revision-14
-      ;;
-    *"get controllerrevision ursula-revision-13 -o jsonpath={.revision}"*)
-      printf '%s' 13
-      ;;
-    *"get controllerrevision ursula-revision-14 -o jsonpath={.revision}"*)
-      printf '%s' "${legacy_current_sequence}"
-      ;;
-    *)
-      printf 'unexpected legacy kubectl invocation: %s\n' "$*" >&2
-      return 1
-      ;;
-  esac
-}
-desired_revision() { printf '%s' ursula-revision-15; }
-wait_for_pod_ready() { [ "$1" = "2" ]; }
-wait_for_pod_started() { wait_for_pod_ready "$1"; }
-start_forward() { [ "$1" = "2" ]; legacy_forward=1; }
-strict_verify() { legacy_verifies=$((legacy_verifies + 1)); }
-replace_pod() { legacy_destructive_call=1; return 1; }
-record_state() {
-  [ "$1" = complete ]
-  [ "$2" = 3 ]
-  legacy_complete=1
-}
-legacy_forward=0
-legacy_verifies=0
-legacy_destructive_call=0
-legacy_complete=0
-legacy_current_sequence=14
-legacy_state_schema=
-legacy_source_pod_uid=
-resume_if_needed
-[ "${legacy_forward}" = "1" ]
-[ "${legacy_verifies}" = "1" ]
-[ "${legacy_destructive_call}" = "0" ]
-[ "${legacy_complete}" = "1" ]
-[ "$(tr '\n' ' ' <"${legacy_ctl_calls}")" = "wait undrain " ]
-legacy_current_sequence=12
-if replacement_attempt_was_superseded 2 ursula-revision-13 ''; then
-  echo "an older ControllerRevision must not supersede saved rollout state" >&2
-  exit 1
-fi
-legacy_state_schema=2
-if resume_if_needed; then
-  echo "schema v2 restarting state without its source Pod UID must fail closed" >&2
-  exit 1
-fi
-rm -f "${legacy_ctl}" "${legacy_ctl_calls}"
+# Unknown and pre-0.7 schemas must fail before any resume mutation, even
+# when the saved phase says complete (a future schema can change its meaning).
+(
+  rejection_dir=$(mktemp -d)
+  trap 'rm -rf "${rejection_dir}"' EXIT
+  MANIFEST="${rejection_dir}/manifest"
+  printf '%s' unchanged >"${MANIFEST}"
+  rejected_mutation() { : >"${rejection_dir}/mutation"; return 1; }
+  CTL=rejected_mutation
+  replace_pod() { rejected_mutation; }
+  record_state() { rejected_mutation; }
+  kubectl() {
+    case "$*" in
+      *'{.data.state-schema-version}') printf '%s' "${rejected_schema}" ;;
+      *'{.data.phase}') printf '%s' "${rejected_phase}" ;;
+      *'{.data.node-id}') printf '%s' 1 ;;
+      *'{.data.source-pod-uid}') printf '%s' source-uid ;;
+      *'{.data.process-manifest}') printf '%s' '{"nodes":[]}' ;;
+      *" get "*) return 0 ;;
+      *) rejected_mutation ;;
+    esac
+  }
+  for rejected_schema in '' 1 2 4; do
+    for rejected_phase in restarting complete; do
+      if rejection=$(resume_if_needed); then
+        echo "unsupported schema ${rejected_schema} resumed" >&2
+        exit 1
+      fi
+      printf '%s' "${rejection}" | grep -q 'unsupported rollout state schema:'
+      [ ! -e "${rejection_dir}/mutation" ]
+      [ "$(cat "${MANIFEST}")" = unchanged ]
+    done
+  done
+)
 
-# Schema v2 uses the source Pod UID and therefore does not need legacy
+# Schema 3 uses the source Pod UID and therefore does not need
 # ControllerRevision access. An unchanged UID is not proof of replacement.
 kubectl() {
   case "$*" in
@@ -231,10 +165,10 @@ kubectl() {
 }
 controller_revision_read=0
 current_uid=new-uid
-replacement_attempt_was_superseded 0 ignored old-uid
+replacement_attempt_was_superseded 0 old-uid
 [ "${controller_revision_read}" = "0" ]
 current_uid=old-uid
-if replacement_attempt_was_superseded 0 ignored old-uid; then
+if replacement_attempt_was_superseded 0 old-uid; then
   echo "an unchanged source Pod UID must not close restarting state" >&2
   exit 1
 fi
@@ -284,7 +218,10 @@ CTL
         printf '%s' ursula-old-target
         ;;
       *"get configmap ursula-rollout-state -o jsonpath={.data.state-schema-version}"*)
-        printf '%s' 2
+        printf '%s' 3
+        ;;
+      *"get configmap ursula-rollout-state -o jsonpath={.data.process-manifest}"*)
+        printf '%s' '{"nodes":[]}'
         ;;
       *"get configmap ursula-rollout-state -o jsonpath={.data.source-pod-uid}"*)
         printf '%s' drained-source-uid
@@ -386,7 +323,7 @@ fi
 # stale replacement in the fixture cannot become Ready until resume replaces
 # it, so reversing these two calls recreates the production deadlock.
 call_order=
-legacy_shared_store_guard() { :; }
+require_unreserved_rollout() { :; }
 write_manifest() { :; }
 pin_manifest() { :; }
 wait_for_template() { :; }
@@ -642,10 +579,11 @@ echo "graceful-rollout.sh: all checks passed"
   deny_survivor=false
   saved_count=0
   observation_failure=false
+  fixture_schema=3
   kubectl() {
     case "$*" in
       *'{.data.source-pod-uid}') printf '%s' old-pod ;;
-      *'{.data.state-schema-version}') [ "${observation_failure}" = false ] || return 1; printf '%s' 3 ;;
+      *'{.data.state-schema-version}') [ "${observation_failure}" = false ] || return 1; printf '%s' "${fixture_schema}" ;;
       *'{.data.replacement-pod-uid}') printf '%s' "${bound_uid}" ;;
       *'{.metadata.uid}') printf '%s' "${current_uid}" ;;
       *) return 1 ;;
@@ -661,6 +599,15 @@ echo "graceful-rollout.sh: all checks passed"
     saved_count=$((saved_count + 1))
     bound_uid=$4
   }
+  for fixture_schema in '' 1 2 4; do
+    if bind_replacement_incarnation 3; then
+      echo "unsupported replacement schema ${fixture_schema} refreshed identity" >&2
+      exit 1
+    fi
+    [ ! -e "${identity_dir}/calls" ]
+    [ "${saved_count}" = 0 ]
+  done
+  fixture_schema=3
   current_uid=old-pod
   observation_failure=true
   if bind_replacement_incarnation 3; then echo 'failed state observation must refuse identity refresh' >&2; exit 1; fi
@@ -688,7 +635,7 @@ echo "graceful-rollout.sh: all checks passed"
   [ ! -s "${identity_dir}/calls" ]
 )
 
-# Disabling the new value cannot reopen the legacy writer after adoption.
+# A values change cannot reopen the unreserved writer beside a shared store.
 (
   . "${test_dir}/graceful-rollout.sh"
   guard_mode=present
@@ -699,9 +646,9 @@ echo "graceful-rollout.sh: all checks passed"
       failed) return 1 ;;
     esac
   }
-  if legacy_shared_store_guard; then echo 'shared store reopened legacy writer' >&2; exit 1; fi
+  if require_unreserved_rollout; then echo 'shared store reopened unreserved writer' >&2; exit 1; fi
   guard_mode=failed
-  if legacy_shared_store_guard; then echo 'failed GET reopened legacy writer' >&2; exit 1; fi
+  if require_unreserved_rollout; then echo 'failed GET reopened unreserved writer' >&2; exit 1; fi
   guard_mode=missing
-  legacy_shared_store_guard
+  require_unreserved_rollout
 )

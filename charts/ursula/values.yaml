@@ -91,8 +91,8 @@ server:
     # Shared CAS/process fencing requires all voters to support maintenance
     # tokens and an explicitly bootstrapped persistent <StatefulSet>-maintenance
     # ConfigMap. A missing store fails closed; this hook never initializes it.
-    # false retains only the uncertified legacy upgrade migration. Enable this
-    # after migration before claiming production-safe shared maintenance.
+    # false uses the rollout controller without a shared maintenance store.
+    # Enable this after bootstrapping the store for coordinated maintenance.
     maintenanceReservation: false
     # Groups `ursulactl verify-cluster` should find. Defaults to raft.groupCount.
     expectedGroups: null

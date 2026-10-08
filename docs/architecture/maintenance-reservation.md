@@ -205,12 +205,12 @@ The state retains at most eight retired replacements and the existing 32 Pod UID
 
 ## Outstanding host work
 
-`maintenanceReservation=false` retains the existing unconditional-apply adapter
-only for explicitly uncertified legacy migration. Legacy voters without executor
-admission need this controlled migration before strong takeover is enabled. Once
-the persistent store exists, the legacy Job refuses to run even if a later values
-change disables the reserved path; a failed store GET also fails closed. Bootstrap
-requires that every legacy executor has already stopped.
+`maintenanceReservation=false` uses the rollout controller for clusters without
+an initialized shared maintenance store. It reads and writes only rollout-state
+schema 3. Older or unknown state versions are refused rather than migrated.
+Once the persistent store exists, this unreserved Job refuses to run even if a
+later values change disables the reserved path. A failed store GET also fails
+closed. Store bootstrap requires every unreserved executor to have stopped.
 Both planned rollouts and managed-node writers must eventually use the common
 reservation before they can share one exclusion boundary. External uncoordinated
 force deletion or Node/provider mutation is not qualified by this Pod-only path.
