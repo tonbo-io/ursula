@@ -83,7 +83,8 @@ message RaftTransferLeaderRequestV1 {
 }
 
 message RaftTransferLeaderAckV1 {
-  // MessagePack-encoded TransferLeaderResponse; absent on pre-alpha28 peers.
+  // MessagePack-encoded openraft `TransferLeaderResponse`. Required: an empty
+  // value is a malformed response.
   bytes response = 1;
 }
 
