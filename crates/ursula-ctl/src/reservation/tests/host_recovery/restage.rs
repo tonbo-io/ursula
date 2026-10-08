@@ -275,10 +275,7 @@ fn restaged_state_preserves_schema_and_cannot_prune_its_floor() {
     };
     let next = fenced.recover_host(action).unwrap();
     let encoded = serde_json::to_value(&next).unwrap();
-    assert_eq!(
-        encoded["version"],
-        super::super::super::RESERVATION_SCHEMA_VERSION
-    );
+    assert_eq!(encoded["version"], 1);
     serde_json::from_value::<Reservation>(encoded.clone())
         .unwrap()
         .validate()

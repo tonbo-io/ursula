@@ -64,7 +64,7 @@ fn document() -> Value {
 #[test]
 fn initial_store_uses_one_schema_and_rejects_other_versions() {
     let initial = Reservation::initial(cell()).unwrap();
-    assert_eq!(initial.version, super::RESERVATION_SCHEMA_VERSION);
+    assert_eq!(u32::from(initial.version), 1);
     assert!(initial.hosts().is_none());
     // The initial store already has the final shape: optional data is null.
     let encoded = serde_json::to_value(&initial).unwrap();

@@ -16,6 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::ProcessIncarnation;
+use ursula_proto::admin::SchemaVersion;
 
 use crate::NodeInfo;
 use crate::quorum::QuorumVerification;
@@ -78,7 +79,8 @@ pub struct Operation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reservation {
-    version: u32,
+    /// The one reservation schema. Decoding refuses any other version.
+    version: SchemaVersion<1>,
     cell: CellIdentity,
     generation: u64,
     operation: Option<Operation>,
@@ -289,14 +291,12 @@ impl SourceIdentity {
     }
 }
 
-const RESERVATION_SCHEMA_VERSION: u32 = 1;
-
 impl Reservation {
     /// Reviewed bootstrap only. Missing/deleted stores must not call this as
     /// an automatic recovery fallback; this module never initializes a store.
     pub fn initial(cell: CellIdentity) -> Result<Self> {
         let state = Self {
-            version: RESERVATION_SCHEMA_VERSION,
+            version: SchemaVersion,
             cell,
             generation: 0,
             operation: None,
@@ -328,12 +328,11 @@ impl Reservation {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.version != RESERVATION_SCHEMA_VERSION
-            || self.cell.group_count == 0
+        if self.cell.group_count == 0
             || self.cell.core_count == 0
             || self.cell.voter_ids != BTreeSet::from([1, 2, 3])
         {
-            bail!("unsupported reservation schema or three-voter inventory");
+            bail!("unsupported three-voter inventory");
         }
         if let Some(hosts) = &self.hosts {
             hosts.validate(&self.cell)?;

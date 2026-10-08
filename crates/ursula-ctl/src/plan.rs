@@ -249,7 +249,7 @@ pub fn check_readiness(
                     )
                     .chain(
                         (report.node_id != target_node_id)
-                            .then(|| "invalid maintenance report identity or version".to_owned()),
+                            .then(|| "invalid maintenance report identity".to_owned()),
                     )
                     .collect()
             })
