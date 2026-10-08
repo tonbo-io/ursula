@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use ursula_shard::RaftGroupId;
 
@@ -154,12 +155,19 @@ impl ElectionPolicy {
     pub fn may_campaign(&self, gate: Option<&GroupRejoin>) -> bool {
         self.state().should_campaign() && gate.is_none_or(GroupRejoin::may_campaign)
     }
+    /// The one handoff policy: whether `target` can take over this node's
+    /// leadership of `group` now. OpenRaft parks a leader whose transfer
+    /// cannot complete, so the target must be another voter that answered
+    /// this leader within `ack_window` (`target_ack_age` is how long ago it
+    /// last did), holds every committed entry, and did not lose its log.
     pub(crate) fn validate_handoff(
         &self,
         group: RaftGroupId,
         target: u64,
         metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>,
         gate: Option<&GroupRejoin>,
+        target_ack_age: Option<Duration>,
+        ack_window: Duration,
     ) -> Result<(), LeadershipTransferError> {
         if metrics.current_leader != Some(metrics.id) {
             return Err(LeadershipTransferError::NotLeader { group });
@@ -169,6 +177,31 @@ impl ElectionPolicy {
         }
         if gate.is_some_and(|gate| gate.is_reverted_follower(target)) {
             return Err(LeadershipTransferError::RecoveringTarget { group, target });
+        }
+        if target_ack_age.is_none_or(|age| age > ack_window) {
+            return Err(LeadershipTransferError::UnreachableTarget {
+                group,
+                target,
+                ack_age: target_ack_age,
+            });
+        }
+        let matched = metrics
+            .replication
+            .as_ref()
+            .and_then(|replication| replication.get(&target))
+            .and_then(|matched| matched.as_ref())
+            .map(|log_id| log_id.index());
+        let committed = metrics
+            .local_committed
+            .as_ref()
+            .map(|log_id| log_id.index());
+        if matched < committed {
+            return Err(LeadershipTransferError::LaggingTarget {
+                group,
+                target,
+                matched,
+                committed,
+            });
         }
         Ok(())
     }
@@ -190,6 +223,25 @@ pub enum LeadershipTransferError {
     InvalidTarget { group: RaftGroupId, target: u64 },
     #[error("node {target} lost its log in Raft group {group:?}")]
     RecoveringTarget { group: RaftGroupId, target: u64 },
+    #[error(
+        "node {target} has not answered the leader of Raft group {group:?} recently (last answer \
+         {ack_age:?} ago)"
+    )]
+    UnreachableTarget {
+        group: RaftGroupId,
+        target: u64,
+        ack_age: Option<Duration>,
+    },
+    #[error(
+        "node {target} matched {matched:?} of Raft group {group:?}, short of the committed \
+         {committed:?}"
+    )]
+    LaggingTarget {
+        group: RaftGroupId,
+        target: u64,
+        matched: Option<u64>,
+        committed: Option<u64>,
+    },
     #[error("OpenRaft leadership transfer failed for {group:?}: {source}")]
     Raft {
         group: RaftGroupId,

@@ -344,6 +344,9 @@ pub enum TransferRejection {
     NotLeader,
     InvalidTarget,
     RecoveringTarget,
+    /// The target has not answered the leader recently or lacks committed
+    /// entries, so the handoff could not complete now.
+    UnreadyTarget,
     RaftStopped,
     /// A rejection a newer server of the same minor version reports that this
     /// build does not know. It is not retried.
@@ -352,7 +355,10 @@ pub enum TransferRejection {
 }
 impl TransferRejection {
     pub fn should_replan(self) -> bool {
-        matches!(self, Self::NotLeader | Self::RecoveringTarget)
+        matches!(
+            self,
+            Self::NotLeader | Self::RecoveringTarget | Self::UnreadyTarget
+        )
     }
 }
 

@@ -161,9 +161,16 @@ pub fn spawn_commit_stall_watchdog(
                 );
                 let mut handed_off = false;
                 for target in &action.targets {
-                    // A follower that lost its log can never win: handing it
-                    // leadership would only park the group in a transfer.
-                    if registry.is_reverted_follower(RaftGroupId(action.group_id), *target) {
+                    // A target that is down, behind or lost its log cannot
+                    // take over: handing it leadership would park the group
+                    // in a transfer.
+                    if let Err(err) = registry.check_handoff(RaftGroupId(action.group_id), *target)
+                    {
+                        tracing::warn!(
+                            "commit-stall: group {} skips target {}: {err}",
+                            action.group_id,
+                            target
+                        );
                         continue;
                     }
                     match registry

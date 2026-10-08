@@ -2563,6 +2563,10 @@ fn transfer_raft_error_response(
         LeadershipTransferError::RecoveringTarget { .. } => {
             (StatusCode::CONFLICT, TransferRejection::RecoveringTarget)
         }
+        LeadershipTransferError::UnreachableTarget { .. }
+        | LeadershipTransferError::LaggingTarget { .. } => {
+            (StatusCode::CONFLICT, TransferRejection::UnreadyTarget)
+        }
         LeadershipTransferError::InvalidTarget { .. } => {
             (StatusCode::BAD_REQUEST, TransferRejection::InvalidTarget)
         }

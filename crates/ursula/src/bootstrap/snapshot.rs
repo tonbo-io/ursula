@@ -237,10 +237,9 @@ pub fn spawn_snapshot_driver(
                     if snapshot.current_leader == Some(snapshot.node_id)
                         && let Some(target) = snapshot.voter_ids.iter().copied().find(|voter| {
                             *voter != snapshot.node_id
-                                && !registry.is_reverted_follower(
-                                    RaftGroupId(snapshot.raft_group_id),
-                                    *voter,
-                                )
+                                && registry
+                                    .check_handoff(RaftGroupId(snapshot.raft_group_id), *voter)
+                                    .is_ok()
                         })
                     {
                         match registry

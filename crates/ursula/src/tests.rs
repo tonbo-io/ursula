@@ -5832,7 +5832,6 @@ mod leadership_balance {
 
     use ursula_raft::RaftGroupMetricsSnapshot;
 
-    use crate::bootstrap::handoff_target_caught_up;
     use crate::bootstrap::leader_counts;
     use crate::bootstrap::plan_leadership_balance;
     use crate::bootstrap::plan_leadership_balance_with_eligible_nodes;
@@ -6023,15 +6022,6 @@ mod leadership_balance {
         let actions = plan_leadership_balance_with_eligible_nodes(&snaps, 2, 4, &eligible);
         assert_eq!(actions.len(), 3, "actions={actions:?}");
         assert!(actions.iter().all(|action| action.target == 3));
-    }
-
-    #[test]
-    fn balancer_hands_off_only_to_a_target_that_matched_the_leader_log() {
-        // An empty restarted voter has matched nothing; handing it the group
-        // leaves the leader muted in transfer while the target cannot win.
-        assert!(!handoff_target_caught_up(Some(11), None));
-        assert!(!handoff_target_caught_up(Some(11), Some(10)));
-        assert!(handoff_target_caught_up(Some(11), Some(11)));
     }
 
     #[test]
@@ -8513,6 +8503,25 @@ async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejection
             LeadershipTransferError::RecoveringTarget { group, target: 2 },
             StatusCode::CONFLICT,
             TransferRejection::RecoveringTarget,
+        ),
+        (
+            LeadershipTransferError::UnreachableTarget {
+                group,
+                target: 2,
+                ack_age: None,
+            },
+            StatusCode::CONFLICT,
+            TransferRejection::UnreadyTarget,
+        ),
+        (
+            LeadershipTransferError::LaggingTarget {
+                group,
+                target: 2,
+                matched: Some(4),
+                committed: Some(5),
+            },
+            StatusCode::CONFLICT,
+            TransferRejection::UnreadyTarget,
         ),
         (
             LeadershipTransferError::Raft {
