@@ -1653,7 +1653,7 @@
         },
         "initMembership": {
           "type": "boolean",
-          "description": "One-time fresh-cluster membership bootstrap flag."
+          "description": "Membership bootstrap from every voter, with the same empty-voter check as initMembershipPerGroup, which turns it on as well."
         },
         "initMembershipPerGroup": {
           "type": "boolean",

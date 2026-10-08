@@ -192,7 +192,8 @@ server:
 raft:
   # Number of Raft groups. Defaults to a lighter quickstart than production docs.
   groupCount: 64
-  # Fresh-cluster bootstrap flag. Set to false after the first successful ready.
+  # Let every voter bootstrap every group, with the same empty-voter check as below.
+  # initMembershipPerGroup: true turns this on as well.
   initMembership: false
   # Idempotent per-group bootstrap flag. Persistent groups may keep this enabled across restarts:
   # a replica that ever held its group never initializes it again, and a replica that holds

@@ -35,17 +35,15 @@ Cluster readiness test:
   Helm test rendering is disabled by tests.enabled=false.
 {{ end }}
 
-Important bootstrap step:
-  raft.initMembershipPerGroup is currently {{ .Values.raft.initMembershipPerGroup }}.
+Bootstrap:
+  raft.initMembershipPerGroup is {{ .Values.raft.initMembershipPerGroup }}.
 {{- if .Values.raft.initMembershipPerGroup }}
-  For a fresh cluster this should be true only for the first successful bootstrap.
-  After helm test passes, or after your equivalent readiness check succeeds,
-  update your values and run:
-    helm upgrade {{ .Release.Name }} <chart-ref-or-path> -n {{ .Release.Namespace }} --reuse-values --set raft.initMembershipPerGroup=false
-  If you do not use --reuse-values, repeat image overrides or use a values file.
+  Each Raft group initializes once every configured voter reports it empty and
+  no leader. Keep this value true across restarts and upgrades: a replica that
+  ever held its group never initializes it again.
 {{- else }}
-  Keep this value false for normal restarts and upgrades. The future Ursula
-  operator will own this transition automatically.
+  With raft.initMembership also false, the groups of a fresh cluster never
+  initialize and elect no leader.
 {{- end }}
 
 Static membership warning:
