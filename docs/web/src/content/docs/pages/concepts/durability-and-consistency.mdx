@@ -5,7 +5,7 @@ sidebarTitle: Durability and Consistency
 
 ## Durability
 
-An append is acknowledged once a **majority of voters** has replicated it. A single node failure cannot lose an acknowledged write. Acknowledged data lives in replicated hot state across the cluster, and a background worker flushes older segments to S3 on a configurable interval, after which the data inherits S3-grade durability.
+An append is acknowledged once a **majority of voters** has replicated it. A single node failure cannot lose an acknowledged write. With the default `raft.wal.fsync = "never"`, a replica holds the newest appends in the page cache, so a host crash of a majority of voters at once can lose the writes acknowledged after their last `fsync`. Set `always` to acknowledge only after `fsync` (see [Configuration](/docs/configuration#raft)). Acknowledged data lives in replicated hot state across the cluster, and a background worker flushes older segments to S3 on a configurable interval, after which the data inherits S3-grade durability.
 
 In a cross-region deployment with a 5-second flush interval, per-message durability is approximately 9-10 nines. The window where acknowledged-but-unflushed data is at risk from a simultaneous multi-region failure is measured in seconds.
 

@@ -39,8 +39,8 @@ diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
 For a mismatch, restore the stored counts reported in the error. A missing
 record on an existing WAL or a corrupt record also refuses startup. Do not
 replace it with the current configuration. See [WAL routing
-configuration](/docs/operations#wal-routing-configuration) for the upgrade and
-replica-rebuild limitations.
+configuration](/docs/operations#wal-routing-configuration) for rebuilding a
+replica.
 
 ### `raft.wal.path is required when raft.peers is set`
 

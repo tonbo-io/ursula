@@ -109,7 +109,7 @@ HTTP ---> Runtime ---> core mailbox ---> GroupActor
                                   Raft.client_write
                                        │
                                        v
-                            WAL append + fsync, replicate to followers
+                    WAL append (fsync per policy), replicate to followers
                                        │
                                        v commit
                                   StateMachine::apply
@@ -121,7 +121,7 @@ HTTP ---> Runtime ---> core mailbox ---> GroupActor
                                 AppendResponse -> client
 ```
 
-The leader writes the entry to its write-ahead log (WAL), fsyncs, and replicates to followers in parallel. Once a quorum has persisted the entry, the state machine applies it and the response goes back to the client. Producer dedup headers ([exactly-once writes](/docs/concepts/exactly-once-writes)) are checked inside the state machine, so retries of an already-applied append return the original offset rather than appending again. `Stream-Seq` is checked in the same place, after producer dedup, as a per-stream compare-and-set ([conditional writes](/docs/concepts/conditional-writes)).
+The leader appends the entry to its write-ahead log (WAL) and replicates it to followers in parallel. A replica acknowledges the entry once its journal holds it: in the page cache with the default `raft.wal.fsync = "never"`, after an `fsync` with `always` (see [Configuration](/docs/configuration#raft)). Once a quorum holds the entry, the state machine applies it and the response goes back to the client. Producer dedup headers ([exactly-once writes](/docs/concepts/exactly-once-writes)) are checked inside the state machine, so retries of an already-applied append return the original offset rather than appending again. `Stream-Seq` is checked in the same place, after producer dedup, as a per-stream compare-and-set ([conditional writes](/docs/concepts/conditional-writes)).
 
 ## Storage layout
 
@@ -142,7 +142,7 @@ Each Raft group has two storage planes: a replicated log and a stream state mach
               recent bytes         S3 objects
 ```
 
-The Raft log is the ordering and durability boundary for writes. A write is acknowledged only after a majority of that group's replicas persist the entry. The entry carries the stream command and metadata needed to apply it deterministically.
+The Raft log is the ordering and durability boundary for writes. A write is acknowledged only after a majority of that group's replicas hold the entry in their WAL. The entry carries the stream command and metadata needed to apply it deterministically.
 
 The stream data plane lives in the group's state machine. A group owns many streams, keyed by `(bucket_id, stream_id)`. For each stream it tracks metadata, offsets, producer dedup state, live snapshots, hot byte segments, and cold chunk references.
 

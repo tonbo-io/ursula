@@ -130,14 +130,13 @@ available parallelism and `group_count` defaults to that parallelism times 16
 Changing cores changes the journal directory of some groups. Changing group
 count changes stream routing. Neither is an online resharding operation.
 
-WAL roots written before this check have no topology record and cannot be
-upgraded in place by this release. Do not manufacture a record from the new
-configuration or remove the check's files. Keep a backup and run the previous
-release to export data, or rebuild one replica at a time on a fresh WAL from a
-healthy quorum using the existing cluster routing counts. Follow the rejoin
-procedure below and wait for full catch-up before replacing another replica.
-A single-node deployment needs an export/import migration. A fresh WAL alone
-does not preserve its data.
+For a mismatch, configure the stored counts again. The error reports them. Do
+not manufacture a record from the new configuration or remove the check's
+files. A replica whose record is missing or corrupt can be rebuilt on an empty
+WAL directory from a healthy quorum, with the cluster's routing counts. Follow
+the rejoin procedure below and wait for full catch-up before replacing another
+replica. A single node has no quorum to rebuild from, so a fresh WAL does not
+preserve its data.
 
 ### Rejoining a wiped node
 

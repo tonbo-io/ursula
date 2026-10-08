@@ -84,8 +84,14 @@ with `kubectl port-forward` (or run `curl` inside the pod with `kubectl exec`):
 
 ```bash
 kubectl port-forward pod/ursula-0 4438:4438
-curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" \
+  -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
 ```
+
+Every admin mutation needs the `x-ursula-process-incarnation` header with the
+`process_incarnation` the node reported before the operation. A node answers
+`428` without it and `412` after a restart.
 
 ## Expose With Ingress
 
