@@ -79,6 +79,14 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
                 ),
             ..
         } => StatusCode::SERVICE_UNAVAILABLE,
+        // Refused before proposal: nothing was written and a retry fails too.
+        RuntimeError::GroupEngine {
+            error:
+                ursula_runtime::GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::InvalidRaftCommand { .. },
+                ),
+            ..
+        } => StatusCode::BAD_REQUEST,
         RuntimeError::GroupEngine { error, .. } => match error.code() {
             Some(code) => stream_error_code_status(code),
             None => StatusCode::INTERNAL_SERVER_ERROR,
@@ -848,5 +856,15 @@ mod tests {
             );
             assert!(!error.to_string().contains("panic payload"));
         }
+        let unproposable = RuntimeError::GroupEngine {
+            core_id: ursula_shard::CoreId(0),
+            raft_group_id: ursula_shard::RaftGroupId(2),
+            error: ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::InvalidRaftCommand {
+                    command: ursula_runtime::UnproposableCommand::CreateBucket,
+                },
+            ),
+        };
+        assert_eq!(runtime_error_status(&unproposable), StatusCode::BAD_REQUEST);
     }
 }

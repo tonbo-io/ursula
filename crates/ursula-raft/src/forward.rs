@@ -532,7 +532,7 @@ pub(crate) fn validate_proposal(command: &GroupWriteCommand) -> Result<(), Group
     if matches!(command, ursula_stream::StreamCommand::CreateBucket { .. }) {
         return Err(GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::InvalidRaftCommand {
-                command: "CreateBucket".to_owned(),
+                command: ursula_runtime::UnproposableCommand::CreateBucket,
             },
         ));
     }

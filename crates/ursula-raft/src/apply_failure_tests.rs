@@ -121,7 +121,9 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     assert!(matches!(
         rejected,
         ursula_runtime::GroupEngineError::Infra(
-            ursula_runtime::GroupInfraError::InvalidRaftCommand { .. }
+            ursula_runtime::GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::CreateBucket
+            }
         )
     ));
     assert_eq!(
