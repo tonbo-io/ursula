@@ -74,6 +74,10 @@ type MetaLeaderId = <MetaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 #[path = "rejoin_grpc_tests.rs"]
 mod rejoin_grpc_tests;
 
+#[cfg(not(madsim))]
+#[path = "forward_tests.rs"]
+mod forward_tests;
+
 struct FileLogStoreBuilder;
 
 impl
@@ -386,13 +390,29 @@ async fn build_three_node_cluster(
     u64,
     Vec<tempfile::TempDir>,
 ) {
+    build_three_node_cluster_at(cluster_name, policy, |node_id| format!("node-{node_id}")).await
+}
+
+/// [`build_three_node_cluster`] with each node advertising `address(node_id)`.
+/// The in-process network delivers Raft RPCs by node id, so only leader
+/// forwarding (gRPC) dials these addresses.
+async fn build_three_node_cluster_at(
+    cluster_name: &str,
+    policy: Option<InProcessRaftNetworkPolicy>,
+    address: impl Fn(u64) -> String,
+) -> (
+    InProcessRaftRegistry,
+    Vec<RaftGroupEngine>,
+    u64,
+    Vec<tempfile::TempDir>,
+) {
     let registry = InProcessRaftRegistry::default();
     // OpenRaft also uses election_timeout_min as the vote RPC deadline.
     // Leave room for concurrent tests fsyncing votes on the same executor host.
     let config = raft_config(cluster_name, 500, 1_000);
     let mut nodes = BTreeMap::new();
     for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
+        nodes.insert(node_id, BasicNode::new(address(node_id)));
     }
 
     let mut engines = Vec::new();
