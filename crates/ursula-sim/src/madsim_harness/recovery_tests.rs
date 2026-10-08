@@ -908,8 +908,9 @@ async fn restart_shorter_followers(
 /// entry to carry the rewind. The first conflict to arrive must not make the
 /// leader remove that follower while the other one has not answered yet: a
 /// joint config that only the other follower could commit would wedge the
-/// group. Every group heals without an operator and keeps every acknowledged
-/// write.
+/// group until the heal step times out. Every group heals before a gated
+/// replica reports it stalled, without an operator, and keeps every
+/// acknowledged write.
 #[test]
 fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
     let _guard = sim_test_guard();
@@ -919,7 +920,9 @@ fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
             let (mut cluster, survivor, followers) =
                 followers_lose_a_committed_tail("gate-idle-majority", &context).await;
             restart_shorter_followers(&mut cluster, survivor, &followers, &context).await;
-            wait_healed(&cluster, &context, Duration::from_secs(15)).await;
+            // Healed before any gated replica reports its group stalled:
+            // nothing here needs an operator.
+            wait_healed(&cluster, &context, RECOVERY_STALL_AFTER).await;
             assert_no_vote_while_gated(&cluster, &context);
             for group in JOURNAL_GROUPS {
                 wait_writable(&mut cluster, group, &context).await;
