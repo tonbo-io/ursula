@@ -147,6 +147,11 @@ pub enum FrameDefect {
 /// Failure of the journal file.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    #[error("frozen archive '{}': {defect}", .path.display())]
+    FrozenArchive {
+        path: PathBuf,
+        defect: super::ArchiveDefect,
+    },
     #[error("{op} journal '{}': {source}", .path.display())]
     Io {
         path: PathBuf,
@@ -274,7 +279,8 @@ impl JournalError {
     pub(crate) fn kind(&self) -> io::ErrorKind {
         match self {
             Self::Io { source, .. } => source.kind(),
-            Self::NotAJournal { .. }
+            Self::FrozenArchive { .. }
+            | Self::NotAJournal { .. }
             | Self::UnsupportedVersion { .. }
             | Self::CorruptHeader { .. }
             | Self::CorruptFrame { .. }

@@ -379,6 +379,7 @@ runtime_metrics! {
         core per_core_wal_fsync_records, group per_group_wal_fsync_records;
     sum wal_reclaims: core per_core_wal_reclaims;
     sum wal_stopped_rewritten_bytes: core per_core_wal_stopped_rewritten_bytes;
+    sum wal_frozen_reference_rewritten_bytes: core per_core_wal_frozen_reference_rewritten_bytes;
     sum wal_reclaimed_bytes: core per_core_wal_reclaimed_bytes;
     sum wal_reclaim_ns: core per_core_wal_reclaim_ns;
     sum wal_reclaim_failures: core per_core_wal_reclaim_failures;
@@ -656,6 +657,8 @@ impl RuntimeMetricsInner {
             .add_at(core_index, sample.reclaims);
         self.per_core_wal_stopped_rewritten_bytes
             .add_at(core_index, sample.stopped_rewritten_bytes);
+        self.per_core_wal_frozen_reference_rewritten_bytes
+            .add_at(core_index, sample.frozen_reference_rewritten_bytes);
         self.per_core_wal_reclaimed_bytes
             .add_at(core_index, sample.reclaimed_bytes);
         self.per_core_wal_reclaim_ns
@@ -1012,7 +1015,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 161] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 163] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1101,6 +1104,8 @@ mod metric_manifest_tests {
         "per_core_wal_reclaims",
         "wal_stopped_rewritten_bytes",
         "per_core_wal_stopped_rewritten_bytes",
+        "wal_frozen_reference_rewritten_bytes",
+        "per_core_wal_frozen_reference_rewritten_bytes",
         "wal_reclaimed_bytes",
         "per_core_wal_reclaimed_bytes",
         "wal_reclaim_ns",
@@ -1257,11 +1262,13 @@ pub struct WalJournalSample {
     pub reclaim_ns: u64,
     /// Reclaim passes that stopped on an error and left the journal correct.
     pub reclaim_failures: u64,
-    /// Live entry bytes copied out of old segments.
+    /// Payload and encoded reference bytes copied out of old segments.
     pub rewritten_bytes: u64,
-    /// Subset copied for groups stopped by committed application failure.
+    /// Payload bytes archived once for groups stopped by committed apply failure.
     pub stopped_rewritten_bytes: u64,
-    /// Gauge: the journal's size, all segments.
+    /// Encoded immutable-payload references moved during journal reclaim.
+    pub frozen_reference_rewritten_bytes: u64,
+    /// Gauge: journal segments plus unique frozen payloads and pending garbage.
     pub physical_bytes: u64,
     /// Gauge: the journal's segments.
     pub segments: u64,

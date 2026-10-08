@@ -68,17 +68,33 @@ Chaos qualification.
 
 ## WAL retention cost
 
-A stopped group's intact committed history remains in the shared journal.
-It is excluded from snapshot selection and from the lagging-snapshot queue.
-Reclaim copies its records under the existing rewrite chunk and per-pass byte
-budgets so healthy groups can reclaim the journal's oldest segments. The
-`wal_stopped_rewritten_bytes` counter reports this subset of reclaim work.
-Alert on `ursula.raft.apply_stopped` and sustained growth of this counter.
-Repair the binary promptly to stop the recurring copy cost.
+A stopped group is excluded from snapshot selection and the lagging-snapshot
+queue. Reclaim moves each retained payload once into an immutable `frozen-*.seg`
+file beside the journal segments, using the existing journal encoding and disk
+interface. The shared journal keeps checksummed references. Later reclaim passes
+copy only those references, so the stopped group does not hold healthy groups'
+segments or repeatedly copy its payloads.
 
-This is bounded repeat rewriting, not a one-time relocation. The current WAL
-requires consecutive segment numbers to detect missing storage. Skipping an
-old frozen segment while deleting later segments would break that check. A
-one-time relocation scheme needs a separately reviewed durable compaction
-certificate. This change preserves the existing format and missing-segment
-validation. Memory and disk still retain the failed group's full live history.
+The archive is synced and its directory entry made durable before the journal
+reference is synced. Only then can reclaim discard the original records.
+Recovery verifies every referenced archive and the exact retained log IDs.
+Missing or damaged archives fail startup. Segment continuity checks still apply.
+Preserve the entire WAL directory, including the frozen files, during repair.
+
+`wal_stopped_rewritten_bytes` counts payload bytes moved into archives.
+`wal_frozen_reference_rewritten_bytes` counts later reference copying.
+`wal_physical_bytes` includes retained archive files. Alert on
+`ursula.raft.apply_stopped` and monitor retained disk space while repairing the
+binary. The payload counter should stop growing once that group's retained
+records have been archived, even while healthy groups keep writing.
+
+Corrected code replays the same committed entries through the references.
+Archives are collected after no remaining physical journal record references
+them and the old segments' deletion is durable. Cleanup failures are retried
+without blocking healthy journal reclamation. During an unverified-tail repair run,
+cleanup waits until the affected segment has been durably reclaimed. A later
+clean startup validates the durably repaired journal before collecting orphans.
+
+A binary that predates frozen references rejects them on replay, including in
+the newest segment. Once references have been written, repair with compatible
+code rather than downgrading or deleting the archives.

@@ -17,8 +17,8 @@
 //!   reverts directory operations that were not `fsync`ed.
 //!   [`SimDisk::power_loss_losing_unsynced`] drops every unsynced page, for
 //!   a schedule that needs the loss to happen.
-//! - [`SimDisk::inject_fault`] fails the next write, `fsync` or removal on a
-//!   path. A failed `fsync` marks the pages clean without persisting them, as
+//! - [`SimDisk::inject_fault`] fails the next write, `fsync`, removal or rename
+//!   to a path. A failed `fsync` marks the pages clean without persisting them, as
 //!   Linux does, so a later successful `fsync` does not make them durable.
 //!
 //! The disk also stands in for the host's boot id
@@ -65,6 +65,8 @@ pub enum SimDiskFault {
     Sync,
     /// The next removal of the file fails and removes nothing.
     Remove,
+    /// The next rename to this destination fails without changing either name.
+    Rename,
 }
 
 /// What [`SimDisk::power_loss`] did.
@@ -529,7 +531,8 @@ impl SimDisk {
         io_with_disk(|state| state.power_loss(prefix, &mut || false))
     }
 
-    /// Fails the next write or `fsync` of `path` with an I/O error.
+    /// Fails the next matching operation on `path` with an I/O error.
+    /// Rename faults are keyed by the destination path.
     pub fn inject_fault(path: &Path, fault: SimDiskFault) -> io::Result<()> {
         with_disk(|state| {
             state.faults.insert((path.to_owned(), fault));
@@ -621,6 +624,7 @@ impl JournalDisk for SimDisk {
 
     fn rename(from: &Path, to: &Path) -> io::Result<()> {
         io_with_disk(|state| {
+            state.take_fault(to, SimDiskFault::Rename)?;
             let inode = state.resolve_file(from)?;
             state.require_parent_dir(to)?;
             if state.resolve(to) == Some(Entry::Dir) {

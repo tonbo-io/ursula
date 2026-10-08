@@ -1460,7 +1460,7 @@ fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
 static MADSIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(madsim)]
-fn madsim_test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn madsim_test_guard() -> std::sync::MutexGuard<'static, ()> {
     MADSIM_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

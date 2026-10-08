@@ -52,8 +52,10 @@ pub(crate) struct FramePos {
 pub(crate) struct IndexedEntry {
     pub(crate) log_id: LogId,
     pub(crate) frame: FramePos,
-    /// What the entry weighs: in its segment's live bytes and in the cache.
+    /// Payload weight for read materialization budgets and cache accounting.
     pub(crate) bytes: u32,
+    /// Journal space; archived payload retains its original read budget above.
+    pub(crate) storage_bytes: u32,
 }
 
 /// How a record reaches [`GroupLog::apply`].
@@ -201,7 +203,8 @@ impl GroupLog {
                     ),
                 ))
             }
-            RaftGroupLogRecord::Purge(_)
+            RaftGroupLogRecord::FrozenAppend(_)
+            | RaftGroupLogRecord::Purge(_)
             | RaftGroupLogRecord::SaveCommitted(_)
             | RaftGroupLogRecord::TruncateAfter(_) => Ok(()),
         }
@@ -222,6 +225,31 @@ impl GroupLog {
                 Ok(())
             }
             RaftGroupLogRecord::Append(entries) => self.append(entries, at, mode),
+            RaftGroupLogRecord::FrozenAppend(frozen) => {
+                let Some(first) = frozen.entries.first().map(|entry| entry.log_id.index) else {
+                    return Ok(());
+                };
+                self.cache.truncate_after(first.checked_sub(1));
+                let storage_bytes = u32::try_from(
+                    at.loc
+                        .file_bytes()
+                        .div_ceil(u64::try_from(frozen.entries.len()).unwrap_or(u64::MAX)),
+                )
+                .unwrap_or(u32::MAX);
+                for entry in frozen.entries {
+                    let indexed = IndexedEntry {
+                        log_id: entry.log_id,
+                        frame: at,
+                        bytes: entry.bytes,
+                        storage_bytes,
+                    };
+                    if let Some(replaced) = self.index.insert(indexed)? {
+                        self.unlive(replaced);
+                    }
+                    self.add_live(at.segment, u64::from(storage_bytes));
+                }
+                Ok(())
+            }
             RaftGroupLogRecord::TruncateAfter(last) => {
                 self.truncate_after(last.map(|log_id| log_id.index));
                 Ok(())
@@ -280,6 +308,7 @@ impl GroupLog {
                 log_id: entry.log_id,
                 frame: at,
                 bytes,
+                storage_bytes: bytes,
             };
             if let Some(replaced) = self.index.insert(indexed)? {
                 self.unlive(replaced);
@@ -392,20 +421,36 @@ impl GroupLog {
     /// Records that a rewrite copied `entry`, last seen at `from`, to
     /// `to`. An entry the log no longer holds there (truncated, purged or
     /// written again since) keeps its position.
+    #[cfg(test)]
     pub(crate) fn relocate(&mut self, index: u64, from: FramePos, to: FramePos) {
+        self.relocate_sized(index, from, to, None);
+    }
+
+    pub(crate) fn relocate_sized(
+        &mut self,
+        index: u64,
+        from: FramePos,
+        to: FramePos,
+        bytes: Option<u32>,
+    ) {
         let Some(entry) = self.index.get_mut(index) else {
             return;
         };
         if entry.frame != from {
             return;
         }
+        let previous_bytes = entry.storage_bytes;
         entry.frame = to;
+        if let Some(bytes) = bytes {
+            entry.storage_bytes = bytes;
+        }
         let moved = *entry;
         self.unlive(IndexedEntry {
             frame: from,
+            storage_bytes: previous_bytes,
             ..moved
         });
-        self.add_live(to.segment, u64::from(moved.bytes));
+        self.add_live(to.segment, u64::from(moved.storage_bytes));
     }
 
     /// Records that a rewrite wrote the committed marker again at `to`.
@@ -509,7 +554,7 @@ impl Default for EntryIndex {
 /// Takes `entry` out of the live bytes of its segment.
 fn remove_live(live: &mut BTreeMap<SegmentId, u64>, entry: &IndexedEntry) {
     if let Some(bytes) = live.get_mut(&entry.frame.segment) {
-        *bytes = bytes.saturating_sub(u64::from(entry.bytes));
+        *bytes = bytes.saturating_sub(u64::from(entry.storage_bytes));
         if *bytes == 0 {
             live.remove(&entry.frame.segment);
         }
@@ -1084,6 +1129,7 @@ mod tests {
             log_id: log_id(term, index),
             frame: at(1, index),
             bytes: 1,
+            storage_bytes: 1,
         };
         let indexes = |index: &EntryIndex, range: (Bound<u64>, Bound<u64>)| {
             index

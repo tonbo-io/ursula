@@ -11,6 +11,7 @@
 //! - `reclaim`: which segments a reclaim pass deletes or rewrites, and which
 //!   groups it reports lagging.
 //! - `journal`: the framed, checksummed format of one segment.
+//! - `frozen`: immutable payload archives and validated journal references for stopped groups.
 //! - `core_meta`: each core's metadata file: every group's vote and log
 //!   state (empty, initialized or recovering).
 //! - `topology`: immutable core and group counts of the WAL root.
@@ -25,6 +26,9 @@
 mod core_meta;
 mod disk;
 mod file;
+mod frozen;
+#[cfg(test)]
+mod frozen_tests;
 mod group_log;
 mod journal;
 #[cfg(all(test, not(madsim)))]
@@ -51,6 +55,7 @@ pub use disk::JournalFile;
 #[cfg(madsim)]
 pub use disk::LockAttempt;
 pub use file::RaftGroupFileLogStore;
+pub use frozen::ArchiveDefect;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;
 pub use journal::JournalError;
@@ -120,6 +125,7 @@ use crate::types::UrsulaRaftTypeConfig;
 pub(crate) enum RaftGroupLogRecord {
     SaveCommitted(Option<LogIdOf<UrsulaRaftTypeConfig>>),
     Append(Vec<EntryOf<UrsulaRaftTypeConfig>>),
+    FrozenAppend(Box<frozen::FrozenAppend>),
     TruncateAfter(Option<LogIdOf<UrsulaRaftTypeConfig>>),
     Purge(LogIdOf<UrsulaRaftTypeConfig>),
 }

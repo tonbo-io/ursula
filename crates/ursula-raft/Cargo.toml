@@ -12,6 +12,7 @@ description = "OpenRaft integration for Ursula's per-group multi-Raft replicatio
 [dependencies]
 bitflags = { workspace = true }
 bytes = { workspace = true }
+blake3 = { workspace = true }
 crc32fast = { workspace = true }
 futures-util = { workspace = true }
 fs4 = { workspace = true }
@@ -50,7 +51,6 @@ sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 [dev-dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
-blake3 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 raft-log = "0.4.5"
 tempfile = { workspace = true }
