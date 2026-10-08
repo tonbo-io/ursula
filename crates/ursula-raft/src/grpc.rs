@@ -835,12 +835,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         )?;
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
-        self.registry
+        let response = self
+            .registry
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
             .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         Ok(tonic::Response::new(
-            raft_internal_proto::RaftTransferLeaderAckV1 {},
+            raft_internal_proto::RaftTransferLeaderAckV1 {
+                response: encode_wire(&response),
+            },
         ))
     }
 
@@ -1367,6 +1370,20 @@ impl GrpcRaftNetwork {
         }
     }
 
+    fn decode_transfer_leader_ack(
+        &self,
+        payload: &[u8],
+    ) -> Result<
+        openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>,
+        RPCError<UrsulaRaftTypeConfig>,
+    > {
+        // Pre-alpha28 peers acknowledge delivery with an empty envelope.
+        if payload.is_empty() {
+            return Ok(Ok(()));
+        }
+        self.decode_rpc_ack("TransferLeader", payload)
+    }
+
     /// Decode the MessagePack payload of an envelope-style ack.
     fn decode_rpc_ack<T: DeserializeOwned>(
         &self,
@@ -1808,16 +1825,20 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         &mut self,
         req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
-    ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+    ) -> Result<
+        openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>,
+        RPCError<UrsulaRaftTypeConfig>,
+    > {
         let envelope = self.transfer_leader_envelope(&req);
-        self.call(
-            "TransferLeader",
-            envelope,
-            option,
-            |mut client, request| async move { client.transfer_leader(request).await },
-        )
-        .await
-        .map(|_ack| ())
+        let ack = self
+            .call(
+                "TransferLeader",
+                envelope,
+                option,
+                |mut client, request| async move { client.transfer_leader(request).await },
+            )
+            .await?;
+        self.decode_transfer_leader_ack(&ack.response)
     }
 }
 
@@ -2441,5 +2462,50 @@ mod reconnect_tests {
         assert_eq!(net.consecutive_failures, 0);
         // Whether the post-rebuild client is Ok or Err is tonic's choice for
         // this endpoint string; the contract is just "no panic, counter reset".
+    }
+}
+
+#[cfg(all(test, not(madsim)))]
+mod transfer_leader_codec_tests {
+    use std::sync::Arc;
+
+    use openraft::vote::RaftLeaderId;
+    use ursula_shard::RaftGroupId;
+
+    use super::CoreRaftTransport;
+    use super::GrpcRaftNetwork;
+    use crate::codec::encode_wire;
+    use crate::types::UrsulaRaftTypeConfig;
+
+    #[tokio::test]
+    async fn transfer_leader_ack_preserves_typed_rejections_and_legacy_success() {
+        let network = GrpcRaftNetwork::new(
+            Arc::new(CoreRaftTransport::default()),
+            RaftGroupId(1),
+            2,
+            "http://127.0.0.1:1",
+        );
+        assert_eq!(network.decode_transfer_leader_ack(&[]).unwrap(), Ok(()));
+        for response in [
+            Ok(()),
+            Err(openraft::raft::TransferLeaderError::VoteChanged {
+                expected: openraft::Vote::new_committed(1, 1),
+                actual: openraft::Vote::new_committed(2, 2),
+            }),
+            Err(openraft::raft::TransferLeaderError::LogNotFlushed {
+                expected: Some(openraft::LogId::new(
+                    <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId::new(1, 1),
+                    4,
+                )),
+                actual: None,
+            }),
+        ] {
+            assert_eq!(
+                network
+                    .decode_transfer_leader_ack(&encode_wire(&response))
+                    .unwrap(),
+                response
+            );
+        }
     }
 }

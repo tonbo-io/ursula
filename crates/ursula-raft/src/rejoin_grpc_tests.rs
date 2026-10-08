@@ -366,7 +366,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .is_err(),
         "a leadership transfer must not bypass recovery"
     );
-    engines[2].raft.trigger().elect().await.unwrap();
+    engines[2].raft.trigger().elect(false).await.unwrap();
     tokio::time::sleep(LONGER_THAN_AN_ELECTION).await;
     assert_ne!(
         engines[2].raft.metrics().borrow_watched().current_leader,
@@ -508,7 +508,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         term,
         "undrain cannot bypass a new recovery gate"
     );
-    engines[2].raft.trigger().elect().await.unwrap();
+    engines[2].raft.trigger().elect(false).await.unwrap();
     engines[2]
         .raft
         .wait(Some(Duration::from_secs(5)))

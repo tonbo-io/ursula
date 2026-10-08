@@ -170,7 +170,7 @@ fn heal_view(
         reverted: rejoin.reverted_followers(&metrics.vote),
         awaiting_rewind,
         matched,
-        committed: log_index(metrics.committed.as_ref()),
+        committed: log_index(metrics.local_committed.as_ref()),
         configured: configured.clone(),
     }
 }

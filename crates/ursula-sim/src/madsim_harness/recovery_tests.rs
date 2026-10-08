@@ -128,7 +128,7 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
                 return false;
             };
             let leader_metrics = metrics(cluster, group, leader);
-            let committed = leader_metrics.committed.map(|log_id| log_id.index);
+            let committed = leader_metrics.local_committed.map(|log_id| log_id.index);
             NODES.into_iter().all(|node_id| {
                 let replica = metrics(cluster, group, node_id);
                 cluster.rejoins[&(group, node_id)].vote_gate_open()
@@ -333,7 +333,7 @@ fn a_follower_power_loss_rejoins_through_the_recovery_gate() {
                     cluster.engines[&(group, healthy)]
                         .raft_handle()
                         .trigger()
-                        .elect()
+                        .elect(false)
                         .await
                         .expect("trigger an election");
                 }
@@ -1046,7 +1046,7 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
                 madsim::time::sleep(Duration::from_millis(1)).await;
             };
             let joint = metrics(&cluster, joint_group, leader);
-            assert!(joint.committed < *joint.membership_config.log_id());
+            assert!(joint.local_committed < *joint.membership_config.log_id());
             // B loses its tail only after A's removal is pending.
             let before_loss = metrics(&cluster, joint_group, b).last_log_index;
             assert!(unsynced_loss_and_restart(&mut cluster, b).await > 0);

@@ -472,7 +472,7 @@ impl CommittedEntries {
                 continue;
             }
             let Some(committed) = metrics(cluster, group, node_id)
-                .committed
+                .local_committed
                 .map(|log_id| log_id.index)
             else {
                 continue;
@@ -732,7 +732,7 @@ fn bootstrap_membership_survives_full_cluster_power_loss_under_never() {
                 }
                 let elected = metrics(&cluster, group, leader);
                 assert!(
-                    elected.committed >= *elected.membership_config.log_id(),
+                    elected.local_committed >= *elected.membership_config.log_id(),
                     "{context}"
                 );
             }

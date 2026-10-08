@@ -8431,6 +8431,63 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
 }
 
 #[tokio::test]
+async fn self_election_uses_the_observed_vote_and_respects_the_recovery_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let spawned = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::Raft {
+            log_dir: root.path().into(),
+        },
+        Topology::static_cluster(
+            1,
+            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            1,
+            true,
+            Default::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = spawned.runtime;
+    let registry = spawned.raft_registry.unwrap();
+    runtime.warm_all_groups().await.unwrap();
+    let raft = registry.get(RaftGroupId(0)).unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "single voter elected")
+        .await
+        .unwrap();
+    let admin = admin_router(HttpState::with_raft_registry(
+        runtime.clone(),
+        registry.clone(),
+    ));
+    let request = SelfElectionRequest {
+        current_term: raft.metrics().borrow_watched().current_term,
+    };
+    let response = http_post(
+        &admin,
+        "/__ursula/raft/0/self-election",
+        &[("content-type", "application/json")],
+        Body::from(serde_json::to_vec(&request).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    let request = SelfElectionRequest {
+        current_term: raft.metrics().borrow_watched().current_term,
+    };
+    let response = http_post(
+        &admin,
+        "/__ursula/raft/0/self-election",
+        &[("content-type", "application/json")],
+        Body::from(serde_json::to_vec(&request).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    runtime.shutdown_group_engines().await.unwrap();
+    spawned.raft_wal.unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejections() {
     use ursula_proto::admin::TransferLeaderResponse;
     use ursula_proto::admin::TransferRejection;

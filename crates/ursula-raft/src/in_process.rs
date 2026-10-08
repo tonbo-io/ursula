@@ -697,7 +697,10 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         &mut self,
         req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
         _option: RPCOption,
-    ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+    ) -> Result<
+        openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>,
+        RPCError<UrsulaRaftTypeConfig>,
+    > {
         self.before_rpc(InProcessRaftRpcKind::TransferLeader)
             .await
             .map_err(RPCError::Unreachable)?;

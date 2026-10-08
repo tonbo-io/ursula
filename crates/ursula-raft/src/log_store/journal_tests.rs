@@ -1579,7 +1579,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     }
     let leader = engines[0].raft_handle();
     leader.initialize(members).await.unwrap();
-    leader.trigger().elect().await.unwrap();
+    leader.trigger().elect(false).await.unwrap();
     leader
         .wait(Some(Duration::from_secs(5)))
         .current_leader(1, "leader elected")

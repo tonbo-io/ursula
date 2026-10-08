@@ -2642,13 +2642,16 @@ async fn request_raft_self_election(
     let Some(registry) = state.raft_registry() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let transfer = openraft::raft::TransferLeaderRequest::new(
-        openraft::Vote::new(request.current_term, observed.id),
-        observed.id,
-        None,
-    );
+    // OpenRaft checks the persisted vote before accepting the transfer. A
+    // synthetic vote for this node is not the vote it actually observed.
+    let transfer = openraft::raft::TransferLeaderRequest::new(observed.vote, observed.id, None);
     match registry.handle_transfer_leader(group_id, transfer).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) => (
+            StatusCode::CONFLICT,
+            format!("self-election refused: {error}"),
+        )
+            .into_response(),
         Err(error) => (
             StatusCode::CONFLICT,
             format!("self-election refused: {error}"),
