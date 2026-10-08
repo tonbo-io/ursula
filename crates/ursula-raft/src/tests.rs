@@ -2901,6 +2901,69 @@ async fn registry_handoff_abandons_a_transfer_nobody_takes_over() {
     shutdown_all(&engines).await;
 }
 
+/// A leader steps down from a stalled transfer through a vote it grants
+/// itself. The vote is marked a leadership transfer, so the leader's own
+/// lease, which runs for a maximum election timeout after its election,
+/// cannot refuse it.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_transfer_step_down_is_not_refused_by_the_leaders_own_lease() {
+    use openraft::rt::WatchReceiver;
+    let (_network, engines, first, _roots) =
+        build_three_node_cluster("step-down-lease", None).await;
+    let first_raft = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == first)
+        .unwrap()
+        .raft_handle();
+    // A leader elected a moment ago: its lease is still running.
+    let leader = (1..=3).find(|id| *id != first).unwrap();
+    first_raft.trigger().transfer_leader(leader).await.unwrap();
+    first_raft
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(leader, "a fresh leader")
+        .await
+        .unwrap();
+    let raft = engines
+        .iter()
+        .find(|engine| engine.raft.metrics().borrow_watched().id == leader)
+        .unwrap()
+        .raft_handle();
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.state == openraft::ServerState::Leader,
+            "the fresh leader leads",
+        )
+        .await
+        .unwrap();
+    let vote = raft.metrics().borrow_watched().vote;
+    let last_log_id = raft.data_metrics().borrow_watched().last_log;
+    let target = first;
+
+    let mut plain = crate::owner::transfer_step_down(vote, target, last_log_id);
+    plain.leadership_transfer = false;
+    let refused = raft.vote(plain).await.unwrap();
+    assert!(
+        !refused.vote_granted,
+        "the lease refuses a plain vote request"
+    );
+    assert_eq!(raft.metrics().borrow_watched().vote, vote);
+
+    let stepped_down = raft
+        .vote(crate::owner::transfer_step_down(vote, target, last_log_id))
+        .await
+        .unwrap();
+    assert!(stepped_down.vote_granted);
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.state != openraft::ServerState::Leader && metrics.vote != vote,
+            "the leader stepped down",
+        )
+        .await
+        .unwrap();
+    shutdown_all(&engines).await;
+}
+
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn recovery_proof_rejects_a_vote_change_after_read_index() {

@@ -118,44 +118,65 @@ impl OwnerRaftHandle {
     /// leader forwards every write to `target`, sends no heartbeats, never
     /// campaigns, and refuses a candidate with a shorter log without adopting
     /// its term. Its `elect` keeps that leader state behind a new candidacy.
-    /// So the leader steps down as a follower would: it votes for `target`
-    /// in the next term with its own last log id, which drops the leader
-    /// state, then campaigns, shed or not. The target's own vote request is
-    /// still judged by its log.
+    /// So the leader steps down as a follower would ([`transfer_step_down`]),
+    /// which drops the leader state, then campaigns, shed or not. A refused
+    /// step-down is retried every minimum election timeout until the
+    /// leadership or the vote changes.
     pub(crate) fn abandon_stalled_transfer(&self, vote: UrsulaVote, target: u64) {
         let deadline = self.transfer_deadline;
+        let retry = self.handoff_ack_window;
         let job: Job = Box::new(move |raft| {
             Box::pin(async move {
-                let settled = raft
-                    .wait(Some(deadline))
-                    .metrics(
-                        |metrics| {
-                            metrics.vote != vote || metrics.state != openraft::ServerState::Leader
-                        },
-                        "leadership transfer settles",
-                    )
-                    .await;
-                if !matches!(settled, Err(openraft::metrics::WaitError::Timeout(..))) {
-                    return;
-                }
-                let last_log_id = raft.data_metrics().borrow_watched().last_log.clone();
-                let next = UrsulaVote::new(vote.leader_id().term().saturating_add(1), target);
-                match raft.vote(UrsulaVoteRequest::new(next, last_log_id)).await {
-                    Ok(stepped_down) if stepped_down.vote_granted => {
-                        tracing::warn!(
-                            node_id = raft.metrics().borrow_watched().id,
-                            target,
-                            %vote,
-                            ?deadline,
-                            "leadership transfer did not complete; stepping down and campaigning"
-                        );
-                        if let Err(error) = raft.trigger().elect(false).await {
-                            tracing::warn!(%error, "campaign after abandoning a leadership transfer");
-                        }
+                let mut wait = deadline;
+                loop {
+                    let settled = raft
+                        .wait(Some(wait))
+                        .metrics(
+                            |metrics| {
+                                metrics.vote != vote
+                                    || metrics.state != openraft::ServerState::Leader
+                            },
+                            "leadership transfer settles",
+                        )
+                        .await;
+                    if !matches!(settled, Err(openraft::metrics::WaitError::Timeout(..))) {
+                        return;
                     }
-                    Ok(_moved_on) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, target, "abandon a stalled leadership transfer");
+                    let last_log_id = raft.data_metrics().borrow_watched().last_log;
+                    match raft
+                        .vote(transfer_step_down(vote, target, last_log_id))
+                        .await
+                    {
+                        Ok(stepped_down) if stepped_down.vote_granted => {
+                            tracing::warn!(
+                                node_id = raft.metrics().borrow_watched().id,
+                                target,
+                                %vote,
+                                ?deadline,
+                                "leadership transfer did not complete; stepping down and \
+                                 campaigning"
+                            );
+                            if let Err(error) = raft.trigger().elect(false).await {
+                                tracing::warn!(
+                                    %error,
+                                    "campaign after abandoning a leadership transfer"
+                                );
+                            }
+                            return;
+                        }
+                        Ok(refused) => {
+                            tracing::debug!(
+                                target,
+                                %vote,
+                                refused_by = %refused.vote,
+                                "step-down from a stalled leadership transfer refused; retrying"
+                            );
+                            wait = retry;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, target, "abandon a stalled leadership transfer");
+                            return;
+                        }
                     }
                 }
             })
@@ -331,6 +352,25 @@ impl OwnerRaftHandle {
             .await
             .map_err(owner_stopped)?
     }
+}
+
+/// The vote a leader that is stuck in a transfer to `target` at `vote` grants
+/// itself to step down: a vote for `target` in the next term, at the leader's
+/// own last log id, so its log check passes. It is marked a leadership
+/// transfer, which this leader authorizes, so its own leader lease cannot
+/// refuse it. Granting it drops the leader state as for any follower; the
+/// target's own vote request in that term is still judged by its log.
+pub(crate) fn transfer_step_down(
+    vote: UrsulaVote,
+    target: u64,
+    last_log_id: Option<openraft::alias::LogIdOf<C>>,
+) -> UrsulaVoteRequest {
+    let mut request = UrsulaVoteRequest::new(
+        UrsulaVote::new(vote.leader_id().term().saturating_add(1), target),
+        last_log_id,
+    );
+    request.leadership_transfer = true;
+    request
 }
 
 /// Administrative triggers execute on the owner, including their task creation.
