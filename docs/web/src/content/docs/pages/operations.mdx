@@ -2,7 +2,7 @@
 title: Operations
 ---
 
-The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often: drain, status, readiness gates. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, and the operational policies ursulactl does not encode (backups, log levels). Deployment and process lifecycle belong to the platform, [Helm and OpenTofu](/docs/deploy-cluster).
+The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often: drain, status, readiness gates. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, and the operational policies ursulactl does not encode (backups, log levels). Deployment and process lifecycle belong to the platform, such as [Helm](/docs/deploy-cluster).
 
 ## Tooling map
 
@@ -130,14 +130,13 @@ available parallelism and `group_count` defaults to that parallelism times 16
 Changing cores changes the journal directory of some groups. Changing group
 count changes stream routing. Neither is an online resharding operation.
 
-WAL roots written before this check have no topology record and cannot be
-upgraded in place by this release. Do not manufacture a record from the new
-configuration or remove the check's files. Keep a backup and run the previous
-release to export data, or rebuild one replica at a time on a fresh WAL from a
-healthy quorum using the existing cluster routing counts. Follow the rejoin
-procedure below and wait for full catch-up before replacing another replica.
-A single-node deployment needs an export/import migration. A fresh WAL alone
-does not preserve its data.
+For a mismatch, configure the stored counts again. The error reports them. Do
+not manufacture a record from the new configuration or remove the check's
+files. A replica whose record is missing or corrupt can be rebuilt on an empty
+WAL directory from a healthy quorum, with the cluster's routing counts. Follow
+the rejoin procedure below and wait for full catch-up before replacing another
+replica. A single node has no quorum to rebuild from, so a fresh WAL does not
+preserve its data.
 
 ### Rejoining a wiped node
 
@@ -311,31 +310,37 @@ For MinIO or another S3-compatible store, add `--endpoint-url`. The copy must ma
 
 Never point two clusters at one prefix, and never point a new cluster at the source's prefix in place. After a restore both clusters hold the same streams under the same keys, but each one deletes cold objects by its own state alone: the cold GC after a delete, a retention advance or a compaction, the orphan sweep for unreferenced objects older than a day, and the pruning of `snapshots/` by the cluster's own references. Two clusters on one prefix delete objects the other still reads. A copy also leaves the source cluster and its prefix as they were, so the source stays a way back until clients switch.
 
-## Upgrading to 0.6
+## Upgrading to 0.7
 
-**0.6.0 is a breaking release.** It changes the storage format (format epoch 2) and removes several protocol features (listed in the release notes). It refuses to start on data written by 0.5.x (Raft WAL directories, object-storage prefixes, snapshots and backups) and will not join a cluster with 0.5.x nodes. There is no in-place upgrade, no automatic migration and no rollback.
+**0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
-- **If you run 0.5.x with data you need to keep, do not upgrade yet.** Stay on 0.5.1 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
-- **New deployments install on fresh storage:** empty PVCs and a never-used object-storage prefix.
-- **`helm upgrade` from 0.5.x stops at the first pod.** Recover with `helm rollback`.
+- **If you run 0.6 with data you need to keep, stay on 0.6.2.** 0.7 provides no migration path from 0.6.
+- **Deploy 0.7 fresh:** empty PVCs and a never-used object-storage prefix.
+- **`helm upgrade` from 0.6 stops before a second voter is replaced.** Recover with `helm rollback`.
 
-The removed protocol features, and every behaviour change, are listed in the [0.6.0 release notes](/docs/release-notes#removed).
+Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes#070).
 
-To install 0.6:
+To install 0.7:
 
-1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again; the registration and query formats changed ([release notes](/docs/release-notes#event-time-indexer-experimental)).
-2. **Reset SQLite VFS clients.** Stop every owner of a stream before upgrading the extension, then delete `<db>`, `<db>-wal` and `<db>-ursula` before attaching, or attach under a new stream URL.
-3. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
+1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again.
+2. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
+3. **Update the configuration.**
+   - Remove `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`, `raft.memory_bootstrap_marker_dir` and `raft.rejoin_probe`. A config file that still sets one fails to load.
+   - Set `raft.wal.path` on every node of a multi-node cluster. 0.6 defaulted to the memory WAL, and a 0.7 node with `raft.peers` refuses to start without a WAL path.
+   - Choose `raft.wal.fsync` (Helm `raft.walFsync`). The default `never` acknowledges a write once a quorum of voters holds it in the page cache, and a host crash can cost a replica its unsynced tail (see [Recovering after a host crash](#recovering-after-a-host-crash)). Set `always` to keep the 0.6 disk WAL behavior of one `fsync` per batch.
+   - With Helm, remove `raft.storageMode`, `raft.allowVolatileMultiPeer` and `persistence.enabled`. Every pod gets a PVC for its WAL. The values schema refuses unknown keys under `raft` and `persistence`.
+   - Keep `runtime.core_count` and `raft.group_count` explicit and unchanged (see [WAL routing configuration](#wal-routing-configuration)).
+4. **Update runbooks and tooling.** `ursulactl` 0.7 removes the memory-WAL restart verbs `prepare-restart`, `restart-quiesce-capability`, `finish-prepared-restart`, `abort-prepared-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`, `prepare-recovery-handoff` and `classify-amnesiac`. A planned restart is drain, restart, wait and undrain ([Restarting a voter](#restarting-a-voter)), and a voter that lost entries is rebuilt by its group leaders. Custom tooling that calls admin mutations must send `x-ursula-process-incarnation` ([Admin endpoints](#admin-endpoints)).
 
-`helm upgrade` from 0.5.x stalls at the first new pod, with the default `RollingUpdate` strategy and also with `OnDelete` plus the graceful rollout: the new pod exits at startup or reports not ready, so no second voter is replaced. Recover with `helm rollback`. The refused pod wrote nothing, so the old pods are unaffected.
+A values file that still sets a removed chart value fails validation, and nothing changes. Otherwise `helm upgrade` from 0.6 replaces the first pod, with the default `RollingUpdate` strategy and also with `OnDelete` plus the graceful rollout. That pod finds the 0.6 data on its volume and exits at startup, so no second voter is replaced. Recover with `helm rollback`. With `OnDelete`, also delete the refused pod after the rollback so that it starts from the 0.6 template again. The refused pod wrote nothing, so the old pods are unaffected.
 
-How a 0.6 node refuses old data, and what it prints, is listed under [Startup failures](/docs/troubleshooting#startup-failures). Every startup refusal happens before the node writes anything:
+How a 0.7 node refuses data of another release, and what it prints, is listed under [Startup failures](/docs/troubleshooting#startup-failures). Every startup refusal happens before the node writes anything:
 
 - **Raft WAL directory.** `{raft.wal.path}/raft-log/FORMAT_EPOCH` records the epoch. A directory that holds data without the marker, or a marker of another epoch, is refused. The marker is written after every check passes.
 - **Object storage.** `URSULA_FORMAT_EPOCH` sits at `storage.cold.root` when the cold backend is S3, otherwise at the S3 snapshot namespace (`storage.snapshot.s3_prefix`) when snapshots live on S3. A namespace that holds objects without the marker is refused, so it must be used only by this cluster. With a memory cold store and inline snapshots there is no object-storage check.
-- **Peers.** Before it writes the markers, a node with configured peers asks each one, in parallel (2 seconds to connect plus 2 seconds for the answer, about 4 seconds at most), whether it speaks Raft protocol 2. A peer that refuses ends startup; an unreachable peer is skipped, because a fresh cluster starts its pods in parallel.
-- **Readiness.** Any later Raft protocol mismatch, inbound or outbound, is logged at error level and makes `/__ursula/ready` answer `503` with `"reason": "format_epoch_mismatch"` until the node restarts.
-- **Backups.** Backups use format version 2. `ursulactl restore` and `backup-create` refuse a cluster that reports another version, and a server refuses to import a group without format epoch 2 (`400`).
+- **Peers.** Before it writes the markers, a node with configured peers asks each one, in parallel (2 seconds to connect plus 2 seconds for the answer, about 4 seconds at most), whether it speaks Raft protocol 3. A peer that refuses ends startup. An unreachable peer is skipped, because a fresh cluster starts its pods in parallel.
+- **Readiness.** Any later Raft protocol mismatch, inbound or outbound, is logged at error level and makes `/__ursula/ready` answer `503` with `"reason": "format_epoch_mismatch"` until the node restarts. This also holds for a 0.6 node that a 0.7 node contacts, including through the startup probe. Keep the peer lists of 0.6 and 0.7 nodes apart.
+- **Backups.** Backups use format version 3. `ursulactl restore` and `backup-create` refuse a cluster that reports another version, and a server refuses to import a group of another format epoch (`400`).
 
 Bucket IDs `snapshots` and any ID starting with `__` are reserved (`400`): `snapshots` is the default raft-snapshot namespace in the object store.
 

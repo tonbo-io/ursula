@@ -17,4 +17,4 @@ helm install ursula-chaos charts/ursula-chaos --namespace ursula -f chaos-values
 
 The independently published OCI package is `oci://ghcr.io/tonbo-io/charts/ursula-chaos`.
 
-For an EKS Pod Identity and a generated values file, use [`deploy/chaos-eks`](../../deploy/chaos-eks).
+When `statusS3Uri` is set, the chart's service account needs read and write access to that S3 object, for example through an IRSA role in `serviceAccount.annotations` or EKS Pod Identity.

@@ -6,7 +6,7 @@ Ursula is a self-hosted, distributed Durable Streams server for replayable, appe
 
 The server uses a thread-per-core, multi-Raft architecture: each stream hashes to one Raft group, that group has one replica on each voter node, and the same group ID is owned by a deterministic core on every node. Groups replicate independently with no cross-group transaction path.
 
-- **Version**: 0.3.4 (prototype phase)
+- **Version**: 0.7.0 (pre-1.0)
 - **License**: Apache-2.0
 - **Repository**: <https://github.com/tonbo-io/ursula>
 - **Homepage**: <https://ursula.tonbo.io>
@@ -348,7 +348,7 @@ verifies them, and only then creates the Git tag and GitHub Release:
 ## Development Tips
 
 - Use `just build`, `just test`, `just fmt-check`, `just clippy` for common tasks.
-- The project is in the `0.1.x` phase; breaking compatibility is acceptable when it improves correctness or simplicity.
+- The project is pre-1.0 (`0.x`); breaking compatibility is acceptable when it improves correctness or simplicity.
 - For performance work, add/update a micro benchmark in `ursula-runtime/benches/`.
 - When modifying protobuf schemas, remember both `ursula-proto` and `ursula-raft` have build scripts that regenerate code.
 - The `tokio-console` feature can be enabled by building with `--no-default-features --features tokio-console` for async debugging.

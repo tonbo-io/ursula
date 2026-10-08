@@ -16,9 +16,33 @@ The chart uses a fixed configured voter set. Its optional graceful-rollout hook 
 
 This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods. `server.updateStrategy=OnDelete` stages new pod templates without letting Kubernetes restart voters automatically, and `server.gracefulRollout.enabled=true` supplies the sequence it leaves undone: a post-upgrade job that drains one voter, replaces it, waits for it to rejoin and catch up, verifies the cluster, and only then moves to the next. Enable both together, or the upgrade stages a template that nothing ever applies. A Helm pre-upgrade hook removes stale `rollingUpdate` state before switching an existing StatefulSet to `OnDelete`; GitOps users that already provide an equivalent PreSync migration can disable it with `server.onDeleteMigration.enabled=false`.
 
-[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. For a complete AWS prerequisite flow, use [`deploy/eks`](../../deploy/eks): `tofu apply` produces `generated-values.yaml` and a dedicated kubeconfig, after which deployment is one `helm install` and one `helm test`.
+[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. It needs the AWS resources listed under [Prerequisites](#prerequisites).
 
 [`examples/tls-ingress.yaml`](examples/tls-ingress.yaml) is the exposure half: one HTTPS domain terminating at the ingress, with voters and the admin plane private. Layer it on top of a sizing example. Ursula never terminates TLS itself — see the security guide for why, and for the ingress settings that live tails and leader redirects depend on.
+
+## Prerequisites
+
+The chart needs Kubernetes 1.24 or later and a StorageClass for the per-pod Raft
+log PVCs. A multi-node cluster also needs an S3 or S3-compatible bucket for cold
+chunks and snapshots.
+
+On AWS, [`examples/production-eks.yaml`](examples/production-eks.yaml) expects:
+
+- An EKS cluster with nodes in three availability zones. The example spreads
+  voters and gateways across zones with `whenUnsatisfiable: DoNotSchedule`.
+- The EBS CSI driver add-on and a StorageClass named `gp3`, for example with
+  provisioner `ebs.csi.aws.com`, parameters `type: gp3` and `encrypted: "true"`,
+  `volumeBindingMode: WaitForFirstConsumer` and `reclaimPolicy: Retain`.
+- An S3 bucket in the cluster's region with versioning, default encryption and
+  blocked public access. Set `s3.bucket`, `s3.region` and `s3.prefix`.
+- IAM roles for the Ursula and indexer service accounts, through IRSA (the
+  `eks.amazonaws.com/role-arn` annotations in the example) or EKS Pod Identity.
+  Limit each role to its own prefix: `s3.prefix` for Ursula and
+  `indexer.s3.prefix` for the indexer. Each needs `s3:ListBucket`,
+  `s3:GetBucketLocation` and `s3:ListBucketMultipartUploads` on the bucket for
+  its prefix, and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`,
+  `s3:AbortMultipartUpload` and `s3:ListMultipartUploadParts` on the objects
+  under it.
 
 ## Build A Local Image
 
@@ -37,7 +61,7 @@ kind load docker-image ursula:dev
 From the published OCI chart:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.6.2
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.0
 ```
 
 For a local image loaded into the cluster:
@@ -84,8 +108,14 @@ with `kubectl port-forward` (or run `curl` inside the pod with `kubectl exec`):
 
 ```bash
 kubectl port-forward pod/ursula-0 4438:4438
-curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
+process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" \
+  -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
 ```
+
+Every admin mutation needs the `x-ursula-process-incarnation` header with the
+`process_incarnation` the node reported before the operation. A node answers
+`428` without it and `412` after a restart.
 
 ## Expose With Ingress
 
@@ -314,14 +344,12 @@ plus `snapshotStore.prefix`.
 Ursula 0.7 (format epoch 3) cannot read the data or the backups of a 0.6
 release. Install it fresh, as a new release with new PVCs and a new
 `s3.prefix` (and, with cold storage off and S3 snapshots, a new
-`snapshotStore.prefix`).
-
-Ursula 0.6 (format epoch 2) cannot upgrade a 0.5.x release in place. Install it
-fresh: `helm uninstall`, delete the PVCs, and install with a new `s3.prefix`
-(and, with cold storage off and S3 snapshots, a new `snapshotStore.prefix`).
-`helm upgrade` from 0.5.x stalls at the first new pod, which exits at startup
-or reports not ready, so no second voter is replaced; recover with
-`helm rollback`. See the operations guide's "Upgrading to 0.6".
+`snapshotStore.prefix`). Remove `raft.storageMode`,
+`raft.allowVolatileMultiPeer` and `persistence.enabled` from values files. The
+values schema refuses them. `helm upgrade` from 0.6 stops before a second voter
+is replaced, because the first new pod finds the 0.6 data on its volume and
+exits at startup. Recover with `helm rollback`. See the operations guide's
+"Upgrading to 0.7".
 
 Until the operator exists, Kubernetes StatefulSet rolling updates do not
 transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.

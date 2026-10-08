@@ -124,7 +124,7 @@ Three or five Ursula processes act as one durable-streams server. A stream hashe
 
   [axum](https://github.com/tokio-rs/axum) parses, routes, and renders the protocol while stream ownership and mutable state stay inside the owning group actor.
 
-Across nodes, writes are leader-serialized within one group and acknowledged after a majority of that group's replicas persist and apply the command. Full design: [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
+Across nodes, writes are leader-serialized within one group and acknowledged once a majority of that group's replicas hold the command in their Raft WAL and it is applied. Full design: [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
 
 ## Benchmark
 
@@ -132,7 +132,7 @@ On EC2 (3 × `c7g.4xlarge`, Raft quorum), Ursula sustains **35.2k appends/sec** 
 
 ## Roadmap
 
-The `v0.1.x` line is a working prototype. Next on deck:
+Ursula is pre-1.0, and a minor release can break compatibility. Next on deck:
 
 - [ ] **Stateless WASM compute over streams.**
 
@@ -142,9 +142,9 @@ The `v0.1.x` line is a working prototype. Next on deck:
 
   Online voter / learner reconfiguration and orchestrated rolling membership changes (today's clusters are static).
 
-- [ ] **Backup and restore tooling.**
+- [ ] **Recovery from the cold tier alone.**
 
-  A supported recovery path for total-cluster loss from the S3 cold tier (today there is none).
+  A recovery path for total-cluster loss from the S3 cold tier. Today it needs a backup made with `ursulactl backup-create`.
 
 - [ ] **Client SDKs.**
 

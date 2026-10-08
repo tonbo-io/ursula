@@ -54,7 +54,7 @@ ursulactl drain --config pinned-cluster.json --node 3
 
 The saved nodes carry `expected_process_incarnation`. After an admitted Pod replacement, `pin-incarnations --replace-node 3` can bind that one replacement; every survivor must still match its saved identity. The Helm rollout persists these pins and the admitted source/replacement Pod UIDs in state schema 3. Resuming the same replacement validates its saved process instead of refreshing it after a container restart. It stops on a missing saved plan, changed survivor, or another unadmitted replacement.
 
-`--allow-legacy-incarnation` is the deployed through-0.6.2 migration option: those servers have no identity precondition and the output reports `process_incarnations_certified=false`. Retire the option when those upgrade sources and retained legacy rollout states are gone. `verify-quorum` records the observed process identities and their certification separately from Raft participation. Instance identity does not serialize concurrent executors or prove a failed host is physically fenced.
+`--allow-legacy-incarnation` accepts nodes that report no process incarnation, and the output then reports `process_incarnations_certified=false`. Only 0.6.2 servers report none. Every 0.7 server reports one, so a 0.7 cluster does not need the option, and it will be removed ([#410](https://github.com/tonbo-io/ursula/issues/410)). `verify-quorum` records the observed process identities and their certification separately from Raft participation. Instance identity does not serialize concurrent executors or prove a failed host is physically fenced.
 
 ## Maintenance executor admission
 
@@ -109,7 +109,7 @@ On bare metal the same shape works with `ssh -N -L 5441:127.0.0.1:4438 admin@nod
 | Task | Tool |
 |------|------|
 | Day-2 logical operations: drain, observe, gate on readiness | **`ursulactl`** |
-| Deployment, restarts, upgrades, topology | [Helm and OpenTofu](/docs/deploy-cluster) (systemd on bare metal) |
+| Deployment, restarts, upgrades, topology | [Helm](/docs/deploy-cluster) (systemd on bare metal) |
 | Custom operator tooling | The admin-plane HTTP endpoints, reached over your own tunnel |
 
 ## Install
@@ -133,7 +133,7 @@ kubectl get configmap ursula -o jsonpath='{.data.cluster-manifest\.json}' \
   | ursulactl status --config -
 ```
 
-For infrastructure provisioned by OpenTofu, emit the manifest as a stack output or generated file (the same pattern as `deploy/eks`'s `generated-values.yaml`) rather than teaching ursulactl to read state files. `tofu output -json <name> | ursulactl status --config -` composes the same way.
+For infrastructure provisioned by OpenTofu, emit the manifest as a stack output or a generated file rather than teaching ursulactl to read state files. `tofu output -json <name> | ursulactl status --config -` composes the same way.
 
 Per-node fields, all optional except `id`:
 
@@ -235,7 +235,7 @@ After one voter becomes unavailable, this source can separately observe the two 
 ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected-groups 256 --timeout-secs 120
 ```
 
-Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology; it never shrinks the configured membership to fit observations. Legacy diagnostics retain the explicit opt-in and do not certify participation.
+Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology. It never shrinks the configured membership to fit observations.
 
 The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
 

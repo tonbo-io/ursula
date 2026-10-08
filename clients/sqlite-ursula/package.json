@@ -1,6 +1,6 @@
 {
   "name": "@tonbo/sqlite-ursula",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "SQLite replicated through an Ursula stream by the sqlite-ursula-vfs extension, with Pi Durable's official SqliteStorage on top",
   "license": "Apache-2.0",
   "repository": {

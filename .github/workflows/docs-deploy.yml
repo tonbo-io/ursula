@@ -1,8 +1,8 @@
 name: Deploy docs
 
-# Frozen: main documents changes made after 0.6.2 that no release ships yet, so pushes to main do
-# not deploy. Dispatch by hand with the ref to publish (v0.6.2 until the next release); the
-# post-release follow-up of the next release restores the push trigger.
+# Frozen until the 0.7.0 release: main documents 0.7.0 before it is published, so pushes to main do
+# not deploy. Dispatch by hand with the ref to publish (v0.6.2 until 0.7.0 is out, then the release
+# commit); a follow-up after the release restores the push trigger.
 
 on:
   workflow_dispatch:
