@@ -683,6 +683,10 @@ pub struct RaftGroupMetrics {
     pub maintenance: RaftGroupMaintenanceState,
     #[serde(deserialize_with = "Option::deserialize")]
     pub last_log_index: Option<u64>,
+    /// The term of the last log entry, `null` only for an empty log. With
+    /// `last_log_index` it is the last log id an election compares.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub last_log_term: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub committed_term: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -753,6 +757,7 @@ mod metrics_contract_tests {
                     stopped_for_operator: false,
                 },
                 last_log_index: Some(5),
+                last_log_term: Some(1),
                 committed_term: Some(1),
                 last_applied_term: Some(1),
                 snapshot_term: None,

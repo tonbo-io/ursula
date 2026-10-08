@@ -804,7 +804,7 @@ impl RaftGroupHandleRegistry {
                         node_id: *node_id,
                         current_term: stopped.failure.term,
                         current_leader: None,
-                        last_log_index: None,
+                        last_log: None,
                         committed: None,
                         last_applied: stopped.last_applied.map(log_progress_snapshot),
                         snapshot: None,
@@ -829,6 +829,9 @@ impl RaftGroupHandleRegistry {
             let raft = entry.raft();
             let health = &entry.apply_health;
             let metrics = raft.metrics().borrow_watched().clone();
+            // `RaftMetrics` carry only the index of the last log id. The data
+            // metrics carry the whole id, so its term and index match.
+            let last_log = raft.data_metrics().borrow_watched().last_log;
             let membership = metrics.membership_config.membership();
             let apply_failure = health.failure();
             let apply_running = apply_failure.is_none();
@@ -843,7 +846,7 @@ impl RaftGroupHandleRegistry {
                 // A stopped replica leads nothing. Its last observation is
                 // stale, so leader counts and drains must not see it.
                 current_leader: metrics.current_leader.filter(|_| running),
-                last_log_index: metrics.last_log_index,
+                last_log: last_log.map(log_progress_snapshot),
                 committed: metrics.local_committed.map(log_progress_snapshot),
                 last_applied: metrics.last_applied.map(log_progress_snapshot),
                 snapshot: metrics.snapshot.map(log_progress_snapshot),

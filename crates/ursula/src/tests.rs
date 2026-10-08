@@ -5840,7 +5840,7 @@ fn raft_metrics_snapshot(
         node_id,
         current_term: 1,
         current_leader: leader,
-        last_log_index: last_log,
+        last_log: last_log.map(progress),
         committed: committed.map(progress),
         last_applied: committed.map(progress),
         snapshot: snapshot.map(progress),
@@ -6161,19 +6161,24 @@ mod snapshot_driver {
     fn metrics_export_log_bytes_since_snapshot_and_last_snapshot_size() {
         // Bounded-state §7.5 soak gauges: unpurged log bytes and snapshot raw
         // bytes per group, scraped from `/__ursula/metrics`.
-        let rendered = crate::render::render_raft_group_metrics_array(&[snap(
-            3,
-            Some(100),
-            Some(40),
-            GroupLogProgress {
-                log_bytes: 5 * MIB,
-                log_entries: 60,
-                last_snapshot_bytes: 3 * MIB,
-                has_snapshot: true,
-            },
-        )]);
+        let mut snapshot = snap(3, Some(100), Some(40), GroupLogProgress {
+            log_bytes: 5 * MIB,
+            log_entries: 60,
+            last_snapshot_bytes: 3 * MIB,
+            has_snapshot: true,
+        });
+        // The last log id renders as one term and index, apart from the
+        // replica's current term.
+        snapshot.last_log = Some(super::RaftLogProgressSnapshot {
+            term: 4,
+            index: 120,
+        });
+        let rendered = crate::render::render_raft_group_metrics_array(&[snapshot]);
         let group = &rendered[0];
         assert_eq!(group["raft_group_id"], 3);
+        assert_eq!(group["current_term"], 1);
+        assert_eq!(group["last_log_index"], 120);
+        assert_eq!(group["last_log_term"], 4);
         assert_eq!(group["log_bytes_since_snapshot"], 5 * MIB);
         assert_eq!(group["log_entries_since_snapshot"], 60);
         assert_eq!(group["last_snapshot_bytes"], 3 * MIB);

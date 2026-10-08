@@ -18,6 +18,7 @@ use openraft::error::ClientWriteError;
 use openraft::error::Fatal;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
+use openraft::metrics::RaftDataMetrics;
 use openraft::raft::ClientWriteResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
@@ -56,6 +57,7 @@ impl Drop for Mailbox {
 pub struct OwnerRaftHandle {
     mailbox: Arc<Mailbox>,
     metrics: WatchReceiverOf<C, RaftMetrics<C>>,
+    data_metrics: WatchReceiverOf<C, RaftDataMetrics<C>>,
     handoff_ack_window: Duration,
     transfer_deadline: Duration,
 }
@@ -74,6 +76,7 @@ impl std::fmt::Debug for OwnerRaftHandle {
 impl OwnerRaftHandle {
     pub(crate) fn new(raft: RaftGroupHandle) -> Self {
         let metrics = raft.metrics();
+        let data_metrics = raft.data_metrics();
         let handoff_ack_window = Duration::from_millis(raft.config().election_timeout_min);
         let transfer_deadline = Duration::from_millis(
             raft.config()
@@ -98,6 +101,7 @@ impl OwnerRaftHandle {
         Self {
             mailbox: Arc::new(Mailbox { sender, task }),
             metrics,
+            data_metrics,
             handoff_ack_window,
             transfer_deadline,
         }
@@ -213,6 +217,12 @@ impl OwnerRaftHandle {
 
     pub fn metrics(&self) -> WatchReceiverOf<C, RaftMetrics<C>> {
         self.metrics.clone()
+    }
+
+    /// OpenRaft's data metrics, which carry the full last log id. Its
+    /// `RaftMetrics` report only the last log index.
+    pub(crate) fn data_metrics(&self) -> WatchReceiverOf<C, RaftDataMetrics<C>> {
+        self.data_metrics.clone()
     }
 
     pub fn wait(&self, timeout: Option<Duration>) -> openraft::metrics::Wait<C> {
