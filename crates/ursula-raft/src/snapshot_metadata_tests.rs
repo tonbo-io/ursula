@@ -23,6 +23,7 @@ use super::UrsulaRaftTypeConfig;
 use super::default_snapshot_store;
 use super::group_snapshot_frames;
 use crate::log_store::SimDisk;
+use crate::log_store::SimDiskError;
 use crate::log_store::SimDiskFault;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +128,11 @@ fn snapshot_metadata_failed_publication_restores_a_complete_pointer() {
                         };
                         SimDisk::inject_fault(&fault_path, fault).unwrap();
                         let error = install(&mut state, 2).await.unwrap_err();
-                        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                        assert!(matches!(
+                            error.get_ref().and_then(|source| source.downcast_ref::<SimDiskError>()),
+                            Some(SimDiskError::Injected { path, fault: actual })
+                                if path == &fault_path && *actual == fault
+                        ), "expected {phase:?} injection: {error}");
                         drop(state);
                         if host_crash {
                             SimDisk::power_loss_losing_unsynced(&root).unwrap();
