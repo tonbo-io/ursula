@@ -31,7 +31,8 @@ for alpha in (21, 28):
         test = test.replace('update_data_with', 'update_with')
     if alpha == 28:
         test = test.replace('// STREAM_ID', 'let stream_id = rh.leader.progress.get(&3).stream_id;')
-        test = test.replace('/* STREAM_ARG */', 'stream_id,')
+        test = test.replace('// STREAM_ARG', 'stream_id,')
+        test = test.replace('// REMOVED_STREAM_ARG', 'crate::progress::stream_id::StreamId::new(41),')
         test = test.replace('rh.state.committed()', 'rh.state.cluster_committed()')
     target = source / 'src/engine/handler/replication_handler/update_matching_test.rs'
     with target.open('a') as out:
@@ -47,7 +48,7 @@ for alpha in (21, 28):
     with (root / f'alpha{alpha}.log').open('w') as log:
         result = subprocess.run(['cargo', 'test', '--lib', 'ursula_', '--', '--nocapture'], cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT)
     output = (root / f'alpha{alpha}.log').read_text()
-    expected = '2 failed' if alpha == 21 else '2 passed'
+    expected = '4 failed' if alpha == 21 else '4 passed'
     if expected not in output or (alpha == 28 and result.returncode):
         raise SystemExit(f'Unexpected result for {version}; inspect {root / f"alpha{alpha}.log"}')
     print(f'{version}: expected {expected}; log={root / f"alpha{alpha}.log"}', flush=True)

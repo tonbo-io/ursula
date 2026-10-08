@@ -43,3 +43,52 @@ fn ursula_wrong_inflight_ack_does_not_advance_matching() {
     assert_eq!(before.as_ref(), rh.leader.progress.get(&3).matching());
     assert_eq!(None, rh.state.committed());
 }
+
+#[test]
+fn ursula_removed_stream_conflict_does_not_rewind_readded_peer() {
+    let mut eng = eng();
+    eng.testing_new_leader();
+    eng.output.take_commands();
+    let mut rh = eng.replication_handler();
+    rh.update_matching(3, Some(log_id(2, 1, 3)), None);
+    rh.leader.progress.update_data_with(&3, |data| {
+        data.inflight = Inflight::logs_since(Some(log_id(2, 1, 3)), InflightId::new(42));
+        data.stream_id = crate::progress::stream_id::StreamId::new(42);
+    });
+    rh.update_progress(
+        3,
+        // REMOVED_STREAM_ARG
+        Ok(crate::replication::response::ReplicationResult(Err(
+            log_id(2, 1, 2),
+        ))),
+        Some(InflightId::new(41)),
+    );
+    assert_eq!(
+        Some(&log_id(2, 1, 3)),
+        rh.leader.progress.get(&3).matching()
+    );
+}
+#[test]
+fn ursula_removed_stream_ack_does_not_rewind_readded_peer() {
+    let mut eng = eng();
+    eng.testing_new_leader();
+    eng.output.take_commands();
+    let mut rh = eng.replication_handler();
+    rh.update_matching(3, Some(log_id(2, 1, 3)), None);
+    rh.leader.progress.update_data_with(&3, |data| {
+        data.inflight = Inflight::logs_since(Some(log_id(2, 1, 3)), InflightId::new(42));
+        data.stream_id = crate::progress::stream_id::StreamId::new(42);
+    });
+    rh.update_progress(
+        3,
+        // REMOVED_STREAM_ARG
+        Ok(crate::replication::response::ReplicationResult(Ok(Some(
+            log_id(2, 1, 2),
+        )))),
+        Some(InflightId::new(41)),
+    );
+    assert_eq!(
+        Some(&log_id(2, 1, 3)),
+        rh.leader.progress.get(&3).matching()
+    );
+}
