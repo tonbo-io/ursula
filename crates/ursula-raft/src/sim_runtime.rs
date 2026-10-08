@@ -480,7 +480,7 @@ where T: OptionalSend + OptionalSync
 
 #[cfg(test)]
 mod tests {
-    use futures::FutureExt;
+    use futures_util::FutureExt;
     use openraft_rt::RecvError;
     use openraft_rt::Watch;
     use openraft_rt::WatchReceiver;
