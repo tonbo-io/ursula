@@ -1331,6 +1331,7 @@ mod tests {
             stale_joint: false,
             voters: voters.iter().copied().collect(),
             learners: learners.iter().copied().collect(),
+            answering: voters.iter().copied().collect(),
             reverted: reverted.iter().copied().collect(),
             awaiting_rewind: BTreeSet::new(),
             matched: BTreeMap::new(),
@@ -1369,6 +1370,30 @@ mod tests {
             Some(HealStep::RemoveLearner { target: 3 })
         );
         assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[], &[])), None);
+    }
+
+    #[test]
+    fn the_heal_driver_removes_a_voter_only_with_a_quorum_that_answered() {
+        // 3 lost entries and 2 has not answered since it restarted: 2 may
+        // have lost entries too, so a removal could need it and never
+        // commit. Rewind 3 instead.
+        let mut silent = view(&[1, 2, 3], &[], &[3]);
+        silent.answering = BTreeSet::from([1]);
+        assert_eq!(
+            plan_heal_step(&silent),
+            Some(HealStep::RewindVoters {
+                targets: BTreeSet::from([3]),
+            })
+        );
+        // Once 2 answers, it holds its log and the removal can commit.
+        silent.answering.insert(2);
+        assert_eq!(
+            plan_heal_step(&silent),
+            Some(HealStep::RemoveVoter {
+                target: 3,
+                voters: BTreeSet::from([1, 2]),
+            })
+        );
     }
 
     #[test]

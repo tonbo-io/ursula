@@ -30,6 +30,10 @@ pub(crate) struct HealView {
     pub stale_joint: bool,
     pub voters: BTreeSet<u64>,
     pub learners: BTreeSet<u64>,
+    /// This leader and the followers that answered it within a minimum
+    /// election timeout. A follower that has not answered since it
+    /// restarted may have lost entries this leader does not know of yet.
+    pub answering: BTreeSet<u64>,
     pub reverted: BTreeSet<u64>,
     /// Voters whose rewind this leader allowed but OpenRaft has not done yet:
     /// their progress still shows the index they had matched.
@@ -91,8 +95,15 @@ pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
     if let Some(target) = reverted_voters.first() {
         // The removal commits only with a quorum of the current voters that
         // still hold their log. Without one, this leader rewinds them: it
-        // holds every committed entry and they cannot vote meanwhile.
-        let healthy_voters = view.voters.difference(&view.reverted).count();
+        // holds every committed entry and they cannot vote meanwhile. Only a
+        // voter that answered recently is known to hold its log: one that is
+        // still silent after a restart may have lost entries too, and a
+        // removal that needs it would wedge the group in a joint config.
+        let healthy_voters = view
+            .voters
+            .iter()
+            .filter(|voter| !view.reverted.contains(*voter) && view.answering.contains(*voter))
+            .count();
         if healthy_voters < quorum(view.voters.len()) {
             return Some(HealStep::RewindVoters {
                 targets: reverted_voters,
@@ -140,6 +151,7 @@ fn heal_view(
     metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
     rejoin: &GroupRejoin,
     configured: &BTreeSet<u64>,
+    answer_window: Duration,
 ) -> HealView {
     let membership = metrics.membership_config.membership();
     let matched = metrics
@@ -153,6 +165,21 @@ fn heal_view(
         })
         .unwrap_or_default();
     let voters = membership.voter_ids().collect::<BTreeSet<_>>();
+    let mut answering = metrics
+        .heartbeat
+        .as_ref()
+        .map(|acks| {
+            acks.iter()
+                .filter(|(_, acked)| {
+                    acked
+                        .as_ref()
+                        .is_some_and(|acked| openraft::Instant::elapsed(&**acked) <= answer_window)
+                })
+                .map(|(node_id, _)| *node_id)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    answering.insert(metrics.id);
     let awaiting_rewind = rejoin
         .allowed_rewinds(&metrics.vote)
         .into_iter()
@@ -167,6 +194,7 @@ fn heal_view(
         stale_joint: false,
         voters,
         learners: membership.learner_ids().collect(),
+        answering,
         reverted: rejoin.reverted_followers(&metrics.vote),
         awaiting_rewind,
         matched,
@@ -186,6 +214,7 @@ pub async fn run_rejoin_heal(
     interval: Duration,
 ) {
     let configured_ids = configured.keys().copied().collect::<BTreeSet<_>>();
+    let answer_window = Duration::from_millis(raft.config().election_timeout_min);
     // The log id of the joint config seen on the previous tick, if any.
     let mut last_joint = None;
     let mut last_attempt = None;
@@ -201,7 +230,7 @@ pub async fn run_rejoin_heal(
             if metrics.running_state.is_err() {
                 return;
             }
-            let mut view = heal_view(&metrics, &rejoin, &configured_ids);
+            let mut view = heal_view(&metrics, &rejoin, &configured_ids, answer_window);
             let joint = (!view.uniform).then(|| *metrics.membership_config.log_id());
             if joint != last_joint {
                 joint_since = crate::rt::time::Instant::now();
