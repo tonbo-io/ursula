@@ -233,6 +233,31 @@ mod tests {
     use super::AcceptUnsyncedLossRequest;
     use super::MaintenanceFence;
     use super::ProcessIncarnation;
+    use super::RaftMaintenanceIssue;
+    use super::RaftMaintenanceReport;
+    use super::TransferRejection;
+
+    /// A newer server of the same minor version may report an issue or a
+    /// rejection this build does not know. It decodes, never reads as ready
+    /// and is never retried.
+    #[test]
+    fn unknown_issues_and_rejections_decode_and_fail_closed() {
+        let report: RaftMaintenanceReport = serde_json::from_str(
+            r#"{"version": 1, "node_id": 1, "lag_tolerance": 0,
+                "expected_groups": {"0": [1, 2, 3]},
+                "node_issues": ["a_future_issue"], "group_issues": {}}"#,
+        )
+        .unwrap();
+        assert_eq!(report.node_issues, vec![RaftMaintenanceIssue::Unknown]);
+        assert!(!report.ready());
+        let rejection: TransferRejection = serde_json::from_str(r#""a_future_rejection""#).unwrap();
+        assert_eq!(rejection, TransferRejection::Unknown);
+        assert!(!rejection.should_replan());
+        assert_eq!(
+            serde_json::from_str::<TransferRejection>(r#""not_leader""#).unwrap(),
+            TransferRejection::NotLeader
+        );
+    }
 
     /// The expected log must be stated, also when it is empty.
     #[test]
@@ -320,6 +345,10 @@ pub enum TransferRejection {
     InvalidTarget,
     RecoveringTarget,
     RaftStopped,
+    /// A rejection a newer server of the same minor version reports that this
+    /// build does not know. It is not retried.
+    #[serde(other)]
+    Unknown,
 }
 impl TransferRejection {
     pub fn should_replan(self) -> bool {
@@ -367,6 +396,10 @@ pub enum RaftMaintenanceIssue {
     LeaderOutsideVoters,
     NotApplied,
     ApplyLag,
+    /// An issue a newer server of the same minor version reports that this
+    /// build does not know. Like every issue, it makes the report not ready.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
