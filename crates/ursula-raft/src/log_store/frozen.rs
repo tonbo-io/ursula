@@ -43,17 +43,14 @@ pub(crate) struct ArchiveRef {
     pub(crate) bytes: u64,
     pub(crate) checksum: u32,
 }
-/// Only these selected log IDs are live. Rewriting a reference must not
-/// resurrect entries superseded by a later truncate, append or purge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FrozenEntry {
-    pub(crate) log_id: LogId,
-    pub(crate) bytes: u32,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FrozenAppend {
     pub(crate) archive: ArchiveRef,
-    pub(crate) entries: Vec<FrozenEntry>,
+    /// Only these selected log IDs are live. Rewriting a reference must not
+    /// resurrect entries superseded by a later truncate, append or purge.
+    /// Weights are not stored: the binary that replays the archive derives
+    /// them, so a corrected build may change its size estimate.
+    pub(crate) log_ids: Vec<LogId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -213,31 +210,25 @@ pub(crate) fn selected(
         path: path(dir, frozen.archive.id),
         defect: ArchiveDefect::Content,
     };
-    if frozen.entries.is_empty()
-        || frozen.entries.windows(2).any(|pair| match pair {
-            [a, b] => a.log_id.index >= b.log_id.index,
+    if frozen.log_ids.is_empty()
+        || frozen.log_ids.windows(2).any(|pair| match pair {
+            [a, b] => a.index >= b.index,
             _ => false,
         })
     {
         return Err(defect());
     }
     let mut entries = read(dir, group, &frozen.archive)?.into_iter().peekable();
-    let mut selected = Vec::with_capacity(frozen.entries.len());
-    for expected in &frozen.entries {
+    let mut selected = Vec::with_capacity(frozen.log_ids.len());
+    for expected in &frozen.log_ids {
         while entries
             .peek()
-            .is_some_and(|entry| entry.log_id.index < expected.log_id.index)
+            .is_some_and(|entry| entry.log_id.index < expected.index)
         {
             entries.next();
         }
         match entries.next() {
-            Some(entry)
-                if entry.log_id == expected.log_id
-                    && u32::try_from(crate::types::entry_log_bytes(&entry)).unwrap_or(u32::MAX)
-                        == expected.bytes =>
-            {
-                selected.push(entry)
-            }
+            Some(entry) if entry.log_id == *expected => selected.push(entry),
             _ => return Err(defect()),
         }
     }

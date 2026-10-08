@@ -605,10 +605,7 @@ fn archived_payload_damage_is_a_typed_hard_startup_failure() {
                 group_id: 1,
                 record: RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
                     archive: archive.clone(),
-                    entries: vec![super::frozen::FrozenEntry {
-                        log_id: entry.log_id,
-                        bytes: u32::try_from(crate::types::entry_log_bytes(&entry)).unwrap(),
-                    }],
+                    log_ids: vec![entry.log_id],
                 })),
             })
             .unwrap();

@@ -27,7 +27,6 @@ use super::frozen;
 use super::frozen::ArchiveDefect;
 use super::frozen::ArchiveId;
 use super::frozen::FrozenAppend;
-use super::frozen::FrozenEntry;
 use super::journal;
 use super::journal::JournalError;
 use super::journal::JournalOp;
@@ -313,13 +312,7 @@ fn old_decoder_refuses_frozen_reference_without_trimming_either_replay_mode() {
                 group_id: 7,
                 record: RaftGroupLogRecord::FrozenAppend(Box::new(FrozenAppend {
                     archive,
-                    entries: values
-                        .iter()
-                        .map(|entry| FrozenEntry {
-                            log_id: entry.log_id,
-                            bytes: u32::try_from(entry_log_bytes(entry)).unwrap(),
-                        })
-                        .collect(),
+                    log_ids: values.iter().map(|entry| entry.log_id).collect(),
                 })),
             })
             .unwrap();
@@ -367,33 +360,13 @@ fn selected_reference_keeps_exact_live_ids_and_rejects_invalid_selection() {
         let ids = values.iter().map(|entry| entry.log_id).collect::<Vec<_>>();
         let reference = FrozenAppend {
             archive: archive.clone(),
-            entries: [0, 2]
-                .into_iter()
-                .map(|index| FrozenEntry {
-                    log_id: ids[index],
-                    bytes: u32::try_from(entry_log_bytes(&values[index])).unwrap(),
-                })
-                .collect(),
+            log_ids: vec![ids[0], ids[2]],
         };
         assert_eq!(
             encode_wire(&frozen::selected(&dir, 7, &reference).unwrap()),
             encode_wire(&vec![values[0].clone(), values[2].clone()])
         );
         let before = SimDisk::read(&frozen::path(&dir, archive.id)).unwrap();
-        let wrong_bytes = FrozenAppend {
-            archive: archive.clone(),
-            entries: vec![FrozenEntry {
-                log_id: ids[0],
-                bytes: 0,
-            }],
-        };
-        assert!(matches!(
-            frozen::selected(&dir, 7, &wrong_bytes).unwrap_err(),
-            JournalError::FrozenArchive {
-                defect: ArchiveDefect::Content,
-                ..
-            }
-        ));
         for log_ids in [
             vec![],
             vec![ids[0], ids[0]],
@@ -409,13 +382,7 @@ fn selected_reference_keeps_exact_live_ids_and_rejects_invalid_selection() {
         ] {
             let reference = FrozenAppend {
                 archive: archive.clone(),
-                entries: log_ids
-                    .into_iter()
-                    .map(|log_id| FrozenEntry {
-                        log_id,
-                        bytes: u32::try_from(entry_log_bytes(&values[0])).unwrap(),
-                    })
-                    .collect(),
+                log_ids,
             };
             assert!(matches!(
                 frozen::selected(&dir, 7, &reference).unwrap_err(),
@@ -460,13 +427,7 @@ fn archive_and_journal_reference_have_separate_durability_boundaries() {
                     group_id: 7,
                     record: RaftGroupLogRecord::FrozenAppend(Box::new(FrozenAppend {
                         archive: archive.clone(),
-                        entries: values
-                            .iter()
-                            .map(|entry| FrozenEntry {
-                                log_id: entry.log_id,
-                                bytes: u32::try_from(entry_log_bytes(entry)).unwrap(),
-                            })
-                            .collect(),
+                        log_ids: values.iter().map(|entry| entry.log_id).collect(),
                     })),
                 })
                 .unwrap();
@@ -533,13 +494,7 @@ fn garbage_collection_preserves_duplicate_references_and_syncs_their_deletion_fi
             group_id: 7,
             record: RaftGroupLogRecord::FrozenAppend(Box::new(FrozenAppend {
                 archive: archive.clone(),
-                entries: values
-                    .iter()
-                    .map(|entry| FrozenEntry {
-                        log_id: entry.log_id,
-                        bytes: u32::try_from(entry_log_bytes(entry)).unwrap(),
-                    })
-                    .collect(),
+                log_ids: values.iter().map(|entry| entry.log_id).collect(),
             })),
         };
         let references = [

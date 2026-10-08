@@ -539,8 +539,16 @@ impl CoreFileLogWriter {
                 // Include groups whose first journal append preceded its
                 // metadata write in the durable pre-repair gate.
                 replayed_groups.borrow_mut().insert(record.group_id);
-                if let RaftGroupLogRecord::FrozenAppend(frozen) = &record.record {
-                    if let Err(error) = super::frozen::selected(&dir, record.group_id, frozen) {
+                let log = logs
+                    .entry(record.group_id)
+                    .or_insert_with(|| GroupLog::replaying(cache_bytes));
+                let at = FramePos { segment, loc };
+                let RaftGroupLogRecord::FrozenAppend(frozen) = record.record else {
+                    return log.apply(record.record, at, ApplyMode::Replay);
+                };
+                let selected = match super::frozen::selected(&dir, record.group_id, &frozen) {
+                    Ok(selected) => selected,
+                    Err(error) => {
                         archive_failure = Some(error);
                         // The journal visitor requires io::Result. Retain the
                         // original typed failure and return it below.
@@ -549,15 +557,13 @@ impl CoreFileLogWriter {
                             "frozen archive validation failed",
                         ));
                     }
-                    archive_sizes.insert(frozen.archive.id, frozen.archive.bytes);
-                    archive_references
-                        .entry(segment)
-                        .or_default()
-                        .insert(frozen.archive.id);
-                }
-                logs.entry(record.group_id)
-                    .or_insert_with(|| GroupLog::replaying(cache_bytes))
-                    .apply(record.record, FramePos { segment, loc }, ApplyMode::Replay)
+                };
+                archive_sizes.insert(frozen.archive.id, frozen.archive.bytes);
+                archive_references
+                    .entry(segment)
+                    .or_default()
+                    .insert(frozen.archive.id);
+                log.apply_archived(&selected, at)
             },
             || {
                 for group in replayed_groups.borrow().iter() {
@@ -1428,14 +1434,11 @@ impl CoreJournal {
                         continue;
                     }
                     let ids = read.log_ids;
-                    frozen.entries = records
+                    frozen.log_ids = records
                         .entries
                         .iter()
                         .filter(|entry| entry.frame == read.frame)
-                        .map(|entry| super::frozen::FrozenEntry {
-                            log_id: entry.log_id,
-                            bytes: entry.bytes,
-                        })
+                        .map(|entry| entry.log_id)
                         .collect();
                     let to = match self
                         .append_rewritten(*group_id, RaftGroupLogRecord::FrozenAppend(frozen))
@@ -1510,20 +1513,14 @@ impl CoreJournal {
                         last_index: last.log_id.index,
                         content_hash: [0; 32],
                     };
-                    let entries = chunk
-                        .iter()
-                        .map(|entry| super::frozen::FrozenEntry {
-                            log_id: entry.log_id,
-                            bytes: u32::try_from(entry_log_bytes(entry)).unwrap_or(u32::MAX),
-                        })
-                        .collect();
+                    let log_ids = chunk.iter().map(|entry| entry.log_id).collect();
                     let archive = match super::frozen::publish(&self.context.dir, id, chunk) {
                         Ok(reference) => reference,
                         Err(error) => return Reclaim::Poisoned(error),
                     };
                     RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
                         archive,
-                        entries,
+                        log_ids,
                     }))
                 } else {
                     RaftGroupLogRecord::Append(chunk)
@@ -2208,7 +2205,7 @@ pub(crate) fn raft_group_log_record_requires_sync(
 pub(crate) fn raft_group_log_record_initializes(record: &RaftGroupLogRecord) -> bool {
     match record {
         RaftGroupLogRecord::Append(entries) => !entries.is_empty(),
-        RaftGroupLogRecord::FrozenAppend(frozen) => !frozen.entries.is_empty(),
+        RaftGroupLogRecord::FrozenAppend(frozen) => !frozen.log_ids.is_empty(),
         RaftGroupLogRecord::Purge(_) => true,
         RaftGroupLogRecord::SaveCommitted(_) | RaftGroupLogRecord::TruncateAfter(_) => false,
     }

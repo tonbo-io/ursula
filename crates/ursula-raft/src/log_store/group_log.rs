@@ -225,31 +225,11 @@ impl GroupLog {
                 Ok(())
             }
             RaftGroupLogRecord::Append(entries) => self.append(entries, at, mode),
-            RaftGroupLogRecord::FrozenAppend(frozen) => {
-                let Some(first) = frozen.entries.first().map(|entry| entry.log_id.index) else {
-                    return Ok(());
-                };
-                self.cache.truncate_after(first.checked_sub(1));
-                let storage_bytes = u32::try_from(
-                    at.loc
-                        .file_bytes()
-                        .div_ceil(u64::try_from(frozen.entries.len()).unwrap_or(u64::MAX)),
-                )
-                .unwrap_or(u32::MAX);
-                for entry in frozen.entries {
-                    let indexed = IndexedEntry {
-                        log_id: entry.log_id,
-                        frame: at,
-                        bytes: entry.bytes,
-                        storage_bytes,
-                    };
-                    if let Some(replaced) = self.index.insert(indexed)? {
-                        self.unlive(replaced);
-                    }
-                    self.add_live(at.segment, u64::from(storage_bytes));
-                }
-                Ok(())
-            }
+            // Its read weights come from the archive it names.
+            RaftGroupLogRecord::FrozenAppend(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an archived append is applied with its resolved archive entries",
+            )),
             RaftGroupLogRecord::TruncateAfter(last) => {
                 self.truncate_after(last.map(|log_id| log_id.index));
                 Ok(())
@@ -319,6 +299,39 @@ impl GroupLog {
             }
         }
         self.add_live(at.segment, live);
+        Ok(())
+    }
+
+    /// Indexes the archive reference written at `at`. `selected` holds
+    /// exactly the live entries it names, read from the archive at open, so
+    /// this binary derives their read weights instead of trusting stored ones.
+    pub(crate) fn apply_archived(
+        &mut self,
+        selected: &[Entry],
+        at: FramePos,
+    ) -> Result<(), io::Error> {
+        let Some(first) = selected.first().map(|entry| entry.log_id.index) else {
+            return Ok(());
+        };
+        self.cache.truncate_after(first.checked_sub(1));
+        let storage_bytes = u32::try_from(
+            at.loc
+                .file_bytes()
+                .div_ceil(u64::try_from(selected.len()).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(u32::MAX);
+        for entry in selected {
+            let indexed = IndexedEntry {
+                log_id: entry.log_id,
+                frame: at,
+                bytes: u32::try_from(entry_log_bytes(entry)).unwrap_or(u32::MAX),
+                storage_bytes,
+            };
+            if let Some(replaced) = self.index.insert(indexed)? {
+                self.unlive(replaced);
+            }
+            self.add_live(at.segment, u64::from(storage_bytes));
+        }
         Ok(())
     }
 
@@ -935,6 +948,32 @@ mod tests {
         assert_eq!(log.live_in(SegmentId(2)), weight(100) + MARKER_BYTES);
         assert_eq!(log.last_log_id(), Some(log_id(1, 4)));
         assert_eq!(log.live_bytes(), weight(100) + 2 * MARKER_BYTES);
+    }
+
+    /// An archive reference stores only log IDs: a corrected binary may
+    /// change the size estimate. Replay derives read weights from the
+    /// archived payload and journal space from the reference frame.
+    #[test]
+    fn archived_entries_take_read_weights_from_the_replaying_binary() {
+        let mut log = GroupLog::replaying(1 << 20);
+        let reference = at(2, 32);
+        log.apply_archived(&[entry(1, 1, 300), entry(1, 2, 10)], reference)
+            .expect("index the reference");
+        log.finish_replay().expect("finish replay");
+        assert_eq!(
+            log.live_in(SegmentId(2)),
+            2 * reference.loc.file_bytes().div_ceil(2)
+        );
+        let plan = log.plan_read(1..=2, Some(weight(300)));
+        assert!(plan.cached.is_empty());
+        assert_eq!(plan.disk.len(), 1);
+        assert_eq!(plan.disk[0].log_ids, vec![log_id(1, 1)]);
+        log.apply(
+            RaftGroupLogRecord::Append(vec![entry(1, 3, 10)]),
+            at(2, 200),
+            ApplyMode::Live,
+        )
+        .expect("a live append extends the archived prefix");
     }
 
     #[test]
