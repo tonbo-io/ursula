@@ -15,13 +15,11 @@
 //! journal to stay correct: a deleted segment that a power loss brings back
 //! replays history that later records supersede.
 //!
-//! Recovery reads the segments in order ([`recover_segments`]). Strict
-//! replay tolerates only an incomplete final frame of the newest segment.
-//! Verified-prefix replay keeps every frame before the first one that fails
-//! verification, in whatever segment, and drops the rest of that segment and
-//! every later one. The dropped segments are removed durably before that
-//! segment is truncated, so a second crash cannot bring them back after a
-//! shorter segment and replay them over a hole.
+//! Recovery reads all sealed segments strictly, under either fsync policy.
+//! The newest segment keeps its verified prefix. Before discarding complete
+//! invalid frames, the caller must durably close recovery gates; incomplete
+//! final writes need no additional gate. This ordering preserves the gate
+//! even if another crash interrupts tail truncation.
 
 use std::fmt;
 use std::io;
@@ -149,12 +147,6 @@ pub(crate) enum RecoveryEnd {
     /// The newest segment held no complete header (a crash cut its creation
     /// short) and was removed.
     TornNewest { segment: SegmentId },
-    /// Verified-prefix replay stopped before `segment`: its header or its
-    /// sequence did not verify. It and every later segment were removed.
-    Dropped {
-        segment: SegmentId,
-        dropped_segments: u64,
-    },
 }
 
 /// What [`recover_segments`] kept of a core journal.
@@ -182,18 +174,16 @@ enum Cut {
     },
     /// Remove the newest segment: its header is incomplete.
     TornNewest(SegmentId),
-    /// Remove this segment and every later one.
-    DropFrom(SegmentId),
 }
 
-/// Reads every segment of the core journal in `dir` in order and in `mode`,
+/// Reads every segment of the core journal in `dir` in order,
 /// streaming each record with its segment and position through `visit`, and
 /// then cuts the journal after its verified records (see the module
 /// documentation).
 pub(crate) fn recover_segments<C: FrameCodec>(
     dir: &Path,
-    mode: JournalReplayMode,
     mut visit: impl FnMut(SegmentId, FrameLoc, C::Record) -> io::Result<()>,
+    mut before_unverified_repair: impl FnMut() -> Result<(), JournalError>,
 ) -> Result<RecoveredSegments, JournalError> {
     let ids = list_segments(dir)?;
     let mut kept: Vec<KeptSegment> = Vec::with_capacity(ids.len());
@@ -205,41 +195,31 @@ pub(crate) fn recover_segments<C: FrameCodec>(
         if let Some(previous) = kept.last()
             && previous.id.next() != id
         {
-            match mode {
-                JournalReplayMode::Strict => {
-                    return Err(JournalError::MissingSegment {
-                        dir: dir.to_owned(),
-                        previous: previous.id.0,
-                        found: id.0,
-                    });
-                }
-                JournalReplayMode::VerifiedPrefix => {
-                    cut = Cut::DropFrom(id);
-                    break;
-                }
-            }
+            return Err(JournalError::MissingSegment {
+                dir: dir.to_owned(),
+                previous: previous.id.0,
+                found: id.0,
+            });
         }
         let path = segment_path(dir, id);
         let len = file_len(&path)?;
         if len < journal::JOURNAL_HEADER_LEN_U64 {
-            match (newest, mode) {
-                (true, _) => {
-                    cut = Cut::TornNewest(id);
-                    break;
-                }
-                (false, JournalReplayMode::VerifiedPrefix) => {
-                    cut = Cut::DropFrom(id);
-                    break;
-                }
-                (false, JournalReplayMode::Strict) => {
-                    return Err(JournalError::CorruptHeader {
-                        path,
-                        defect: HeaderDefect::Torn,
-                    });
-                }
+            if newest {
+                cut = Cut::TornNewest(id);
+                break;
             }
+            return Err(JournalError::CorruptHeader {
+                path,
+                defect: HeaderDefect::Torn,
+            });
         }
-        let replayed = journal::replay::<C>(&path, mode, |loc, record| visit(id, loc, record))?;
+        let frame_mode = if newest {
+            JournalReplayMode::VerifiedPrefix
+        } else {
+            JournalReplayMode::Strict
+        };
+        let replayed =
+            journal::replay::<C>(&path, frame_mode, |loc, record| visit(id, loc, record))?;
         if let Some(found) = replayed.sequence
             && found != id.0
         {
@@ -255,7 +235,7 @@ pub(crate) fn recover_segments<C: FrameCodec>(
         verified_bytes = verified_bytes.saturating_add(replayed.verified_len);
         match replayed.tail {
             ReplayTail::Clean => kept.push(KeptSegment { id, len }),
-            ReplayTail::Incomplete { bytes } if !newest && mode == JournalReplayMode::Strict => {
+            ReplayTail::Incomplete { bytes } if !newest => {
                 return Err(JournalError::IncompleteSealedSegment { path, bytes });
             }
             tail @ (ReplayTail::Incomplete { .. } | ReplayTail::Unverified { .. }) => {
@@ -272,10 +252,18 @@ pub(crate) fn recover_segments<C: FrameCodec>(
             }
         }
     }
+    // Persist the recovery gate before truncation can erase the evidence of
+    // complete invalid frames. An incomplete final write needs no new gate.
+    if matches!(cut, Cut::Truncate {
+        tail: ReplayTail::Unverified { .. },
+        ..
+    }) {
+        before_unverified_repair()?;
+    }
     let first_dropped = match &cut {
         Cut::None => None,
         Cut::Truncate { segment, .. } => Some(segment.next()),
-        Cut::TornNewest(segment) | Cut::DropFrom(segment) => Some(*segment),
+        Cut::TornNewest(segment) => Some(*segment),
     };
     let dropped = ids
         .iter()
@@ -312,10 +300,6 @@ pub(crate) fn recover_segments<C: FrameCodec>(
             }
         }
         Cut::TornNewest(segment) => RecoveryEnd::TornNewest { segment },
-        Cut::DropFrom(segment) => RecoveryEnd::Dropped {
-            segment,
-            dropped_segments,
-        },
     };
     Ok(RecoveredSegments {
         segments: kept,

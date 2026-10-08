@@ -147,7 +147,7 @@ A voter whose WAL directory was wiped or replaced, for example after a lost disk
 - **It stays behind the recovery gate.** It does not campaign and refuses every vote once it knows the group holds entries, until it has applied a fresh barrier from the group's leader (see [Recovering after a host crash](#recovering-after-a-host-crash)).
 - **The leader rebuilds it.** The leader sees the node answer that it lacks entries it had acknowledged: it commits a voter set without the node, adds it back as a learner, waits until it has replicated the commit index and promotes it. Each step is read off the current membership, so a leader change or another restart of the node converge. Leadership handoffs (the balancer, the commit-stall watchdog) skip the node until then.
 
-No operator step is needed. `ursulactl wait --node N` returns once every group has promoted the node, and `ursulactl verify-cluster` shows it unready until then. If a majority of a group's voters lost their disks at once, recover as after a majority host crash below. If every voter lost its disk, the bootstrap probe sees only empty voters and initializes the groups again, empty: every acknowledged write is lost, and cold objects written before stay in object storage, unreferenced. Start such a cluster over on a new object-storage prefix, as for any fresh install.
+No operator step is needed. `ursulactl wait --node N` returns once every group has promoted the node, and `ursulactl verify-cluster` shows it unready until then. If a majority of a group's voters lost their disks at once, a surviving quorum may be unable to establish their vote floors. `accept-unsynced-loss` cannot bypass missing voting history. Restore enough intact voters to obtain a fresh quorum proof before these replicas can rejoin. If every voter lost its disk, the bootstrap probe sees only empty voters and initializes the groups again, empty: every acknowledged write is lost, and cold objects written before stay in object storage, unreferenced. Start such a cluster over on a new object-storage prefix, as for any fresh install.
 
 ### Recovering after a host crash
 
@@ -179,8 +179,11 @@ It answers `{"raft_group_id": 42, "node_id": 1, "outcome": "gate_opened", "last_
 
 The call is refused with `409 Conflict`, and changes nothing, when:
 
+- the replica lost its vote and has not established a durable vote floor. Restore connectivity to an intact quorum so it can obtain a fresh barrier. Accepting unsynced data loss cannot authorize a replica to acknowledge an unknown leader.
 - the replica's gate is closed but not stalled. It may still open through a leader's barrier without losing anything. Wait for `recovery_stalled`.
 - the replica no longer holds the log the body names, because it moved since you read the metrics. Read the metrics again and decide again.
+
+With `fsync = "always"`, acknowledged appends survive a host crash, but the newest journal segment can still contain an incomplete or invalid unacknowledged tail. Recovery rejects damage in sealed segments. It repairs the newest tail to its verified prefix and records the affected core's recovery gates before cutting a complete invalid frame. An incomplete final frame can be removed without a new recovery gate.
 
 A single-voter group has no other replica to recover from, so it needs this call after every host crash under `never`, once its gate reports the group stalled. Use `fsync = "always"` where that is not acceptable.
 

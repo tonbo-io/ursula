@@ -571,6 +571,10 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                 let e_acknowledged = attempt_append(&mut cluster, group, new_leader, b"EEEE;")
                     .await
                     == Attempt::Acknowledged;
+                assert!(
+                    e_acknowledged,
+                    "{context}: E must be acknowledged before losing V"
+                );
                 madsim::time::sleep(Duration::from_millis(200)).await;
                 committed.observe(&cluster, group).await;
 
@@ -587,10 +591,55 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                 cluster.policy.heal_bidirectional(wiped, stale_leader);
                 cluster.start_node(wiped).await;
 
+                // Lost vote history is not an operator-accepted log-tail loss.
+                let stalled_by = madsim::time::Instant::now() + RECOVERY_STALL_AFTER * 3;
+                while gate(&cluster, group, wiped) != RecoveryGateStatus::Stalled {
+                    assert!(
+                        madsim::time::Instant::now() < stalled_by,
+                        "{context}: wiped replica never reported stalled"
+                    );
+                    madsim::time::sleep(Duration::from_millis(25)).await;
+                }
+                let admin = ursula_raft::RaftGroupHandleRegistry::default();
+                admin.register(
+                    group_placement(group),
+                    cluster.engines[&(group, wiped)].raft_handle(),
+                );
+                admin.register_rejoin(RaftGroupId(group), cluster.rejoins[&(group, wiped)].clone());
+                let seen = metrics(&cluster, group, wiped);
+                let error = admin
+                    .accept_unsynced_loss(RaftGroupId(group), &AcceptUnsyncedLossRequest {
+                        expected_last_log_index: seen.last_log_index,
+                        expected_current_term: seen.current_term,
+                    })
+                    .await
+                    .expect_err(
+                        "the production admin entry point must reject unknown vote history",
+                    );
+                assert!(
+                    matches!(error, RecoveryGateError::MissingVoteFloor { raft_group_id } if raft_group_id == RaftGroupId(group)),
+                    "{context}: {error:?}"
+                );
+                assert_eq!(gate(&cluster, group, wiped), RecoveryGateStatus::Stalled);
+                assert!(!cluster.rejoins[&(group, wiped)].vote_gate_open());
+                drop(admin);
+
                 // A clean restart retains its committed self vote. Cover this
                 // separately: crash demotion alone can mask the lost-voter bug.
                 restart(&mut cluster, stale_leader, restart_kind).await;
                 madsim::time::sleep(Duration::from_millis(500)).await;
+                if matches!(restart_kind, Restart::Clean) {
+                    let stale = metrics(&cluster, group, stale_leader);
+                    assert_eq!(
+                        stale.state,
+                        ServerState::Leader,
+                        "{context}: clean old L must still lead before X"
+                    );
+                    assert_eq!(
+                        stale.vote, old_vote,
+                        "{context}: old L must retain the original stale vote"
+                    );
+                }
                 let x_acknowledged = attempt_append(&mut cluster, group, stale_leader, b"XXXX;")
                     .await
                     == Attempt::Acknowledged;
@@ -601,6 +650,10 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                 // Everything heals and the group converges.
                 cluster.policy.clear();
                 madsim::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    metrics(&cluster, group, stale_leader).vote > old_vote,
+                    "{context}: the stale leadership must end after encountering the newer vote"
+                );
                 let final_leader = wait_leader(&cluster, group, &context).await;
                 assert_eq!(
                     attempt_append(&mut cluster, group, final_leader, b"after;").await,

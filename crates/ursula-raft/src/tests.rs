@@ -424,13 +424,36 @@ async fn build_three_node_cluster(
         .initialize(nodes)
         .await
         .expect("initialize raft group");
-    let leader_metrics = engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
-        .await
-        .expect("wait for leader");
-    let leader_id = leader_metrics.current_leader.expect("leader id");
+    let leader_id = tokio::time::timeout(Duration::from_secs(5), async {
+        let leader_metrics = engines[0]
+            .raft
+            .wait(None)
+            .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
+            .await
+            .expect("wait for leader");
+        let leader_id = leader_metrics.current_leader.expect("leader id");
+        let leader_index = usize::try_from(leader_id).unwrap().checked_sub(1).unwrap();
+        engines[leader_index]
+            .raft
+            .wait(None)
+            .metrics(
+                |metrics| {
+                    metrics.state == openraft::ServerState::Leader
+                        && metrics.current_leader == Some(leader_id)
+                },
+                "elected actor enters leader state",
+            )
+            .await
+            .expect("wait for selected leader actor");
+        let (vote, _) = registry
+            .confirm_recovery_barrier(leader_id, placement().raft_group_id)
+            .await
+            .expect("selected leader confirms a fresh quorum before fixture writes");
+        assert_eq!(*vote.leader_id().node_id(), leader_id);
+        leader_id
+    })
+    .await
+    .expect("election and quorum readiness share the existing five-second budget");
     (registry, engines, leader_id, wal_roots)
 }
 
@@ -2117,11 +2140,15 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         .expect("wait for leader purge");
 
     registry.register(3, engines[2].raft.clone());
-    let learner_added = engines[leader_index]
-        .raft
-        .add_learner(3, BasicNode::new("node-3"), true)
-        .await
-        .expect("add lagging learner");
+    let learner_added = tokio::time::timeout(
+        Duration::from_secs(5),
+        engines[leader_index]
+            .raft
+            .add_learner(3, BasicNode::new("node-3"), true),
+    )
+    .await
+    .expect("lagging learner catch-up finishes within the existing apply budget")
+    .expect("add lagging learner");
     for _ in 0..50 {
         if registry.full_snapshot_count(3) > 0 {
             break;

@@ -5103,159 +5103,211 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
 /// gave.
 #[tokio::test]
 async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
-    let placement = ursula_shard::ShardPlacement {
-        core_id: ursula_shard::CoreId(0),
-        shard_id: ursula_shard::ShardId(0),
-        raft_group_id: RaftGroupId(0),
-    };
-    // A replica on an empty WAL: its gate is closed until a barrier or an
-    // operator opens it.
-    let wal_root = tempfile::tempdir().expect("WAL root");
-    let store = ursula_raft::RaftWal::start(
-        wal_root.path(),
-        ursula_config::WalFsync::Never,
-        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
-    )
-    .expect("start the Raft WAL")
-    .open(
-        placement,
-        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-    )
-    .expect("open the log store");
-    let gate = Arc::new(
-        ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
-            .await
-            .expect("open the gate"),
-    );
-    let engine = ursula_raft::RaftGroupEngine::new_single_node(
-        placement,
-        1,
-        openraft::BasicNode::new("local"),
-        Arc::new(openraft::Config::default().validate().unwrap()),
-        store,
-        ursula_raft::RaftGroupEngineOptions::default(),
-    )
-    .await
-    .expect("single-node group");
-    gate.bind(&engine.raft_handle());
-    let registry = RaftGroupHandleRegistry::default();
-    registry.register_rejoin(RaftGroupId(0), gate.clone());
-    registry.register(placement, engine.raft_handle());
-    let runtime = spawn_runtime(
-        &test_config(1, 1),
-        Persistence::InMemory,
-        Topology::SingleNode {
-            raft_group_count: 1,
-        },
-    )
-    .expect("runtime")
-    .runtime;
-    let state = HttpState::with_raft_registry(runtime, registry.clone());
-    let client = client_router_with_admission(state.clone(), IngressAdmission::default());
-    let ready = http_get(&client, READINESS_PATH).await;
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-    assert_eq!(body["reason"], json!("recovery_gate_closed"));
+    use openraft::storage::RaftLogReader;
+    use openraft::storage::RaftLogStorage;
 
-    let admin = admin_router(state.clone());
-    let path = "/__ursula/raft/0/recovery/accept-unsynced-loss";
-    let json_body = &[("content-type", "application/json")];
-    let metrics: serde_json::Value =
-        serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
-            .expect("metrics JSON");
-    let group = &metrics["raft_groups"][0];
-    let seen = ursula_proto::admin::AcceptUnsyncedLossRequest {
-        expected_last_log_index: group["last_log_index"].as_u64(),
-        expected_current_term: group["current_term"].as_u64().expect("current term"),
-    };
-    let accept = |expected: ursula_proto::admin::AcceptUnsyncedLossRequest| {
-        Body::from(serde_json::to_vec(&expected).expect("request JSON"))
-    };
-
-    let unbound = admin
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("content-type", "application/json")
-                .body(accept(seen))
+    for retained_vote in [false, true] {
+        let placement = ursula_shard::ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        // A missing log with either retained vote metadata or lost vote history.
+        // Only the former may accept an unsynced-tail loss.
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let mut store = ursula_raft::RaftWal::start(
+            wal_root.path(),
+            ursula_config::WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start the Raft WAL")
+        .open(
+            placement,
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("open the log store");
+        if retained_vote {
+            store
+                .save_vote(&ursula_raft::UrsulaVote::new(1, 2))
+                .await
+                .expect("persist retained vote metadata");
+        }
+        let gate = Arc::new(
+            ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
+                .await
+                .expect("open the gate"),
+        );
+        let engine = ursula_raft::RaftGroupEngine::new_node(
+            placement,
+            1,
+            Arc::new(
+                openraft::Config {
+                    enable_tick: false,
+                    ..Default::default()
+                }
+                .validate()
                 .unwrap(),
+            ),
+            ursula_raft::SingleNodeRaftNetworkFactory,
+            store.clone(),
+            ursula_raft::RaftGroupEngineOptions::default(),
         )
         .await
-        .unwrap();
-    assert_eq!(unbound.status(), StatusCode::PRECONDITION_REQUIRED);
-    let unnamed = http_post(&admin, path, json_body, Body::from("{}")).await;
-    assert_eq!(unnamed.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // The gate awaits a barrier: it may still open without losing anything.
-    let awaiting = http_post(&admin, path, json_body, accept(seen)).await;
-    assert_eq!(awaiting.status(), StatusCode::CONFLICT);
-    assert!(!gate.vote_gate_open(), "a refused request opened the gate");
+        .expect("recovering group");
+        if retained_vote {
+            engine
+                .raft_handle()
+                .wait(Some(std::time::Duration::from_secs(2)))
+                .metrics(
+                    |metrics| metrics.vote == ursula_raft::UrsulaVote::new(1, 2),
+                    "retained vote restored before observing the admin CAS",
+                )
+                .await
+                .expect("restore retained vote");
+        }
+        gate.bind(&engine.raft_handle());
+        let registry = RaftGroupHandleRegistry::default();
+        registry.register_rejoin(RaftGroupId(0), gate.clone());
+        registry.register(placement, engine.raft_handle());
+        let runtime = spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime;
+        let state = HttpState::with_raft_registry(runtime, registry.clone());
+        let client = client_router_with_admission(state.clone(), IngressAdmission::default());
+        let ready = http_get(&client, READINESS_PATH).await;
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
+        assert_eq!(body["reason"], json!("recovery_gate_closed"));
 
-    // No leader confirms a barrier: the production driver reports the group
-    // stalled.
-    let barrier = tokio::spawn(ursula_raft::run_rejoin_vote_barrier(
-        registry.get(RaftGroupId(0)).expect("registered owner"),
-        gate.clone(),
-        registry.election_policy(),
-        BTreeMap::new(),
-        |_leader, _address| async {
-            Err::<(ursula_raft::UrsulaVote, u64), _>("no leader".to_owned())
-        },
-        std::time::Duration::from_millis(10),
-        std::time::Duration::from_millis(10),
-        std::time::Duration::from_millis(50),
-    ));
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
-    while gate.status() != ursula_raft::RecoveryGateStatus::Stalled {
-        assert!(Instant::now() < deadline, "the gate never stalled");
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let admin = admin_router(state.clone());
+        let path = "/__ursula/raft/0/recovery/accept-unsynced-loss";
+        let json_body = &[("content-type", "application/json")];
+        let metrics: serde_json::Value =
+            serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
+                .expect("metrics JSON");
+        let group = &metrics["raft_groups"][0];
+        let seen = ursula_proto::admin::AcceptUnsyncedLossRequest {
+            expected_last_log_index: group["last_log_index"].as_u64(),
+            expected_current_term: group["current_term"].as_u64().expect("current term"),
+        };
+        let accept = |expected: ursula_proto::admin::AcceptUnsyncedLossRequest| {
+            Body::from(serde_json::to_vec(&expected).expect("request JSON"))
+        };
+
+        let unbound = admin
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(accept(seen))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unbound.status(), StatusCode::PRECONDITION_REQUIRED);
+        let unnamed = http_post(&admin, path, json_body, Body::from("{}")).await;
+        assert_eq!(unnamed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // The gate awaits a barrier: it may still open without losing anything.
+        let awaiting = http_post(&admin, path, json_body, accept(seen)).await;
+        assert_eq!(awaiting.status(), StatusCode::CONFLICT);
+        assert!(!gate.vote_gate_open(), "a refused request opened the gate");
+
+        // No leader confirms a barrier: the production driver reports the group
+        // stalled.
+        let barrier = tokio::spawn(ursula_raft::run_rejoin_vote_barrier(
+            registry.get(RaftGroupId(0)).expect("registered owner"),
+            gate.clone(),
+            registry.election_policy(),
+            BTreeMap::new(),
+            |_leader, _address| async {
+                Err::<(ursula_raft::UrsulaVote, u64), _>("no leader".to_owned())
+            },
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        ));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while gate.status() != ursula_raft::RecoveryGateStatus::Stalled {
+            assert!(Instant::now() < deadline, "the gate never stalled");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !retained_vote {
+            let rejected = http_post(&admin, path, json_body, accept(seen)).await;
+            assert_eq!(rejected.status(), StatusCode::CONFLICT);
+            assert_eq!(gate.status(), ursula_raft::RecoveryGateStatus::Stalled);
+            assert!(!gate.vote_gate_open());
+            assert_eq!(store.read_vote().await.expect("unchanged lost vote"), None);
+            assert!(!registry.recovery_barriers_ready());
+            barrier.abort();
+            assert!(
+                barrier
+                    .await
+                    .expect_err("stopped recovery waiter")
+                    .is_cancelled()
+            );
+            engine.shutdown().await.expect("stop unknown-history group");
+            continue;
+        }
+        let other_log = ursula_proto::admin::AcceptUnsyncedLossRequest {
+            expected_last_log_index: Some(
+                seen.expected_last_log_index
+                    .map_or(0, |index| index.saturating_add(1)),
+            ),
+            ..seen
+        };
+        let changed = http_post(&admin, path, json_body, accept(other_log)).await;
+        assert_eq!(changed.status(), StatusCode::CONFLICT);
+        assert!(!gate.vote_gate_open(), "a refused request opened the gate");
+
+        for expected in [
+            ursula_raft::AcceptUnsyncedLossOutcome::GateOpened,
+            ursula_raft::AcceptUnsyncedLossOutcome::AlreadyOpen,
+        ] {
+            let response = http_post(&admin, path, json_body, accept(seen)).await;
+            let status = response.status();
+            let response_body = body_bytes(response).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&response_body)
+            );
+            let report: ursula_raft::AcceptUnsyncedLossReport =
+                serde_json::from_slice(&response_body).expect("typed report");
+            assert_eq!(report.raft_group_id, 0);
+            assert_eq!(report.node_id, 1);
+            assert_eq!(report.outcome, expected);
+            assert_eq!(report.last_log_index, seen.expected_last_log_index);
+            assert_eq!(report.current_term, seen.expected_current_term);
+        }
+        assert!(gate.vote_gate_open());
+        barrier
+            .await
+            .expect("the barrier driver ends once the gate opens");
+        assert!(registry.recovery_barriers_ready());
+        let ready = http_get(&client, READINESS_PATH).await;
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
+        assert_eq!(body["recovery_barriers_ready"], json!(true));
+        assert_eq!(body["recovery_stalled_groups"], json!([]));
+
+        let missing = http_post(
+            &admin,
+            "/__ursula/raft/7/recovery/accept-unsynced-loss",
+            json_body,
+            accept(seen),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        engine.shutdown().await.expect("stop the group");
     }
-    let other_log = ursula_proto::admin::AcceptUnsyncedLossRequest {
-        expected_last_log_index: Some(
-            seen.expected_last_log_index
-                .map_or(0, |index| index.saturating_add(1)),
-        ),
-        ..seen
-    };
-    let changed = http_post(&admin, path, json_body, accept(other_log)).await;
-    assert_eq!(changed.status(), StatusCode::CONFLICT);
-    assert!(!gate.vote_gate_open(), "a refused request opened the gate");
-
-    for expected in [
-        ursula_raft::AcceptUnsyncedLossOutcome::GateOpened,
-        ursula_raft::AcceptUnsyncedLossOutcome::AlreadyOpen,
-    ] {
-        let response = http_post(&admin, path, json_body, accept(seen)).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let report: ursula_raft::AcceptUnsyncedLossReport =
-            serde_json::from_slice(&body_bytes(response).await).expect("typed report");
-        assert_eq!(report.raft_group_id, 0);
-        assert_eq!(report.node_id, 1);
-        assert_eq!(report.outcome, expected);
-        assert_eq!(report.last_log_index, seen.expected_last_log_index);
-        assert_eq!(report.current_term, seen.expected_current_term);
-    }
-    assert!(gate.vote_gate_open());
-    barrier
-        .await
-        .expect("the barrier driver ends once the gate opens");
-    assert!(registry.recovery_barriers_ready());
-    let ready = http_get(&client, READINESS_PATH).await;
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-    assert_eq!(body["recovery_barriers_ready"], json!(true));
-    assert_eq!(body["recovery_stalled_groups"], json!([]));
-
-    let missing = http_post(
-        &admin,
-        "/__ursula/raft/7/recovery/accept-unsynced-loss",
-        json_body,
-        accept(seen),
-    )
-    .await;
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    engine.shutdown().await.expect("stop the group");
 }
-
 #[tokio::test]
 async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_missing() {
     let runtime = spawn_runtime(

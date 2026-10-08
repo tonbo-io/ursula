@@ -820,18 +820,16 @@ impl RaftGroupHandleRegistry {
         &self,
         group: RaftGroupId,
         vote: crate::types::UrsulaVote,
-    ) -> Result<(), GroupEngineError> {
-        if self
-            .rejoin(group)
-            .is_some_and(|rejoin| !rejoin.replication_allowed(vote))
-        {
-            return Err(GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::RecoveryVoteFloor {
-                    raft_group_id: group,
-                },
-            ));
-        }
-        Ok(())
+    ) -> Result<Option<crate::types::UrsulaVote>, GroupEngineError> {
+        let Some(rejoin) = self.rejoin(group) else {
+            return Ok(None);
+        };
+        let floor = rejoin.recovery_vote().ok_or({
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::RecoveryVoteFloor {
+                raft_group_id: group,
+            })
+        })?;
+        Ok((vote < floor).then_some(floor))
     }
 
     pub async fn append_entries(
@@ -839,7 +837,9 @@ impl RaftGroupHandleRegistry {
         raft_group_id: RaftGroupId,
         request: AppendEntriesRequest<UrsulaRaftTypeConfig>,
     ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
-        self.check_recovery_vote(raft_group_id, request.vote)?;
+        if let Some(floor) = self.check_recovery_vote(raft_group_id, request.vote)? {
+            return Ok(AppendEntriesResponse::HigherVote(floor));
+        }
         let raft = self.require_group(raft_group_id)?;
         let rejoin = self.rejoin(raft_group_id);
         raft.call(move |raft| async move {
@@ -904,7 +904,9 @@ impl RaftGroupHandleRegistry {
             })?;
             (raft, lifetime)
         };
-        self.check_recovery_vote(raft_group_id, vote)?;
+        if let Some(floor) = self.check_recovery_vote(raft_group_id, vote)? {
+            return Ok(SnapshotResponse::new(floor));
+        }
         let registry = self.clone();
         // The admitted task retains prefetch and permits through Raft consumption,
         // even when the RPC waiter disconnects or is canceled.
@@ -937,6 +939,10 @@ impl RaftGroupHandleRegistry {
                 .map_err(crate::owner::owner_stopped)
                 .map_err(SnapshotInstallError::Group);
             drop(_prefetch_guard);
+            // Object-store publication and its retry backoff must not monopolize
+            // the node-wide download/install budget. Keep the per-group lock
+            // and engine lifetime until publication completes.
+            drop(_permit);
             let publication = registry
                 .snapshot_install
                 .references(raft_group_id.0)
@@ -1230,13 +1236,28 @@ mod tests {
         crate::RaftGroupEngine,
         tempfile::TempDir,
     ) {
+        reference_failure_engine_for_group(store, RaftGroupId(7), Default::default()).await
+    }
+
+    async fn reference_failure_engine_for_group(
+        store: Arc<FailingReferenceStore>,
+        group: RaftGroupId,
+        snapshot_install: SnapshotInstallCoordinator,
+    ) -> (
+        RaftGroupHandleRegistry,
+        crate::RaftGroupEngine,
+        tempfile::TempDir,
+    ) {
         let wal_root = tempfile::tempdir().unwrap();
-        let registry = RaftGroupHandleRegistry::default();
+        let registry = RaftGroupHandleRegistry {
+            snapshot_install,
+            ..Default::default()
+        };
         registry.set_snapshot_store(Some(store.clone()));
         let placement = ShardPlacement {
             core_id: ursula_shard::CoreId(0),
             shard_id: ursula_shard::ShardId(0),
-            raft_group_id: RaftGroupId(7),
+            raft_group_id: group,
         };
         let config = Arc::new(
             openraft::Config {
@@ -1379,6 +1400,78 @@ mod tests {
                 .expect("raft core must keep running after the snapshot retry");
             raft.shutdown().await.unwrap();
         }
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn slow_reference_publication_does_not_block_another_groups_install() {
+        let coordinator = SnapshotInstallCoordinator::new(1);
+        let slow_store = Arc::new(FailingReferenceStore::default());
+        slow_store.pause_current.store(true, Ordering::SeqCst);
+        let (slow_registry, slow_engine, _slow_root) = reference_failure_engine_for_group(
+            slow_store.clone(),
+            RaftGroupId(7),
+            coordinator.clone(),
+        )
+        .await;
+        let (fast_registry, fast_engine, _fast_root) =
+            reference_failure_engine_for_group(Arc::default(), RaftGroupId(6), coordinator).await;
+        let slow = crate::rt::spawn(async move {
+            slow_registry
+                .install_full_snapshot(
+                    RaftGroupId(7),
+                    crate::types::UrsulaVote::new_committed(1, 2),
+                    reference_failure_snapshot(),
+                )
+                .await
+        });
+        slow_store.entered_current.notified().await;
+        // Cancellation must still retain the per-group publication and lifetime,
+        // but the sole node-wide install permit belongs to neither I/O nor backoff.
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        let mut group = decode_group_snapshot(&group_snapshot_bytes()).unwrap();
+        group.placement.raft_group_id = RaftGroupId(6);
+        let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(group))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect();
+        let mut snapshot = reference_failure_snapshot();
+        snapshot.snapshot = Cursor::new(
+            SnapshotPointer {
+                snapshot_id: snapshot.meta.snapshot_id.clone(),
+                location: SnapshotLocation::Inline { bytes },
+            }
+            .encode_binary()
+            .unwrap(),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fast_registry.install_full_snapshot(
+                RaftGroupId(6),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                snapshot,
+            ),
+        )
+        .await
+        .expect("another group must install while publication remains paused")
+        .unwrap();
+        assert_eq!(
+            fast_engine
+                .raft_handle()
+                .metrics()
+                .borrow_watched()
+                .last_applied
+                .unwrap()
+                .index(),
+            1
+        );
+        slow_store.pause_current.store(false, Ordering::SeqCst);
+        slow_store.release_current.notify_one();
+        slow_engine.shutdown().await.unwrap();
+        fast_engine.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]

@@ -158,7 +158,6 @@ static GRPC_SNAPSHOT_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
 use crate::registry::RaftGroupHandleRegistry;
 
 const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
-pub(crate) const REJOIN_BARRIER_CAPABILITY: &str = "ursula-rejoin-barrier";
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
@@ -174,8 +173,6 @@ pub(crate) enum RecoveryProbeError {
     Payload(#[from] ursula_runtime::GroupEngineError),
     #[error("recovery peer does not report itself as committed leader")]
     NotLeader,
-    #[error("recovery peer changed its vote across the ReadIndex proof")]
-    LeadershipChanged,
 }
 
 /// Confirm a group's current quorum without issuing an application write.
@@ -188,15 +185,8 @@ pub(crate) async fn confirm_quorum_prefix(
     address: &str,
     timeout: Duration,
 ) -> Result<QuorumPrefix, RecoveryProbeError> {
-    let (vote, index) = probe_rejoin_vote_barrier(
-        Arc::default(),
-        placement,
-        leader_id,
-        leader_id,
-        address,
-        timeout,
-    )
-    .await?;
+    let (vote, index) =
+        probe_rejoin_vote_barrier(Arc::default(), placement, leader_id, address, timeout).await?;
     Ok(QuorumPrefix {
         raft_group_id: placement.raft_group_id.0,
         leader_id,
@@ -205,70 +195,29 @@ pub(crate) async fn confirm_quorum_prefix(
     })
 }
 
-/// Fresh recovery evidence. Negotiate the explicit barrier RPC through the
-/// existing Vote response before calling it: an unknown RPC on a 0.6.2
-/// HTTP/gRPC mux falls through to the HTTP append route. For a 0.6.2
-/// leader during rolling upgrade, a linearizable HEAD of an impossible HTTP
-/// name confirms leadership before validating the name. A subsequent low-term
-/// vote probe supplies a conservative catch-up bound (the leader's last log,
-/// which includes its confirmed read index). Reject a peer reporting another
-/// leader: its HEAD may have been forwarded and its own prefix may be behind.
-///
+/// Fresh recovery evidence through the explicit ReadIndex barrier RPC.
 /// ReadIndexBarrier only coalesces rounds whose confirmation has not started;
 /// an inbound request never joins an already-started confirmation round.
 pub(crate) async fn probe_rejoin_vote_barrier(
     transport: Arc<CoreRaftTransport>,
     placement: ursula_shard::ShardPlacement,
-    node_id: u64,
     leader_id: u64,
     address: &str,
     timeout: Duration,
 ) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
     let network = GrpcRaftNetwork::new(transport, placement.raft_group_id, leader_id, address);
     let mut client = network.client()?;
-    let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote(node_id));
-    GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    GRPC_VOTE_REQUEST_BYTES.fetch_add(envelope.encoded_len() as u64, Ordering::Relaxed);
-    let mut capability_request = tonic::Request::new(envelope);
-    capability_request.set_timeout(timeout);
-    let capability_response = client.vote(capability_request).await?;
-    let explicit_barrier = capability_response
-        .metadata()
-        .get(REJOIN_BARRIER_CAPABILITY)
-        .is_some_and(|value| value == "1");
-    let ack = capability_response.into_inner();
-    GRPC_VOTE_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-    let response: UrsulaVoteResponse = decode_wire(&ack.payload, "rejoin capability vote")?;
-    if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
+    let mut request = tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
+        raft_group_id: placement.raft_group_id.0,
+        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+    });
+    request.set_timeout(timeout);
+    let response = client.rejoin_barrier(request).await?.into_inner();
+    let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
+    if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
         return Err(RecoveryProbeError::NotLeader);
     }
-    let observed_vote = response.vote;
-    // Capability metadata is only a routing hint, never fresh quorum or
-    // catch-up evidence. Do not cache it across peer replacements.
-    if explicit_barrier {
-        let mut barrier_request =
-            tonic::Request::new(raft_internal_proto::RejoinBarrierRequestV1 {
-                raft_group_id: placement.raft_group_id.0,
-                protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            });
-        barrier_request.set_timeout(timeout);
-        match client.rejoin_barrier(barrier_request).await {
-            Ok(response) => {
-                let response = response.into_inner();
-                let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
-                if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
-                    return Err(RecoveryProbeError::NotLeader);
-                }
-                if vote != observed_vote {
-                    return Err(RecoveryProbeError::LeadershipChanged);
-                }
-                return Ok((vote, response.index));
-            }
-            Err(status) if status.code() == tonic::Code::Unimplemented => {}
-            Err(status) => return Err(status.into()),
-        }
-    }
-    Err(tonic::Status::unimplemented("peer does not support RejoinBarrier").into())
+    Ok((vote, response.index))
 }
 
 #[derive(Debug, Clone)]
@@ -758,14 +707,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .vote(raft_group_id, request)
             .await
             .map_err(group_rpc_status)?;
-        let mut response = tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
+        Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
-        });
-        response.metadata_mut().insert(
-            REJOIN_BARRIER_CAPABILITY,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-        Ok(response)
+        }))
     }
 
     async fn full_snapshot(

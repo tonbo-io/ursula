@@ -2696,6 +2696,7 @@ pub(crate) async fn accept_unsynced_loss(
         Err(
             err @ (ursula_raft::RecoveryGateError::StoreClosed { .. }
             | ursula_raft::RecoveryGateError::NotStalled { .. }
+            | ursula_raft::RecoveryGateError::MissingVoteFloor { .. }
             | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
         ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
         Err(

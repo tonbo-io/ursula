@@ -217,9 +217,9 @@ impl PreviousRun {
         }
     }
 
-    /// How to read the journals the previous run left. Under `always`,
-    /// corruption must fail before repair can discard acknowledged frames.
-    /// Strict replay still truncates an incomplete newest tail.
+    /// Whether a possibly lossy run starts a new prefix-verification epoch.
+    /// Sealed segments always verify strictly. Newest-segment invalid tails
+    /// are repaired only after the core durably closes its recovery gates.
     pub fn replay_mode(self) -> JournalReplayMode {
         match self {
             Self::Absent

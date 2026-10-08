@@ -527,13 +527,26 @@ impl CoreFileLogWriter {
         let cache_bytes = options.tuning.group_cache_bytes;
         let recovery_started_at = Instant::now();
         let mut logs = BTreeMap::<u32, GroupLog>::new();
+        let replayed_groups = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let mut invalid_tail = false;
         let recovered = segment::recover_segments::<WireCodec<CoreJournalRecord>>(
             &dir,
-            replay_mode,
             |segment, loc, record| {
+                // Include groups whose first journal append preceded its
+                // metadata write in the durable pre-repair gate.
+                replayed_groups.borrow_mut().insert(record.group_id);
                 logs.entry(record.group_id)
                     .or_insert_with(|| GroupLog::replaying(cache_bytes))
                     .apply(record.record, FramePos { segment, loc }, ApplyMode::Replay)
+            },
+            || {
+                for group in replayed_groups.borrow().iter() {
+                    metadata.initialize(*group, GroupLogState::Recovering);
+                }
+                metadata.mark_recovering();
+                metadata.store(&metadata_path)?;
+                invalid_tail = true;
+                Ok(())
             },
         )?;
         for (group_id, log) in &mut logs {
@@ -583,7 +596,7 @@ impl CoreFileLogWriter {
         // A verified prefix may hold frames whose `fsync` failed and that
         // only the page cache still has, so every kept segment is written
         // again: every frame it keeps is then on disk.
-        if replay_mode == JournalReplayMode::VerifiedPrefix {
+        if replay_mode == JournalReplayMode::VerifiedPrefix || invalid_tail {
             segment::persist_segments(&dir, &recovered.segments)?;
         }
         // The journal now reads in full in this epoch. A group whose journal
@@ -593,7 +606,7 @@ impl CoreFileLogWriter {
         // replaced or wiped journal): it recovers.
         let mut metadata_changed = metadata.set_verified_epoch(options.recovery_epoch);
         // Without metadata, surviving records do not prove the lost vote.
-        let damaged = metadata_missing;
+        let damaged = metadata_missing || invalid_tail;
         let repaired = match (options.node_recovery, damaged) {
             (RecoveryState::Normal, false) => GroupLogState::Initialized,
             _ => GroupLogState::Recovering,
@@ -637,9 +650,7 @@ impl CoreFileLogWriter {
             ),
             None => {
                 let start = match recovered.end {
-                    RecoveryEnd::TornNewest { segment } | RecoveryEnd::Dropped { segment, .. } => {
-                        segment
-                    }
+                    RecoveryEnd::TornNewest { segment } => segment,
                     RecoveryEnd::Clean | RecoveryEnd::Truncated { .. } => SegmentId::FIRST,
                 };
                 (start, Vec::new())

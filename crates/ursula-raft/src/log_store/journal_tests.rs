@@ -634,47 +634,45 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
 
 #[tokio::test]
 async fn complete_corruption_under_always_fails_without_changing_any_segment() {
-    for sealed in [false, true] {
-        let core = Core::small(WalFsync::Always);
-        let writer = core.writer();
-        let mut store = core.store(&writer, 1);
-        let entries = if sealed { 40 } else { 2 };
-        for index in 1..=entries {
-            append(&mut store, [payload_entry(index, 512)]).await;
-        }
-        drop((store, writer));
-        let ids = core.segments();
-        let id = if sealed { ids[0] } else { *ids.last().unwrap() };
-        let path = core.segment(id);
-        let bytes = fs::read(&path).unwrap();
-        let offset = u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap();
-        overwrite(&path, offset, &[bytes.last().unwrap() ^ 0xff]);
-        let before = ids
-            .iter()
-            .map(|id| (*id, fs::read(core.segment(*id)).unwrap()))
-            .collect::<Vec<_>>();
-        for configured_fsync in [WalFsync::Always, WalFsync::Never] {
-            let mut options = core.options(0, RecoveryState::Normal);
-            options.tuning.fsync = configured_fsync;
-            options.previous_run = super::run_state::PreviousRun::HostCrash {
-                fsync: WalFsync::Always,
-            };
-            let error = CoreFileLogWriter::open(core.dir.clone(), options)
-                .expect_err("durable corruption fails closed even after changing fsync policy");
-            assert!(
-                matches!(
-                    journal_error(&error),
-                    Some(JournalError::CorruptFrame {
-                        defect: FrameDefect::PayloadChecksum,
-                        ..
-                    })
-                ),
-                "{error}"
-            );
-            assert_eq!(core.segments(), ids);
-            for (id, bytes) in &before {
-                assert_eq!(fs::read(core.segment(*id)).unwrap(), *bytes);
-            }
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    let entries = 40;
+    for index in 1..=entries {
+        append(&mut store, [payload_entry(index, 512)]).await;
+    }
+    drop((store, writer));
+    let ids = core.segments();
+    let id = ids[0];
+    let path = core.segment(id);
+    let bytes = fs::read(&path).unwrap();
+    let offset = u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap();
+    overwrite(&path, offset, &[bytes.last().unwrap() ^ 0xff]);
+    let before = ids
+        .iter()
+        .map(|id| (*id, fs::read(core.segment(*id)).unwrap()))
+        .collect::<Vec<_>>();
+    for configured_fsync in [WalFsync::Always, WalFsync::Never] {
+        let mut options = core.options(0, RecoveryState::Normal);
+        options.tuning.fsync = configured_fsync;
+        options.previous_run = super::run_state::PreviousRun::HostCrash {
+            fsync: WalFsync::Always,
+        };
+        let error = CoreFileLogWriter::open(core.dir.clone(), options)
+            .expect_err("durable corruption fails closed even after changing fsync policy");
+        assert!(
+            matches!(
+                journal_error(&error),
+                Some(JournalError::CorruptFrame {
+                    defect: FrameDefect::PayloadChecksum,
+                    ..
+                })
+            ),
+            "{error}"
+        );
+        assert_eq!(core.segments(), ids);
+        for (id, bytes) in &before {
+            assert_eq!(fs::read(core.segment(*id)).unwrap(), *bytes);
         }
     }
 }
@@ -737,6 +735,102 @@ async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
 }
 
 #[tokio::test]
+async fn newest_tail_is_unchanged_when_persisting_its_recovery_gate_fails() {
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [payload_entry(1, 512)]).await;
+    append(&mut store, [payload_entry(2, 512)]).await;
+    drop((store, writer));
+    let path = core.segment(*core.segments().last().unwrap());
+    let bytes = fs::read(&path).unwrap();
+    overwrite(
+        &path,
+        u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap(),
+        &[bytes.last().unwrap() ^ 0xff],
+    );
+    let damaged = fs::read(&path).unwrap();
+    let metadata_path = core_metadata_path(&core.dir);
+    let metadata_before = fs::read(&metadata_path).unwrap();
+    // Atomic metadata publication cannot create its temporary file.
+    fs::create_dir(core.dir.join("journal.meta.tmp")).unwrap();
+    for _ in 0..2 {
+        let error = core.open(JournalReplayMode::Strict).unwrap_err();
+        assert!(matches!(
+            journal_error(&error),
+            Some(JournalError::Io { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
+    }
+}
+
+#[tokio::test]
+async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retries() {
+    use super::run_state::NodeWal;
+    use super::run_state::RUN_STATE_FILE;
+
+    for gate_already_persisted in [false, true] {
+        let core = Core::small(WalFsync::Always);
+        let root = core._root.path();
+        let topology = ursula_shard::StaticShardMap::new(1, 3).unwrap();
+        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+        let writer = core.writer();
+        let mut sibling = core.store(&writer, 2);
+        append(&mut sibling, [blank_entry(1)]).await;
+        let mut store = core.store(&writer, 1);
+        append(&mut store, [payload_entry(1, 512)]).await;
+        append(&mut store, [payload_entry(2, 512)]).await;
+        drop((store, sibling, writer));
+        let path = core.segment(*core.segments().last().unwrap());
+        let bytes = fs::read(&path).unwrap();
+        overwrite(
+            &path,
+            u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap(),
+            &[bytes.last().unwrap() ^ 0xff],
+        );
+        RunStateFile::new(root.join(RUN_STATE_FILE), RunState {
+            boot_id: None,
+            fsync: WalFsync::Always,
+            status: RunStatus::Running,
+            recovery_epoch: 0,
+        })
+        .record(RunStatus::Running, "host crash")
+        .unwrap();
+        // Startup records Running but crashes before lazy core replay.
+        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+        if gate_already_persisted {
+            // Also exercise a crash after the durable repair gate, before truncate.
+            assert!(
+                super::core_meta::mark_core_recovering(&core_metadata_path(&core.dir)).unwrap()
+            );
+        }
+        for _ in 0..2 {
+            let node = NodeWal::start(root.to_owned(), WalFsync::Never, &topology).unwrap();
+            let opening = node.opening();
+            let mut options = core.options(opening.recovery_epoch, opening.recovery);
+            options.tuning.fsync = WalFsync::Never;
+            options.previous_run = opening.previous_run;
+            options.run_state = node.run_state().clone();
+            let writer = CoreFileLogWriter::open(core.dir.clone(), options).unwrap();
+            let store = core.store(&writer, 1);
+            let sibling = core.store(&writer, 2);
+            assert_eq!(log_ids(&store).await, [1]);
+            assert_eq!(log_ids(&sibling).await, [1]);
+            assert_eq!(store.log_state(), GroupLogState::Recovering);
+            assert_eq!(sibling.log_state(), GroupLogState::Recovering);
+            let durable = CoreMetadata::load(&core_metadata_path(&core.dir)).unwrap();
+            assert!(
+                durable
+                    .groups()
+                    .all(|(_, group)| group.log == GroupLogState::Recovering)
+            );
+            drop((store, sibling, writer));
+        }
+    }
+}
+
+#[tokio::test]
 async fn never_host_crash_repair_remains_gated_when_switching_to_always() {
     let core = Core::small(WalFsync::Never);
     let writer = core.writer();
@@ -789,130 +883,64 @@ async fn an_incomplete_sealed_segment_fails_strict() {
     );
 }
 
-/// Corruption in an older segment fails strict recovery, and a verified
-/// prefix keeps the frames before it and drops every later segment.
+/// Rotation fsyncs sealed segments under both policies; never repair their damage.
 #[tokio::test]
-async fn corruption_in_an_older_segment_fails_strict_and_ends_the_verified_prefix() {
-    let core = Core::small(WalFsync::Never);
-    let writer = core.writer();
-    let mut store = core.store(&writer, 1);
-    for index in 1..=40 {
-        append(&mut store, [payload_entry(index, 512)]).await;
-    }
-    drop(store);
-    drop(writer);
-    let segments = core.segments();
-    assert!(segments.len() >= 4);
-    // The second frame of segment 2.
-    let records =
-        super::read_wire_frames::<CoreJournalRecord>(&fs::read(core.segment(2)).expect("read"))
-            .expect("decode segment 2");
-    assert!(records.len() >= 3);
-    let first_entry_of_segment_2 = match records.first().map(|record| &record.record) {
-        Some(RaftGroupLogRecord::Append(entries)) => {
-            entries.first().expect("an entry").log_id.index
+async fn sealed_corruption_and_missing_segments_fail_without_mutation_under_never() {
+    for missing in [false, true] {
+        let core = Core::small(WalFsync::Never);
+        let writer = core.writer();
+        let mut store = core.store(&writer, 1);
+        for index in 1..=40 {
+            append(&mut store, [payload_entry(index, 512)]).await;
         }
-        other => panic!("unexpected first record {other:?}"),
-    };
-    let frame_2 = 32 + 12 + {
-        let bytes = fs::read(core.segment(2)).expect("read");
-        let len = bytes.get(32..36).expect("frame length");
-        u64::from(u32::from_le_bytes(len.try_into().expect("four bytes")))
-    };
-    overwrite(&core.segment(2), frame_2 + 20, b"corrupt");
-
-    let err = core
-        .open(JournalReplayMode::Strict)
-        .expect_err("strict fails closed");
-    assert!(
-        matches!(
-            journal_error(&err),
-            Some(JournalError::CorruptFrame {
-                frame: 2,
-                defect: FrameDefect::PayloadChecksum,
-                ..
-            })
-        ),
-        "{err}"
-    );
-    assert_eq!(core.segments(), segments, "strict recovery changes nothing");
-
-    let writer = core
-        .open(JournalReplayMode::VerifiedPrefix)
-        .expect("keep the verified prefix");
-    let mut store = core.store(&writer, 1);
-    assert_eq!(
-        log_ids(&store).await,
-        (1..=first_entry_of_segment_2).collect::<Vec<_>>(),
-        "every entry before the bad frame, none after"
-    );
-    assert_eq!(core.segments(), [1, 2], "the later segments are gone");
-    assert_eq!(file_len(&core.segment(2)), frame_2);
-    // Appends continue on the truncated segment and survive a restart.
-    append(&mut store, [payload_entry(
-        first_entry_of_segment_2 + 1,
-        512,
-    )])
-    .await;
-    drop(store);
-    drop(writer);
-    let writer = core.writer();
-    let store = core.store(&writer, 1);
-    assert_eq!(
-        log_ids(&store).await,
-        (1..=first_entry_of_segment_2 + 1).collect::<Vec<_>>()
-    );
-}
-
-/// A segment missing between others means the journal is not what was
-/// written: strict recovery fails, a verified prefix stops before the gap.
-#[tokio::test]
-async fn a_missing_segment_fails_strict_and_ends_the_verified_prefix() {
-    let core = Core::small(WalFsync::Never);
-    let writer = core.writer();
-    let mut store = core.store(&writer, 1);
-    for index in 1..=40 {
-        append(&mut store, [payload_entry(index, 512)]).await;
+        drop((store, writer));
+        if missing {
+            fs::remove_file(core.segment(3)).unwrap();
+        } else {
+            let path = core.segment(2);
+            let bytes = fs::read(&path).unwrap();
+            overwrite(
+                &path,
+                u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap(),
+                &[bytes.last().unwrap() ^ 0xff],
+            );
+        }
+        let before = core
+            .segments()
+            .into_iter()
+            .map(|id| (id, fs::read(core.segment(id)).unwrap()))
+            .collect::<Vec<_>>();
+        for mode in [JournalReplayMode::Strict, JournalReplayMode::VerifiedPrefix] {
+            let error = core.open(mode).unwrap_err();
+            match (missing, journal_error(&error)) {
+                (
+                    true,
+                    Some(JournalError::MissingSegment {
+                        previous: 2,
+                        found: 4,
+                        ..
+                    }),
+                )
+                | (
+                    false,
+                    Some(JournalError::CorruptFrame {
+                        defect: FrameDefect::PayloadChecksum,
+                        ..
+                    }),
+                ) => {}
+                other => panic!("unexpected recovery result {other:?}"),
+            }
+            assert_eq!(
+                core.segments(),
+                before.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+            );
+            for (id, bytes) in &before {
+                assert_eq!(fs::read(core.segment(*id)).unwrap(), *bytes);
+            }
+        }
     }
-    drop(store);
-    drop(writer);
-    fs::remove_file(core.segment(3)).expect("remove segment 3");
-    let err = core
-        .open(JournalReplayMode::Strict)
-        .expect_err("strict fails closed");
-    assert!(
-        matches!(
-            journal_error(&err),
-            Some(JournalError::MissingSegment {
-                previous: 2,
-                found: 4,
-                ..
-            })
-        ),
-        "{err}"
-    );
-    let writer = core
-        .open(JournalReplayMode::VerifiedPrefix)
-        .expect("verified prefix");
-    let store = core.store(&writer, 1);
-    let kept = log_ids(&store).await;
-    assert!(kept.starts_with(&[1, 2]) && kept.len() < 40);
-    // Recovery keeps segments 1 and 2 and removes every one after the gap.
-    // Segment 2 is full, so the writer seals it as it starts and appends go
-    // to a new segment 3. Closing waits for that rotation, which otherwise
-    // races the listing.
-    writer.close().await.expect("close the writer");
-    assert_eq!(core.segments(), [1, 2, 3]);
-    assert!(
-        super::read_wire_frames::<CoreJournalRecord>(&fs::read(core.segment(3)).expect("read"))
-            .expect("decode segment 3")
-            .is_empty(),
-        "segment 3 is new, not the one removed"
-    );
 }
 
-/// A new segment's header is durable before anything goes to it, so a
-/// newest segment shorter than a header is a rotation a crash cut short.
 #[tokio::test]
 async fn a_newest_segment_without_a_whole_header_is_removed() {
     let core = Core::small(WalFsync::Always);
