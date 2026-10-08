@@ -53,7 +53,7 @@ The main friction points are:
 
 CI runs both `cargo test -p ursula-raft --lib` and
 `RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib`. The latter runs the
-whole crate, not a name-filtered subset. Native tests remain part of the regular
+every test that compiles under `cfg(madsim)`, without a name filter. Native tests remain part of the regular
 workspace unit-test job.
 
 | Fixture | Native coverage | Simulation coverage |
@@ -61,9 +61,9 @@ workspace unit-test job.
 | Journal storage contract | OpenRaft storage suite on a real temporary WAL; reopen, truncate, purge, vote and commit persistence | The same OpenRaft storage suite on `SimDisk`; `ursula-sim` disk/recovery tests exercise page loss, reordered writes, fsync failure and gated restart |
 | Replication and linearizable reads | Real Tokio Raft actors, sockets and thread-per-core ownership | Raft unit strict append/read replay and partition/heal; smoke corpus `snapshot_catch_up`, leader-failover and leader-read-linearizability families |
 | Runtime-owned Raft and cold tier | Native factory, cold-index cache, compaction and object reference integration | Hosted runtime/Raft network, cold flush/restart and cold-write-failure smoke families |
-| Snapshot reference publication and host concurrency | Native cancellation, publication retries, install permits, OS threads and real filesystem metadata | Pure snapshot codec, state-machine install and prefetch contracts remain in the simulated crate suite; this does **not** simulate the native filesystem publication worker |
+| Snapshot reference publication and host concurrency | Native cancellation, publication retries, install permits, OS threads and real filesystem metadata | Snapshot codec, state-machine install, prefetch, reference pinning and publication failure/retry contracts run on SimDisk; OS-thread concurrency stays native |
 | Batch hot-capacity reservation | Native factory and append batch | The same unapplied-entry capacity assertions on a SimDisk-backed engine |
-| Control state and wire formats | Pure state machines, log stores and codec tests | The same pure tests; native OpenRaft meta actor startup stays native |
+| Control state and wire formats | Pure state machines, log stores and codec tests | The same pure tests and in-memory OpenRaft meta actor startup |
 
 A fixture that opens `tempfile`/`std::fs`, real sockets or OS threads is marked
 `cfg(not(madsim))` together with its private helpers. Those dependencies are not

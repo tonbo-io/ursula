@@ -1142,7 +1142,6 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(madsim))]
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -1185,7 +1184,6 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    #[cfg(not(madsim))]
     struct FailingReferenceStore {
         fail_pin: std::sync::atomic::AtomicBool,
         fail_current: std::sync::atomic::AtomicBool,
@@ -1200,7 +1198,6 @@ mod tests {
         release_download: crate::rt::sync::Notify,
     }
 
-    #[cfg(not(madsim))]
     impl SnapshotStore for FailingReferenceStore {
         fn upload<'a>(
             &'a self,
@@ -1287,26 +1284,49 @@ mod tests {
         }
     }
 
-    #[cfg(not(madsim))]
+    struct ReferenceWalRoot {
+        #[cfg(not(madsim))]
+        root: tempfile::TempDir,
+        #[cfg(madsim)]
+        root: std::path::PathBuf,
+    }
+    impl ReferenceWalRoot {
+        fn new() -> Self {
+            Self {
+                #[cfg(not(madsim))]
+                root: tempfile::tempdir().unwrap(),
+                #[cfg(madsim)]
+                root: crate::log_store::SimDisk::provision_dir("snapshot-reference").unwrap(),
+            }
+        }
+        fn path(&self) -> &std::path::Path {
+            #[cfg(not(madsim))]
+            {
+                self.root.path()
+            }
+            #[cfg(madsim)]
+            {
+                &self.root
+            }
+        }
+    }
     async fn reference_failure_group(
         store: Arc<FailingReferenceStore>,
-    ) -> (RaftGroupHandleRegistry, RaftGroupHandle, tempfile::TempDir) {
+    ) -> (RaftGroupHandleRegistry, RaftGroupHandle, ReferenceWalRoot) {
         let (registry, engine, root) = reference_failure_engine(store).await;
         (registry, engine.raft_handle(), root)
     }
 
-    #[cfg(not(madsim))]
     async fn reference_failure_engine(
         store: Arc<FailingReferenceStore>,
     ) -> (
         RaftGroupHandleRegistry,
         crate::RaftGroupEngine,
-        tempfile::TempDir,
+        ReferenceWalRoot,
     ) {
         reference_failure_engine_for_group(store, RaftGroupId(7), Default::default()).await
     }
 
-    #[cfg(not(madsim))]
     async fn reference_failure_engine_for_group(
         store: Arc<FailingReferenceStore>,
         group: RaftGroupId,
@@ -1314,9 +1334,9 @@ mod tests {
     ) -> (
         RaftGroupHandleRegistry,
         crate::RaftGroupEngine,
-        tempfile::TempDir,
+        ReferenceWalRoot,
     ) {
-        let wal_root = tempfile::tempdir().unwrap();
+        let wal_root = ReferenceWalRoot::new();
         let registry = RaftGroupHandleRegistry {
             snapshot_install,
             ..Default::default()
@@ -1364,7 +1384,6 @@ mod tests {
         (registry, engine, wal_root)
     }
 
-    #[cfg(not(madsim))]
     fn reference_failure_snapshot() -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
         let mut snapshot = external_snapshot("reference-fault");
         let id = openraft::LogId::new(openraft::vote::RaftLeaderId::new(1, 2), 1);
@@ -1422,6 +1441,20 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_reference_put_failures_retry_without_restarting_raft() {
+        snapshot_reference_put_failures_retry_without_restarting_raft_body().await;
+    }
+    #[cfg(madsim)]
+    #[test]
+    fn snapshot_reference_put_failures_retry_without_restarting_raft() {
+        crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+            crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+                7,
+                snapshot_reference_put_failures_retry_without_restarting_raft_body(),
+            )
+            .await
+        });
+    }
+    async fn snapshot_reference_put_failures_retry_without_restarting_raft_body() {
         for fail_pin in [true, false] {
             let store = Arc::new(FailingReferenceStore::default());
             store.fail_pin.store(fail_pin, Ordering::SeqCst);
@@ -1756,6 +1789,20 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
+        rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer_body().await;
+    }
+    #[cfg(madsim)]
+    #[test]
+    fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
+        crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+            crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+                7,
+                rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer_body(),
+            )
+            .await
+        });
+    }
+    async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer_body() {
         let store = Arc::new(FailingReferenceStore::default());
         let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
         raft.vote(crate::types::UrsulaVoteRequest::new(
@@ -1781,6 +1828,21 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
+        lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body().await;
+    }
+    #[cfg(madsim)]
+    #[test]
+    fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
+        crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+            crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+                7,
+                lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body(
+                ),
+            )
+            .await
+        });
+    }
+    async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body() {
         let store = Arc::new(FailingReferenceStore::default());
         let shared: SharedSnapshotStore = store.clone();
         let references = Arc::new(crate::snapshot_references::SnapshotReferences::default());

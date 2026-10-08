@@ -1072,6 +1072,20 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn single_node_meta_raft_applies_node_registration() {
+    single_node_meta_raft_applies_node_registration_body().await;
+}
+#[cfg(madsim)]
+#[test]
+fn single_node_meta_raft_applies_node_registration() {
+    crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            7,
+            single_node_meta_raft_applies_node_registration_body(),
+        )
+        .await
+    });
+}
+async fn single_node_meta_raft_applies_node_registration_body() {
     let config = raft_config("ursula-meta-single-node-test", 30, 60);
     let mut log_store = MetaTestLogStore::shared();
     let handle = MetaRaftHandle::new_single_node_with_log_store(
@@ -1136,6 +1150,20 @@ async fn single_node_meta_raft_applies_node_registration() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn meta_raft_handle_registers_initial_data_nodes() {
+    meta_raft_handle_registers_initial_data_nodes_body().await;
+}
+#[cfg(madsim)]
+#[test]
+fn meta_raft_handle_registers_initial_data_nodes() {
+    crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            7,
+            meta_raft_handle_registers_initial_data_nodes_body(),
+        )
+        .await
+    });
+}
+async fn meta_raft_handle_registers_initial_data_nodes_body() {
     let config = raft_config("ursula-meta-initial-data-nodes-test", 30, 60);
     let handle = MetaRaftHandle::new_single_node_with_log_store(
         1,
@@ -1185,6 +1213,20 @@ async fn meta_raft_handle_registers_initial_data_nodes() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
+    meta_raft_handle_rejects_invalid_initial_data_nodes_body().await;
+}
+#[cfg(madsim)]
+#[test]
+fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
+    crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            7,
+            meta_raft_handle_rejects_invalid_initial_data_nodes_body(),
+        )
+        .await
+    });
+}
+async fn meta_raft_handle_rejects_invalid_initial_data_nodes_body() {
     let config = raft_config("ursula-meta-invalid-initial-data-nodes-test", 30, 60);
     let handle = MetaRaftHandle::new_single_node_with_log_store(
         1,
@@ -1516,7 +1558,11 @@ pub(crate) fn madsim_test_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(madsim)]
-fn check_madsim_determinism<F>(seed: u64, config: madsim::Config, f: fn() -> F) -> F::Output
+pub(crate) fn check_madsim_determinism<F>(
+    seed: u64,
+    config: madsim::Config,
+    f: fn() -> F,
+) -> F::Output
 where
     F: std::future::Future + 'static,
     F::Output: Send,

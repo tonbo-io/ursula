@@ -54,22 +54,20 @@ impl StoreBuilder<UrsulaRaftTypeConfig, Arc<RaftGroupFileLogStore>, RaftGroupSta
 
 #[test]
 fn simulated_journal_passes_openraft_storage_conformance() {
-    let mut runtime = madsim::runtime::Runtime::with_seed_and_config(7, madsim::Config::default());
-    runtime.set_time_limit(std::time::Duration::from_secs(60));
-    runtime.block_on(crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
-        Suite::test_all(SimLogStoreBuilder::default())
-            .await
-            .expect("OpenRaft simulated journal conformance");
-    }));
+    super::check_madsim_determinism(7, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
+            Suite::test_all(SimLogStoreBuilder::default())
+                .await
+                .expect("OpenRaft simulated journal conformance");
+        })
+        .await;
+    });
 }
 
 #[test]
 fn simulated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
-    let mut runtime = madsim::runtime::Runtime::with_seed_and_config(11, madsim::Config::default());
-    runtime.set_time_limit(std::time::Duration::from_secs(10));
-    runtime.block_on(crate::sim_runtime::MadsimOpenRaftRuntime::scope(
-        11,
-        async {
+    super::check_madsim_determinism(11, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(11, async {
             let mut engine = crate::RaftGroupEngine::new_single_node(
                 placement(),
                 1,
@@ -84,6 +82,7 @@ fn simulated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
             ursula_runtime::GroupEngine::shutdown(&mut engine)
                 .await
                 .unwrap();
-        },
-    ));
+        })
+        .await;
+    });
 }
