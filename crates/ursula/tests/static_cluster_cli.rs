@@ -1257,11 +1257,72 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// Preserve HTTP/2 bodies and trailers while delaying only snapshot transfer.
+/// Metrics and readiness use the server's real listeners directly.
+struct SnapshotProxy {
+    url: String,
+    release: tokio::sync::watch::Sender<bool>,
+    blocked: tokio::sync::watch::Receiver<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SnapshotProxy {
+    async fn start(target: &str) -> Self {
+        use tower::ServiceExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let channel = tonic::transport::Endpoint::from_shared(target.to_owned())
+            .unwrap()
+            .connect_lazy();
+        let (release, released) = tokio::sync::watch::channel(true);
+        let (blocked_tx, blocked) = tokio::sync::watch::channel(false);
+        let proxy = tower::service_fn(move |request: axum::http::Request<axum::body::Body>| {
+            let channel = channel.clone();
+            let mut released = released.clone();
+            let blocked_tx = blocked_tx.clone();
+            async move {
+                if request.uri().path() == ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH {
+                    if !*released.borrow() {
+                        blocked_tx.send_replace(true);
+                    }
+                    released.wait_for(|ready| *ready).await.unwrap();
+                }
+                let response = channel.oneshot(request.map(tonic::body::boxed)).await;
+                Ok::<_, std::convert::Infallible>(match response {
+                    Ok(response) => response.map(axum::body::Body::new),
+                    Err(_transport) => axum::http::Response::builder()
+                        .status(axum::http::StatusCode::BAD_GATEWAY)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                })
+            }
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback_service(proxy))
+                .await
+                .unwrap();
+        });
+        Self {
+            url,
+            release,
+            blocked,
+            task,
+        }
+    }
+}
+
+impl Drop for SnapshotProxy {
+    fn drop(&mut self) {
+        self.release.send_replace(true);
+        self.task.abort();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     // A voter replaced on an empty WAL directory (its disk was lost) must not
     // re-run per-group Initialize for the groups it bootstraps (2 and 5 of 6
-    // for node 3): it must never report itself a voter with nothing applied.
+    // for node 3): it must never become eligible to vote with nothing applied.
     // The leaders see it lost the entries it had acknowledged and rebuild it
     // through remove, learner, catch-up and promote with no operator.
     let _guard = static_cluster_cli_test_guard().await;
@@ -1271,9 +1332,19 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     };
     let ports = [free_port(), free_port(), free_port()];
     let public = |node_id: u64| format!("http://127.0.0.1:{}", node_port(&ports, node_id));
+    let mut snapshot_proxy = SnapshotProxy::start(&public(3)).await;
     let peers = [1_u64, 2, 3]
         .into_iter()
-        .map(|node_id| (node_id, public(node_id)))
+        .map(|node_id| {
+            (
+                node_id,
+                if node_id == 3 {
+                    snapshot_proxy.url.clone()
+                } else {
+                    public(node_id)
+                },
+            )
+        })
         .collect::<Vec<_>>();
 
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -1335,6 +1406,33 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     )
     .await
     .expect("capture requires full startup recovery, not listener readiness");
+    // Force the wiped replica to catch up through a snapshot. The proxy holds
+    // that transfer until we have observed the real automatic learner phase.
+    // Membership changes still come exclusively from the production heal driver.
+    let before_wipe = ctl.fetch_cluster(&nodes).await.unwrap();
+    for view in before_wipe.per_node.iter().filter(|view| view.node.id != 3) {
+        for group in &view.groups {
+            let root = format!(
+                "{}/__ursula/raft/{}",
+                view.node.admin_url.as_str().trim_end_matches('/'),
+                group.raft_group_id
+            );
+            let response = admin_test_post(&client, format!("{root}/snapshot"))
+                .await
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let result: ursula_proto::admin::SnapshotResponse = response.json().await.unwrap();
+            let index = result.snapshot_index.unwrap();
+            let response = admin_test_post(&client, format!("{root}/purge?upto={index}"))
+                .await
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+    }
     let inventory_started = now_ms();
     let inventory_proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
         .await
@@ -1443,6 +1541,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     assert!(survivors.verification.maintenance_executor_certified);
     assert!(!survivors.full_redundancy_restored);
     // The replacement comes back on an empty WAL: the source's disk is lost.
+    snapshot_proxy.release.send_replace(false);
     remove_test_path(node_wal_dir(wal_root.path(), 3));
     std::fs::write(&replacement_config, replacement_text).unwrap();
     let mut command = Command::new(binary);
@@ -1456,6 +1555,14 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     children.push(child);
     let retired_identity = nodes[2].expected_process_incarnation.clone();
     wait_until_ready(&client, &public(3), &mut children).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        snapshot_proxy.blocked.wait_for(|blocked| *blocked),
+    )
+    .await
+    .expect("wiped voter must request the compacted snapshot")
+    .unwrap();
 
     // Observe the actual empty-WAL recovery before allowing another maintenance
     // operation. This exercises startup gates and learner catch-up, not a live demotion.
@@ -1535,6 +1642,8 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    snapshot_proxy.release.send_replace(true);
+
     let stale_clear = ctl
         .set_maintenance_drain(&nodes[2], false)
         .await
@@ -1585,7 +1694,10 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
             .expect("activate only the new process; survivors stay fixed");
     }
 
-    // Node 3 heals by itself; it is never an empty voter on the way.
+    // Snapshot metadata can restore historical voter membership before apply.
+    // Such a replica must still have its actual vote gate closed. Check both
+    // fields in one observation, since recovery can advance between HTTP reads.
+    // The serving endpoint was independently checked while snapshots were held.
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(60))
         .unwrap();
@@ -1599,11 +1711,13 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
                 .filter_map(|group| group.committed_index)
                 .max();
             let empty_voter = target.is_some_and(|group| {
-                group.voter_ids.contains(&3) && group.last_applied_index.is_none()
+                group.voter_ids.contains(&3)
+                    && group.last_applied_index.is_none()
+                    && group.maintenance.recovery_ready
             }) && peer_committed.is_some_and(|committed| committed > 0);
             assert!(
                 !empty_voter,
-                "node 3 reported itself an empty voter of group {group_id}: {snapshot:?}"
+                "node 3 opened its vote gate as an empty voter of group {group_id}: {snapshot:?}"
             );
         }
         if ursula_ctl::plan::check_readiness(&snapshot, 3, 0).all_ready {
