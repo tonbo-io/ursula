@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crossbeam_utils::CachePadded;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use openraft::BasicNode;
@@ -139,11 +140,16 @@ static GRPC_APPEND_STREAM_EXPIRED_UNSENT: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_STALLS: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_HEARTBEAT_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_HEARTBEAT_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_REPLICATION_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_REPLICATION_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_REPLICATION_ENTRIES: AtomicU64 = AtomicU64::new(0);
+// Independent heartbeat and replication accounting must not share cache lines.
+static GRPC_APPEND_HEARTBEAT_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_HEARTBEAT_REQUEST_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_REPLICATION_REQUESTS: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_REPLICATION_REQUEST_BYTES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
+static GRPC_APPEND_REPLICATION_ENTRIES: CachePadded<AtomicU64> =
+    CachePadded::new(AtomicU64::new(0));
 static GRPC_APPEND_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);

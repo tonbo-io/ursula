@@ -4614,6 +4614,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "criterion",
+ "crossbeam-utils",
  "fs4",
  "futures-util",
  "madsim",
