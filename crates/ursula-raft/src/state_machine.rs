@@ -57,6 +57,10 @@ use ursula_shard::ShardPlacement;
 
 use crate::engine::group_engine_io_error;
 use crate::engine::invalid_data;
+use crate::log_store::disk::Disk;
+use crate::log_store::disk::JournalDisk;
+use crate::log_store::disk::JournalFile;
+use crate::log_store::disk::create_dir_all_durable;
 use crate::log_store::elapsed_ns;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
@@ -566,11 +570,16 @@ impl RaftGroupStateMachine {
         let Some(path) = &self.snapshot_metadata_path else {
             return Ok(());
         };
-        if !path.exists() {
+        if !Disk::exists(path) {
             return Ok(());
         }
 
-        let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&std::fs::read(path)?)
+        let mut file = Disk::open_read(path)?;
+        let length = usize::try_from(file.file_len()?)
+            .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes)?;
+        let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
@@ -1239,7 +1248,7 @@ fn persist_snapshot_metadata(
         return Ok(());
     };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_durable(parent)?;
     }
     let encoded = encode_binary_envelope(&PersistedSnapshot {
         meta: meta.clone(),
@@ -1247,20 +1256,24 @@ fn persist_snapshot_metadata(
     })
     .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
     let temporary = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
+    if Disk::exists(&temporary) {
+        Disk::remove_file(&temporary)?;
     }
-    std::fs::rename(&temporary, path)?;
+    {
+        let mut file = Disk::open_append(&temporary)?;
+        file.append(&encoded)?;
+        file.sync_data()?;
+    }
+    Disk::rename(&temporary, path)?;
     if let Some(parent) = path.parent() {
-        let directory = std::fs::File::open(parent)?;
-        directory.sync_all()?;
+        Disk::sync_dir(parent)?;
     }
     Ok(())
 }
+
+#[cfg(all(test, madsim))]
+#[path = "snapshot_metadata_tests.rs"]
+mod snapshot_metadata_tests;
 
 #[cfg(test)]
 mod tests {

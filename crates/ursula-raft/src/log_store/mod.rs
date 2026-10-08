@@ -24,7 +24,7 @@
 //!   only (`cfg(test)`).
 
 mod core_meta;
-mod disk;
+pub(crate) mod disk;
 mod file;
 mod frozen;
 #[cfg(test)]

@@ -26,6 +26,15 @@ available outside the hot ring; it does not by itself authorize deletion of a
 Raft entry. Physical WAL reclaim is safe only after OpenRaft has persisted a
 state-machine snapshot and advanced the group's purge boundary.
 
+The node-local snapshot pointer uses the same disk I/O seam as the journal.
+Publication syncs a temporary file, renames it, and syncs its parent directory.
+New parent directories are made durable before publication. Restoration reads
+through that seam as well, so simulated power loss covers the actual pointer
+used to select the snapshot before log replay. A publication error does not
+acknowledge the new pointer. After a rename followed by a failed directory sync,
+a process restart may see the new pointer while a host restart may restore the
+old one. Recovery must accept either complete record.
+
 ## Why the upstream example is useful but not the production topology
 
 The upstream example validates the same high-level split Ursula wants: a
