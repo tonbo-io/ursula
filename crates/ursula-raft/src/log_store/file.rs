@@ -137,6 +137,14 @@ impl StoreLog {
 }
 
 impl RaftGroupFileLogStore {
+    pub(crate) fn apply_stop_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply_stopped
+            .clone()
+    }
+
     /// Simulation fault: hold the writer before performing a collected batch's I/O.
     #[cfg(madsim)]
     pub fn pause_simulated_writer(&self, paused: bool) {

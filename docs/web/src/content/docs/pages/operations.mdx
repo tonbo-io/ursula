@@ -363,3 +363,9 @@ RUST_LOG=ursula_raft=debug ./target/release/ursula server ...
 ```
 
 `debug` is verbose under sustained load, so redirect to a file.
+
+## Committed application failures
+
+A stopped group requires [corrected-code replay](/docs/apply-failure-recovery).
+Retain the original WAL and referenced snapshot objects. Never skip a committed
+record to recover readiness.

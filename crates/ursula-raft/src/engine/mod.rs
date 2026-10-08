@@ -123,6 +123,9 @@ use crate::types::UrsulaRaftTypeConfig;
 /// Optional capabilities of a group engine, independent of its transport and log store.
 #[derive(Default)]
 pub struct RaftGroupEngineOptions {
+    pub(crate) apply_stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub metrics: Option<GroupEngineMetrics>,
     pub cold_store: Option<ColdStoreHandle>,
     pub snapshot_store: Option<SharedSnapshotStore>,
@@ -132,6 +135,7 @@ pub struct RaftGroupEngineOptions {
 }
 
 pub struct RaftGroupEngine {
+    pub(crate) apply_health: crate::apply_failure::ApplyHealth,
     pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
     pub(crate) recovery_tasks: crate::rejoin::RecoveryGate,
@@ -318,6 +322,9 @@ impl RaftGroupEngine {
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let RaftGroupEngineOptions {
+            apply_stop_signal,
+            #[cfg(test)]
+            apply_fault,
             metrics,
             cold_store,
             snapshot_store,
@@ -337,6 +344,11 @@ impl RaftGroupEngine {
             snapshot_install,
             snapshot_metadata_path,
         );
+        state_machine.apply_stop_signal = apply_stop_signal;
+        #[cfg(test)]
+        {
+            state_machine.apply_fault = apply_fault;
+        }
         state_machine
             .restore_persisted_snapshot()
             .await
@@ -346,6 +358,7 @@ impl RaftGroupEngine {
         // install) then reach reads on every replica, followers included.
         let cold_index_cache = state_machine.engine.cold_index_cache();
         let metadata_serial = state_machine.metadata_serial.clone();
+        let apply_health = state_machine.apply_health.clone();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
@@ -354,9 +367,16 @@ impl RaftGroupEngine {
             state_machine,
         )
         .await
-        .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;
+        .map_err(|err| {
+            tracing::error!(raft_group_id = placement.raft_group_id.0, error = %err, "Raft initialization failed");
+            apply_health
+                .check(placement.raft_group_id)
+                .err()
+                .unwrap_or_else(|| GroupEngineError::new(format!("create OpenRaft group: {err}")))
+        })?;
 
         Ok(Self {
+            apply_health,
             recovery_tasks: crate::rejoin::RecoveryGate::default(),
             snapshot_installs: Arc::default(),
             metadata_serial,
@@ -479,8 +499,13 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        // Refused before proposal: nothing was written.
+        self.apply_health.check(self.placement.raft_group_id)?;
+        crate::forward::validate_proposal(&command)?;
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
+            // Once submitted, a group that stops may already have committed
+            // the command and applies it after repair: the outcome is unknown.
             Err(err) => {
                 let self_id = self.raft.metrics().borrow_watched().id;
                 return Err(group_engine_client_write_error(err, self_id));
@@ -517,6 +542,7 @@ impl RaftGroupEngine {
     where
         V: OptionalSend + 'static,
     {
+        self.apply_health.check(self.placement.raft_group_id)?;
         self.raft
             .with_state_machine(f)
             .await
@@ -1866,7 +1892,8 @@ impl GroupEngine for RaftGroupEngine {
 }
 
 pub(crate) fn group_engine_io_error(err: ursula_runtime::GroupEngineError) -> io::Error {
-    io::Error::other(err.message().into_owned())
+    // OpenRaft requires io::Error; retain the typed application source.
+    io::Error::other(err)
 }
 
 pub(crate) fn invalid_data(err: impl std::error::Error + Send + Sync + 'static) -> io::Error {

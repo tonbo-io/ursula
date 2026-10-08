@@ -5547,6 +5547,7 @@ fn raft_metrics_snapshot(
 ) -> RaftGroupMetricsSnapshot {
     let progress = |index: u64| RaftLogProgressSnapshot { term: 1, index };
     RaftGroupMetricsSnapshot {
+        apply_failure: None,
         raft_group_id: group_id,
         node_id,
         current_term: 1,
@@ -5745,6 +5746,32 @@ mod snapshot_driver {
             last_snapshot_bytes,
             has_snapshot: last_snapshot_bytes > 0,
         }
+    }
+
+    #[test]
+    fn snapshot_driver_excludes_apply_stopped_groups_even_under_pressure() {
+        let mut stopped = snap(0, Some(9), None, log(16 * MIB, 0));
+        stopped.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 1,
+            index: 10,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "diagnostic".to_owned(),
+        });
+        let healthy = snap(1, Some(9), None, log(MIB, 0));
+        let groups = [stopped, healthy];
+        let (_, selected) = plan_snapshot_drive(
+            &groups,
+            &SnapshotCadence::new(MIB, 2, 100),
+            2,
+            &std::collections::BTreeSet::from([ursula_shard::RaftGroupId(0)]),
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|group| group.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]

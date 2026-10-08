@@ -52,8 +52,10 @@ pub(crate) struct FramePos {
 pub(crate) struct IndexedEntry {
     pub(crate) log_id: LogId,
     pub(crate) frame: FramePos,
-    /// What the entry weighs: in its segment's live bytes and in the cache.
+    /// Payload weight for read materialization budgets and cache accounting.
     pub(crate) bytes: u32,
+    /// Journal space; archived payload retains its original read budget above.
+    pub(crate) storage_bytes: u32,
 }
 
 /// How a record reaches [`GroupLog::apply`].
@@ -103,6 +105,7 @@ impl SegmentRecords {
 /// A raft group's log in its core journal; see the module documentation.
 #[derive(Debug)]
 pub(crate) struct GroupLog {
+    pub(crate) apply_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_purged: Option<LogId>,
     committed: Option<LogId>,
     /// The segment of the latest committed record, if any was written.
@@ -118,6 +121,7 @@ pub(crate) struct GroupLog {
 impl GroupLog {
     pub(crate) fn new(cache_budget: u64) -> Self {
         Self {
+            apply_stopped: Default::default(),
             last_purged: None,
             committed: None,
             committed_at: None,
@@ -199,7 +203,8 @@ impl GroupLog {
                     ),
                 ))
             }
-            RaftGroupLogRecord::Purge(_)
+            RaftGroupLogRecord::FrozenAppend(_)
+            | RaftGroupLogRecord::Purge(_)
             | RaftGroupLogRecord::SaveCommitted(_)
             | RaftGroupLogRecord::TruncateAfter(_) => Ok(()),
         }
@@ -220,6 +225,11 @@ impl GroupLog {
                 Ok(())
             }
             RaftGroupLogRecord::Append(entries) => self.append(entries, at, mode),
+            // Its read weights come from the archive it names.
+            RaftGroupLogRecord::FrozenAppend(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an archived append is applied with its resolved archive entries",
+            )),
             RaftGroupLogRecord::TruncateAfter(last) => {
                 self.truncate_after(last.map(|log_id| log_id.index));
                 Ok(())
@@ -278,6 +288,7 @@ impl GroupLog {
                 log_id: entry.log_id,
                 frame: at,
                 bytes,
+                storage_bytes: bytes,
             };
             if let Some(replaced) = self.index.insert(indexed)? {
                 self.unlive(replaced);
@@ -288,6 +299,39 @@ impl GroupLog {
             }
         }
         self.add_live(at.segment, live);
+        Ok(())
+    }
+
+    /// Indexes the archive reference written at `at`. `selected` holds
+    /// exactly the live entries it names, read from the archive at open, so
+    /// this binary derives their read weights instead of trusting stored ones.
+    pub(crate) fn apply_archived(
+        &mut self,
+        selected: &[Entry],
+        at: FramePos,
+    ) -> Result<(), io::Error> {
+        let Some(first) = selected.first().map(|entry| entry.log_id.index) else {
+            return Ok(());
+        };
+        self.cache.truncate_after(first.checked_sub(1));
+        let storage_bytes = u32::try_from(
+            at.loc
+                .file_bytes()
+                .div_ceil(u64::try_from(selected.len()).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(u32::MAX);
+        for entry in selected {
+            let indexed = IndexedEntry {
+                log_id: entry.log_id,
+                frame: at,
+                bytes: u32::try_from(entry_log_bytes(entry)).unwrap_or(u32::MAX),
+                storage_bytes,
+            };
+            if let Some(replaced) = self.index.insert(indexed)? {
+                self.unlive(replaced);
+            }
+            self.add_live(at.segment, u64::from(storage_bytes));
+        }
         Ok(())
     }
 
@@ -390,20 +434,36 @@ impl GroupLog {
     /// Records that a rewrite copied `entry`, last seen at `from`, to
     /// `to`. An entry the log no longer holds there (truncated, purged or
     /// written again since) keeps its position.
+    #[cfg(test)]
     pub(crate) fn relocate(&mut self, index: u64, from: FramePos, to: FramePos) {
+        self.relocate_sized(index, from, to, None);
+    }
+
+    pub(crate) fn relocate_sized(
+        &mut self,
+        index: u64,
+        from: FramePos,
+        to: FramePos,
+        bytes: Option<u32>,
+    ) {
         let Some(entry) = self.index.get_mut(index) else {
             return;
         };
         if entry.frame != from {
             return;
         }
+        let previous_bytes = entry.storage_bytes;
         entry.frame = to;
+        if let Some(bytes) = bytes {
+            entry.storage_bytes = bytes;
+        }
         let moved = *entry;
         self.unlive(IndexedEntry {
             frame: from,
+            storage_bytes: previous_bytes,
             ..moved
         });
-        self.add_live(to.segment, u64::from(moved.bytes));
+        self.add_live(to.segment, u64::from(moved.storage_bytes));
     }
 
     /// Records that a rewrite wrote the committed marker again at `to`.
@@ -507,7 +567,7 @@ impl Default for EntryIndex {
 /// Takes `entry` out of the live bytes of its segment.
 fn remove_live(live: &mut BTreeMap<SegmentId, u64>, entry: &IndexedEntry) {
     if let Some(bytes) = live.get_mut(&entry.frame.segment) {
-        *bytes = bytes.saturating_sub(u64::from(entry.bytes));
+        *bytes = bytes.saturating_sub(u64::from(entry.storage_bytes));
         if *bytes == 0 {
             live.remove(&entry.frame.segment);
         }
@@ -890,6 +950,32 @@ mod tests {
         assert_eq!(log.live_bytes(), weight(100) + 2 * MARKER_BYTES);
     }
 
+    /// An archive reference stores only log IDs: a corrected binary may
+    /// change the size estimate. Replay derives read weights from the
+    /// archived payload and journal space from the reference frame.
+    #[test]
+    fn archived_entries_take_read_weights_from_the_replaying_binary() {
+        let mut log = GroupLog::replaying(1 << 20);
+        let reference = at(2, 32);
+        log.apply_archived(&[entry(1, 1, 300), entry(1, 2, 10)], reference)
+            .expect("index the reference");
+        log.finish_replay().expect("finish replay");
+        assert_eq!(
+            log.live_in(SegmentId(2)),
+            2 * reference.loc.file_bytes().div_ceil(2)
+        );
+        let plan = log.plan_read(1..=2, Some(weight(300)));
+        assert!(plan.cached.is_empty());
+        assert_eq!(plan.disk.len(), 1);
+        assert_eq!(plan.disk[0].log_ids, vec![log_id(1, 1)]);
+        log.apply(
+            RaftGroupLogRecord::Append(vec![entry(1, 3, 10)]),
+            at(2, 200),
+            ApplyMode::Live,
+        )
+        .expect("a live append extends the archived prefix");
+    }
+
     #[test]
     fn a_live_append_must_extend_the_log() {
         let mut log = GroupLog::new(1 << 20);
@@ -1082,6 +1168,7 @@ mod tests {
             log_id: log_id(term, index),
             frame: at(1, index),
             bytes: 1,
+            storage_bytes: 1,
         };
         let indexes = |index: &EntryIndex, range: (Bound<u64>, Bound<u64>)| {
             index

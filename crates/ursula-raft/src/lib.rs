@@ -1,6 +1,7 @@
 //! OpenRaft integration for Ursula.
 //!
 //! Module map:
+//! - [`apply_failure`]: fatal per-group application diagnostics.
 //!
 //! - [`types`]: shared `UrsulaRaftTypeConfig`, type aliases, and the
 //!   [`RaftGroupResponse`] applied-entry response around the canonical
@@ -192,3 +193,8 @@ mod tests;
 
 #[cfg(test)]
 mod cold_index_tests;
+
+pub mod apply_failure;
+#[cfg(test)]
+#[cfg(not(madsim))]
+mod apply_failure_tests;

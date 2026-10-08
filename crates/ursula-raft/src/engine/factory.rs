@@ -148,6 +148,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
             );
             let log_store = self.log_stores.open(placement, metrics.clone())?;
+            let apply_stop_signal = log_store.apply_stop_signal();
             let engine = RaftGroupEngine::new_single_node(
                 placement,
                 1,
@@ -155,6 +156,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 config,
                 log_store,
                 RaftGroupEngineOptions {
+                    apply_stop_signal: Some(apply_stop_signal),
                     metrics: Some(metrics),
                     cold_store: self.cold_store.clone(),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
@@ -411,6 +413,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             let network = GrpcRaftNetworkFactory::new(transport.clone(), placement.raft_group_id)
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
+            let apply_stop_signal = store.apply_stop_signal();
             let engine = RaftGroupEngine::new_node(
                 placement,
                 self.node_id,
@@ -418,11 +421,14 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 network,
                 store,
                 RaftGroupEngineOptions {
+                    apply_stop_signal: Some(apply_stop_signal),
                     metrics: Some(metrics),
                     cold_store: self.cold_store.clone(),
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_build: Some(self.registry.snapshot_build_coordinator()),
                     snapshot_install: Some(self.registry.snapshot_install_coordinator()),
+                    #[cfg(test)]
+                    apply_fault: None,
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                 },
             )

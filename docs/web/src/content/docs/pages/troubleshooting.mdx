@@ -44,6 +44,14 @@ A 200 response does not certify full redundancy. Keep maintenance blocked until
 `ursulactl wait-ready` succeeds. Alert separately on incomplete voter sets in
 the maintenance report, as described in [Observability](/docs/observability).
 
+### `503` with `ApplyStopped` from one group
+
+A committed command failed to apply and stopped that group on this replica.
+The node stays ready and serves its other groups. Its maintenance report names
+the group with `apply_stopped`, so `ursulactl wait-ready` refuses disruption
+until the group recovers. Follow [Recovering stopped Raft
+groups](/docs/apply-failure-recovery) and never skip the committed record.
+
 ## Startup failures
 
 ### WAL topology mismatch or missing topology

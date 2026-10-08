@@ -744,6 +744,7 @@ pub(crate) fn test_group(
         log_entries_since_snapshot: 0,
         last_snapshot_bytes: 0,
         has_snapshot: false,
+        apply_failure: None,
     }
 }
 
@@ -1274,7 +1275,8 @@ mod tests {
                         "maintenance":{"running":true,"recovery_ready":true,"accepting_transfers":true,"membership_joint":false,"membership_log_index":0,"stopped_for_operator":false},
                         "last_log_index":1,"committed_term":1,"last_applied_term":1,
                         "snapshot_term":null,"snapshot_index":null,"purged_term":null,"purged_index":null,
-                        "log_bytes_since_snapshot":0,"log_entries_since_snapshot":0,"last_snapshot_bytes":0,"has_snapshot":false
+                        "log_bytes_since_snapshot":0,"log_entries_since_snapshot":0,"last_snapshot_bytes":0,"has_snapshot":false,
+                        "apply_failure":null
                     }])
                 }
                 _ => {

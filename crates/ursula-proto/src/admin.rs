@@ -47,6 +47,24 @@ impl<const V: u32> From<SchemaVersion<V>> for u32 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApplyFailure {
+    pub term: u64,
+    pub index: u64,
+    pub kind: ApplyFailureKind,
+    pub message: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyFailureKind {
+    Panic,
+    InvariantViolation,
+    /// A kind a newer server of the same minor version reports that this
+    /// build does not know. The group is still stopped.
+    #[serde(other)]
+    Unknown,
+}
+
 /// A mutation must carry the incarnation observed before its maintenance plan.
 pub const PROCESS_INCARNATION_HEADER: &str = "x-ursula-process-incarnation";
 
@@ -271,11 +289,28 @@ impl From<ProcessIncarnation> for String {
 #[cfg(test)]
 mod tests {
     use super::AcceptUnsyncedLossRequest;
+    use super::ApplyFailure;
+    use super::ApplyFailureKind;
     use super::MaintenanceFence;
     use super::ProcessIncarnation;
     use super::RaftMaintenanceIssue;
     use super::RaftMaintenanceReport;
     use super::TransferRejection;
+
+    /// A newer server may report a failure kind this build does not know.
+    /// The stopped group's diagnostics still decode.
+    #[test]
+    fn unknown_apply_failure_kinds_decode() {
+        let failure: ApplyFailure = serde_json::from_str(
+            r#"{"term": 2, "index": 9, "kind": "a_future_kind", "message": "stopped"}"#,
+        )
+        .unwrap();
+        assert_eq!(failure.kind, ApplyFailureKind::Unknown);
+        assert_eq!(
+            serde_json::from_str::<ApplyFailureKind>(r#""invariant_violation""#).unwrap(),
+            ApplyFailureKind::InvariantViolation
+        );
+    }
 
     /// A newer server of the same minor version may report an issue or a
     /// rejection this build does not know. It decodes, never reads as ready
@@ -433,6 +468,7 @@ pub enum RaftMaintenanceIssue {
     DuplicateGroup,
     WrongNodeIdentity,
     RaftStopped,
+    ApplyStopped,
     RecoveryBarrier,
     StoppedForOperator,
     JointMembership,
@@ -460,12 +496,17 @@ pub struct RaftMaintenanceReport {
 }
 
 impl RaftMaintenanceReport {
-    /// Local serving eligibility; maintenance additionally requires the full voter set.
+    /// Local serving eligibility; maintenance additionally requires the full
+    /// voter set and no stopped group. A group stopped by an apply failure
+    /// answers its own requests with a typed 503 while the node serves the
+    /// others, so it only blocks disruption.
     pub fn serving_ready(&self) -> bool {
         let local_issue = |issue: &RaftMaintenanceIssue| {
             !matches!(
                 issue,
-                RaftMaintenanceIssue::IncompleteVoterSet | RaftMaintenanceIssue::JointMembership
+                RaftMaintenanceIssue::IncompleteVoterSet
+                    | RaftMaintenanceIssue::JointMembership
+                    | RaftMaintenanceIssue::ApplyStopped
             )
         };
         !self.expected_groups.is_empty()
@@ -658,11 +699,15 @@ pub struct RaftGroupMetrics {
     pub log_entries_since_snapshot: u64,
     pub last_snapshot_bytes: u64,
     pub has_snapshot: bool,
+    /// Set once a committed command failed to apply: the replica stopped.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub apply_failure: Option<ApplyFailure>,
 }
 impl RaftGroupMetrics {
     pub fn participation_ready(&self) -> bool {
         let health = &self.maintenance;
-        health.running
+        self.apply_failure.is_none()
+            && health.running
             && health.recovery_ready
             && !health.membership_joint
             && !health.stopped_for_operator
@@ -718,6 +763,7 @@ mod metrics_contract_tests {
                 log_entries_since_snapshot: 0,
                 last_snapshot_bytes: 0,
                 has_snapshot: false,
+                apply_failure: None,
             }],
         }
     }

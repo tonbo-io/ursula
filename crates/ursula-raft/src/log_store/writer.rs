@@ -529,15 +529,41 @@ impl CoreFileLogWriter {
         let mut logs = BTreeMap::<u32, GroupLog>::new();
         let replayed_groups = std::cell::RefCell::new(std::collections::BTreeSet::new());
         let mut invalid_tail = false;
+        let mut archive_references =
+            BTreeMap::<SegmentId, BTreeSet<super::frozen::ArchiveId>>::new();
+        let mut archive_failure = None;
+        let mut archive_sizes = BTreeMap::new();
         let recovered = segment::recover_segments::<WireCodec<CoreJournalRecord>>(
             &dir,
             |segment, loc, record| {
                 // Include groups whose first journal append preceded its
                 // metadata write in the durable pre-repair gate.
                 replayed_groups.borrow_mut().insert(record.group_id);
-                logs.entry(record.group_id)
-                    .or_insert_with(|| GroupLog::replaying(cache_bytes))
-                    .apply(record.record, FramePos { segment, loc }, ApplyMode::Replay)
+                let log = logs
+                    .entry(record.group_id)
+                    .or_insert_with(|| GroupLog::replaying(cache_bytes));
+                let at = FramePos { segment, loc };
+                let RaftGroupLogRecord::FrozenAppend(frozen) = record.record else {
+                    return log.apply(record.record, at, ApplyMode::Replay);
+                };
+                let selected = match super::frozen::selected(&dir, record.group_id, &frozen) {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        archive_failure = Some(error);
+                        // The journal visitor requires io::Result. Retain the
+                        // original typed failure and return it below.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "frozen archive validation failed",
+                        ));
+                    }
+                };
+                archive_sizes.insert(frozen.archive.id, frozen.archive.bytes);
+                archive_references
+                    .entry(segment)
+                    .or_default()
+                    .insert(frozen.archive.id);
+                log.apply_archived(&selected, at)
             },
             || {
                 for group in replayed_groups.borrow().iter() {
@@ -548,7 +574,11 @@ impl CoreFileLogWriter {
                 invalid_tail = true;
                 Ok(())
             },
-        )?;
+        );
+        if let Some(error) = archive_failure {
+            return Err(error.into());
+        }
+        let recovered = recovered?;
         for (group_id, log) in &mut logs {
             log.finish_replay()
                 .map_err(|source| CoreJournalError::InconsistentLog {
@@ -668,6 +698,10 @@ impl CoreFileLogWriter {
         let (tx, rx) = mpsc::unbounded_channel();
         #[cfg(madsim)]
         let (pause, paused) = crate::rt::sync::watch::channel(false);
+        let gc_blocked_through =
+            (recovered.end != RecoveryEnd::Clean).then_some(SegmentId(active.sequence()));
+        let archive_orphan_bytes =
+            super::frozen::orphan_bytes(&dir, &archive_sizes.keys().copied().collect())?;
         let journal = CoreJournal {
             context: WriterContext {
                 #[cfg(madsim)]
@@ -686,6 +720,11 @@ impl CoreFileLogWriter {
             sealed,
             active,
             read_buf: Vec::new(),
+            archive_references,
+            archive_sizes,
+            archive_orphan_bytes,
+            gc_blocked_through,
+            gc_due: recovered.end == RecoveryEnd::Clean,
             reclaim_due: true,
             pinned_segments: 0,
             lagging_groups: 0,
@@ -920,6 +959,12 @@ struct CoreJournal {
     /// The newest segment, which appends go to.
     active: JournalWriter,
     read_buf: Vec<u8>,
+    /// Physical references, including superseded ones until their segment deletion is durable.
+    archive_references: BTreeMap<SegmentId, BTreeSet<super::frozen::ArchiveId>>,
+    archive_sizes: BTreeMap<super::frozen::ArchiveId, u64>,
+    archive_orphan_bytes: u64,
+    gc_blocked_through: Option<SegmentId>,
+    gc_due: bool,
     /// Whether the next batch should run a reclaim pass.
     reclaim_due: bool,
     /// What the last reclaim pass found: sealed segments kept only for
@@ -1107,13 +1152,19 @@ impl CoreJournal {
         SegmentId(self.active.sequence())
     }
 
-    /// The journal's size, all segments.
+    /// Journal segments plus unique immutable payloads (including pending garbage).
     fn physical_bytes(&self) -> u64 {
         self.sealed
             .iter()
             .fold(self.active.len(), |total, (_, len)| {
                 total.saturating_add(*len)
             })
+            .saturating_add(
+                self.archive_sizes
+                    .values()
+                    .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes)),
+            )
+            .saturating_add(self.archive_orphan_bytes)
     }
 
     fn group_log(&self, group_id: u32) -> Option<Arc<Mutex<GroupLog>>> {
@@ -1213,6 +1264,7 @@ impl CoreJournal {
                 && oldest < active
             {
                 pins.push(GroupPin {
+                    apply_stopped: log.apply_stopped.load(std::sync::atomic::Ordering::Acquire),
                     group_id,
                     oldest,
                     live_in_oldest: log.live_in(oldest),
@@ -1247,11 +1299,21 @@ impl CoreJournal {
             }
             let (deleted, error) = segment::delete_segments(&self.context.dir, &plan.delete);
             let removed = usize::try_from(deleted.segments).unwrap_or(usize::MAX);
-            self.sealed.drain(..removed.min(self.sealed.len()));
+            let removed_ids = self
+                .sealed
+                .drain(..removed.min(self.sealed.len()))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
             sample.reclaims = sample.reclaims.saturating_add(deleted.segments);
             sample.reclaimed_bytes = sample.reclaimed_bytes.saturating_add(deleted.bytes);
             if deleted.segments != 0 {
                 sample.fsyncs = sample.fsyncs.saturating_add(1);
+            }
+            if !matches!(&error, Some(DeleteError::SyncDir(_))) {
+                for id in removed_ids {
+                    self.archive_references.remove(&id);
+                }
+                self.gc_due = true;
             }
             match error {
                 None => {}
@@ -1264,8 +1326,38 @@ impl CoreJournal {
                 Some(DeleteError::SyncDir(error)) => return Reclaim::Poisoned(error),
             }
         }
+        if self.gc_blocked_through.is_some_and(|barrier| {
+            self.active_id() > barrier && self.sealed.iter().all(|(id, _)| *id > barrier)
+        }) {
+            self.gc_blocked_through = None;
+        }
+        let mut garbage_error = None;
+        if self.gc_due && self.gc_blocked_through.is_none() {
+            let retained = self
+                .archive_references
+                .values()
+                .flatten()
+                .copied()
+                .collect();
+            match super::frozen::collect(&self.context.dir, &retained) {
+                Ok(()) => {
+                    self.gc_due = false;
+                    self.archive_orphan_bytes = 0;
+                    self.archive_sizes.retain(|id, _| retained.contains(id));
+                }
+                Err(error) => {
+                    self.reclaim_due = true;
+                    garbage_error = Some(error);
+                }
+            }
+        }
         if let (Reclaim::Done, Some((target, groups))) = (&outcome, plan.rewrite) {
             outcome = self.rewrite(target, &groups, sample);
+        }
+        if matches!(outcome, Reclaim::Done)
+            && let Some(error) = garbage_error
+        {
+            outcome = Reclaim::Abandoned(error);
         }
         sample.reclaim_ns = sample.reclaim_ns.saturating_add(elapsed_ns(started_at));
         outcome
@@ -1294,6 +1386,8 @@ impl CoreJournal {
         let chunk_bytes = self.context.tuning.rewrite_chunk_bytes();
         let mut moves = Vec::<Moved>::new();
         let mut copied = 0_u64;
+        let mut stopped_copied = 0_u64;
+        let mut reference_copied = 0_u64;
         let mut outcome = Reclaim::Done;
         for group_id in groups {
             if copied >= budget {
@@ -1307,9 +1401,77 @@ impl CoreJournal {
             if records.is_empty() {
                 continue;
             }
-            let reads = disk_reads(&records.entries);
+            let positions = records
+                .entries
+                .iter()
+                .map(|entry| (entry.log_id.index, entry.frame))
+                .collect::<BTreeMap<_, _>>();
+            let mut ordinary = Vec::new();
+            // Copy references as references, using only IDs still live in this
+            // frame. Never resurrect a purged or replaced part of an archive.
+            for read in disk_reads(&records.entries) {
+                let record = match journal::read_frame::<WireCodec<CoreJournalRecord>>(
+                    &mut file,
+                    &path,
+                    target.0,
+                    read.frame.loc,
+                    &mut self.read_buf,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => return Reclaim::Poisoned(error),
+                };
+                if record.group_id != *group_id {
+                    return Reclaim::Poisoned(JournalError::FrameMismatch {
+                        path: path.clone(),
+                        offset: read.frame.loc.offset,
+                        raft_group_id: *group_id,
+                        index: read.log_ids.first().map_or(0, |id| id.index),
+                    });
+                }
+                if let RaftGroupLogRecord::FrozenAppend(mut frozen) = record.record {
+                    if copied >= budget {
+                        self.reclaim_due = true;
+                        continue;
+                    }
+                    let ids = read.log_ids;
+                    frozen.log_ids = records
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.frame == read.frame)
+                        .map(|entry| entry.log_id)
+                        .collect();
+                    let to = match self
+                        .append_rewritten(*group_id, RaftGroupLogRecord::FrozenAppend(frozen))
+                    {
+                        Ok(to) => to,
+                        Err(error) => return Reclaim::Poisoned(error),
+                    };
+                    let weight = u32::try_from(
+                        to.loc
+                            .file_bytes()
+                            .div_ceil(u64::try_from(ids.len()).unwrap_or(u64::MAX)),
+                    )
+                    .unwrap_or(u32::MAX);
+                    for id in ids {
+                        moves.push(Moved::Entry {
+                            group_id: *group_id,
+                            index: id.index,
+                            from: read.frame,
+                            to,
+                            bytes: Some(weight),
+                        });
+                    }
+                    copied = copied.saturating_add(to.loc.file_bytes());
+                    reference_copied = reference_copied.saturating_add(to.loc.file_bytes());
+                    if let Err(error) = self.rotate_if_full(sample) {
+                        return Reclaim::Poisoned(error);
+                    }
+                } else {
+                    ordinary.push(read);
+                }
+            }
             let entries =
-                match read_entries(&mut file, &path, *group_id, &reads, &mut self.read_buf) {
+                match read_entries(&mut file, &path, *group_id, &ordinary, &mut self.read_buf) {
                     Ok(entries) => entries,
                     Err(error) if error.is_io() => {
                         self.reclaim_due = true;
@@ -1318,11 +1480,9 @@ impl CoreJournal {
                     }
                     Err(error) => return Reclaim::Poisoned(error),
                 };
-            let positions = records
-                .entries
-                .iter()
-                .map(|entry| (entry.log_id.index, entry.frame))
-                .collect::<BTreeMap<_, _>>();
+            let stopped = lock_log(&log)
+                .apply_stopped
+                .load(std::sync::atomic::Ordering::Acquire);
             for chunk in chunk_entries(entries, chunk_bytes).into_iter().rev() {
                 if copied >= budget {
                     self.reclaim_due = true;
@@ -1335,10 +1495,48 @@ impl CoreJournal {
                 let bytes = chunk.iter().fold(0_u64, |total, entry| {
                     total.saturating_add(entry_log_bytes(entry))
                 });
-                let to = match self.append_rewritten(*group_id, RaftGroupLogRecord::Append(chunk)) {
+                let record = if stopped {
+                    let Some(first) = chunk.first() else {
+                        continue;
+                    };
+                    let Some(last) = chunk.last() else {
+                        continue;
+                    };
+                    let Some(source) = positions.get(&first.log_id.index) else {
+                        continue;
+                    };
+                    let id = super::frozen::ArchiveId {
+                        group_id: *group_id,
+                        segment: target.0,
+                        offset: source.loc.offset,
+                        first_index: first.log_id.index,
+                        last_index: last.log_id.index,
+                        content_hash: [0; 32],
+                    };
+                    let log_ids = chunk.iter().map(|entry| entry.log_id).collect();
+                    let archive = match super::frozen::publish(&self.context.dir, id, chunk) {
+                        Ok(reference) => reference,
+                        Err(error) => return Reclaim::Poisoned(error),
+                    };
+                    RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
+                        archive,
+                        log_ids,
+                    }))
+                } else {
+                    RaftGroupLogRecord::Append(chunk)
+                };
+                let to = match self.append_rewritten(*group_id, record) {
                     Ok(to) => to,
                     Err(error) => return Reclaim::Poisoned(error),
                 };
+                let reference_weight = stopped.then(|| {
+                    u32::try_from(
+                        to.loc
+                            .file_bytes()
+                            .div_ceil(u64::try_from(indexes.len()).unwrap_or(u64::MAX)),
+                    )
+                    .unwrap_or(u32::MAX)
+                });
                 for index in indexes {
                     if let Some(from) = positions.get(&index) {
                         moves.push(Moved::Entry {
@@ -1346,10 +1544,14 @@ impl CoreJournal {
                             index,
                             from: *from,
                             to,
+                            bytes: reference_weight,
                         });
                     }
                 }
                 copied = copied.saturating_add(bytes);
+                if stopped {
+                    stopped_copied = stopped_copied.saturating_add(bytes);
+                }
                 if let Err(error) = self.rotate_if_full(sample) {
                     return Reclaim::Poisoned(error);
                 }
@@ -1393,13 +1595,23 @@ impl CoreJournal {
             let mut log = lock_log(&log);
             match moved {
                 Moved::Entry {
-                    index, from, to, ..
-                } => log.relocate(index, from, to),
+                    index,
+                    from,
+                    to,
+                    bytes,
+                    ..
+                } => log.relocate_sized(index, from, to, bytes),
                 Moved::Committed { from, to, .. } => log.relocate_committed(from, to),
                 Moved::Purged { from, to, .. } => log.relocate_purged(from, to),
             }
         }
         sample.rewritten_bytes = sample.rewritten_bytes.saturating_add(copied);
+        sample.frozen_reference_rewritten_bytes = sample
+            .frozen_reference_rewritten_bytes
+            .saturating_add(reference_copied);
+        sample.stopped_rewritten_bytes = sample
+            .stopped_rewritten_bytes
+            .saturating_add(stopped_copied);
         self.reclaim_due = true;
         outcome
     }
@@ -1411,9 +1623,22 @@ impl CoreJournal {
         record: RaftGroupLogRecord,
     ) -> Result<FramePos, JournalError> {
         let segment = self.active_id();
+        let archive = match &record {
+            RaftGroupLogRecord::FrozenAppend(frozen) => {
+                Some((frozen.archive.id, frozen.archive.bytes))
+            }
+            _ => None,
+        };
         let loc = self
             .active
             .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord { group_id, record })?;
+        if let Some((archive, bytes)) = archive {
+            self.archive_sizes.insert(archive, bytes);
+            self.archive_references
+                .entry(segment)
+                .or_default()
+                .insert(archive);
+        }
         if self.active.pending_bytes() >= WRITE_BUFFER_BYTES {
             self.active.flush()?;
         }
@@ -1429,6 +1654,7 @@ enum Moved {
         index: u64,
         from: FramePos,
         to: FramePos,
+        bytes: Option<u32>,
     },
     Committed {
         group_id: u32,
@@ -1507,8 +1733,14 @@ pub(crate) fn read_entries(
             index,
         };
         let first_wanted = read.log_ids.first().map_or(0, |log_id| log_id.index);
-        let RaftGroupLogRecord::Append(frame_entries) = record.record else {
-            return Err(mismatch(first_wanted));
+        let frame_entries = match record.record {
+            RaftGroupLogRecord::Append(entries) => entries,
+            RaftGroupLogRecord::FrozenAppend(frozen) => super::frozen::selected(
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                group_id,
+                &frozen,
+            )?,
+            _ => return Err(mismatch(first_wanted)),
         };
         if record.group_id != group_id {
             return Err(mismatch(first_wanted));
@@ -1960,6 +2192,9 @@ pub(crate) fn raft_group_log_record_requires_sync(
                     .iter()
                     .any(|entry| matches!(entry.payload, openraft::EntryPayload::Membership(_)))
         }
+        // A reference may replace the only original payload; it must be durable
+        // before relocation under either policy. Reclaim also syncs before publish.
+        RaftGroupLogRecord::FrozenAppend(_) => true,
         RaftGroupLogRecord::Purge(_) => fsync == WalFsync::Always,
         RaftGroupLogRecord::SaveCommitted(_) | RaftGroupLogRecord::TruncateAfter(_) => false,
     }
@@ -1970,6 +2205,7 @@ pub(crate) fn raft_group_log_record_requires_sync(
 pub(crate) fn raft_group_log_record_initializes(record: &RaftGroupLogRecord) -> bool {
     match record {
         RaftGroupLogRecord::Append(entries) => !entries.is_empty(),
+        RaftGroupLogRecord::FrozenAppend(frozen) => !frozen.log_ids.is_empty(),
         RaftGroupLogRecord::Purge(_) => true,
         RaftGroupLogRecord::SaveCommitted(_) | RaftGroupLogRecord::TruncateAfter(_) => false,
     }
@@ -1977,4 +2213,150 @@ pub(crate) fn raft_group_log_record_initializes(record: &RaftGroupLogRecord) -> 
 
 pub(crate) fn elapsed_ns(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(all(test, madsim))]
+mod frozen_gc_tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use openraft::EntryPayload;
+    use openraft::LogId;
+    use openraft::entry::RaftEntry;
+    use openraft::storage::IOFlushed;
+    use openraft::storage::RaftLogStorage;
+    use openraft::type_config::TypeConfigExt;
+    use openraft::vote::RaftLeaderId;
+    use openraft::vote::leader_id_adv::CommittedLeaderId;
+    use ursula_config::WalFsync;
+    use ursula_runtime::GroupWriteCommand;
+    use ursula_runtime::RuntimeMetrics;
+    use ursula_shard::BucketStreamId;
+    use ursula_shard::CoreId;
+    use ursula_shard::RaftGroupId;
+    use ursula_shard::ShardId;
+    use ursula_shard::ShardPlacement;
+    use ursula_stream::StreamCommand;
+
+    use super::CoreFileLogWriter;
+    use super::CoreJournalOptions;
+    use super::Entry;
+    use super::JournalTuning;
+    use super::LaggingGroups;
+    use super::UrsulaRaftTypeConfig;
+    use crate::log_store::RaftGroupFileLogStore;
+    use crate::log_store::disk::JournalDisk;
+    use crate::log_store::disk::JournalFile;
+    use crate::log_store::run_state::PreviousRun;
+    use crate::log_store::run_state::RecoveryState;
+    use crate::log_store::run_state::RunState;
+    use crate::log_store::run_state::RunStateFile;
+    use crate::log_store::run_state::RunStatus;
+    use crate::log_store::sim_disk::SimDisk;
+    use crate::log_store::sim_disk::SimDiskFault;
+
+    fn placement(group: u32) -> ShardPlacement {
+        ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(group),
+            raft_group_id: RaftGroupId(group),
+        }
+    }
+
+    async fn append(store: &mut Arc<RaftGroupFileLogStore>, index: u64) {
+        let entry = Entry::new(
+            LogId {
+                leader_id: CommittedLeaderId::new(1, 1),
+                index,
+            },
+            EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+                stream_id: BucketStreamId::new("gc", "progress"),
+                content_type: None,
+                payload: Bytes::from(vec![1; 512]),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                now_ms: 0,
+            })),
+        );
+        let (sender, receiver) = UrsulaRaftTypeConfig::oneshot();
+        store
+            .append([entry], IOFlushed::signal(sender))
+            .await
+            .unwrap();
+        receiver.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn garbage_remove_failure_does_not_block_healthy_rewrite() {
+        let _guard = crate::tests::madsim_test_guard();
+        madsim::runtime::Runtime::with_seed_and_config(43691, Default::default()).block_on(async {
+            let dir = SimDisk::provision_dir("frozen-gc-progress").unwrap();
+            let metrics = RuntimeMetrics::new(1, 3);
+            let writer = CoreFileLogWriter::open(dir.clone(), CoreJournalOptions {
+                previous_run: PreviousRun::Absent,
+                core: CoreId(0),
+                recovery_epoch: 0,
+                tuning: JournalTuning {
+                    fsync: WalFsync::Always,
+                    segment_bytes: JournalTuning::MIN_SEGMENT_BYTES,
+                    group_cache_bytes: 1024,
+                },
+                run_state: Arc::new(RunStateFile::new(dir.join("run-state"), RunState {
+                    boot_id: None,
+                    fsync: WalFsync::Always,
+                    status: RunStatus::Running,
+                    recovery_epoch: 0,
+                })),
+                node_recovery: RecoveryState::Normal,
+                lagging: Arc::new(LaggingGroups::default()),
+                metrics: Some((placement(0), metrics.group_engine_metrics())),
+            })
+            .unwrap();
+            let mut quiet = RaftGroupFileLogStore::open(
+                placement(1),
+                metrics.group_engine_metrics(),
+                writer.clone(),
+            )
+            .unwrap();
+            let mut healthy = RaftGroupFileLogStore::open(
+                placement(2),
+                metrics.group_engine_metrics(),
+                writer.clone(),
+            )
+            .unwrap();
+            append(&mut quiet, 1).await;
+            let garbage = dir.join("frozen-unreferenced.seg");
+            let mut file = SimDisk::open_append(&garbage).unwrap();
+            file.append(b"unreferenced interrupted publication")
+                .unwrap();
+            file.sync_data().unwrap();
+            SimDisk::sync_dir(&dir).unwrap();
+            for index in 1..=120_u64 {
+                SimDisk::inject_fault(&garbage, SimDiskFault::Remove).unwrap();
+                append(&mut healthy, index).await;
+                if index % 8 == 0 {
+                    SimDisk::inject_fault(&garbage, SimDiskFault::Remove).unwrap();
+                    healthy
+                        .purge(LogId {
+                            leader_id: CommittedLeaderId::new(1, 1),
+                            index: index.saturating_sub(4),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            let snapshot = metrics.snapshot();
+            assert!(snapshot.wal_reclaim_failures > 0);
+            assert!(
+                snapshot.wal_rewritten_bytes > 0,
+                "garbage failures must not bypass rewrite"
+            );
+            assert!(snapshot.wal_reclaims > 0);
+            SimDisk::clear_faults(&dir).unwrap();
+            append(&mut healthy, 121).await;
+            writer.close().await.unwrap();
+            assert!(!SimDisk::exists(&garbage));
+        });
+    }
 }

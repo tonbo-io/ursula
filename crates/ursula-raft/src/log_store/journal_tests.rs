@@ -412,6 +412,231 @@ async fn purge_deletes_the_segments_no_group_needs() {
     );
 }
 
+/// A stopped group's retained committed history must not pin the journal's
+/// ever-growing suffix, even when it exceeds the normal rewrite threshold.
+#[tokio::test]
+async fn apply_stopped_payload_is_archived_once_and_references_reclaim() {
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let mut healthy = core.store(&writer, 2);
+    append(&mut stopped, (1..=8).map(|index| payload_entry(index, 700))).await;
+    stopped.save_committed(Some(log_id(8))).await.unwrap();
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    for index in 1..=400_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    healthy.save_committed(Some(log_id(400))).await.unwrap();
+    writer.close().await.unwrap();
+    let metrics = core.metrics.snapshot();
+    assert!(metrics.wal_stopped_rewritten_bytes > 0);
+    assert!(metrics.wal_reclaims > 20);
+    assert!(core.lagging.groups().is_empty());
+    assert!(
+        core.segments().len() < 16,
+        "bounded retained WAL: {:?}",
+        core.segments()
+    );
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    drop(stopped);
+    drop(healthy);
+    drop(writer);
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let healthy = core.store(&writer, 2);
+    assert!(
+        !stopped
+            .apply_stop_signal()
+            .load(std::sync::atomic::Ordering::Acquire),
+        "replay, not a persistent failure marker, reestablishes stopped state"
+    );
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    assert_eq!(stopped.read_committed().await.unwrap(), Some(log_id(8)));
+    assert_eq!(log_ids(&healthy).await, (397..=400).collect::<Vec<_>>());
+    // Replaying faulty code reestablishes the stop signal. Further healthy
+    // reclamation copies references, never the already archived payload.
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut healthy = healthy;
+    for index in 401..=800_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    writer.close().await.unwrap();
+    let after = core.metrics.snapshot();
+    assert_eq!(
+        after.wal_stopped_rewritten_bytes,
+        metrics.wal_stopped_rewritten_bytes
+    );
+    assert!(
+        after.wal_frozen_reference_rewritten_bytes > metrics.wal_frozen_reference_rewritten_bytes
+    );
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    assert!(core.segments().len() < 16);
+}
+
+#[tokio::test]
+async fn archived_subset_does_not_resurrect_truncated_or_purged_entries() {
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let mut healthy = core.store(&writer, 2);
+    append(
+        &mut stopped,
+        (1..=10).map(|index| payload_entry(index, 700)),
+    )
+    .await;
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    for index in 1..=200_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    writer.close().await.unwrap();
+    assert!(core.metrics.snapshot().wal_stopped_rewritten_bytes > 0);
+    drop((stopped, healthy, writer));
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let mut healthy = core.store(&writer, 2);
+    stopped.truncate_after(Some(log_id(6))).await.unwrap();
+    let replacement = (7..=8)
+        .map(|index| {
+            let mut entry = payload_entry(index, 700);
+            entry.log_id.leader_id = CommittedLeaderId::new(6, 2);
+            entry
+        })
+        .collect::<Vec<_>>();
+    append(&mut stopped, replacement.clone()).await;
+    stopped.purge(log_id(2)).await.unwrap();
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    for index in 201..=400_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    writer.close().await.unwrap();
+    drop((stopped, healthy, writer));
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let mut reader = stopped.get_log_reader().await;
+    let expected = (3..=6)
+        .map(|index| payload_entry(index, 700))
+        .chain(replacement)
+        .collect::<Vec<_>>();
+    assert_eq!(reader.try_get_log_entries(..).await.unwrap(), expected);
+    // Corrected code can purge archived records. GC waits until every old
+    // physical reference has itself been durably reclaimed.
+    stopped
+        .purge(LogId {
+            leader_id: CommittedLeaderId::new(6, 2),
+            index: 8,
+        })
+        .await
+        .unwrap();
+    let mut healthy = core.store(&writer, 2);
+    for index in 401..=800_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    writer.close().await.unwrap();
+    assert!(fs::read_dir(&core.dir).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("frozen-")
+    }));
+}
+
+#[test]
+fn archived_payload_damage_is_a_typed_hard_startup_failure() {
+    for missing in [false, true] {
+        let core = Core::small(WalFsync::Always);
+        fs::create_dir_all(&core.dir).unwrap();
+        let entry = payload_entry(1, 700);
+        let archive = super::frozen::publish(
+            &core.dir,
+            super::frozen::ArchiveId {
+                group_id: 1,
+                segment: 1,
+                offset: 32,
+                first_index: 1,
+                last_index: 1,
+                content_hash: [0; 32],
+            },
+            vec![entry.clone()],
+        )
+        .unwrap();
+        let journal_path = core.segment(1);
+        let mut journal = JournalWriter::open(&journal_path, 1).unwrap();
+        journal
+            .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
+                group_id: 1,
+                record: RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
+                    archive: archive.clone(),
+                    log_ids: vec![entry.log_id],
+                })),
+            })
+            .unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+        let original = fs::read(&journal_path).unwrap();
+        let archive_path = super::frozen::path(&core.dir, archive.id);
+        if missing {
+            fs::remove_file(&archive_path).unwrap();
+        } else {
+            fs::write(&archive_path, b"corrupt").unwrap();
+        }
+        for _ in 0..2 {
+            let error = core.open_after(PreviousRun::Absent).unwrap_err();
+            match error {
+                CoreJournalError::Journal(error) if missing => {
+                    assert!(matches!(error.as_ref(), JournalError::Io { .. }))
+                }
+                CoreJournalError::Journal(error) => {
+                    assert!(matches!(error.as_ref(), JournalError::FrozenArchive {
+                        defect: super::ArchiveDefect::Length,
+                        ..
+                    }))
+                }
+                error => panic!("unexpected startup error: {error:?}"),
+            }
+            assert_eq!(fs::read(&journal_path).unwrap(), original);
+        }
+    }
+}
+
 /// A quiet group's few entries keep the oldest segment alive. Once the
 /// journal outgrows twice its live bytes they are rewritten into the newest
 /// segment in chunks, with the group's markers, and the old segments go.
@@ -1585,12 +1810,24 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .current_leader(1, "leader elected")
         .await
         .unwrap();
-    leader
-        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
-            bucket_id: "before-pause".into(),
+    let response = leader
+        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
+            stream_id: ursula_shard::BucketStreamId::new("before-pause", "events"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: bytes::Bytes::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            now_ms: 0,
         }))
         .await
         .unwrap();
+    assert!(matches!(
+        response.data,
+        crate::RaftGroupResponse::Write(Ok(ursula_runtime::GroupWriteResponse::CreateStream(_)))
+    ));
     let before = leader.metrics().borrow_watched().last_log_index;
     let vote = leader.metrics().borrow_watched().vote;
     let (entered, wait_entered) = tokio::sync::oneshot::channel();
@@ -1604,8 +1841,16 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     let writing = leader.clone();
     let append = tokio::spawn(async move {
         writing
-            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
-                bucket_id: "during-pause".into(),
+            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
+                stream_id: ursula_shard::BucketStreamId::new("during-pause", "events"),
+                content_type: "application/octet-stream".to_owned(),
+                initial_payload: bytes::Bytes::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                now_ms: 0,
             }))
             .await
     });
@@ -1621,7 +1866,11 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .await
         .unwrap();
     drop(release);
-    append.await.unwrap().unwrap();
+    let response = append.await.unwrap().unwrap();
+    assert!(matches!(
+        response.data,
+        crate::RaftGroupResponse::Write(Ok(ursula_runtime::GroupWriteResponse::CreateStream(_)))
+    ));
     for engine in engines {
         engine.shutdown().await.unwrap();
     }

@@ -4591,6 +4591,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ursula-config",
+ "ursula-proto",
  "ursula-shard",
  "ursula-stream",
  "zstd",

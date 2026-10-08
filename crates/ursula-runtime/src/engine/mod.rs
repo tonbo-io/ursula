@@ -806,12 +806,32 @@ pub struct StreamEngineError {
     context: Vec<StreamErrorContext>,
 }
 
+/// A command the data-group apply dispatcher cannot execute. The proposal
+/// boundary refuses it before anything is written, because once committed it
+/// would stop every replica of the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnproposableCommand {
+    /// Stream commands create their bucket inside their own apply.
+    CreateBucket,
+}
+
 /// Infra error variants with structured fields render their human message on
 /// demand (`message`) instead of storing a denormalized copy alongside the
 /// fields. `Internal` is the exception: it carries free-form text with no
 /// structured source, so it keeps an owned `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
+    #[error(
+        "raft group {raft_group_id:?} stopped after a committed apply failure; retain WAL for corrected-code replay"
+    )]
+    ApplyStopped {
+        raft_group_id: RaftGroupId,
+        term: u64,
+        index: u64,
+        kind: ursula_proto::admin::ApplyFailureKind,
+    },
+    #[error("command {command:?} cannot be proposed to a data Raft group")]
+    InvalidRaftCommand { command: UnproposableCommand },
     #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
     RecoveryVoteFloor { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]

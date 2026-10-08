@@ -163,6 +163,7 @@ pub use engine::GroupTidyStreamFuture;
 pub use engine::GroupTidyStreamsFuture;
 pub use engine::GroupTouchStreamAccessFuture;
 pub use engine::GroupWriteResponse;
+pub use engine::UnproposableCommand;
 pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;
 pub use engine::in_memory::next_repair_cursor;

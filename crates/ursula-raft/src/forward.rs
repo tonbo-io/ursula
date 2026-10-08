@@ -522,12 +522,32 @@ pub(crate) fn has_leader_channel(address: &str) -> bool {
     LEADER_CHANNELS.contains(address)
 }
 
+/// Reject commands that the data-group apply dispatcher cannot execute.
+pub(crate) fn validate_proposal(command: &GroupWriteCommand) -> Result<(), GroupEngineError> {
+    let GroupWriteCommand::Stream(command) = command;
+    let mut command = command;
+    while let ursula_stream::StreamCommand::IfIncarnation { command: inner, .. } = command {
+        command = inner;
+    }
+    if matches!(command, ursula_stream::StreamCommand::CreateBucket { .. }) {
+        return Err(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::CreateBucket,
+            },
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn write_commands_on_raft(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     commands: Vec<GroupWriteCommand>,
 ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
         return Ok(Vec::new());
+    }
+    for command in &commands {
+        validate_proposal(command)?;
     }
     let expected_responses = commands.len();
     let stream = raft.client_write_many(commands).await.map_err(|error| {
@@ -599,7 +619,8 @@ pub(crate) fn group_engine_client_write_error(
             false,
         );
     }
-    GroupEngineError::new(format!("OpenRaft client_write: {err}"))
+    tracing::warn!(error = %err, "Raft write response lost after submission");
+    GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
 }
 
 /// Map a failed ReadIndex barrier (`Raft::get_read_linearizer`). Nothing was

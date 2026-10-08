@@ -131,13 +131,26 @@ impl SnapshotBuildCoordinator {
         Arc::clone(gauges.entry(raft_group_id).or_default())
     }
 
-    /// The log progress of every group with a gauge (F12e).
+    /// Actual log progress, including retained stopped-group history.
     pub fn log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
         self.inner
             .log_gauges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
+            .map(|(group, gauge)| (*group, gauge.progress()))
+            .collect()
+    }
+
+    /// Stopped groups cannot snapshot and must not permanently hold the
+    /// snapshot-driven write-pressure gate closed for healthy groups.
+    pub fn reclaimable_log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
+        self.inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, gauge)| !gauge.apply_stopped())
             .map(|(group, gauge)| (*group, gauge.progress()))
             .collect()
     }
@@ -430,6 +443,10 @@ pub(crate) struct CurrentSnapshot {
 const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 
 pub struct RaftGroupStateMachine {
+    pub(crate) apply_stop_signal: Option<Arc<AtomicBool>>,
+    pub(crate) apply_health: crate::apply_failure::ApplyHealth,
+    #[cfg(test)]
+    pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub(crate) placement: ShardPlacement,
     pub(crate) engine: InMemoryGroupEngine,
     pub(crate) metrics: Option<GroupEngineMetrics>,
@@ -455,6 +472,27 @@ struct PersistedSnapshot {
 }
 
 impl RaftGroupStateMachine {
+    fn stop_apply(
+        &self,
+        log_id: LogIdOf<UrsulaRaftTypeConfig>,
+        error: crate::apply_failure::ApplyError,
+    ) -> io::Error {
+        let failure = crate::apply_failure::ApplyFailure {
+            term: log_id.committed_leader_id().term,
+            index: log_id.index(),
+            kind: error.kind(),
+            message: error.to_string(),
+        };
+        tracing::error!(raft_group_id = self.placement.raft_group_id.0, log_index = failure.index, error = %error, "stopping failed group; preserve WAL for corrected-code replay");
+        self.apply_health.stop(failure);
+        self.log_gauge.stop_apply();
+        if let Some(signal) = &self.apply_stop_signal {
+            signal.store(true, Ordering::Release);
+        }
+        // OpenRaft's state-machine interface requires io::Error at this boundary.
+        io::Error::other(error)
+    }
+
     pub fn new(placement: ShardPlacement) -> Self {
         Self::new_with_metrics(placement, None)
     }
@@ -502,6 +540,10 @@ impl RaftGroupStateMachine {
     ) -> Self {
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         Self {
+            apply_health: Default::default(),
+            apply_stop_signal: None,
+            #[cfg(test)]
+            apply_fault: None,
             placement,
             engine: match cold_store {
                 Some(cold_store) => InMemoryGroupEngine::with_cold_store(cold_store),
@@ -705,13 +747,11 @@ impl RaftGroupStateMachine {
         &mut self,
         build_permit: OwnedSemaphorePermit,
     ) -> RaftGroupSnapshotBuilder {
-        let snapshot = self
-            .group_snapshot()
-            .await
-            .expect("in-memory group snapshot should not fail");
+        let snapshot = self.engine.snapshot(self.placement).await.map(Arc::new);
         RaftGroupSnapshotBuilder {
+            apply_health: self.apply_health.clone(),
             placement: self.placement,
-            snapshot: Arc::new(snapshot),
+            snapshot,
             meta: self.snapshot_meta(),
             current_snapshot: self.current_snapshot.clone(),
             metadata_serial: self.metadata_serial.clone(),
@@ -768,18 +808,57 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let mut applied_entries = 0usize;
         let mut apply_ns = 0u64;
         while let Some((entry, responder)) = entries.try_next().await? {
-            self.last_applied_log_id = Some(entry.log_id);
-
-            self.log_gauge
-                .record_applied(crate::types::entry_log_bytes(&entry));
+            let entry_bytes = crate::types::entry_log_bytes(&entry);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
-                    let response = RaftGroupResponse::Write(
-                        self.engine.apply_committed_write(command, self.placement),
-                    );
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let result = self.engine.apply_committed_write(command, self.placement);
+                        // Inject AFTER mutation to prove partial state cannot escape.
+                        #[cfg(test)]
+                        match self.apply_fault {
+                            Some(crate::apply_failure::ApplyFault::InvariantAfterMutation {
+                                index,
+                            }) if index == entry.log_id.index() => {
+                                return Err(GroupEngineError::Infra(
+                                    ursula_runtime::GroupInfraError::ProtoDecode {
+                                        field: "injected-after-mutation".to_owned(),
+                                    },
+                                ));
+                            }
+                            Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
+                                index,
+                            }) => assert_ne!(
+                                index,
+                                entry.log_id.index(),
+                                "injected deterministic apply failure"
+                            ),
+                            _ => {}
+                        }
+                        result
+                    }));
+                    let response = match outcome {
+                        Ok(Err(error @ GroupEngineError::Infra(_))) => {
+                            return Err(self.stop_apply(
+                                entry.log_id,
+                                crate::apply_failure::ApplyError::InvariantViolation(error),
+                            ));
+                        }
+                        Ok(result) => RaftGroupResponse::Write(result),
+                        Err(payload) => {
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .map(|value| (*value).to_owned())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_owned());
+                            return Err(self.stop_apply(
+                                entry.log_id,
+                                crate::apply_failure::ApplyError::Panic { message },
+                            ));
+                        }
+                    };
                     apply_ns = apply_ns.saturating_add(elapsed_ns(apply_started_at));
                     response
                 }
@@ -792,6 +871,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 }
             };
 
+            self.last_applied_log_id = Some(entry.log_id);
+            self.log_gauge.record_applied(entry_bytes);
             if let Some(responder) = responder {
                 responder.send(response);
             }
@@ -944,10 +1025,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
 }
 
 pub struct RaftGroupSnapshotBuilder {
+    apply_health: crate::apply_failure::ApplyHealth,
     placement: ShardPlacement,
     /// Shared with the frame iterators, so an upload and any inline fallback
     /// encode the same group without deep-cloning it (F12c).
-    snapshot: Arc<GroupSnapshot>,
+    snapshot: Result<Arc<GroupSnapshot>, GroupEngineError>,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
@@ -963,8 +1045,15 @@ pub struct RaftGroupSnapshotBuilder {
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
+        self.apply_health
+            .check(self.placement.raft_group_id)
+            .map_err(group_engine_io_error)?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .map_err(|error| group_engine_io_error(error.clone()))?;
         let started_at = Instant::now();
-        let stream_count = self.snapshot.stream_snapshot.streams.len();
+        let stream_count = snapshot.stream_snapshot.streams.len();
         let snapshot_id = self.meta.snapshot_id.clone();
         let key = SnapshotKey {
             raft_group_id: self.placement.raft_group_id.0,
@@ -972,7 +1061,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         };
         let location = match self
             .snapshot_store
-            .upload_iter(key, group_snapshot_frames(Arc::clone(&self.snapshot)))
+            .upload_iter(key, group_snapshot_frames(Arc::clone(snapshot)))
             .await
         {
             Ok(location) => {
@@ -990,7 +1079,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                             "falling back to inline OpenRaft snapshot after external snapshot verification failed"
                         );
                         SnapshotLocation::Inline {
-                            bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
+                            bytes: group_snapshot_frames(Arc::clone(snapshot))
                                 .collect::<Result<Vec<_>, _>>()
                                 .map_err(|err| err.into_io())?
                                 .into_iter()
@@ -1007,7 +1096,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     "falling back to inline OpenRaft snapshot after external snapshot upload failed"
                 );
                 SnapshotLocation::Inline {
-                    bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
+                    bytes: group_snapshot_frames(Arc::clone(snapshot))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|err| err.into_io())?
                         .into_iter()
@@ -1033,7 +1122,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             Err(err) => {
                 tracing::warn!(snapshot_id, %err, "falling back to inline snapshot after external pin failure");
                 pointer.location = SnapshotLocation::Inline {
-                    bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
+                    bytes: group_snapshot_frames(Arc::clone(snapshot))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|err| err.into_io())?
                         .into_iter()
@@ -1202,6 +1291,30 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
+    #[test]
+    fn stopped_log_does_not_hold_healthy_group_write_pressure_closed() {
+        let coordinator = SnapshotBuildCoordinator::default();
+        let stopped = coordinator.log_gauge(0);
+        let healthy = coordinator.log_gauge(1);
+        stopped.record_applied(10_000);
+        healthy.record_applied(1);
+        assert_eq!(coordinator.reclaimable_log_progress().len(), 2);
+        stopped.stop_apply();
+        assert_eq!(
+            coordinator
+                .reclaimable_log_progress()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            stopped.progress().log_bytes,
+            10_000,
+            "diagnostics retain the actual byte count"
+        );
+    }
+
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn canceled_metadata_waiter_retains_serial_until_publication() {
@@ -1317,8 +1430,9 @@ mod tests {
         let metadata_path = directory.join("group-7.snapshot.json");
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut builder = RaftGroupSnapshotBuilder {
+            apply_health: Default::default(),
             placement,
-            snapshot: Arc::new(test_group_snapshot(placement, 42)),
+            snapshot: Ok(Arc::new(test_group_snapshot(placement, 42))),
             meta: test_snapshot_meta(42),
             current_snapshot,
             metadata_serial: Arc::default(),
@@ -1381,8 +1495,9 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
         let metadata_path = directory.join("group-7.snapshot.json");
         let mut builder = RaftGroupSnapshotBuilder {
+            apply_health: Default::default(),
             placement,
-            snapshot: Arc::new(test_group_snapshot(placement, 42)),
+            snapshot: Ok(Arc::new(test_group_snapshot(placement, 42))),
             meta: test_snapshot_meta(42),
             current_snapshot: Arc::new(Mutex::new(None)),
             metadata_serial: Arc::default(),
@@ -1520,8 +1635,9 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
 
         let mut first = RaftGroupSnapshotBuilder {
+            apply_health: Default::default(),
             placement,
-            snapshot: Arc::new(test_group_snapshot(placement, 1)),
+            snapshot: Ok(Arc::new(test_group_snapshot(placement, 1))),
             meta: test_snapshot_meta(1),
             current_snapshot: current_snapshot.clone(),
             metadata_serial: Arc::default(),
@@ -1538,8 +1654,9 @@ mod tests {
             SnapshotPointer::decode(&first_snapshot.snapshot.into_inner()).expect("first pointer");
 
         let mut second = RaftGroupSnapshotBuilder {
+            apply_health: Default::default(),
             placement,
-            snapshot: Arc::new(test_group_snapshot(placement, 2)),
+            snapshot: Ok(Arc::new(test_group_snapshot(placement, 2))),
             meta: test_snapshot_meta(2),
             current_snapshot: current_snapshot.clone(),
             metadata_serial: Arc::default(),
@@ -1573,8 +1690,9 @@ mod tests {
         // in external storage, but builder-local retired state is gone.
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut third = RaftGroupSnapshotBuilder {
+            apply_health: Default::default(),
             placement,
-            snapshot: Arc::new(test_group_snapshot(placement, 3)),
+            snapshot: Ok(Arc::new(test_group_snapshot(placement, 3))),
             meta: test_snapshot_meta(3),
             current_snapshot,
             metadata_serial: Arc::default(),
@@ -1656,8 +1774,9 @@ mod tests {
         };
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut builder = RaftGroupSnapshotBuilder {
+            apply_health: Default::default(),
             placement,
-            snapshot: Arc::new(test_group_snapshot(placement, 3)),
+            snapshot: Ok(Arc::new(test_group_snapshot(placement, 3))),
             meta: test_snapshot_meta(3),
             current_snapshot: current_snapshot.clone(),
             metadata_serial: Arc::default(),
@@ -1681,7 +1800,7 @@ mod tests {
         assert!(current_snapshot.lock().expect("snapshot mutex").is_some());
         // F12c: the upload attempt and the inline fallback both encoded from
         // the shared group without keeping or deep-cloning it.
-        assert_eq!(Arc::strong_count(&builder.snapshot), 1);
+        assert_eq!(Arc::strong_count(builder.snapshot.as_ref().unwrap()), 1);
     }
 
     #[tokio::test]

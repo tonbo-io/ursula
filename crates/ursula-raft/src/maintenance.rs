@@ -52,6 +52,17 @@ pub fn check_raft_maintenance(
         if group.node_id != node_id {
             issues.push(Issue::WrongNodeIdentity);
         }
+        // A stopped group's Raft observations are stale. The stop is its
+        // only issue, so serving and maintenance policy can each decide on it.
+        if group.apply_failure.is_some() {
+            issues.push(Issue::ApplyStopped);
+            report
+                .group_issues
+                .entry(group.raft_group_id)
+                .or_default()
+                .extend(issues);
+            continue;
+        }
         if !group.maintenance.running {
             issues.push(Issue::RaftStopped);
         }
@@ -140,6 +151,7 @@ mod tests {
     fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
         let progress = RaftLogProgressSnapshot { term: 1, index: 20 };
         RaftGroupMetricsSnapshot {
+            apply_failure: None,
             raft_group_id: id,
             node_id: 1,
             current_term: 1,
@@ -190,6 +202,29 @@ mod tests {
             ]),
             16,
         )
+    }
+
+    #[test]
+    fn apply_failure_has_a_distinct_maintenance_reason() {
+        let mut group = healthy(0);
+        group.maintenance.running = false;
+        group.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 2,
+            index: 9,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "invariant".to_owned(),
+        });
+        group.current_leader = None;
+        group.maintenance.recovery_ready = false;
+        let report = report(&[group, healthy(1)]);
+        assert_eq!(report.group_issues[&0], vec![
+            RaftMaintenanceIssue::ApplyStopped
+        ]);
+        assert!(!report.group_issues.contains_key(&1));
+        // The stop blocks disruption, while the node keeps serving its other
+        // groups and the stopped group answers with a typed 503.
+        assert!(!report.ready());
+        assert!(report.serving_ready());
     }
 
     #[test]

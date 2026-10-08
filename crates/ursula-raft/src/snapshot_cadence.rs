@@ -225,6 +225,7 @@ pub struct SnapshotPlan {
 /// snapshot builds still counts toward the next one.
 #[derive(Debug, Default)]
 pub struct GroupLogGauge {
+    apply_stopped: AtomicBool,
     applied_bytes: AtomicU64,
     applied_entries: AtomicU64,
     snapshot_bytes_mark: AtomicU64,
@@ -248,6 +249,13 @@ impl GroupLogMark {
 }
 
 impl GroupLogGauge {
+    pub(crate) fn stop_apply(&self) {
+        self.apply_stopped.store(true, AtomicOrdering::Release);
+    }
+    pub(crate) fn apply_stopped(&self) -> bool {
+        self.apply_stopped.load(AtomicOrdering::Acquire)
+    }
+
     /// Counts one applied entry of `bytes` estimated log bytes.
     pub fn record_applied(&self, bytes: u64) {
         self.applied_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
