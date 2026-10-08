@@ -1012,7 +1012,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 159] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 161] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
