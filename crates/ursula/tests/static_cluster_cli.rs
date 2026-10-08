@@ -1915,10 +1915,15 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
                     };
                 }
                 Err(error) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "candidate-loss proof: {error}"
-                    );
+                    if tokio::time::Instant::now() >= deadline {
+                        let survivors = nodes
+                            .iter()
+                            .filter(|node| node.id != 3)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let evidence = ctl.try_fetch_cluster(&survivors).await;
+                        panic!("candidate-loss proof: {error:#}; survivor evidence: {evidence:?}");
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
