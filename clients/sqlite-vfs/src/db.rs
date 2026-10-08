@@ -55,6 +55,10 @@ pub(crate) struct Db {
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
     pub(crate) overlay: BTreeMap<i64, Vec<u8>>,
+    /// The crc32c of every WAL page this process wrote in the WAL's current generation, by file
+    /// offset. A page read back with other bytes was lost on its way to the disk (see
+    /// `overlay_read`).
+    pub(crate) wal_written: BTreeMap<i64, u32>,
     /// The transaction's commit is acknowledged: later writes go straight to the local WAL, and
     /// the sidecar advances once the transaction ends.
     pub(crate) committed: bool,

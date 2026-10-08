@@ -607,6 +607,7 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
         log,
         poisoned: None,
         overlay: BTreeMap::new(),
+        wal_written: BTreeMap::new(),
         committed: false,
         commit_frame_no: 0,
         wal_open: 0,

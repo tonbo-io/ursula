@@ -13,8 +13,14 @@ pub(crate) const WAL_HDR: i64 = WAL_HDR_LEN as i64;
 pub(crate) const FRAME_HDR: i64 = FRAME_HDR_LEN as i64;
 pub(crate) const FRAME: i64 = FRAME_LEN as i64;
 
-/// Where frame 0's page starts in the WAL file.
+/// Where frame 0's page starts in the WAL file, and a page's size as a file offset.
 pub(crate) const FIRST_PAGE: i64 = WAL_HDR + FRAME_HDR;
+pub(crate) const PAGE_BYTES: i64 = PAGE as i64;
+
+/// Whether `off` is where a frame's page starts in the WAL file.
+pub(crate) fn page_at(off: i64) -> bool {
+    off >= FIRST_PAGE && off.saturating_sub(FIRST_PAGE).checked_rem(FRAME) == Some(0)
+}
 
 /// The same sizes, as buffer lengths.
 const WAL_HDR_LEN: usize = 32;

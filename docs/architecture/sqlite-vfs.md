@@ -282,8 +282,9 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
 - An acknowledged commit (the SQL `COMMIT` returned) is in the stream, and every host that
   attaches after it sees it, through replay or a snapshot that includes it. Caveat: the owner's
   later commits are page images read from its local files, so local files that lose a write
-  underneath a running process (the write-back I/O error of §6) can overwrite acknowledged changes
-  in the stream. Local files rolled back while no process had them attached (a restored disk
+  underneath a running process (the write-back I/O error of §6) could overwrite acknowledged
+  changes in the stream. The VFS checks WAL pages read back against what it wrote, which closes
+  most of that window; §6 lists what remains. Local files rolled back while no process had them attached (a restored disk
   image) are caught by attach (§6).
 - Nothing the stream did not acknowledge becomes visible: no frame of a transaction reaches the
   local WAL before its append is acknowledged, and a fenced or failed commit leaves no trace
@@ -434,15 +435,25 @@ What attach does in each case:
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
   the log grows, nothing is lost; retention simply does not advance.
 
-Residual risk, a disk write-back I/O error underneath a running process (EIO from the device, a
+A disk write-back I/O error underneath a running process (EIO from the device, a
 thin-provisioned volume out of space). The WAL is never fsynced and the db file only at WAL
-restarts, truncates and attach, so nothing reports such an error when it happens; once the dirty
-page is evicted, SQLite reads the old block back and the owner's next commits append page images
-built on it, losing acknowledged changes from the stream itself, not only from the cache. An error
-writing back the db file is reported (Linux reports it to an fsync on any descriptor opened
-before it) by the next fsync of the db file, at the latest when the WAL wraps, which poisons the
-database; one writing back a WAL frame is never reported. Between the error and that fsync the
-stream can already hold the damage.
+restarts, truncates and attach, so nothing reports such an error when it happens. Once the dirty
+page is evicted, a read gets the old block back, and SQLite does not check WAL frames on a read:
+the owner's next commits would append page images built on it, losing acknowledged changes from
+the stream itself, not only from the cache. So the VFS remembers the crc32c of every WAL page this
+process writes in the WAL's current generation, by offset (4 bytes per page), and checks every
+page its connections read back. A page that reads back other bytes fails the read and poisons the
+database before any commit can build on it. An error writing back the db file is reported (Linux
+reports it to an fsync on any descriptor opened before it) by the next fsync of the db file. That
+fsync comes before the commit that restarts the WAL, which is normally the first commit after a
+complete checkpoint, the point from which readers read checkpointed pages from the db file
+instead of the WAL.
+
+Residual risk:
+- The snapshot thread's private connection reads the WAL outside the VFS when it checkpoints, so
+  a lost WAL page that no connection of the owner read back can be checkpointed into the db file.
+- A commit that cannot restart the WAL, because another connection still reads from it, can read
+  a db page that lost its write-back since the last fsync and append the damage.
 
 Unsupported, because they break the model above: a runtime that fakes a fixed boot id; a volume
 swapped or rolled back underneath a running process; edits to the files outside the extension (a
@@ -496,7 +507,9 @@ rebuild, delete `<db>`.
   a stream another owner extended is rebuilt; the cache of a deleted stream is rebuilt from the
   stream recreated at its path, both shorter than the file's offset and grown past it), a file with
   a sidecar opening only while attached in the process (refused before an attach, and after a failed
-  re-attach of an attached file, until an attach succeeds; then commits replicate again), snapshots
+  re-attach of an attached file, until an attach succeeds; then commits replicate again), a WAL
+  page changed underneath the owner (standing in for a lost write-back) failing the read that gets
+  it back and poisoning the owner, not fenced, with the stream intact, snapshots
   and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
   fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
   fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
