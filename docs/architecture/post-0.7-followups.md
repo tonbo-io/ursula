@@ -22,12 +22,7 @@ persisted genesis vote is different from a missing vote.
 | #416 | A pure control-state foundation exists on main. The frozen executor and identity design need review. | Follow the design and dependency order below. |
 | #417 | The frozen allocator cleanup is independent of control-plane changes. | Use dhat for runtime/stream allocation assertions in isolated test binaries. Keep the state probe's bucket-counting allocator. |
 | #418 | The frozen patch isolates some apply failures and supports replay with corrected code. | First ship isolation and diagnostics. Decide supported recovery semantics separately before closing the issue. |
-| #419, #420 | Performance comparison and extended Chaos/soak qualification. | Validation is owned by the user. Code-level tests here do not claim to satisfy these issues. |
-
-The original EKS cluster remains available for implementation validation. Check
-its current workloads before reuse and leave the user's Chaos run untouched.
-A new cluster is unnecessary for this design work. If later work requires new
-resources, record their ownership and remove task-owned resources when finished.
+| #419, #420 | Performance comparison and extended Chaos/soak qualification. | Require separate acceptance evidence; code-level tests here do not satisfy these issues. |
 
 ## Extraction rules
 
@@ -65,10 +60,19 @@ belongs to the final cutover PR, with a working ordinary-PVC-restart runbook.
   recovery. A surviving page-cache prefix alone is insufficient coverage.
 - Delay a real replication response across reboot and recovery. Assert it
   cannot make the leader commit using a retired replica's acknowledgement.
-- Audit snapshot publication ordering through directory fsync and pointer
-  publication before purge. Main's `state_machine.rs` currently skips directory
-  sync when opening the parent directory fails. Propagate that error and test
-  the ordering separately from the already merged cancellation fixes.
+- Route snapshot metadata through the same journal I/O abstraction and audit
+  publication ordering: temporary-file write, file sync, rename, parent-directory
+  sync, pointer publication, then purge. The current direct `std::fs` path is
+  invisible to SimDisk power-loss schedules. Test each boundary under both WAL
+  fsync policies, including restart after a lost directory entry; an in-memory
+  pointer or surviving page-cache prefix is not durability evidence.
+
+The snapshot parent-directory open error is a separate immediate fix, not gated
+on the wider #411 audit or the control-plane design. Main's
+`persist_snapshot_metadata` silently skips directory sync when `File::open(parent)`
+fails. Propagate the open error, preserve the previous published pointer, and
+cover the failure before the 0.7 release. This narrow fix does not by itself
+bring snapshot metadata into the simulated I/O path.
 
 ## #416: authority and availability
 
@@ -113,6 +117,32 @@ observations consistently. Mark observations stale or unavailable when their
 source cannot be refreshed. Missing safety fields must not deserialize to
 "ready". A local serving decision and authorization for another disruption
 remain separate answers.
+
+## Durable meta storage
+
+The meta Raft log is an append log through the same WAL I/O abstraction as the
+data groups, in native and SimDisk builds. Do not port frozen #426's full-file
+rewrite on every append, and do not add a separate direct-`std::fs` storage path.
+
+The design choice is to store meta as an internal logical group in the existing
+per-core journal, reusing its writer, framing, checksums, segment lifecycle,
+replay and durability barriers. It is not a drop-in data-group allocation:
+`CoreJournalRecord` currently carries `UrsulaRaftTypeConfig` entries and a data
+`group_id`. The storage change must introduce a typed record/group namespace for
+meta, keep its identity outside client-visible shard routing, and define the
+storage-format upgrade boundary. A second WAL implementation needs a concrete
+reason that this shared representation cannot support the required lifecycle;
+a different Raft command type alone is not that reason.
+
+Test recovery under both `always` and `never`, including a full-cluster power
+loss immediately after an acknowledged meta append. A data WAL policy of
+`never` does not permit acknowledged control ownership, process epochs or
+activation records to roll back. Specify and enforce the meta record's durable
+acknowledgement boundary through the shared writer, including directory entry
+durability, and measure any extra fsync cost. Snapshot install and compaction
+must retain the same committed prefix and authority after restart. Vote,
+truncate, purge and snapshot-pointer recovery belong in the same native/SimDisk
+fault matrix, rather than only testing a successful append/reopen.
 
 ## Replica identity fence
 
@@ -248,8 +278,10 @@ Independent work can proceed alongside design review:
 After this design is reviewed, #416 proceeds in dependency order:
 
 1. One pure operation model, including recovery outcomes and transition tests.
-2. Durable meta storage and authenticated transport with explicit managed-mode
-   startup. Keep it unenabled until the remaining integration is complete.
+2. Append-only meta storage in the shared per-core WAL and authenticated
+   transport with explicit managed-mode startup. Validate both fsync policies
+   through the native/SimDisk I/O seam. Keep it unenabled until the remaining
+   integration is complete.
 3. Encapsulated request/response identity admission and simulated durable fences.
 4. Thin executor with participant restart and cancellation reconciliation.
 5. Complete live topology, join and decommission, followed by removal of the
