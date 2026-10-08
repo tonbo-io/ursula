@@ -3,16 +3,6 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
-## Unreleased
-
-Local serving readiness is separate from full maintenance redundancy. Healthy
-surviving voters can remain ready while a wiped replica rebuilds. The local
-Raft refusal reason changes from `raft_maintenance_unready` to
-`raft_replica_unready`. Update alerts that match that reason and monitor
-`raft_maintenance.group_issues` for incomplete voter sets. `ursulactl wait-ready`
-continues to require complete redundancy and now also checks the existing
-serving probe. No new maintenance endpoint is required.
-
 ## 0.7.0
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
@@ -80,7 +70,9 @@ See [Recovering after a host crash](/docs/operations#recovering-after-a-host-cra
 - **Leadership transfer errors.** `POST /__ursula/raft/{group}/leader/transfer/{node}` answers `409` for a changed leader or a recovering target, `400` for an invalid target, `404` for an unregistered group and `500` for a stopped Raft. `ursulactl drain` observes again and plans again after a `409`.
 - **Leader forwarding is bounded.** A follower that forwards a read, `HEAD` or bucket purge to a leader it cannot reach answers `503` with `Retry-After` within about 3 seconds, or 10 seconds when the leader accepts the call and never answers. Before, it answered `500` once the kernel gave up on the connection, about 16 minutes after the leader's host lost power, and the group's later requests waited behind it. Connections between nodes now send HTTP/2 PINGs to detect a silent peer.
 - **Gateway upstream failures.** `ursulagw` forgets a cached leader when its upstream fails at the transport. An upstream it cannot connect to answers `503` with `Retry-After`, and one that sends no response headers in time answers `504`. Both used to answer an empty `502`.
-- **Readiness and metrics.** `/__ursula/ready` adds the reasons `recovery_gate_closed` and `recovery_stalled` and the list `recovery_stalled_groups`. `/__ursula/metrics` adds `process_incarnation`, `wal_recovery` and `recovery_gates`, and OpenTelemetry adds the gauges `ursula.wal.recovering` and `ursula.raft.recovery_gates`. `memory_wal_full_restart_groups` and the `wal_backend` metric are gone.
+- **Readiness checks the node's own Raft replicas.** `/__ursula/ready` answers `503` with the reason `raft_replica_unready` while one of the node's replicas is not a healthy voter, for example a wiped replica that its leaders rebuild as a learner. It also adds the reasons `recovery_gate_closed` and `recovery_stalled` and the list `recovery_stalled_groups`, and the admin plane now serves it next to `/__ursula/metrics`. Readiness does not report lost redundancy: healthy surviving voters stay ready while a replica rebuilds. Alert on `incomplete_voter_set` in `raft_maintenance.group_issues` instead (see [Observability](/docs/observability)).
+- **Metrics.** `/__ursula/metrics` adds `process_incarnation`, `raft_maintenance`, `wal_recovery` and `recovery_gates`, and OpenTelemetry adds the gauges `ursula.wal.recovering` and `ursula.raft.recovery_gates`. `memory_wal_full_restart_groups` and the `wal_backend` metric are gone.
+- **`ursulactl wait-ready` waits for full redundancy.** Besides a leader for every group, it requires each node's `raft_maintenance` report to show the complete voter set, no uncertain maintenance fence, and `200` from `/__ursula/ready`. It retries connection failures until its timeout.
 
 ### Removed in 0.7.0
 
