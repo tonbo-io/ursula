@@ -528,19 +528,17 @@ pub fn raft_grpc_service(
 }
 
 pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
-    if matches!(
-        error.infra(),
-        Some(ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. })
-    ) {
-        return tonic::Status::unavailable(error.to_string());
-    }
-    if matches!(
-        error.infra(),
-        Some(ursula_runtime::GroupInfraError::OwnerStopped)
-    ) {
-        tonic::Status::unavailable(error.to_string())
-    } else {
-        tonic::Status::internal(error.to_string())
+    match error.infra() {
+        Some(ursula_runtime::GroupInfraError::RaftGroupNotRegistered { .. }) => {
+            tonic::Status::not_found(error.to_string())
+        }
+        Some(
+            ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
+            | ursula_runtime::GroupInfraError::OwnerStopped
+            | ursula_runtime::GroupInfraError::ApplyStopped { .. }
+            | ursula_runtime::GroupInfraError::OutcomeUnknown,
+        ) => tonic::Status::unavailable(error.to_string()),
+        _ => tonic::Status::internal(error.to_string()),
     }
 }
 
@@ -756,10 +754,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 "group_write_request",
             )
             .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-            let raft = self
+            let entry = self
                 .registry
-                .get(placement.raft_group_id)
-                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
+                .entry(placement.raft_group_id)
+                .map_err(group_rpc_status)?;
+            let raft = entry.raft().clone();
             let commands = request
                 .command_payloads
                 .into_iter()
@@ -867,7 +866,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let entry = self
                 .registry
                 .entry(placement.raft_group_id)
-                .map_err(|error| tonic::Status::not_found(error.to_string()))?;
+                .map_err(group_rpc_status)?;
             let raft = entry.raft().clone();
             let read_barrier = entry.barrier.clone();
             let cold_store = self.cold_store.clone();

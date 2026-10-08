@@ -313,6 +313,45 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     assert!(!restarted_registry.may_campaign(RaftGroupId(999)));
     assert!(!restarted_registry.may_campaign(RaftGroupId(0)));
     assert!(restarted_registry.get(RaftGroupId(0)).is_none());
+    assert!(restarted_registry.contains_group(RaftGroupId(0)));
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+    let service = crate::grpc::RaftGrpcService::new(restarted_registry.clone());
+    let write_error = service
+        .group_write(tonic::Request::new(
+            crate::raft_internal_proto::GroupWriteRequestV1 {
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                command_payloads: vec![crate::codec::encode_wire(&create_stream(
+                    "refused-after-replay",
+                ))],
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(write_error.code(), tonic::Code::Unavailable);
+    let read_error = service
+        .group_read(tonic::Request::new(
+            crate::raft_internal_proto::GroupReadRequestV1 {
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(read_error.code(), tonic::Code::Unavailable);
+    let append_error = restarted_registry
+        .append_entries(RaftGroupId(0), crate::UrsulaAppendEntriesRequest {
+            vote: crate::UrsulaVote::new_committed(100, 1),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(append_error, ursula_runtime::GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index, .. }) if index == poison_index)
+    );
+
     let healthy_stream = (0..1000)
         .map(|index| ursula_shard::BucketStreamId::new(format!("restarted-{index}"), "events"))
         .find(|stream| runtime.locate(stream).raft_group_id == RaftGroupId(1))

@@ -632,7 +632,7 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn contains_group(&self, raft_group_id: RaftGroupId) -> bool {
-        self.get(raft_group_id).is_some()
+        self.groups.load().contains_key(&raft_group_id.0)
     }
 
     pub fn allow_dynamic_group_hosting(&self, raft_group_id: RaftGroupId) -> bool {
