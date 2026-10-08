@@ -108,6 +108,7 @@ pub use writer::CoreJournalError;
 pub(crate) use writer::CoreJournalOptions;
 pub use writer::JournalTuning;
 pub use writer::LaggingGroups;
+pub(crate) use writer::WriterExited;
 pub(crate) use writer::elapsed_ns;
 #[cfg(test)]
 pub(crate) use writer::read_wire_frames;

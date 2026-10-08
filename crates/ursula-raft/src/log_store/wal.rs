@@ -23,10 +23,18 @@ use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
 use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
+use crate::log_store::WriterExited;
 use crate::log_store::core_dir;
 
-/// The open writer of one core's journal, if any.
-type CoreWriterSlot = Arc<Mutex<Weak<CoreFileLogWriter>>>;
+/// The open writer of one core's journal, if any, and the signal that its
+/// worker stopped, which outlives the writer's last handle.
+type CoreWriterSlot = Arc<Mutex<CoreWriterState>>;
+
+#[derive(Debug, Default)]
+struct CoreWriterState {
+    writer: Weak<CoreFileLogWriter>,
+    exited: Option<WriterExited>,
+}
 
 /// The core writers of a running WAL, by core.
 #[derive(Debug)]
@@ -134,7 +142,7 @@ impl RaftWal {
             }
         };
         let mut slot = slot.lock().map_err(|_poisoned| poisoned())?;
-        if let Some(writer) = slot.upgrade() {
+        if let Some(writer) = slot.writer.upgrade() {
             return Ok(writer);
         }
 
@@ -151,7 +159,10 @@ impl RaftWal {
                 metrics: Some((placement, metrics)),
             })
             .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
-        *slot = Arc::downgrade(&writer);
+        *slot = CoreWriterState {
+            writer: Arc::downgrade(&writer),
+            exited: Some(writer.exited()),
+        };
         Ok(writer)
     }
 
@@ -185,12 +196,13 @@ impl RaftWal {
             }
         };
         let mut writers = Vec::with_capacity(slots.len());
+        let mut exits = Vec::with_capacity(slots.len());
         for (core, slot) in slots {
-            let writer = slot
+            let slot = slot
                 .lock()
-                .map_err(|_poisoned| RaftWalError::LockPoisoned)?
-                .upgrade();
-            writers.extend(writer.map(|writer| (core, writer)));
+                .map_err(|_poisoned| RaftWalError::LockPoisoned)?;
+            writers.extend(slot.writer.upgrade().map(|writer| (core, writer)));
+            exits.extend(slot.exited.clone());
         }
         let closed = join_all(writers.iter().map(|(core, writer)| async move {
             writer
@@ -203,6 +215,11 @@ impl RaftWal {
         }))
         .await;
         closed.into_iter().collect::<Result<Vec<()>, _>>()?;
+        // A writer whose last handle is being dropped still drains its queued
+        // batch. Only once every worker stopped can no journal change.
+        for mut exited in exits {
+            while exited.changed().await.is_ok() {}
+        }
         self.node.record_clean()?;
         tracing::info!(
             root = %self.root().display(),
@@ -228,6 +245,52 @@ mod tests {
             std::process::id(),
             ordinal,
         ))
+    }
+
+    /// A writer whose last handle is still draining it keeps a shutdown from
+    /// recording the run as clean, so nothing writes the journal after that.
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_a_writer_whose_last_handle_is_dropping() {
+        let root = unique_test_dir("draining-writer-shutdown");
+        let wal = RaftWal::start(
+            &root,
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
+        let store = wal
+            .open(
+                ShardPlacement {
+                    core_id: CoreId(0),
+                    shard_id: ShardId(0),
+                    raft_group_id: RaftGroupId(0),
+                },
+                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+            )
+            .expect("open a store");
+        let exited = {
+            let core_writers = wal.core_writers.lock().expect("slots");
+            let CoreWriterSlots::Running(slots) = &*core_writers else {
+                panic!("a started WAL is running");
+            };
+            slots[&0]
+                .lock()
+                .expect("core 0")
+                .exited
+                .clone()
+                .expect("an opened writer")
+        };
+        // Dropping the last handle joins the worker, so it runs beside the
+        // shutdown.
+        let dropping = tokio::task::spawn_blocking(move || drop(store));
+        wal.shutdown().await.expect("a clean shutdown");
+        // The worker dropped its sender before the run was recorded clean.
+        if let Ok(changed) = exited.has_changed() {
+            panic!("the writer still runs after a clean shutdown (changed: {changed})");
+        }
+        dropping.await.expect("drop the last handle");
+        crate::tests::remove_test_path(&root);
     }
 
     /// A core recovering its journal does not hold up another core's.

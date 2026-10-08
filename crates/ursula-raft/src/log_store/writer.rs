@@ -394,6 +394,8 @@ pub(crate) struct CoreFileLogWriter {
     groups: Arc<Mutex<CoreGroups>>,
     group_cache_bytes: u64,
     worker: Option<WriterWorker>,
+    /// Closes once the worker has stopped, whoever stops it.
+    exited: WriterExited,
     /// Released after the worker has stopped (see `Drop`).
     _lock: DiskLock,
 }
@@ -414,6 +416,11 @@ pub(crate) struct OpenedGroup {
     pub(crate) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
     pub(crate) state: GroupLogState,
 }
+
+/// Closes once a core writer's worker has stopped. The last handle's drop
+/// lets the worker finish its queued batch, so only this tells a shutdown
+/// that the writer can no longer touch its journal.
+pub(crate) type WriterExited = crate::rt::sync::watch::Receiver<()>;
 
 #[cfg(not(madsim))]
 type WriterWorker = std::thread::JoinHandle<()>;
@@ -729,7 +736,8 @@ impl CoreFileLogWriter {
             pinned_segments: 0,
             lagging_groups: 0,
         };
-        let worker = spawn_core_file_log_writer(Box::new(journal), rx)?;
+        let (exited_tx, exited) = crate::rt::sync::watch::channel(());
+        let worker = spawn_core_file_log_writer(Box::new(journal), rx, exited_tx)?;
         Ok(Arc::new(Self {
             #[cfg(madsim)]
             pause,
@@ -740,8 +748,14 @@ impl CoreFileLogWriter {
             groups,
             group_cache_bytes: cache_bytes,
             worker: Some(worker),
+            exited,
             _lock: lock,
         }))
+    }
+
+    /// Closes once this writer's worker has stopped.
+    pub(crate) fn exited(&self) -> WriterExited {
+        self.exited.clone()
     }
 
     /// The core journal's directory.
@@ -885,6 +899,7 @@ fn writer_name(dir: &Path) -> String {
 fn spawn_core_file_log_writer(
     journal: Box<CoreJournal>,
     rx: mpsc::UnboundedReceiver<CoreWriterRequest>,
+    exited: crate::rt::sync::watch::Sender<()>,
 ) -> Result<WriterWorker, CoreJournalError> {
     let spawn_error = |source| CoreJournalError::SpawnWriter {
         source: Arc::new(source),
@@ -899,7 +914,8 @@ fn spawn_core_file_log_writer(
         .spawn(move || {
             runtime.block_on(tokio::task::unconstrained(run_core_file_log_writer(
                 journal, rx,
-            )))
+            )));
+            drop(exited);
         })
         .map_err(spawn_error)
 }
@@ -909,8 +925,13 @@ fn spawn_core_file_log_writer(
 fn spawn_core_file_log_writer(
     journal: Box<CoreJournal>,
     rx: mpsc::UnboundedReceiver<CoreWriterRequest>,
+    exited: crate::rt::sync::watch::Sender<()>,
 ) -> Result<WriterWorker, CoreJournalError> {
-    Ok(crate::rt::spawn(run_core_file_log_writer(journal, rx)))
+    // An aborted task drops `exited` with its future.
+    Ok(crate::rt::spawn(async move {
+        run_core_file_log_writer(journal, rx).await;
+        drop(exited);
+    }))
 }
 
 /// The channel is closed, so the thread finishes its batch, `fsync`s the
