@@ -105,7 +105,7 @@ fn spawn_log_pressure_monitor(coordinator: SnapshotBuildCoordinator, cadence: &S
     tokio::spawn(async move {
         loop {
             let log_bytes = coordinator
-                .log_progress()
+                .reclaimable_log_progress()
                 .values()
                 .fold(0_u64, |total, progress| {
                     total.saturating_add(progress.log_bytes)

@@ -131,9 +131,20 @@ impl SnapshotBuildCoordinator {
         Arc::clone(gauges.entry(raft_group_id).or_default())
     }
 
-    /// Snapshot-reclaimable progress. Stopped groups retain their WAL but must
-    /// not keep the node-wide write pressure gate permanently closed.
+    /// Actual log progress, including retained stopped-group history.
     pub fn log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
+        self.inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(group, gauge)| (*group, gauge.progress()))
+            .collect()
+    }
+
+    /// Stopped groups cannot snapshot and must not permanently hold the
+    /// snapshot-driven write-pressure gate closed for healthy groups.
+    pub fn reclaimable_log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
         self.inner
             .log_gauges
             .lock()
@@ -1287,7 +1298,7 @@ mod tests {
         let healthy = coordinator.log_gauge(1);
         stopped.record_applied(10_000);
         healthy.record_applied(1);
-        assert_eq!(coordinator.log_progress().len(), 2);
+        assert_eq!(coordinator.reclaimable_log_progress().len(), 2);
         stopped.stop_apply();
         assert_eq!(
             coordinator
