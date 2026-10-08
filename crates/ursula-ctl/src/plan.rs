@@ -273,7 +273,7 @@ mod tests {
 
     fn view(node_id: u64, groups: Vec<RaftGroupView>) -> NodeMetricsView {
         NodeMetricsView {
-            process_incarnation: None,
+            process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
             maintenance_fence: None,
             maintenance_fence_uncertain: false,
             node: node(node_id),

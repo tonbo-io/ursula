@@ -190,7 +190,6 @@ fn run_host_cli(interrupt_candidate: bool) {
         verification: ursula_ctl::quorum::QuorumVerification {
             version: 3,
             participation_certified: true,
-            process_incarnations_certified: true,
             process_incarnations: plan
                 .iter()
                 .map(|node| (node.id, node.expected_process_incarnation.clone().unwrap()))
@@ -742,7 +741,6 @@ fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted()
         verification: ursula_ctl::quorum::QuorumVerification {
             version: 3,
             participation_certified: true,
-            process_incarnations_certified: true,
             process_incarnations: state
                 .operation()
                 .unwrap()

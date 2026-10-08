@@ -224,7 +224,7 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: node(1),
@@ -232,7 +232,7 @@ mod tests {
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: node(2),
@@ -249,7 +249,7 @@ mod tests {
     fn cluster_ready_false_when_group_lacks_leader() {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
-                process_incarnation: None,
+                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                 maintenance_fence: None,
                 maintenance_fence_uncertain: false,
                 node: node(1),
@@ -266,7 +266,7 @@ mod tests {
     fn cluster_ready_false_when_group_is_uninitialized() {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
-                process_incarnation: None,
+                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                 maintenance_fence: None,
                 maintenance_fence_uncertain: false,
                 node: node(1),

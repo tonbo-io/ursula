@@ -348,7 +348,6 @@ fn observation(
         verification: crate::quorum::QuorumVerification {
             version: 3,
             participation_certified: true,
-            process_incarnations_certified: true,
             process_incarnations: operation
                 .process_plan
                 .iter()
@@ -516,7 +515,8 @@ fn incomplete_or_uncertified_healthy_inventory_cannot_anchor_host_recovery() {
                 request
                     .observation
                     .verification
-                    .process_incarnations_certified = false
+                    .process_incarnations
+                    .remove(&3);
             }
             12 => {
                 request

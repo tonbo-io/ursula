@@ -1159,7 +1159,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
 
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
     nodes = ctl
-        .pin_nodes(&nodes, None, false)
+        .pin_nodes(&nodes, None)
         .await
         .expect("save original process plan");
     let now_ms = || {
@@ -1337,7 +1337,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5))
         .expect("new admitted repair operation");
     nodes = ctl
-        .pin_nodes(&nodes, Some(3), false)
+        .pin_nodes(&nodes, Some(3))
         .await
         .expect("bind only admitted replacement");
     assert_ne!(nodes[2].expected_process_incarnation, retired_identity);
@@ -1428,7 +1428,13 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         .await
         .expect("current process full prefix proof");
     assert!(proof.maintenance_executor_certified);
-    assert!(proof.process_incarnations_certified);
+    assert_eq!(proof.process_incarnations.len(), nodes.len());
+    for node in &nodes {
+        assert_eq!(
+            proof.process_incarnations.get(&node.id),
+            node.expected_process_incarnation.as_ref()
+        );
+    }
     for node in &nodes {
         ctl.set_maintenance_fence(node, true)
             .await
@@ -1588,7 +1594,7 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         .await;
     }
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
-    nodes = ctl.pin_nodes(&nodes, None, false).await.unwrap();
+    nodes = ctl.pin_nodes(&nodes, None).await.unwrap();
     ursula_ctl::wait_cluster_ready(
         "host recovery prefault",
         &nodes,
@@ -1750,7 +1756,7 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     // Each client pins fetched boot identities for its lifetime. The durable
     // reservation, rather than the old transport cache, admits this new boot.
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
-    nodes = ctl.pin_nodes(&nodes, Some(3), false).await.unwrap();
+    nodes = ctl.pin_nodes(&nodes, Some(3)).await.unwrap();
     state=state.recover_host(HostRequest::BindHostReplacement {fence:state.operation().unwrap().fence.clone(),process_plan:nodes.clone(),
         pod:serde_json::json!({"kind":"Pod","metadata":{"namespace":"native","name":"voters-2","uid":"native-host-replacement","ownerReferences":[{"kind":"StatefulSet","uid":"native-sts","controller":true}]},"spec":{"nodeName":"native-host-3-replacement"}}),
         node:serde_json::json!({"kind":"Node","metadata":{"name":"native-host-3-replacement","uid":"native-node-3-replacement","labels":{"topology.kubernetes.io/zone":"native-zone-3"}},"spec":{"providerID":"native-instance-3-replacement"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})
@@ -1875,7 +1881,7 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         wait_until_ready(&client, &public(3), &mut children).await;
         let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap();
         nodes = ctl
-            .pin_nodes(&state.operation().unwrap().process_plan, Some(3), false)
+            .pin_nodes(&state.operation().unwrap().process_plan, Some(3))
             .await
             .unwrap();
         state = state.recover_host(HostRequest::BindHostReplacement { fence: state.operation().unwrap().fence.clone(), process_plan: nodes.clone(),

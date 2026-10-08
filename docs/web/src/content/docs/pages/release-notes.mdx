@@ -78,10 +78,10 @@ See [Recovering after a host crash](/docs/operations#recovering-after-a-host-cra
 - **Chart values** `raft.storageMode`, `raft.allowVolatileMultiPeer` and `persistence.enabled`. Every server pod gets a `raft-data` PVC, and `raft.logDir` must be set. The values schema refuses unknown keys under `raft` and `persistence`.
 - **`ursulactl` verbs** `prepare-restart`, `restart-quiesce-capability`, `finish-prepared-restart`, `abort-prepared-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`, `prepare-recovery-handoff` and `classify-amnesiac`. A planned restart is `drain`, restart, `wait` and `undrain` (see [Restarting a voter](/docs/operations#restarting-a-voter)). A voter that lost entries needs no verb: its group leaders rebuild it.
 - **Admin endpoints** `POST /__ursula/raft/quiesce-for-restart`, `POST /__ursula/raft/{group}/rejoin/adopt-survivor/{node}` and `POST /__ursula/raft/{group}/rejoin/reinitialize`. `accept-unsynced-loss` replaces the last two.
+- **`ursulactl pin-incarnations --allow-legacy-incarnation`.** Every 0.7 server reports a process incarnation, so `pin-incarnations` refuses a node without one and has no override.
 
 ### Known issues
 
-- [#410](https://github.com/tonbo-io/ursula/issues/410): `ursulactl pin-incarnations` still takes `--allow-legacy-incarnation`, a 0.6.2 migration switch that no 0.7 server needs. It will be removed.
 - [#411](https://github.com/tonbo-io/ursula/issues/411): an adversarial review of recovery left residual risks open, mostly liveness. For example, a node that loses its run state file can restart a recovery epoch that its cores already verified, and a failure to record the `poisoned` status is not yet covered by tests.
 - [#454](https://github.com/tonbo-io/ursula/issues/454): after a voter host loses power, `ursulagw` keeps choosing the dead upstream at random until its pod returns. Each such attempt waits for the 5 second connect timeout, so a stream can fail through the gateway for about a minute although the cluster elected new leaders within seconds. Clients that connect to the servers directly are not affected.
 

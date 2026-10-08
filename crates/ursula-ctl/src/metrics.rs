@@ -24,7 +24,7 @@ use crate::provider::NodeInfo;
 pub struct MetricsClient {
     client: Client,
     timeout: Duration,
-    incarnations: Arc<Mutex<HashMap<u64, Option<ProcessIncarnation>>>>,
+    incarnations: Arc<Mutex<HashMap<u64, ProcessIncarnation>>>,
 }
 
 impl MetricsClient {
@@ -48,15 +48,11 @@ impl MetricsClient {
         &self.client
     }
 
-    fn pin_incarnation(
-        &self,
-        node: &NodeInfo,
-        observed: &Option<ProcessIncarnation>,
-    ) -> Result<()> {
+    fn pin_incarnation(&self, node: &NodeInfo, observed: &ProcessIncarnation) -> Result<()> {
         if node
             .expected_process_incarnation
             .as_ref()
-            .is_some_and(|expected| observed.as_ref() != Some(expected))
+            .is_some_and(|expected| observed != expected)
         {
             bail!(
                 "node {} process incarnation differs from its maintenance plan",
@@ -80,7 +76,7 @@ impl MetricsClient {
         Ok(())
     }
 
-    async fn observed_incarnation(&self, node: &NodeInfo) -> Result<Option<ProcessIncarnation>> {
+    async fn observed_incarnation(&self, node: &NodeInfo) -> Result<ProcessIncarnation> {
         let existing = self
             .incarnations
             .lock()
@@ -101,22 +97,13 @@ impl MetricsClient {
         url: url::Url,
     ) -> Result<RequestBuilder> {
         let incarnation = self.observed_incarnation(node).await?;
-        let mut request = self.client.request(method, url);
-        if let Some(identity) = &incarnation {
-            request = request.header(PROCESS_INCARNATION_HEADER, identity.as_str());
-        }
+        let mut request = self
+            .client
+            .request(method, url)
+            .header(PROCESS_INCARNATION_HEADER, incarnation.as_str());
         if let Some(fence) = &node.expected_maintenance_fence {
-            if incarnation.is_none() {
-                bail!(
-                    "executor fencing requires process identity at node {}",
-                    node.id
-                );
-            }
             request = request.header(MAINTENANCE_FENCE_HEADER, fence.header_value());
         }
-        // Concrete migration consumers: deployed servers through 0.6.2 lack
-        // the identity field and cannot enforce this precondition. Preserve
-        // their existing transport only until those sources are retired.
         Ok(request)
     }
 
@@ -182,7 +169,6 @@ impl MetricsClient {
         &self,
         nodes: &[NodeInfo],
         replacement: Option<u64>,
-        allow_legacy: bool,
     ) -> Result<Vec<NodeInfo>> {
         crate::provider::validate_maintenance_fences(nodes)?;
         let ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
@@ -212,10 +198,7 @@ impl MetricsClient {
                     == Some(&MaintenanceFenceState::Active {
                         fence: expected.clone(),
                     });
-                if (!unclaimed && !same)
-                    || view.maintenance_fence_uncertain
-                    || view.process_incarnation.is_none()
-                {
+                if (!unclaimed && !same) || view.maintenance_fence_uncertain {
                     bail!(
                         "replacement node {} has another or unresolved maintenance authority",
                         node.id
@@ -235,13 +218,7 @@ impl MetricsClient {
                     node.id
                 );
             }
-            if view.process_incarnation.is_none() && !allow_legacy {
-                bail!(
-                    "node {} lacks process identity; only the deployed legacy migration may opt in",
-                    node.id
-                );
-            }
-            node.expected_process_incarnation = view.process_incarnation;
+            node.expected_process_incarnation = Some(view.process_incarnation);
             pinned.push(node);
         }
         Ok(pinned)
@@ -264,7 +241,7 @@ impl MetricsClient {
             .json()
             .await
             .with_context(|| format!("decode metrics from node {}", node.id))?;
-        if (body.process_incarnation.is_some() && body.process_node_id != Some(node.id))
+        if body.process_node_id != node.id
             || body
                 .raft_groups
                 .iter()
@@ -367,9 +344,7 @@ impl MetricsClient {
         raft_group_id: u64,
         current_term: u64,
     ) -> Result<()> {
-        self.observed_incarnation(voter)
-            .await?
-            .context("self-election requires process identity")?;
+        self.observed_incarnation(voter).await?;
         let url = voter
             .admin_url
             .join(&format!("/__ursula/raft/{raft_group_id}/self-election"))?;
@@ -395,9 +370,7 @@ impl MetricsClient {
         leader: &NodeInfo,
         group: u32,
     ) -> Result<ursula_proto::admin::QuorumPrefix> {
-        self.observed_incarnation(leader)
-            .await?
-            .context("quorum proof requires process identity")?;
+        self.observed_incarnation(leader).await?;
         let url = leader
             .admin_url
             .join(&format!("/__ursula/raft/{group}/quorum"))?;
@@ -565,10 +538,8 @@ fn metrics_base_url(node: &NodeInfo) -> &url::Url {
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawMetrics {
-    #[serde(default)]
-    process_incarnation: Option<ProcessIncarnation>,
-    #[serde(default)]
-    process_node_id: Option<u64>,
+    process_incarnation: ProcessIncarnation,
+    process_node_id: u64,
     #[serde(default)]
     maintenance_fence: Option<MaintenanceFenceState>,
     #[serde(default)]
@@ -604,7 +575,7 @@ pub struct NodeMetricsView {
     pub node: NodeInfo,
     pub groups: Vec<RaftGroupView>,
     pub raft_maintenance: Option<ursula_proto::admin::RaftMaintenanceReport>,
-    pub process_incarnation: Option<ProcessIncarnation>,
+    pub process_incarnation: ProcessIncarnation,
     pub maintenance_fence: Option<MaintenanceFenceState>,
     pub maintenance_fence_uncertain: bool,
 }
@@ -826,7 +797,7 @@ mod tests {
                 .to_string()
                 .contains("maintenance plan")
         );
-        assert_eq!(pinned, Some(ProcessIncarnation::from_bits(1)));
+        assert_eq!(pinned, ProcessIncarnation::from_bits(1));
         task.abort();
     }
 
@@ -838,18 +809,18 @@ mod tests {
             incarnation_node(2, Some(ProcessIncarnation::from_bits(2))).await;
         let nodes = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&[a, b], None, false)
+            .pin_nodes(&[a, b], None)
             .await
             .unwrap();
         *a_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(3));
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         client
-            .pin_nodes(&nodes, None, false)
+            .pin_nodes(&nodes, None)
             .await
             .expect_err("a changed process incarnation must not match the saved manifest");
         let replaced = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&nodes, Some(1), false)
+            .pin_nodes(&nodes, Some(1))
             .await
             .unwrap();
         assert_eq!(
@@ -863,7 +834,7 @@ mod tests {
         *b_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(4));
         MetricsClient::new(Duration::from_secs(1))
             .unwrap()
-            .pin_nodes(&nodes, Some(1), false)
+            .pin_nodes(&nodes, Some(1))
             .await
             .expect_err("a changed survivor incarnation must not be replaced silently");
         a_task.abort();
@@ -871,19 +842,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_identity_requires_explicit_manifest_migration_and_never_matches_a_saved_pin() {
+    async fn missing_identity_cannot_be_pinned_even_for_an_explicit_replacement() {
         let (mut node, _, _, task) = incarnation_node(1, None).await;
-        MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .pin_nodes(&[node.clone()], None, false)
-            .await
-            .expect_err("a legacy identity must require explicit manifest migration");
-        let migrated = MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .pin_nodes(&[node.clone()], None, true)
-            .await
-            .unwrap();
-        assert!(migrated[0].expected_process_incarnation.is_none());
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        for replacement in [None, Some(1)] {
+            client
+                .pin_nodes(&[node.clone()], replacement)
+                .await
+                .expect_err("missing identity cannot authorize a maintenance participant");
+        }
         node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
         MetricsClient::new(Duration::from_secs(1))
             .unwrap()
@@ -916,25 +883,27 @@ mod tests {
         let (node, _, applied, task) = incarnation_node(1, None).await;
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         let election = client.request_self_election(&node, 0, 7).await.unwrap_err();
-        assert!(election.to_string().contains("requires process identity"));
+        assert!(
+            election
+                .downcast_ref::<reqwest::Error>()
+                .unwrap()
+                .is_decode()
+        );
         let quorum = client.confirm_quorum(&node, 0).await.unwrap_err();
-        assert!(quorum.to_string().contains("requires process identity"));
+        assert!(quorum.downcast_ref::<reqwest::Error>().unwrap().is_decode());
         assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 0);
         task.abort();
     }
 
-    #[tokio::test]
-    async fn identity_appearing_after_observation_requires_a_new_client() {
-        let (node, identity, _, task) = incarnation_node(1, None).await;
-        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
-        client.fetch_node(&node).await.unwrap();
-        *identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(1));
-        let error = client.request_self_election(&node, 0, 7).await.unwrap_err();
-        assert!(
-            error.to_string().contains("requires process identity"),
-            "changed identity must stop before HTTP or consensus mutation: {error}"
-        );
-        task.abort();
+    #[test]
+    fn metrics_require_non_null_process_identity() {
+        for body in [
+            r#"{"process_node_id":1}"#,
+            r#"{"process_node_id":1,"process_incarnation":null}"#,
+        ] {
+            let error = serde_json::from_str::<RawMetrics>(body).unwrap_err();
+            assert!(error.is_data());
+        }
     }
 
     #[tokio::test]
@@ -1076,6 +1045,7 @@ mod tests {
                 "/__ursula/metrics",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({
+                        "process_node_id": 1, "process_incarnation": ProcessIncarnation::from_bits(1),
                         "raft_groups": [{"raft_group_id": 0, "node_id": 1}]
                     }))
                 }),
@@ -1124,7 +1094,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             axum::serve(listener, Router::new().route("/__ursula/metrics", axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"raft_groups": [{"raft_group_id": 0, "node_id": 2}]}))
+                axum::Json(serde_json::json!({"process_node_id":2,"process_incarnation":ProcessIncarnation::from_bits(2),"raft_groups": [{"raft_group_id": 0, "node_id": 2}]}))
             }))).await.unwrap();
         });
         let node = NodeInfo {
