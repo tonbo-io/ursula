@@ -923,6 +923,64 @@ fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
     });
 }
 
+/// Both voters that do not initialize restart after the initializer ran
+/// `Initialize` and before its first vote request reaches them. Their durable
+/// genesis vote floor proves that they granted and acknowledged nothing
+/// since, so they keep it and the new group still elects a leader. Dropped,
+/// it would leave them refusing the initializer's votes while their genesis
+/// probe sees it in a later term, and the group would never start.
+#[test]
+fn a_genesis_vote_floor_survives_a_restart_before_the_first_election() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let mut cluster = JournalCluster::unstarted("genesis-floor-restart", WalFsync::Always);
+            // Raft RPCs take two seconds. The bootstrap probes are not delayed,
+            // so the floors and `Initialize` happen before any vote arrives.
+            cluster.policy.set_delay(Some(Duration::from_secs(2)));
+            for node_id in NODES {
+                cluster.start_node(node_id).await;
+            }
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(1);
+            for group in JOURNAL_GROUPS {
+                while !cluster.engines[&(group, 1)]
+                    .raft_handle()
+                    .is_initialized()
+                    .await
+                    .expect("read the initializer's state")
+                {
+                    assert!(
+                        madsim::time::Instant::now() < deadline,
+                        "{context}: group {group} was not initialized"
+                    );
+                    madsim::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            for node_id in [2, 3] {
+                for group in JOURNAL_GROUPS {
+                    let mut store = cluster.wals[&node_id]
+                        .store(RaftGroupId(group))
+                        .expect("a running replica holds its store");
+                    assert_eq!(
+                        store.read_vote().await.expect("read the vote"),
+                        Some(ursula_raft::UrsulaVote::new(0, 0)),
+                        "{context}: node {node_id} group {group} holds only its genesis floor"
+                    );
+                }
+                let wal = cluster.wals[&node_id].clone();
+                wal.clean_shutdown(cluster.stop_node(node_id)).await;
+                cluster.start_node(node_id).await;
+            }
+            cluster.policy.set_delay(None);
+            for group in JOURNAL_GROUPS {
+                wait_leader(&cluster, group, &context).await;
+            }
+            cluster.wait_gates_open(Duration::from_secs(5)).await;
+        });
+    }
+}
+
 #[test]
 fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
     let _guard = sim_test_guard();

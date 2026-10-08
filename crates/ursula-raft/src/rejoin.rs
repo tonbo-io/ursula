@@ -572,11 +572,10 @@ impl GroupRejoin {
             raft_group_id,
             metrics: OnceLock::new(),
             gate: Mutex::new(gate),
-            vote_floor: Mutex::new(
-                store
-                    .vote()
-                    .filter(|vote| vote.leader_id.term > 0 || vote.is_committed()),
-            ),
+            // Any durable vote is a floor, the genesis `(0, 0)` included:
+            // granting a vote or acknowledging a leader persists a higher
+            // vote first, so a durable `(0, 0)` proves neither happened.
+            vote_floor: Mutex::new(store.vote()),
             reverted: Mutex::new(RevertedFollowers::default()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
