@@ -2970,10 +2970,8 @@ async fn cli_surviving_quorum_serves_while_maintenance_waits_for_rebuilt_voter()
             let group = &node.groups[0];
             group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == voters
                 && group.learner_ids.contains(&target.id)
-                && group.maintenance.as_ref().is_some_and(|state| {
-                    !state.membership_joint
-                        && group.last_applied_index >= state.membership_log_index
-                })
+                && !group.maintenance.membership_joint
+                && group.last_applied_index >= group.maintenance.membership_log_index
         }) {
             break;
         }

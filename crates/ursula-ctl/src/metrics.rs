@@ -912,10 +912,10 @@ mod tests {
             let app = Router::new().route(
                 ursula_proto::admin::MAINTENANCE_READINESS_PATH,
                 axum::routing::get(move || async move {
-                    axum::Json(MaintenanceReadiness {
+                    let mut wire = serde_json::to_value(MaintenanceReadiness {
                         ready: true,
                         raft_maintenance: present.then(|| RaftMaintenanceReport {
-                            version,
+                            version: ursula_proto::admin::SchemaVersion,
                             node_id,
                             lag_tolerance: 16,
                             expected_groups: BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
@@ -923,6 +923,11 @@ mod tests {
                             group_issues: BTreeMap::new(),
                         }),
                     })
+                    .unwrap();
+                    if present {
+                        wire["raft_maintenance"]["version"] = serde_json::json!(version);
+                    }
+                    axum::Json(wire)
                 }),
             );
             let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -935,14 +940,20 @@ mod tests {
                 expected_process_incarnation: None,
                 expected_maintenance_fence: None,
             };
-            assert_eq!(
-                MetricsClient::new(Duration::from_secs(1))
-                    .unwrap()
-                    .maintenance_ready(&node)
-                    .await
-                    .unwrap(),
-                expected
-            );
+            let result = MetricsClient::new(Duration::from_secs(1))
+                .unwrap()
+                .maintenance_ready(&node)
+                .await;
+            if version == 2 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_decode)
+                );
+            } else {
+                assert_eq!(result.unwrap(), expected);
+            }
             task.abort();
         }
     }

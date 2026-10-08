@@ -468,8 +468,7 @@ impl RaftMaintenanceReport {
                 RaftMaintenanceIssue::IncompleteVoterSet | RaftMaintenanceIssue::JointMembership
             )
         };
-        self.version == 1
-            && !self.expected_groups.is_empty()
+        !self.expected_groups.is_empty()
             && !self.node_issues.iter().any(local_issue)
             && !self.group_issues.values().flatten().any(local_issue)
     }
@@ -816,6 +815,7 @@ pub const MAINTENANCE_READINESS_PATH: &str = "/__ursula/maintenance/ready";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaintenanceReadiness {
     pub ready: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
     pub raft_maintenance: Option<RaftMaintenanceReport>,
 }
 
@@ -826,7 +826,7 @@ mod serving_readiness_tests {
     #[test]
     fn only_membership_completeness_is_relaxed_for_serving() {
         let mut report = RaftMaintenanceReport {
-            version: 1,
+            version: SchemaVersion,
             node_id: 1,
             lag_tolerance: 16,
             expected_groups: BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
@@ -855,9 +855,6 @@ mod serving_readiness_tests {
             assert!(!report.serving_ready());
         }
         report.group_issues.clear();
-        report.version = 2;
-        assert!(!report.serving_ready());
-        report.version = 1;
         report.expected_groups.clear();
         assert!(!report.serving_ready());
     }
