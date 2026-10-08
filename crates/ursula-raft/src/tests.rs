@@ -428,6 +428,7 @@ async fn build_three_node_cluster(
 /// [`build_three_node_cluster`] with each node advertising `address(node_id)`.
 /// The in-process network delivers Raft RPCs by node id, so only leader
 /// forwarding (gRPC) dials these addresses.
+#[cfg(not(madsim))]
 async fn build_three_node_cluster_at(
     cluster_name: &str,
     policy: Option<InProcessRaftNetworkPolicy>,
