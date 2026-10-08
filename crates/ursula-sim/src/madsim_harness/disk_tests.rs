@@ -21,12 +21,14 @@ use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupEngine;
+use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
 use ursula_raft::RaftWalError;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::WalOpening;
+use ursula_raft::apply_failure::ApplyFault;
 use ursula_raft::wal::diagnostics::CoreJournalError;
 use ursula_raft::wal::diagnostics::GroupLogState;
 use ursula_raft::wal::diagnostics::JournalDisk;
@@ -48,6 +50,8 @@ use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
@@ -372,6 +376,12 @@ pub(super) struct JournalCluster {
     /// Each node's WAL metrics, kept across its restarts.
     pub(super) metrics: BTreeMap<u64, RuntimeMetrics>,
     pub(super) acknowledged: BTreeMap<u32, Vec<u8>>,
+    /// The deterministic bug a group's replicas run, if the nodes start
+    /// faulty code.
+    faulty: Option<(u32, ApplyFault)>,
+    /// Replicas whose startup replay stopped at a committed record, by the
+    /// failing index. They have no engine.
+    replay_stopped: BTreeMap<(u32, u64), u64>,
 }
 
 impl JournalCluster {
@@ -451,6 +461,8 @@ impl JournalCluster {
                 .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
                 .collect(),
             acknowledged: BTreeMap::new(),
+            faulty: None,
+            replay_stopped: BTreeMap::new(),
         }
     }
 
@@ -470,7 +482,12 @@ impl JournalCluster {
             let mut config = (*self.config).clone();
             config.enable_elect =
                 ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
-            let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+            let mut options = RaftGroupEngineOptions::default();
+            options.apply_fault = self
+                .faulty
+                .filter(|(faulty, _)| *faulty == group)
+                .map(|(_, fault)| fault);
+            let started = RaftGroupEngine::new_node(
                 placement,
                 node_id,
                 Arc::new(config),
@@ -479,11 +496,21 @@ impl JournalCluster {
                     .with_policy(self.policy.clone())
                     .with_rejoin(rejoin.clone()),
                 store,
-                None,
-                None,
+                options,
             )
-            .await
-            .expect("start a journal-backed replica");
+            .await;
+            let engine = match started {
+                Ok(engine) => engine,
+                // Faulty code replays a committed poison record: that group
+                // stays stopped and the node's other groups start.
+                Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped { index, .. }))
+                    if self.faulty.is_some() =>
+                {
+                    self.replay_stopped.insert((group, node_id), index);
+                    continue;
+                }
+                Err(error) => panic!("start a journal-backed replica: {error}"),
+            };
             recovery_wiring::wire_recovery(
                 node_id,
                 placement,
@@ -502,11 +529,14 @@ impl JournalCluster {
     pub(super) async fn stop_node(&mut self, node_id: u64) {
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
-            let engine = self
-                .engines
-                .remove(&(group, node_id))
-                .expect("running replica");
-            engine.shutdown().await.expect("stop the replica");
+            match self.engines.remove(&(group, node_id)) {
+                Some(engine) => engine.shutdown().await.expect("stop the replica"),
+                None => {
+                    self.replay_stopped
+                        .remove(&(group, node_id))
+                        .expect("a running replica, or one whose replay stopped");
+                }
+            }
         }
     }
 
@@ -679,21 +709,33 @@ impl JournalCluster {
 
     /// Every acknowledged write is readable from every replica.
     pub(super) async fn verify_reads(&self) {
-        for ((group, node_id), engine) in &self.engines {
-            let expected = &self.acknowledged[group];
+        for group in JOURNAL_GROUPS {
+            self.verify_group_reads(group).await;
+        }
+    }
+
+    /// Every running replica of `group` reads the group's acknowledged
+    /// payloads.
+    pub(super) async fn verify_group_reads(&self, group: u32) {
+        for ((_, node_id), engine) in self
+            .engines
+            .iter()
+            .filter(|((engine_group, _), _)| *engine_group == group)
+        {
+            let expected = &self.acknowledged[&group];
             let mut last = Vec::new();
             for _ in 0..100 {
                 last = engine
                     .sim_read_local_stream(
                         ReadStreamRequest {
-                            stream_id: group_stream(*group),
+                            stream_id: group_stream(group),
                             offset: 0,
                             max_len: expected.len().saturating_add(64),
                             now_ms: 0,
                             leader_only: false,
                             read_index: None,
                         },
-                        group_placement(*group),
+                        group_placement(group),
                     )
                     .await
                     .map(|read| read.payload)
@@ -1391,6 +1433,122 @@ fn clean_shutdown_then_power_loss_reads_strictly_and_loses_nothing() {
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 3).await;
             }
+            cluster.verify_reads().await;
+        });
+    }
+}
+
+const APPLY_POISON_SEEDS: [u64; 3] = [4, 17, 31];
+
+/// A deterministic poison record in group 0 stops every replica that applies
+/// it, and no replica applies past it. Group 1 shares each node's core
+/// journal and keeps serving. A node restarted with the faulty code starts
+/// group 1 and leaves group 0 stopped at the same record. Corrected code then
+/// replays the intact journals on every replica, poison record included.
+#[test]
+fn a_poison_record_isolates_its_group_until_corrected_replay() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("APPLY_POISON_SEEDS", &APPLY_POISON_SEEDS) {
+        run_with_madsim(seed, async move {
+            let mut cluster = JournalCluster::start("apply-poison").await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 3).await;
+            }
+            let leader = cluster.leader(0).await;
+            let last = openraft::rt::WatchReceiver::borrow_watched(
+                &cluster.engines[&(0, leader)].raft_handle().metrics(),
+            )
+            .last_log_index
+            .expect("group 0 holds entries");
+            let poison = last.checked_add(1).expect("next index");
+            let fault = ApplyFault::PanicAfterMutation { index: poison };
+            cluster.faulty = Some((0, fault));
+            for node_id in 1..=3 {
+                cluster.engines[&(0, node_id)]
+                    .inject_apply_fault(fault)
+                    .await
+                    .expect("run the faulty code");
+            }
+            let written = cluster
+                .engines
+                .get_mut(&(0, leader))
+                .expect("group 0 leader")
+                .append(
+                    AppendRequest::from_bytes(group_stream(0), b"poison;".to_vec()),
+                    group_placement(0),
+                    ColdWriteAdmission::default(),
+                )
+                .await;
+            // Committed but stopped before its response: the outcome is
+            // unknown, and corrected code applies the record.
+            assert!(
+                matches!(
+                    written,
+                    Err(GroupEngineError::Infra(GroupInfraError::OutcomeUnknown))
+                ),
+                "seed {seed}: {written:?}"
+            );
+            cluster
+                .acknowledged
+                .entry(0)
+                .or_default()
+                .extend_from_slice(b"poison;");
+
+            // A re-elected leader applies the committed record and stops too.
+            let mut stopped = Vec::new();
+            for _ in 0..200 {
+                stopped = (1..=3)
+                    .filter(|node_id| cluster.stopped_by_storage_error(0, *node_id))
+                    .collect::<Vec<_>>();
+                if stopped.len() >= 2 {
+                    break;
+                }
+                madsim::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(stopped.len() >= 2, "seed {seed}: stopped {stopped:?}");
+            for node_id in 1..=3 {
+                let applied = openraft::rt::WatchReceiver::borrow_watched(
+                    &cluster.engines[&(0, node_id)].raft_handle().metrics(),
+                )
+                .last_applied;
+                assert!(
+                    applied.is_none_or(|applied| applied.index < poison),
+                    "seed {seed}: node {node_id} applied {applied:?} past poison {poison}"
+                );
+            }
+
+            // Group 1 on the same core journals keeps serving.
+            cluster.append(1, 3).await;
+            cluster.verify_group_reads(1).await;
+
+            // A restart with the faulty code keeps the node up.
+            let victim = stopped[0];
+            let wal = cluster.wals[&victim].clone();
+            wal.clean_shutdown(cluster.stop_node(victim)).await;
+            cluster.start_node(victim).await;
+            assert_eq!(
+                cluster.replay_stopped.get(&(0, victim)),
+                Some(&poison),
+                "seed {seed}: node {victim} replays and stops at the same record"
+            );
+            assert!(cluster.engines.contains_key(&(1, victim)));
+            cluster.wait_gates_open(Duration::from_secs(5)).await;
+            cluster.append(1, 2).await;
+            cluster.verify_group_reads(1).await;
+
+            // Corrected code replays every replica's intact journal.
+            cluster.faulty = None;
+            for node_id in 1..=3 {
+                let wal = cluster.wals[&node_id].clone();
+                wal.clean_shutdown(cluster.stop_node(node_id)).await;
+            }
+            for node_id in 1..=3 {
+                cluster.start_node(node_id).await;
+            }
+            assert!(cluster.replay_stopped.is_empty());
+            cluster.wait_gates_open(Duration::from_secs(5)).await;
+            cluster.append(0, 2).await;
+            cluster.append(1, 1).await;
             cluster.verify_reads().await;
         });
     }

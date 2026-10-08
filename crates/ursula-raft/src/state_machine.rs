@@ -445,7 +445,7 @@ const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 pub struct RaftGroupStateMachine {
     pub(crate) apply_stop_signal: Option<Arc<AtomicBool>>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
-    #[cfg(test)]
+    #[cfg(any(test, madsim))]
     pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub(crate) placement: ShardPlacement,
     pub(crate) engine: InMemoryGroupEngine,
@@ -542,7 +542,7 @@ impl RaftGroupStateMachine {
         Self {
             apply_health: Default::default(),
             apply_stop_signal: None,
-            #[cfg(test)]
+            #[cfg(any(test, madsim))]
             apply_fault: None,
             placement,
             engine: match cold_store {
@@ -817,7 +817,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let result = self.engine.apply_committed_write(command, self.placement);
                         // Inject AFTER mutation to prove partial state cannot escape.
-                        #[cfg(test)]
+                        #[cfg(any(test, madsim))]
                         match self.apply_fault {
                             Some(crate::apply_failure::ApplyFault::InvariantAfterMutation {
                                 index,

@@ -124,8 +124,9 @@ use crate::types::UrsulaRaftTypeConfig;
 #[derive(Default)]
 pub struct RaftGroupEngineOptions {
     pub(crate) apply_stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
-    #[cfg(test)]
-    pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
+    /// Faulty code for tests and simulations; production has none.
+    #[cfg(any(test, madsim))]
+    pub apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub metrics: Option<GroupEngineMetrics>,
     pub cold_store: Option<ColdStoreHandle>,
     pub snapshot_store: Option<SharedSnapshotStore>,
@@ -374,7 +375,7 @@ impl RaftGroupEngine {
     {
         let RaftGroupEngineOptions {
             apply_stop_signal,
-            #[cfg(test)]
+            #[cfg(any(test, madsim))]
             apply_fault,
             metrics,
             cold_store,
@@ -397,7 +398,7 @@ impl RaftGroupEngine {
         );
         state_machine.apply_stop_signal = apply_stop_signal;
         state_machine.apply_health = apply_health.clone();
-        #[cfg(test)]
+        #[cfg(any(test, madsim))]
         {
             state_machine.apply_fault = apply_fault;
         }
@@ -636,6 +637,20 @@ impl RaftGroupEngine {
             .with_state_machine(f)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft state-machine access: {err}")))
+    }
+
+    /// Run faulty code from now on, as a deployment of a buggy binary does.
+    #[cfg(any(test, madsim))]
+    pub async fn inject_apply_fault(
+        &self,
+        fault: crate::apply_failure::ApplyFault,
+    ) -> Result<(), GroupEngineError> {
+        self.with_state_machine(move |state| {
+            Box::pin(async move {
+                state.apply_fault = Some(fault);
+            })
+        })
+        .await
     }
 
     /// The live stream's cold-index generation (F14g; 0 when absent).

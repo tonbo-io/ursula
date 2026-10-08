@@ -68,9 +68,11 @@ impl ApplyHealth {
     }
 }
 
-#[cfg(test)]
+/// A deterministic application bug at one committed index, hit after the
+/// command mutated state. Tests and simulations run it as faulty code.
+#[cfg(any(test, madsim))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ApplyFault {
+pub enum ApplyFault {
     PanicAfterMutation { index: u64 },
     InvariantAfterMutation { index: u64 },
 }
