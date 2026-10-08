@@ -222,6 +222,22 @@ impl MetricsClient {
         Ok(pinned)
     }
 
+    pub async fn maintenance_ready(&self, node: &NodeInfo) -> Result<bool> {
+        let url = node
+            .admin_url
+            .join(ursula_proto::admin::MAINTENANCE_READINESS_PATH)?;
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+        let report: ursula_proto::admin::MaintenanceReadiness = response.json().await?;
+        Ok(report.ready
+            && report
+                .raft_maintenance
+                .as_ref()
+                .is_some_and(|report| report.node_id == node.id && report.ready()))
+    }
+
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
         let url = metrics_base_url(node)
             .join("/__ursula/metrics")
@@ -874,6 +890,58 @@ mod tests {
                     .chain()
                     .filter_map(|source| source.downcast_ref::<reqwest::Error>())
                     .any(reqwest::Error::is_decode)
+            );
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_probe_requires_supported_local_complete_evidence() {
+        use std::collections::BTreeMap;
+
+        use ursula_proto::admin::MaintenanceReadiness;
+        use ursula_proto::admin::RaftMaintenanceReport;
+        for (version, node_id, present, expected) in [
+            (1, 1, true, true),
+            (2, 1, true, false),
+            (1, 2, true, false),
+            (1, 1, false, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                ursula_proto::admin::MAINTENANCE_READINESS_PATH,
+                axum::routing::get(move || async move {
+                    axum::Json(MaintenanceReadiness {
+                        ready: true,
+                        raft_maintenance: present.then(|| RaftMaintenanceReport {
+                            version,
+                            node_id,
+                            lag_tolerance: 16,
+                            expected_groups: BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
+                            node_issues: vec![],
+                            group_issues: BTreeMap::new(),
+                        }),
+                    })
+                }),
+            );
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let node = NodeInfo {
+                id: 1,
+                host: address.to_string(),
+                admin_url: format!("http://{address}").parse().unwrap(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            };
+            assert_eq!(
+                MetricsClient::new(Duration::from_secs(1))
+                    .unwrap()
+                    .maintenance_ready(&node)
+                    .await
+                    .unwrap(),
+                expected
             );
             task.abort();
         }

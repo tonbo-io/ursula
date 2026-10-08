@@ -92,7 +92,9 @@ ursulactl wait-ready \
 ```
 
 `wait-ready` succeeds only when every configured node reports the expected Raft
-group count and every group has a leader.
+group count, every group has a leader, and the admin probe
+`GET /__ursula/maintenance/ready` certifies the complete configured voter set.
+The rollout hook uses this same command before allowing another disruption.
 
 ## Access Locally
 
@@ -160,7 +162,7 @@ redirect URL configuration.
 
 If a majority of a group's voters lose their tail at once, the group has no leader and refuses writes, and the gated replicas report it stalled (readiness reason `recovery_stalled`). It resumes only after an operator accepts the loss of writes acknowledged after the last `fsync`, with `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated replicas with the longest logs, naming the `last_log_index` and `current_term` their metrics show. Set `raft.walFsync=always` to acknowledge every batch after `fsync` instead. See the [operations guide](https://ursula.tonbo.io/docs/operations#recovering-after-a-host-crash).
 
-These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Readiness in this source checks the configured group inventory, running replicas, recovery gates, complete uniform voter sets, applied membership and bounded local lag. It does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes. This observation still requires an exclusive maintenance reservation and physical fencing before it can authorize a disruption.
+These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Serving readiness (`/__ursula/ready`) checks the configured group inventory, running local voter replicas, recovery gates, applied membership and bounded local lag. During a voter rebuild, healthy surviving voters remain Service endpoints, while the rebuilding learner stays NotReady. With three pods and the default PDB, that unavailable learner consumes the one allowed disruption. The separate admin maintenance probe additionally requires complete uniform voter sets; `ursulactl wait-ready` and rollout hooks therefore continue to block a second maintenance. It does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes. This observation still requires an exclusive maintenance reservation and physical fencing before it can authorize a disruption.
 
 Reservation stores have one schema, version 1, for Pod replacement, host recovery and candidate restaging. Host inventory is optional data, and publishing it keeps the version. `ursulactl` refuses a store with any other version.
 

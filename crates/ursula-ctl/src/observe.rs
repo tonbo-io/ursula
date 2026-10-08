@@ -93,6 +93,7 @@ fn format_leaders(counts: &BTreeMap<u64, usize>) -> String {
 
 /// Block until every node reports `expected_groups` raft groups and every group
 /// has initialized voter membership plus a leader observed by that node.
+/// The separate maintenance probe must also certify the full configured voter set.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -105,7 +106,17 @@ pub async fn wait_ready(
     loop {
         let snapshot = client.try_fetch_cluster(nodes).await;
         if cluster_ready(&snapshot, nodes.len(), expected_groups, &mut last_summary) {
-            return Ok(snapshot);
+            let mut safe = true;
+            for node in nodes {
+                if !client.maintenance_ready(node).await.unwrap_or(false) {
+                    safe = false;
+                    last_summary = format!("node {} is not safe for maintenance", node.id);
+                    break;
+                }
+            }
+            if safe {
+                return Ok(snapshot);
+            }
         }
         if started.elapsed() >= timeout {
             bail!("cluster not ready after {:?}: {last_summary}", timeout);

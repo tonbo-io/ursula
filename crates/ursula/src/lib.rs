@@ -911,6 +911,10 @@ pub fn admin_router(state: HttpState) -> Router {
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
+            ursula_proto::admin::MAINTENANCE_READINESS_PATH,
+            get(maintenance_readiness),
+        )
+        .route(
             "/__ursula/maintenance/fence/activate",
             post(activate_admin_fence),
         )
@@ -1309,6 +1313,29 @@ async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
 }
 
+async fn maintenance_readiness(State(state): State<HttpState>) -> Response {
+    let raft_maintenance = state.raft_maintenance_report();
+    let ready = !state.admin_fence.is_uncertain()
+        && !state.wal_disk.snapshot().pressure
+        && !state.format_epoch_mismatch.recorded()
+        && (state.raft_registry().is_none()
+            || raft_maintenance
+                .as_ref()
+                .is_some_and(ursula_proto::admin::RaftMaintenanceReport::ready));
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        axum::Json(ursula_proto::admin::MaintenanceReadiness {
+            ready,
+            raft_maintenance,
+        }),
+    )
+        .into_response()
+}
+
 async fn readiness(State(state): State<HttpState>) -> Response {
     let disk = state.wal_disk.snapshot();
     // A node that saw a peer on another format epoch never becomes Ready
@@ -1319,11 +1346,11 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
     let raft_maintenance = state.raft_maintenance_report();
     // Non-Raft dev mode has no static voter role. A registry without its
-    // topology cannot certify a complete maintenance inventory.
+    // topology cannot certify its local replica inventory.
     let raft_ready = state.raft_registry().is_none()
         || raft_maintenance
             .as_ref()
-            .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
+            .is_some_and(ursula_raft::RaftMaintenanceReport::serving_ready);
     let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
     // Groups whose gated replica here got no leader barrier and applied
     // nothing for a while: a majority of their voters may be gated, and they
@@ -1350,7 +1377,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
             } else if !recovery_ready {
                 Some("recovery_gate_closed")
             } else if !raft_ready {
-                Some("raft_maintenance_unready")
+                Some("raft_replica_unready")
             } else {
                 None
             },

@@ -2899,3 +2899,156 @@ fn core_journal_record_bytes(core_dir: &Path) -> u64 {
         })
         .sum()
 }
+
+/// Serving the surviving quorum must not grant permission for another disruption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_surviving_quorum_serves_while_maintenance_waits_for_rebuilt_voter() {
+    use std::collections::BTreeSet;
+
+    use ursula_ctl::MetricsClient;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let directory = tempfile::tempdir().unwrap();
+    let peers: Vec<_> = (1..=3)
+        .map(|id| (id, format!("http://127.0.0.1:{}", free_port())))
+        .collect();
+    let mut nodes = Vec::new();
+    let mut children = Vec::new();
+    for (id, url) in &peers {
+        let path = directory.path().join(format!("node-{id}.toml"));
+        let port = url::Url::parse(url).unwrap().port().unwrap();
+        let admin = write_node_toml(
+            &path,
+            port,
+            *id,
+            1,
+            &peers,
+            true,
+            &node_wal_dir(directory.path(), *id),
+            "memory",
+            None,
+        );
+        nodes.push(ctl_node(*id, admin, url));
+        children.push(spawn_node_with_cluster_config(
+            env!("CARGO_BIN_EXE_ursula"),
+            &path,
+        ));
+    }
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    for (_, url) in &peers {
+        wait_until_ready(&http, url, &mut children).await;
+    }
+    let metrics = MetricsClient::new(Duration::from_secs(3)).unwrap();
+    let ready = ursula_ctl::wait_ready(
+        &metrics,
+        &nodes,
+        1,
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    let leader_id = ready.per_node[0].groups[0].current_leader.unwrap();
+    let leader = nodes.iter().find(|node| node.id == leader_id).unwrap();
+    let target = nodes.iter().find(|node| node.id != leader_id).unwrap();
+    let survivors: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.id != target.id)
+        .cloned()
+        .collect();
+    let voters: BTreeSet<_> = survivors.iter().map(|node| node.id).collect();
+    metrics.change_membership(leader, 0, &voters).await.unwrap();
+    metrics.add_learner(leader, 0, target).await.unwrap();
+
+    let started = std::time::Instant::now();
+    loop {
+        let snapshot = metrics.fetch_cluster(&nodes).await.unwrap();
+        if snapshot.per_node.iter().all(|node| {
+            let group = &node.groups[0];
+            group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == voters
+                && group.learner_ids.contains(&target.id)
+                && group.maintenance.as_ref().is_some_and(|state| {
+                    !state.membership_joint
+                        && group.last_applied_index >= state.membership_log_index
+                })
+        }) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "membership did not converge: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for node in &nodes {
+        let public = node.http_url.as_ref().unwrap();
+        let response = http
+            .get(public.join("/__ursula/ready").unwrap())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            if node.id == target.id {
+                reqwest::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                reqwest::StatusCode::OK
+            },
+            "node {}: {body}",
+            node.id
+        );
+        assert!(!metrics.maintenance_ready(node).await.unwrap());
+    }
+    let public = leader.http_url.as_ref().unwrap();
+    let bucket = public.join("readiness-survivors").unwrap().to_string();
+    put_until_created(&http, &bucket).await;
+    let stream = format!("{bucket}/stream");
+    put_with_body_until_created(&http, &stream, "surviving-quorum").await;
+    read_until_matches(&http, &format!("{stream}?offset=-1"), b"surviving-quorum").await;
+    let next_maintenance = ursula_ctl::wait_ready(
+        &metrics,
+        &survivors,
+        1,
+        Duration::from_millis(150),
+        Duration::from_millis(25),
+    )
+    .await;
+    assert!(
+        next_maintenance.is_err(),
+        "serving readiness must not authorize a second maintenance"
+    );
+    metrics
+        .change_membership(leader, 0, &nodes.iter().map(|node| node.id).collect())
+        .await
+        .unwrap();
+    ursula_ctl::wait_ready(
+        &metrics,
+        &nodes,
+        1,
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap();
+    for node in &nodes {
+        assert_eq!(
+            http.get(
+                node.http_url
+                    .as_ref()
+                    .unwrap()
+                    .join("/__ursula/ready")
+                    .unwrap()
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            reqwest::StatusCode::OK
+        );
+    }
+}
