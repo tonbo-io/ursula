@@ -82,7 +82,8 @@ See [Recovering after a host crash](/docs/operations#recovering-after-a-host-cra
 ### Known issues
 
 - [#410](https://github.com/tonbo-io/ursula/issues/410): `ursulactl pin-incarnations` still takes `--allow-legacy-incarnation`, a 0.6.2 migration switch that no 0.7 server needs. It will be removed.
-- [#411](https://github.com/tonbo-io/ursula/issues/411): an adversarial review of recovery left residual risks open, mostly liveness. For example, a group created just before a full-cluster power loss under `never` can stay without a leader even after `accept-unsynced-loss`.
+- [#411](https://github.com/tonbo-io/ursula/issues/411): an adversarial review of recovery left residual risks open, mostly liveness. For example, a node that loses its run state file can restart a recovery epoch that its cores already verified, and a failure to record the `poisoned` status is not yet covered by tests.
+- [#454](https://github.com/tonbo-io/ursula/issues/454): after a voter host loses power, `ursulagw` keeps choosing the dead upstream at random until its pod returns. Each such attempt waits for the 5 second connect timeout, so a stream can fail through the gateway for about a minute although the cluster elected new leaders within seconds. Clients that connect to the servers directly are not affected.
 
 ## 0.6.2
 
