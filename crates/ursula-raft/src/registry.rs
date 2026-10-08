@@ -842,6 +842,7 @@ impl RaftGroupHandleRegistry {
                 snapshot: metrics.snapshot.map(log_progress_snapshot),
                 purged: metrics.purged.map(log_progress_snapshot),
                 voter_ids: membership.voter_ids().collect(),
+                voter_configurations: membership.get_joint_config().clone(),
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
                     running: metrics.running_state.is_ok()

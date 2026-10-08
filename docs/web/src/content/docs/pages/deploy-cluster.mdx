@@ -61,7 +61,7 @@ helm test ursula --namespace ursula
 helm test ursula
 ```
 
-The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`. It succeeds only when every node reports the expected Raft group count and every group has a leader. To query a node directly:
+The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`. It requires the expected group inventory and leaders, a complete uniform voter set in each maintenance report, no uncertain maintenance fence, and a 200 response from every node's `/__ursula/ready` probe. To query a node directly:
 
 ```bash
 kubectl port-forward svc/ursula 4437:4437

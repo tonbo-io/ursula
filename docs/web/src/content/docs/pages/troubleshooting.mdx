@@ -31,6 +31,19 @@ node, and after a Raft protocol mismatch with a peer
 Prometheus `/metrics`, or `/cluster/status`; use the JSON snapshot for detailed
 diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
 
+### Serving during a replica rebuild
+
+`raft_replica_unready` means local Raft participation is not safe for serving.
+Inspect `raft_maintenance.group_issues` for `local_replica_not_voter`, missing
+membership, unapplied entries, or apply lag. A wiped replica stays 503 while
+its recovery gate is closed and while it is a learner. Healthy surviving
+voters can return 200 during the repair. A voter leaving a joint membership
+also stays unready once any configuration excludes it.
+
+A 200 response does not certify full redundancy. Keep maintenance blocked until
+`ursulactl wait-ready` succeeds. Alert separately on incomplete voter sets in
+the maintenance report, as described in [Observability](/docs/observability).
+
 ## Startup failures
 
 ### WAL topology mismatch or missing topology

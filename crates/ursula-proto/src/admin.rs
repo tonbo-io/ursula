@@ -437,6 +437,7 @@ pub enum RaftMaintenanceIssue {
     StoppedForOperator,
     JointMembership,
     IncompleteVoterSet,
+    LocalReplicaNotVoter,
     MembershipNotApplied,
     LeaderUnknown,
     LeaderOutsideVoters,
@@ -459,6 +460,19 @@ pub struct RaftMaintenanceReport {
 }
 
 impl RaftMaintenanceReport {
+    /// Local serving eligibility; maintenance additionally requires the full voter set.
+    pub fn serving_ready(&self) -> bool {
+        let local_issue = |issue: &RaftMaintenanceIssue| {
+            !matches!(
+                issue,
+                RaftMaintenanceIssue::IncompleteVoterSet | RaftMaintenanceIssue::JointMembership
+            )
+        };
+        !self.expected_groups.is_empty()
+            && !self.node_issues.iter().any(local_issue)
+            && !self.group_issues.values().flatten().any(local_issue)
+    }
+
     pub fn ready(&self) -> bool {
         !self.expected_groups.is_empty()
             && self.node_issues.is_empty()
@@ -792,5 +806,107 @@ mod metrics_contract_tests {
                 .unwrap_err()
                 .is_data()
         );
+    }
+}
+
+/// Local serving health, distinct from complete maintenance redundancy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingReadinessReason {
+    FormatEpochMismatch,
+    WalDiskPressure,
+    RecoveryStalled,
+    RecoveryGateClosed,
+    RaftReplicaUnready,
+    /// A reason a newer server of the same minor version reports that this
+    /// build does not know. The response status still decides readiness.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServingReadiness {
+    pub ready: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reason: Option<ServingReadinessReason>,
+    pub format_epoch_mismatch: bool,
+    pub recovery_barriers_ready: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub raft_maintenance: Option<RaftMaintenanceReport>,
+    pub recovery_stalled_groups: Vec<u32>,
+    pub wal_disk_pressure: bool,
+    pub wal_available_bytes: u64,
+    pub wal_min_available_bytes: u64,
+    pub wal_resume_available_bytes: u64,
+    pub wal_disk_stat_errors: u64,
+}
+
+#[cfg(test)]
+mod serving_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn readiness_reasons_keep_their_wire_names_and_unknown_reasons_decode() {
+        for (reason, name) in [
+            (
+                ServingReadinessReason::FormatEpochMismatch,
+                "format_epoch_mismatch",
+            ),
+            (ServingReadinessReason::WalDiskPressure, "wal_disk_pressure"),
+            (ServingReadinessReason::RecoveryStalled, "recovery_stalled"),
+            (
+                ServingReadinessReason::RecoveryGateClosed,
+                "recovery_gate_closed",
+            ),
+            (
+                ServingReadinessReason::RaftReplicaUnready,
+                "raft_replica_unready",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&reason).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<ServingReadinessReason>(name.into()).unwrap(),
+                reason
+            );
+        }
+        let newer: ServingReadinessReason =
+            serde_json::from_str("\"reason_from_a_newer_server\"").unwrap();
+        assert_eq!(newer, ServingReadinessReason::Unknown);
+    }
+
+    #[test]
+    fn only_membership_completeness_is_relaxed_for_serving() {
+        let mut report = RaftMaintenanceReport {
+            version: SchemaVersion,
+            node_id: 1,
+            lag_tolerance: 16,
+            expected_groups: BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
+            node_issues: vec![],
+            group_issues: BTreeMap::new(),
+        };
+        for issue in [
+            RaftMaintenanceIssue::IncompleteVoterSet,
+            RaftMaintenanceIssue::JointMembership,
+        ] {
+            report.group_issues.insert(0, vec![issue]);
+            assert!(report.serving_ready());
+            assert!(!report.ready());
+        }
+        for issue in [
+            RaftMaintenanceIssue::LocalReplicaNotVoter,
+            RaftMaintenanceIssue::RecoveryBarrier,
+            RaftMaintenanceIssue::RaftStopped,
+            RaftMaintenanceIssue::ApplyLag,
+            RaftMaintenanceIssue::MembershipNotApplied,
+            RaftMaintenanceIssue::MissingGroup,
+            RaftMaintenanceIssue::LeaderUnknown,
+            RaftMaintenanceIssue::LeaderOutsideVoters,
+        ] {
+            report.group_issues.insert(0, vec![issue]);
+            assert!(!report.serving_ready());
+        }
+        report.group_issues.clear();
+        report.expected_groups.clear();
+        assert!(!report.serving_ready());
     }
 }

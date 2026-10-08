@@ -24,8 +24,13 @@ histograms, per-group leader and `last_applied`, hot/cold bytes, cold-flush
 backlog, WAL physical/reclaim/recovery work, WAL disk-pressure admission, HTTP
 status counters, live-read watchers, and cold-write admission state. Start here
 when triaging slowness, lag, or `503`s. `GET /__ursula/ready` provides the
-process-level readiness signal; `ursulactl status` is a friendlier read of the
-leadership-related fields across the whole cluster.
+local serving signal with a typed `reason` on refusal, on the client and admin
+planes alike. Healthy surviving voters
+can serve during a rebuild while the learner remains unready. Maintenance also
+requires a complete `raft_maintenance` report and certain maintenance authority
+from metrics. `ursulactl wait-ready` checks both the metrics and this existing
+readiness endpoint. `ursulactl status` presents leadership fields across the
+cluster.
 
 ## Admin endpoints
 

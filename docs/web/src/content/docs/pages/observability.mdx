@@ -109,6 +109,18 @@ Two surfaces expose the same counters:
 - **JSON**: `GET /__ursula/metrics` returns the full per-core/per-group
   snapshot for quick inspection and is what `ursulactl status` reads.
 
+For redundancy alerts, inspect the JSON metric `raft_maintenance.group_issues`.
+Alert on `incomplete_voter_set` or `joint_membership`, and treat a missing
+maintenance report as unavailable evidence. Also alert on nonempty
+`raft_maintenance.node_issues`. These fields remain strict when healthy
+survivors return 200 from `/__ursula/ready` during a replica rebuild.
+They are JSON report fields, not new OTLP instrument names.
+
+```bash
+curl --fail http://NODE:4437/__ursula/metrics | jq '
+  .raft_maintenance | {node_issues, group_issues}'
+```
+
 Metrics are gathered on the hot path with lock-free per-core counters. The OTLP
 layer is an *export-time bridge*: it reads a snapshot at the collection
 interval rather than calling the metrics SDK per record, so enabling export

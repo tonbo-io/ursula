@@ -85,6 +85,7 @@ pub struct RaftGroupMetricsSnapshot {
     pub snapshot: Option<RaftLogProgressSnapshot>,
     pub purged: Option<RaftLogProgressSnapshot>,
     pub voter_ids: Vec<u64>,
+    pub voter_configurations: Vec<std::collections::BTreeSet<u64>>,
     pub learner_ids: Vec<u64>,
     /// Process-local participation and effective-membership status. Missing
     /// fields deserialize closed; an old metrics record is not a health proof.

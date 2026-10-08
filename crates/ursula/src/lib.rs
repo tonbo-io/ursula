@@ -892,22 +892,23 @@ pub fn router_with_http_state(state: HttpState) -> Router {
 }
 
 /// Admin-plane routes: the mutating operator surface (raft group operations,
-/// maintenance drain, cold-flush trigger, bucket purge) plus read-only metrics
-/// and usage so operator tooling works over a single tunnel. Production binds this to
+/// maintenance drain, cold-flush trigger, bucket purge) plus read-only metrics,
+/// readiness and usage so operator tooling works over a single tunnel. Production binds this to
 /// `server.admin_listen` (loopback by default) — nodes expose no
 /// cluster-mutation endpoints on the client or cluster planes.
 pub fn admin_router(state: HttpState) -> Router {
     admin_ops_router(state.clone()).merge(
         Router::new()
             .route("/__ursula/metrics", get(metrics))
+            .route(READINESS_PATH, get(readiness))
             .route("/__ursula/usage", get(bucket_usage))
             .with_state(state),
     )
 }
 
-/// The mutating admin routes without the metrics and usage aliases. The
-/// single-router convenience mergers use this directly because the client
-/// plane already serves `/__ursula/metrics` and `/__ursula/usage`.
+/// The mutating admin routes without the read-only aliases. The single-router
+/// convenience mergers use this directly because the client plane already
+/// serves `/__ursula/metrics`, `/__ursula/ready` and `/__ursula/usage`.
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
@@ -1319,11 +1320,11 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
     let raft_maintenance = state.raft_maintenance_report();
     // Non-Raft dev mode has no static voter role. A registry without its
-    // topology cannot certify a complete maintenance inventory.
+    // topology cannot certify its local replica inventory.
     let raft_ready = state.raft_registry().is_none()
         || raft_maintenance
             .as_ref()
-            .is_some_and(ursula_raft::RaftMaintenanceReport::ready);
+            .is_some_and(ursula_raft::RaftMaintenanceReport::serving_ready);
     let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
     // Groups whose gated replica here got no leader barrier and applied
     // nothing for a while: a majority of their voters may be gated, and they
@@ -1337,35 +1338,36 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    json_response(
+    use ursula_proto::admin::ServingReadinessReason as Reason;
+    (
         status,
-        serde_json::json!({
-            "ready": ready,
-            "reason": if format_epoch_mismatch {
-                Some("format_epoch_mismatch")
+        axum::Json(ursula_proto::admin::ServingReadiness {
+            ready,
+            reason: if format_epoch_mismatch {
+                Some(Reason::FormatEpochMismatch)
             } else if disk.pressure {
-                Some("wal_disk_pressure")
+                Some(Reason::WalDiskPressure)
             } else if !stalled_groups.is_empty() {
-                Some("recovery_stalled")
+                Some(Reason::RecoveryStalled)
             } else if !recovery_ready {
-                Some("recovery_gate_closed")
+                Some(Reason::RecoveryGateClosed)
             } else if !raft_ready {
-                Some("raft_maintenance_unready")
+                Some(Reason::RaftReplicaUnready)
             } else {
                 None
             },
-            "format_epoch_mismatch": format_epoch_mismatch,
-            "recovery_barriers_ready": recovery_ready,
-            "raft_maintenance": raft_maintenance,
-            "recovery_stalled_groups": stalled_groups,
-            "wal_disk_pressure": disk.pressure,
-            "wal_available_bytes": disk.available_bytes,
-            "wal_min_available_bytes": disk.min_available_bytes,
-            "wal_resume_available_bytes": disk.resume_available_bytes,
-            "wal_disk_stat_errors": disk.stat_errors,
-        })
-        .to_string(),
+            format_epoch_mismatch,
+            recovery_barriers_ready: recovery_ready,
+            raft_maintenance,
+            recovery_stalled_groups: stalled_groups,
+            wal_disk_pressure: disk.pressure,
+            wal_available_bytes: disk.available_bytes,
+            wal_min_available_bytes: disk.min_available_bytes,
+            wal_resume_available_bytes: disk.resume_available_bytes,
+            wal_disk_stat_errors: disk.stat_errors,
+        }),
     )
+        .into_response()
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
