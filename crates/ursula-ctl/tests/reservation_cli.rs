@@ -233,9 +233,9 @@ fn run_host_cli(interrupt_candidate: bool) {
         )
         .unwrap();
     }
-    // A saved v3 proof cannot be interpreted as the current structural proof.
+    // An unsupported proof schema cannot produce a mutation request.
     let mut legacy = serde_json::to_value(&proof).unwrap();
-    legacy["verification"]["version"] = json!(3);
+    legacy["verification"]["version"] = json!(2);
     let error = serde_json::from_value::<PrefixObservation>(legacy.clone()).unwrap_err();
     assert!(error.is_data());
     file(directory.path(), "legacy-observation", &legacy);
