@@ -317,7 +317,7 @@ impl Gateway {
         match self.forward(&upstream, &parts, body_bytes, tail).await {
             Ok(response) => response,
             Err(e) => {
-                error!(error = %e, "gateway request failed");
+                error!(error = ?e, "gateway request failed");
                 e.into_response()
             }
         }
@@ -446,9 +446,13 @@ impl Gateway {
             .map(|pq| pq.as_str())
             .unwrap_or("/");
         let target_url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
+        let pin_key = upstream_pin_key(&parts.uri, self.shard_map.as_ref());
 
         let redirect_started_at = Instant::now();
-        let upstream_resp = self.send_request(&target_url, parts, body.clone()).await?;
+        let upstream_resp = self
+            .send_request(upstream, &target_url, parts, body.clone())
+            .await
+            .inspect_err(|_| self.forget_failed_upstream(pin_key.as_deref(), upstream))?;
 
         // Raft leadership redirect: follow internally for all methods because
         // the body has been buffered and the client cannot do better than
@@ -463,7 +467,7 @@ impl Gateway {
                 self.metrics
                     .leader_redirects
                     .fetch_add(1, Ordering::Relaxed);
-                if let Some(key) = upstream_pin_key(&parts.uri, self.shard_map.as_ref()) {
+                if let Some(key) = pin_key.clone() {
                     self.remember_leader(key, leader_upstream.to_owned());
                 }
                 // Drop the follower response; it has no meaningful body.
@@ -474,7 +478,12 @@ impl Gateway {
                     leader_upstream.trim_end_matches('/'),
                     path_and_query
                 );
-                let leader_resp = self.send_request(&leader_target, parts, body).await?;
+                let leader_resp = self
+                    .send_request(leader_upstream, &leader_target, parts, body)
+                    .await
+                    .inspect_err(|_| {
+                        self.forget_failed_upstream(pin_key.as_deref(), leader_upstream);
+                    })?;
                 self.metrics.leader_redirect_ns.fetch_add(
                     u64::try_from(redirect_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
@@ -491,9 +500,9 @@ impl Gateway {
         // fresh random/redirect lookup.
         if upstream_resp.status() == StatusCode::SERVICE_UNAVAILABLE
             && upstream_resp.headers().contains_key(RETRY_AFTER)
-            && let Some(key) = upstream_pin_key(&parts.uri, self.shard_map.as_ref())
+            && let Some(key) = &pin_key
         {
-            self.forget_leader_if_matches(&key, upstream);
+            self.forget_leader_if_matches(key, upstream);
         }
 
         Self::build_response(upstream_resp, tail)
@@ -502,14 +511,16 @@ impl Gateway {
     /// Covers only response headers so SSE bodies stay open.
     async fn send_request(
         &self,
+        upstream: &str,
         url: &str,
         parts: &axum::http::request::Parts,
         body: bytes::Bytes,
     ) -> Result<reqwest::Response, GatewayError> {
         debug!(method = %parts.method, url = %url, "sending upstream request");
 
+        let timeout = self.response_header_timeout_for_url(url);
         tokio::time::timeout(
-            self.response_header_timeout_for_url(url),
+            timeout,
             self.client
                 .request(parts.method.clone(), url)
                 .headers(copy_forwarded_headers(&parts.headers, true))
@@ -517,8 +528,32 @@ impl Gateway {
                 .send(),
         )
         .await
-        .map_err(|e| GatewayError::Upstream(format!("upstream response header timeout: {e}")))?
-        .map_err(|e| GatewayError::Upstream(e.to_string()))
+        .map_err(|_elapsed| GatewayError::UpstreamTimeout {
+            upstream: upstream.to_owned(),
+            timeout,
+        })?
+        .map_err(|source| {
+            if source.is_connect() {
+                GatewayError::UpstreamUnreachable {
+                    upstream: upstream.to_owned(),
+                    source,
+                }
+            } else {
+                GatewayError::Upstream {
+                    upstream: upstream.to_owned(),
+                    source,
+                }
+            }
+        })
+    }
+
+    /// A cached route whose upstream failed at the transport (down, gone, or
+    /// silent) is dropped, so the next request picks an upstream afresh and
+    /// learns the current leader instead of failing on the same node.
+    fn forget_failed_upstream(&self, pin_key: Option<&str>, upstream: &str) {
+        if let Some(key) = pin_key {
+            self.forget_leader_if_matches(key, upstream);
+        }
     }
 
     fn response_header_timeout_for_url(&self, url: &str) -> Duration {
@@ -1014,16 +1049,50 @@ fn is_hop_by_hop_header(key: &str, connection_tokens: &[String]) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
-    #[error("upstream request failed: {0}")]
-    Upstream(String),
+    /// No connection to the upstream: the request was never sent.
+    #[error("upstream {upstream} is unreachable")]
+    UpstreamUnreachable {
+        upstream: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// No response headers in time. The request may have reached the
+    /// upstream.
+    #[error("upstream {upstream} sent no response headers within {timeout:?}")]
+    UpstreamTimeout { upstream: String, timeout: Duration },
+    /// The exchange failed after the request may have reached the upstream.
+    #[error("upstream request to {upstream} failed")]
+    Upstream {
+        upstream: String,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("failed to build response: {0}")]
     ResponseBuild(String),
 }
 
 impl GatewayError {
+    /// The client's answer. Only an unreachable upstream is safe to retry
+    /// whatever the method (503 with `Retry-After`, as Ursula answers while
+    /// a group has no reachable leader): the request was never sent. The
+    /// bodies name no internal address.
     fn into_response(self) -> AxumResponse {
         match self {
-            Self::Upstream(_) | Self::ResponseBuild(_) => StatusCode::BAD_GATEWAY.into_response(),
+            Self::UpstreamUnreachable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(RETRY_AFTER, HeaderValue::from_static("1"))],
+                "upstream unreachable; retry",
+            )
+                .into_response(),
+            Self::UpstreamTimeout { .. } => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream sent no response in time",
+            )
+                .into_response(),
+            Self::Upstream { .. } => {
+                (StatusCode::BAD_GATEWAY, "upstream request failed").into_response()
+            }
+            Self::ResponseBuild(_) => StatusCode::BAD_GATEWAY.into_response(),
         }
     }
 }

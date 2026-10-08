@@ -29,6 +29,8 @@
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
 //!   mismatch record readiness reads.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
+//! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
+//!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
 //!   the per-group log gauges the snapshot driver reads.
 //! - [`snapshot_references`]: prepared external-pointer pins and recoverable
@@ -60,6 +62,7 @@ mod in_process;
 mod log_store;
 mod maintenance;
 mod meta;
+mod peer_channel;
 mod read_index;
 mod recovery_transport;
 mod registry;
