@@ -18,6 +18,8 @@ use std::sync::atomic::Ordering;
 use libsqlite3_sys as ffi;
 
 use crate::attach::attach;
+use crate::auth::set_token;
+use crate::error::Error;
 use crate::host::API;
 use crate::host::OK;
 use crate::host::UNIX;
@@ -133,6 +135,20 @@ unsafe extern "C" fn fn_stats(
     unsafe { result(ctx, "ursula_stats", stats(&path)) };
 }
 
+/// `ursula_set_token(token)`: the bearer token every request carries from now on; NULL or `''` goes
+/// back to `URSULA_VFS_TOKEN_FILE`.
+unsafe extern "C" fn fn_set_token(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let token = unsafe { arg(argc, argv, 0) };
+    set_token(Some(&token));
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_set_token", Ok::<_, Error>(String::new())) };
+}
+
 /// Registers the "ursula" VFS over "unix" as the default (once per process) and the SQL functions
 /// on `db`.
 ///
@@ -161,10 +177,11 @@ pub unsafe extern "C" fn sqlite3_extension_init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 3] = [
+    let fns: [(&CStr, c_int, SqlFn); 4] = [
         (c"ursula_attach", 2, fn_attach),
         (c"ursula_status", 1, fn_status),
         (c"ursula_stats", 1, fn_stats),
+        (c"ursula_set_token", 1, fn_set_token),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the

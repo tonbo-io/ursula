@@ -38,6 +38,16 @@ export function attach(file: string, streamUrl: string): StreamOffset {
 }
 
 /**
+ * Sets the bearer token every request of the extension carries from now on, process-wide (for an
+ * endpoint behind `ursula gateway --auth-*`). `null` goes back to the file named by
+ * `URSULA_VFS_TOKEN_FILE`, which is read again whenever it changes. A request whose token is
+ * refused (401) is retried, with the token read again, within the retry budget.
+ */
+export function setToken(token: string | null): void {
+	loadUrsulaVfs().prepare("SELECT ursula_set_token(?)").get(token ?? "");
+}
+
+/**
  * A stream offset as the server wrote it (`Stream-Next-Offset`): opaque. Compare two offsets of one
  * stream only as strings (lexicographically, e.g. `a < b`); never parse or do arithmetic on them.
  * `"-1"` is the beginning of the stream, and stands for "none" where an offset may be absent.

@@ -151,7 +151,7 @@ it("(j) a missing stream is not recreated under a file that holds data", async (
 	expect((await child.exited).code).toBe(0);
 	expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
 	const [db, sidecar] = [readFileSync(file), readFileSync(`${file}-ursula`)];
-	expect(() => attach(file, url)).toThrow(/is missing and .* holds data/);
+	expect(() => attach(file, url)).toThrow(/is missing .* holds data/);
 	expect((await fetch(url, { method: "HEAD" })).status).toBe(404);
 	expect(readFileSync(file).equals(db)).toBe(true);
 	expect(readFileSync(`${file}-ursula`).equals(sidecar)).toBe(true);

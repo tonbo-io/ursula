@@ -21,11 +21,12 @@
 //!   `Producer-Seq` per append; commits also carry `Stream-Seq`, see `stream_seq`): an append
 //!   whose outcome is unknown is retried with the same sequence until the server answers (a
 //!   duplicate is acknowledged without being applied twice);
-//!   403 means another owner claimed the stream. Every request after attach's first `HEAD` carries
-//!   that `HEAD`'s `Stream-Incarnation` as a precondition, which the server checks atomically with
-//!   the request (a write at Raft apply): nothing of an owner reaches a stream deleted and
-//!   recreated at its path, and the server's 412 fences and poisons the owner (an attach that
-//!   meets one rebuilds against the new stream; see the design doc, §6).
+//!   a 403 with `Producer-Epoch` means another owner claimed the stream (an authorizer's 401 or
+//!   403 is a refused token, never a fence; see `auth`). Every request after attach's first
+//!   `HEAD` carries that `HEAD`'s `Stream-Incarnation` as a precondition, which the server checks
+//!   atomically with the request (a write at Raft apply): nothing of an owner reaches a stream
+//!   deleted and recreated at its path, and the server's 412 fences and poisons the owner (an
+//!   attach that meets one rebuilds against the new stream; see the design doc, §6).
 //! * WAL writes of an attached database go to a per-database overlay (reads and the file size see
 //!   it). The write of the commit frame's page data (the frame whose header carries a non-zero
 //!   "db size after commit") is the commit point: the transaction's final page images become one
@@ -75,6 +76,7 @@
 //! - [`frame`]: the stream's frames (commits and claims).
 //! - [`snapshot`]: snapshot bodies.
 //! - `attach`: `ursula_attach`, from the local files' trust decision to the bound attachment.
+//! - `auth`: the bearer token every request carries.
 //! - `claim`: claiming a stream (fencing earlier owners) and re-claiming an expired producer.
 //! - `client`: the stream over blocking HTTP, with the retries.
 //! - `config`: settings and test hooks from the environment.
@@ -89,6 +91,7 @@
 //! - `wal`: the local WAL's format, recovery scan and fold.
 
 mod attach;
+mod auth;
 mod claim;
 mod client;
 mod config;

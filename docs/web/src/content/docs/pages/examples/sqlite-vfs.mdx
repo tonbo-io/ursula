@@ -57,7 +57,27 @@ console.log(status("/data/app.db"));
 // { offset, epoch, poisoned, fenced, reason, snapshot, retained, local, installed }
 ```
 
-From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path)` and `ursula_stats(path)`. Offsets (`attach`'s result, and `offset`, `snapshot`, `retained`, `local` and `installed`) are the server's [opaque offset](/docs/concepts/offsets) strings: compare two of the same stream as strings, never as numbers. `"-1"` means none (no snapshot, no retention, a file rebuilt from nothing).
+From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path)`, `ursula_stats(path)` and `ursula_set_token(token)`. Offsets (`attach`'s result, and `offset`, `snapshot`, `retained`, `local` and `installed`) are the server's [opaque offset](/docs/concepts/offsets) strings: compare two of the same stream as strings, never as numbers. `"-1"` means none (no snapshot, no retention, a file rebuilt from nothing).
+
+## TLS and credentials
+
+`https://` stream URLs work with the certificate authorities bundled with the extension (Mozilla's). For a private CA, point `URSULA_VFS_CA_FILE` at a PEM bundle: the extension then trusts only the CAs in it.
+
+Behind `ursula gateway` with access control (see [Security](/docs/security)), every request needs a bearer token. Name a file that holds it, and the extension reads it again whenever it changes (a Kubernetes projected token, or a file a sidecar refreshes):
+
+```bash
+export URSULA_VFS_TOKEN_FILE=/var/run/secrets/ursula/token
+```
+
+Or set it from the application. It takes precedence over the file until you set `null`:
+
+```ts
+import { setToken } from "@tonbo/sqlite-ursula";
+
+setToken(accessToken);
+```
+
+The token is process-wide. A request whose token is refused (`401`) is sent again, with the token read again, within the retry budget (`URSULA_VFS_RETRY_MS`). A commit still refused then fails, and the file must be attached again, as after any failed commit. A `403` from the gateway's authorizer fails the request at once. Neither marks the owner fenced. The gateway answers `404` for a private bucket to a client without a token, so attach then reports the stream as missing.
 
 ## Pi Durable
 
