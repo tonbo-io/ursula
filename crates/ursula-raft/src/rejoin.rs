@@ -859,29 +859,41 @@ impl GroupRejoin {
                 floor.is_some(),
             ));
         }
-        let screen = if floor.is_some_and(|floor| request.vote < floor) || floor.is_none() {
-            VoteScreen::Refuse
-        } else {
-            self.gate().screen(candidate_index)
-        };
-        match screen {
-            VoteScreen::Pass => None,
-            VoteScreen::Refuse => {
-                tracing::info!(
+        let last_applied = metrics.last_applied.as_ref().map(|log_id| log_id.index());
+        match floor {
+            None => tracing::info!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                candidate,
+                "recovery gate: refusing a vote until a quorum proves this replica's lost vote"
+            ),
+            // Any replica, gated or not, refuses a candidate whose vote is
+            // older than its own; the answer carries the newer vote.
+            Some(floor) if request.vote < floor => tracing::debug!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                candidate,
+                candidate_vote = %request.vote,
+                vote = %floor,
+                "refusing a vote request older than this replica's vote"
+            ),
+            Some(_) => match self.gate().screen(candidate_index) {
+                VoteScreen::Pass => return None,
+                VoteScreen::Refuse => tracing::info!(
                     node_id = self.node_id,
                     raft_group_id = self.raft_group_id.0,
                     candidate,
                     candidate_last_log_index = ?candidate_index,
-                    last_applied = ?metrics.last_applied.as_ref().map(|log_id| log_id.index()),
+                    last_applied = ?last_applied,
                     "recovery gate: refusing a vote until this replica has caught up"
-                );
-                Some(UrsulaVoteResponse::new(
-                    floor.unwrap_or(metrics.vote),
-                    self.last_log_id().or(metrics.last_applied),
-                    false,
-                ))
-            }
+                ),
+            },
         }
+        Some(UrsulaVoteResponse::new(
+            floor.unwrap_or(metrics.vote),
+            self.last_log_id().or(metrics.last_applied),
+            false,
+        ))
     }
 
     /// The last entry this replica holds, which a refusal reports so that a
