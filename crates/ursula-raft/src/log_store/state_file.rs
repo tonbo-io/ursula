@@ -14,7 +14,8 @@
 //!           | payload (MessagePack) | u32 CRC32 of every byte before it
 //! ```
 //!
-//! The version is the format epoch, as in the journal header.
+//! Core/run-state versions follow the journal. The root topology has its own
+//! data-only (3) or explicitly managed (4) local version; S3/wire epochs do not change.
 
 use std::io;
 use std::path::Path;
@@ -44,14 +45,24 @@ pub enum StateFileKind {
     RunState,
     /// The immutable routing configuration of this WAL root.
     Topology,
+    /// The explicit managed namespace of the WAL root; unrelated to S3/wire epochs.
+    ManagedTopology,
 }
 
 impl StateFileKind {
+    fn version(self) -> u16 {
+        match self {
+            Self::Topology => 3,
+            Self::ManagedTopology => 4,
+            Self::CoreMetadata | Self::RunState => JOURNAL_VERSION,
+        }
+    }
+
     fn magic(self) -> [u8; 8] {
         match self {
             Self::CoreMetadata => *b"URSWMETA",
             Self::RunState => *b"URSWRUN\0",
-            Self::Topology => *b"URSWTOPO",
+            Self::Topology | Self::ManagedTopology => *b"URSWTOPO",
         }
     }
 }
@@ -81,10 +92,7 @@ pub enum StateFileError {
     },
     #[error("'{}' is not an Ursula WAL {kind:?} file", .path.display())]
     WrongKind { path: PathBuf, kind: StateFileKind },
-    #[error("{}", ursula_stream::format_epoch_refusal(
-        &format!("WAL state file '{}'", .path.display()),
-        &format!("uses Ursula WAL version {version}"),
-    ))]
+    #[error("WAL state file '{}' uses unsupported local version {version}", .path.display())]
     UnsupportedVersion { path: PathBuf, version: u16 },
     #[error("WAL state file '{}' is corrupt: {defect}", .path.display())]
     Corrupt {
@@ -109,7 +117,7 @@ pub(crate) fn encode<T: Serialize>(kind: StateFileKind, value: &T) -> Vec<u8> {
             .saturating_add(CHECKSUM_LEN),
     );
     bytes.extend_from_slice(&kind.magic());
-    bytes.extend_from_slice(&JOURNAL_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&kind.version().to_le_bytes());
     bytes.extend_from_slice(&[0; 2]);
     bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(&payload);
@@ -141,7 +149,7 @@ pub(crate) fn decode<T: DeserializeOwned>(
         .ok_or_else(|| corrupt(StateFileDefect::Truncated))?;
     let [_, _, _, _, _, _, _, _, v0, v1, r0, r1, l0, l1, l2, l3] = *header;
     let version = u16::from_le_bytes([v0, v1]);
-    if version != JOURNAL_VERSION {
+    if version != kind.version() {
         return Err(StateFileError::UnsupportedVersion {
             path: path.to_owned(),
             version,

@@ -87,6 +87,28 @@ impl RaftWal {
         })
     }
 
+    /// Explicitly enables the managed WAL namespace before returning any core
+    /// handle. Existing data records are not rewritten. Older binaries and
+    /// data-only startup refuse this root after its topology marker is durable.
+    /// This does not by itself start a meta authority or a network listener.
+    pub fn start_managed(
+        root: impl Into<PathBuf>,
+        tuning: JournalTuning,
+        topology: &ursula_shard::StaticShardMap,
+    ) -> Result<Self, RaftWalError> {
+        Ok(Self {
+            node: Arc::new(NodeWal::start_with_mode(
+                root.into(),
+                tuning.fsync,
+                topology,
+                super::topology::WalMode::Managed,
+            )?),
+            tuning,
+            lagging: Arc::new(LaggingGroups::default()),
+            core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
+        })
+    }
+
     pub fn root(&self) -> &Path {
         self.node.root()
     }

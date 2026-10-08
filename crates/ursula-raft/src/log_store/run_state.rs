@@ -307,6 +307,8 @@ pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> Jour
 /// Failure to start or shut down a node's Raft WAL.
 #[derive(Debug, thiserror::Error)]
 pub enum RaftWalError {
+    #[error("WAL root '{}' requires explicitly configured managed mode; refusing data-only startup", .root.display())]
+    ManagedModeRequired { root: PathBuf },
     #[error("WAL topology mismatch at '{}': stored core_count={stored_core_count}, group_count={stored_group_count}, configured core_count={configured_core_count}, group_count={configured_group_count}. Restore the stored counts, or rebuild this replica on an empty WAL from a healthy quorum using the cluster's existing routing counts. See https://ursula.tonbo.io/docs/operations#wal-routing-configuration", .root.display())]
     TopologyMismatch {
         root: PathBuf,
@@ -430,6 +432,15 @@ impl NodeWal {
         fsync: WalFsync,
         topology: &ursula_shard::StaticShardMap,
     ) -> Result<Self, RaftWalError> {
+        Self::start_with_mode(root, fsync, topology, super::topology::WalMode::DataOnly)
+    }
+
+    pub(crate) fn start_with_mode(
+        root: PathBuf,
+        fsync: WalFsync,
+        topology: &ursula_shard::StaticShardMap,
+        mode: super::topology::WalMode,
+    ) -> Result<Self, RaftWalError> {
         create_dir_all_durable(&root).map_err(|source| RaftWalError::CreateDir {
             path: root.clone(),
             source,
@@ -452,7 +463,12 @@ impl NodeWal {
             .map_err(RaftWalError::ReadRunState)?;
         let cores = core_dirs(&root)?;
         // Even metadata-only cores are prior state: votes must not be forgotten.
-        super::topology::check_or_create(&root, topology, previous.is_some() || !cores.is_empty())?;
+        super::topology::check_or_create_with_mode(
+            &root,
+            topology,
+            previous.is_some() || !cores.is_empty(),
+            mode,
+        )?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
         let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync);
