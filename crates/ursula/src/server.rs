@@ -775,6 +775,65 @@ mod tests {
         );
     }
 
+    /// A single-node durable server has no static inventory. It is ready
+    /// before its first group exists and while its groups serve.
+    #[tokio::test]
+    async fn a_single_node_durable_server_becomes_ready() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.raft.node_id = 7;
+        config.raft.wal.path = Some(dir.path().to_owned());
+        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
+        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
+        let persistence = crate::Persistence::Raft {
+            log_dir: wal_dir.log_dir(),
+        };
+        let state = super::init_state(&config, persistence, false)
+            .await
+            .unwrap();
+        let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let client =
+            crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default());
+        let ready = |client: axum::Router| async move {
+            client
+                .oneshot(
+                    Request::builder()
+                        .uri(crate::READINESS_PATH)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(ready(client.clone()).await, StatusCode::OK);
+        let created = client
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/ready/events")
+                    .header("content-type", "text/plain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(ready(client).await, StatusCode::OK);
+        assert_eq!(
+            super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await,
+            super::WalShutdown::Clean
+        );
+    }
+
     /// Without `raft.wal.path` a single node runs its WAL in a fresh
     /// temporary directory, removed once the server shut down cleanly and
     /// kept otherwise. Only the zero-config default runs without Raft.
