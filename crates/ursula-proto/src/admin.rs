@@ -496,12 +496,17 @@ pub struct RaftMaintenanceReport {
 }
 
 impl RaftMaintenanceReport {
-    /// Local serving eligibility; maintenance additionally requires the full voter set.
+    /// Local serving eligibility; maintenance additionally requires the full
+    /// voter set and no stopped group. A group stopped by an apply failure
+    /// answers its own requests with a typed 503 while the node serves the
+    /// others, so it only blocks disruption.
     pub fn serving_ready(&self) -> bool {
         let local_issue = |issue: &RaftMaintenanceIssue| {
             !matches!(
                 issue,
-                RaftMaintenanceIssue::IncompleteVoterSet | RaftMaintenanceIssue::JointMembership
+                RaftMaintenanceIssue::IncompleteVoterSet
+                    | RaftMaintenanceIssue::JointMembership
+                    | RaftMaintenanceIssue::ApplyStopped
             )
         };
         !self.expected_groups.is_empty()

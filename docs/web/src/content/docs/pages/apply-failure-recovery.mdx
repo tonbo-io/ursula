@@ -13,9 +13,10 @@ a deterministic application result and does not stop the group.
 
 `/__ursula/metrics` reports `raft_groups[].apply_failure` with the log term,
 index, failure kind and diagnostic message. The affected group's
-`maintenance.running` is false and maintenance readiness refuses another
-unsafe disruption. Node readiness also becomes unready. Liveness and the other
-group actors stay up. Invariant violations can have partially
+`maintenance.running` is false. The maintenance report names the group with
+`apply_stopped`, so `ursulactl wait-ready` and rollouts refuse another
+disruption. The node's `/__ursula/ready` stays 200 and its other groups keep
+serving. Requests to the stopped group answer a typed `503`. Invariant violations can have partially
 modified memory: that state must not be read, flushed, or made into a snapshot.
 A previously captured snapshot only contains its earlier successful prefix.
 

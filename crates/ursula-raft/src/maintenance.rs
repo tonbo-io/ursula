@@ -216,11 +216,15 @@ mod tests {
         });
         group.current_leader = None;
         group.maintenance.recovery_ready = false;
-        let report = report(&[group]);
+        let report = report(&[group, healthy(1)]);
         assert_eq!(report.group_issues[&0], vec![
             RaftMaintenanceIssue::ApplyStopped
         ]);
+        assert!(!report.group_issues.contains_key(&1));
+        // The stop blocks disruption, while the node keeps serving its other
+        // groups and the stopped group answers with a typed 503.
         assert!(!report.ready());
+        assert!(report.serving_ready());
     }
 
     #[test]
