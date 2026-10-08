@@ -109,7 +109,7 @@ pub(super) fn wire_recovery(
     policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
 ) {
-    registry.register_rejoin(node_id, rejoin.clone());
+    registry.register_rejoin(node_id, engine, rejoin.clone());
     engine.attach_recovery(
         rejoin.clone(),
         &RaftGroupHandleRegistry::default(),

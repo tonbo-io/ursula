@@ -434,7 +434,7 @@ async fn build_three_node_cluster_at(
         )
         .await
         .expect("create cluster raft group node");
-        registry.register(node_id, engine.raft.clone());
+        registry.register(node_id, &engine);
         engines.push(engine);
         wal_roots.push(wal_root);
     }
@@ -2020,7 +2020,7 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
             },
         ));
         let engine = rx.await.expect("receive simulated raft group node");
-        registry.register(node_id, engine.raft.clone());
+        registry.register(node_id, &engine);
         engines.push(engine);
     }
 
@@ -2076,7 +2076,7 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         .await
         .expect("create cluster raft group node");
         if node_id != 3 {
-            registry.register(node_id, engine.raft.clone());
+            registry.register(node_id, &engine);
         }
         engines.push(engine);
     }
@@ -2159,7 +2159,7 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         .await
         .expect("wait for leader purge");
 
-    registry.register(3, engines[2].raft.clone());
+    registry.register(3, &engines[2]);
     let learner_added = tokio::time::timeout(
         Duration::from_secs(5),
         engines[leader_index]
@@ -2706,8 +2706,7 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
             .expect("open the gate"),
     );
     gate.bind(&raft);
-    registry.register_rejoin(placement().raft_group_id, gate.clone());
-    registry.register(placement(), raft.clone());
+    registry.register_engine(engine, Some(gate.clone()));
     let metrics = raft.metrics().borrow_watched().clone();
     let matched = metrics.replication.as_ref().unwrap()[&target];
     assert!(gate.follower_lost_log(

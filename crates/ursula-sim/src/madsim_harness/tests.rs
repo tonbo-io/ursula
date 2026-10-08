@@ -1923,7 +1923,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             .await
             .expect("wait for purge");
 
-        registry.register(learner_id, engines[learner_index].raft_handle());
+        registry.register(learner_id, &engines[learner_index]);
         let added = leader
             .add_learner(learner_id, BasicNode::new("node-3"), true)
             .await
@@ -2467,7 +2467,7 @@ async fn external_locator_snapshot_install(seed: u64) {
         )
         .await
         .expect("wait for purge");
-    registry.register(learner_id, engines[engine_index(learner_id)].raft_handle());
+    registry.register(learner_id, &engines[engine_index(learner_id)]);
     leader
         .add_learner(learner_id, BasicNode::new("node-3"), true)
         .await

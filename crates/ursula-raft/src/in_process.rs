@@ -35,7 +35,8 @@ use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug, Clone, Default)]
 pub struct InProcessRaftRegistry {
-    endpoints: Arc<Mutex<BTreeMap<u64, crate::RaftGroupHandleRegistry>>>,
+    endpoints:
+        Arc<Mutex<BTreeMap<u64, (ursula_shard::RaftGroupId, crate::RaftGroupHandleRegistry)>>>,
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
     barriers: Arc<Mutex<BTreeMap<u64, Arc<crate::read_index::ReadIndexBarrier>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
@@ -45,30 +46,18 @@ pub struct InProcessRaftRegistry {
 }
 
 impl InProcessRaftRegistry {
-    pub fn register(&self, node_id: u64, raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>) {
-        let barrier = Arc::new(crate::read_index::ReadIndexBarrier::new(raft.clone()));
+    pub fn register(&self, node_id: u64, engine: &crate::RaftGroupEngine) {
+        let raft = engine.raft_handle();
         self.barriers
             .lock()
             .expect("in-process barrier mutex")
-            .insert(node_id, barrier.clone());
+            .insert(node_id, engine.read_barrier.clone());
         let endpoint = crate::RaftGroupHandleRegistry::default();
-        let group = ursula_shard::RaftGroupId(0);
-        if let Some(gate) = self.rejoin(node_id) {
-            endpoint.register_rejoin(group, gate);
-        }
-        endpoint.register_read_barrier(group, barrier);
-        endpoint.register(
-            ursula_shard::ShardPlacement {
-                shard_id: ursula_shard::ShardId(0),
-                core_id: ursula_shard::CoreId(0),
-                raft_group_id: group,
-            },
-            raft.clone(),
-        );
+        endpoint.register_engine(engine, self.rejoin(node_id));
         self.endpoints
             .lock()
             .expect("endpoint registry")
-            .insert(node_id, endpoint);
+            .insert(node_id, (engine.placement.raft_group_id, endpoint));
         self.nodes
             .lock()
             .expect("in-process raft registry mutex")
@@ -116,7 +105,10 @@ impl InProcessRaftRegistry {
         crate::registry::confirm_recovery_barrier(group, barrier.owner(), barrier.as_ref()).await
     }
 
-    fn endpoint(&self, node_id: u64) -> Option<crate::RaftGroupHandleRegistry> {
+    fn endpoint(
+        &self,
+        node_id: u64,
+    ) -> Option<(ursula_shard::RaftGroupId, crate::RaftGroupHandleRegistry)> {
         self.endpoints
             .lock()
             .expect("endpoint registry")
@@ -130,24 +122,27 @@ impl InProcessRaftRegistry {
         node_id: u64,
         request: crate::UrsulaVoteRequest,
     ) -> Result<crate::UrsulaVoteResponse, ursula_runtime::GroupEngineError> {
-        let endpoint = self
-            .endpoint(node_id)
-            .ok_or(ursula_runtime::GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::OwnerStopped,
-            ))?;
-        endpoint.vote(ursula_shard::RaftGroupId(0), request).await
+        let (group, endpoint) =
+            self.endpoint(node_id)
+                .ok_or(ursula_runtime::GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::OwnerStopped,
+                ))?;
+        endpoint.vote(group, request).await
     }
 
     /// Screen the votes and appends delivered to `node_id` through its
     /// recovery gate (replaces a previous registration).
-    pub fn register_rejoin(&self, node_id: u64, rejoin: Arc<GroupRejoin>) {
-        if let Some(endpoint) = self.endpoint(node_id) {
-            endpoint.register_rejoin(ursula_shard::RaftGroupId(0), rejoin.clone());
-        }
+    pub fn register_rejoin(
+        &self,
+        node_id: u64,
+        engine: &crate::RaftGroupEngine,
+        rejoin: Arc<GroupRejoin>,
+    ) {
         self.rejoins
             .lock()
             .expect("in-process raft rejoin mutex")
             .insert(node_id, rejoin);
+        self.register(node_id, engine);
     }
 
     pub fn rejoin(&self, node_id: u64) -> Option<Arc<GroupRejoin>> {
@@ -576,7 +571,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_rpc(InProcessRaftRpcKind::AppendEntries)
             .await
             .map_err(RPCError::Unreachable)?;
-        let target = self.registry.endpoint(self.target).ok_or_else(|| {
+        let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -593,15 +588,12 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         let leader = rpc.vote;
         let prev_log_id = rpc.prev_log_id;
         let sent_last_log_id = rpc.entries.last().map(|entry| entry.log_id);
-        let response = target
-            .append_entries(ursula_shard::RaftGroupId(0), rpc)
-            .await
-            .map_err(|err| {
-                RPCError::Network(NetworkError::from_string(format!(
-                    "remote AppendEntries on node {}: {err}",
-                    self.target
-                )))
-            })?;
+        let response = target.append_entries(group, rpc).await.map_err(|err| {
+            RPCError::Network(NetworkError::from_string(format!(
+                "remote AppendEntries on node {}: {err}",
+                self.target
+            )))
+        })?;
         if let Some(rejoin) = &self.rejoin
             && rejoin.follower_lost_log(
                 self.target,
@@ -627,7 +619,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_rpc(InProcessRaftRpcKind::Vote)
             .await
             .map_err(RPCError::Unreachable)?;
-        let target = self.registry.endpoint(self.target).ok_or_else(|| {
+        let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -643,12 +635,9 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         });
         let target_rejoin = self.registry.rejoin(self.target);
         let target_gate = target_rejoin.as_ref().map(|rejoin| rejoin.status());
-        let response = target
-            .vote(ursula_shard::RaftGroupId(0), rpc)
-            .await
-            .map_err(|err| {
-                RPCError::Network(NetworkError::from_string(format!("remote vote: {err}")))
-            })?;
+        let response = target.vote(group, rpc).await.map_err(|err| {
+            RPCError::Network(NetworkError::from_string(format!("remote vote: {err}")))
+        })?;
         self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
             source: self.source,
             target: self.target,
@@ -668,7 +657,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel)
             .await?;
         self.registry.record_full_snapshot(self.target);
-        let target = self.registry.endpoint(self.target).ok_or_else(|| {
+        let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -683,7 +672,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             kind: InProcessRaftRpcKind::FullSnapshot,
         });
         target
-            .install_full_snapshot(ursula_shard::RaftGroupId(0), vote, snapshot)
+            .install_full_snapshot(group, vote, snapshot)
             .await
             .map_err(|err| {
                 StreamingError::Network(NetworkError::from_string(format!(

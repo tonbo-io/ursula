@@ -1799,7 +1799,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         )
         .await
         .unwrap();
-        network.register(id, engine.raft_handle());
+        network.register(id, &engine);
         engines.push(engine);
     }
     let leader = engines[0].raft_handle();

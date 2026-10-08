@@ -603,11 +603,10 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                     madsim::time::sleep(Duration::from_millis(25)).await;
                 }
                 let admin = ursula_raft::RaftGroupHandleRegistry::default();
-                admin.register(
-                    group_placement(group),
-                    cluster.engines[&(group, wiped)].raft_handle(),
+                admin.register_engine(
+                    &cluster.engines[&(group, wiped)],
+                    Some(cluster.rejoins[&(group, wiped)].clone()),
                 );
-                admin.register_rejoin(RaftGroupId(group), cluster.rejoins[&(group, wiped)].clone());
                 let seen = metrics(&cluster, group, wiped);
                 let error = admin
                     .accept_unsynced_loss(RaftGroupId(group), &AcceptUnsyncedLossRequest {

@@ -170,9 +170,7 @@ async fn new_recovery_engine(
     .await
     .expect("new engine on an empty WAL");
     gate.bind(&engine.raft_handle());
-    registry.register_rejoin(placement().raft_group_id, gate.clone());
-    registry.register_read_barrier(placement().raft_group_id, engine.read_barrier.clone());
-    registry.register(placement(), engine.raft_handle());
+    registry.register_engine(&engine, Some(gate.clone()));
     (engine, store, gate, wal_root)
 }
 

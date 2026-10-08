@@ -496,7 +496,7 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
             )
             .await
             .unwrap();
-            network.register(id, engine.raft.clone());
+            network.register(id, &engine);
             logs.push(log);
             wals.push(wal);
             engines.push(engine);

@@ -1005,7 +1005,7 @@ impl MadsimRuntimeRaftNetworkFactory {
             self.cold_store.clone(),
         )
         .await?;
-        control.registry.register(node_id, engine.raft_handle());
+        control.registry.register(node_id, &engine);
         self.followers
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1080,7 +1080,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                     cold_store.clone(),
                 )
                 .await?;
-                registry.register(node_id, engine.raft_handle());
+                registry.register(node_id, &engine);
                 engines.push((node_id, engine));
             }
 
@@ -2183,7 +2183,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         )
         .await
         .expect("create simulated raft group node");
-        registry.register(node_id, engine.raft_handle());
+        registry.register(node_id, &engine);
         engines.push(engine);
         wals.push(wal);
     }
@@ -2247,7 +2247,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
         .await
         .expect("create simulated raft group node");
         if node_id != 3 {
-            registry.register(node_id, engine.raft_handle());
+            registry.register(node_id, &engine);
         }
         engines.push(engine);
     }
@@ -2326,7 +2326,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         )
         .await
         .expect("create snapshot-purge simulated raft group node");
-        registry.register(node_id, engine.raft_handle());
+        registry.register(node_id, &engine);
         engines.push(engine);
         wals.push(wal);
     }
