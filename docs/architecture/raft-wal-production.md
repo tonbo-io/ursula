@@ -234,6 +234,10 @@ epoch. Cores open lazily, so a core whose
 metadata shows an older epoch has not been read since the crash and is still
 read as a verified prefix, however the runs in between ended.
 
+If the run-state file is missing, startup reads every surviving core metadata
+file and advances beyond the greatest recorded verification epoch. Unreadable
+metadata or an exhausted epoch refuses startup before recording a new run.
+
 "Recovering" means the node's logs may be missing entries it acknowledged.
 The node logs it at warn, reports it in the metrics JSON (`wal_recovery`), as
 the `ursula.wal.recovering` gauge, and through

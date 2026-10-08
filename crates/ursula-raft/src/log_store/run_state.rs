@@ -344,6 +344,10 @@ pub enum RaftWalError {
     },
     #[error("read the Raft WAL run state: {0}")]
     ReadRunState(#[source] StateFileError),
+    #[error("read core metadata while recovering epochs: {0}")]
+    ReadCoreMetadata(#[source] StateFileError),
+    #[error("Raft WAL recovery epoch {recovery_epoch} cannot advance")]
+    RecoveryEpochExhausted { recovery_epoch: u64 },
     #[error("list the core journals under '{}': {source}", .root.display())]
     ListCores {
         root: PathBuf,
@@ -455,7 +459,27 @@ impl NodeWal {
         super::topology::check_or_create(&root, topology, previous.is_some() || !cores.is_empty())?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
-        let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync);
+        let mut opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync);
+        let mut prior_epoch = previous.as_ref().map_or(0, |state| state.recovery_epoch);
+        if previous.is_none() && !cores.is_empty() {
+            // A lost marker cannot make a core's old verification certify this run.
+            // Read every core before changing metadata or recording the new run.
+            for core in &cores {
+                let metadata = super::core_meta::CoreMetadata::load(&core_metadata_path(core))
+                    .map_err(RaftWalError::ReadCoreMetadata)?;
+                prior_epoch = prior_epoch.max(metadata.verified_epoch());
+            }
+        }
+        if opening.replay_mode == JournalReplayMode::VerifiedPrefix
+            || (previous.is_none() && !cores.is_empty())
+        {
+            opening.recovery_epoch =
+                prior_epoch
+                    .checked_add(1)
+                    .ok_or(RaftWalError::RecoveryEpochExhausted {
+                        recovery_epoch: prior_epoch,
+                    })?;
+        }
         log_opening(&root, previous.as_ref(), boot_id.as_ref(), fsync, &opening);
         // Before this run records itself, so a crash in between marks the
         // cores again on the next start.

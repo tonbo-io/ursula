@@ -1897,3 +1897,116 @@ async fn missing_metadata_beside_a_nonempty_journal_closes_the_recovery_gate() {
         .expect("gate");
     assert!(!gate.vote_gate_open());
 }
+
+#[tokio::test]
+async fn missing_run_state_advances_past_every_surviving_core_epoch() {
+    use super::run_state::NodeWal;
+    use super::run_state::RUN_STATE_FILE;
+
+    let core = Core::small(WalFsync::Always);
+    let root = core._root.path();
+    let topology = ursula_shard::StaticShardMap::new(2, 4).unwrap();
+    drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [blank_entry(1)]).await;
+    drop((store, writer));
+    let other = root.join("core-1");
+    fs::create_dir_all(&other).unwrap();
+    for (dir, epoch) in [(&core.dir, 8), (&other, 21)] {
+        let path = core_metadata_path(dir);
+        let mut metadata = CoreMetadata::load(&path).unwrap();
+        metadata.set_verified_epoch(epoch);
+        metadata.store(&path).unwrap();
+    }
+    for expected in [22, 23] {
+        fs::remove_file(root.join(RUN_STATE_FILE)).unwrap();
+        let node = NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap();
+        let opening = node.opening();
+        assert_eq!(opening.recovery_epoch, expected);
+        assert_eq!(opening.replay_mode, JournalReplayMode::VerifiedPrefix);
+        let mut options = core.options(opening.recovery_epoch, opening.recovery);
+        options.previous_run = opening.previous_run;
+        options.run_state = node.run_state().clone();
+        let writer = CoreFileLogWriter::open(core.dir.clone(), options).unwrap();
+        assert_eq!(writer.replay_mode(), JournalReplayMode::VerifiedPrefix);
+        let store = core.store(&writer, 1);
+        assert_eq!(log_ids(&store).await, [1]);
+        assert_eq!(store.log_state(), GroupLogState::Recovering);
+        drop((store, writer, node));
+    }
+}
+
+#[tokio::test]
+async fn missing_run_state_refuses_unreadable_or_exhausted_core_epochs() {
+    use super::run_state::NodeWal;
+    use super::run_state::RUN_STATE_FILE;
+    use super::run_state::RaftWalError;
+
+    for corrupt in [false, true] {
+        let core = Core::small(WalFsync::Always);
+        let root = core._root.path();
+        let topology = ursula_shard::StaticShardMap::new(1, 3).unwrap();
+        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+        let writer = core.writer();
+        let mut store = core.store(&writer, 1);
+        append(&mut store, [blank_entry(1)]).await;
+        drop((store, writer));
+        let path = core_metadata_path(&core.dir);
+        let mut metadata = CoreMetadata::load(&path).unwrap();
+        metadata.set_verified_epoch(u64::MAX);
+        metadata.store(&path).unwrap();
+        if corrupt {
+            fs::write(&path, b"broken core metadata").unwrap();
+        }
+        fs::remove_file(root.join(RUN_STATE_FILE)).unwrap();
+        let before = fs::read(&path).unwrap();
+        for _ in 0..2 {
+            let error = NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap_err();
+            if corrupt {
+                assert!(
+                    matches!(error, RaftWalError::ReadCoreMetadata(_)),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    matches!(error, RaftWalError::RecoveryEpochExhausted {
+                        recovery_epoch: u64::MAX
+                    }),
+                    "{error}"
+                );
+            }
+            assert!(!root.join(RUN_STATE_FILE).exists());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_exhausted_recorded_epoch_refuses_a_new_poisoned_recovery() {
+    use super::run_state::NodeWal;
+    use super::run_state::RUN_STATE_FILE;
+    use super::run_state::RaftWalError;
+
+    let core = Core::small(WalFsync::Always);
+    let root = core._root.path();
+    let topology = ursula_shard::StaticShardMap::new(1, 3).unwrap();
+    drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+    let path = root.join(RUN_STATE_FILE);
+    RunStateFile::new(path.clone(), RunState {
+        boot_id: None,
+        fsync: WalFsync::Always,
+        status: RunStatus::Poisoned,
+        recovery_epoch: u64::MAX,
+    })
+    .record(RunStatus::Poisoned, "exhausted epoch")
+    .unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(matches!(
+        NodeWal::start(root.to_owned(), WalFsync::Always, &topology),
+        Err(RaftWalError::RecoveryEpochExhausted {
+            recovery_epoch: u64::MAX
+        })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
