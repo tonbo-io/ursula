@@ -1364,20 +1364,6 @@ impl GrpcRaftNetwork {
         }
     }
 
-    fn decode_transfer_leader_ack(
-        &self,
-        payload: &[u8],
-    ) -> Result<
-        openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>,
-        RPCError<UrsulaRaftTypeConfig>,
-    > {
-        // Pre-alpha28 peers acknowledge delivery with an empty envelope.
-        if payload.is_empty() {
-            return Ok(Ok(()));
-        }
-        self.decode_rpc_ack("TransferLeader", payload)
-    }
-
     /// Decode the MessagePack payload of an envelope-style ack.
     fn decode_rpc_ack<T: DeserializeOwned>(
         &self,
@@ -1832,7 +1818,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 |mut client, request| async move { client.transfer_leader(request).await },
             )
             .await?;
-        self.decode_transfer_leader_ack(&ack.response)
+        self.decode_rpc_ack("TransferLeader", &ack.response)
     }
 }
 
@@ -2463,6 +2449,7 @@ mod reconnect_tests {
 mod transfer_leader_codec_tests {
     use std::sync::Arc;
 
+    use openraft::error::RPCError;
     use openraft::vote::RaftLeaderId;
     use ursula_shard::RaftGroupId;
 
@@ -2471,15 +2458,22 @@ mod transfer_leader_codec_tests {
     use crate::codec::encode_wire;
     use crate::types::UrsulaRaftTypeConfig;
 
+    type TransferLeaderResponse = openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>;
+
     #[tokio::test]
-    async fn transfer_leader_ack_preserves_typed_rejections_and_legacy_success() {
+    async fn transfer_leader_ack_preserves_typed_rejections_and_refuses_an_empty_response() {
         let network = GrpcRaftNetwork::new(
             Arc::new(CoreRaftTransport::default()),
             RaftGroupId(1),
             2,
             "http://127.0.0.1:1",
         );
-        assert_eq!(network.decode_transfer_leader_ack(&[]).unwrap(), Ok(()));
+        // Every peer encodes its TransferLeaderResponse, so an empty ack is
+        // a malformed response, not a success.
+        assert!(matches!(
+            network.decode_rpc_ack::<TransferLeaderResponse>("TransferLeader", &[]),
+            Err(RPCError::Network(_))
+        ));
         for response in [
             Ok(()),
             Err(openraft::raft::TransferLeaderError::VoteChanged {
@@ -2496,7 +2490,10 @@ mod transfer_leader_codec_tests {
         ] {
             assert_eq!(
                 network
-                    .decode_transfer_leader_ack(&encode_wire(&response))
+                    .decode_rpc_ack::<TransferLeaderResponse>(
+                        "TransferLeader",
+                        &encode_wire(&response)
+                    )
                     .unwrap(),
                 response
             );

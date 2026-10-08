@@ -1,6 +1,6 @@
 //! Coalesced ReadIndex confirmation for one Raft group (D10).
 //!
-//! openraft 0.10.0-alpha.21 sends a heartbeat to every voter for each
+//! openraft 0.10.0-alpha.28 sends a heartbeat to every voter for each
 //! `get_read_linearizer` call; it does not batch concurrent callers. This
 //! barrier runs at most one confirmation round per group at a time. Readers
 //! that arrive while a round is in flight share the next round, which starts
