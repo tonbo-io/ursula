@@ -74,6 +74,7 @@ toml = { workspace = true }
 # Path-only: a versionless dev-dependency is dropped from the published
 # manifest, so `ursula` publishes without waiting for `ursula-ctl`.
 ursula-ctl = { path = "../ursula-ctl" }
+ursula-raft = { workspace = true, features = ["fault-injection"] }
 
 [[bench]]
 name = "json_text"

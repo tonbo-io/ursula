@@ -485,6 +485,8 @@ struct StaticGrpcTestNodeStorage {
     per_group_initializers: bool,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     start_maintenance_drained: bool,
+    /// Faulty code every replica of one group runs.
+    apply_fault: Option<(RaftGroupId, ursula_raft::apply_failure::ApplyFault)>,
 }
 
 async fn spawn_static_grpc_test_node(
@@ -538,6 +540,9 @@ async fn spawn_static_grpc_test_node(
     factory = factory.with_cold_store(storage.cold_store.clone());
     if let Some(engine_config) = storage.engine_config {
         factory = factory.with_engine_config(engine_config);
+    }
+    if let Some((group, fault)) = storage.apply_fault {
+        factory = factory.with_apply_fault(group, fault);
     }
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, storage.cold_store)
@@ -2389,6 +2394,270 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     assert!(location.ends_with(&format!("/{}", stream_id)));
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+/// Starts three durable nodes with two groups on `addresses`, each node's
+/// journals under `root`, and warms every group they host.
+async fn start_durable_cluster(
+    root: &std::path::Path,
+    addresses: &[std::net::SocketAddr],
+    initialize: bool,
+    apply_fault: Option<(RaftGroupId, ursula_raft::apply_failure::ApplyFault)>,
+) -> Vec<StaticGrpcTestNode> {
+    let peers = (1..=3u64)
+        .zip(addresses)
+        .map(|(node_id, address)| (node_id, format!("http://{address}")))
+        .collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    for (node_id, address) in (1..=3u64).zip(addresses) {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("bind the node's address");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                initialize && node_id == 1,
+                2,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: Some(root.join(format!("node-{node_id}"))),
+                    apply_fault,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    // The initializer warms last, after its peers can answer.
+    for node in nodes.iter().rev() {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the node's groups in time")
+            .expect("warm the node's groups");
+    }
+    nodes
+}
+
+/// Polls `url` until it answers 200, and returns the last status.
+async fn poll_status(client: &reqwest::Client, url: &str) -> StatusCode {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .expect("deadline");
+    loop {
+        let status = client.get(url).send().await.expect("request").status();
+        if status == StatusCode::OK || tokio::time::Instant::now() >= deadline {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Polls a stream's read through `base` until it holds `expected`.
+async fn poll_payload(
+    client: &reqwest::Client,
+    base: &str,
+    stream: &BucketStreamId,
+    expected: &str,
+) {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .expect("deadline");
+    loop {
+        let response = client
+            .get(format!("{base}/{stream}?offset=0"))
+            .send()
+            .await
+            .expect("read the stream");
+        let status = response.status();
+        let body = response.text().await.expect("read body");
+        if status == StatusCode::OK && body == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{base}/{stream}: {status} {body:?}, expected {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A deterministic poison record stops its group on every voter: a buggy
+/// binary replays the committed record at startup on each replica. Every
+/// node stays serving-ready and serves its other group, while maintenance
+/// readiness refuses disruption. Corrected code replays the record on every
+/// voter without skipping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_replay() {
+    let root = tempfile::tempdir().expect("WAL root");
+    let mut addresses = Vec::new();
+    for _ in 1..=3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve an address");
+        addresses.push(listener.local_addr().expect("local addr"));
+    }
+    let bases = addresses
+        .iter()
+        .map(|address| format!("http://{address}"))
+        .collect::<Vec<_>>();
+    let manifest = (1..=3u64)
+        .zip(&bases)
+        .map(|(id, base)| ursula_ctl::NodeInfo {
+            expected_process_incarnation: None,
+            expected_maintenance_fence: None,
+            id,
+            admin_url: base.parse().unwrap(),
+            http_url: Some(base.parse().unwrap()),
+            metrics_url: Some(base.parse().unwrap()),
+            host: base.clone(),
+        })
+        .collect::<Vec<_>>();
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let nodes = start_durable_cluster(root.path(), &addresses, true, None).await;
+    let stream_of = |group: u32, name: &str| {
+        (0..10_000)
+            .map(|index| BucketStreamId::new("poison", format!("{name}-{index}")))
+            .find(|stream| nodes[0].runtime.locate(stream).raft_group_id == RaftGroupId(group))
+            .expect("a stream of the group")
+    };
+    let poisoned = stream_of(0, "poisoned");
+    let healthy = stream_of(1, "healthy");
+    ursula_ctl::observe::wait_ready(
+        &ctl,
+        &manifest,
+        2,
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("a fresh cluster becomes ready");
+    for (stream, body) in [(&poisoned, "poison"), (&healthy, "healthy")] {
+        let created = client
+            .put(format!("{}/{stream}", bases[0]))
+            .header(CONTENT_TYPE, "text/plain")
+            .body(body)
+            .send()
+            .await
+            .expect("create a stream");
+        assert_eq!(created.status(), StatusCode::CREATED, "{stream}");
+    }
+    let poison = nodes[0]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("group 0")
+        .metrics()
+        .borrow_watched()
+        .last_applied
+        .expect("the record applied")
+        .index;
+    for node in &nodes {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("group 0")
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(poison), "every voter applied the record")
+            .await
+            .expect("replicate the record");
+    }
+    for node in nodes {
+        node.shutdown().await;
+    }
+
+    // A buggy binary now fails on the committed record, which every replica
+    // replays at startup.
+    let fault = ursula_raft::apply_failure::ApplyFault::PanicAfterMutation { index: poison };
+    let nodes = start_durable_cluster(
+        root.path(),
+        &addresses,
+        false,
+        Some((RaftGroupId(0), fault)),
+    )
+    .await;
+    for node in &nodes {
+        let groups = node.registry.metrics_snapshot();
+        let stopped = groups
+            .iter()
+            .find(|group| group.raft_group_id == 0)
+            .and_then(|group| group.apply_failure.as_ref())
+            .expect("group 0 stopped at startup");
+        assert_eq!(stopped.index, poison);
+    }
+    for (base, node_id) in bases.iter().zip(1..=3u64) {
+        assert_eq!(
+            poll_status(&client, &format!("{base}/__ursula/ready")).await,
+            StatusCode::OK,
+            "node {node_id} keeps serving its other group"
+        );
+        let appended = client
+            .post(format!("{base}/{healthy}"))
+            .header(CONTENT_TYPE, "text/plain")
+            .body(format!("-{node_id}"))
+            .send()
+            .await
+            .expect("append to the healthy group");
+        assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+        let refused = client
+            .post(format!("{base}/{poisoned}"))
+            .header(CONTENT_TYPE, "text/plain")
+            .body("refused")
+            .send()
+            .await
+            .expect("append to the stopped group");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    for base in &bases {
+        poll_payload(&client, base, &healthy, "healthy-1-2-3").await;
+    }
+    let refusal = ursula_ctl::observe::wait_ready(
+        &ctl,
+        &manifest,
+        2,
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect_err("maintenance refuses disruption beside a stopped group");
+    match refusal.downcast_ref::<ursula_ctl::observe::ReadinessRefusal>() {
+        Some(ursula_ctl::observe::ReadinessRefusal::Maintenance {
+            report: Some(report),
+            ..
+        }) => assert_eq!(
+            report.group_issues.get(&0),
+            Some(&vec![
+                ursula_proto::admin::RaftMaintenanceIssue::ApplyStopped
+            ])
+        ),
+        other => panic!("expected a maintenance refusal: {other:?} ({refusal:#})"),
+    }
+    for node in nodes {
+        node.shutdown().await;
+    }
+
+    // Corrected code replays the retained record on every voter.
+    let nodes = start_durable_cluster(root.path(), &addresses, false, None).await;
+    ursula_ctl::observe::wait_ready(
+        &ctl,
+        &manifest,
+        2,
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("corrected code recovers the group");
+    for base in &bases {
+        poll_payload(&client, base, &poisoned, "poison").await;
+        poll_payload(&client, base, &healthy, "healthy-1-2-3").await;
+    }
     for node in nodes {
         node.shutdown().await;
     }

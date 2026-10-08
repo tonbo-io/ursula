@@ -208,6 +208,9 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     log_stores: RaftWal,
     snapshot_store: Option<SharedSnapshotStore>,
     engine_config: RaftEngineConfig,
+    /// Faulty code that every replica of one group runs, for tests.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    apply_fault: Option<(RaftGroupId, crate::apply_failure::ApplyFault)>,
 }
 
 impl StaticGrpcRaftGroupEngineFactory {
@@ -233,7 +236,20 @@ impl StaticGrpcRaftGroupEngineFactory {
             log_stores,
             snapshot_store: None,
             engine_config: RaftEngineConfig::default(),
+            #[cfg(any(test, madsim, feature = "fault-injection"))]
+            apply_fault: None,
         }
+    }
+
+    /// Run faulty code for `group`, as a deployment of a buggy binary does.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub fn with_apply_fault(
+        mut self,
+        group: RaftGroupId,
+        fault: crate::apply_failure::ApplyFault,
+    ) -> Self {
+        self.apply_fault = Some((group, fault));
+        self
     }
 
     pub fn registry(&self) -> &RaftGroupHandleRegistry {
@@ -450,8 +466,11 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_build: Some(self.registry.snapshot_build_coordinator()),
                     snapshot_install: Some(self.registry.snapshot_install_coordinator()),
-                    #[cfg(any(test, madsim))]
-                    apply_fault: None,
+                    #[cfg(any(test, madsim, feature = "fault-injection"))]
+                    apply_fault: self
+                        .apply_fault
+                        .filter(|(group, _)| *group == placement.raft_group_id)
+                        .map(|(_, fault)| fault),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                 },
                 health.clone(),

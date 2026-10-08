@@ -125,7 +125,7 @@ use crate::types::UrsulaRaftTypeConfig;
 pub struct RaftGroupEngineOptions {
     pub(crate) apply_stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Faulty code for tests and simulations; production has none.
-    #[cfg(any(test, madsim))]
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
     pub apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub metrics: Option<GroupEngineMetrics>,
     pub cold_store: Option<ColdStoreHandle>,
@@ -375,7 +375,7 @@ impl RaftGroupEngine {
     {
         let RaftGroupEngineOptions {
             apply_stop_signal,
-            #[cfg(any(test, madsim))]
+            #[cfg(any(test, madsim, feature = "fault-injection"))]
             apply_fault,
             metrics,
             cold_store,
@@ -398,7 +398,7 @@ impl RaftGroupEngine {
         );
         state_machine.apply_stop_signal = apply_stop_signal;
         state_machine.apply_health = apply_health.clone();
-        #[cfg(any(test, madsim))]
+        #[cfg(any(test, madsim, feature = "fault-injection"))]
         {
             state_machine.apply_fault = apply_fault;
         }
@@ -640,7 +640,7 @@ impl RaftGroupEngine {
     }
 
     /// Run faulty code from now on, as a deployment of a buggy binary does.
-    #[cfg(any(test, madsim))]
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
     pub async fn inject_apply_fault(
         &self,
         fault: crate::apply_failure::ApplyFault,

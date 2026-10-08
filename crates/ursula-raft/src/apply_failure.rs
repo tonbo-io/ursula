@@ -70,7 +70,7 @@ impl ApplyHealth {
 
 /// A deterministic application bug at one committed index, hit after the
 /// command mutated state. Tests and simulations run it as faulty code.
-#[cfg(any(test, madsim))]
+#[cfg(any(test, madsim, feature = "fault-injection"))]
 #[derive(Debug, Clone, Copy)]
 pub enum ApplyFault {
     PanicAfterMutation { index: u64 },
