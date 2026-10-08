@@ -235,7 +235,7 @@ After one voter becomes unavailable, this source can separately observe the two 
 ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected-groups 256 --timeout-secs 120
 ```
 
-Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology; it never shrinks the configured membership to fit observations.
+Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology. It never shrinks the configured membership to fit observations.
 
 The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
 

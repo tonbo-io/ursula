@@ -314,11 +314,11 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
-- **If you run 0.6 with data you need to keep, do not upgrade yet.** Stay on 0.6.2 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
+- **If you run 0.6 with data you need to keep, stay on 0.6.2.** 0.7 provides no migration path from 0.6.
 - **Deploy 0.7 fresh:** empty PVCs and a never-used object-storage prefix.
 - **`helm upgrade` from 0.6 stops before a second voter is replaced.** Recover with `helm rollback`.
 
-Every behaviour change is listed in the [0.7.0 release notes](/docs/release-notes#070).
+Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes#070).
 
 To install 0.7:
 
@@ -327,7 +327,7 @@ To install 0.7:
 3. **Update the configuration.**
    - Remove `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`, `raft.memory_bootstrap_marker_dir` and `raft.rejoin_probe`. A config file that still sets one fails to load.
    - Set `raft.wal.path` on every node of a multi-node cluster. 0.6 defaulted to the memory WAL, and a 0.7 node with `raft.peers` refuses to start without a WAL path.
-   - Choose `raft.wal.fsync` (Helm `raft.walFsync`). The default `never` acknowledges a write once a quorum of voters holds it in the page cache, and a host crash can cost a replica its unsynced tail (see [Recovering after a host crash](#recovering-after-a-host-crash)). Set `always` to keep the 0.6 disk WAL behaviour of one `fsync` per batch.
+   - Choose `raft.wal.fsync` (Helm `raft.walFsync`). The default `never` acknowledges a write once a quorum of voters holds it in the page cache, and a host crash can cost a replica its unsynced tail (see [Recovering after a host crash](#recovering-after-a-host-crash)). Set `always` to keep the 0.6 disk WAL behavior of one `fsync` per batch.
    - With Helm, remove `raft.storageMode`, `raft.allowVolatileMultiPeer` and `persistence.enabled`. Every pod gets a PVC for its WAL. The values schema refuses unknown keys under `raft` and `persistence`.
    - Keep `runtime.core_count` and `raft.group_count` explicit and unchanged (see [WAL routing configuration](#wal-routing-configuration)).
 4. **Update runbooks and tooling.** `ursulactl` 0.7 removes the memory-WAL restart verbs `prepare-restart`, `restart-quiesce-capability`, `finish-prepared-restart`, `abort-prepared-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`, `prepare-recovery-handoff` and `classify-amnesiac`. A planned restart is drain, restart, wait and undrain ([Restarting a voter](#restarting-a-voter)), and a voter that lost entries is rebuilt by its group leaders. Custom tooling that calls admin mutations must send `x-ursula-process-incarnation` ([Admin endpoints](#admin-endpoints)).

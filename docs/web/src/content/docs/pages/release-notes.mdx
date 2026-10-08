@@ -7,9 +7,9 @@ description: Changes that affect clients and operators, newest first.
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
 
-- **If you run 0.6 with data you need to keep, do not upgrade yet.** Stay on 0.6.2 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
+- **If you run 0.6 with data you need to keep, stay on 0.6.2.** 0.7 provides no migration path from 0.6.
 - **Deploy 0.7 fresh:** empty PVCs and a never-used object-storage prefix.
-- **`raft.wal.fsync` now defaults to `never`.** The 0.6 disk WAL fsynced every batch. Set `always` to keep that behaviour.
+- **`raft.wal.fsync` now defaults to `never`.** The 0.6 disk WAL fsynced every batch. Set `always` to keep that behavior.
 - **`helm upgrade` from 0.6 stops before a second voter is replaced.** Recover with `helm rollback`.
 
 This release adds an fsync policy and a recovery gate to the Raft WAL, splits each core's journal into segments with bounded memory, binds the WAL to the routing configuration, and removes the memory-WAL restart tooling.
