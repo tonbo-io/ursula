@@ -226,16 +226,9 @@ impl MetricsClient {
         &self,
         node: &NodeInfo,
     ) -> Result<(reqwest::StatusCode, ursula_proto::admin::ServingReadiness)> {
-        let url = node
-            .http_url
-            .as_ref()
-            .with_context(|| {
-                format!(
-                    "node {} needs http_url for its serving readiness probe",
-                    node.id
-                )
-            })?
-            .join("/__ursula/ready")?;
+        let url = metrics_base_url(node)
+            .join("/__ursula/ready")
+            .with_context(|| format!("compose readiness url for node {}", node.id))?;
         let response = self.client.get(url).send().await?;
         if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
             response.error_for_status_ref()?;
@@ -557,6 +550,8 @@ impl MetricsClient {
     }
 }
 
+/// Base URL of the read-only observations, metrics and serving readiness. Both
+/// planes serve them, so the rollout's Pod-bound admin tunnel suffices.
 fn metrics_base_url(node: &NodeInfo) -> &url::Url {
     node.metrics_url
         .as_ref()

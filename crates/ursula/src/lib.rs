@@ -892,22 +892,23 @@ pub fn router_with_http_state(state: HttpState) -> Router {
 }
 
 /// Admin-plane routes: the mutating operator surface (raft group operations,
-/// maintenance drain, cold-flush trigger, bucket purge) plus read-only metrics
-/// and usage so operator tooling works over a single tunnel. Production binds this to
+/// maintenance drain, cold-flush trigger, bucket purge) plus read-only metrics,
+/// readiness and usage so operator tooling works over a single tunnel. Production binds this to
 /// `server.admin_listen` (loopback by default) — nodes expose no
 /// cluster-mutation endpoints on the client or cluster planes.
 pub fn admin_router(state: HttpState) -> Router {
     admin_ops_router(state.clone()).merge(
         Router::new()
             .route("/__ursula/metrics", get(metrics))
+            .route(READINESS_PATH, get(readiness))
             .route("/__ursula/usage", get(bucket_usage))
             .with_state(state),
     )
 }
 
-/// The mutating admin routes without the metrics and usage aliases. The
-/// single-router convenience mergers use this directly because the client
-/// plane already serves `/__ursula/metrics` and `/__ursula/usage`.
+/// The mutating admin routes without the read-only aliases. The single-router
+/// convenience mergers use this directly because the client plane already
+/// serves `/__ursula/metrics`, `/__ursula/ready` and `/__ursula/usage`.
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(

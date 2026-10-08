@@ -48,7 +48,7 @@ impl Drop for ChildGuard {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_wait_ready_uses_the_chart_generated_client_plane_through_startup() {
+async fn cli_wait_ready_uses_the_chart_generated_admin_tunnel_through_startup() {
     use ursula_ctl::provider::NodeProvider;
     let _guard = static_cluster_cli_test_guard().await;
     let root = tempfile::tempdir().unwrap();
@@ -93,9 +93,9 @@ async fn cli_wait_ready_uses_the_chart_generated_client_plane_through_startup() 
         String::from_utf8_lossy(&generated.stderr)
     );
     let provider = ursula_ctl::provider::StaticNodeProvider::from_path(&manifest).unwrap();
-    let mut nodes = provider.list_nodes().await.unwrap();
+    let nodes = provider.list_nodes().await.unwrap();
     assert_eq!(nodes.len(), 1);
-    let node = &mut nodes[0];
+    let node = &nodes[0];
     assert_eq!(
         node.http_url.as_ref().unwrap().host_str(),
         Some("ursula-0.ursula-headless.readiness-test.svc.cluster.local")
@@ -104,13 +104,8 @@ async fn cli_wait_ready_uses_the_chart_generated_client_plane_through_startup() 
     assert_eq!(node.metrics_url.as_ref().unwrap().port(), Some(admin_port));
     assert_eq!(node.admin_url.port(), Some(admin_port));
     assert_ne!(port, admin_port);
-    // Local processes have no Kubernetes DNS. Remap only its hostname,
-    // retaining every generated address role and port.
-    node.http_url
-        .as_mut()
-        .unwrap()
-        .set_host(Some("127.0.0.1"))
-        .unwrap();
+    // The cluster DNS name of http_url does not resolve here. Like the hook,
+    // wait-ready must observe metrics and readiness through the admin tunnel.
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     let wait = ursula_ctl::observe::wait_ready(
         &ctl,
@@ -133,10 +128,12 @@ async fn cli_wait_ready_uses_the_chart_generated_client_plane_through_startup() 
             .len(),
         1
     );
-    let response = reqwest::get(format!("http://127.0.0.1:{admin_port}/__ursula/ready"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    for plane in [port, admin_port] {
+        let response = reqwest::get(format!("http://127.0.0.1:{plane}/__ursula/ready"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
 }
 
 #[cfg(unix)]

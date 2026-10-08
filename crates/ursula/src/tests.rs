@@ -5205,11 +5205,19 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         .runtime;
         let state = HttpState::with_raft_registry(runtime, registry.clone());
         let client = client_router_with_admission(state.clone(), IngressAdmission::default());
-        let ready = http_get(&client, READINESS_PATH).await;
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-        assert_eq!(body["reason"], json!("recovery_gate_closed"));
-
         let admin = admin_router(state.clone());
+        // Operator tooling reads the same readiness through its admin tunnel.
+        for app in [&client, &admin] {
+            let ready = http_get(app, READINESS_PATH).await;
+            assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: ursula_proto::admin::ServingReadiness =
+                serde_json::from_slice(&body_bytes(ready).await).unwrap();
+            assert_eq!(
+                body.reason,
+                Some(ursula_proto::admin::ServingReadinessReason::RecoveryGateClosed)
+            );
+        }
+
         let path = "/__ursula/raft/0/recovery/accept-unsynced-loss";
         let json_body = &[("content-type", "application/json")];
         let metrics: serde_json::Value =

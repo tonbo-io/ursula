@@ -16,22 +16,21 @@ const DEFAULT_ADMIN_PORT: u16 = 4438;
 pub struct NodeInfo {
     pub id: u64,
     /// Admin-plane endpoint carrying the operator surface (raft ops,
-    /// maintenance drain, metrics). Mutating verbs send requests here, never
+    /// maintenance drain, metrics, readiness). Mutating verbs send requests here, never
     /// to the public client plane. Nodes bind this plane to loopback, so from
     /// outside the host point it at your own tunnel (for example a
     /// `kubectl port-forward` local port).
     pub admin_url: Url,
     /// Address shown in reports. Defaults to the admin URL's host.
     pub host: String,
-    /// Advertised public client/Raft address for learner attachment,
-    /// survivor handoff, and the serving probe required by `wait-ready`.
-    /// Metrics use it when `metrics_url` is absent, then
-    /// fall back to `admin_url`.
+    /// Advertised public client/Raft address for learner attachment and
+    /// survivor handoff. Metrics and readiness use it when `metrics_url` is
+    /// absent, then fall back to `admin_url`.
     #[serde(default)]
     pub http_url: Option<Url>,
-    /// Optional read-only metrics endpoint, independent of the advertised
-    /// Raft/client address. Rollouts use their admin tunnel so a replacement
-    /// can be inspected before its cluster DNS record becomes reachable.
+    /// Optional read-only metrics and readiness endpoint, independent of the
+    /// advertised Raft/client address. Rollouts use their admin tunnel so a
+    /// replacement can be inspected before its cluster DNS record resolves.
     #[serde(default)]
     pub metrics_url: Option<Url>,
     /// Identity retained by a maintenance plan across CLI invocations. A
