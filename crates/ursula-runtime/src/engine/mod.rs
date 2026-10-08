@@ -812,6 +812,10 @@ pub struct StreamEngineError {
 /// structured source, so it keeps an owned `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
+    #[error(
+        "raft group {raft_group_id:?} stopped after a committed apply failure; retain WAL for corrected-code replay"
+    )]
+    ApplyStopped { raft_group_id: RaftGroupId },
     #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
     RecoveryVoteFloor { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]

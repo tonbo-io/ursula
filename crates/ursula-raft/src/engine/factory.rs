@@ -423,6 +423,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_build: Some(self.registry.snapshot_build_coordinator()),
                     snapshot_install: Some(self.registry.snapshot_install_coordinator()),
+                    #[cfg(test)]
+                    fail_apply_at: None,
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                 },
             )

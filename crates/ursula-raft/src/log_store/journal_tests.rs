@@ -1585,12 +1585,24 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .current_leader(1, "leader elected")
         .await
         .unwrap();
-    leader
-        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
-            bucket_id: "before-pause".into(),
+    let response = leader
+        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
+            stream_id: ursula_shard::BucketStreamId::new("before-pause", "events"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: bytes::Bytes::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            now_ms: 0,
         }))
         .await
         .unwrap();
+    assert!(matches!(
+        response.data,
+        crate::RaftGroupResponse::Write(Ok(ursula_runtime::GroupWriteResponse::CreateStream(_)))
+    ));
     let before = leader.metrics().borrow_watched().last_log_index;
     let vote = leader.metrics().borrow_watched().vote;
     let (entered, wait_entered) = tokio::sync::oneshot::channel();
@@ -1604,8 +1616,16 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     let writing = leader.clone();
     let append = tokio::spawn(async move {
         writing
-            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateBucket {
-                bucket_id: "during-pause".into(),
+            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
+                stream_id: ursula_shard::BucketStreamId::new("during-pause", "events"),
+                content_type: "application/octet-stream".to_owned(),
+                initial_payload: bytes::Bytes::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                now_ms: 0,
             }))
             .await
     });
@@ -1621,7 +1641,11 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .await
         .unwrap();
     drop(release);
-    append.await.unwrap().unwrap();
+    let response = append.await.unwrap().unwrap();
+    assert!(matches!(
+        response.data,
+        crate::RaftGroupResponse::Write(Ok(ursula_runtime::GroupWriteResponse::CreateStream(_)))
+    ));
     for engine in engines {
         engine.shutdown().await.unwrap();
     }

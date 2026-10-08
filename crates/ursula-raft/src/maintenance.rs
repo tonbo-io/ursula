@@ -140,6 +140,7 @@ mod tests {
     fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
         let progress = RaftLogProgressSnapshot { term: 1, index: 20 };
         RaftGroupMetricsSnapshot {
+            apply_failure: None,
             raft_group_id: id,
             node_id: 1,
             current_term: 1,

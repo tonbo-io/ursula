@@ -75,6 +75,8 @@ pub struct RaftLogProgressSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaftGroupMetricsSnapshot {
+    #[serde(default)]
+    pub apply_failure: Option<crate::apply_failure::ApplyFailure>,
     pub raft_group_id: u32,
     pub node_id: u64,
     pub current_term: u64,

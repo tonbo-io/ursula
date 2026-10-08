@@ -176,6 +176,7 @@ pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStor
 /// describe supported capabilities (single-node groups need no recovery gate).
 #[derive(Debug, Default, Clone)]
 struct GroupResources {
+    apply_health: crate::apply_failure::ApplyHealth,
     snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     cache: Option<GroupColdIndexCache>,
     barrier: Option<Arc<ReadIndexBarrier>>,
@@ -334,6 +335,14 @@ pub(crate) async fn confirm_recovery_barrier(
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
+    pub(crate) fn apply_health(&self, group: RaftGroupId) -> crate::apply_failure::ApplyHealth {
+        self.groups
+            .load()
+            .get(&group.0)
+            .map(|entry| entry.resources().apply_health.clone())
+            .unwrap_or_default()
+    }
+
     /// Configure the node-wide budget for each direction before constructing transports.
     pub fn with_append_transport_budget_bytes(mut self, bytes: usize) -> Self {
         self.append_send_budget = crate::grpc::AppendTransportBudget::new(bytes);
@@ -516,6 +525,7 @@ impl RaftGroupHandleRegistry {
         let entry = Arc::new(GroupEntry::Active {
             raft: handle,
             resources: GroupResources {
+                apply_health: engine.apply_health.clone(),
                 snapshot_installs: engine.snapshot_installs.clone(),
                 cache: engine.cold_index_cache.clone(),
                 barrier: Some(engine.read_barrier.clone()),
@@ -819,19 +829,26 @@ impl RaftGroupHandleRegistry {
             .groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| entry.raft().map(|raft| (*id, raft.clone())))
+            .filter_map(|(id, entry)| {
+                entry
+                    .raft()
+                    .map(|raft| (*id, raft.clone(), entry.resources().apply_health.clone()))
+            })
             .collect::<Vec<_>>();
 
         let log_progress = self.snapshot_build_coordinator().log_progress();
         let mut snapshots = Vec::with_capacity(groups.len());
-        for (raft_group_id, raft) in groups {
+        for (raft_group_id, raft, health) in groups {
             let log = log_progress
                 .get(&raft_group_id)
                 .copied()
                 .unwrap_or_default();
             let metrics = raft.metrics().borrow_watched().clone();
             let membership = metrics.membership_config.membership();
+            let apply_failure = health.failure();
+            let apply_running = apply_failure.is_none();
             snapshots.push(RaftGroupMetricsSnapshot {
+                apply_failure,
                 raft_group_id,
                 node_id: metrics.id,
                 current_term: metrics.current_term,
@@ -845,7 +862,8 @@ impl RaftGroupHandleRegistry {
                 voter_configurations: membership.get_joint_config().clone(),
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
-                    running: metrics.running_state.is_ok()
+                    running: apply_running
+                        && metrics.running_state.is_ok()
                         && metrics.state != openraft::ServerState::Shutdown,
                     recovery_ready: self
                         .rejoin(RaftGroupId(raft_group_id))
@@ -1438,13 +1456,28 @@ mod tests {
                 .current_leader(1, "recovered group elects")
                 .await
                 .unwrap();
-            raft.client_write(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::CreateBucket {
-                    bucket_id: "after-retry".to_owned(),
-                },
-            ))
-            .await
-            .unwrap();
+            let response = raft
+                .client_write(ursula_runtime::GroupWriteCommand::Stream(
+                    ursula_stream::StreamCommand::CreateStream {
+                        stream_id: ursula_shard::BucketStreamId::new("after-retry", "events"),
+                        content_type: "application/octet-stream".to_owned(),
+                        initial_payload: bytes::Bytes::new(),
+                        close_after: false,
+                        stream_seq: None,
+                        producer: None,
+                        stream_ttl_seconds: None,
+                        stream_expires_at_ms: None,
+                        now_ms: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                response.data,
+                crate::RaftGroupResponse::Write(Ok(
+                    ursula_runtime::GroupWriteResponse::CreateStream(_)
+                ))
+            ));
             raft.metrics()
                 .borrow_watched()
                 .running_state

@@ -887,9 +887,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         ))
                     })
                 });
+            let apply_health = self.registry.apply_health(placement.raft_group_id);
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
+                        apply_health,
                         snapshot_installs: Arc::default(),
                         metadata_serial: Arc::default(),
                         recovery_tasks: crate::rejoin::RecoveryGate::default(),
