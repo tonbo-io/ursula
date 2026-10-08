@@ -241,7 +241,7 @@ The output is scoped as `surviving_quorum`, records the configured and observed 
 
 ### Shared reservation proposals
 
-Reservation stores use one validated schema (version 1) for Pod replacement, host recovery and candidate restaging. Host inventory is optional data. Publishing it does not change the schema. Unknown versions are rejected, and 0.7 provides no migration from unreleased reservation formats.
+Reservation stores have one schema, version 1, for Pod replacement, host recovery and candidate restaging. Host inventory is optional data, and publishing it keeps the version. `ursulactl` refuses a store with any other version.
 
 `reservation-propose --cell cell.json --snapshot before.json --request request.json`
 produces a whole-ConfigMap CAS proposal without contacting Kubernetes.

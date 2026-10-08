@@ -162,7 +162,7 @@ If a majority of a group's voters lose their tail at once, the group has no lead
 
 These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Readiness in this source checks the configured group inventory, running replicas, recovery gates, complete uniform voter sets, applied membership and bounded local lag. It does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes. This observation still requires an exclusive maintenance reservation and physical fencing before it can authorize a disruption.
 
-Reservation stores use one validated schema (version 1) for Pod replacement, host recovery and candidate restaging. Host inventory is optional data. Publishing it does not change the schema. Unknown versions are rejected, and 0.7 provides no migration from unreleased reservation formats.
+Reservation stores have one schema, version 1, for Pod replacement, host recovery and candidate restaging. Host inventory is optional data, and publishing it keeps the version. `ursulactl` refuses a store with any other version.
 
 ## Static Membership And `server.replicaCount`
 

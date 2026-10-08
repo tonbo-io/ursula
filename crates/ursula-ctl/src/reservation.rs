@@ -72,7 +72,6 @@ pub struct Operation {
     pub acquired_ms: u64,
     pub admission: Option<PrefixObservation>,
     pub replacement: Option<SourceIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostRecovery>,
 }
 
@@ -84,7 +83,6 @@ pub struct Reservation {
     generation: u64,
     operation: Option<Operation>,
     completion: Option<Completion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     hosts: Option<HostInventory>,
 }
 
@@ -104,7 +102,6 @@ pub struct Completion {
     pub source: SourceIdentity,
     pub replacement: SourceIdentity,
     pub observation: PrefixObservation,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostRecovery>,
 }
 

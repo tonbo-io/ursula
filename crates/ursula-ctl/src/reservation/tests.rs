@@ -66,6 +66,11 @@ fn initial_store_uses_one_schema_and_rejects_other_versions() {
     let initial = Reservation::initial(cell()).unwrap();
     assert_eq!(initial.version, super::RESERVATION_SCHEMA_VERSION);
     assert!(initial.hosts().is_none());
+    // The initial store already has the final shape: optional data is null.
+    let encoded = serde_json::to_value(&initial).unwrap();
+    for field in ["operation", "completion", "hosts"] {
+        assert_eq!(encoded.get(field), Some(&Value::Null), "{field}");
+    }
     for version in [0, 2, 3, 4, u32::MAX] {
         let mut state = serde_json::to_value(&initial).unwrap();
         state["version"] = json!(version);

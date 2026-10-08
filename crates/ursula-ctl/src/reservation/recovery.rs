@@ -130,11 +130,8 @@ pub struct HostRecovery {
     /// Persist before any force delete; none may subsequently bind as replacement.
     pub pod_retirement_intents: BTreeSet<String>,
     pub replacement_host: Option<HostVoter>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_retirement: Option<ReplacementRetirement>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_replacements: Vec<RetiredHostReplacement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_replacement_prefix: Option<SurvivingPrefixObservation>,
 }
 
