@@ -26,7 +26,6 @@ use openraft::type_config::alias::SnapshotOf;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupWriteCommand;
 
 use crate::registry::RaftGroupHandle;
 use crate::rt::sync::mpsc;
@@ -282,13 +281,6 @@ impl OwnerRaftHandle {
     }
     pub async fn get_snapshot(&self) -> Result<Option<SnapshotOf<C>>, RaftError<C>> {
         self.call(move |raft| async move { raft.get_snapshot().await })
-            .await?
-    }
-    pub async fn client_write(
-        &self,
-        command: GroupWriteCommand,
-    ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
-        self.call(move |raft| async move { raft.client_write(command).await })
             .await?
     }
     pub async fn add_learner(
