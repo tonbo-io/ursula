@@ -2500,3 +2500,7 @@ mod transfer_leader_codec_tests {
         }
     }
 }
+#[cfg(test)]
+#[cfg(not(madsim))]
+#[path = "grpc_counter_bench.rs"]
+mod counter_bench;
