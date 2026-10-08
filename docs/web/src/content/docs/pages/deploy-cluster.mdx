@@ -4,32 +4,9 @@ title: Deploy a Cluster
 
 Production Ursula is a static-membership Raft cluster: three voting nodes across availability zones, a durable Raft log per node, and a shared S3 bucket for the cold tier.
 
-The recommended way to run it is **Kubernetes via the Helm chart**, with **OpenTofu** provisioning the cloud prerequisites:
+The recommended way to run it is **Kubernetes via the Helm chart**. Bring a Kubernetes cluster with a StorageClass for the voters' volumes and an S3 bucket for the cold tier. The chart installs Ursula into it. If you are not running Kubernetes, see [bare metal](#without-kubernetes-bare-metal--vms) at the end.
 
-- **Starting from scratch on AWS**: use the OpenTofu stack in `deploy/eks`. It provisions the VPC, EKS cluster, storage, S3 bucket, and IAM identities, and generates the Helm values to install with.
-- **Already have a Kubernetes cluster**: `helm install` directly from GHCR and supply your own S3 bucket and storage class.
-
-If you are not running Kubernetes, see [bare metal](#without-kubernetes-bare-metal--vms) at the end.
-
-## Recommended: OpenTofu + Helm on EKS
-
-The repository includes an OpenTofu reference stack under [`deploy/eks`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks). It provisions a three-AZ VPC and EKS cluster, one managed node group per zone, the EBS CSI and Pod Identity add-ons, an encrypted `gp3` StorageClass, a versioned S3 bucket, and least-privilege identities for Ursula and the event-time indexer. It writes the complete Helm input to `generated-values.yaml` and a dedicated kubeconfig without touching `~/.kube/config`.
-
-One-time setup: create a versioned, encrypted S3 bucket for OpenTofu state, copy `backend.tf.example` to the ignored `backend.tf` with a unique state key, and copy `terraform.tfvars.example` to the ignored `terraform.tfvars`. In the tfvars, pick an explicit image tag and restrict the EKS public API to your operator or CI CIDRs (the stack rejects `0.0.0.0/0` and `::/0`).
-
-After that, the complete deployment path is:
-
-```bash
-cd deploy/eks
-tofu init
-tofu apply
-KUBECONFIG=./kubeconfig helm install ursula ../../charts/ursula --namespace ursula --create-namespace -f generated-values.yaml
-KUBECONFIG=./kubeconfig helm test ursula --namespace ursula
-```
-
-See [`deploy/eks/README.md`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks) for inputs, cost, state, and teardown guidance. OpenTofu owns the AWS prerequisites and Helm owns the namespace-scoped Ursula workloads.
-
-## Existing Kubernetes cluster: Helm
+## Helm
 
 The chart and images are published to GHCR on every release. One command starts a three-voter cluster:
 
@@ -60,6 +37,23 @@ With cold storage enabled the chart also turns on cold-chunk compaction and lets
 For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload identity over static S3 credentials. To use a registry mirror, set `global.image.repository`, `global.image.tag`, and optionally `global.imagePullSecrets`.
 
 `server.replicaCount` controls the voter set for a **fresh** cluster and supports `1`, `3`, and `5`. Production should use `3`, or `5` only when tolerating two simultaneous voter failures justifies the larger write quorum. Changing it on an initialized cluster is not safe Raft voter reconfiguration. Safe scaling needs the future operator workflow.
+
+### On AWS (EKS)
+
+The chart's [`examples/production-eks.yaml`](https://github.com/tonbo-io/ursula/blob/main/charts/ursula/examples/production-eks.yaml) is a three-zone starting point: three voters on `gp3` volumes, S3 cold storage and snapshots, three gateways, and a two-replica indexer pool with its own workload identity. It needs:
+
+- an EKS cluster with nodes in three availability zones,
+- the EBS CSI driver and a StorageClass named `gp3`,
+- an S3 bucket,
+- IAM roles for the Ursula and indexer service accounts (IRSA or EKS Pod Identity), each limited to its own S3 prefix.
+
+The [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#prerequisites) lists the details. Replace the bucket and the role ARNs in the example, then install it:
+
+```bash
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.0 \
+  --namespace ursula --create-namespace -f production-eks.yaml
+helm test ursula --namespace ursula
+```
 
 ## Verify
 

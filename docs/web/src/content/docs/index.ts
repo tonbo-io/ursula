@@ -38,7 +38,7 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "quick-start": { group: "Getting Started", order: 4 },
   clients: { group: "Getting Started", order: 5 },
 
-  // Deploy - the production path (OpenTofu + Helm), then the consolidated
+  // Deploy - the production path (Helm), then the consolidated
   // configuration reference and the security model.
   "deploy-cluster": { group: "Deploy", order: 1 },
   configuration: { group: "Deploy", order: 2 },

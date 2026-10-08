@@ -18,7 +18,7 @@ env:
 
 jobs:
   infrastructure:
-    name: OpenTofu and Helm
+    name: Helm
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -31,19 +31,6 @@ jobs:
         run: |
           ./scripts/test_validate_release_version.sh
           ./scripts/check-release-versions.sh
-
-      - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@v1
-        with:
-          tofu_version: 1.12.4
-
-      - name: Validate EKS prerequisites
-        run: |
-          tofu fmt -check -recursive deploy/eks
-          tofu -chdir=deploy/eks init -backend=false
-          tofu -chdir=deploy/eks validate
-          tofu -chdir=deploy/chaos-eks init -backend=false
-          tofu -chdir=deploy/chaos-eks validate
 
       - name: Install Helm
         uses: azure/setup-helm@v4

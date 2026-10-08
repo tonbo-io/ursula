@@ -21,11 +21,5 @@ docs/web/target/
 # Local benchmark output
 .bench-results/
 
-# OpenTofu working data and generated deployment values
-**/.terraform/
-**/*.tfstate
-**/*.tfstate.*
-**/*.tfplan
-
 # Internal migration / architecture / operations notes
 docs/migration/
