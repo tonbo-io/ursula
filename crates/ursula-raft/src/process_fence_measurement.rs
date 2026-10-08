@@ -116,6 +116,361 @@ async fn installed_replica_fence_rejects_old_identity_without_meta_reads() {
     engine.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_leader_recovers_missed_membership_with_only_the_new_quorum() {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use openraft::rt::WatchReceiver;
+
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+    let group = RaftGroupId(0);
+    let placement = ShardPlacement {
+        core_id: CoreId(0),
+        shard_id: ShardId(0),
+        raft_group_id: group,
+    };
+    let transport = crate::InProcessRaftRegistry::default();
+    let mut engines = BTreeMap::new();
+    let mut registries = BTreeMap::new();
+    let mut stores = BTreeMap::new();
+    let mut roots = Vec::new();
+    for node in 1..=4 {
+        let root = tempfile::tempdir().unwrap();
+        let wal = crate::log_store::RaftWal::start(
+            root.path(),
+            ursula_config::WalFsync::Always,
+            &ursula_shard::StaticShardMap::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        let store = wal
+            .open(
+                placement,
+                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+            )
+            .unwrap();
+        let registry = crate::RaftGroupHandleRegistry::default();
+        registry.set_replica_authority(node, identity(1, u128::from(node)));
+        let mut genesis = (1..=3)
+            .map(|node| (node, identity(1, u128::from(node))))
+            .collect::<BTreeMap<_, _>>();
+        if node == 4 {
+            genesis.insert(4, identity(1, 4));
+        }
+        registry.set_replica_genesis(genesis);
+        let engine = crate::RaftGroupEngine::new_node(
+            placement,
+            node,
+            Arc::new(
+                openraft::Config {
+                    enable_elect: false,
+                    enable_tick: false,
+                    ..Default::default()
+                }
+                .validate()
+                .unwrap(),
+            ),
+            crate::InProcessRaftNetworkFactory::new(transport.clone()).with_source(node),
+            store.clone(),
+            crate::RaftGroupEngineOptions {
+                process_authority: Some(registry.clone()),
+                snapshot_metadata_path: Some(root.path().join("group.snapshot.json")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        registry.register_engine(&engine, None);
+        transport.register(node, engine.raft_handle());
+        engines.insert(node, engine);
+        registries.insert(node, registry);
+        stores.insert(node, store);
+        roots.push(root);
+    }
+    let leader = engines[&1].raft_handle();
+    leader
+        .initialize(
+            (1..=3)
+                .map(|node| (node, openraft::BasicNode::new(format!("node-{node}"))))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .await
+        .unwrap();
+    leader.trigger().elect().await.unwrap();
+    engines[&1]
+        .wait_for_current_leader(1, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let fence = registries[&1]
+        .install_replica_identity(group, 4, None, identity(1, 4))
+        .await
+        .unwrap();
+    engines[&2]
+        .raft_handle()
+        .wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(
+            Some(fence),
+            "old voter durably ACKs new identity before going offline",
+        )
+        .await
+        .unwrap();
+    let stale = engines[&2]
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_applied
+        .unwrap();
+    let gate = Arc::new(
+        crate::GroupRejoin::durable(2, group, &stores[&2])
+            .await
+            .unwrap(),
+    );
+    gate.set_replica_fence_required_index(engines[&2].replica_fences.required_index());
+    gate.bind(&engines[&2].raft_handle());
+    registries[&2].register_engine(&engines[&2], Some(gate.clone()));
+    transport.unregister(2);
+    leader
+        .add_learner(4, openraft::BasicNode::new("node-4"), true)
+        .await
+        .unwrap();
+    leader
+        .change_membership(BTreeSet::from([1, 2, 4]), false)
+        .await
+        .unwrap();
+    leader.trigger().transfer_leader(4).await.unwrap();
+    engines[&4]
+        .wait_for_current_leader(4, Duration::from_secs(5))
+        .await
+        .unwrap();
+    engines[&4].read_barrier.round().await.unwrap();
+    assert!(!registries[&2].replica_sender_is_voter(group, 4));
+    assert!(registries[&2].admits_replica(group, 4, &identity(1, 4)));
+
+    // Neither a data proof endpoint nor meta quorum is available. Membership
+    // ingress must use only already committed local admission state.
+    let endpoint = "http://127.0.0.1:1".to_owned();
+    let mut topology = ursula_control::ControlPlaneState::default();
+    for node in [1, 2, 4] {
+        assert_eq!(
+            topology.apply(ursula_control::ControlCommand::RegisterNode {
+                node_id: node,
+                client_url: endpoint.clone(),
+                cluster_url: endpoint.clone(),
+                labels: BTreeMap::new(),
+                now_ms: 1
+            }),
+            ursula_control::ControlResponse::Ok
+        );
+        assert!(matches!(
+            topology.apply(ursula_control::ControlCommand::Operation {
+                command: ursula_control::OperationCommand::ClaimProcess {
+                    node_id: node,
+                    expected_epoch: 0,
+                    incarnation: ProcessIncarnation::from_bits(u128::from(node))
+                },
+                now_ms: 1
+            }),
+            ursula_control::ControlResponse::Operation(Ok(_))
+        ));
+    }
+    topology
+        .operations
+        .replicas
+        .insert(4, ursula_control::ReplicaState::Active {
+            identity: identity(1, 4),
+            installed_groups: BTreeMap::from([(group, fence)]),
+        });
+    assert_eq!(
+        topology.apply(ursula_control::ControlCommand::SeedPlacement {
+            raft_group_id: group,
+            voters: BTreeSet::from([1, 2, 4]),
+            now_ms: 1
+        }),
+        ursula_control::ControlResponse::Ok
+    );
+    let (topology_tx, watch) = tokio::sync::watch::channel(topology.clone());
+    registries[&2].set_control_topology(watch);
+    let meta_root = tempfile::tempdir().unwrap();
+    let meta = crate::MetaRaftHandle::new_durable(
+        2,
+        meta_root.path().to_path_buf(),
+        Arc::new(openraft::Config::default()),
+    )
+    .await
+    .unwrap();
+    meta.shutdown().await.unwrap();
+    registries[&2].set_process_authority(
+        2,
+        ursula_control::ProcessIdentity {
+            epoch: 1,
+            incarnation: ProcessIncarnation::from_bits(2),
+        },
+        meta,
+    );
+    let vote = engines[&4].raft_handle().metrics().borrow_watched().vote;
+    let envelope = crate::raft_internal_proto::RaftRpcEnvelopeV1 {
+        protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+        raft_group_id: 0,
+        node_id: 2,
+        process_identity: crate::codec::encode_wire(&FencedProcess {
+            node_id: 4,
+            identity: identity(1, 4),
+        }),
+        payload: crate::codec::encode_wire(&crate::UrsulaAppendEntriesRequest {
+            vote,
+            prev_log_id: Some(stale),
+            entries: Vec::new(),
+            leader_commit: Some(stale),
+        }),
+    };
+    let service = crate::grpc::RaftGrpcService::new(registries[&2].clone());
+    let mut rejected_states = Vec::new();
+    let mut retired = topology.clone();
+    retired
+        .operations
+        .replicas
+        .insert(4, ursula_control::ReplicaState::Retired(identity(1, 4)));
+    rejected_states.push(retired);
+    let mut uncertified = topology.clone();
+    if let ursula_control::ReplicaState::Active {
+        installed_groups, ..
+    } = uncertified.operations.replicas.get_mut(&4).unwrap()
+    {
+        installed_groups.clear();
+    }
+    rejected_states.push(uncertified);
+    for absent in [2, 4] {
+        let mut nonhosted = topology.clone();
+        nonhosted
+            .placements
+            .get_mut(&group)
+            .unwrap()
+            .voters
+            .remove(&absent);
+        rejected_states.push(nonhosted);
+    }
+    for rejected in rejected_states {
+        topology_tx.send_replace(rejected);
+        let error = service
+            .append(tonic::Request::new(envelope.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    topology_tx.send_replace(topology);
+    let mut unknown = envelope.clone();
+    unknown.process_identity = crate::codec::encode_wire(&FencedProcess {
+        node_id: 4,
+        identity: identity(2, 44),
+    });
+    assert_eq!(
+        service
+            .append(tonic::Request::new(unknown))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(registries[&2].admits_replica(group, 4, &identity(1, 4)));
+    assert!(engines[&2].replica_fences.recovery_membership().is_none());
+    transport.unregister(1);
+    let required = engines[&4]
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_applied
+        .unwrap()
+        .index();
+    assert!(required > stale.index());
+    // An existing prefix gate remains closed; accepting replication grants no
+    // vote or campaign authority to this recovering receiver.
+    gate.set_replica_fence_required_index(required);
+    assert!(!gate.vote_gate_open());
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        service.append(tonic::Request::new(envelope.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response: crate::UrsulaAppendEntriesResponse =
+        rmp_serde::from_slice(&response.into_inner().payload).unwrap();
+    assert!(matches!(
+        response,
+        crate::UrsulaAppendEntriesResponse::Success
+    ));
+    assert!(!gate.vote_gate_open());
+    for candidate in [1, 4] {
+        let request =
+            crate::UrsulaVoteRequest::new(crate::UrsulaVote::new(100, candidate), Some(stale));
+        let result = service
+            .vote(tonic::Request::new(
+                crate::raft_internal_proto::RaftRpcEnvelopeV1 {
+                    protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                    raft_group_id: 0,
+                    node_id: 2,
+                    payload: crate::codec::encode_wire(&request),
+                    process_identity: crate::codec::encode_wire(&FencedProcess {
+                        node_id: candidate,
+                        identity: identity(1, u128::from(candidate)),
+                    }),
+                },
+            ))
+            .await;
+        if candidate == 4 {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        } else {
+            let response: crate::UrsulaVoteResponse =
+                rmp_serde::from_slice(&result.unwrap().into_inner().payload).unwrap();
+            assert!(!response.vote_granted);
+        }
+    }
+    let snapshot = registries[&4]
+        .build_snapshot_for_transfer(group)
+        .await
+        .unwrap();
+    service
+        .full_snapshot(tonic::Request::new(
+            crate::raft_internal_proto::RaftFullSnapshotRequestV1 {
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                raft_group_id: 0,
+                node_id: 2,
+                vote: crate::codec::encode_wire(&vote),
+                snapshot_meta: crate::codec::encode_wire(&snapshot.meta),
+                snapshot_payload: snapshot.snapshot.into_inner().into(),
+                process_identity: envelope.process_identity,
+            },
+        ))
+        .await
+        .unwrap();
+    engines[&2]
+        .raft_handle()
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .eq([1, 2, 4])
+            },
+            "snapshot supplies missing membership",
+        )
+        .await
+        .unwrap();
+    assert!(gate.vote_gate_open());
+    transport.register(2, engines[&2].raft_handle());
+    // Node1 remains absent: the actual new quorum {2,4} must make progress.
+    tokio::time::timeout(Duration::from_secs(3), engines[&4].read_barrier.round())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(engines[&2].replica_fences.recovery_membership().is_none());
+    for engine in engines.values() {
+        engine.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn certified_reactivation_persists_peer_fences_and_gates_old_membership() {
     let (root, engine, registry) = fixture().await;

@@ -618,7 +618,8 @@ fn validate_replica_leader(
             *vote.leader_id().node_id() == sender.node_id
                 && (registry.replica_sender_has_accepted_vote(group, vote)
                     || (vote.is_committed()
-                        && registry.replica_sender_is_recovery_voter(group, sender.node_id)))
+                        && (registry.replica_sender_is_recovery_voter(group, sender.node_id)
+                            || admitted_replication_sender(registry, group, &sender))))
         });
     if sender.node_id != leader || !admitted {
         return Err(GrpcRpcError::failed_precondition(
@@ -626,6 +627,57 @@ fn validate_replica_leader(
         ));
     }
     Ok(())
+}
+
+/// A committed admission may precede the membership entry that promotes a
+/// replica. Existing voters must accept that leader's replication while their
+/// local membership catches up. This is not election authority: Vote/Transfer
+/// remain strict, and Raft still checks the durable vote floor and log prefix.
+fn admitted_replication_sender(
+    registry: &RaftGroupHandleRegistry,
+    group: ursula_shard::RaftGroupId,
+    sender: &FencedProcess,
+) -> bool {
+    let Some((local, replica)) = registry.replica_authority() else {
+        return false;
+    };
+    let Some((process_node, process, _)) = registry.process_authority() else {
+        return false;
+    };
+    let Some(state) = registry.control_state() else {
+        return false;
+    };
+    if process_node != local
+        || !state.operations.accepts_process(local, &process)
+        || !registry.admits_replica(group, local, &replica)
+        || !registry.admits_replica(group, sender.node_id, &sender.identity)
+    {
+        return false;
+    }
+    let Some(ursula_control::ReplicaState::Active {
+        identity,
+        installed_groups,
+    }) = state.operations.replicas.get(&sender.node_id)
+    else {
+        return false;
+    };
+    if identity != &sender.identity || !installed_groups.get(&group).is_some_and(|index| *index > 0)
+    {
+        return false;
+    }
+    let hosted = |node| {
+        state
+            .placements
+            .get(&group)
+            .is_some_and(|placement| placement.hosts(node))
+            || state
+                .operations
+                .active
+                .as_ref()
+                .and_then(|operation| operation.desired.get(&group))
+                .is_some_and(|voters| voters.contains(&node))
+    };
+    hosted(local) && hosted(sender.node_id)
 }
 
 async fn handle_append_envelope(
