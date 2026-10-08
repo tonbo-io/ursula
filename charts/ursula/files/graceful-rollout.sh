@@ -68,11 +68,11 @@ bind_replacement_incarnation() {
     -o jsonpath='{.data.replacement-pod-uid}') || return 1
   current_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-$((node_id - 1))" \
     -o jsonpath='{.metadata.uid}') || return 1
-  case "${saved_schema:-1}" in
-    1|2|3) ;;
+  case "${saved_schema}" in
+    3) ;;
     *) log "unsupported replacement state schema: ${saved_schema}"; return 1 ;;
   esac
-  if [ "${saved_schema}" = 3 ] && { [ -z "${saved_uid}" ] || [ "${saved_uid}" = "${current_uid}" ]; }; then
+  if [ -z "${saved_uid}" ] || [ "${saved_uid}" = "${current_uid}" ]; then
     log "refusing to refresh node ${node_id} process without an admitted Pod replacement"
     return 1
   fi
@@ -93,12 +93,7 @@ bind_replacement_incarnation() {
     return 1
   fi
   mv "${MANIFEST}.next" "${MANIFEST}" || return 1
-  # Schema 1/2 are interrupted legacy rollouts without a saved instance plan.
-  # Preserve their admitted UID when present. Do not create a schema-3 state
-  # without a source UID; the old schema-1 path finishes only this migration.
-  if [ -n "${saved_uid}" ]; then
-    record_state restarting "${node_id}" "${saved_uid}" "${current_uid}"
-  fi
+  record_state restarting "${node_id}" "${saved_uid}" "${current_uid}"
 }
 
 forward_pid() {
@@ -307,8 +302,7 @@ record_state() {
 
 replacement_attempt_was_superseded() {
   ordinal=$1
-  saved_revision=$2
-  source_pod_uid=$3
+  source_pod_uid=$2
   pod="${STATEFULSET}-${ordinal}"
   ready=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
@@ -316,34 +310,7 @@ replacement_attempt_was_superseded() {
 
   current_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
-  if [ -n "${source_pod_uid}" ]; then
-    [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" != "${source_pod_uid}" ]
-    return
-  fi
-
-  # State schema v1 did not record the source Pod UID. Its concrete consumer
-  # is an interrupted pre-0.4.7 rollout: a later hook replaced the voter but
-  # left the older `restarting` record behind. ControllerRevision.revision is
-  # the controller-owned monotonic order that proves the current Ready Pod is
-  # newer than that saved target. Remove this branch once releases predating
-  # state schema v2 are no longer supported upgrade sources.
-  current_revision=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
-    -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-  saved_sequence=$(kubectl -n "${NAMESPACE}" get controllerrevision "${saved_revision}" \
-    -o jsonpath='{.revision}' 2>/dev/null || true)
-  current_sequence=$(kubectl -n "${NAMESPACE}" get controllerrevision "${current_revision}" \
-    -o jsonpath='{.revision}' 2>/dev/null || true)
-  case "${saved_sequence}" in
-    ''|*[!0-9]*)
-      return 1
-      ;;
-  esac
-  case "${current_sequence}" in
-    ''|*[!0-9]*)
-      return 1
-      ;;
-  esac
-  [ "${current_sequence}" -gt "${saved_sequence}" ]
+  [ -n "${source_pod_uid}" ] && [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" != "${source_pod_uid}" ]
 }
 
 # The replacement starts maintenance-drained: the entrypoint reads the
@@ -406,6 +373,10 @@ resume_if_needed() {
     -o jsonpath='{.data.phase}')
   node_id=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.node-id}')
+  case "${state_schema}" in
+    3) ;;
+    *) log "unsupported rollout state schema: ${state_schema}"; return 1 ;;
+  esac
   case "${phase}" in
     complete)
       return 0
@@ -417,38 +388,18 @@ resume_if_needed() {
       return 1
       ;;
   esac
-  case "${state_schema:-1}" in
-    1)
-      if [ "${phase}" != "restarting" ]; then
-        log "rollout state schema 1 cannot represent phase ${phase}"
-        return 1
-      fi
-      ;;
-    3)
-      if [ -z "${source_pod_uid}" ]; then
-        log "rollout state schema 3 is missing source-pod-uid"
-        return 1
-      fi
-      # Read the durable plan before any state-changing CLI operation. Parsing
-      # and all surviving instance matches are checked by pin-incarnations.
-      kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
-        -o jsonpath='{.data.process-manifest}' >"${MANIFEST}"
-      if [ ! -s "${MANIFEST}" ]; then
-        log "rollout state schema 3 is missing process-manifest"
-        return 1
-      fi
-      ;;
-    2)
-      if [ -z "${source_pod_uid}" ]; then
-        log "rollout state schema 2 is missing source-pod-uid"
-        return 1
-      fi
-      ;;
-    *)
-      log "unsupported rollout state schema: ${state_schema}"
-      return 1
-      ;;
-  esac
+  if [ -z "${source_pod_uid}" ]; then
+    log "rollout state schema 3 is missing source-pod-uid"
+    return 1
+  fi
+  # Read the durable plan before any state-changing CLI operation. Parsing
+  # and all surviving instance matches are checked by pin-incarnations.
+  kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.process-manifest}' >"${MANIFEST}"
+  if [ ! -s "${MANIFEST}" ]; then
+    log "rollout state schema 3 is missing process-manifest"
+    return 1
+  fi
   case "${node_id}" in
     ''|*[!0-9]*)
       log "invalid saved rollout node id: ${node_id}"
@@ -461,8 +412,8 @@ resume_if_needed() {
   fi
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
-  log "resuming interrupted rollout at node ${node_id}: schema=${state_schema:-1} saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
-  if replacement_attempt_was_superseded "${ordinal}" "${saved_revision}" "${source_pod_uid}"; then
+  log "resuming interrupted rollout at node ${node_id}: schema=${state_schema} saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
+  if replacement_attempt_was_superseded "${ordinal}" "${source_pod_uid}"; then
     log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; waiting for it to catch up"
     finish_superseded_replacement "${ordinal}" "${node_id}"
     return 0
@@ -538,13 +489,13 @@ roll_node() {
   log "node ${node_id} verified"
 }
 
-legacy_shared_store_guard() {
+require_unreserved_rollout() {
   # Once a reviewed shared reservation exists, a later values/default regression
   # must not re-enable this independent writer, even when the store is idle.
-  # Bootstrap itself requires no legacy executor still running.
+  # Bootstrap itself requires no unreserved executor still running.
   if ! shared_store=$(kubectl -n "${NAMESPACE}" get configmap "${STATEFULSET}-maintenance" \
       --ignore-not-found=true -o name); then
-    log "cannot establish whether shared maintenance is enabled; refusing legacy rollout"
+    log "cannot establish whether shared maintenance is enabled; refusing unreserved rollout"
     return 1
   fi
   if [ -n "${shared_store}" ]; then
@@ -554,7 +505,7 @@ legacy_shared_store_guard() {
 }
 
 main() {
-  legacy_shared_store_guard || return 1
+  require_unreserved_rollout || return 1
   write_manifest
   wait_for_template
 
