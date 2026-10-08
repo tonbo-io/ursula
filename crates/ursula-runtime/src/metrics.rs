@@ -693,8 +693,8 @@ impl RuntimeMetricsInner {
             .store_at(group_index, group_hot_bytes);
         self.per_group_cold_hot_bytes_max
             .max_at(group_index, group_hot_bytes);
-        self.per_group_cold_hot_stream_bytes_max
-            .max_at(group_index, stream_hot_bytes);
+        self.cold_hot_stream_bytes_max
+            .fetch_max_relaxed(stream_hot_bytes);
     }
 
     pub(crate) fn record_cold_backpressure(
@@ -913,7 +913,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 160] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 159] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1069,7 +1069,6 @@ mod metric_manifest_tests {
         "cold_hot_group_bytes_high_watermark",
         "per_group_cold_hot_bytes_max",
         "cold_hot_stream_bytes_max",
-        "per_group_cold_hot_stream_bytes_max",
         "cold_backpressure_events",
         "per_core_cold_backpressure_events",
         "per_group_cold_backpressure_events",

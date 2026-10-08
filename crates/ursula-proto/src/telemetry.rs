@@ -99,7 +99,7 @@ macro_rules! runtime_metrics_manifest {
     // series remains the lifetime high-water mark for diagnostics.
     max cold_hot_group_bytes_max: group per_group_cold_hot_bytes_current_max;
     max cold_hot_group_bytes_high_watermark: group per_group_cold_hot_bytes_max;
-    max cold_hot_stream_bytes_max: group per_group_cold_hot_stream_bytes_max;
+    counter cold_hot_stream_bytes_max;
     sum cold_backpressure_events:
         core per_core_cold_backpressure_events, group per_group_cold_backpressure_events;
     counter cold_backpressure_bytes;
