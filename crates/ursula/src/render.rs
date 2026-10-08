@@ -18,10 +18,9 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
+#[cfg(test)]
 use serde_json::Value;
-use serde_json::json;
 use ursula_raft::RaftGroupMetricsSnapshot;
-use ursula_raft::RaftGrpcMetricsSnapshot;
 use ursula_raft::raft_grpc_metrics_snapshot;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdStoreInfo;
@@ -288,106 +287,128 @@ pub(crate) fn render_metrics(
     http: HttpMetricsSnapshot,
     raft_groups: &[RaftGroupMetricsSnapshot],
     cold_store: Option<&ColdStoreInfo>,
-) -> Value {
-    // The bulk of the metrics object is the runtime + HTTP snapshots flattened
-    // in verbatim (their field names are the wire keys, kept in sync by the
-    // compiler). Only the derived/aggregate fields are spelled out here.
-    #[derive(serde::Serialize)]
-    struct MetricsView<'a> {
-        #[serde(flatten)]
-        runtime: &'a RuntimeMetricsSnapshot,
-        active_cores: usize,
-        active_groups: usize,
-        #[serde(flatten)]
-        http: &'a HttpMetricsSnapshot,
-        #[serde(flatten)]
-        raft_grpc: &'a RaftGrpcMetricsSnapshot,
-        mailbox_depths: &'a [usize],
-        mailbox_capacities: &'a [usize],
-        cold_store: Value,
-        raft_group_count: usize,
-        raft_groups: Value,
-    }
-
-    let active_cores = snapshot
-        .per_core_appends
-        .iter()
-        .filter(|appends| **appends > 0)
-        .count();
-    let active_groups = snapshot
-        .per_group_appends
-        .iter()
-        .filter(|appends| **appends > 0)
-        .count();
-
-    let raft_grpc = raft_grpc_metrics_snapshot();
-    let view = MetricsView {
-        runtime: &snapshot,
-        active_cores,
-        active_groups,
-        http: &http,
-        raft_grpc: &raft_grpc,
-        mailbox_depths: &mailbox.depths,
-        mailbox_capacities: &mailbox.capacities,
-        cold_store: render_cold_store_info(cold_store),
-        raft_group_count: raft_groups.len(),
-        raft_groups: render_raft_group_metrics_array(raft_groups),
-    };
-    serde_json::to_value(&view).unwrap_or(Value::Null)
-}
-
-pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> Value {
-    let Some(value) = value else {
-        return json!({
-            "backend": "none",
-            "root": null,
-            "bucket": null,
-            "region": null,
-            "endpoint": null,
-            "encryption": null,
-        });
-    };
-    json!({
-        "backend": value.backend,
-        "root": value.root,
-        "bucket": value.bucket,
-        "region": value.region,
-        "endpoint": value.endpoint,
-        "encryption": value.encryption,
-    })
-}
-
-pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> Value {
-    Value::Array(
-        values
+) -> ursula_proto::telemetry::NodeDiagnostics {
+    use ursula_proto::telemetry::ColdStoreMetrics;
+    use ursula_proto::telemetry::NodeDiagnostics;
+    NodeDiagnostics {
+        active_cores: snapshot
+            .per_core_appends
             .iter()
-            .map(|value| {
-                json!({
-                    "raft_group_id": value.raft_group_id,
-                    "node_id": value.node_id,
-                    "current_term": value.current_term,
-                    "current_leader": value.current_leader,
-                    "last_log_index": value.last_log_index,
-                    "committed_term": value.committed.map(|progress| progress.term),
-                    "committed_index": value.committed.map(|progress| progress.index),
-                    "last_applied_term": value.last_applied.map(|progress| progress.term),
-                    "last_applied_index": value.last_applied.map(|progress| progress.index),
-                    "snapshot_term": value.snapshot.map(|progress| progress.term),
-                    "snapshot_index": value.snapshot.map(|progress| progress.index),
-                    "purged_term": value.purged.map(|progress| progress.term),
-                    "purged_index": value.purged.map(|progress| progress.index),
-                    "voter_ids": value.voter_ids,
-                    "learner_ids": value.learner_ids,
-                    "maintenance": value.maintenance,
-                    // F12e cadence inputs (bounded-state §7.5 soak gauges).
-                    "log_bytes_since_snapshot": value.log.log_bytes,
-                    "log_entries_since_snapshot": value.log.log_entries,
-                    "last_snapshot_bytes": value.log.last_snapshot_bytes,
-                    "has_snapshot": value.log.has_snapshot,
-                })
+            .filter(|count| **count > 0)
+            .count(),
+        active_groups: snapshot
+            .per_group_appends
+            .iter()
+            .filter(|count| **count > 0)
+            .count(),
+        runtime: snapshot,
+        http,
+        raft_grpc: raft_grpc_metrics_snapshot(),
+        mailbox_depths: mailbox.depths,
+        mailbox_capacities: mailbox.capacities,
+        cold_store: cold_store
+            .map(|store| ColdStoreMetrics {
+                backend: store.backend.to_owned(),
+                root: store.root.clone(),
+                bucket: store.bucket.clone(),
+                region: store.region.clone(),
+                endpoint: store.endpoint.clone(),
+                encryption: store.encryption.map(str::to_owned),
             })
-            .collect(),
-    )
+            .unwrap_or_else(|| ColdStoreMetrics {
+                backend: "none".to_owned(),
+                ..Default::default()
+            }),
+        raft_group_count: raft_groups.len(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn wal_recovery_metrics(
+    wal: &ursula_raft::wal::RaftWal,
+) -> ursula_proto::telemetry::WalRecoveryMetrics {
+    use ursula_proto::telemetry::PreviousWalRun;
+    use ursula_proto::telemetry::WalJournalSync;
+    use ursula_proto::telemetry::WalRecoveryMetrics;
+    use ursula_proto::telemetry::WalRecoveryReason;
+    use ursula_proto::telemetry::WalRecoveryState;
+    use ursula_proto::telemetry::WalReplayMode;
+    use ursula_proto::telemetry::WalSyncPolicy;
+    use ursula_raft::wal::RecoveryState;
+    use ursula_raft::wal::diagnostics::JournalReplayMode;
+    use ursula_raft::wal::diagnostics::JournalSync;
+    use ursula_raft::wal::diagnostics::PreviousRun;
+    use ursula_raft::wal::diagnostics::RecoveryReason;
+    let policy = |value| match value {
+        ursula_config::WalFsync::Always => WalSyncPolicy::Always,
+        ursula_config::WalFsync::Never => WalSyncPolicy::Never,
+    };
+    let opening = wal.opening();
+    WalRecoveryMetrics {
+        fsync: policy(wal.fsync()),
+        previous_run: match opening.previous_run {
+            PreviousRun::Absent => PreviousWalRun::Absent,
+            PreviousRun::Unrecorded => PreviousWalRun::Unrecorded,
+            PreviousRun::Clean => PreviousWalRun::Clean,
+            PreviousRun::ProcessCrash => PreviousWalRun::ProcessCrash,
+            PreviousRun::HostCrash { fsync } => PreviousWalRun::HostCrash {
+                fsync: policy(fsync),
+            },
+            PreviousRun::Poisoned => PreviousWalRun::Poisoned,
+        },
+        replay_mode: match opening.replay_mode {
+            JournalReplayMode::Strict => WalReplayMode::Strict,
+            JournalReplayMode::VerifiedPrefix => WalReplayMode::VerifiedPrefix,
+        },
+        recovery: match opening.recovery {
+            RecoveryState::Normal => WalRecoveryState::Normal,
+            RecoveryState::Recovering { reason } => WalRecoveryState::Recovering {
+                reason: match reason {
+                    RecoveryReason::HostCrash => WalRecoveryReason::HostCrash,
+                    RecoveryReason::Poisoned => WalRecoveryReason::Poisoned,
+                    RecoveryReason::UnknownHistory => WalRecoveryReason::UnknownHistory,
+                },
+            },
+        },
+        recovery_epoch: opening.recovery_epoch,
+        journal_sync: Some(match opening.journal_sync {
+            JournalSync::NotNeeded => WalJournalSync::NotNeeded,
+            JournalSync::BeforeRecording => WalJournalSync::BeforeRecording,
+        }),
+    }
+}
+
+pub(crate) fn raft_group_metrics(
+    value: &RaftGroupMetricsSnapshot,
+) -> ursula_proto::admin::RaftGroupMetrics {
+    ursula_proto::admin::RaftGroupMetrics {
+        raft_group_id: u64::from(value.raft_group_id),
+        node_id: value.node_id,
+        current_term: Some(value.current_term),
+        current_leader: value.current_leader,
+        committed_index: value.committed.map(|progress| progress.index),
+        last_applied_index: value.last_applied.map(|progress| progress.index),
+        voter_ids: value.voter_ids.clone(),
+        learner_ids: value.learner_ids.clone(),
+        maintenance: value.maintenance.clone(),
+        last_log_index: value.last_log_index,
+        committed_term: value.committed.map(|progress| progress.term),
+        last_applied_term: value.last_applied.map(|progress| progress.term),
+        snapshot_term: value.snapshot.map(|progress| progress.term),
+        snapshot_index: value.snapshot.map(|progress| progress.index),
+        purged_term: value.purged.map(|progress| progress.term),
+        purged_index: value.purged.map(|progress| progress.index),
+        log_bytes_since_snapshot: value.log.log_bytes,
+        log_entries_since_snapshot: value.log.log_entries,
+        last_snapshot_bytes: value.log.last_snapshot_bytes,
+        has_snapshot: value.log.has_snapshot,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> Value {
+    serde_json::to_value(values.iter().map(raft_group_metrics).collect::<Vec<_>>())
+        .unwrap_or(Value::Null)
 }
 
 pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {

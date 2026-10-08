@@ -471,6 +471,7 @@ impl RecoveryGateStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryGatesReport {
+    #[serde(deserialize_with = "deserialize_group_map")]
     pub gated: BTreeMap<u32, RecoveryGateStatus>,
     pub stalled: Vec<u32>,
 }
@@ -555,4 +556,154 @@ pub struct AddLearnerQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipQuery {
     pub voters: String,
+}
+
+/// Shared node metrics contract. Missing safety fields must never default to
+/// healthy; runtime and transport counters use the shared telemetry schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMetrics {
+    pub process_incarnation: ProcessIncarnation,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub process_node_id: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub maintenance_fence: Option<MaintenanceFenceState>,
+    pub maintenance_fence_uncertain: bool,
+    pub raft_groups: Vec<RaftGroupMetrics>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub raft_maintenance: Option<RaftMaintenanceReport>,
+    #[serde(flatten)]
+    pub diagnostics: crate::telemetry::NodeDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftGroupMetrics {
+    pub raft_group_id: u64,
+    pub node_id: u64,
+    pub current_term: Option<u64>,
+    pub current_leader: Option<u64>,
+    pub committed_index: Option<u64>,
+    pub last_applied_index: Option<u64>,
+    pub voter_ids: Vec<u64>,
+    pub learner_ids: Vec<u64>,
+    pub maintenance: RaftGroupMaintenanceState,
+    pub last_log_index: Option<u64>,
+    pub committed_term: Option<u64>,
+    pub last_applied_term: Option<u64>,
+    pub snapshot_term: Option<u64>,
+    pub snapshot_index: Option<u64>,
+    pub purged_term: Option<u64>,
+    pub purged_index: Option<u64>,
+    #[serde(default)]
+    pub log_bytes_since_snapshot: u64,
+    #[serde(default)]
+    pub log_entries_since_snapshot: u64,
+    #[serde(default)]
+    pub last_snapshot_bytes: u64,
+    #[serde(default)]
+    pub has_snapshot: bool,
+}
+
+// Flattened serde objects buffer JSON keys as strings, losing the JSON
+// deserializer's integer-key coercion. Accept both wire representations.
+fn deserialize_group_map<'de, D, V>(deserializer: D) -> Result<BTreeMap<u32, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    #[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[serde(untagged)]
+    enum Key {
+        Number(u32),
+        Text(String),
+    }
+    let entries = BTreeMap::<Key, V>::deserialize(deserializer)?;
+    let mut groups = BTreeMap::new();
+    for (key, value) in entries {
+        let group = match key {
+            Key::Number(group) => group,
+            Key::Text(text) => text.parse().map_err(serde::de::Error::custom)?,
+        };
+        if groups.insert(group, value).is_some() {
+            return Err(serde::de::Error::custom("duplicate group identifier"));
+        }
+    }
+    Ok(groups)
+}
+
+#[cfg(test)]
+mod metrics_contract_tests {
+    use super::*;
+
+    fn node() -> NodeMetrics {
+        NodeMetrics {
+            process_incarnation: ProcessIncarnation::from_bits(1),
+            process_node_id: Some(1),
+            maintenance_fence: Some(MaintenanceFenceState::Unclaimed),
+            maintenance_fence_uncertain: false,
+            raft_groups: vec![],
+            raft_maintenance: Some(RaftMaintenanceReport {
+                version: 1,
+                node_id: 1,
+                lag_tolerance: 0,
+                expected_groups: BTreeMap::from([(0, BTreeSet::from([1]))]),
+                node_issues: vec![],
+                group_issues: BTreeMap::new(),
+            }),
+            diagnostics: crate::telemetry::NodeDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn absent_safety_fields_are_not_healthy_defaults() {
+        for field in [
+            "process_incarnation",
+            "process_node_id",
+            "raft_groups",
+            "raft_maintenance",
+            "maintenance_fence",
+            "maintenance_fence_uncertain",
+        ] {
+            let mut wire = serde_json::to_value(node()).unwrap();
+            wire.as_object_mut().unwrap().remove(field);
+            serde_json::from_value::<NodeMetrics>(wire).expect_err(field);
+        }
+        serde_json::from_value::<RaftGroupMetrics>(serde_json::json!({
+            "raft_group_id": 0, "node_id": 1, "voter_ids": [1], "learner_ids": []
+        }))
+        .expect_err("group participation proof is required");
+    }
+
+    #[test]
+    fn unsupported_maintenance_version_is_not_a_safety_proof() {
+        let mut node = node();
+        node.raft_maintenance.as_mut().unwrap().version = 2;
+        let decoded: NodeMetrics =
+            serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
+        assert!(!decoded.raft_maintenance.unwrap().ready());
+    }
+
+    #[test]
+    fn flattened_metrics_round_trip_nonempty_recovery_gates_and_diagnostics() {
+        let mut node = node();
+        node.diagnostics.recovery_gates = Some(RecoveryGatesReport::new(BTreeMap::from([
+            (0, RecoveryGateStatus::AwaitingBarrier),
+            (u32::MAX, RecoveryGateStatus::Stalled),
+        ])));
+        node.diagnostics.runtime.accepted_appends = 7;
+        node.diagnostics.raft_grpc.raft_grpc_append_stream_requests = 19;
+        let wire = serde_json::to_vec(&node).unwrap();
+        let decoded: NodeMetrics = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded.diagnostics.runtime.accepted_appends, 7);
+        assert_eq!(
+            decoded
+                .diagnostics
+                .raft_grpc
+                .raft_grpc_append_stream_requests,
+            19
+        );
+        assert_eq!(
+            decoded.diagnostics.recovery_gates.unwrap().gated,
+            node.diagnostics.recovery_gates.unwrap().gated
+        );
+    }
 }

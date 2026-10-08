@@ -521,14 +521,7 @@ impl HttpMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-struct HttpMetricsSnapshot {
-    sse_streams_opened: u64,
-    sse_read_iterations: u64,
-    sse_data_events: u64,
-    sse_control_events: u64,
-    sse_error_events: u64,
-}
+pub use ursula_proto::telemetry::HttpMetricsSnapshot;
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
@@ -1749,115 +1742,46 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .map(RaftGroupHandleRegistry::metrics_snapshot)
         .unwrap_or_default();
-    let mut body = render_metrics(
+    let mut diagnostics = render_metrics(
         state.runtime.metrics().snapshot(),
         state.runtime.mailbox_snapshot(),
         state.http_metrics.snapshot(),
         &raft_groups,
         state.runtime.cold_store_info().as_ref(),
     );
-    // Splice process-level memory observability onto the metrics JSON so
-    // a chaos node's RSS trajectory is visible from any HTTP client (the
-    // status-publishing pipeline survives SSM exec failures).
-    let rss = state.node_memory.last_rss_bytes();
-    let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
-    let group_state_gauges = group_state_gauges_json(&state).await;
-    let maintenance_fence = state.admin_fence.snapshot().await;
-    if let Some(object) = body.as_object_mut() {
-        object.insert(
-            "process_incarnation".to_owned(),
-            serde_json::json!(state.process_incarnation),
-        );
-        object.insert(
-            "maintenance_fence".to_owned(),
-            serde_json::json!(maintenance_fence),
-        );
-        object.insert(
-            "maintenance_fence_uncertain".to_owned(),
-            serde_json::json!(state.admin_fence.is_uncertain()),
-        );
-        object.insert(
-            "process_node_id".to_owned(),
-            serde_json::json!(
+    diagnostics.configured_raft_group_count = state.runtime.raft_group_count();
+    diagnostics.group_state_gauges = group_state_gauges_json(&state).await;
+    diagnostics.process_rss_bytes = state.node_memory.last_rss_bytes();
+    diagnostics.node_memory_abort_cap_bytes =
+        state.node_memory.abort_cap_bytes().unwrap_or_default();
+    diagnostics.wal_recovery = state.raft_wal.as_ref().map(render::wal_recovery_metrics);
+    diagnostics.recovery_gates = state
+        .raft_registry()
+        .map(RaftGroupHandleRegistry::recovery_report);
+    let wal_disk = state.wal_disk.snapshot();
+    diagnostics.wal_available_bytes = wal_disk.available_bytes;
+    diagnostics.wal_min_available_bytes = wal_disk.min_available_bytes;
+    diagnostics.wal_resume_available_bytes = wal_disk.resume_available_bytes;
+    diagnostics.wal_disk_pressure = wal_disk.pressure;
+    diagnostics.wal_disk_stat_errors = wal_disk.stat_errors;
+    axum::Json(ursula_proto::admin::NodeMetrics {
+        maintenance_fence: Some(state.admin_fence.snapshot().await),
+        maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
+        process_incarnation: state.process_incarnation.clone(),
+        process_node_id: state
+            .configured_node_id
+            .or_else(|| {
                 state
-                    .configured_node_id
-                    .or_else(|| state
-                        .client_write_router
-                        .as_ref()
-                        .and_then(|topology| topology.node_id))
-                    .or_else(|| raft_groups.first().map(|group| group.node_id))
-            ),
-        );
-        object.insert(
-            "configured_raft_group_count".to_owned(),
-            serde_json::json!(state.runtime.raft_group_count()),
-        );
-        object.insert(
-            "raft_maintenance".to_owned(),
-            serde_json::json!(state.raft_maintenance_report()),
-        );
-        object.insert("group_state_gauges".to_owned(), group_state_gauges);
-        object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
-        object.insert(
-            "node_memory_abort_cap_bytes".to_owned(),
-            serde_json::json!(cap),
-        );
-        object.insert(
-            "wal_recovery".to_owned(),
-            serde_json::to_value(state.raft_wal.as_ref().map(WalRecoveryReport::new))
-                .unwrap_or(serde_json::Value::Null),
-        );
-        object.insert(
-            "recovery_gates".to_owned(),
-            serde_json::to_value(
-                state
-                    .raft_registry()
-                    .map(RaftGroupHandleRegistry::recovery_report),
-            )
-            .unwrap_or(serde_json::Value::Null),
-        );
-        let wal_disk = state.wal_disk.snapshot();
-        object.insert(
-            "wal_available_bytes".to_owned(),
-            serde_json::json!(wal_disk.available_bytes),
-        );
-        object.insert(
-            "wal_min_available_bytes".to_owned(),
-            serde_json::json!(wal_disk.min_available_bytes),
-        );
-        object.insert(
-            "wal_resume_available_bytes".to_owned(),
-            serde_json::json!(wal_disk.resume_available_bytes),
-        );
-        object.insert(
-            "wal_disk_pressure".to_owned(),
-            serde_json::json!(wal_disk.pressure),
-        );
-        object.insert(
-            "wal_disk_stat_errors".to_owned(),
-            serde_json::json!(wal_disk.stat_errors),
-        );
-    }
-    json_response(StatusCode::OK, body.to_string())
-}
-
-/// How the node's Raft WAL opened, in the metrics JSON as `wal_recovery`.
-/// `recovery.state` is `recovering` while the node's logs may be missing
-/// entries it acknowledged.
-#[derive(Debug, serde::Serialize)]
-struct WalRecoveryReport {
-    fsync: ursula_config::WalFsync,
-    #[serde(flatten)]
-    opening: ursula_raft::WalOpening,
-}
-
-impl WalRecoveryReport {
-    fn new(raft_wal: &ursula_raft::RaftWal) -> Self {
-        Self {
-            fsync: raft_wal.fsync(),
-            opening: raft_wal.opening(),
-        }
-    }
+                    .client_write_router
+                    .as_ref()
+                    .and_then(|topology| topology.node_id)
+            })
+            .or_else(|| raft_groups.first().map(|group| group.node_id)),
+        raft_groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
+        raft_maintenance: state.raft_maintenance_report(),
+        diagnostics,
+    })
+    .into_response()
 }
 
 /// Upper bound on how long a metrics scrape waits for the per-group
@@ -1867,38 +1791,46 @@ const GROUP_STATE_GAUGES_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
 /// §7.5) for `/__ursula/metrics`: one object per Raft group with the group id,
 /// whether this node hosts it, and either the gauges or an error.
-async fn group_state_gauges_json(state: &HttpState) -> serde_json::Value {
+async fn group_state_gauges_json(
+    state: &HttpState,
+) -> ursula_proto::telemetry::GroupGaugeCollection {
+    use ursula_proto::telemetry::GroupGaugeCollection;
+    use ursula_proto::telemetry::GroupGaugeMetrics;
     let Ok(groups) = http_time::timeout(
         GROUP_STATE_GAUGES_TIMEOUT,
         state.runtime.state_gauges_all_groups(),
     )
     .await
     else {
-        return serde_json::json!({ "error": "timed out collecting group state gauges" });
+        return GroupGaugeCollection::Error {
+            error: "timed out collecting group state gauges".to_owned(),
+        };
     };
-    let groups = groups
-        .into_iter()
-        .map(|(group, result)| match result {
-            Ok(gauges) => {
-                let mut value = serde_json::to_value(gauges).unwrap_or(serde_json::Value::Null);
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("raft_group_id".to_owned(), serde_json::json!(group.0));
-                    object.insert("hosted".to_owned(), serde_json::json!(true));
-                }
-                value
-            }
-            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
-                "raft_group_id": group.0,
-                "hosted": false,
-            }),
-            Err(err) => serde_json::json!({
-                "raft_group_id": group.0,
-                "hosted": true,
-                "error": err.to_string(),
-            }),
-        })
-        .collect::<Vec<_>>();
-    serde_json::Value::Array(groups)
+    GroupGaugeCollection::Groups(
+        groups
+            .into_iter()
+            .map(|(group, result)| match result {
+                Ok(gauges) => GroupGaugeMetrics {
+                    raft_group_id: group.0,
+                    hosted: true,
+                    gauges: Some(gauges),
+                    error: None,
+                },
+                Err(RuntimeError::GroupNotHosted { .. }) => GroupGaugeMetrics {
+                    raft_group_id: group.0,
+                    hosted: false,
+                    gauges: None,
+                    error: None,
+                },
+                Err(error) => GroupGaugeMetrics {
+                    raft_group_id: group.0,
+                    hosted: true,
+                    gauges: None,
+                    error: Some(error.to_string()),
+                },
+            })
+            .collect(),
+    )
 }
 
 #[cfg(feature = "jemalloc-prof")]

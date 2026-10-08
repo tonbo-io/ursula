@@ -487,29 +487,45 @@ mod tests {
         cluster: Arc<MockCluster>,
     }
 
-    async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
-        Json(json!({
-            "process_node_id": state.node_id,
-            "process_incarnation": ursula_proto::admin::ProcessIncarnation::from_bits(u128::from(state.node_id)),
-            "raft_groups": [{
-                "raft_group_id": 7,
-                "node_id": state.node_id,
-                "current_term": 1,
-                "current_leader": 2,
-                "committed_index": 100,
-                "last_applied_index": 100,
-                "voter_ids": [1, 2, 3],
-                "learner_ids": [],
-                "maintenance": {
-                    "running": true,
-                    "recovery_ready": state.cluster.recovery_gate_ready.load(Ordering::SeqCst),
-                    "accepting_transfers": true,
-                    "membership_joint": false,
-                    "membership_log_index": 0,
-                    "stopped_for_operator": false
-                }
-            }]
-        }))
+    async fn mock_metrics(State(state): State<MockNode>) -> Json<ursula_proto::admin::NodeMetrics> {
+        let mut metrics = crate::metrics::test_metrics(
+            state.node_id,
+            Some(ursula_proto::admin::ProcessIncarnation::from_bits(
+                u128::from(state.node_id),
+            )),
+        );
+        metrics
+            .raft_groups
+            .push(ursula_proto::admin::RaftGroupMetrics {
+                raft_group_id: 7,
+                node_id: state.node_id,
+                current_term: Some(1),
+                current_leader: Some(2),
+                committed_index: Some(100),
+                last_applied_index: Some(100),
+                voter_ids: vec![1, 2, 3],
+                learner_ids: vec![],
+                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
+                    running: true,
+                    recovery_ready: state.cluster.recovery_gate_ready.load(Ordering::SeqCst),
+                    accepting_transfers: true,
+                    membership_joint: false,
+                    membership_log_index: Some(0),
+                    stopped_for_operator: false,
+                },
+                last_log_index: Some(100),
+                committed_term: Some(1),
+                last_applied_term: Some(1),
+                snapshot_term: None,
+                snapshot_index: None,
+                purged_term: None,
+                purged_index: None,
+                log_bytes_since_snapshot: 0,
+                log_entries_since_snapshot: 0,
+                last_snapshot_bytes: 0,
+                has_snapshot: false,
+            });
+        Json(metrics)
     }
 
     async fn mock_drain(State(state): State<MockNode>) -> StatusCode {

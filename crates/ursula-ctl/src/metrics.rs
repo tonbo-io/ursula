@@ -11,7 +11,6 @@ use anyhow::bail;
 use reqwest::Client;
 use reqwest::Method;
 use reqwest::RequestBuilder;
-use serde::Deserialize;
 use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
@@ -241,7 +240,17 @@ impl MetricsClient {
             .json()
             .await
             .with_context(|| format!("decode metrics from node {}", node.id))?;
-        if body.process_node_id != node.id
+        if body
+            .raft_maintenance
+            .as_ref()
+            .is_some_and(|report| report.version != 1)
+        {
+            bail!(
+                "node {} returned an unsupported maintenance schema version",
+                node.id
+            );
+        }
+        if body.process_node_id != Some(node.id)
             || body
                 .raft_groups
                 .iter()
@@ -536,39 +545,7 @@ fn metrics_base_url(node: &NodeInfo) -> &url::Url {
         .unwrap_or(&node.admin_url)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct RawMetrics {
-    process_incarnation: ProcessIncarnation,
-    process_node_id: u64,
-    #[serde(default)]
-    maintenance_fence: Option<MaintenanceFenceState>,
-    #[serde(default)]
-    maintenance_fence_uncertain: bool,
-    #[serde(default)]
-    raft_groups: Vec<RawRaftGroup>,
-    #[serde(default)]
-    raft_maintenance: Option<ursula_proto::admin::RaftMaintenanceReport>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RawRaftGroup {
-    raft_group_id: u64,
-    node_id: u64,
-    #[serde(default)]
-    current_term: Option<u64>,
-    #[serde(default)]
-    current_leader: Option<u64>,
-    #[serde(default)]
-    committed_index: Option<u64>,
-    #[serde(default)]
-    last_applied_index: Option<u64>,
-    #[serde(default)]
-    voter_ids: Vec<u64>,
-    #[serde(default)]
-    learner_ids: Vec<u64>,
-    #[serde(default)]
-    maintenance: Option<ursula_proto::admin::RaftGroupMaintenanceState>,
-}
+type RawMetrics = ursula_proto::admin::NodeMetrics;
 
 #[derive(Debug, Clone)]
 pub struct NodeMetricsView {
@@ -594,7 +571,7 @@ impl NodeMetricsView {
                 last_applied_index: g.last_applied_index,
                 voter_ids: g.voter_ids,
                 learner_ids: g.learner_ids,
-                maintenance: g.maintenance,
+                maintenance: Some(g.maintenance),
             })
             .collect();
         Self {
@@ -704,6 +681,22 @@ impl ClusterSnapshot {
 }
 
 #[cfg(test)]
+pub(crate) fn test_metrics(
+    id: u64,
+    identity: Option<ProcessIncarnation>,
+) -> ursula_proto::admin::NodeMetrics {
+    ursula_proto::admin::NodeMetrics {
+        process_incarnation: identity.expect("complete fixture identity"),
+        process_node_id: Some(id),
+        maintenance_fence: Some(MaintenanceFenceState::Unclaimed),
+        maintenance_fence_uncertain: false,
+        raft_groups: vec![],
+        raft_maintenance: None,
+        diagnostics: Default::default(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -732,22 +725,40 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new()
-            .route("/__ursula/metrics", axum::routing::get(move || {
-                let identity = metrics_identity.lock().unwrap().clone();
-                async move { axum::Json(serde_json::json!({"process_incarnation": identity, "process_node_id": id, "raft_groups": []})) }
-            }))
-            .route("/__ursula/leadership-shed/maintenance", post(move |headers: axum::http::HeaderMap| {
-                let identity = mutation_identity.lock().unwrap().clone();
-                let count = mutation_count.clone();
-                async move {
-                    if let Some(identity) = identity {
-                        let Some(observed) = headers.get(PROCESS_INCARNATION_HEADER) else { return StatusCode::PRECONDITION_REQUIRED; };
-                        if observed.to_str().ok() != Some(identity.as_str()) { return StatusCode::PRECONDITION_FAILED; }
+            .route(
+                "/__ursula/metrics",
+                axum::routing::get(move || {
+                    let identity = metrics_identity.lock().unwrap().clone();
+                    async move {
+                        let mut body = serde_json::to_value(test_metrics(
+                            id,
+                            Some(ProcessIncarnation::from_bits(1)),
+                        ))
+                        .unwrap();
+                        body["process_incarnation"] = serde_json::to_value(identity).unwrap();
+                        axum::Json(body)
                     }
-                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    StatusCode::OK
-                }
-            }));
+                }),
+            )
+            .route(
+                "/__ursula/leadership-shed/maintenance",
+                post(move |headers: axum::http::HeaderMap| {
+                    let identity = mutation_identity.lock().unwrap().clone();
+                    let count = mutation_count.clone();
+                    async move {
+                        if let Some(identity) = identity {
+                            let Some(observed) = headers.get(PROCESS_INCARNATION_HEADER) else {
+                                return StatusCode::PRECONDITION_REQUIRED;
+                            };
+                            if observed.to_str().ok() != Some(identity.as_str()) {
+                                return StatusCode::PRECONDITION_FAILED;
+                            }
+                        }
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (
             NodeInfo {
@@ -763,6 +774,53 @@ mod tests {
             applied,
             task,
         )
+    }
+
+    #[tokio::test]
+    async fn metrics_client_rejects_missing_safety_fields_and_unknown_versions() {
+        for missing in [
+            Some("maintenance_fence_uncertain"),
+            Some("maintenance_fence"),
+            Some("raft_maintenance"),
+            None,
+        ] {
+            let mut wire =
+                serde_json::to_value(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
+                    .unwrap();
+            if let Some(field) = missing {
+                wire.as_object_mut().unwrap().remove(field);
+            } else {
+                wire["raft_maintenance"] = serde_json::json!({
+                    "version": 2, "node_id": 1, "lag_tolerance": 0,
+                    "expected_groups": {"0": [1]}, "node_issues": [], "group_issues": {}
+                });
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/__ursula/metrics",
+                axum::routing::get(move || {
+                    let wire = wire.clone();
+                    async move { axum::Json(wire) }
+                }),
+            );
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let node = NodeInfo {
+                id: 1,
+                host: address.to_string(),
+                admin_url: format!("http://{address}").parse().unwrap(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            };
+            let result = MetricsClient::new(Duration::from_secs(1))
+                .unwrap()
+                .fetch_node(&node)
+                .await;
+            result.expect_err("unsafe or unsupported metrics must be rejected");
+            task.abort();
+        }
     }
 
     #[tokio::test]
@@ -914,8 +972,10 @@ mod tests {
             .route(
                 "/__ursula/metrics",
                 axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({
-                "process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
+                    axum::Json(crate::metrics::test_metrics(
+                        1,
+                        Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                    ))
                 }),
             )
             .route(
@@ -961,14 +1021,34 @@ mod tests {
         let scrapes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = scrapes.clone();
         let app = Router::new()
-            .route("/__ursula/metrics", axum::routing::get(move || { let observed = observed.clone(); async move {
-                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
-            }}))
-            .route("/__ursula/raft/0/quorum", axum::routing::get(|headers: axum::http::HeaderMap| async move {
-                assert_eq!(headers[PROCESS_INCARNATION_HEADER], "00000000000000000000000000000001");
-                axum::Json(ursula_proto::admin::QuorumPrefix { raft_group_id: 0, leader_id: 1, leader_term: 3, required_applied_index: 17 })
-            }));
+            .route(
+                "/__ursula/metrics",
+                axum::routing::get(move || {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(crate::metrics::test_metrics(
+                            1,
+                            Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                        ))
+                    }
+                }),
+            )
+            .route(
+                "/__ursula/raft/0/quorum",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(
+                        headers[PROCESS_INCARNATION_HEADER],
+                        "00000000000000000000000000000001"
+                    );
+                    axum::Json(ursula_proto::admin::QuorumPrefix {
+                        raft_group_id: 0,
+                        leader_id: 1,
+                        leader_term: 3,
+                        required_applied_index: 17,
+                    })
+                }),
+            );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let node = NodeInfo {
             id: 1,
@@ -1002,15 +1082,32 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let app = Router::new()
-                .route("/__ursula/metrics", axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"process_node_id":1,"process_incarnation":"00000000000000000000000000000001"}))
-                }))
-                .route("/__ursula/raft/0/leader/transfer/2", post(move || async move {
-                    (axum::http::StatusCode::CONFLICT, axum::Json(TransferLeaderResponse {
-                        raft_group_id: 0, from: Some(1), to: Some(2), current_leader: None,
-                        transferred: false, rejection: Some(reason), reason: None,
-                    }))
-                }));
+                .route(
+                    "/__ursula/metrics",
+                    axum::routing::get(|| async {
+                        axum::Json(crate::metrics::test_metrics(
+                            1,
+                            Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                        ))
+                    }),
+                )
+                .route(
+                    "/__ursula/raft/0/leader/transfer/2",
+                    post(move || async move {
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            axum::Json(TransferLeaderResponse {
+                                raft_group_id: 0,
+                                from: Some(1),
+                                to: Some(2),
+                                current_leader: None,
+                                transferred: false,
+                                rejection: Some(reason),
+                                reason: None,
+                            }),
+                        )
+                    }),
+                );
             let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let node = NodeInfo {
                 id: 1,
@@ -1044,10 +1141,7 @@ mod tests {
             .route(
                 "/__ursula/metrics",
                 axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({
-                        "process_node_id": 1, "process_incarnation": ProcessIncarnation::from_bits(1),
-                        "raft_groups": [{"raft_group_id": 0, "node_id": 1}]
-                    }))
+                    axum::Json(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
                 }),
             )
             .route(
@@ -1093,9 +1187,17 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/__ursula/metrics", axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"process_node_id":2,"process_incarnation":ProcessIncarnation::from_bits(2),"raft_groups": [{"raft_group_id": 0, "node_id": 2}]}))
-            }))).await.unwrap();
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/__ursula/metrics",
+                    axum::routing::get(|| async {
+                        axum::Json(test_metrics(2, Some(ProcessIncarnation::from_bits(2))))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
         });
         let node = NodeInfo {
             expected_process_incarnation: None,

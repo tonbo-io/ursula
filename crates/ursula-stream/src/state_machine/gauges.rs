@@ -4,64 +4,12 @@
 //! group's streams (O(streams + producers)), so metric scrapes pay for it and
 //! apply does not.
 
-use serde::Deserialize;
-use serde::Serialize;
+pub use ursula_proto::telemetry::GroupStateGauges;
 
 use super::ProducerReceipt;
 use super::ProducerState;
 use super::StreamStateMachine;
 use super::stream_expiry_at_ms;
-
-/// Snapshot of one group's bounded-state gauges.
-///
-/// Counts are exact. Byte figures are length-based estimates (element counts
-/// times in-memory element sizes, without allocator slack), which is what the
-/// §7.2 formula checks compare against.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupStateGauges {
-    /// Live streams in the group.
-    pub streams: u64,
-    /// Shared pack-slice references held in stream state (F2).
-    pub shared_refs: u64,
-    /// Largest shared-reference list held by one stream.
-    pub max_shared_refs_per_stream: u64,
-    /// Distinct live shared pack objects in the group maps (F2).
-    pub live_packs: u64,
-    /// External payload locators held in stream state (F5).
-    pub staged_external_refs: u64,
-    /// Producer ids across streams (F3).
-    pub producers: u64,
-    /// Largest producer map held by one stream.
-    pub max_producers_per_stream: u64,
-    /// Producer receipts across streams (F3).
-    pub receipts: u64,
-    /// Receipts counted against the F3 window (one item per receipt; target:
-    /// 1,024 per stream beyond each producer's newest).
-    pub receipt_items: u64,
-    /// Largest receipt count held by one stream.
-    pub max_receipt_items_per_stream: u64,
-    /// Length-based producer state bytes across streams (F3 `Prod(s)`).
-    pub producer_bytes: u64,
-    /// Largest length-based producer state of one stream.
-    pub max_producer_bytes_per_stream: u64,
-    /// Live streams with a TTL or absolute expiry.
-    pub ttl_streams: u64,
-    /// Entries in the node-local TTL heap, stale ones included (F8 target:
-    /// at most two per TTL stream).
-    pub ttl_heap_entries: u64,
-    /// Unflushed payload bytes (the group hot gauge).
-    pub hot_payload_bytes: u64,
-    /// Hot blocks of up to 64 KiB (F6b; one per append before it).
-    pub hot_chunks: u64,
-    /// Hot-window block headers beyond payload (F6b).
-    pub hot_overhead_bytes: u64,
-    /// Pending cold-GC queue entries (F14).
-    pub pending_cold_gc: u64,
-    /// Per-bucket usage rows (F15, by design O(buckets ever written)).
-    pub bucket_usage_rows: u64,
-    /// Tenant-erasure fences (F15, by design O(buckets ever purged)).
-    pub erased_buckets: u64,
-}
 
 fn as_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
