@@ -8,7 +8,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
-use anyhow::bail;
 
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
@@ -91,9 +90,68 @@ fn format_leaders(counts: &BTreeMap<u64, usize>) -> String {
     format!("{{{}}}", entries.join(", "))
 }
 
-/// Block until every node reports `expected_groups` raft groups and every group
-/// has initialized voter membership plus a leader observed by that node.
-/// The separate maintenance probe must also certify the full configured voter set.
+/// A refusal retains the report or serving reason that prevents maintenance.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadinessRefusal {
+    #[error("node {node_id} lacks complete maintenance evidence: {report:?}")]
+    Maintenance {
+        node_id: u64,
+        report: Option<ursula_proto::admin::RaftMaintenanceReport>,
+    },
+    #[error("node {node_id} has uncertain maintenance authority")]
+    FenceUncertain { node_id: u64 },
+    #[error("node {node_id} is not serving (HTTP {status}): {reason:?}")]
+    Serving {
+        node_id: u64,
+        status: u16,
+        reason: Option<ursula_proto::admin::ServingReadinessReason>,
+    },
+    #[error(
+        "cluster inventory is incomplete: {observed_nodes}/{expected_nodes} nodes, expecting {expected_groups} initialized groups with leaders per node"
+    )]
+    Inventory {
+        expected_nodes: usize,
+        observed_nodes: usize,
+        expected_groups: usize,
+    },
+}
+
+/// Check existing metrics, without requiring a newer admin endpoint.
+pub fn check_maintenance_snapshot(
+    snapshot: &ClusterSnapshot,
+    expected_nodes: usize,
+    expected_groups: usize,
+) -> std::result::Result<(), ReadinessRefusal> {
+    for view in &snapshot.per_node {
+        if view.maintenance_fence_uncertain {
+            return Err(ReadinessRefusal::FenceUncertain {
+                node_id: view.node.id,
+            });
+        }
+        if !view
+            .raft_maintenance
+            .as_ref()
+            .is_some_and(|report| report.node_id == view.node.id && report.ready())
+        {
+            return Err(ReadinessRefusal::Maintenance {
+                node_id: view.node.id,
+                report: view.raft_maintenance.clone(),
+            });
+        }
+    }
+    let mut detail = String::new();
+    if !cluster_ready(snapshot, expected_nodes, expected_groups, &mut detail) {
+        return Err(ReadinessRefusal::Inventory {
+            expected_nodes,
+            observed_nodes: snapshot.per_node.len(),
+            expected_groups,
+        });
+    }
+    Ok(())
+}
+
+/// Wait for complete metrics evidence and the existing local serving probe.
+/// Transport, decoding, and identity errors retain their original source.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -102,24 +160,27 @@ pub async fn wait_ready(
     poll_interval: Duration,
 ) -> Result<ClusterSnapshot> {
     let started = Instant::now();
-    let mut last_summary = String::from("no metrics yet");
     loop {
-        let snapshot = client.try_fetch_cluster(nodes).await;
-        if cluster_ready(&snapshot, nodes.len(), expected_groups, &mut last_summary) {
-            let mut safe = true;
+        let snapshot = client.fetch_cluster(nodes).await?;
+        let mut refusal = check_maintenance_snapshot(&snapshot, nodes.len(), expected_groups).err();
+        if refusal.is_none() {
             for node in nodes {
-                if !client.maintenance_ready(node).await.unwrap_or(false) {
-                    safe = false;
-                    last_summary = format!("node {} is not safe for maintenance", node.id);
+                let (status, report) = client.serving_readiness(node).await?;
+                if status != reqwest::StatusCode::OK || !report.ready {
+                    refusal = Some(ReadinessRefusal::Serving {
+                        node_id: node.id,
+                        status: status.as_u16(),
+                        reason: report.reason,
+                    });
                     break;
                 }
             }
-            if safe {
-                return Ok(snapshot);
-            }
         }
+        let Some(refusal) = refusal else {
+            return Ok(snapshot);
+        };
         if started.elapsed() >= timeout {
-            bail!("cluster not ready after {:?}: {last_summary}", timeout);
+            return Err(refusal.into());
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -188,6 +249,131 @@ mod tests {
 
     use super::*;
     use crate::metrics::RaftGroupView;
+
+    #[tokio::test]
+    async fn wait_ready_uses_existing_probes_and_preserves_refusal_causes() {
+        use axum::response::IntoResponse;
+        use ursula_proto::admin::ServingReadinessReason;
+        for mode in 0..7 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut metrics = crate::metrics::test_metrics(
+                1,
+                Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+            );
+            let mut replica = group(0, Some(1));
+            replica.node_id = 1;
+            metrics.groups.push(replica);
+            metrics.raft_maintenance =
+                Some(crate::metrics::test_maintenance_report(1, &metrics.groups));
+            if mode == 1 {
+                metrics.maintenance_fence_uncertain = true;
+            }
+            if mode == 2 {
+                metrics
+                    .raft_maintenance
+                    .as_mut()
+                    .unwrap()
+                    .group_issues
+                    .insert(0, vec![
+                        ursula_proto::admin::RaftMaintenanceIssue::IncompleteVoterSet,
+                    ]);
+            }
+            let app = axum::Router::new()
+                .route(
+                    "/__ursula/metrics",
+                    axum::routing::get(move || {
+                        let metrics = metrics.clone();
+                        async move { axum::Json(metrics) }
+                    }),
+                )
+                .route(
+                    "/__ursula/ready",
+                    axum::routing::get(move || async move {
+                        if mode == 4 {
+                            return axum::http::StatusCode::NOT_FOUND.into_response();
+                        }
+                        if mode == 5 {
+                            return (axum::http::StatusCode::OK, "not json").into_response();
+                        }
+                        let ready = mode != 3;
+                        (
+                            if ready && mode != 6 {
+                                axum::http::StatusCode::OK
+                            } else {
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE
+                            },
+                            axum::Json(ursula_proto::admin::ServingReadiness {
+                                ready,
+                                reason: (!ready).then_some(ServingReadinessReason::WalDiskPressure),
+                                format_epoch_mismatch: false,
+                                recovery_barriers_ready: true,
+                                raft_maintenance: None,
+                                recovery_stalled_groups: vec![],
+                                wal_disk_pressure: !ready,
+                                wal_available_bytes: 0,
+                                wal_min_available_bytes: 0,
+                                wal_resume_available_bytes: 0,
+                                wal_disk_stat_errors: 0,
+                            }),
+                        )
+                            .into_response()
+                    }),
+                );
+            // No /maintenance/ready route: this is the existing 0.7 endpoint set.
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut node = node(1);
+            node.http_url = None;
+            node.admin_url = format!("http://{address}").parse().unwrap();
+            let result = wait_ready(
+                &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+                &[node],
+                1,
+                Duration::ZERO,
+                Duration::from_millis(1),
+            )
+            .await;
+            if mode == 0 {
+                assert_eq!(result.unwrap().per_node.len(), 1);
+            } else {
+                let error = result.unwrap_err();
+                match mode {
+                    1 => assert!(matches!(
+                        error.downcast_ref::<ReadinessRefusal>(),
+                        Some(ReadinessRefusal::FenceUncertain { node_id: 1 })
+                    )),
+                    2 => assert!(matches!(
+                        error.downcast_ref::<ReadinessRefusal>(),
+                        Some(ReadinessRefusal::Maintenance { node_id: 1, .. })
+                    )),
+                    3 => assert!(matches!(
+                        error.downcast_ref::<ReadinessRefusal>(),
+                        Some(ReadinessRefusal::Serving {
+                            node_id: 1,
+                            reason: Some(ServingReadinessReason::WalDiskPressure),
+                            status: 503,
+                        })
+                    )),
+                    4 => assert_eq!(
+                        error.downcast_ref::<reqwest::Error>().unwrap().status(),
+                        Some(reqwest::StatusCode::NOT_FOUND)
+                    ),
+                    5 => assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_decode()),
+                    _ => assert!(matches!(
+                        error.downcast_ref::<ReadinessRefusal>(),
+                        Some(ReadinessRefusal::Serving {
+                            node_id: 1,
+                            status: 503,
+                            reason: None
+                        })
+                    )),
+                }
+            }
+            task.abort();
+        }
+    }
 
     fn node(id: u64) -> NodeInfo {
         NodeInfo {

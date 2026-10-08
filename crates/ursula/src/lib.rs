@@ -911,10 +911,6 @@ pub fn admin_router(state: HttpState) -> Router {
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
-            ursula_proto::admin::MAINTENANCE_READINESS_PATH,
-            get(maintenance_readiness),
-        )
-        .route(
             "/__ursula/maintenance/fence/activate",
             post(activate_admin_fence),
         )
@@ -1313,29 +1309,6 @@ async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
 }
 
-async fn maintenance_readiness(State(state): State<HttpState>) -> Response {
-    let raft_maintenance = state.raft_maintenance_report();
-    let ready = !state.admin_fence.is_uncertain()
-        && !state.wal_disk.snapshot().pressure
-        && !state.format_epoch_mismatch.recorded()
-        && (state.raft_registry().is_none()
-            || raft_maintenance
-                .as_ref()
-                .is_some_and(ursula_proto::admin::RaftMaintenanceReport::ready));
-    (
-        if ready {
-            StatusCode::OK
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        },
-        axum::Json(ursula_proto::admin::MaintenanceReadiness {
-            ready,
-            raft_maintenance,
-        }),
-    )
-        .into_response()
-}
-
 async fn readiness(State(state): State<HttpState>) -> Response {
     let disk = state.wal_disk.snapshot();
     // A node that saw a peer on another format epoch never becomes Ready
@@ -1364,35 +1337,36 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    json_response(
+    use ursula_proto::admin::ServingReadinessReason as Reason;
+    (
         status,
-        serde_json::json!({
-            "ready": ready,
-            "reason": if format_epoch_mismatch {
-                Some("format_epoch_mismatch")
+        axum::Json(ursula_proto::admin::ServingReadiness {
+            ready,
+            reason: if format_epoch_mismatch {
+                Some(Reason::FormatEpochMismatch)
             } else if disk.pressure {
-                Some("wal_disk_pressure")
+                Some(Reason::WalDiskPressure)
             } else if !stalled_groups.is_empty() {
-                Some("recovery_stalled")
+                Some(Reason::RecoveryStalled)
             } else if !recovery_ready {
-                Some("recovery_gate_closed")
+                Some(Reason::RecoveryGateClosed)
             } else if !raft_ready {
-                Some("raft_replica_unready")
+                Some(Reason::RaftReplicaUnready)
             } else {
                 None
             },
-            "format_epoch_mismatch": format_epoch_mismatch,
-            "recovery_barriers_ready": recovery_ready,
-            "raft_maintenance": raft_maintenance,
-            "recovery_stalled_groups": stalled_groups,
-            "wal_disk_pressure": disk.pressure,
-            "wal_available_bytes": disk.available_bytes,
-            "wal_min_available_bytes": disk.min_available_bytes,
-            "wal_resume_available_bytes": disk.resume_available_bytes,
-            "wal_disk_stat_errors": disk.stat_errors,
-        })
-        .to_string(),
+            format_epoch_mismatch,
+            recovery_barriers_ready: recovery_ready,
+            raft_maintenance,
+            recovery_stalled_groups: stalled_groups,
+            wal_disk_pressure: disk.pressure,
+            wal_available_bytes: disk.available_bytes,
+            wal_min_available_bytes: disk.min_available_bytes,
+            wal_resume_available_bytes: disk.resume_available_bytes,
+            wal_disk_stat_errors: disk.stat_errors,
+        }),
     )
+        .into_response()
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {

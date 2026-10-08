@@ -809,19 +809,49 @@ mod metrics_contract_tests {
     }
 }
 
-/// Separate admin probe for disruption safety, not Service endpoint selection.
-pub const MAINTENANCE_READINESS_PATH: &str = "/__ursula/maintenance/ready";
+/// Local serving health, distinct from complete maintenance redundancy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingReadinessReason {
+    FormatEpochMismatch,
+    WalDiskPressure,
+    RecoveryStalled,
+    RecoveryGateClosed,
+    #[serde(alias = "raft_maintenance_unready")]
+    RaftReplicaUnready,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MaintenanceReadiness {
+pub struct ServingReadiness {
     pub ready: bool,
     #[serde(deserialize_with = "Option::deserialize")]
+    pub reason: Option<ServingReadinessReason>,
+    pub format_epoch_mismatch: bool,
+    pub recovery_barriers_ready: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
     pub raft_maintenance: Option<RaftMaintenanceReport>,
+    pub recovery_stalled_groups: Vec<u32>,
+    pub wal_disk_pressure: bool,
+    pub wal_available_bytes: u64,
+    pub wal_min_available_bytes: u64,
+    pub wal_resume_available_bytes: u64,
+    pub wal_disk_stat_errors: u64,
 }
 
 #[cfg(test)]
 mod serving_readiness_tests {
     use super::*;
+
+    #[test]
+    fn previous_readiness_reason_decodes_but_serialization_uses_current_name() {
+        let reason: ServingReadinessReason =
+            serde_json::from_str("\"raft_maintenance_unready\"").unwrap();
+        assert_eq!(reason, ServingReadinessReason::RaftReplicaUnready);
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            "\"raft_replica_unready\""
+        );
+    }
 
     #[test]
     fn only_membership_completeness_is_relaxed_for_serving() {

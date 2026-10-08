@@ -33,7 +33,7 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
 | `pin-incarnations` | Save required process identities in a manifest for subsequent commands |
 | `status` | Per-node group counts and leadership distribution |
-| `wait-ready` | Block until every node reports the expected group count and every group has a leader |
+| `wait-ready` | Wait for complete maintenance evidence and local serving health on every node |
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
 | `verify-quorum` | Confirm every configured group with a fresh ReadIndex round and require every replica to apply its fixed prefix under the same leader term |
 | `verify-survivors` | Confirm fresh prefixes on two observed survivors while preserving the three-voter configuration; does not certify full redundancy or physical fencing |
@@ -72,7 +72,7 @@ These commands install or retire the supplied token; they do not acquire a share
 
 Activation waits for admitted mutation handlers and then confirms prior messages were processed by each captured local Raft API queue. Caller cancellation leaves its admitted handler running; abnormal handler termination latches that process closed. Failed or cancelled activation/retirement stays closed until the same pending lifecycle completes or an externally admitted higher generation activates. Retirement retains its generation and cannot be reopened by the same token. This confirms submission ordering, not completion of asynchronous replication, snapshot work, or physical operations. Fresh all-replica prefix certification and external lifecycle reconciliation remain required before releasing the reservation.
 
-New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token; other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`; `verify-quorum` schema 3 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it; a mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
+New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token; other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`; `verify-quorum` schema 4 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it; a mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
 
 ## The admin plane
 
@@ -168,13 +168,13 @@ node 3 (10.0.0.3): groups=4 leaders={1: 2, 2: 2}
 
 ## `wait-ready`
 
-Block until every node reports `--expected-groups` Raft groups, each with a leader. Useful in CI / scripts after a deploy or a config change.
+Wait until every node reports `--expected-groups` initialized Raft groups with leaders, a complete uniform voter set in `raft_maintenance`, and no uncertain maintenance fence. Each node must also return 200 from the existing `/__ursula/ready` probe. This works against 0.7.0 servers without adding a new endpoint.
 
 ```bash
 ursulactl wait-ready --config cluster.json --expected-groups 4
 ```
 
-Exits non-zero with a one-line reason if the timeout passes (`cluster not ready after 120s: node 3 has 1 group(s) without a leader`).
+Exits non-zero with the maintenance report or serving refusal when the timeout passes. Transport, decoding, and identity errors retain their original cause and stop the wait. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
 
 ## Underlying HTTP surface
 
@@ -182,7 +182,8 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 
 | Verb | Endpoint |
 |------|----------|
-| `status`, `wait-ready`, `wait` | `GET /__ursula/metrics` |
+| `status`, `wait` | `GET /__ursula/metrics` |
+| `wait-ready` | `GET /__ursula/metrics` and `GET /__ursula/ready` |
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
 | `backup-create` | `GET /__ursula/backup/info`, `GET /__ursula/backup/group/{raft_group_id}` |

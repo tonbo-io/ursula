@@ -65,7 +65,12 @@ pub fn check_raft_maintenance(
             issues.push(Issue::JointMembership);
         }
         let voters = group.voter_ids.iter().copied().collect::<BTreeSet<_>>();
-        if !voters.contains(&node_id) {
+        if group.voter_configurations.is_empty()
+            || !group
+                .voter_configurations
+                .iter()
+                .all(|config| config.contains(&node_id))
+        {
             issues.push(Issue::LocalReplicaNotVoter);
         }
         if &voters != expected || !group.learner_ids.is_empty() {
@@ -121,6 +126,7 @@ mod tests {
     fn serving_keeps_survivors_but_excludes_the_rebuilding_learner() {
         let mut survivor = healthy(0);
         survivor.voter_ids = vec![1, 2];
+        survivor.voter_configurations = vec![BTreeSet::from([1, 2])];
         survivor.learner_ids = vec![3];
         let expected = BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]);
         let report = check_raft_maintenance(&[survivor.clone()], 1, expected.clone(), 16);
@@ -144,6 +150,7 @@ mod tests {
             snapshot: None,
             purged: None,
             voter_ids: vec![1, 2, 3],
+            voter_configurations: vec![BTreeSet::from([1, 2, 3])],
             learner_ids: vec![],
             maintenance: RaftGroupMaintenanceState {
                 running: true,
@@ -155,6 +162,22 @@ mod tests {
             },
             log: Default::default(),
         }
+    }
+
+    #[test]
+    fn outgoing_joint_voter_is_not_serving_even_while_in_union() {
+        let mut group = healthy(0);
+        group.node_id = 3;
+        group.maintenance.membership_joint = true;
+        group.voter_configurations = vec![BTreeSet::from([1, 2, 3]), BTreeSet::from([1, 2])];
+        let report = check_raft_maintenance(
+            &[group],
+            3,
+            BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
+            16,
+        );
+        assert!(report.group_issues[&0].contains(&RaftMaintenanceIssue::LocalReplicaNotVoter));
+        assert!(!report.serving_ready());
     }
 
     fn report(groups: &[RaftGroupMetricsSnapshot]) -> RaftMaintenanceReport {

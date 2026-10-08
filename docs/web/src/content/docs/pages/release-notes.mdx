@@ -3,6 +3,16 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## Unreleased
+
+Local serving readiness is separate from full maintenance redundancy. Healthy
+surviving voters can remain ready while a wiped replica rebuilds. The local
+Raft refusal reason changes from `raft_maintenance_unready` to
+`raft_replica_unready`. Update alerts that match that reason and monitor
+`raft_maintenance.group_issues` for incomplete voter sets. `ursulactl wait-ready`
+continues to require complete redundancy and now also checks the existing
+serving probe. No new maintenance endpoint is required.
+
 ## 0.7.0
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.

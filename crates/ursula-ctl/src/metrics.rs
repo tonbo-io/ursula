@@ -222,20 +222,16 @@ impl MetricsClient {
         Ok(pinned)
     }
 
-    pub async fn maintenance_ready(&self, node: &NodeInfo) -> Result<bool> {
-        let url = node
-            .admin_url
-            .join(ursula_proto::admin::MAINTENANCE_READINESS_PATH)?;
+    pub async fn serving_readiness(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<(reqwest::StatusCode, ursula_proto::admin::ServingReadiness)> {
+        let url = metrics_base_url(node).join("/__ursula/ready")?;
         let response = self.client.get(url).send().await?;
-        if !response.status().is_success() {
-            return Ok(false);
+        if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            response.error_for_status_ref()?;
         }
-        let report: ursula_proto::admin::MaintenanceReadiness = response.json().await?;
-        Ok(report.ready
-            && report
-                .raft_maintenance
-                .as_ref()
-                .is_some_and(|report| report.node_id == node.id && report.ready()))
+        Ok((response.status(), response.json().await?))
     }
 
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
@@ -891,69 +887,6 @@ mod tests {
                     .filter_map(|source| source.downcast_ref::<reqwest::Error>())
                     .any(reqwest::Error::is_decode)
             );
-            task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn maintenance_probe_requires_supported_local_complete_evidence() {
-        use std::collections::BTreeMap;
-
-        use ursula_proto::admin::MaintenanceReadiness;
-        use ursula_proto::admin::RaftMaintenanceReport;
-        for (version, node_id, present, expected) in [
-            (1, 1, true, true),
-            (2, 1, true, false),
-            (1, 2, true, false),
-            (1, 1, false, false),
-        ] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let app = Router::new().route(
-                ursula_proto::admin::MAINTENANCE_READINESS_PATH,
-                axum::routing::get(move || async move {
-                    let mut wire = serde_json::to_value(MaintenanceReadiness {
-                        ready: true,
-                        raft_maintenance: present.then(|| RaftMaintenanceReport {
-                            version: ursula_proto::admin::SchemaVersion,
-                            node_id,
-                            lag_tolerance: 16,
-                            expected_groups: BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
-                            node_issues: vec![],
-                            group_issues: BTreeMap::new(),
-                        }),
-                    })
-                    .unwrap();
-                    if present {
-                        wire["raft_maintenance"]["version"] = serde_json::json!(version);
-                    }
-                    axum::Json(wire)
-                }),
-            );
-            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let node = NodeInfo {
-                id: 1,
-                host: address.to_string(),
-                admin_url: format!("http://{address}").parse().unwrap(),
-                http_url: None,
-                metrics_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
-            };
-            let result = MetricsClient::new(Duration::from_secs(1))
-                .unwrap()
-                .maintenance_ready(&node)
-                .await;
-            if version == 2 {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .downcast_ref::<reqwest::Error>()
-                        .is_some_and(reqwest::Error::is_decode)
-                );
-            } else {
-                assert_eq!(result.unwrap(), expected);
-            }
             task.abort();
         }
     }

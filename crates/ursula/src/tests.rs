@@ -5358,8 +5358,13 @@ async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_m
     let app = client_router_with_admission(state, IngressAdmission::default());
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-    assert_eq!(body["reason"], json!("raft_replica_unready"));
+    let typed: ursula_proto::admin::ServingReadiness =
+        serde_json::from_slice(&body_bytes(ready).await).unwrap();
+    assert_eq!(
+        typed.reason,
+        Some(ursula_proto::admin::ServingReadinessReason::RaftReplicaUnready)
+    );
+    let body = serde_json::to_value(typed).unwrap();
     assert_eq!(
         body["raft_maintenance"]["expected_groups"],
         json!({"0": [1, 2, 3], "1": [1, 2, 3]})
@@ -5543,6 +5548,7 @@ fn raft_metrics_snapshot(
         last_applied: committed.map(progress),
         snapshot: snapshot.map(progress),
         purged: None,
+        voter_configurations: vec![voters.iter().copied().collect()],
         voter_ids: voters,
         learner_ids: vec![],
         maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
@@ -8564,35 +8570,4 @@ async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejection
         assert_eq!(body.rejection, Some(reason));
         assert!(!body.transferred);
     }
-}
-
-#[tokio::test]
-async fn maintenance_readiness_is_admin_only_and_honors_local_disk_health() {
-    let monitor = WalDiskMonitor::new(100, 200);
-    let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
-    )
-    .with_wal_disk_monitor(monitor.clone());
-    let client = client_router_with_admission(state.clone(), IngressAdmission::default());
-    let admin = admin_router(state);
-    let path = ursula_proto::admin::MAINTENANCE_READINESS_PATH;
-    assert_eq!(
-        http_get(&client, path).await.status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(http_get(&admin, path).await.status(), StatusCode::OK);
-    monitor.observe_available(99);
-    let response = http_get(&admin, path).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let report: ursula_proto::admin::MaintenanceReadiness =
-        serde_json::from_slice(&body_bytes(response).await).unwrap();
-    assert!(!report.ready);
 }
