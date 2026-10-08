@@ -283,7 +283,7 @@ impl Drop for PrefetchedSnapshotGuard {
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuorumProofError {
-    #[error("Raft group {group:?} has no registered ReadIndex barrier")]
+    #[error("Raft group {group:?} is not registered on this node")]
     NotRegistered { group: RaftGroupId },
     #[error("Raft group {group:?} is not led by this node")]
     NotLeader { group: RaftGroupId },
