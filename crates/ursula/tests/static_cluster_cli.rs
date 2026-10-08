@@ -2315,7 +2315,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         wait_until_ready(&client, url, &mut children).await;
     }
     let admin = &admins[0];
-    let genesis = state(&client, admin).await;
+    let genesis = state(&client, admin, concat!(file!(), ":", line!())).await;
     assert_eq!(genesis.operations.processes.len(), 3);
     assert!(!genesis.nodes.contains_key(&4));
     let stream = format!("{}/meta/drill", peers[0].1);
@@ -2332,7 +2332,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     for (_, url) in peers.iter().take(3) {
         wait_until_ready(&client, url, &mut children).await;
     }
-    let restarted_genesis = state(&client, admin).await;
+    let restarted_genesis = state(&client, admin, concat!(file!(), ":", line!())).await;
     assert_eq!(restarted_genesis.placements, genesis.placements);
     assert_eq!(
         restarted_genesis.operations.replicas,
@@ -2365,7 +2365,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     );
     children.push(spawn_node_with_cluster_config(binary, &configs[3]));
     wait_until_ready(&client, &peers[3].1, &mut children).await;
-    let initial = state(&client, admin).await;
+    let initial = state(&client, admin, concat!(file!(), ":", line!())).await;
     assert_eq!(initial.operations.processes.len(), 4);
     assert_eq!(initial.placements, genesis.placements);
     read_until_matches(&client, &read, b"durable-before-maintenance").await;
@@ -2375,7 +2375,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     children[1].child.wait().expect("join node2");
     children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
     wait_until_ready(&client, &peers[1].1, &mut children).await;
-    let restarted = state(&client, admin).await;
+    let restarted = state(&client, admin, concat!(file!(), ":", line!())).await;
     assert!(restarted.operations.processes[&2].epoch() > initial.operations.processes[&2].epoch());
     assert_eq!(restarted.placements, initial.placements);
     read_until_matches(&client, &read, b"durable-before-maintenance").await;
@@ -2509,7 +2509,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             // Same-WAL restarts of source, target and survivor during Preparing
             // must refresh boot pins without changing the durable replica token.
             for index in [2_usize, 3, 1] {
-                let before = state(&client, admin).await;
+                let before = state(&client, admin, concat!(file!(), ":", line!())).await;
                 children[index]
                     .child
                     .kill()
@@ -2520,7 +2520,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                     .expect("join operation participant");
                 children[index] = spawn_node_with_cluster_config(binary, &configs[index]);
                 wait_until_ready(&client, &peers[index].1, &mut children).await;
-                let after = state(&client, admin).await;
+                let after = state(&client, admin, concat!(file!(), ":", line!())).await;
                 let node_id = u64::try_from(index).unwrap().saturating_add(1);
                 assert!(
                     after.operations.processes[&node_id].epoch()
@@ -2618,7 +2618,12 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         if matches!(kind, OperationKind::RebuildReplica { .. }) {
             children[1].child.kill().expect("stop retired node2");
             children[1].child.wait().expect("join retired node2");
-            let retired = state(&client, admin).await;
+            let retired = state(
+                &client,
+                admin,
+                "after stopping retired node2, before old-WAL restart",
+            )
+            .await;
             // Restarting the revoked old WAL is not a replacement. It must
             // fail before changing the retired process/replica authority.
             children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
@@ -2634,7 +2639,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let rejected = state(&client, admin).await;
+            let rejected = state(&client, admin, concat!(file!(), ":", line!())).await;
             assert_eq!(
                 rejected.operations.processes[&2],
                 retired.operations.processes[&2]
@@ -2653,7 +2658,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             // replacement identity on every survivor group and activates it.
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
-                let observed = state(&client, admin).await;
+                let observed = state(&client, admin, concat!(file!(), ":", line!())).await;
                 if matches!(
                     observed.operations.replicas.get(&2),
                     Some(ursula_control::ReplicaState::Pending { .. })
@@ -2666,7 +2671,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let pending = state(&client, admin).await;
+            let pending = state(&client, admin, concat!(file!(), ":", line!())).await;
             children[1]
                 .child
                 .kill()
@@ -2675,7 +2680,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
-                let restarted = state(&client, admin).await;
+                let restarted = state(&client, admin, concat!(file!(), ":", line!())).await;
                 if restarted.operations.processes[&2].epoch()
                     > pending.operations.processes[&2].epoch()
                 {
@@ -2704,7 +2709,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         if matches!(kind, OperationKind::RebuildReplica { .. }) {
             // A survivor may restart in Retired after the replacement has been
             // fenced and promoted, before final evidence is collected.
-            let before = state(&client, admin).await;
+            let before = state(&client, admin, concat!(file!(), ":", line!())).await;
             children[3]
                 .child
                 .kill()
@@ -2715,7 +2720,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                 .expect("join retired-phase survivor");
             children[3] = spawn_node_with_cluster_config(binary, &configs[3]);
             wait_until_ready(&client, &peers[3].1, &mut children).await;
-            let after = state(&client, admin).await;
+            let after = state(&client, admin, concat!(file!(), ":", line!())).await;
             assert!(
                 after.operations.processes[&4].epoch() > before.operations.processes[&4].epoch()
             );
@@ -2779,7 +2784,7 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
             read_until_matches(&client, &read, b"durable-before-maintenance").await;
         }
     }
-    let completed = state(&client, admin).await;
+    let completed = state(&client, admin, concat!(file!(), ":", line!())).await;
     assert!(completed.operations.active.is_none());
     assert_eq!(
         completed.placements[&RaftGroupId(0)].voters,
@@ -2813,17 +2818,49 @@ mod lifecycle_support {
     use ursula_control::OperationRequest;
 
     use super::*;
-    pub(super) async fn state(client: &reqwest::Client, admin: &str) -> ControlPlaneState {
-        client
-            .get(format!("{admin}/__ursula/control/state"))
-            .send()
+    pub(super) async fn state(
+        client: &reqwest::Client,
+        admin: &str,
+        phase: &str,
+    ) -> ControlPlaneState {
+        read_state(client, admin, Duration::from_secs(30))
             .await
-            .expect("read meta state")
-            .error_for_status()
-            .expect("linearizable meta read")
-            .json()
-            .await
-            .expect("typed meta state")
+            .unwrap_or_else(|error| panic!("meta state in {phase} at {admin}: {error:#}"))
+    }
+
+    pub(super) async fn read_state(
+        client: &reqwest::Client,
+        admin: &str,
+        budget: Duration,
+    ) -> anyhow::Result<ControlPlaneState> {
+        let mut last_unavailable = String::new();
+        let result = tokio::time::timeout(budget, async {
+            loop {
+                let response = client
+                    .get(format!("{admin}/__ursula/control/state"))
+                    .send()
+                    .await?;
+                let status = response.status();
+                let body = response.text().await?;
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    last_unavailable = body;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                anyhow::ensure!(
+                    status.is_success(),
+                    "linearizable meta read returned {status}: {body}"
+                );
+                return Ok::<_, anyhow::Error>(serde_json::from_str(&body)?);
+            }
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "linearizable meta read exceeded {budget:?}: {error}; last503={last_unavailable}"
+            )),
+        }
     }
     pub(super) async fn operation(
         client: &reqwest::Client,
@@ -2957,7 +2994,7 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
         let stream = format!("{}/meta/offline-survivor", peers[0].1);
         put_with_body_until_created(&client, &stream, "before-replacement").await;
         let admin = &admins[0];
-        let before = state(&client, admin).await;
+        let before = state(&client, admin, concat!(file!(), ":", line!())).await;
         let survivor_identity = before.operations.replicas[&5].clone();
         let OperationOutcome::Acquired(token) = operation(
             &client,
@@ -2996,7 +3033,7 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
         children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
         phase.set("replacement pending");
         let replacement = loop {
-            let observed = state(&client, admin).await;
+            let observed = state(&client, admin, concat!(file!(), ":", line!())).await;
             if let ReplicaState::Pending { replacement, .. } = &observed.operations.replicas[&2] {
                 break replacement.clone();
             }
@@ -3006,18 +3043,28 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
         // but deliberately insufficient for the required all-survivor fence.
         children[4].child.kill().unwrap();
         children[4].child.wait().unwrap();
-        let request = admin_test_post(&client, format!("{admin}/__ursula/control/operation"))
-            .await
-            .json(&OperationRequest::Reconcile {
-                token: token.clone(),
-            });
-        let reconcile = tokio::spawn(async move {
-            let response = request.send().await?;
-            let status = response.status();
-            Ok::<_, reqwest::Error>((status, response.text().await?))
+        let operator = ursula_ctl::MetricsClient::new(Duration::from_secs(60)).unwrap();
+        let node = ursula_ctl::NodeInfo {
+            id: 1,
+            admin_url: admin.parse().unwrap(),
+            host: "127.0.0.1".into(),
+            http_url: None,
+            metrics_url: None,
+            expected_process_incarnation: None,
+        };
+        let request = OperationRequest::Reconcile { token: token.clone() };
+        let mut reconcile = tokio::spawn(async move {
+            operator.submit_operation(&node, &request).await
         });
         phase.set("quorum has fence but offline survivor blocks activation");
         loop {
+            if reconcile.is_finished() {
+                let result = (&mut reconcile).await;
+                let observed = state(&client, admin, "background Reconcile terminated before fence quorum").await;
+                let reports = children.iter().map(child_report).collect::<Vec<_>>();
+                panic!("Reconcile ended before survivor fence installation: {result:?}; control={observed:?}; children={reports:#?}");
+            }
+
             let mut installed = true;
             for index in [0, 2, 3] {
                 let metrics: NodeMetrics = client
@@ -3038,7 +3085,7 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let blocked = state(&client, admin).await;
+        let blocked = state(&client, admin, concat!(file!(), ":", line!())).await;
         assert!(
             matches!(&blocked.operations.replicas[&2], ReplicaState::Pending {
             replacement: current, installed_groups, ..
@@ -3056,13 +3103,10 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
         phase.set("same-WAL survivor returns");
         children[4] = spawn_node_with_cluster_config(binary, &configs[4]);
         wait_until_ready(&client, &peers[4].1, &mut children).await;
-        let attempted = reconcile.await.unwrap();
-        if let Ok((status, body)) = &attempted {
-            assert!(
-                status.is_success() || *status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                "unexpected reconcile refusal: {status}: {body}"
-            );
-        }
+        let reconciled = reconcile.await.expect("background Reconcile task");
+        assert!(matches!(reconciled,
+            Ok(ursula_control::ControlResponse::Operation(Ok(OperationOutcome::ActionFinished)))),
+            "background Reconcile after survivor return: {reconciled:?}");
         operation(
             &client,
             admin,
@@ -3072,7 +3116,7 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
             &children,
         )
         .await;
-        let active = state(&client, admin).await;
+        let active = state(&client, admin, concat!(file!(), ":", line!())).await;
         assert_eq!(active.operations.replicas[&5], survivor_identity);
         let ReplicaState::Active {
             identity,
@@ -3179,5 +3223,71 @@ async fn cli_replica_replacement_waits_for_an_offline_survivor() {
             "offline-survivor deadline in {}; children={reports:#?}",
             phase.get()
         );
+    }
+}
+
+#[tokio::test]
+async fn meta_state_read_retries_only_503_with_one_deadline() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use axum::http::StatusCode;
+
+    for (status, recover) in [
+        (StatusCode::SERVICE_UNAVAILABLE, true),
+        (StatusCode::CONFLICT, false),
+        (StatusCode::SERVICE_UNAVAILABLE, false),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/__ursula/control/state",
+            axum::routing::get(move || {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if recover && attempt > 0 {
+                        (
+                            StatusCode::OK,
+                            serde_json::to_string(&ursula_control::ControlPlaneState::default())
+                                .unwrap(),
+                        )
+                    } else {
+                        (status, "fixture meta leader unavailable".to_owned())
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            lifecycle_support::read_state(
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                Duration::from_millis(250),
+            ),
+        )
+        .await
+        .expect("overall retry deadline must not reset");
+        if recover {
+            assert_eq!(
+                result.unwrap(),
+                ursula_control::ControlPlaneState::default()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        } else {
+            let error = result
+                .expect_err("permanent or unavailable result must fail")
+                .to_string();
+            assert!(error.contains("fixture meta leader unavailable"), "{error}");
+            if status == StatusCode::CONFLICT {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(calls.load(Ordering::SeqCst) >= 2);
+            }
+        }
+        server.abort();
+        server.await.expect_err("mock listener stopped");
     }
 }
