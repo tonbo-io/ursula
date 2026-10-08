@@ -7,38 +7,63 @@ Start at `/__ursula/metrics`. Most operational symptoms have a clear signal in t
 ## Diagnostic surface
 
 ```bash
-curl http://NODE:4437/__ursula/metrics | jq .
+curl http://NODE:4437/__ursula/metrics > metrics.json
 ```
 
-Useful jq selectors:
+Useful jq selectors. Arrays named `per_core_*` are indexed by core, and arrays named `per_group_*` by Raft group ID.
 
-| What you need | jq filter |
-| ------------- | --------- |
-| Per-group leader / term | `.raft_groups[] | {id, leader_id, current_term, last_applied}` |
-| Hot bytes per group | `.raft_groups[] | {id, hot_bytes_total}` |
-| Cold backpressure events | `.cold_backpressure_events_total` |
-| Per-core mailbox depth | `.cores[] | {core_id, mailbox_pending}` |
-| Live-read watcher counts | `.cores[] | {core_id, live_read_watchers_active}` |
-| HTTP error counters | `.http.responses_by_status` |
-| WAL disk pressure | `{available: .wal_available_bytes, minimum: .wal_min_available_bytes, pressure: .wal_disk_pressure}` |
-| WAL reclaim/restart | `{physical: .wal_physical_bytes, segments: .wal_segments, reclaims: .wal_reclaims, lagging: .wal_lagging_groups, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
-| WAL opening and recovery gates | `{opening: .wal_recovery, gates: .recovery_gates}` |
+```bash
+# Leader, term and applied index of each group. current_leader is null while the group has no leader.
+jq '.raft_groups[] | {raft_group_id, current_leader, current_term, last_applied_index}' metrics.json
+# Groups without a leader
+jq '[.raft_groups[] | select(.current_leader == null) | .raft_group_id]' metrics.json
+# Hot bytes waiting for cold flush, per group
+jq '.per_group_cold_hot_bytes' metrics.json
+# Writes refused by cold-write backpressure, in total and per group
+jq '{total: .cold_backpressure_events, per_group: .per_group_cold_backpressure_events}' metrics.json
+# Mailbox depth and capacity, per core
+jq '{depths: .mailbox_depths, capacities: .mailbox_capacities}' metrics.json
+# Live reads waiting for new data, per core
+jq '.per_core_live_read_waiters' metrics.json
+# SSE streams opened and SSE error events
+jq '{opened: .sse_streams_opened, errors: .sse_error_events}' metrics.json
+# WAL disk pressure
+jq '{available: .wal_available_bytes, minimum: .wal_min_available_bytes, pressure: .wal_disk_pressure}' metrics.json
+# WAL reclaim and restart work
+jq '{physical: .wal_physical_bytes, segments: .wal_segments, reclaims: .wal_reclaims, lagging: .wal_lagging_groups, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}' metrics.json
+# How the WAL opened, and the groups behind a recovery gate
+jq '{opening: .wal_recovery, gates: .recovery_gates}' metrics.json
+# Local Raft issues that make the node unready or block maintenance
+jq '.raft_maintenance | {node_issues, group_issues}' metrics.json
+```
 
-`GET /__ursula/ready` is the process readiness probe: it returns `503` while
-the WAL disk-pressure guard is active, while a group's recovery gate is closed on this
-node, and after a Raft protocol mismatch with a peer
-(`"reason": "format_epoch_mismatch"`). Ursula does **not** expose `/healthz`, `/readyz`,
-Prometheus `/metrics`, or `/cluster/status`; use the JSON snapshot for detailed
-diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
+`GET /__ursula/ready` is the process readiness probe. It answers `200` when the
+node may serve, and otherwise `503` with a typed `reason`. When several apply,
+it reports the first of:
+
+| `reason` | Meaning |
+| -------- | ------- |
+| `format_epoch_mismatch` | The node exchanged a Raft RPC with a peer of another format epoch. It stays unready until it restarts |
+| `wal_disk_pressure` | The WAL filesystem is below `raft.wal.min_available_size`, or its free-space check failed |
+| `recovery_stalled` | A group's recovery gate on this node is stalled. The groups are listed under `recovery_stalled_groups` |
+| `recovery_gate_closed` | A group's recovery gate on this node is closed until the replica has applied a fresh barrier from the group's leader |
+| `raft_replica_unready` | A local replica is not a healthy voter. `raft_maintenance.group_issues` names the issue |
+
+Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
+`/cluster/status`. Use the JSON snapshot for detailed diagnosis and
+`ursulactl wait-ready` for cluster-wide Raft readiness.
 
 ### Serving during a replica rebuild
 
 `raft_replica_unready` means local Raft participation is not safe for serving.
-Inspect `raft_maintenance.group_issues` for `local_replica_not_voter`, missing
-membership, unapplied entries, or apply lag. A wiped replica stays 503 while
-its recovery gate is closed and while it is a learner. Healthy surviving
-voters can return 200 during the repair. A voter leaving a joint membership
-also stays unready once any configuration excludes it.
+Inspect `raft_maintenance.group_issues` for `local_replica_not_voter`,
+`membership_not_applied`, `not_applied`, `apply_lag` or `leader_unknown`. A
+wiped replica stays 503 while its recovery gate is closed and while it is a
+learner. Healthy surviving voters can return 200 during the repair. A voter
+leaving a joint membership also stays unready once any configuration excludes
+it. A replica whose own gate is open reports `leader_unknown` for a group that
+has no leader, for example a group stalled because a majority of its voters
+are gated.
 
 A 200 response does not certify full redundancy. Keep maintenance blocked until
 `ursulactl wait-ready` succeeds. Alert separately on incomplete voter sets in
@@ -134,9 +159,12 @@ leader and refuses writes. The groups are listed under
 If the stalled replicas retain their voting history, an operator can accept
 the loss of writes acknowledged after the last `fsync`, with
 `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated
-replicas with the longest logs. A replica without a durable vote floor
-refuses this call and still needs a fresh quorum proof. The request body names the replica's
-`last_log_index` and `current_term` from `/__ursula/metrics`. See
+replicas with the highest `last_log_index`, until the open replicas form a
+majority. A replica without a durable vote floor refuses this call and still
+needs a fresh quorum proof. The request body names the replica's
+`last_log_index` and `current_term` from `/__ursula/metrics`. A voter of the
+group that was never gated does not report `recovery_stalled`. It answers
+`raft_replica_unready` with `leader_unknown` for the group. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### `accept-unsynced-loss` answers `409 Conflict`
@@ -173,7 +201,7 @@ The backup references cold objects that the target's `storage.cold.root` does no
 
 ### A fresh cluster never elects leaders
 
-`/__ursula/metrics` on each node should show non-zero `leader_id` and a stable `current_term`. If groups stay leaderless:
+`/__ursula/metrics` on each node should show a non-null `current_leader` and a stable `current_term` for every group in `raft_groups`. If groups stay leaderless:
 
 - First start must include `raft.init_membership_per_group = true` (or `raft.init_membership = true`) on every voting node.
 - Every peer URL must be reachable from every node.
@@ -243,20 +271,20 @@ The first read of a cold offset triggers an S3 `GetObject` range read. It runs o
 
 ## Replication and consensus
 
-### A group has no leader (`leader_id == 0`)
+### A group has no leader (`current_leader: null`)
 
 Either an election is in progress or quorum is lost for that group. Only streams hashed to that group are affected.
 
 - Multiple nodes briefly claim leader: election is flapping. Check peer reachability and CPU pressure.
-- No node claims leader: fewer than `n/2+1` voters are reachable. Restore reachability.
+- No node claims leader: fewer than `n/2+1` voters are reachable, or a majority of the group's voters are behind their recovery gates. Restore reachability. For gated voters, see [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### One follower lags behind
 
-State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied` trails. Check:
+State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied_index` trails `committed_index`. Check:
 
-- Per-core mailbox depth (sustained queueing means saturation).
+- Per-core mailbox depth (`mailbox_depths`). Sustained queueing means saturation.
 - Disk pressure on the WAL volume (`fsync` latency, in particular with `raft.wal.fsync = "always"`).
-- A pathological hot stream forcing constant cold flushes (`hot_bytes_total` per group).
+- A pathological hot stream forcing constant cold flushes (`per_group_cold_hot_bytes`).
 
 ### Manually trigger a snapshot
 
@@ -277,7 +305,7 @@ Purge only after the snapshot replicates. Otherwise a slow follower may need log
 - `storage.cold.backend` is `none`, or set to `memory` when you expected `s3`.
 - IAM permissions missing. Required: `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject`.
 - `storage.cold.s3.endpoint` unreachable.
-- Cold flush worker stalled (`cold_backpressure_events_total` climbing).
+- Cold flush failing or falling behind (`cold_flush_write_errors` or `cold_backpressure_events` climbing, `cold_hot_bytes` growing).
 
 If hot bytes grow unbounded, you'll eventually hit `storage.cold.max_hot_size_per_group` and writes start returning `503`. Fix the backend before that.
 

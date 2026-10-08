@@ -65,7 +65,7 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | `raft.wal.min_available_size` | `512MiB` | Reject writes and mark `/__ursula/ready` unavailable below this much free WAL-filesystem space. `0` disables the guard |
 | `raft.wal.resume_available_size` | `1GiB` | Free space required before disk-pressure admission clears. Must exceed the minimum |
 | `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node |
-| `raft.init_membership_per_group` | `false` | One-time per-group membership bootstrap. Set `true` on the very first start of a fresh cluster, then flip back to `false` |
+| `raft.init_membership_per_group` | `false` | Per-group membership bootstrap. One voter per group initializes it once every configured voter reports the group empty and no leader. A replica that ever held its group never initializes it again, so keep it `true` across restarts. The Helm chart sets `true` |
 
 The Raft WAL is always the per-core disk journal. A node with `raft.peers` set
 refuses to start without `raft.wal.path`. A single node without a path creates a

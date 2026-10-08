@@ -140,7 +140,7 @@ Start each node with its own ID:
 ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 ```
 
-`init_membership_per_group = true` is only needed on the very first start of a fresh cluster. Flip it to `false` afterwards. Then verify with a one-file manifest:
+`init_membership_per_group = true` bootstraps each group on the first start of a fresh cluster. Keep it on every node across restarts: a replica that ever held its group never initializes it again, and an empty replica initializes a group only when every configured voter reports it empty and no leader (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Verify the cluster with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'
