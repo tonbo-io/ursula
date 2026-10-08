@@ -52,12 +52,6 @@ impl HostRecovery {
         Ok(())
     }
 
-    pub(in crate::reservation) fn uses_restage_schema(&self) -> bool {
-        self.replacement_retirement.is_some()
-            || !self.retired_replacements.is_empty()
-            || self.retained_replacement_prefix.is_some()
-    }
-
     pub(super) fn check_retired_host_reuse(&self, candidate: &HostVoter) -> Result<()> {
         if self.retired_replacements.iter().any(|old| {
             old.host.source.pod_uid == candidate.source.pod_uid

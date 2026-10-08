@@ -406,7 +406,7 @@ class RolloutTests(unittest.TestCase):
         run = self.run_shell()
         self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
         final = self.refresh()
-        self.assertEqual(final['version'], 2)
+        self.assertEqual(final['version'], 1)
         self.assertEqual(final['generation'], 1)
         self.assertIsNone(final['operation'])
         self.assertEqual(len(self.deletions()), 1)

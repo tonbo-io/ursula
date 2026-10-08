@@ -566,7 +566,6 @@ impl Reservation {
             let source_host = hosts.voter(node_id)?.clone();
             original_host_plan(hosts, &source_host.source, &process_plan, now_ms)?;
             let mut next = self.clone();
-            next.version = self.version.max(3);
             next.generation = self
                 .generation
                 .checked_add(1)
@@ -774,7 +773,6 @@ impl Reservation {
                     now_ms,
                     observation,
                 )?;
-                next.version = 4;
             }
             HostRequest::RecordReplacementTermination {
                 candidate,

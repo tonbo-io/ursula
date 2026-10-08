@@ -30,6 +30,7 @@ maintenance_read() {
 maintenance_load() {
   # Missing is an error. No bootstrap, apply, expiry, or stale-plan refresh.
   kubectl -n "${NAMESPACE}" get configmap "${MAINTENANCE_STORE}" -o json >"${SNAPSHOT}"
+  # The CLI validates the single reservation schema, with or without host inventory.
   maintenance_read state >/dev/null
 }
 
