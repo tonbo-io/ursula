@@ -3,6 +3,85 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.7.0
+
+**0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
+
+- **If you run 0.6 with data you need to keep, do not upgrade yet.** Stay on 0.6.2 and [open an issue](https://github.com/tonbo-io/ursula/issues) so we can work out a migration path with you.
+- **Deploy 0.7 fresh:** empty PVCs and a never-used object-storage prefix.
+- **`raft.wal.fsync` now defaults to `never`.** The 0.6 disk WAL fsynced every batch. Set `always` to keep that behaviour.
+- **`helm upgrade` from 0.6 stops before a second voter is replaced.** Recover with `helm rollback`.
+
+This release adds an fsync policy and a recovery gate to the Raft WAL, splits each core's journal into segments with bounded memory, binds the WAL to the routing configuration, and removes the memory-WAL restart tooling.
+
+### Installing 0.7.0
+
+See [Upgrading to 0.7](/docs/operations#upgrading-to-07).
+
+1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs (with cold storage off and S3 snapshots, also a new `snapshotStore.prefix`). With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again.
+2. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
+3. **Update the configuration.** Remove the keys and chart values listed under [Removed in 0.7.0](#removed-in-070). Set `raft.wal.path` on every node of a multi-node cluster: 0.6 defaulted to the memory WAL, and a 0.7 node with `raft.peers` refuses to start without a WAL path. Choose `raft.wal.fsync` (Helm `raft.walFsync`) as described under [WAL fsync policy](#wal-fsync-policy).
+4. **Update runbooks and tooling.** Take the removed `ursulactl` verbs out of scripts. Custom tooling that calls admin mutations must send `x-ursula-process-incarnation` ([Changed](#changed)).
+
+A values file that still sets a removed chart value fails validation, and nothing changes. Otherwise `helm upgrade` from 0.6 replaces the first pod, which finds the 0.6 data on its volume and exits at startup, so no second voter is replaced. Recover with `helm rollback`. With `OnDelete`, also delete the refused pod after the rollback so that it starts from the 0.6 template again. The refused pod wrote nothing. A 0.7 node that contacts 0.6 peers makes each of them answer `503` with `format_epoch_mismatch` on `/__ursula/ready` until it restarts, so keep the peer lists of 0.6 and 0.7 nodes apart.
+
+### WAL fsync policy
+
+`raft.wal.fsync` (Helm `raft.walFsync`) chooses when journal appends reach stable storage. Votes, each group's log state and the node's run state are always written with `fsync`.
+
+- **`never`, the new default.** A replica writes an append to the page cache and acknowledges it without `fsync`, so a write is acknowledged once a quorum of voters holds it in the page cache. A process crash loses nothing, and a graceful shutdown `fsync`s every journal. A host crash or power loss can cost that replica the unsynced tail of its journals. While at most a minority of a group's voters lose their tail, the other voters hold every acknowledged write. If a majority of a group's voters crash at once, writes acknowledged after their last `fsync` can be lost, and the group stops until an operator accepts that loss.
+- **`always`.** A replica acknowledges a batch only after `fsync`, as the 0.6 disk WAL did. A host crash loses no acknowledged write. Each batch waits for an `fsync`, which costs write latency.
+
+See [Configuration](/docs/configuration#raft) and [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
+
+### Recovery gate
+
+A replica that may have lost acknowledged writes recovers behind a gate for each of its groups. That covers a host crash under `never`, a run stopped by a journal I/O error, a wiped or replaced WAL directory, a missing run state next to a non-empty journal, and a damaged journal tail.
+
+- A gated replica neither votes nor campaigns until it has applied a fresh ReadIndex barrier from the group's leader. A replica that led the group restarts as a follower. Meanwhile `/__ursula/ready` answers `503` with reason `recovery_gate_closed`, and `recovery_gates` in `/__ursula/metrics` lists the gated groups.
+- The leader rebuilds a replica that lost entries it had acknowledged. It removes the voter, adds it back as a learner and promotes it once it has caught up. While a majority of the group's voters are intact, no operator step is needed.
+- A replica whose WAL directory was wiped also lost its vote. It refuses replication until the group's leader proves a fresh quorum without it. In a 3-voter group that needs both other voters up.
+- If a majority of a group's voters are gated, the group has no leader and refuses writes. After 30 seconds the gated replicas report the group stalled (readiness reason `recovery_stalled`). An operator then runs `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated replicas with the longest logs until the open replicas form a majority. The request names the replica's `last_log_index` and `current_term`. It answers `409` and changes nothing when the gate is not stalled, when the replica no longer holds that log, or when the replica lost its vote and has no durable vote floor.
+- Under `always`, a host crash can still leave a complete invalid frame after the last `fsync` in a journal's newest segment, for example a torn sector inside an unacknowledged batch. Recovery cannot tell it from media corruption, so it gates every group on that core. A single-voter group, or a group gated on a majority of its voters, then needs `accept-unsynced-loss` although no acknowledged write was lost.
+- A single-voter group has no other replica to recover from. Under `never` it needs `accept-unsynced-loss` after every host crash, once its gate reports the group stalled.
+
+See [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash) and [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node).
+
+### New
+
+- **Segmented journal with bounded memory.** Each core's journal is a run of segments (`raft.wal.segment_size`, default 64 MiB, Helm `raft.walSegmentBytes`). Purge deletes whole segments, and the few entries quiet groups leave in old segments are copied forward. Each group keeps an index of its entries and a cache of recent ones (`raft.wal.cache_size`, default 256 MiB per node, Helm `raft.walCacheBytes`). Older entries, such as a lagging follower's catch-up, are read from disk. `/__ursula/metrics` reports the new work under `wal_segments`, `wal_rotations`, `wal_rewritten_bytes`, `wal_pinned_segments`, `wal_lagging_groups` and the `wal_cache_*` and `wal_disk_read*` counters.
+- **WAL layout guard.** `{raft.wal.path}/raft-log/topology.bin` records `runtime.core_count` and `raft.group_count`. A node refuses to start when either differs from its configuration, and when an existing WAL has no record or a corrupt one. Before, a changed core count moved groups to other journals and a changed group count remapped streams. Keep both values explicit. See [WAL routing configuration](/docs/operations#wal-routing-configuration).
+- **Graceful voter shutdown.** On the first `SIGTERM` or Ctrl-C a voter marks itself drained and hands each leadership to a caught-up voter for up to 5 seconds. It then drains its listeners, stops its groups, `fsync`s every journal and records a clean shutdown, within 20 seconds of the signal. The chart's new `server.terminationGracePeriodSeconds` defaults to `30` to fit. See [Graceful voter shutdown](/docs/operations#graceful-voter-shutdown).
+- **Raft work stays on the owning core.** Raft RPCs from peers run on the core that owns the group, and each core keeps its own peer connections. A group's journal append returns once the batch is queued, and Raft counts the entries once the fsync policy is met, so a group no longer waits for one journal write before it queues the next. `raft.append_transport_budget_bytes` (default 128 MiB) caps the append bytes queued for Raft transport in each direction across the node.
+- **CPU pinning.** On Linux, each core's worker thread is pinned to a CPU when the process may use exactly `runtime.core_count` CPUs. `runtime.cpu_affinity = true` forces pinning and `false` turns it off.
+- **Fresh-quorum checks.** `ursulactl verify-quorum` confirms each group's leader with a fresh ReadIndex round and waits until every replica has applied that prefix (admin route `GET /__ursula/raft/{group}/quorum`). `ursulactl verify-survivors` runs the same check on the two remaining voters when one is down. See [ursulactl](/docs/cli#verify-quorum).
+- **Maintenance fencing for rollout tooling.** `ursulactl pin-incarnations`, `activate-maintenance-fence`, `retire-maintenance-fence`, `startup-admit` and the `reservation-*` verbs, with the chart values `server.gracefulRollout.maintenanceReservation` and `server.startupOwnership`, serialize planned voter replacements through a shared reservation and bind them to process and host identity. Both chart values default to `false`. See [Maintenance executor admission](/docs/cli#maintenance-executor-admission).
+- **Restore checks cold objects first.** `ursulactl restore` asks the target cluster to check every group's cold references against its cold store (`POST /__ursula/backup/group/{group}/cold-check`). If any object is missing, it imports nothing and names the first missing keys. See [Backup and disaster recovery](/docs/operations#backup-and-disaster-recovery).
+- **SQLite VFS on npm.** The TypeScript helpers are published as `@tonbo/sqlite-ursula`, with the extension prebuilt for `linux-x64-gnu`, `linux-arm64-gnu`, `linux-x64-musl` and `darwin-arm64`. See [SQLite VFS](/docs/examples/sqlite-vfs).
+
+### Changed
+
+- **Admin mutations are bound to one server process.** Every mutating admin request needs `x-ursula-process-incarnation`, the `process_incarnation` that `GET /__ursula/metrics` reported before the operation. Without it a node answers `428`. A node that restarted since then answers `412` and changes nothing. `ursulactl` sends the header. Custom tooling must add it, bucket purge included. See [Admin endpoints](/docs/operations#admin-endpoints).
+- **Format epoch 3.** The Raft WAL journal and state files, the WAL directory and object-storage markers, group and stream snapshots, snapshot references, backups (`format_version` 3) and the Raft gRPC protocol carry format epoch 3. A node refuses data, backups and peers of another epoch.
+- **A journal write or `fsync` error stops the process.** The journal writer retries nothing and aborts the process. The next start keeps the verified prefix of the journals and puts the node's groups behind the recovery gate. Journal frames now carry checksums over their header, payload and journal sequence, so a damaged length is reported as corruption. Recovery refuses damage in sealed segments and repairs only the tail of the newest one.
+- **Bootstrap.** A replica that ever held a group never initializes it again. A replica that holds nothing initializes the group only when every configured voter reports an empty group and no leader. This replaces the 0.6.2 restart guard, and 0.7 neither writes nor reads its `URSULA_GROUP_INITIALIZED/` markers in object storage.
+- **Raft without a WAL path.** 0.6 defaulted to the memory WAL. Every preset other than `default`, and a config file loaded without `--preset default`, now runs Raft on the disk WAL. A single node without `raft.wal.path` keeps its WAL in a temporary directory that it logs at startup and removes on a clean shutdown. The Docker image's default configuration runs this way.
+- **Chart rollouts.** The graceful-rollout hook runs drain, delete, wait and undrain for one voter at a time. An external `OnDelete` controller runs the same sequence.
+- **Leadership transfer errors.** `POST /__ursula/raft/{group}/leader/transfer/{node}` answers `409` for a changed leader or a recovering target, `400` for an invalid target, `404` for an unregistered group and `500` for a stopped Raft. `ursulactl drain` observes again and plans again after a `409`.
+- **Readiness and metrics.** `/__ursula/ready` adds the reasons `recovery_gate_closed` and `recovery_stalled` and the list `recovery_stalled_groups`. `/__ursula/metrics` adds `process_incarnation`, `wal_recovery` and `recovery_gates`, and OpenTelemetry adds the gauges `ursula.wal.recovering` and `ursula.raft.recovery_gates`. `memory_wal_full_restart_groups` and the `wal_backend` metric are gone.
+
+### Removed in 0.7.0
+
+- **The memory WAL and its configuration keys:** `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer` and `raft.memory_bootstrap_marker_dir`, and also `raft.rejoin_probe`. A config file that still sets one fails to load.
+- **Chart values** `raft.storageMode`, `raft.allowVolatileMultiPeer` and `persistence.enabled`. Every server pod gets a `raft-data` PVC, and `raft.logDir` must be set. The values schema refuses unknown keys under `raft` and `persistence`.
+- **`ursulactl` verbs** `prepare-restart`, `restart-quiesce-capability`, `finish-prepared-restart`, `abort-prepared-restart`, `prepare-amnesiac-restart`, `repair-restarted-voter`, `prepare-recovery-handoff` and `classify-amnesiac`. A planned restart is `drain`, restart, `wait` and `undrain` (see [Restarting a voter](/docs/operations#restarting-a-voter)). A voter that lost entries needs no verb: its group leaders rebuild it.
+- **Admin endpoints** `POST /__ursula/raft/quiesce-for-restart`, `POST /__ursula/raft/{group}/rejoin/adopt-survivor/{node}` and `POST /__ursula/raft/{group}/rejoin/reinitialize`. `accept-unsynced-loss` replaces the last two.
+
+### Known issues
+
+- [#410](https://github.com/tonbo-io/ursula/issues/410): `ursulactl pin-incarnations` still takes `--allow-legacy-incarnation`, a 0.6.2 migration switch that no 0.7 server needs. It will be removed.
+- [#411](https://github.com/tonbo-io/ursula/issues/411): an adversarial review of recovery left residual risks open, mostly liveness. For example, a group created just before a full-cluster power loss under `never` can stay without a leader even after `accept-unsynced-loss`.
+
 ## 0.6.2
 
 0.6.2 is a drop-in patch for 0.6.x: format epoch 2 is unchanged, with no change to existing storage records, snapshots or the Raft protocol. It adds one small marker object per memory-WAL group in object storage, which 0.6.0 and 0.6.1 ignore. Upgrade from 0.6.0 or 0.6.1 in place with an ordinary rolling restart (`helm upgrade`); no fresh install or data move is needed.

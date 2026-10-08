@@ -37,7 +37,7 @@ kind load docker-image ursula:dev
 From the published OCI chart:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.6.2
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.0
 ```
 
 For a local image loaded into the cluster:
@@ -314,14 +314,12 @@ plus `snapshotStore.prefix`.
 Ursula 0.7 (format epoch 3) cannot read the data or the backups of a 0.6
 release. Install it fresh, as a new release with new PVCs and a new
 `s3.prefix` (and, with cold storage off and S3 snapshots, a new
-`snapshotStore.prefix`).
-
-Ursula 0.6 (format epoch 2) cannot upgrade a 0.5.x release in place. Install it
-fresh: `helm uninstall`, delete the PVCs, and install with a new `s3.prefix`
-(and, with cold storage off and S3 snapshots, a new `snapshotStore.prefix`).
-`helm upgrade` from 0.5.x stalls at the first new pod, which exits at startup
-or reports not ready, so no second voter is replaced; recover with
-`helm rollback`. See the operations guide's "Upgrading to 0.6".
+`snapshotStore.prefix`). Remove `raft.storageMode`,
+`raft.allowVolatileMultiPeer` and `persistence.enabled` from values files. The
+values schema refuses them. `helm upgrade` from 0.6 stops before a second voter
+is replaced, because the first new pod finds the 0.6 data on its volume and
+exits at startup. Recover with `helm rollback`. See the operations guide's
+"Upgrading to 0.7".
 
 Until the operator exists, Kubernetes StatefulSet rolling updates do not
 transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.
