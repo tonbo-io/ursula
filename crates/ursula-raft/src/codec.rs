@@ -55,3 +55,51 @@ pub(crate) fn placement_from_parts(
 pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngineError> {
     value.ok_or_else(|| GroupEngineError::Infra(GroupInfraError::proto_decode(field)))
 }
+
+#[cfg(test)]
+mod tests {
+    use openraft::type_config::alias::EntryOf;
+    use openraft::type_config::alias::LogIdOf;
+    use openraft::type_config::alias::StoredMembershipOf;
+    use openraft::type_config::alias::VoteOf;
+
+    use super::decode_wire;
+    use super::encode_wire;
+    use crate::UrsulaRaftTypeConfig;
+
+    #[test]
+    fn alpha21_persisted_envelopes_remain_byte_compatible() {
+        // Produced by rmp_serde::to_vec_named using crates.io OpenRaft alpha21.
+        // Includes a joint membership, its learner and node addresses.
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/openraft-alpha21.json")).unwrap();
+        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(
+            fixtures: &serde_json::Value,
+            name: &str,
+        ) -> T {
+            let bytes: Vec<u8> = serde_json::from_value(fixtures[name].clone()).unwrap();
+            let value: T = decode_wire(&bytes, name).unwrap();
+            assert_eq!(encode_wire(&value).as_ref(), bytes.as_slice());
+            value
+        }
+        let vote: VoteOf<UrsulaRaftTypeConfig> = check(&fixtures, "vote");
+        assert_eq!(vote, openraft::Vote::new_committed(7, 2));
+        let log: LogIdOf<UrsulaRaftTypeConfig> = check(&fixtures, "log_id");
+        assert_eq!(log.index, 19);
+        let membership: StoredMembershipOf<UrsulaRaftTypeConfig> = check(&fixtures, "membership");
+        assert_eq!(membership.log_id(), &Some(log));
+        assert_eq!(membership.membership().get_joint_config(), &vec![
+            [1, 2].into_iter().collect(),
+            [2, 3].into_iter().collect(),
+        ]);
+        assert_eq!(
+            membership.membership().get_node(&4).unwrap().addr,
+            "learner4"
+        );
+        let entry: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "entry");
+        assert_eq!(entry.log_id, log);
+        assert!(
+            matches!(entry.payload, openraft::EntryPayload::Membership(m) if &m == membership.membership())
+        );
+    }
+}

@@ -2779,7 +2779,7 @@
     },
     "outcome": {
       "seed": 155,
-      "leader_id": 3,
+      "leader_id": 2,
       "target_node_id": 1,
       "appended_log_index": 22,
       "trace": {
@@ -3043,13 +3043,13 @@
           },
           {
             "event": "leader_elected",
-            "leader_id": 3
+            "leader_id": 2
           },
           {
             "event": "runtime_raft_network_leader_failover_stage_reached",
             "stage": "replacement_leader_installed",
             "old_leader_id": 1,
-            "current_leader_id": 3,
+            "current_leader_id": 2,
             "log_index": null
           },
           {
@@ -3059,7 +3059,7 @@
               "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
             },
             "old_leader_id": 1,
-            "new_leader_id": 3,
+            "new_leader_id": 2,
             "next_offset": 54,
             "group_commit_index": 18
           },
@@ -3080,7 +3080,7 @@
               "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
             },
             "old_leader_id": 1,
-            "new_leader_id": 3,
+            "new_leader_id": 2,
             "next_offset": 54,
             "group_commit_index": 20
           },
@@ -3101,7 +3101,7 @@
               "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
             },
             "old_leader_id": 1,
-            "new_leader_id": 3,
+            "new_leader_id": 2,
             "next_offset": 63,
             "group_commit_index": 22
           },
@@ -3127,7 +3127,7 @@
             "event": "runtime_raft_network_leader_failover_stage_reached",
             "stage": "failover_appends_applied",
             "old_leader_id": 1,
-            "current_leader_id": 3,
+            "current_leader_id": 2,
             "log_index": 37
           },
           {
@@ -3139,7 +3139,7 @@
             "event": "runtime_raft_network_leader_failover_stage_reached",
             "stage": "old_leader_caught_up",
             "old_leader_id": 1,
-            "current_leader_id": 3,
+            "current_leader_id": 2,
             "log_index": 37
           },
           {
@@ -3174,7 +3174,7 @@
             "event": "runtime_raft_network_leader_failover_stage_reached",
             "stage": "cold_flush_started_after_failover",
             "old_leader_id": 1,
-            "current_leader_id": 3,
+            "current_leader_id": 2,
             "log_index": null
           },
           {
@@ -3187,7 +3187,7 @@
             "event": "runtime_raft_network_leader_failover_stage_reached",
             "stage": "cold_flush_applied_after_failover",
             "old_leader_id": 1,
-            "current_leader_id": 3,
+            "current_leader_id": 2,
             "log_index": 49
           },
           {
@@ -3239,7 +3239,7 @@
             "event": "runtime_raft_network_leader_failover_cold_live_read_verified",
             "stream_count": 3,
             "old_leader_id": 1,
-            "current_leader_id": 3,
+            "current_leader_id": 2,
             "flushed_count": 12
           }
         ]

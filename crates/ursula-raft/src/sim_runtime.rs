@@ -468,4 +468,41 @@ where T: OptionalSend + OptionalSync
     fn borrow_watched(&self) -> <MadsimWatch as Watch>::Ref<'_, T> {
         self.shared.read()
     }
+
+    fn borrow_and_update(&mut self) -> <MadsimWatch as Watch>::Ref<'_, T> {
+        // Publishers advance the version under this same value lock. Mark
+        // exactly the value being returned seen, including sends after changed().
+        let value = self.shared.read();
+        self.seen = self.shared.version.load(Ordering::SeqCst);
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+    use openraft_rt::RecvError;
+    use openraft_rt::Watch;
+    use openraft_rt::WatchReceiver;
+    use openraft_rt::WatchSender;
+
+    use super::MadsimWatch;
+
+    #[test]
+    fn borrowed_watch_update_is_not_delivered_twice() {
+        madsim::runtime::Runtime::new().block_on(async {
+            let (tx, mut rx) = MadsimWatch::channel(0);
+            tx.send(1).unwrap();
+            rx.changed().await.unwrap();
+            // A new command arrives after changed() but before borrowing it.
+            tx.send(2).unwrap();
+            assert_eq!(*rx.borrow_and_update(), 2);
+            assert!(rx.changed().now_or_never().is_none());
+            tx.send(3).unwrap();
+            rx.changed().await.unwrap();
+            assert_eq!(*rx.borrow_and_update(), 3);
+            drop(tx);
+            assert!(matches!(rx.changed().await, Err(RecvError(()))));
+        });
+    }
 }

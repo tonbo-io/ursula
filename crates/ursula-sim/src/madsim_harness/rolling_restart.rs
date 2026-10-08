@@ -193,7 +193,7 @@ impl RollingRestartValidator {
                     node_id,
                     current_term: Some(metrics.current_term),
                     current_leader: metrics.current_leader,
-                    committed_index: metrics.committed.map(|log_id| log_id.index),
+                    committed_index: metrics.local_committed.map(|log_id| log_id.index),
                     last_applied_index: metrics.last_applied.map(|log_id| log_id.index),
                     voter_ids,
                     learner_ids,

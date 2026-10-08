@@ -82,7 +82,10 @@ message RaftTransferLeaderRequestV1 {
   bytes request = 4;
 }
 
-message RaftTransferLeaderAckV1 {}
+message RaftTransferLeaderAckV1 {
+  // MessagePack-encoded TransferLeaderResponse; absent on pre-alpha28 peers.
+  bytes response = 1;
+}
 
 message GroupWriteRequestV1 {
   uint32 raft_group_id = 1;

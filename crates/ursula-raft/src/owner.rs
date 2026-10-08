@@ -178,7 +178,7 @@ impl OwnerRaftHandle {
     pub async fn handle_transfer_leader(
         &self,
         request: TransferLeaderRequest<C>,
-    ) -> Result<(), Fatal<C>> {
+    ) -> Result<openraft::raft::TransferLeaderResponse<C>, Fatal<C>> {
         self.call(move |raft| async move { raft.handle_transfer_leader(request).await })
             .await?
     }
@@ -268,7 +268,7 @@ macro_rules! trigger {
 }
 impl OwnerTrigger {
     trigger!(snapshot());
-    trigger!(elect());
+    trigger!(elect(pre_vote: bool));
     trigger!(heartbeat());
     trigger!(purge_log(upto: u64));
     trigger!(transfer_leader(to: u64));

@@ -64,8 +64,8 @@ opentelemetry-otlp = { version = "0.30", default-features = false, features = ["
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "zstd"] }
 foyer = { version = "0.22.3", features = ["nightly"] }
 fs4 = "0.13"
-openraft = { version = "0.10.0-alpha.21", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
-openraft-rt = "0.10.0-alpha.21"
+openraft = { version = "=0.10.0-alpha.28", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
+openraft-rt = "=0.10.0-alpha.28"
 pin-project-lite = "0.2"
 prost = "0.13"
 prost-build = "0.13"

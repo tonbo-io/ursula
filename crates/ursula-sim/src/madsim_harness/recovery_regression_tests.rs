@@ -472,7 +472,7 @@ impl CommittedEntries {
                 continue;
             }
             let Some(committed) = metrics(cluster, group, node_id)
-                .committed
+                .local_committed
                 .map(|log_id| log_id.index)
             else {
                 continue;

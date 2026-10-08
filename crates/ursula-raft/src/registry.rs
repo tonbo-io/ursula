@@ -107,7 +107,10 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
         &mut self,
         _req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
         _option: RPCOption,
-    ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+    ) -> Result<
+        openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>,
+        RPCError<UrsulaRaftTypeConfig>,
+    > {
         unreachable!("single-node raft group must not transfer leadership")
     }
 }
@@ -151,7 +154,10 @@ impl RaftNetworkV2<MetaRaftTypeConfig> for SingleNodeRaftNetwork {
         &mut self,
         _req: TransferLeaderRequest<MetaRaftTypeConfig>,
         _option: RPCOption,
-    ) -> Result<(), RPCError<MetaRaftTypeConfig>> {
+    ) -> Result<
+        openraft::raft::TransferLeaderResponse<MetaRaftTypeConfig>,
+        RPCError<MetaRaftTypeConfig>,
+    > {
         unreachable!("single-node meta raft group must not transfer leadership")
     }
 }
@@ -791,7 +797,7 @@ impl RaftGroupHandleRegistry {
                 current_term: metrics.current_term,
                 current_leader: metrics.current_leader,
                 last_log_index: metrics.last_log_index,
-                committed: metrics.committed.map(log_progress_snapshot),
+                committed: metrics.local_committed.map(log_progress_snapshot),
                 last_applied: metrics.last_applied.map(log_progress_snapshot),
                 snapshot: metrics.snapshot.map(log_progress_snapshot),
                 purged: metrics.purged.map(log_progress_snapshot),
@@ -1035,7 +1041,8 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<(), GroupEngineError> {
+) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, GroupEngineError>
+    {
         let raft = self.require_group(raft_group_id)?;
         if *request.to_node_id() == raft.metrics().borrow_watched().id
             && !self.may_campaign(raft_group_id)
@@ -1385,7 +1392,7 @@ mod tests {
             );
             assert_eq!(store.pins.lock().unwrap().len(), 1);
             // Same Raft handle resumes an election and committed application.
-            raft.trigger().elect().await.unwrap();
+            raft.trigger().elect(false).await.unwrap();
             raft.wait(Some(Duration::from_secs(2)))
                 .current_leader(1, "recovered group elects")
                 .await
