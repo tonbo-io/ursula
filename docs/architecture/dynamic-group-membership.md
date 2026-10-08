@@ -5,6 +5,10 @@ membership and the foundation merged in the first phase. It is not an operator
 runbook yet: the public HTTP admin API, `ursulactl` workflow, bootstrap wiring,
 and durable meta log store are intentionally left for follow-up work.
 
+The proposed post-0.7 convergence and PR boundaries are tracked in
+[Recovery follow-ups and maintenance convergence](post-0.7-followups.md).
+That proposal requires design review before enabling the new control plane.
+
 The design target is not "every node hosts every group". A cluster can have
 more data-capable nodes than any single data group needs:
 
