@@ -1,25 +1,29 @@
 # Single Raft WAL with an fsync policy
 
-Status: proposed. It removes the memory WAL backend and extends the per-core
-journal described in [Production Raft WAL](raft-wal-production.md).
+Status: implemented, shipped in Ursula 0.7.0. It removed the memory WAL
+backend and extends the per-core journal described in
+[Production Raft WAL](raft-wal-production.md). The text describes 0.7.0,
+including the OpenRaft 0.10.0-alpha.28 upgrade (#466) and the handoff checks
+(#467).
 
 ## Decision
 
 - Ursula has one Raft WAL backend: the per-core shared journal. The memory
-  backend is removed. Configurations that select it are refused at startup;
-  there is no migration path because no deployment depends on it.
+  backend is removed. Configurations that select it fail to load, and 0.7.0
+  has no migration path from 0.6.
 - `raft.wal.fsync` chooses when journal appends reach stable storage:
   - `never` (default): ordinary data appends are written to the page cache and
     acknowledged without `fsync`. Batches containing a Raft membership entry
     are always synced before acknowledgement. This preserves the voter set
     needed to recover after a full-cluster power loss, even when unsynced data
     loss is accepted.
-  - `always`: every batch is acknowledged only after `fsync`, which is the
-    current behaviour.
+  - `always`: every batch that carries entries or a purge is acknowledged
+    only after `fsync`, as the 0.6 disk WAL did. Commit and truncate markers
+    are not synced on their own.
 
-  There is no interval mode. After an unclean crash a replica keeps only its
-  verified prefix and rejoins through the recovery gate, so a periodic `fsync`
-  would not change what recovery does.
+  There is no interval mode. After a host crash under `never` a replica keeps
+  only its verified prefix and rejoins through the recovery gate, so a
+  periodic `fsync` would not change what recovery does.
 - Raft metadata that must survive any crash is stored outside the journal and
   is always written with `fsync`. That covers each group's vote, whether each
   group was ever initialized, and the node's run state.
@@ -75,8 +79,9 @@ an acknowledged write, so it gates every group on that core before it cuts the
 frame. That is the safe choice, and it is deliberate. A group whose other
 voters are healthy rejoins without an operator. A single-voter group, or a
 group with a majority of its voters gated together, for example by a rack
-power loss, stays stopped until an operator runs `accept-unsynced-loss`,
-although no acknowledged write was lost.
+power loss, stays stopped until an operator calls
+`POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`, although no
+acknowledged write was lost.
 
 ## Metadata and run state
 
@@ -99,14 +104,16 @@ The node keeps a run-state file with:
   that a core opened later in the run is still read that way once.
 
 At startup the node reads it, decides how to open the journals, and then
-durably records the current boot id with `clean = false`. It does this before
+durably records the current boot id with status `running`. It does this before
 any new journal write. On graceful shutdown it stops the Raft cores, `fsync`s
-every journal and only then writes `clean = true`. A real shutdown path
-replaces the current `process::exit(0)`.
+every journal and only then records status `clean`. Shutdown has a deadline of
+20 seconds from the first signal. A second signal, or a shutdown still running
+at the deadline, exits at once without recording `clean`, so the next start
+treats the run as a crash.
 
 The boot id comes from `/proc/sys/kernel/random/boot_id`. Inside a container
-that is the host's boot id. Where it is unavailable, a missing `clean` flag is
-treated as an unclean crash.
+that is the host's boot id. Where it is unavailable, a run that did not
+record `clean` is read as a host crash under its recorded policy.
 
 ## Opening the journal
 
@@ -155,15 +162,17 @@ since a host crash after it gates every group anyway.
 ## Recovery gate
 
 A replica whose log may be missing entries it acknowledged must not help
-elect a leader that lacks them. While gated it does not campaign and it grants
-no votes. The gate opens once the replica has applied the committed index
-returned by a fresh outbound ReadIndex barrier from the current leader. This
-is the barrier from the memory-WAL rejoin work, now applied to any replica in
-the recovery state.
+elect a leader that lacks them. While gated it does not campaign and takes no
+leadership transfer. It grants no vote once it knows the group holds entries,
+so an empty replica still votes in a new group's first election. The gate
+opens once the replica has applied the committed index returned by a fresh
+outbound ReadIndex barrier from the current leader. This is the barrier from
+the memory-WAL rejoin work, now applied to any replica in the recovery state.
 
 The vote is restored from the metadata file before the Raft core starts, so a
 recovering replica still rejects appends from a leader with a stale term. A
-recovering replica that led its group starts as a follower: OpenRaft restores a
+replica that led its group starts as a follower after any restart that was not
+clean, and whenever it is recovering: OpenRaft restores a
 replica whose committed vote names itself as that term's leader without an
 election, and with a truncated log it would reuse the log ids of entries it
 lost and fork the group. Before its Raft core starts, the replica records its
@@ -175,17 +184,26 @@ the gate opened, by a barrier or by an operator. A vote for another replica is
 never changed, and nothing is written for it.
 
 On the leader, a follower whose log moved backwards is rebuilt through the
-existing remove, learner and promote steps. If a majority of the followers
-moved backwards while the leader kept its log, removal cannot commit, so the
-leader rewinds their replication progress instead. Neither case needs an
-operator. In managed mode this becomes the control plane's `RebuildReplica`
-operation.
+remove, learner and promote steps. The leader removes it only when a quorum of
+voters kept their log and acknowledged the leader within one minimum election
+timeout (1.5 seconds), counting the leader itself. Otherwise the removal might
+not commit, so the leader rewinds the replication progress of the voters that
+lost entries instead. Neither case needs an operator.
+
+A leader hands its leadership only to another voter that kept its log,
+acknowledged the leader within one minimum election timeout and holds every
+committed entry. Every leadership planner and the admin transfer endpoint use
+this check. If the target has not taken over within two maximum election
+timeouts (6 seconds), the leader steps down and campaigns again.
 
 If a majority of a group's voters are gated, no leader can produce a barrier.
-A gated replica that applies nothing for 30 seconds reports itself stalled,
-and the group stays stopped. An operator then accepts the loss of the unsynced
-tail on the replicas with the longest last log id until a majority of the
-voters is open, and normal election picks the longest verified log. Accepting
+A gated replica that applies nothing for 30 seconds reports itself stalled:
+readiness answers `503` with reason `recovery_stalled` and lists the group. The
+group stays stopped. An operator then accepts the loss of the unsynced tail on
+the replicas with the longest last log id until a majority of the voters is
+open, and normal election picks the longest verified log. Metrics show each
+replica's last log index but not its term, so the operator runbook ranks by
+index. Accepting
 on more replicas than needed lets election choose any log at least as long as
 a majority's. This replaces `adopt-survivor` and `reinitialize`. A group whose
 state is `Initialized` or `Recovering` never runs `Initialize`, which replaces
@@ -194,7 +212,8 @@ the S3 initialized markers and the restart guard.
 An acceptance is a compare-and-act on what the operator saw. Its request names
 the replica's last log index and current term, as the group's metrics showed
 them. The replica refuses it with `409 Conflict`, and changes nothing, unless
-its gate is stalled, it still holds that log, and it has a durable vote floor.
+it has a durable vote floor, its gate is stalled and it still holds that log. A
+replica whose gate is already open answers `200` with outcome `already_open`.
 Accepting unsynced data loss cannot replace lost voting history. A replica
 without a floor must obtain a fresh quorum proof before it can accept
 replication or open its gate. A gate that awaits or
@@ -232,7 +251,7 @@ floor.
 ## Journal hardening
 
 - **Fail-stop.** Any write or `fsync` error stops the core writer. Pending
-  requests fail, the writer tries to record `poisoned = true`, and the process
+  requests fail, the writer tries to record the status `poisoned`, and the process
   aborts. It never appends after a partial frame and never retries a failed
   `fsync`.
 - **Format epoch 3.** Each frame's checksum covers its length, its payload and
@@ -264,13 +283,14 @@ the operator saw.
 
 ## Removed
 
-- The memory log store, `raft.wal.backend`, `allow_volatile_multi_peer`,
-  `memory_bootstrap_marker_dir`, and the chart's `storageMode` and
-  `allowVolatileMultiPeer`.
+- The memory log store, `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`,
+  `raft.memory_bootstrap_marker_dir`, `raft.rejoin_probe`, and the chart's
+  `raft.storageMode`, `raft.allowVolatileMultiPeer` and `persistence.enabled`.
 - The restart guard and its S3 initialized markers.
 - The memory-only rejoin entry points, `adopt-survivor` and `reinitialize`.
-- The single-node development mode moves to a disk journal under its data
-  directory.
+- Zero-config development mode (the `default` preset on one node) runs
+  without Raft. Any other single Raft node without `raft.wal.path` keeps its
+  journal in a temporary directory that a clean shutdown removes.
 
 ## Delivery
 
@@ -283,4 +303,5 @@ the operator saw.
    (#400) followed.
 4. Segments, rewrite-based reclaim and bounded memory (#401).
 
-The meta-Raft control plane work starts after step 3.
+Dynamic membership is tracked in
+[Dynamic Group Membership](dynamic-group-membership.md).
