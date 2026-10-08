@@ -293,7 +293,7 @@ impl HostInventory {
 }
 
 impl Reservation {
-    /// Idle-only schema migration/refresh, acquired by the existing whole-store CAS.
+    /// Idle-only inventory publication/refresh, acquired by the existing whole-store CAS.
     /// Healthy refresh may update process/Pod incarnations on the same physical
     /// hosts; a changed host requires the fenced replacement state machine.
     pub fn publish_hosts(&self, request: PublishHostInventory) -> Result<Self> {
@@ -367,7 +367,6 @@ impl Reservation {
             }
         }
         let mut next = self.clone();
-        next.version = self.version.max(2);
         next.hosts = Some(hosts);
         next.validate()?;
         Ok(next)

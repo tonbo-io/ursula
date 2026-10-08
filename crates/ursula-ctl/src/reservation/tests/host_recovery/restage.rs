@@ -1,7 +1,3 @@
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use serde_json::json;
 use ursula_proto::admin::ProcessIncarnation;
 
@@ -75,9 +71,9 @@ fn rebound(state: &Reservation) -> Reservation {
 #[test]
 fn bound_candidate_cannot_be_cleared_until_exact_irreversible_fence_is_recorded() {
     let state = bound();
-    assert!(state.recover_host(restage(&state)).is_err());
+    state.recover_host(restage(&state)).unwrap_err();
     let admitted = admit(&state);
-    assert!(admitted.recover_host(restage(&admitted)).is_err());
+    admitted.recover_host(restage(&admitted)).unwrap_err();
     assert!(
         admitted.recover_host(complete(&admitted)).is_err(),
         "asynchronous termination intent must forbid release"
@@ -99,10 +95,10 @@ fn bound_candidate_cannot_be_cleared_until_exact_irreversible_fence_is_recorded(
                 terminal_state: status.into(),
             },
         };
-        assert!(admitted.recover_host(action).is_err());
+        admitted.recover_host(action).unwrap_err();
     }
     let fenced = record(&admitted);
-    assert!(fenced.recover_host(complete(&fenced)).is_err());
+    fenced.recover_host(complete(&fenced)).unwrap_err();
     let next = fenced.recover_host(restage(&fenced)).unwrap();
     assert!(next.operation().unwrap().replacement.is_none());
     let host = next.operation().unwrap().host.as_ref().unwrap();
@@ -156,16 +152,14 @@ fn candidate_retirement_requires_current_fresh_survivors_and_retains_the_new_pre
                 observation.verification.excluded_voter_id = 2;
             }
         }
-        assert!(
-            state
-                .recover_host(HostRequest::AdmitReplacementTermination {
-                    fence: state.operation().unwrap().fence.clone(),
-                    candidate: state.operation().unwrap().replacement.clone().unwrap(),
-                    now_ms: 3400,
-                    observation
-                })
-                .is_err()
-        );
+        state
+            .recover_host(HostRequest::AdmitReplacementTermination {
+                fence: state.operation().unwrap().fence.clone(),
+                candidate: state.operation().unwrap().replacement.clone().unwrap(),
+                now_ms: 3400,
+                observation,
+            })
+            .unwrap_err();
     }
     let next = record(&admit(&state));
     let next = next.recover_host(restage(&next)).unwrap();
@@ -205,10 +199,8 @@ fn candidate_retirement_requires_current_fresh_survivors_and_retains_the_new_pre
 fn stale_delete_or_previous_physical_boot_can_never_bind_after_restaging() {
     let state = record(&admit(&bound()));
     let next = state.recover_host(restage(&state)).unwrap();
-    assert!(
-        next.recover_host(binding(&next, "failed-candidate"))
-            .is_err()
-    );
+    next.recover_host(binding(&next, "failed-candidate"))
+        .unwrap_err();
     for reuse in 0..3 {
         let mut action = binding(&next, "different-pod");
         if let HostRequest::BindHostReplacement {
@@ -227,7 +219,7 @@ fn stale_delete_or_previous_physical_boot_can_never_bind_after_restaging() {
                 }
             }
         }
-        assert!(next.recover_host(action).is_err());
+        next.recover_host(action).unwrap_err();
     }
     rebound(&next).validate().unwrap();
 }
@@ -243,7 +235,7 @@ fn takeover_keeps_candidate_intent_receipt_floor_and_delete_history() {
             now_ms: 3800,
         })
         .unwrap();
-    assert!(taken.recover_host(old).is_err());
+    taken.recover_host(old).unwrap_err();
     let restaged = taken.recover_host(restage(&taken)).unwrap();
     let taken = restaged
         .propose(OwnershipRequest::Takeover {
@@ -277,7 +269,7 @@ fn takeover_keeps_candidate_intent_receipt_floor_and_delete_history() {
 }
 
 #[test]
-fn extended_state_round_trips_and_cannot_be_downgraded_or_prune_its_floor() {
+fn restaged_state_preserves_schema_and_cannot_prune_its_floor() {
     let fenced = record(&admit(&bound()));
     let action = restage(&fenced);
     let bytes = serde_json::to_vec(&ReservationRequest::Host(action)).unwrap();
@@ -286,7 +278,10 @@ fn extended_state_round_trips_and_cannot_be_downgraded_or_prune_its_floor() {
     };
     let next = fenced.recover_host(action).unwrap();
     let encoded = serde_json::to_value(&next).unwrap();
-    assert_eq!(encoded["version"], 4);
+    assert_eq!(
+        encoded["version"],
+        super::super::super::RESERVATION_SCHEMA_VERSION
+    );
     serde_json::from_value::<Reservation>(encoded.clone())
         .unwrap()
         .validate()
@@ -294,19 +289,17 @@ fn extended_state_round_trips_and_cannot_be_downgraded_or_prune_its_floor() {
     for mutation in 0..3 {
         let mut tampered = encoded.clone();
         match mutation {
-            0 => tampered["version"] = json!(3),
+            0 => tampered["hosts"] = serde_json::Value::Null,
             1 => tampered["operation"]["host"]["pod_retirement_intents"] = json!(["pod-1"]),
             _ => {
                 tampered["operation"]["host"]["retained_replacement_prefix"] =
                     serde_json::Value::Null
             }
         }
-        assert!(
-            serde_json::from_value::<Reservation>(tampered)
-                .unwrap()
-                .validate()
-                .is_err()
-        );
+        serde_json::from_value::<Reservation>(tampered)
+            .unwrap()
+            .validate()
+            .unwrap_err();
     }
 }
 
@@ -424,11 +417,11 @@ fn restaging_requires_exact_committed_cas_and_then_allows_only_one_new_startup_b
         .unwrap();
     assert!(before.state().operation().unwrap().replacement.is_some());
     let mut response = proposal.document().clone();
-    assert!(before.acknowledge(&proposal, response.clone()).is_err());
+    before.acknowledge(&proposal, response.clone()).unwrap_err();
     response["metadata"]["resourceVersion"] = json!("restaged-rv");
     let mut recreated = response.clone();
     recreated["metadata"]["uid"] = json!("recreated-store");
-    assert!(before.acknowledge(&proposal, recreated).is_err());
+    before.acknowledge(&proposal, recreated).unwrap_err();
     let next = before.acknowledge(&proposal, response).unwrap();
 
     let HostRequest::BindHostReplacement {
@@ -437,16 +430,14 @@ fn restaging_requires_exact_committed_cas_and_then_allows_only_one_new_startup_b
     else {
         unreachable!()
     };
-    assert!(
-        next.propose_startup(
-            1,
-            "failed-candidate",
-            &pod,
-            &node,
-            ProcessIncarnation::from_bits(101)
-        )
-        .is_err()
-    );
+    next.propose_startup(
+        1,
+        "failed-candidate",
+        &pod,
+        &node,
+        ProcessIncarnation::from_bits(101),
+    )
+    .unwrap_err();
     pod["metadata"]["uid"] = json!("next-pod");
     node["metadata"]["uid"] = json!("next-node");
     node["spec"]["providerID"] = json!("next-instance");
@@ -472,19 +463,17 @@ fn restaging_requires_exact_committed_cas_and_then_allows_only_one_new_startup_b
         .unwrap();
     let mut response = first.document().clone();
     response["metadata"]["resourceVersion"] = json!("next-boot-rv");
-    assert!(next.acknowledge(&second, response.clone()).is_err());
+    next.acknowledge(&second, response.clone()).unwrap_err();
     let accepted = next.acknowledge(&first, response).unwrap();
-    assert!(
-        accepted
-            .propose_startup(
-                1,
-                "next-pod",
-                &pod,
-                &node,
-                ProcessIncarnation::from_bits(102)
-            )
-            .is_err()
-    );
+    accepted
+        .propose_startup(
+            1,
+            "next-pod",
+            &pod,
+            &node,
+            ProcessIncarnation::from_bits(102),
+        )
+        .unwrap_err();
     assert_eq!(
         accepted
             .state()
@@ -537,10 +526,10 @@ fn extra_pod_retirement_requires_the_recorded_irreversibly_fenced_physical_host(
                 }
             }
         }
-        assert!(next.recover_host(changed).is_err());
+        next.recover_host(changed).unwrap_err();
     }
     let bound = rebound(&recorded);
-    assert!(bound.recover_host(action).is_err());
+    bound.recover_host(action).unwrap_err();
 }
 
 #[test]
@@ -549,10 +538,8 @@ fn candidate_intent_cannot_deserialize_into_another_bound_identity() {
     let mut tampered = serde_json::to_value(admitted).unwrap();
     tampered["operation"]["host"]["replacement_retirement"]["candidate"]["pod_uid"] =
         json!("another-candidate");
-    assert!(
-        serde_json::from_value::<Reservation>(tampered)
-            .unwrap()
-            .validate()
-            .is_err()
-    );
+    serde_json::from_value::<Reservation>(tampered)
+        .unwrap()
+        .validate()
+        .unwrap_err();
 }

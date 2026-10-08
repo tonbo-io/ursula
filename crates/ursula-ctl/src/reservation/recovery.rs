@@ -130,11 +130,8 @@ pub struct HostRecovery {
     /// Persist before any force delete; none may subsequently bind as replacement.
     pub pod_retirement_intents: BTreeSet<String>,
     pub replacement_host: Option<HostVoter>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_retirement: Option<ReplacementRetirement>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_replacements: Vec<RetiredHostReplacement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_replacement_prefix: Option<SurvivingPrefixObservation>,
 }
 
@@ -566,7 +563,6 @@ impl Reservation {
             let source_host = hosts.voter(node_id)?.clone();
             original_host_plan(hosts, &source_host.source, &process_plan, now_ms)?;
             let mut next = self.clone();
-            next.version = self.version.max(3);
             next.generation = self
                 .generation
                 .checked_add(1)
@@ -774,7 +770,6 @@ impl Reservation {
                     now_ms,
                     observation,
                 )?;
-                next.version = 4;
             }
             HostRequest::RecordReplacementTermination {
                 candidate,

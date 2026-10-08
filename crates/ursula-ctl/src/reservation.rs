@@ -72,7 +72,6 @@ pub struct Operation {
     pub acquired_ms: u64,
     pub admission: Option<PrefixObservation>,
     pub replacement: Option<SourceIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostRecovery>,
 }
 
@@ -84,7 +83,6 @@ pub struct Reservation {
     generation: u64,
     operation: Option<Operation>,
     completion: Option<Completion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     hosts: Option<HostInventory>,
 }
 
@@ -104,7 +102,6 @@ pub struct Completion {
     pub source: SourceIdentity,
     pub replacement: SourceIdentity,
     pub observation: PrefixObservation,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostRecovery>,
 }
 
@@ -292,12 +289,14 @@ impl SourceIdentity {
     }
 }
 
+const RESERVATION_SCHEMA_VERSION: u32 = 1;
+
 impl Reservation {
     /// Reviewed bootstrap only. Missing/deleted stores must not call this as
     /// an automatic recovery fallback; this module never initializes a store.
     pub fn initial(cell: CellIdentity) -> Result<Self> {
         let state = Self {
-            version: 1,
+            version: RESERVATION_SCHEMA_VERSION,
             cell,
             generation: 0,
             operation: None,
@@ -329,15 +328,12 @@ impl Reservation {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 1..=4)
+        if self.version != RESERVATION_SCHEMA_VERSION
             || self.cell.group_count == 0
             || self.cell.core_count == 0
             || self.cell.voter_ids != BTreeSet::from([1, 2, 3])
         {
             bail!("unsupported reservation schema or three-voter inventory");
-        }
-        if (self.version >= 2) != self.hosts.is_some() {
-            bail!("host inventory requires an explicit schema-2 CAS migration");
         }
         if let Some(hosts) = &self.hosts {
             hosts.validate(&self.cell)?;
@@ -392,9 +388,6 @@ impl Reservation {
                 bail!("completion process or generation does not match its replacement");
             }
             if let Some(host) = &receipt.host {
-                if self.version < 3 || (host.uses_restage_schema() && self.version != 4) {
-                    bail!("host completion requires schema 3, restaging requires schema 4");
-                }
                 host.validate_completion(&self.cell, receipt)?;
                 host.validate_retired_host_placement(
                     self.hosts.as_ref().context("no host inventory")?,
@@ -402,6 +395,9 @@ impl Reservation {
             }
         }
         if let Some(operation) = &self.operation {
+            if operation.host.is_some() && self.hosts.is_none() {
+                bail!("host recovery requires host inventory");
+            }
             if operation.fence.generation() != self.generation
                 || !self.cell.voter_ids.contains(&operation.source.node_id)
                 || operation.process_plan.len() != self.cell.voter_ids.len()
@@ -442,9 +438,6 @@ impl Reservation {
                 original.expected_process_incarnation =
                     Some(operation.source.process_incarnation.clone());
                 if let Some(host) = &operation.host {
-                    if self.version < 3 || (host.uses_restage_schema() && self.version != 4) {
-                        bail!("host recovery requires schema 3, restaging requires schema 4");
-                    }
                     host.validate_operation(self, operation)?;
                 } else {
                     hosts.validate_source(

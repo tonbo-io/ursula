@@ -1,7 +1,3 @@
-#![expect(
-    clippy::assertions_on_result_states,
-    reason = "pre-existing result-state assertion debt; see Known debt in AGENTS.md"
-)]
 use serde_json::json;
 use ursula_proto::admin::ProcessIncarnation;
 
@@ -66,6 +62,25 @@ fn document() -> Value {
 }
 
 #[test]
+fn initial_store_uses_one_schema_and_rejects_other_versions() {
+    let initial = Reservation::initial(cell()).unwrap();
+    assert_eq!(initial.version, super::RESERVATION_SCHEMA_VERSION);
+    assert!(initial.hosts().is_none());
+    // The initial store already has the final shape: optional data is null.
+    let encoded = serde_json::to_value(&initial).unwrap();
+    for field in ["operation", "completion", "hosts"] {
+        assert_eq!(encoded.get(field), Some(&Value::Null), "{field}");
+    }
+    for version in [0, 2, 3, 4, u32::MAX] {
+        let mut state = serde_json::to_value(&initial).unwrap();
+        state["version"] = json!(version);
+        let mut snapshot = document();
+        snapshot["data"]["reservation"] = json!(serde_json::to_string(&state).unwrap());
+        ConfigMapSnapshot::parse(snapshot, &cell()).unwrap_err();
+    }
+}
+
+#[test]
 fn concurrent_owners_cannot_both_acknowledge_one_store_revision() {
     let before = ConfigMapSnapshot::parse(document(), &cell()).unwrap();
     let winner = before.propose(request(1, 10, 1)).unwrap();
@@ -77,8 +92,8 @@ fn concurrent_owners_cannot_both_acknowledge_one_store_revision() {
     let acquired = before.acknowledge(&winner, response.clone()).unwrap();
     assert_eq!(acquired.state().generation(), 1);
     assert_eq!(acquired.state().operation().unwrap().source.node_id, 1);
-    assert!(before.acknowledge(&loser, response).is_err());
-    assert!(acquired.propose(request(2, 20, 2)).is_err());
+    before.acknowledge(&loser, response).unwrap_err();
+    acquired.propose(request(2, 20, 2)).unwrap_err();
     assert_eq!(winner.document()["data"]["other"], "preserved");
     assert_eq!(
         winner.document()["metadata"]["annotations"]["retained"],
@@ -156,7 +171,7 @@ async fn two_proposals_over_mock_http_have_one_successful_compare_and_swap() {
         statuses[1].is_success()
     );
     let committed = ConfigMapSnapshot::parse(stored.lock().unwrap().clone(), &cell()).unwrap();
-    assert!(committed.propose(request(3, 30, 3)).is_err());
+    committed.propose(request(3, 30, 3)).unwrap_err();
     server.abort();
 }
 
@@ -165,15 +180,13 @@ fn takeover_preserves_source_and_processes_and_advances_only_executor_authority(
     let initial = Reservation::initial(cell()).unwrap();
     let reserved = initial.propose(request(1, 10, 3)).unwrap();
     for (operation, executor) in [(2, 20), (1, 10)] {
-        assert!(
-            reserved
-                .propose(OwnershipRequest::Takeover {
-                    operation_id: format!("{operation:032x}"),
-                    executor_id: format!("{executor:032x}"),
-                    now_ms: 2000,
-                })
-                .is_err()
-        );
+        reserved
+            .propose(OwnershipRequest::Takeover {
+                operation_id: format!("{operation:032x}"),
+                executor_id: format!("{executor:032x}"),
+                now_ms: 2000,
+            })
+            .unwrap_err();
     }
     let resumed = reserved
         .propose(OwnershipRequest::Takeover {
@@ -205,25 +218,23 @@ fn takeover_preserves_source_and_processes_and_advances_only_executor_authority(
 fn acknowledgement_requires_original_store_identity_and_exact_committed_state() {
     let before = ConfigMapSnapshot::parse(document(), &cell()).unwrap();
     let proposal = before.propose(request(1, 10, 1)).unwrap();
-    assert!(
-        before
-            .acknowledge(&proposal, proposal.document().clone())
-            .is_err()
-    );
+    before
+        .acknowledge(&proposal, proposal.document().clone())
+        .unwrap_err();
     let mut recreated = proposal.document().clone();
     recreated["metadata"]["uid"] = json!("another-store");
     recreated["metadata"]["resourceVersion"] = json!("rv-two");
-    assert!(before.acknowledge(&proposal, recreated).is_err());
+    before.acknowledge(&proposal, recreated).unwrap_err();
     let mut overwritten = proposal.document().clone();
     overwritten["metadata"]["resourceVersion"] = json!("rv-two");
     overwritten["data"]["other"] = json!("changed");
-    assert!(before.acknowledge(&proposal, overwritten).is_err());
+    before.acknowledge(&proposal, overwritten).unwrap_err();
     let mut newer_document = document();
     newer_document["metadata"]["resourceVersion"] = json!("rv-other");
     let newer = ConfigMapSnapshot::parse(newer_document, &cell()).unwrap();
     let mut original_response = proposal.document().clone();
     original_response["metadata"]["resourceVersion"] = json!("rv-two");
-    assert!(newer.acknowledge(&proposal, original_response).is_err());
+    newer.acknowledge(&proposal, original_response).unwrap_err();
 }
 
 #[test]
@@ -239,17 +250,17 @@ fn ephemeral_deleting_misdirected_or_missing_stores_fail_closed() {
     ] {
         let mut raw = document();
         raw["metadata"][field] = value;
-        assert!(ConfigMapSnapshot::parse(raw, &cell()).is_err());
+        ConfigMapSnapshot::parse(raw, &cell()).unwrap_err();
     }
     let mut wrong_cell = cell();
     wrong_cell.statefulset_uid = "new-lifetime".to_owned();
-    assert!(ConfigMapSnapshot::parse(document(), &wrong_cell).is_err());
+    ConfigMapSnapshot::parse(document(), &wrong_cell).unwrap_err();
     let mut missing = document();
     missing["data"]
         .as_object_mut()
         .unwrap()
         .remove("reservation");
-    assert!(ConfigMapSnapshot::parse(missing, &cell()).is_err());
+    ConfigMapSnapshot::parse(missing, &cell()).unwrap_err();
 }
 
 #[test]
@@ -273,12 +284,10 @@ fn incomplete_duplicate_or_rebound_process_plans_cannot_reserve() {
             3 => source.process_incarnation = ProcessIncarnation::from_bits(99),
             _ => source.pod_name = "voters-2".to_owned(),
         }
-        assert!(
-            Reservation::initial(cell())
-                .unwrap()
-                .propose(action)
-                .is_err()
-        );
+        Reservation::initial(cell())
+            .unwrap()
+            .propose(action)
+            .unwrap_err();
     }
 }
 
@@ -289,7 +298,7 @@ fn clearing_an_active_operation_or_wrapping_generation_never_opens_a_new_source(
         .propose(request(1, 10, 1))
         .unwrap();
     reserved.operation = None;
-    assert!(reserved.validate().is_err());
+    reserved.validate().unwrap_err();
     let mut reserved = Reservation::initial(cell())
         .unwrap()
         .propose(request(1, 10, 1))
@@ -428,7 +437,7 @@ fn host_publication() -> super::PublishHostInventory {
 }
 
 #[test]
-fn host_inventory_migration_is_whole_store_cas_and_serializes_with_ownership() {
+fn host_inventory_publication_is_whole_store_cas_and_preserves_schema() {
     let before = ConfigMapSnapshot::parse(document(), &cell()).unwrap();
     let inventory_request = super::ReservationRequest::Inventory(host_publication());
     // The actual JSON path, including string-encoded integer proof map keys.
@@ -440,8 +449,8 @@ fn host_inventory_migration_is_whole_store_cas_and_serializes_with_ownership() {
     let mut response = capture.document().clone();
     response["metadata"]["resourceVersion"] = json!("rv-two");
     let acknowledged = before.acknowledge(&capture, response.clone()).unwrap();
-    assert!(before.acknowledge(&owner, response).is_err());
-    assert_eq!(acknowledged.state().version, 2);
+    before.acknowledge(&owner, response).unwrap_err();
+    assert_eq!(acknowledged.state().version, before.state().version);
     assert_eq!(acknowledged.state().generation(), 0);
     assert!(acknowledged.state().operation().is_none());
     assert_eq!(
@@ -462,7 +471,7 @@ fn host_inventory_migration_is_whole_store_cas_and_serializes_with_ownership() {
         *now_ms = 1600;
     }
     let owned = acknowledged.state().propose(action).unwrap();
-    assert!(owned.publish_hosts(host_publication()).is_err());
+    owned.publish_hosts(host_publication()).unwrap_err();
     let takeover = owned
         .propose(OwnershipRequest::Takeover {
             operation_id: format!("{:032x}", 1),
@@ -647,7 +656,7 @@ fn healthy_refresh_cannot_forget_a_changed_or_reused_physical_host() {
         }
         assert!(saved.publish_hosts(refresh).is_err(), "case {case}");
     }
-    assert!(saved.publish_hosts(host_publication()).is_err()); // Older sampler cannot overwrite newer evidence.
+    saved.publish_hosts(host_publication()).unwrap_err(); // Older sampler cannot overwrite newer evidence.
 }
 
 #[test]
@@ -682,7 +691,7 @@ fn recovered_process_can_refresh_only_after_full_nonregressing_proof() {
     if let OwnershipRequest::Reserve { now_ms, .. } = &mut action {
         *now_ms = 1900;
     }
-    assert!(repaired.propose(action.clone()).is_err());
+    repaired.propose(action.clone()).unwrap_err();
     if let OwnershipRequest::Reserve {
         source,
         process_plan,
@@ -708,15 +717,13 @@ fn planned_completion_advances_host_catalog_without_discarding_old_physical_iden
         *now_ms = 1600;
     }
     let reserved = saved.propose(action).unwrap();
-    assert!(
-        reserved
-            .progress(super::ProgressRequest::AdmitPodDeletion {
-                fence: reserved.operation().unwrap().fence.clone(),
-                now_ms: 1900,
-                observation: observation(&reserved, false, 1700, 49),
-            })
-            .is_err()
-    );
+    reserved
+        .progress(super::ProgressRequest::AdmitPodDeletion {
+            fence: reserved.operation().unwrap().fence.clone(),
+            now_ms: 1900,
+            observation: observation(&reserved, false, 1700, 49),
+        })
+        .unwrap_err();
     let admitted = reserved
         .progress(super::ProgressRequest::AdmitPodDeletion {
             fence: reserved.operation().unwrap().fence.clone(),
@@ -739,7 +746,7 @@ fn planned_completion_advances_host_catalog_without_discarding_old_physical_iden
     {
         prefix.required_applied_index = 49;
     }
-    assert!(regressed.validate().is_err());
+    regressed.validate().unwrap_err();
     if let super::ProgressRequest::BindPodReplacement { node, .. } = &mut bind {
         node["metadata"]["labels"] = json!({"topology.kubernetes.io/zone":"zone-1"});
     }
@@ -747,7 +754,7 @@ fn planned_completion_advances_host_catalog_without_discarding_old_physical_iden
     if let super::ProgressRequest::BindPodReplacement { node, .. } = &mut wrong_host {
         node["spec"]["providerID"] = json!("new-instance");
     }
-    assert!(admitted.progress(wrong_host).is_err());
+    admitted.progress(wrong_host).unwrap_err();
     let rebound = admitted.progress(bind).unwrap();
     let completed = rebound
         .progress(super::ProgressRequest::CompletePodReplacement {
@@ -817,9 +824,9 @@ fn release_requires_retired_original_uid_and_all_retired_current_prefixes() {
         now_ms: 2000,
         observation: observation(&active, true, 1700, 60),
     };
-    assert!(active.progress(complete).is_err()); // A container restart is insufficient.
+    active.progress(complete).unwrap_err(); // A container restart is insufficient.
     let rebound = active.progress(binding(&active)).unwrap();
-    assert!(rebound.progress(binding(&rebound)).is_err());
+    rebound.progress(binding(&rebound)).unwrap_err();
     for case in 0..7 {
         let mut proof = observation(&rebound, true, 1700, 60);
         match case {
@@ -858,15 +865,13 @@ fn release_requires_retired_original_uid_and_all_retired_current_prefixes() {
                 proof.verification.prefixes.remove(&1);
             }
         }
-        assert!(
-            rebound
-                .progress(super::ProgressRequest::CompletePodReplacement {
-                    fence: rebound.operation().unwrap().fence.clone(),
-                    now_ms: 2000,
-                    observation: proof
-                })
-                .is_err()
-        );
+        rebound
+            .progress(super::ProgressRequest::CompletePodReplacement {
+                fence: rebound.operation().unwrap().fence.clone(),
+                now_ms: 2000,
+                observation: proof,
+            })
+            .unwrap_err();
     }
     let completed = rebound
         .progress(super::ProgressRequest::CompletePodReplacement {
@@ -877,7 +882,7 @@ fn release_requires_retired_original_uid_and_all_retired_current_prefixes() {
         .unwrap();
     assert!(completed.operation().is_none());
     assert_eq!(completed.generation(), 1);
-    assert!(completed.propose(request(2, 20, 2)).is_err()); // Old target process cannot reopen maintenance.
+    completed.propose(request(2, 20, 2)).unwrap_err(); // Old target process cannot reopen maintenance.
     let mut next_request = request(2, 20, 2);
     if let OwnershipRequest::Reserve {
         process_plan,
@@ -916,24 +921,22 @@ fn takeover_cannot_discard_admitted_source_or_replay_old_executor_proofs() {
             .required_applied_index,
         50
     );
-    assert!(takeover.progress(old_binding).is_err());
-    assert!(takeover.propose(request(3, 30, 2)).is_err());
+    takeover.progress(old_binding).unwrap_err();
+    takeover.propose(request(3, 30, 2)).unwrap_err();
     let mut wrong_pod = binding(&takeover);
     if let super::ProgressRequest::BindPodReplacement { pod, .. } = &mut wrong_pod {
         pod["metadata"]["uid"] = json!("pod-1");
     }
-    assert!(takeover.progress(wrong_pod).is_err());
+    takeover.progress(wrong_pod).unwrap_err();
     let rebound = takeover.progress(binding(&takeover)).unwrap();
     let old_proof = observation(&active, true, 2100, 60);
-    assert!(
-        rebound
-            .progress(super::ProgressRequest::CompletePodReplacement {
-                fence: rebound.operation().unwrap().fence.clone(),
-                now_ms: 2400,
-                observation: old_proof
-            })
-            .is_err()
-    );
+    rebound
+        .progress(super::ProgressRequest::CompletePodReplacement {
+            fence: rebound.operation().unwrap().fence.clone(),
+            now_ms: 2400,
+            observation: old_proof,
+        })
+        .unwrap_err();
     let complete = rebound
         .progress(super::ProgressRequest::CompletePodReplacement {
             fence: rebound.operation().unwrap().fence.clone(),
@@ -967,15 +970,13 @@ fn stale_future_or_incomplete_admission_cannot_authorize_pod_deletion() {
                 .map(|_| ())
                 .unwrap(),
         }
-        assert!(
-            state
-                .progress(super::ProgressRequest::AdmitPodDeletion {
-                    fence: state.operation().unwrap().fence.clone(),
-                    now_ms,
-                    observation: proof
-                })
-                .is_err()
-        );
+        state
+            .progress(super::ProgressRequest::AdmitPodDeletion {
+                fence: state.operation().unwrap().fence.clone(),
+                now_ms,
+                observation: proof,
+            })
+            .unwrap_err();
     }
 }
 
@@ -989,15 +990,13 @@ fn oversized_declared_inventory_cannot_allocate_missing_group_evidence() {
         .unwrap();
     let proof = observation(&reserved, false, 1200, 50);
     reserved.cell.group_count = u32::MAX;
-    assert!(
-        reserved
-            .progress(super::ProgressRequest::AdmitPodDeletion {
-                fence: reserved.operation().unwrap().fence.clone(),
-                now_ms: 1500,
-                observation: proof,
-            })
-            .is_err()
-    );
+    reserved
+        .progress(super::ProgressRequest::AdmitPodDeletion {
+            fence: reserved.operation().unwrap().fence.clone(),
+            now_ms: 1500,
+            observation: proof,
+        })
+        .unwrap_err();
 }
 
 #[test]
@@ -1016,7 +1015,7 @@ fn captured_api_identity_rejects_misdirected_or_deleting_objects() {
     ] {
         let mut invalid = sts.clone();
         *invalid.pointer_mut(path).unwrap() = value;
-        assert!(CellIdentity::capture(&namespace, &invalid, 256, 2).is_err());
+        CellIdentity::capture(&namespace, &invalid, 256, 2).unwrap_err();
     }
     let active = admitted();
     let super::ProgressRequest::BindPodReplacement {
@@ -1049,10 +1048,8 @@ fn captured_api_identity_rejects_misdirected_or_deleting_objects() {
             4 => invalid_node["spec"]["providerID"] = json!(""),
             _ => invalid_plan[0].expected_process_incarnation = None,
         }
-        assert!(
-            SourceIdentity::capture(&active.cell, 1, &invalid_pod, &invalid_node, &invalid_plan)
-                .is_err()
-        );
+        SourceIdentity::capture(&active.cell, 1, &invalid_pod, &invalid_node, &invalid_plan)
+            .unwrap_err();
     }
 }
 
