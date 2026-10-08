@@ -312,15 +312,28 @@ async fn init_state(
                     config.raft.node_id,
                     raft_group_id,
                     &per_group_voters,
-                ) {
-                    runtime.warm_group(RaftGroupId(raft_group_id)).await?;
+                ) && let Err(error) = runtime.warm_group(RaftGroupId(raft_group_id)).await
+                {
+                    if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
+                        error: ursula_runtime::GroupEngineError::Infra(
+                            ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                        ),
+                        ..
+                    }) {
+                        tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
+                    } else {
+                        return Err(error.into());
+                    }
                 }
             }
         }
     }
 
     let state = if raft_peers.is_empty() {
-        HttpState::new(runtime)
+        match spawned.raft_registry {
+            Some(registry) => HttpState::with_raft_registry(runtime, registry),
+            None => HttpState::new(runtime),
+        }
     } else {
         let registry = spawned
             .raft_registry

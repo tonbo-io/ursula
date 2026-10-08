@@ -251,13 +251,38 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        let engine = Self::new_node(
+        Self::new_single_node_observed(
+            placement,
+            node_id,
+            node,
+            config,
+            log_store,
+            options,
+            Default::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_single_node_observed<LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        node: BasicNode,
+        config: Arc<Config>,
+        log_store: LS,
+        options: RaftGroupEngineOptions,
+        apply_health: crate::apply_failure::ApplyHealth,
+    ) -> Result<Self, GroupEngineError>
+    where
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
+        let engine = Self::new_node_observed(
             placement,
             node_id,
             config,
             SingleNodeRaftNetworkFactory,
             log_store,
             options,
+            apply_health,
         )
         .await?;
 
@@ -322,6 +347,31 @@ impl RaftGroupEngine {
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        Self::new_node_observed(
+            placement,
+            node_id,
+            config,
+            network_factory,
+            log_store,
+            options,
+            Default::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_node_observed<NF, LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        log_store: LS,
+        options: RaftGroupEngineOptions,
+        apply_health: crate::apply_failure::ApplyHealth,
+    ) -> Result<Self, GroupEngineError>
+    where
+        NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
         let RaftGroupEngineOptions {
             apply_stop_signal,
             #[cfg(test)]
@@ -346,6 +396,7 @@ impl RaftGroupEngine {
             snapshot_metadata_path,
         );
         state_machine.apply_stop_signal = apply_stop_signal;
+        state_machine.apply_health = apply_health.clone();
         #[cfg(test)]
         {
             state_machine.apply_fault = apply_fault;

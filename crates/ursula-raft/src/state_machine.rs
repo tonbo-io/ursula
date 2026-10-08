@@ -484,7 +484,7 @@ impl RaftGroupStateMachine {
             message: error.to_string(),
         };
         tracing::error!(raft_group_id = self.placement.raft_group_id.0, log_index = failure.index, error = %error, "stopping failed group; preserve WAL for corrected-code replay");
-        self.apply_health.stop(failure);
+        self.apply_health.stop(failure, self.last_applied_log_id);
         self.log_gauge.stop_apply();
         if let Some(signal) = &self.apply_stop_signal {
             signal.store(true, Ordering::Release);
