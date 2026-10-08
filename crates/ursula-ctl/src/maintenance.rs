@@ -489,6 +489,8 @@ mod tests {
 
     async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
         Json(json!({
+            "process_node_id": state.node_id,
+            "process_incarnation": ursula_proto::admin::ProcessIncarnation::from_bits(u128::from(state.node_id)),
             "raft_groups": [{
                 "raft_group_id": 7,
                 "node_id": state.node_id,
@@ -677,7 +679,7 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
@@ -685,7 +687,7 @@ mod tests {
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
@@ -693,7 +695,7 @@ mod tests {
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),
@@ -714,7 +716,7 @@ mod tests {
     fn missing_target_timeout_hint_points_to_the_leaders_rebuild() {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
-                process_incarnation: None,
+                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                 maintenance_fence: None,
                 maintenance_fence_uncertain: false,
                 node: n(2, "10.0.0.2"),
@@ -810,7 +812,7 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
@@ -818,7 +820,7 @@ mod tests {
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
@@ -837,7 +839,7 @@ mod tests {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(1, "10.0.0.1"),
@@ -845,7 +847,7 @@ mod tests {
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(2, "10.0.0.2"),
@@ -853,7 +855,7 @@ mod tests {
                     raft_maintenance: None,
                 },
                 NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: n(3, "10.0.0.3"),

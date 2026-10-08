@@ -184,7 +184,9 @@ impl RollingRestartValidator {
             let learner_ids: Vec<u64> = membership.learner_ids().collect();
             let view = NodeMetricsView {
                 // This harness models Raft state directly, not an HTTP process.
-                process_incarnation: None,
+                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(
+                    u128::from(node_id),
+                ),
                 maintenance_fence: None,
                 maintenance_fence_uncertain: false,
                 node: synthetic_node_info(node_id),

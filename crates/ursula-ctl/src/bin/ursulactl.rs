@@ -340,10 +340,6 @@ struct PinIncarnationsArgs {
     /// every other voter must still match the saved manifest.
     #[arg(long)]
     replace_node: Option<u64>,
-    /// Migration diagnostic for deployed 0.6.2 and earlier sources only.
-    /// Missing identities remain explicitly uncertified in the output.
-    #[arg(long)]
-    allow_legacy_incarnation: bool,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -503,13 +499,8 @@ async fn main() -> Result<()> {
         Command::PinIncarnations(args) => {
             let nodes = load_nodes(&args.config).await?;
             let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-            let pinned = client
-                .pin_nodes(&nodes, args.replace_node, args.allow_legacy_incarnation)
-                .await?;
-            println!(
-                "{}",
-                serde_json::json!({"process_incarnations_certified": pinned.iter().all(|node| node.expected_process_incarnation.is_some()), "nodes": pinned})
-            );
+            let pinned = client.pin_nodes(&nodes, args.replace_node).await?;
+            println!("{}", serde_json::json!({"nodes": pinned}));
             Ok(())
         }
         Command::ActivateMaintenanceFence(args) => {
@@ -1134,4 +1125,22 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     .await?;
     println!("cluster verified: {} node(s) fully ready", nodes.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    #[test]
+    fn pin_incarnations_rejects_the_removed_legacy_override() {
+        let error = super::Cli::try_parse_from([
+            "ursulactl",
+            "pin-incarnations",
+            "--config",
+            "nodes.json",
+            "--allow-legacy-incarnation",
+        ])
+        .expect_err("a removed override must not authorize legacy identities");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 }

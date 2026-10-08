@@ -36,7 +36,6 @@ pub struct QuorumVerificationOptions {
 pub struct QuorumVerification {
     pub version: u32,
     pub participation_certified: bool,
-    pub process_incarnations_certified: bool,
     pub process_incarnations: BTreeMap<u64, ProcessIncarnation>,
     /// Process-local admission only, not proof of an external CAS reservation.
     pub maintenance_executor_certified: bool,
@@ -67,7 +66,6 @@ fn certified_executor(snapshot: &ClusterSnapshot, retired: bool) -> Option<Maint
         .iter()
         .all(|node| {
             node.node.expected_maintenance_fence.as_ref() == Some(expected)
-                && node.process_incarnation.is_some()
                 && node.maintenance_fence.as_ref() == Some(&expected_state)
                 && !node.maintenance_fence_uncertain
         })
@@ -321,11 +319,7 @@ async fn verify_observed_quorum(
                     let process_incarnations = snapshot
                         .per_node
                         .iter()
-                        .filter_map(|node| {
-                            node.process_incarnation
-                                .clone()
-                                .map(|incarnation| (node.node.id, incarnation))
-                        })
+                        .map(|node| (node.node.id, node.process_incarnation.clone()))
                         .collect::<BTreeMap<_, _>>();
                     let active_fence = certified_executor(&snapshot, false);
                     let retired_fence = certified_executor(&snapshot, true);
@@ -335,7 +329,6 @@ async fn verify_observed_quorum(
                         maintenance_executor_retired_certified: retired_fence.is_some(),
                         maintenance_fence: active_fence.or(retired_fence),
                         participation_certified,
-                        process_incarnations_certified: process_incarnations.len() == nodes.len(),
                         process_incarnations,
                         prefixes,
                         applied,
@@ -363,7 +356,7 @@ mod tests {
         ClusterSnapshot {
             per_node: (1..=3)
                 .map(|id| NodeMetricsView {
-                    process_incarnation: None,
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
                     maintenance_fence: None,
                     maintenance_fence_uncertain: false,
                     node: NodeInfo {
@@ -416,8 +409,7 @@ mod tests {
         let mut state = snapshot();
         assert_eq!(certified_executor(&state, false), None);
         for node in &mut state.per_node {
-            node.process_incarnation =
-                Some(ProcessIncarnation::from_bits(u128::from(node.node.id)));
+            node.process_incarnation = ProcessIncarnation::from_bits(u128::from(node.node.id));
             node.node.expected_maintenance_fence = Some(fence.clone());
             node.maintenance_fence = Some(MaintenanceFenceState::Active {
                 fence: fence.clone(),

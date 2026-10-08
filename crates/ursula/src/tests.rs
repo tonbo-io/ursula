@@ -2111,7 +2111,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
                 .all(|groups| groups[&id] >= prefix.required_applied_index)
         );
     }
-    let mut admitted = client.pin_nodes(&manifest, None, false).await.unwrap();
+    let mut admitted = client.pin_nodes(&manifest, None).await.unwrap();
     for node in &mut admitted {
         node.expected_maintenance_fence = Some(executor_token(1));
     }
@@ -8227,7 +8227,7 @@ async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
         .await
         .expect_err("the replaced executor must not read the node");
     old_client
-        .pin_nodes(std::slice::from_ref(&old_node), None, false)
+        .pin_nodes(std::slice::from_ref(&old_node), None)
         .await
         .expect_err("the replaced executor must not pin the node");
     assert!(registry.leadership_shed_state().is_shed());
@@ -8273,12 +8273,12 @@ async fn explicit_replacement_binding_preserves_token_and_rejects_another_execut
     };
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     client
-        .pin_nodes(std::slice::from_ref(&node), None, false)
+        .pin_nodes(std::slice::from_ref(&node), None)
         .await
         .expect_err("pinning without an explicit replacement must fail on an incarnation mismatch");
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     let pinned = client
-        .pin_nodes(std::slice::from_ref(&node), Some(1), false)
+        .pin_nodes(std::slice::from_ref(&node), Some(1))
         .await
         .unwrap();
     assert_eq!(
@@ -8294,7 +8294,7 @@ async fn explicit_replacement_binding_preserves_token_and_rejects_another_execut
     client.set_maintenance_fence(&other, false).await.unwrap();
     let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
     client
-        .pin_nodes(&[node], Some(1), false)
+        .pin_nodes(&[node], Some(1))
         .await
         .expect_err("replacement must reject a node bound to another executor");
     server.abort();

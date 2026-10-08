@@ -49,11 +49,9 @@ write_manifest() {
 }
 
 # Pin across separate CLI invocations and persist the plan before a mutation.
-# --allow-legacy-incarnation is only the deployed <=0.6.2 upgrade consumer;
-# those entries remain explicitly uncertified until each voter is replaced.
 pin_manifest() {
   if ! "${CTL}" pin-incarnations --config "${MANIFEST}" \
-      --allow-legacy-incarnation --http-timeout-secs 60 >"${MANIFEST}.next"; then
+      --http-timeout-secs 60 >"${MANIFEST}.next"; then
     rm -f "${MANIFEST}.next"
     return 1
   fi
@@ -90,7 +88,7 @@ bind_replacement_incarnation() {
     return
   fi
   if ! "${CTL}" pin-incarnations --config "${MANIFEST}" --replace-node "${node_id}" \
-      --allow-legacy-incarnation --http-timeout-secs 60 >"${MANIFEST}.next"; then
+      --http-timeout-secs 60 >"${MANIFEST}.next"; then
     rm -f "${MANIFEST}.next"
     return 1
   fi

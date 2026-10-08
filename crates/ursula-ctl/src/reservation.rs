@@ -610,7 +610,6 @@ fn validate_observed_prefix(
         || observation.completed_ms < observation.started_ms
         || proof.version != 3
         || !proof.participation_certified
-        || !proof.process_incarnations_certified
         || proof
             .process_incarnations
             .keys()
