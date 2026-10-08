@@ -135,7 +135,7 @@ pub struct RaftGroupEngineOptions {
 }
 
 pub struct RaftGroupEngine {
-    pub(crate) rejoin: std::sync::OnceLock<Arc<crate::GroupRejoin>>,
+    pub(crate) rejoin: std::sync::Mutex<Option<Arc<crate::GroupRejoin>>>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
     pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
@@ -438,7 +438,11 @@ impl RaftGroupEngine {
                 },
             ));
         }
-        if let Some(bound) = self.rejoin.get() {
+        let mut binding = self
+            .rejoin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bound) = binding.as_ref() {
             if !Arc::ptr_eq(bound, &gate) {
                 return Err(GroupEngineError::Infra(
                     ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
@@ -448,12 +452,9 @@ impl RaftGroupEngine {
             }
         } else {
             gate.bind(&self.raft_handle())?;
-            self.rejoin.set(gate).map_err(|_already_bound| {
-                GroupEngineError::Infra(ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
-                    raft_group_id: self.placement.raft_group_id,
-                })
-            })?;
+            *binding = Some(gate);
         }
+        drop(binding);
         registry.register_engine(self);
         Ok(())
     }

@@ -500,7 +500,11 @@ impl RaftGroupHandleRegistry {
             snapshot_installs: engine.snapshot_installs.clone(),
             cache: engine.cold_index_cache.clone(),
             barrier: engine.read_barrier.clone(),
-            recovery: engine.rejoin.get().cloned(),
+            recovery: engine
+                .rejoin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         });
         self.groups.rcu(|groups| {
             let mut groups = (**groups).clone();

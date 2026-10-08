@@ -606,9 +606,6 @@ impl GroupRejoin {
                 },
             ));
         }
-        if !self.vote_gate_open() {
-            raft.runtime_config().elect(false);
-        }
         self.metrics.set(raft.metrics()).map_err(|_already_bound| {
             ursula_runtime::GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
@@ -616,6 +613,9 @@ impl GroupRejoin {
                 },
             )
         })?;
+        if !self.vote_gate_open() {
+            raft.runtime_config().elect(false);
+        }
         Ok(())
     }
 

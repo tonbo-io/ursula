@@ -238,6 +238,48 @@ async fn recovery_publication_keeps_one_gate_bound_to_one_engine() {
             ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
         ))
     ));
+    // A refused rebind must not disable the unrelated engine's elections.
+    other
+        .raft
+        .initialize(std::collections::BTreeMap::from([(
+            1,
+            BasicNode::new("local"),
+        )]))
+        .await
+        .unwrap();
+    other
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "singleton leader")
+        .await
+        .unwrap();
+    other
+        .raft
+        .append_entries(crate::UrsulaAppendEntriesRequest {
+            vote: crate::UrsulaVote::new_committed(99, 2),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        })
+        .await
+        .unwrap();
+    other.raft.runtime_config().elect(true);
+    assert!(matches!(
+        gate.bind(&other.raft_handle()),
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryAlreadyBound { .. }
+        ))
+    ));
+    other.raft.runtime_config().tick(true);
+    other
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.current_term > 99 && metrics.current_leader == Some(1),
+            "failed bind preserves campaigning",
+        )
+        .await
+        .unwrap();
     engine.shutdown().await.unwrap();
     other.shutdown().await.unwrap();
 }
