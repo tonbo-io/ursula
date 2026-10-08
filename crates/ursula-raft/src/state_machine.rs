@@ -458,7 +458,7 @@ pub struct RaftGroupStateMachine {
     pub(crate) last_applied_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     pub(crate) last_membership: StoredMembershipOf<UrsulaRaftTypeConfig>,
     pub(crate) current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
-    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
+    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<MetadataPublicationState>>,
     pub(crate) snapshot_store: SharedSnapshotStore,
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
@@ -584,6 +584,12 @@ impl RaftGroupStateMachine {
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
+        // A preceding process may have exited after rename but before its
+        // directory fsync. Establish this visible pointer's durability before
+        // reconciling away pins for the previously durable pointer.
+        if let Some(parent) = path.parent() {
+            Disk::sync_dir(parent)?;
+        }
         let references = self
             .snapshot_install
             .references(self.placement.raft_group_id.0);
@@ -1007,7 +1013,13 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let meta = meta.clone();
         snapshot_metadata_work(self.metadata_serial.clone(), move || {
             let _reference = reference;
-            persist_snapshot_metadata(metadata_path.as_deref(), &meta, &pointer_bytes)?;
+            persist_snapshot_candidate(
+                metadata_path.as_deref(),
+                &meta,
+                &pointer_bytes,
+                &pointer.location,
+                &references,
+            )?;
             *current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
                 meta,
                 pointer_bytes,
@@ -1042,7 +1054,7 @@ pub struct RaftGroupSnapshotBuilder {
     snapshot: Result<Arc<GroupSnapshot>, GroupEngineError>,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
-    metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
+    metadata_serial: Arc<crate::rt::sync::Mutex<MetadataPublicationState>>,
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
     _build_permit: OwnedSemaphorePermit,
@@ -1172,7 +1184,13 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             {
                 Ok(current.clone())
             } else {
-                persist_snapshot_metadata(metadata_path.as_deref(), &meta, &pointer_bytes)?;
+                persist_snapshot_candidate(
+                    metadata_path.as_deref(),
+                    &meta,
+                    &pointer_bytes,
+                    &pointer.location,
+                    &references,
+                )?;
                 let current = CurrentSnapshot {
                     meta,
                     pointer_bytes,
@@ -1218,15 +1236,40 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     }
 }
 
+/// Local snapshot metadata errors stop OpenRaft. Queued pointer operations
+/// must observe the same terminal boundary even before RaftCore sees the error.
+#[derive(Debug, Default)]
+pub(crate) enum MetadataPublicationState {
+    #[default]
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "snapshot metadata publication stopped after an earlier failure; restart to resolve the durable pointer"
+)]
+struct SnapshotMetadataStopped;
+
 /// Keep metadata fsync and the serialized pointer transition off core workers.
 pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
-    serial: Arc<crate::rt::sync::Mutex<()>>,
+    serial: Arc<crate::rt::sync::Mutex<MetadataPublicationState>>,
     work: impl FnOnce() -> Result<T, io::Error> + Send + 'static,
 ) -> Result<T, io::Error> {
-    let serial = serial.lock_owned().await;
+    let mut serial = serial.lock_owned().await;
     let work = move || {
-        let _serial = serial;
-        work()
+        if matches!(*serial, MetadataPublicationState::Failed) {
+            // OpenRaft's snapshot storage API requires an io::Error here.
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                SnapshotMetadataStopped,
+            ));
+        }
+        let result = work();
+        if result.is_err() {
+            *serial = MetadataPublicationState::Failed;
+        }
+        result
     };
     #[cfg(not(madsim))]
     {
@@ -1238,6 +1281,20 @@ pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
     {
         work()
     }
+}
+
+fn persist_snapshot_candidate(
+    path: Option<&Path>,
+    meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    pointer_bytes: &[u8],
+    location: &SnapshotLocation,
+    references: &SnapshotReferences,
+) -> Result<(), io::Error> {
+    persist_snapshot_metadata(path, meta, pointer_bytes).inspect_err(|_error| {
+        // Rename may already have happened. Keep the candidate even if this
+        // particular failure occurred earlier; the terminal latch bounds it.
+        references.retain_failed_candidate(location);
+    })
 }
 
 fn persist_snapshot_metadata(
@@ -1322,7 +1379,7 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn canceled_metadata_waiter_retains_serial_until_publication() {
-        let serial = Arc::new(crate::rt::sync::Mutex::new(()));
+        let serial = Arc::new(crate::rt::sync::Mutex::new(MetadataPublicationState::Ready));
         let (release, wait) = std::sync::mpsc::channel();
         let entered = Arc::new(crate::rt::sync::Notify::new());
         let worker_entered = entered.clone();
@@ -1347,6 +1404,40 @@ mod tests {
             .await
             .unwrap();
         assert!(published.load(Ordering::Acquire));
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn failed_metadata_publication_rejects_an_already_queued_writer() {
+        let serial = Arc::new(crate::rt::sync::Mutex::new(MetadataPublicationState::Ready));
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(snapshot_metadata_work(serial.clone(), move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            Err::<(), _>(io::Error::from(io::ErrorKind::Other))
+        }));
+        entered_rx.await.unwrap();
+        let executed = Arc::new(AtomicBool::new(false));
+        let second_executed = executed.clone();
+        let second = snapshot_metadata_work(serial, move || {
+            second_executed.store(true, Ordering::Release);
+            Ok(())
+        });
+        tokio::pin!(second);
+        assert!(futures_util::poll!(&mut second).is_pending());
+        release.send(()).unwrap();
+        assert_eq!(
+            first.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.get_ref().unwrap().is::<SnapshotMetadataStopped>());
+        assert!(!executed.load(Ordering::Acquire));
     }
 
     #[cfg(not(madsim))]

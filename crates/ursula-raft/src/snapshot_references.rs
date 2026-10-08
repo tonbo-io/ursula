@@ -34,6 +34,9 @@ struct ReferenceState {
     current_known: bool,
     current: Option<SnapshotLocation>,
     active: BTreeMap<String, (SnapshotLocation, usize)>,
+    // A terminal metadata failure may have published this candidate before
+    // returning an error. Keep it beyond the failed engine's lease lifetime.
+    failed_candidate: Option<SnapshotLocation>,
 }
 
 impl ReferenceState {
@@ -41,6 +44,7 @@ impl ReferenceState {
         self.current
             .iter()
             .cloned()
+            .chain(self.failed_candidate.iter().cloned())
             .chain(self.active.values().map(|(location, _)| location.clone()))
             .collect()
     }
@@ -101,10 +105,21 @@ impl SnapshotReferences {
         }))
     }
 
+    /// Metadata publication is terminally latched after this failure, so there
+    /// can be only one failed candidate per incarnation. It need not have
+    /// reached rename; retaining it conservatively is bounded and safe.
+    pub(crate) fn retain_failed_candidate(&self, location: &SnapshotLocation) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(location, SnapshotLocation::S3 { .. }) {
+            state.failed_candidate = Some(location.clone());
+        }
+    }
+
     /// Call after durable metadata and the current pointer change. A prepared
     /// lease protects the new external pointer during this transition.
     pub(crate) fn commit_current(&self, location: &SnapshotLocation) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.failed_candidate = None;
         state.current_known = true;
         state.current = match location {
             SnapshotLocation::S3 { .. } => Some(location.clone()),
