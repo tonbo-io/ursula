@@ -99,6 +99,8 @@ fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_
 /// Single-node groups over the per-core journals of `log_stores`.
 #[derive(Debug, Clone)]
 pub struct DurableRaftGroupEngineFactory {
+    #[cfg(test)]
+    pub(crate) fail_apply_at: Option<(ursula_shard::RaftGroupId, u64)>,
     log_stores: RaftWal,
     cold_store: Option<ColdStoreHandle>,
     registry: Option<RaftGroupHandleRegistry>,
@@ -111,14 +113,16 @@ impl DurableRaftGroupEngineFactory {
 
     pub fn with_cold_store(log_stores: RaftWal, cold_store: Option<ColdStoreHandle>) -> Self {
         Self {
+            #[cfg(test)]
+            fail_apply_at: None,
             log_stores,
             cold_store,
             registry: None,
         }
     }
 
-    /// Registers every group it creates in `registry`: its read barrier,
-    /// Raft handle and cold index cache.
+    /// Publishes each live group's barrier, Raft handle and cold cache, or its
+    /// terminal replay-failure diagnostics when committed application stops.
     pub fn with_registry(mut self, registry: RaftGroupHandleRegistry) -> Self {
         self.registry = Some(registry);
         self
@@ -149,7 +153,8 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
             );
             let log_store = self.log_stores.open(placement, metrics.clone())?;
             let apply_stop_signal = log_store.apply_stop_signal();
-            let engine = RaftGroupEngine::new_single_node(
+            let health = crate::apply_failure::ApplyHealth::default();
+            let engine = RaftGroupEngine::new_single_node_observed(
                 placement,
                 1,
                 BasicNode::new("local"),
@@ -157,13 +162,30 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 log_store,
                 RaftGroupEngineOptions {
                     apply_stop_signal: Some(apply_stop_signal),
+                    #[cfg(test)]
+                    apply_fault: self
+                        .fail_apply_at
+                        .filter(|(group, _)| *group == placement.raft_group_id)
+                        .map(
+                            |(_, index)| crate::apply_failure::ApplyFault::PanicAfterMutation {
+                                index,
+                            },
+                        ),
                     metrics: Some(metrics),
                     cold_store: self.cold_store.clone(),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                     ..Default::default()
                 },
+                health.clone(),
             )
-            .await?;
+            .await
+            .inspect_err(|_error| {
+                if let Some(stopped) = health.stopped()
+                    && let Some(registry) = &self.registry
+                {
+                    registry.register_apply_stopped(placement.raft_group_id, 1, stopped);
+                }
+            })?;
             if let Some(registry) = &self.registry {
                 registry.register_engine(&engine);
             }
@@ -186,6 +208,9 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     log_stores: RaftWal,
     snapshot_store: Option<SharedSnapshotStore>,
     engine_config: RaftEngineConfig,
+    /// Faulty code that every replica of one group runs, for tests.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    apply_fault: Option<(RaftGroupId, crate::apply_failure::ApplyFault)>,
 }
 
 impl StaticGrpcRaftGroupEngineFactory {
@@ -211,7 +236,20 @@ impl StaticGrpcRaftGroupEngineFactory {
             log_stores,
             snapshot_store: None,
             engine_config: RaftEngineConfig::default(),
+            #[cfg(any(test, madsim, feature = "fault-injection"))]
+            apply_fault: None,
         }
+    }
+
+    /// Run faulty code for `group`, as a deployment of a buggy binary does.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub fn with_apply_fault(
+        mut self,
+        group: RaftGroupId,
+        fault: crate::apply_failure::ApplyFault,
+    ) -> Self {
+        self.apply_fault = Some((group, fault));
+        self
     }
 
     pub fn registry(&self) -> &RaftGroupHandleRegistry {
@@ -414,7 +452,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
             let apply_stop_signal = store.apply_stop_signal();
-            let engine = RaftGroupEngine::new_node(
+            let health = crate::apply_failure::ApplyHealth::default();
+            let engine = RaftGroupEngine::new_node_observed(
                 placement,
                 self.node_id,
                 config,
@@ -427,12 +466,25 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     snapshot_store: self.snapshot_store.clone(),
                     snapshot_build: Some(self.registry.snapshot_build_coordinator()),
                     snapshot_install: Some(self.registry.snapshot_install_coordinator()),
-                    #[cfg(test)]
-                    apply_fault: None,
+                    #[cfg(any(test, madsim, feature = "fault-injection"))]
+                    apply_fault: self
+                        .apply_fault
+                        .filter(|(group, _)| *group == placement.raft_group_id)
+                        .map(|(_, fault)| fault),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                 },
+                health.clone(),
             )
-            .await?;
+            .await
+            .inspect_err(|_error| {
+                if let Some(stopped) = health.stopped() {
+                    self.registry.register_apply_stopped(
+                        placement.raft_group_id,
+                        self.node_id,
+                        stopped,
+                    );
+                }
+            })?;
             engine.recovery_tasks.attach(
                 &engine,
                 rejoin,

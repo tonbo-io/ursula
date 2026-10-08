@@ -303,6 +303,7 @@ fn spawn_singleton(
     storage: GroupStorage,
 ) -> Result<SpawnedRuntime, RuntimeError> {
     let raft_wal = storage.raft_wal();
+    let mut raft_registry = None;
     let runtime = match storage {
         GroupStorage::InMemory => {
             let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
@@ -313,10 +314,13 @@ fn spawn_singleton(
             )?
         }
         GroupStorage::Raft(log_stores) => {
+            let registry = ursula_raft::RaftGroupHandleRegistry::default();
+            raft_registry = Some(registry.clone());
             let factory = ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
                 log_stores,
                 cold_store.clone(),
-            );
+            )
+            .with_registry(registry);
             ShardRuntime::spawn_with_engine_factory_and_cold_store(
                 runtime_config,
                 factory,
@@ -326,7 +330,7 @@ fn spawn_singleton(
     };
     Ok(SpawnedRuntime {
         runtime,
-        raft_registry: None,
+        raft_registry,
         raft_wal,
     })
 }

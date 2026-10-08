@@ -124,8 +124,9 @@ use crate::types::UrsulaRaftTypeConfig;
 #[derive(Default)]
 pub struct RaftGroupEngineOptions {
     pub(crate) apply_stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
-    #[cfg(test)]
-    pub(crate) apply_fault: Option<crate::apply_failure::ApplyFault>,
+    /// Faulty code for tests and simulations; production has none.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub apply_fault: Option<crate::apply_failure::ApplyFault>,
     pub metrics: Option<GroupEngineMetrics>,
     pub cold_store: Option<ColdStoreHandle>,
     pub snapshot_store: Option<SharedSnapshotStore>,
@@ -251,13 +252,38 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        let engine = Self::new_node(
+        Self::new_single_node_observed(
+            placement,
+            node_id,
+            node,
+            config,
+            log_store,
+            options,
+            Default::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_single_node_observed<LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        node: BasicNode,
+        config: Arc<Config>,
+        log_store: LS,
+        options: RaftGroupEngineOptions,
+        apply_health: crate::apply_failure::ApplyHealth,
+    ) -> Result<Self, GroupEngineError>
+    where
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
+        let engine = Self::new_node_observed(
             placement,
             node_id,
             config,
             SingleNodeRaftNetworkFactory,
             log_store,
             options,
+            apply_health,
         )
         .await?;
 
@@ -322,9 +348,34 @@ impl RaftGroupEngine {
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        Self::new_node_observed(
+            placement,
+            node_id,
+            config,
+            network_factory,
+            log_store,
+            options,
+            Default::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_node_observed<NF, LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        log_store: LS,
+        options: RaftGroupEngineOptions,
+        apply_health: crate::apply_failure::ApplyHealth,
+    ) -> Result<Self, GroupEngineError>
+    where
+        NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
         let RaftGroupEngineOptions {
             apply_stop_signal,
-            #[cfg(test)]
+            #[cfg(any(test, madsim, feature = "fault-injection"))]
             apply_fault,
             metrics,
             cold_store,
@@ -346,7 +397,8 @@ impl RaftGroupEngine {
             snapshot_metadata_path,
         );
         state_machine.apply_stop_signal = apply_stop_signal;
-        #[cfg(test)]
+        state_machine.apply_health = apply_health.clone();
+        #[cfg(any(test, madsim, feature = "fault-injection"))]
         {
             state_machine.apply_fault = apply_fault;
         }
@@ -585,6 +637,20 @@ impl RaftGroupEngine {
             .with_state_machine(f)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft state-machine access: {err}")))
+    }
+
+    /// Run faulty code from now on, as a deployment of a buggy binary does.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub async fn inject_apply_fault(
+        &self,
+        fault: crate::apply_failure::ApplyFault,
+    ) -> Result<(), GroupEngineError> {
+        self.with_state_machine(move |state| {
+            Box::pin(async move {
+                state.apply_fault = Some(fault);
+            })
+        })
+        .await
     }
 
     /// The live stream's cold-index generation (F14g; 0 when absent).

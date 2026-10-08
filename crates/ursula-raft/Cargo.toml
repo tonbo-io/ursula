@@ -64,5 +64,10 @@ harness = false
 name = "owner_burst"
 harness = false
 
+[features]
+# Lets other crates' tests run deterministic apply bugs. Never enable it in a
+# shipped build.
+fault-injection = []
+
 [lints]
 workspace = true

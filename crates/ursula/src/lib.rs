@@ -291,11 +291,22 @@ pub struct HttpState {
 
 impl HttpState {
     /// The static topology is the expected inventory. Observed metrics cannot
-    /// establish which groups or voters are missing after a restart.
+    /// establish which groups or voters are missing after a restart. A
+    /// single-node durable runtime has no static inventory and creates its
+    /// groups on first use, so it certifies the groups it hosts.
     fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
         let registry = self.raft_registry()?;
-        let topology = self.client_write_router.as_ref()?;
         let snapshots = registry.metrics_snapshot();
+        let Some(topology) = self.client_write_router.as_ref() else {
+            let node_id = snapshots.first()?.node_id;
+            let expected = snapshots
+                .iter()
+                .map(|group| (group.raft_group_id, BTreeSet::from([node_id])))
+                .collect();
+            return Some(ursula_raft::check_raft_maintenance(
+                &snapshots, node_id, expected, 16,
+            ));
+        };
         let node_id = topology
             .node_id
             .or_else(|| snapshots.first().map(|group| group.node_id))?;
@@ -1319,12 +1330,14 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
     let raft_maintenance = state.raft_maintenance_report();
-    // Non-Raft dev mode has no static voter role. A registry without its
-    // topology cannot certify its local replica inventory.
-    let raft_ready = state.raft_registry().is_none()
-        || raft_maintenance
-            .as_ref()
-            .is_some_and(ursula_raft::RaftMaintenanceReport::serving_ready);
+    // Non-Raft dev mode has no static voter role. A single-node durable
+    // runtime has nothing to certify before its first group exists. A cluster
+    // registry without its topology cannot certify its local replica inventory.
+    let raft_ready = match (state.raft_registry(), raft_maintenance.as_ref()) {
+        (None, _) => true,
+        (Some(_), Some(report)) => report.serving_ready(),
+        (Some(registry), None) => state.client_write_router.is_none() && registry.is_empty(),
+    };
     let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
     // Groups whose gated replica here got no leader barrier and applied
     // nothing for a while: a majority of their voters may be gated, and they

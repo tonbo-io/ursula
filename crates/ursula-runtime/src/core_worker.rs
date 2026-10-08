@@ -138,11 +138,22 @@ pub(crate) enum CoreCommand {
     },
 }
 
+/// A failed replay has no actor or read barrier. Retain its terminal slot so
+/// traffic cannot turn a deterministic poison record into a restart loop.
+pub(crate) enum GroupSlot {
+    Running(GroupMailbox),
+    ApplyStopped {
+        term: u64,
+        index: u64,
+        kind: ursula_proto::admin::ApplyFailureKind,
+    },
+}
+
 pub(crate) struct CoreWorker {
     pub(crate) core_id: CoreId,
     pub(crate) rx: mpsc::Receiver<Traced<CoreCommand>>,
     pub(crate) engine_factory: Arc<dyn GroupEngineFactory>,
-    pub(crate) groups: HashMap<RaftGroupId, GroupMailbox>,
+    pub(crate) groups: HashMap<RaftGroupId, GroupSlot>,
     pub(crate) metrics: Arc<RuntimeMetricsInner>,
     pub(crate) group_mailbox_capacity: usize,
     pub(crate) cold_write_admission: ColdWriteAdmission,
@@ -375,10 +386,25 @@ impl CoreWorker {
             let metrics = GroupEngineMetrics {
                 inner: self.metrics.clone(),
             };
-            let engine = engine_factory
-                .create(placement, metrics)
-                .await
-                .map_err(|err| RuntimeError::group_engine(placement, err))?;
+            let engine = match engine_factory.create(placement, metrics).await {
+                Ok(engine) => engine,
+                Err(
+                    error @ crate::engine::GroupEngineError::Infra(
+                        crate::engine::GroupInfraError::ApplyStopped {
+                            term, index, kind, ..
+                        },
+                    ),
+                ) => {
+                    self.groups
+                        .insert(placement.raft_group_id, GroupSlot::ApplyStopped {
+                            term,
+                            index,
+                            kind,
+                        });
+                    return Err(RuntimeError::group_engine(placement, error));
+                }
+                Err(error) => return Err(RuntimeError::group_engine(placement, error)),
+            };
             self.read_barriers
                 .install(placement.raft_group_id, engine.linearizable_read_barrier());
             let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
@@ -394,17 +420,33 @@ impl CoreWorker {
                 read_materialization: self.read_materialization.clone(),
             };
             crate::rt::spawn(actor.run());
-            self.groups.insert(placement.raft_group_id, GroupMailbox {
-                group_id: placement.raft_group_id,
-                tx,
-                metrics: self.metrics.clone(),
-            });
+            self.groups.insert(
+                placement.raft_group_id,
+                GroupSlot::Running(GroupMailbox {
+                    group_id: placement.raft_group_id,
+                    tx,
+                    metrics: self.metrics.clone(),
+                }),
+            );
         }
-        Ok(self
+        match self
             .groups
             .get(&placement.raft_group_id)
             .expect("group was just inserted")
-            .clone())
+        {
+            GroupSlot::Running(mailbox) => Ok(mailbox.clone()),
+            GroupSlot::ApplyStopped { term, index, kind } => Err(RuntimeError::group_engine(
+                placement,
+                crate::engine::GroupEngineError::Infra(
+                    crate::engine::GroupInfraError::ApplyStopped {
+                        raft_group_id: placement.raft_group_id,
+                        term: *term,
+                        index: *index,
+                        kind: *kind,
+                    },
+                ),
+            )),
+        }
     }
 
     pub(crate) async fn shutdown_group_engine(
@@ -417,6 +459,10 @@ impl CoreWorker {
             return;
         };
         self.read_barriers.remove(placement.raft_group_id);
+        let GroupSlot::Running(group) = group else {
+            reply(response_tx, Ok(()));
+            return;
+        };
         if let Err(command) = group
             .send(GroupCommand::ShutdownEngine { response_tx })
             .await
@@ -454,11 +500,14 @@ impl CoreWorker {
             read_materialization: self.read_materialization.clone(),
         };
         crate::rt::spawn(actor.run());
-        self.groups.insert(placement.raft_group_id, GroupMailbox {
-            group_id: placement.raft_group_id,
-            tx,
-            metrics: self.metrics.clone(),
-        });
+        self.groups.insert(
+            placement.raft_group_id,
+            GroupSlot::Running(GroupMailbox {
+                group_id: placement.raft_group_id,
+                tx,
+                metrics: self.metrics.clone(),
+            }),
+        );
         Ok(())
     }
 
@@ -484,15 +533,29 @@ impl CoreWorker {
                     }
                     let engine = engine_factory
                         .create(placement, GroupEngineMetrics { inner: metrics })
-                        .await
-                        .map_err(|err| RuntimeError::group_engine(placement, err))?;
+                        .await;
                     Ok((placement, engine))
                 }
             })
             .buffer_unordered(WARM_GROUP_CONCURRENCY_PER_CORE);
         while let Some(engine) = engines.next().await {
             let (placement, engine) = engine?;
-            self.install_group_engine(placement, engine).await?;
+            match engine {
+                Ok(engine) => self.install_group_engine(placement, engine).await?,
+                Err(crate::engine::GroupEngineError::Infra(
+                    crate::engine::GroupInfraError::ApplyStopped {
+                        term, index, kind, ..
+                    },
+                )) => {
+                    self.groups
+                        .insert(placement.raft_group_id, GroupSlot::ApplyStopped {
+                            term,
+                            index,
+                            kind,
+                        });
+                }
+                Err(error) => return Err(RuntimeError::group_engine(placement, error)),
+            }
         }
         Ok(())
     }

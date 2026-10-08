@@ -24,19 +24,35 @@ impl ApplyError {
     }
 }
 #[derive(Debug, Default, Clone)]
-pub(crate) struct ApplyHealth(Arc<Mutex<Option<ApplyFailure>>>);
+pub(crate) struct ApplyHealth(Arc<Mutex<Option<StoppedApply>>>);
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoppedApply {
+    pub(crate) failure: ApplyFailure,
+    pub(crate) last_applied: Option<openraft::alias::LogIdOf<crate::types::UrsulaRaftTypeConfig>>,
+}
 impl ApplyHealth {
     pub(crate) fn failure(&self) -> Option<ApplyFailure> {
+        self.stopped().map(|stopped| stopped.failure)
+    }
+    pub(crate) fn stopped(&self) -> Option<StoppedApply> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-    pub(crate) fn stop(&self, failure: ApplyFailure) {
+    pub(crate) fn stop(
+        &self,
+        failure: ApplyFailure,
+        last_applied: Option<openraft::alias::LogIdOf<crate::types::UrsulaRaftTypeConfig>>,
+    ) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert(failure);
+            .get_or_insert(StoppedApply {
+                failure,
+                last_applied,
+            });
     }
     pub(crate) fn check(&self, raft_group_id: RaftGroupId) -> Result<(), GroupEngineError> {
         if let Some(failure) = self.failure() {
@@ -52,9 +68,11 @@ impl ApplyHealth {
     }
 }
 
-#[cfg(test)]
+/// A deterministic application bug at one committed index, hit after the
+/// command mutated state. Tests and simulations run it as faulty code.
+#[cfg(any(test, madsim, feature = "fault-injection"))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ApplyFault {
+pub enum ApplyFault {
     PanicAfterMutation { index: u64 },
     InvariantAfterMutation { index: u64 },
 }

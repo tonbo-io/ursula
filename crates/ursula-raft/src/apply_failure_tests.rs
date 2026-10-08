@@ -276,6 +276,137 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .await
         .unwrap();
     assert_eq!(retained_again.len(), 1);
+
+    // The production factory and owner runtime must retain a terminal slot,
+    // start the other group on that same owner, and never retry the poison
+    // merely because another request or warmup arrives.
+    let restarted_registry = RaftGroupHandleRegistry::default();
+    let mut factory = crate::DurableRaftGroupEngineFactory::new(wal.clone())
+        .with_registry(restarted_registry.clone());
+    factory.fail_apply_at = Some((RaftGroupId(0), poison_index));
+    let runtime = ursula_runtime::ShardRuntime::spawn_with_engine_factory(
+        ursula_runtime::RuntimeConfig::new(1, 2),
+        factory,
+    )
+    .unwrap();
+    runtime.warm_all_groups().await.unwrap();
+    runtime.warm_all_groups().await.unwrap();
+    let state = restarted_registry.metrics_snapshot();
+    let failed = state.iter().find(|group| group.raft_group_id == 0).unwrap();
+    assert_eq!(failed.apply_failure.as_ref().unwrap().index, poison_index);
+    assert_eq!(failed.last_applied, stopped.last_applied);
+    assert!(!failed.maintenance.running);
+    assert!(!failed.maintenance.recovery_ready);
+    assert!(
+        !crate::check_raft_maintenance(
+            &state,
+            1,
+            BTreeMap::from([(0, BTreeSet::from([1])), (1, BTreeSet::from([1]))]),
+            0,
+        )
+        .ready()
+    );
+    // The stopped group closes only its own participation: planned handoffs
+    // of the node's other groups stay open.
+    assert!(restarted_registry.recovery_barriers_ready());
+    let participation = restarted_registry.participation_status();
+    assert!(participation.should_campaign);
+    assert!(participation.should_accept_transfer);
+    assert!(!restarted_registry.may_campaign(RaftGroupId(999)));
+    assert!(!restarted_registry.may_campaign(RaftGroupId(0)));
+    assert!(restarted_registry.may_campaign(RaftGroupId(1)));
+    assert!(restarted_registry.get(RaftGroupId(0)).is_none());
+    assert!(restarted_registry.contains_group(RaftGroupId(0)));
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+    let service = crate::grpc::RaftGrpcService::new(restarted_registry.clone());
+    let write_error = service
+        .group_write(tonic::Request::new(
+            crate::raft_internal_proto::GroupWriteRequestV1 {
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                command_payloads: vec![crate::codec::encode_wire(&create_stream(
+                    "refused-after-replay",
+                ))],
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(write_error.code(), tonic::Code::Unavailable);
+    let read_error = service
+        .group_read(tonic::Request::new(
+            crate::raft_internal_proto::GroupReadRequestV1 {
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(read_error.code(), tonic::Code::Unavailable);
+    let append_error = restarted_registry
+        .append_entries(RaftGroupId(0), crate::UrsulaAppendEntriesRequest {
+            vote: crate::UrsulaVote::new_committed(100, 1),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(append_error, ursula_runtime::GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index, .. }) if index == poison_index)
+    );
+
+    let healthy_stream = (0..1000)
+        .map(|index| ursula_shard::BucketStreamId::new(format!("restarted-{index}"), "events"))
+        .find(|stream| runtime.locate(stream).raft_group_id == RaftGroupId(1))
+        .unwrap();
+    runtime
+        .create_stream(ursula_runtime::CreateStreamRequest::new(
+            healthy_stream.clone(),
+            "text/plain",
+        ))
+        .await
+        .unwrap();
+    let head = runtime
+        .head_stream(ursula_runtime::HeadStreamRequest {
+            stream_id: healthy_stream,
+            now_ms: 0,
+            linearizable: true,
+            read_index: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(head.placement.raft_group_id, RaftGroupId(1));
+    let failed_stream = (0..1000)
+        .map(|index| ursula_shard::BucketStreamId::new(format!("failed-{index}"), "events"))
+        .find(|stream| runtime.locate(stream).raft_group_id == RaftGroupId(0))
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            runtime
+                .create_stream(ursula_runtime::CreateStreamRequest::new(
+                    failed_stream.clone(),
+                    "text/plain"
+                ))
+                .await,
+            Err(ursula_runtime::RuntimeError::GroupEngine {
+                error: ursula_runtime::GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
+                ),
+                ..
+            }) if index == poison_index
+        ));
+    }
+    assert!(matches!(
+        runtime.warm_group(RaftGroupId(0)).await,
+        Err(ursula_runtime::RuntimeError::GroupEngine {
+            error: ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
+            ),
+            ..
+        }) if index == poison_index
+    ));
+    runtime.shutdown_group_engines().await.unwrap();
+    drop(runtime);
     wal.shutdown().await.unwrap();
     drop(wal);
 
@@ -673,4 +804,39 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
         drop(logs);
         drop(wals);
     }
+}
+
+#[tokio::test]
+async fn startup_snapshot_corruption_is_not_an_isolated_apply_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let wal = crate::log_store::RaftWal::start(
+        directory.path(),
+        ursula_config::WalFsync::Always,
+        &topology,
+    )
+    .unwrap();
+    let metadata = wal.snapshot_metadata_path(placement(0));
+    std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+    std::fs::write(&metadata, b"not a snapshot envelope").unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ursula_runtime::ShardRuntime::spawn_with_engine_factory(
+        ursula_runtime::RuntimeConfig::new(1, 1),
+        crate::DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone()),
+    )
+    .unwrap();
+    assert!(matches!(
+        runtime.warm_all_groups().await,
+        Err(ursula_runtime::RuntimeError::GroupEngine {
+            error: ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::Internal { .. }
+            ),
+            ..
+        })
+    ));
+    assert!(registry.metrics_snapshot().is_empty());
+    assert_eq!(std::fs::read(metadata).unwrap(), b"not a snapshot envelope");
+    runtime.shutdown_group_engines().await.unwrap();
+    drop(runtime);
+    wal.shutdown().await.unwrap();
 }
