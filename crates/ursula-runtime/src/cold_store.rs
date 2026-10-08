@@ -335,7 +335,7 @@ impl fmt::Debug for ColdStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ColdStoreInfo {
     pub backend: &'static str,
     pub root: Option<String>,

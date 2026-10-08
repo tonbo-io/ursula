@@ -176,7 +176,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::metrics::NodeMetricsView;
     use crate::metrics::RaftGroupView;
 
     fn node(id: u64) -> NodeInfo {
@@ -192,53 +191,19 @@ mod tests {
     }
 
     fn group(raft_group_id: u64, leader: Option<u64>) -> RaftGroupView {
-        RaftGroupView {
-            raft_group_id,
-            node_id: 0,
-            current_term: Some(1),
-            current_leader: leader,
-            committed_index: Some(1),
-            last_applied_index: Some(1),
-            voter_ids: vec![1, 2, 3],
-            learner_ids: vec![],
-            maintenance: None,
-        }
+        crate::metrics::test_group(raft_group_id, 0, 1, leader, Some(1), Some(1), vec![1, 2, 3])
     }
 
     fn empty_group(raft_group_id: u64) -> RaftGroupView {
-        RaftGroupView {
-            raft_group_id,
-            node_id: 0,
-            current_term: Some(0),
-            current_leader: None,
-            committed_index: None,
-            last_applied_index: None,
-            voter_ids: vec![],
-            learner_ids: vec![],
-            maintenance: None,
-        }
+        crate::metrics::test_group(raft_group_id, 0, 0, None, None, None, vec![])
     }
 
     #[test]
     fn cluster_ready_requires_every_node_and_leader_per_group() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: node(1),
-                    groups: vec![group(7, Some(1)), group(8, Some(2))],
-                    raft_maintenance: None,
-                },
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: node(2),
-                    groups: vec![group(7, Some(1)), group(8, Some(2))],
-                    raft_maintenance: None,
-                },
+                crate::metrics::test_view(node(1), vec![group(7, Some(1)), group(8, Some(2))]),
+                crate::metrics::test_view(node(2), vec![group(7, Some(1)), group(8, Some(2))]),
             ],
         };
         let mut summary = String::new();
@@ -248,14 +213,7 @@ mod tests {
     #[test]
     fn cluster_ready_false_when_group_lacks_leader() {
         let snapshot = ClusterSnapshot {
-            per_node: vec![NodeMetricsView {
-                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
-                node: node(1),
-                groups: vec![group(7, None)],
-                raft_maintenance: None,
-            }],
+            per_node: vec![crate::metrics::test_view(node(1), vec![group(7, None)])],
         };
         let mut summary = String::new();
         assert!(!cluster_ready(&snapshot, 1, 1, &mut summary));
@@ -265,14 +223,10 @@ mod tests {
     #[test]
     fn cluster_ready_false_when_group_is_uninitialized() {
         let snapshot = ClusterSnapshot {
-            per_node: vec![NodeMetricsView {
-                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
-                node: node(1),
-                groups: vec![group(7, Some(1)), empty_group(8)],
-                raft_maintenance: None,
-            }],
+            per_node: vec![crate::metrics::test_view(node(1), vec![
+                group(7, Some(1)),
+                empty_group(8),
+            ])],
         };
         let mut summary = String::new();
         assert!(!cluster_ready(&snapshot, 1, 2, &mut summary));

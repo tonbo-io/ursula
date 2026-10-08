@@ -64,7 +64,7 @@ fn document() -> Value {
 #[test]
 fn initial_store_uses_one_schema_and_rejects_other_versions() {
     let initial = Reservation::initial(cell()).unwrap();
-    assert_eq!(initial.version, super::RESERVATION_SCHEMA_VERSION);
+    assert_eq!(u32::from(initial.version), 1);
     assert!(initial.hosts().is_none());
     // The initial store already has the final shape: optional data is null.
     let encoded = serde_json::to_value(&initial).unwrap();
@@ -346,8 +346,7 @@ fn observation(
         started_ms: start,
         completed_ms: start.checked_add(100).unwrap(),
         verification: crate::quorum::QuorumVerification {
-            version: 3,
-            participation_certified: true,
+            version: ursula_proto::admin::SchemaVersion,
             process_incarnations: operation
                 .process_plan
                 .iter()
@@ -510,14 +509,14 @@ fn incomplete_or_uncertified_healthy_inventory_cannot_anchor_host_recovery() {
             9 => {
                 request.observation.verification.applied.remove(&3);
             }
-            10 => request.observation.verification.participation_certified = false,
-            11 => {
-                request
-                    .observation
-                    .verification
-                    .process_incarnations
-                    .remove(&3);
+            10 => {
+                request.observation.verification.prefixes.clear();
             }
+            11 => request
+                .observation
+                .verification
+                .process_incarnations
+                .clear(),
             12 => {
                 request
                     .observation

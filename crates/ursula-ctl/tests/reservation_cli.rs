@@ -188,8 +188,7 @@ fn run_host_cli(interrupt_candidate: bool) {
         started_ms: now,
         completed_ms: now,
         verification: ursula_ctl::quorum::QuorumVerification {
-            version: 3,
-            participation_certified: true,
+            version: ursula_proto::admin::SchemaVersion,
             process_incarnations: plan
                 .iter()
                 .map(|node| (node.id, node.expected_process_incarnation.clone().unwrap()))
@@ -234,6 +233,31 @@ fn run_host_cli(interrupt_candidate: bool) {
         )
         .unwrap();
     }
+    // An unsupported proof schema cannot produce a mutation request.
+    let mut legacy = serde_json::to_value(&proof).unwrap();
+    legacy["verification"]["version"] = json!(2);
+    let error = serde_json::from_value::<PrefixObservation>(legacy.clone()).unwrap_err();
+    assert!(error.is_data());
+    file(directory.path(), "legacy-observation", &legacy);
+    let snapshot_before = std::fs::read(directory.path().join("snapshot")).unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
+        .args(["reservation-request", "publish-host-inventory"])
+        .arg("--pods")
+        .arg(directory.path().join("pods"))
+        .arg("--nodes")
+        .arg(directory.path().join("nodes"))
+        .arg("--config")
+        .arg(directory.path().join("config"))
+        .arg("--observation")
+        .arg(directory.path().join("legacy-observation"))
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert_eq!(
+        std::fs::read(directory.path().join("snapshot")).unwrap(),
+        snapshot_before
+    );
     let builder = Command::new(env!("CARGO_BIN_EXE_ursulactl"))
         .args(["reservation-request", "publish-host-inventory"])
         .arg("--pods")
@@ -739,8 +763,7 @@ fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted()
         started_ms,
         completed_ms: started_ms + 100,
         verification: ursula_ctl::quorum::QuorumVerification {
-            version: 3,
-            participation_certified: true,
+            version: ursula_proto::admin::SchemaVersion,
             process_incarnations: state
                 .operation()
                 .unwrap()

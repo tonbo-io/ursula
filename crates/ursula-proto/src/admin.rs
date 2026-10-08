@@ -7,6 +7,46 @@ use std::str::FromStr;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// A wire schema version validated during decoding; unsupported versions cannot
+/// enter the operation's typed state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct SchemaVersion<const VERSION: u32>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedSchemaVersion {
+    pub expected: u32,
+    pub observed: u32,
+}
+impl std::fmt::Display for UnsupportedSchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported schema version {}; expected {}",
+            self.observed, self.expected
+        )
+    }
+}
+impl std::error::Error for UnsupportedSchemaVersion {}
+impl<const V: u32> TryFrom<u32> for SchemaVersion<V> {
+    type Error = UnsupportedSchemaVersion;
+    fn try_from(observed: u32) -> Result<Self, Self::Error> {
+        if observed == V {
+            Ok(Self)
+        } else {
+            Err(UnsupportedSchemaVersion {
+                expected: V,
+                observed,
+            })
+        }
+    }
+}
+impl<const V: u32> From<SchemaVersion<V>> for u32 {
+    fn from(_: SchemaVersion<V>) -> Self {
+        V
+    }
+}
+
 /// A mutation must carry the incarnation observed before its maintenance plan.
 pub const PROCESS_INCARNATION_HEADER: &str = "x-ursula-process-incarnation";
 
@@ -410,7 +450,7 @@ pub enum RaftMaintenanceIssue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaftMaintenanceReport {
-    pub version: u32,
+    pub version: SchemaVersion<1>,
     pub node_id: u64,
     pub lag_tolerance: u64,
     pub expected_groups: BTreeMap<u32, BTreeSet<u64>>,
@@ -420,8 +460,7 @@ pub struct RaftMaintenanceReport {
 
 impl RaftMaintenanceReport {
     pub fn ready(&self) -> bool {
-        self.version == 1
-            && !self.expected_groups.is_empty()
+        !self.expected_groups.is_empty()
             && self.node_issues.is_empty()
             && self.group_issues.is_empty()
     }
@@ -433,6 +472,7 @@ pub struct RaftGroupMaintenanceState {
     pub recovery_ready: bool,
     pub accepting_transfers: bool,
     pub membership_joint: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
     pub membership_log_index: Option<u64>,
     pub stopped_for_operator: bool,
 }
@@ -555,4 +595,202 @@ pub struct AddLearnerQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipQuery {
     pub voters: String,
+}
+
+/// Shared operational metrics. Diagnostic extensions are intentionally ignored
+/// by readers, so new server diagnostics cannot break maintenance tooling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMetrics {
+    pub process_incarnation: ProcessIncarnation,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub process_node_id: Option<u64>,
+    pub maintenance_fence: MaintenanceFenceState,
+    pub maintenance_fence_uncertain: bool,
+    #[serde(rename = "raft_groups")]
+    pub groups: Vec<RaftGroupMetrics>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub raft_maintenance: Option<RaftMaintenanceReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftGroupMetrics {
+    pub raft_group_id: u64,
+    pub node_id: u64,
+    pub current_term: u64,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub current_leader: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub committed_index: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub last_applied_index: Option<u64>,
+    pub voter_ids: Vec<u64>,
+    pub learner_ids: Vec<u64>,
+    pub maintenance: RaftGroupMaintenanceState,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub last_log_index: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub committed_term: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub last_applied_term: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub snapshot_term: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub snapshot_index: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub purged_term: Option<u64>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub purged_index: Option<u64>,
+    pub log_bytes_since_snapshot: u64,
+    pub log_entries_since_snapshot: u64,
+    pub last_snapshot_bytes: u64,
+    pub has_snapshot: bool,
+}
+impl RaftGroupMetrics {
+    pub fn participation_ready(&self) -> bool {
+        let health = &self.maintenance;
+        health.running
+            && health.recovery_ready
+            && !health.membership_joint
+            && !health.stopped_for_operator
+            && health.membership_log_index.is_some()
+            && self.last_applied_index >= health.membership_log_index
+            && self.committed_index.is_some()
+    }
+}
+
+#[cfg(test)]
+mod metrics_contract_tests {
+    use super::*;
+
+    fn complete() -> NodeMetrics {
+        NodeMetrics {
+            process_incarnation: ProcessIncarnation::from_bits(1),
+            process_node_id: Some(1),
+            maintenance_fence: MaintenanceFenceState::Unclaimed,
+            maintenance_fence_uncertain: false,
+            raft_maintenance: Some(RaftMaintenanceReport {
+                version: SchemaVersion,
+                node_id: 1,
+                lag_tolerance: 0,
+                expected_groups: BTreeMap::from([(0, BTreeSet::from([1]))]),
+                node_issues: vec![],
+                group_issues: BTreeMap::new(),
+            }),
+            groups: vec![RaftGroupMetrics {
+                raft_group_id: 0,
+                node_id: 1,
+                current_term: 1,
+                current_leader: Some(1),
+                committed_index: Some(5),
+                last_applied_index: Some(5),
+                voter_ids: vec![1],
+                learner_ids: vec![],
+                maintenance: RaftGroupMaintenanceState {
+                    running: true,
+                    recovery_ready: true,
+                    accepting_transfers: true,
+                    membership_joint: false,
+                    membership_log_index: Some(0),
+                    stopped_for_operator: false,
+                },
+                last_log_index: Some(5),
+                committed_term: Some(1),
+                last_applied_term: Some(1),
+                snapshot_term: None,
+                snapshot_index: None,
+                purged_term: None,
+                purged_index: None,
+                log_bytes_since_snapshot: 0,
+                log_entries_since_snapshot: 0,
+                last_snapshot_bytes: 0,
+                has_snapshot: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn every_emitted_operational_field_is_required() {
+        let wire = serde_json::to_value(complete()).unwrap();
+        for path in [
+            "",
+            "/raft_groups/0",
+            "/raft_groups/0/maintenance",
+            "/raft_maintenance",
+        ] {
+            for key in wire.pointer(path).unwrap().as_object().unwrap().keys() {
+                let mut damaged = wire.clone();
+                damaged
+                    .pointer_mut(path)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                let error = serde_json::from_value::<NodeMetrics>(damaged).unwrap_err();
+                assert!(error.is_data(), "missing {path}/{key}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn null_is_only_accepted_for_explicitly_nullable_fields() {
+        let wire = serde_json::to_value(complete()).unwrap();
+        for path in [
+            "/process_incarnation",
+            "/maintenance_fence",
+            "/maintenance_fence_uncertain",
+            "/raft_groups",
+            "/raft_groups/0/current_term",
+            "/raft_groups/0/maintenance",
+            "/raft_groups/0/voter_ids",
+            "/raft_groups/0/has_snapshot",
+            "/raft_groups/0/log_bytes_since_snapshot",
+            "/raft_groups/0/log_entries_since_snapshot",
+            "/raft_groups/0/last_snapshot_bytes",
+        ] {
+            let mut damaged = wire.clone();
+            *damaged.pointer_mut(path).unwrap() = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<NodeMetrics>(damaged)
+                    .unwrap_err()
+                    .is_data(),
+                "{path}"
+            );
+        }
+        let mut nullable = complete();
+        nullable.process_node_id = None;
+        nullable.raft_maintenance = None;
+        nullable.groups[0].committed_index = None;
+        let decoded: NodeMetrics =
+            serde_json::from_value(serde_json::to_value(nullable).unwrap()).unwrap();
+        assert!(!decoded.groups[0].participation_ready());
+    }
+
+    #[test]
+    fn diagnostic_extensions_do_not_participate_in_operational_decoding() {
+        let mut wire = serde_json::to_value(complete()).unwrap();
+        wire["wal_recovery"] =
+            serde_json::json!({"fsync":"future-policy", "previous_run":"future-variant"});
+        wire["runtime_future_counter"] = serde_json::json!({"arbitrary": [1,2]});
+        let decoded: NodeMetrics = serde_json::from_value(wire).unwrap();
+        assert!(decoded.groups[0].participation_ready());
+        assert!(decoded.raft_maintenance.unwrap().ready());
+    }
+
+    #[test]
+    fn schema_versions_are_validated_at_the_wire_boundary() {
+        assert_eq!(
+            SchemaVersion::<1>::try_from(2),
+            Err(UnsupportedSchemaVersion {
+                expected: 1,
+                observed: 2
+            })
+        );
+        let mut wire = serde_json::to_value(complete()).unwrap();
+        wire["raft_maintenance"]["version"] = serde_json::json!(2);
+        assert!(
+            serde_json::from_value::<NodeMetrics>(wire)
+                .unwrap_err()
+                .is_data()
+        );
+    }
 }

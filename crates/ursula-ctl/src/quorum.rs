@@ -34,8 +34,7 @@ pub struct QuorumVerificationOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuorumVerification {
-    pub version: u32,
-    pub participation_certified: bool,
+    pub version: ursula_proto::admin::SchemaVersion<3>,
     pub process_incarnations: BTreeMap<u64, ProcessIncarnation>,
     /// Process-local admission only, not proof of an external CAS reservation.
     pub maintenance_executor_certified: bool,
@@ -66,7 +65,7 @@ fn certified_executor(snapshot: &ClusterSnapshot, retired: bool) -> Option<Maint
         .iter()
         .all(|node| {
             node.node.expected_maintenance_fence.as_ref() == Some(expected)
-                && node.maintenance_fence.as_ref() == Some(&expected_state)
+                && node.maintenance_fence == expected_state
                 && !node.maintenance_fence_uncertain
         })
         .then(|| expected.clone())
@@ -89,7 +88,7 @@ fn validate_inventory(
     snapshot: &ClusterSnapshot,
     voters: &BTreeSet<u64>,
     group_count: u32,
-) -> Result<bool> {
+) -> Result<()> {
     validate_observed_inventory(snapshot, voters, voters, group_count)
 }
 
@@ -98,7 +97,7 @@ fn validate_observed_inventory(
     voters: &BTreeSet<u64>,
     observed_voters: &BTreeSet<u64>,
     group_count: u32,
-) -> Result<bool> {
+) -> Result<()> {
     if !observed_voters.is_subset(voters) || observed_voters.len() <= voters.len() / 2 {
         bail!("observed configured voters cannot form a quorum");
     }
@@ -111,7 +110,6 @@ fn validate_observed_inventory(
         bail!("quorum verification requires every selected voter exactly once");
     }
     let expected = (0..u64::from(group_count)).collect::<BTreeSet<_>>();
-    let mut participation_certified = true;
     for node in &snapshot.per_node {
         let inventory = node
             .groups
@@ -144,7 +142,7 @@ fn validate_observed_inventory(
                 );
             }
         } else {
-            participation_certified = false;
+            bail!("metrics cannot certify participation without a maintenance report");
         }
         for group in &node.groups {
             if group.node_id != node.node.id
@@ -157,7 +155,6 @@ fn validate_observed_inventory(
                 || !group
                     .current_leader
                     .is_some_and(|leader| voters.contains(&leader))
-                || group.current_term.is_none()
             {
                 bail!(
                     "node {} group {} is not fully eligible",
@@ -165,15 +162,9 @@ fn validate_observed_inventory(
                     group.raft_group_id
                 );
             }
-            if group.maintenance.is_none() {
-                participation_certified = false;
-            }
         }
     }
-    if !participation_certified {
-        bail!("metrics cannot certify participation");
-    }
-    Ok(participation_certified)
+    Ok(())
 }
 
 fn apply_evidence(
@@ -187,7 +178,7 @@ fn apply_evidence(
             let group = node
                 .group(u64::from(*group_id))
                 .context("captured group is missing")?;
-            if group.current_term != Some(prefix.leader_term)
+            if group.current_term != prefix.leader_term
                 || group.current_leader != Some(prefix.leader_id)
             {
                 bail!("group {group_id} leader changed after its fresh proof; sample again");
@@ -308,12 +299,7 @@ async fn verify_observed_quorum(
             .collect::<Result<BTreeMap<_, _>>>()?;
         loop {
             let snapshot = client.fetch_cluster(nodes).await?;
-            let participation_certified = validate_observed_inventory(
-                &snapshot,
-                &voters,
-                &observed_voters,
-                options.group_count,
-            )?;
+            validate_observed_inventory(&snapshot, &voters, &observed_voters, options.group_count)?;
             match apply_evidence(&snapshot, &prefixes)? {
                 Some(applied) => {
                     let process_incarnations = snapshot
@@ -324,11 +310,10 @@ async fn verify_observed_quorum(
                     let active_fence = certified_executor(&snapshot, false);
                     let retired_fence = certified_executor(&snapshot, true);
                     return Ok(QuorumVerification {
-                        version: 3,
+                        version: ursula_proto::admin::SchemaVersion,
                         maintenance_executor_certified: active_fence.is_some(),
                         maintenance_executor_retired_certified: retired_fence.is_some(),
                         maintenance_fence: active_fence.or(retired_fence),
-                        participation_certified,
                         process_incarnations,
                         prefixes,
                         applied,
@@ -346,20 +331,45 @@ async fn verify_observed_quorum(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proof_has_one_schema_and_no_vacuous_certification_fields() {
+        let proof = super::QuorumVerification {
+            version: ursula_proto::admin::SchemaVersion,
+            process_incarnations: Default::default(),
+            maintenance_executor_certified: false,
+            maintenance_executor_retired_certified: false,
+            maintenance_fence: None,
+            prefixes: Default::default(),
+            applied: Default::default(),
+        };
+        let value = serde_json::to_value(proof).unwrap();
+        assert_eq!(value["version"], 3);
+        for field in ["participation_certified", "process_incarnations_certified"] {
+            assert!(value.get(field).is_none());
+            let mut legacy = value.clone();
+            legacy[field] = serde_json::Value::Bool(true);
+            let error = serde_json::from_value::<super::QuorumVerification>(legacy).unwrap_err();
+            assert_eq!(error.classify(), serde_json::error::Category::Data);
+        }
+        for version in [0, 1, 2, 4, u32::MAX] {
+            let mut unknown = value.clone();
+            unknown["version"] = serde_json::Value::from(version);
+            let error = serde_json::from_value::<super::QuorumVerification>(unknown).unwrap_err();
+            assert_eq!(error.classify(), serde_json::error::Category::Data);
+        }
+        let decoded: super::QuorumVerification = serde_json::from_value(value).unwrap();
+        assert_eq!(u32::from(decoded.version), 3);
+    }
+
     use tokio::time::Instant;
 
     use super::*;
-    use crate::metrics::NodeMetricsView;
-    use crate::metrics::RaftGroupView;
 
     fn snapshot() -> ClusterSnapshot {
         ClusterSnapshot {
             per_node: (1..=3)
-                .map(|id| NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: NodeInfo {
+                .map(|id| {
+                    let node = NodeInfo {
                         expected_process_incarnation: None,
                         expected_maintenance_fence: None,
                         id,
@@ -367,37 +377,21 @@ mod tests {
                         http_url: Some(format!("http://node-{id}:4437").parse().unwrap()),
                         metrics_url: None,
                         host: format!("node-{id}"),
-                    },
-                    groups: (0..2)
-                        .map(|raft_group_id| RaftGroupView {
-                            raft_group_id,
-                            node_id: id,
-                            current_term: Some(7),
-                            current_leader: Some(1),
-                            committed_index: Some(25),
-                            last_applied_index: Some(20),
-                            voter_ids: vec![1, 2, 3],
-                            learner_ids: vec![],
-                            maintenance: Some(ursula_proto::admin::RaftGroupMaintenanceState {
-                                running: true,
-                                recovery_ready: true,
-                                membership_joint: false,
-                                membership_log_index: Some(2),
-                                stopped_for_operator: false,
-                                accepting_transfers: true,
-                            }),
+                    };
+                    let groups = (0..2)
+                        .map(|raft_group_id| {
+                            crate::metrics::test_group(
+                                raft_group_id,
+                                id,
+                                7,
+                                Some(1),
+                                Some(25),
+                                Some(20),
+                                vec![1, 2, 3],
+                            )
                         })
-                        .collect(),
-                    raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {
-                        version: 1,
-                        node_id: id,
-                        lag_tolerance: 16,
-                        expected_groups: (0..2)
-                            .map(|group| (group, BTreeSet::from([1, 2, 3])))
-                            .collect(),
-                        node_issues: vec![],
-                        group_issues: BTreeMap::new(),
-                    }),
+                        .collect();
+                    crate::metrics::test_view(node, groups)
                 })
                 .collect(),
         }
@@ -411,15 +405,15 @@ mod tests {
         for node in &mut state.per_node {
             node.process_incarnation = ProcessIncarnation::from_bits(u128::from(node.node.id));
             node.node.expected_maintenance_fence = Some(fence.clone());
-            node.maintenance_fence = Some(MaintenanceFenceState::Active {
+            node.maintenance_fence = MaintenanceFenceState::Active {
                 fence: fence.clone(),
-            });
+            };
         }
         assert_eq!(certified_executor(&state, false), Some(fence.clone()));
         state.per_node[1].maintenance_fence_uncertain = true;
         assert_eq!(certified_executor(&state, false), None);
         state.per_node[1].maintenance_fence_uncertain = false;
-        state.per_node[1].maintenance_fence = Some(MaintenanceFenceState::Retired { fence });
+        state.per_node[1].maintenance_fence = MaintenanceFenceState::Retired { fence };
         assert_eq!(certified_executor(&state, false), None);
         assert_eq!(certified_executor(&state, true), None);
         let token = state.per_node[0]
@@ -428,9 +422,9 @@ mod tests {
             .clone()
             .unwrap();
         for node in &mut state.per_node {
-            node.maintenance_fence = Some(MaintenanceFenceState::Retired {
+            node.maintenance_fence = MaintenanceFenceState::Retired {
                 fence: token.clone(),
-            });
+            };
         }
         assert_eq!(certified_executor(&state, false), None);
         assert_eq!(certified_executor(&state, true), Some(token));
@@ -455,7 +449,7 @@ mod tests {
     #[test]
     fn captured_apply_target_does_not_follow_continuous_commits() {
         let sample = snapshot();
-        assert!(validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2).unwrap());
+        validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2).unwrap();
         assert!(apply_evidence(&sample, &prefixes(20)).unwrap().is_some());
         assert!(apply_evidence(&sample, &prefixes(21)).unwrap().is_none());
     }
@@ -466,7 +460,7 @@ mod tests {
         sample.per_node.retain(|node| node.node.id != 3);
         let voters = BTreeSet::from([1, 2, 3]);
         let survivors = BTreeSet::from([1, 2]);
-        assert!(validate_observed_inventory(&sample, &voters, &survivors, 2).unwrap());
+        validate_observed_inventory(&sample, &voters, &survivors, 2).unwrap();
         validate_inventory(&sample, &voters, 2)
             .expect_err("inventory without the third voter must be rejected");
         assert_eq!(
@@ -558,9 +552,9 @@ mod tests {
     #[test]
     fn stale_term_or_changed_leader_cannot_reuse_a_prefix() {
         let mut sample = snapshot();
-        sample.per_node[2].groups[0].current_term = Some(8);
+        sample.per_node[2].groups[0].current_term = 8;
         apply_evidence(&sample, &prefixes(20)).expect_err("a stale term must not reuse a prefix");
-        sample.per_node[2].groups[0].current_term = Some(7);
+        sample.per_node[2].groups[0].current_term = 7;
         sample.per_node[2].groups[0].current_leader = Some(2);
         apply_evidence(&sample, &prefixes(20))
             .expect_err("a changed leader must not reuse a prefix");
@@ -570,7 +564,6 @@ mod tests {
     fn missing_maintenance_reports_never_certify_participation() {
         let mut sample = snapshot();
         sample.per_node[0].raft_maintenance = None;
-        sample.per_node[0].groups[0].maintenance = None;
         validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2).expect_err(
             "legacy metrics must not certify participation without a maintenance report",
         );
@@ -583,8 +576,8 @@ mod tests {
             let group = &mut sample.per_node[0].groups[0];
             match mode {
                 0 => group.learner_ids.push(4),
-                1 => group.maintenance.as_mut().unwrap().membership_joint = true,
-                _ => group.maintenance.as_mut().unwrap().recovery_ready = false,
+                1 => group.maintenance.membership_joint = true,
+                _ => group.maintenance.recovery_ready = false,
             }
             validate_inventory(&sample, &BTreeSet::from([1, 2, 3]), 2)
                 .expect_err("a learner, joint membership or closed recovery must be ineligible");

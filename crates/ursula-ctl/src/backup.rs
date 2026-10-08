@@ -935,10 +935,10 @@ mod tests {
             .route(
                 "/__ursula/metrics",
                 get(|| async {
-                    Json(serde_json::json!({
-                        "process_node_id": 1,
-                        "process_incarnation": "00000000000000000000000000000001"
-                    }))
+                    Json(crate::metrics::test_metrics(
+                        1,
+                        Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                    ))
                 }),
             )
             .route(
@@ -1024,8 +1024,10 @@ mod tests {
                     .route(
                         "/__ursula/metrics",
                         get(|| async {
-                            axum::Json(serde_json::json!({
-                    "process_node_id":1, "process_incarnation":"00000000000000000000000000000001"}))
+                            axum::Json(crate::metrics::test_metrics(
+                                1,
+                                Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                            ))
                         }),
                     )
                     .route(

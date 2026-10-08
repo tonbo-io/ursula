@@ -106,10 +106,7 @@ fn pick_successor(
         .filter(|id| {
             peer_views.get(id).is_some_and(|peer| {
                 peer.participation_ready()
-                    && peer
-                        .maintenance
-                        .as_ref()
-                        .is_none_or(|health| health.accepting_transfers)
+                    && peer.maintenance.accepting_transfers
                     && peer.voter_ids.contains(id)
                     && peer.last_applied_index.is_some()
                     && peer.last_applied_index >= required_applied
@@ -155,6 +152,7 @@ pub struct GroupReadiness {
 /// A target node is ready when, in every raft group that any peer reports:
 ///   1. The target is listed in voter_ids (membership intact).
 ///   2. The target's last_applied_index >= max peer committed_index - lag_tolerance.
+///      For an expected single-voter group, use its own committed prefix.
 ///   3. The target has applied something once any peer has committed past the
 ///      initial membership entry. An empty voter (a replica that lost its log
 ///      and has not been rebuilt yet) is never ready, whatever the lag
@@ -185,7 +183,7 @@ pub fn check_readiness(
     let mut per_group = BTreeMap::new();
     let mut all_ready = !all_group_ids.is_empty()
         && target_view.is_some()
-        && maintenance.is_none_or(|report| report.node_id == target_node_id && report.ready());
+        && maintenance.is_some_and(|report| report.node_id == target_node_id && report.ready());
     for group_id in all_group_ids {
         let peers = snapshot.peer_views(group_id, target_node_id);
         let target_group = target_view.and_then(|v| v.group(group_id));
@@ -194,16 +192,30 @@ pub fn check_readiness(
             .unwrap_or(false);
         let target_applied = target_group.and_then(|g| g.last_applied_index);
         let peer_max_committed = peers.values().filter_map(|v| v.committed_index).max();
-        let catch_up_gap = match (peer_max_committed, target_applied) {
+        let expected_voters = u32::try_from(group_id)
+            .ok()
+            .and_then(|group| maintenance.and_then(|report| report.expected_groups.get(&group)));
+        let only_target_votes = target_group
+            .is_some_and(|group| group.voter_ids.as_slice() == [target_node_id])
+            && expected_voters
+                .is_some_and(|voters| voters.len() == 1 && voters.contains(&target_node_id));
+        // A sole voter has no peer observation. Its own committed prefix is
+        // the reference only when both membership and expected inventory agree.
+        let reference_committed = if only_target_votes {
+            target_group.and_then(|group| group.committed_index)
+        } else {
+            peer_max_committed
+        };
+        let catch_up_gap = match (reference_committed, target_applied) {
             (Some(peer), Some(target)) => Some(peer.saturating_sub(target)),
             (Some(peer), None) => Some(peer),
-            (None, _) => Some(0),
+            (None, _) => None,
         };
         let within_lag = catch_up_gap
             .map(|gap| gap <= lag_tolerance)
             .unwrap_or(false);
         let empty_replica =
-            target_applied.is_none() && peer_max_committed.is_some_and(|committed| committed > 0);
+            target_applied.is_none() && reference_committed.is_some_and(|committed| committed > 0);
         let ready = voter_member
             && within_lag
             && target_group.is_some_and(RaftGroupView::participation_ready)
@@ -236,8 +248,8 @@ pub fn check_readiness(
                             .map(|(id, issues)| format!("group {id}: {issues:?}")),
                     )
                     .chain(
-                        (report.node_id != target_node_id || report.version != 1)
-                            .then(|| "invalid maintenance report identity or version".to_owned()),
+                        (report.node_id != target_node_id)
+                            .then(|| "invalid maintenance report identity".to_owned()),
                     )
                     .collect()
             })
@@ -272,14 +284,7 @@ mod tests {
     }
 
     fn view(node_id: u64, groups: Vec<RaftGroupView>) -> NodeMetricsView {
-        NodeMetricsView {
-            process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-            maintenance_fence: None,
-            maintenance_fence_uncertain: false,
-            node: node(node_id),
-            groups,
-            raft_maintenance: None,
-        }
+        crate::metrics::test_view(node(node_id), groups)
     }
 
     fn group(
@@ -290,31 +295,19 @@ mod tests {
         committed: Option<u64>,
         voters: Vec<u64>,
     ) -> RaftGroupView {
-        RaftGroupView {
+        crate::metrics::test_group(
             raft_group_id,
-            node_id: reporting_node,
-            current_term: Some(1),
-            current_leader: leader,
-            committed_index: committed,
-            last_applied_index: applied,
-            voter_ids: voters,
-            learner_ids: vec![],
-            maintenance: None,
-        }
+            reporting_node,
+            1,
+            leader,
+            committed,
+            applied,
+            voters,
+        )
     }
 
     fn empty_group(raft_group_id: u64, reporting_node: u64) -> RaftGroupView {
-        RaftGroupView {
-            raft_group_id,
-            node_id: reporting_node,
-            current_term: Some(0),
-            current_leader: None,
-            committed_index: None,
-            last_applied_index: None,
-            voter_ids: vec![],
-            learner_ids: vec![],
-            maintenance: None,
-        }
+        crate::metrics::test_group(raft_group_id, reporting_node, 0, None, None, None, vec![])
     }
 
     #[test]
@@ -353,25 +346,19 @@ mod tests {
         assert!(plan_drain(&snapshot, 1).is_empty());
         let peer = &mut snapshot.per_node[1].groups[0];
         peer.last_applied_index = Some(100);
-        peer.maintenance = Some(ursula_proto::admin::RaftGroupMaintenanceState {
+        peer.maintenance = ursula_proto::admin::RaftGroupMaintenanceState {
             running: true,
             recovery_ready: false,
             accepting_transfers: true,
             membership_joint: false,
             membership_log_index: Some(0),
             stopped_for_operator: false,
-        });
+        };
         assert!(plan_drain(&snapshot, 1).is_empty());
-        snapshot.per_node[1].groups[0]
-            .maintenance
-            .as_mut()
-            .unwrap()
-            .recovery_ready = true;
+        snapshot.per_node[1].groups[0].maintenance.recovery_ready = true;
         assert_eq!(plan_drain(&snapshot, 1).transfers[0].preferred_successor, 2);
         snapshot.per_node[1].groups[0]
             .maintenance
-            .as_mut()
-            .unwrap()
             .accepting_transfers = false;
         assert!(plan_drain(&snapshot, 1).is_empty());
     }
@@ -406,7 +393,7 @@ mod tests {
                 .collect(),
         };
         snapshot.per_node[0].raft_maintenance = Some(ursula_proto::admin::RaftMaintenanceReport {
-            version: 1,
+            version: ursula_proto::admin::SchemaVersion,
             node_id: 1,
             lag_tolerance: 16,
             expected_groups: BTreeMap::from([
@@ -528,7 +515,65 @@ mod tests {
     }
 
     #[test]
-    fn readiness_ignores_uninitialized_empty_groups() {
+    fn single_voter_readiness_uses_its_own_committed_prefix() {
+        let mut snapshot = ClusterSnapshot {
+            per_node: vec![view(1, vec![group(
+                7,
+                1,
+                Some(1),
+                Some(9),
+                Some(10),
+                vec![1],
+            )])],
+        };
+        let lagging = check_readiness(&snapshot, 1, 0);
+        assert!(!lagging.all_ready);
+        assert_eq!(lagging.per_group[&7].catch_up_gap, Some(1));
+        snapshot.per_node[0].metrics.groups[0].last_applied_index = Some(10);
+        assert!(check_readiness(&snapshot, 1, 0).all_ready);
+        snapshot.per_node[0].metrics.groups[0].committed_index = None;
+        assert!(!check_readiness(&snapshot, 1, 0).all_ready);
+    }
+
+    #[test]
+    fn absent_expected_peers_do_not_become_a_single_voter_baseline() {
+        let mut snapshot = ClusterSnapshot {
+            per_node: vec![view(1, vec![group(
+                7,
+                1,
+                Some(1),
+                Some(10),
+                Some(10),
+                vec![1, 2, 3],
+            )])],
+        };
+        let report = check_readiness(&snapshot, 1, 0);
+        assert!(!report.all_ready);
+        assert_eq!(report.per_group[&7].catch_up_gap, None);
+        // An incomplete local membership cannot override the expected voters.
+        snapshot.per_node[0].metrics.groups[0].voter_ids = vec![1];
+        assert!(!check_readiness(&snapshot, 1, 0).all_ready);
+    }
+
+    #[test]
+    fn readiness_cannot_infer_zero_lag_from_unknown_peer_commit() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                view(1, vec![group(7, 1, Some(2), Some(99), Some(99), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(2), Some(100), None, vec![
+                    1, 2, 3,
+                ])]),
+            ],
+        };
+        let report = check_readiness(&snapshot, 1, 5);
+        assert!(!report.all_ready);
+        assert_eq!(report.per_group[&7].catch_up_gap, None);
+    }
+
+    #[test]
+    fn readiness_rejects_configured_uninitialized_groups() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 view(1, vec![
@@ -542,8 +587,8 @@ mod tests {
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
-        assert!(report.all_ready, "{report:?}");
-        assert!(!report.per_group.contains_key(&8));
+        assert!(!report.all_ready, "{report:?}");
+        assert!(!report.per_group[&8].ready);
     }
 
     #[test]

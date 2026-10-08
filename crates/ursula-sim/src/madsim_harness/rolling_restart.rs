@@ -183,38 +183,72 @@ impl RollingRestartValidator {
             let voter_ids: Vec<u64> = membership.voter_ids().collect();
             let learner_ids: Vec<u64> = membership.learner_ids().collect();
             let view = NodeMetricsView {
-                // This harness models Raft state directly, not an HTTP process.
-                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(
-                    u128::from(node_id),
-                ),
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
                 node: synthetic_node_info(node_id),
-                groups: vec![RaftGroupView {
-                    raft_group_id,
-                    node_id,
-                    current_term: Some(metrics.current_term),
-                    current_leader: metrics.current_leader,
-                    committed_index: metrics.local_committed.map(|log_id| log_id.index),
-                    last_applied_index: metrics.last_applied.map(|log_id| log_id.index),
-                    voter_ids,
-                    learner_ids,
-                    maintenance: Some(ursula_raft::RaftGroupMaintenanceState {
-                        running: metrics.running_state.is_ok()
-                            && metrics.state != openraft::ServerState::Shutdown,
-                        recovery_ready: self
-                            .registry
-                            .rejoin(node_id)
-                            .is_none_or(|rejoin| rejoin.vote_gate_open()),
-                        accepting_transfers: true,
-                        membership_joint: membership.get_joint_config().len() != 1,
-                        membership_log_index: metrics.membership_config.log_id().map(|id| id.index),
-                        stopped_for_operator: self.registry.rejoin(node_id).is_some_and(|rejoin| {
-                            rejoin.status() == ursula_raft::RecoveryGateStatus::Stalled
-                        }),
+                metrics: ursula_proto::admin::NodeMetrics {
+                    process_node_id: Some(node_id),
+                    // This harness models Raft state directly, not an HTTP process.
+                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(
+                        u128::from(node_id),
+                    ),
+                    maintenance_fence: ursula_proto::admin::MaintenanceFenceState::Unclaimed,
+                    maintenance_fence_uncertain: false,
+                    groups: vec![{
+                        let fixture_term = metrics.current_term;
+                        let fixture_committed = metrics.local_committed.map(|log_id| log_id.index);
+                        let fixture_applied = metrics.last_applied.map(|log_id| log_id.index);
+                        RaftGroupView {
+                            raft_group_id,
+                            node_id,
+                            current_term: fixture_term,
+                            current_leader: metrics.current_leader,
+                            committed_index: fixture_committed,
+                            last_applied_index: fixture_applied,
+                            voter_ids,
+                            learner_ids,
+                            maintenance: ursula_raft::RaftGroupMaintenanceState {
+                                running: metrics.running_state.is_ok()
+                                    && metrics.state != openraft::ServerState::Shutdown,
+                                recovery_ready: self
+                                    .registry
+                                    .rejoin(node_id)
+                                    .is_none_or(|rejoin| rejoin.vote_gate_open()),
+                                accepting_transfers: true,
+                                membership_joint: membership.get_joint_config().len() != 1,
+                                membership_log_index: metrics
+                                    .membership_config
+                                    .log_id()
+                                    .map(|id| id.index),
+                                stopped_for_operator: self.registry.rejoin(node_id).is_some_and(
+                                    |rejoin| {
+                                        rejoin.status() == ursula_raft::RecoveryGateStatus::Stalled
+                                    },
+                                ),
+                            },
+                            last_log_index: metrics.last_log_index,
+                            committed_term: metrics.local_committed.map(|id| id.leader_id.term),
+                            last_applied_term: metrics.last_applied.map(|id| id.leader_id.term),
+                            snapshot_term: metrics.snapshot.map(|id| id.leader_id.term),
+                            snapshot_index: metrics.snapshot.map(|id| id.index),
+                            purged_term: metrics.purged.map(|id| id.leader_id.term),
+                            purged_index: metrics.purged.map(|id| id.index),
+                            log_bytes_since_snapshot: 0,
+                            log_entries_since_snapshot: 0,
+                            last_snapshot_bytes: 0,
+                            has_snapshot: metrics.snapshot.is_some(),
+                        }
+                    }],
+                    raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {
+                        version: ursula_proto::admin::SchemaVersion,
+                        node_id,
+                        lag_tolerance: 0,
+                        expected_groups: std::collections::BTreeMap::from([(
+                            placement.raft_group_id.0,
+                            self.node_ids.iter().copied().collect(),
+                        )]),
+                        node_issues: vec![],
+                        group_issues: std::collections::BTreeMap::new(),
                     }),
-                }],
-                raft_maintenance: None,
+                },
             };
             per_node.push(view);
         }

@@ -18,10 +18,9 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
+#[cfg(test)]
 use serde_json::Value;
-use serde_json::json;
 use ursula_raft::RaftGroupMetricsSnapshot;
-use ursula_raft::RaftGrpcMetricsSnapshot;
 use ursula_raft::raft_grpc_metrics_snapshot;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdStoreInfo;
@@ -282,112 +281,171 @@ pub(crate) fn insert_static(headers: &mut HeaderMap, name: &'static str, value: 
     headers.insert(name, HeaderValue::from_static(value));
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct MetricsResponse {
+    #[serde(flatten)]
+    pub node: ursula_proto::admin::NodeMetrics,
+    #[serde(flatten)]
+    pub runtime: RuntimeDiagnostics,
+    pub configured_raft_group_count: u32,
+    pub group_state_gauges: GroupGaugeCollection,
+    pub process_rss_bytes: u64,
+    pub node_memory_abort_cap_bytes: u64,
+    pub wal_recovery: Option<crate::WalRecoveryReport>,
+    pub recovery_gates: Option<ursula_proto::admin::RecoveryGatesReport>,
+    pub wal_available_bytes: u64,
+    pub wal_min_available_bytes: u64,
+    pub wal_resume_available_bytes: u64,
+    pub wal_disk_pressure: bool,
+    pub wal_disk_stat_errors: u64,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct RuntimeDiagnostics {
+    #[serde(flatten)]
+    runtime: RuntimeMetricsSnapshot,
+    #[serde(flatten)]
+    http: HttpMetricsSnapshot,
+    #[serde(flatten)]
+    raft_grpc: ursula_raft::RaftGrpcMetricsSnapshot,
+    active_cores: usize,
+    active_groups: usize,
+    mailbox_depths: Vec<usize>,
+    mailbox_capacities: Vec<usize>,
+    cold_store: ColdStoreInfo,
+    raft_group_count: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum GroupGaugeCollection {
+    Groups(Vec<GroupGaugeMetrics>),
+    Error { error: String },
+}
+pub(crate) enum GroupGaugeMetrics {
+    Hosted {
+        raft_group_id: u32,
+        gauges: ursula_runtime::GroupStateGauges,
+    },
+    NotHosted {
+        raft_group_id: u32,
+    },
+    Failed {
+        raft_group_id: u32,
+        error: String,
+    },
+}
+impl serde::Serialize for GroupGaugeMetrics {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Hosted<'a> {
+            raft_group_id: u32,
+            hosted: bool,
+            #[serde(flatten)]
+            gauges: &'a ursula_runtime::GroupStateGauges,
+        }
+        #[derive(serde::Serialize)]
+        struct Unavailable<'a> {
+            raft_group_id: u32,
+            hosted: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a str>,
+        }
+        match self {
+            Self::Hosted {
+                raft_group_id,
+                gauges,
+            } => Hosted {
+                raft_group_id: *raft_group_id,
+                hosted: true,
+                gauges,
+            }
+            .serialize(serializer),
+            Self::NotHosted { raft_group_id } => Unavailable {
+                raft_group_id: *raft_group_id,
+                hosted: false,
+                error: None,
+            }
+            .serialize(serializer),
+            Self::Failed {
+                raft_group_id,
+                error,
+            } => Unavailable {
+                raft_group_id: *raft_group_id,
+                hosted: true,
+                error: Some(error),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
 pub(crate) fn render_metrics(
     snapshot: RuntimeMetricsSnapshot,
     mailbox: RuntimeMailboxSnapshot,
     http: HttpMetricsSnapshot,
     raft_groups: &[RaftGroupMetricsSnapshot],
     cold_store: Option<&ColdStoreInfo>,
-) -> Value {
-    // The bulk of the metrics object is the runtime + HTTP snapshots flattened
-    // in verbatim (their field names are the wire keys, kept in sync by the
-    // compiler). Only the derived/aggregate fields are spelled out here.
-    #[derive(serde::Serialize)]
-    struct MetricsView<'a> {
-        #[serde(flatten)]
-        runtime: &'a RuntimeMetricsSnapshot,
-        active_cores: usize,
-        active_groups: usize,
-        #[serde(flatten)]
-        http: &'a HttpMetricsSnapshot,
-        #[serde(flatten)]
-        raft_grpc: &'a RaftGrpcMetricsSnapshot,
-        mailbox_depths: &'a [usize],
-        mailbox_capacities: &'a [usize],
-        cold_store: Value,
-        raft_group_count: usize,
-        raft_groups: Value,
-    }
-
-    let active_cores = snapshot
-        .per_core_appends
-        .iter()
-        .filter(|appends| **appends > 0)
-        .count();
-    let active_groups = snapshot
-        .per_group_appends
-        .iter()
-        .filter(|appends| **appends > 0)
-        .count();
-
-    let raft_grpc = raft_grpc_metrics_snapshot();
-    let view = MetricsView {
-        runtime: &snapshot,
-        active_cores,
-        active_groups,
-        http: &http,
-        raft_grpc: &raft_grpc,
-        mailbox_depths: &mailbox.depths,
-        mailbox_capacities: &mailbox.capacities,
-        cold_store: render_cold_store_info(cold_store),
-        raft_group_count: raft_groups.len(),
-        raft_groups: render_raft_group_metrics_array(raft_groups),
-    };
-    serde_json::to_value(&view).unwrap_or(Value::Null)
-}
-
-pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> Value {
-    let Some(value) = value else {
-        return json!({
-            "backend": "none",
-            "root": null,
-            "bucket": null,
-            "region": null,
-            "endpoint": null,
-            "encryption": null,
-        });
-    };
-    json!({
-        "backend": value.backend,
-        "root": value.root,
-        "bucket": value.bucket,
-        "region": value.region,
-        "endpoint": value.endpoint,
-        "encryption": value.encryption,
-    })
-}
-
-pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> Value {
-    Value::Array(
-        values
+) -> RuntimeDiagnostics {
+    RuntimeDiagnostics {
+        active_cores: snapshot
+            .per_core_appends
             .iter()
-            .map(|value| {
-                json!({
-                    "raft_group_id": value.raft_group_id,
-                    "node_id": value.node_id,
-                    "current_term": value.current_term,
-                    "current_leader": value.current_leader,
-                    "last_log_index": value.last_log_index,
-                    "committed_term": value.committed.map(|progress| progress.term),
-                    "committed_index": value.committed.map(|progress| progress.index),
-                    "last_applied_term": value.last_applied.map(|progress| progress.term),
-                    "last_applied_index": value.last_applied.map(|progress| progress.index),
-                    "snapshot_term": value.snapshot.map(|progress| progress.term),
-                    "snapshot_index": value.snapshot.map(|progress| progress.index),
-                    "purged_term": value.purged.map(|progress| progress.term),
-                    "purged_index": value.purged.map(|progress| progress.index),
-                    "voter_ids": value.voter_ids,
-                    "learner_ids": value.learner_ids,
-                    "maintenance": value.maintenance,
-                    // F12e cadence inputs (bounded-state §7.5 soak gauges).
-                    "log_bytes_since_snapshot": value.log.log_bytes,
-                    "log_entries_since_snapshot": value.log.log_entries,
-                    "last_snapshot_bytes": value.log.last_snapshot_bytes,
-                    "has_snapshot": value.log.has_snapshot,
-                })
-            })
-            .collect(),
-    )
+            .filter(|count| **count > 0)
+            .count(),
+        active_groups: snapshot
+            .per_group_appends
+            .iter()
+            .filter(|count| **count > 0)
+            .count(),
+        runtime: snapshot,
+        http,
+        raft_grpc: raft_grpc_metrics_snapshot(),
+        mailbox_depths: mailbox.depths,
+        mailbox_capacities: mailbox.capacities,
+        cold_store: cold_store.cloned().unwrap_or(ColdStoreInfo {
+            backend: "none",
+            root: None,
+            bucket: None,
+            region: None,
+            endpoint: None,
+            encryption: None,
+        }),
+        raft_group_count: raft_groups.len(),
+    }
+}
+
+pub(crate) fn raft_group_metrics(
+    value: &RaftGroupMetricsSnapshot,
+) -> ursula_proto::admin::RaftGroupMetrics {
+    ursula_proto::admin::RaftGroupMetrics {
+        raft_group_id: u64::from(value.raft_group_id),
+        node_id: value.node_id,
+        current_term: value.current_term,
+        current_leader: value.current_leader,
+        committed_index: value.committed.map(|progress| progress.index),
+        last_applied_index: value.last_applied.map(|progress| progress.index),
+        voter_ids: value.voter_ids.clone(),
+        learner_ids: value.learner_ids.clone(),
+        maintenance: value.maintenance.clone(),
+        last_log_index: value.last_log_index,
+        committed_term: value.committed.map(|progress| progress.term),
+        last_applied_term: value.last_applied.map(|progress| progress.term),
+        snapshot_term: value.snapshot.map(|progress| progress.term),
+        snapshot_index: value.snapshot.map(|progress| progress.index),
+        purged_term: value.purged.map(|progress| progress.term),
+        purged_index: value.purged.map(|progress| progress.index),
+        log_bytes_since_snapshot: value.log.log_bytes,
+        log_entries_since_snapshot: value.log.log_entries,
+        last_snapshot_bytes: value.log.last_snapshot_bytes,
+        has_snapshot: value.log.has_snapshot,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> Value {
+    serde_json::to_value(values.iter().map(raft_group_metrics).collect::<Vec<_>>())
+        .unwrap_or(Value::Null)
 }
 
 pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {

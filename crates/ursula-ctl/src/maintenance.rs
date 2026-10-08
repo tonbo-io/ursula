@@ -470,7 +470,6 @@ mod tests {
 
     use super::*;
     use crate::metrics::ClusterSnapshot;
-    use crate::metrics::NodeMetricsView;
     use crate::metrics::RaftGroupView;
     use crate::provider::NodeInfo;
 
@@ -487,29 +486,54 @@ mod tests {
         cluster: Arc<MockCluster>,
     }
 
-    async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
-        Json(json!({
-            "process_node_id": state.node_id,
-            "process_incarnation": ursula_proto::admin::ProcessIncarnation::from_bits(u128::from(state.node_id)),
-            "raft_groups": [{
-                "raft_group_id": 7,
-                "node_id": state.node_id,
-                "current_term": 1,
-                "current_leader": 2,
-                "committed_index": 100,
-                "last_applied_index": 100,
-                "voter_ids": [1, 2, 3],
-                "learner_ids": [],
-                "maintenance": {
-                    "running": true,
-                    "recovery_ready": state.cluster.recovery_gate_ready.load(Ordering::SeqCst),
-                    "accepting_transfers": true,
-                    "membership_joint": false,
-                    "membership_log_index": 0,
-                    "stopped_for_operator": false
-                }
-            }]
-        }))
+    async fn mock_metrics(State(state): State<MockNode>) -> Json<ursula_proto::admin::NodeMetrics> {
+        let mut metrics = crate::metrics::test_metrics(
+            state.node_id,
+            Some(ursula_proto::admin::ProcessIncarnation::from_bits(
+                u128::from(state.node_id),
+            )),
+        );
+        metrics.groups.push(ursula_proto::admin::RaftGroupMetrics {
+            raft_group_id: 7,
+            node_id: state.node_id,
+            current_term: 1,
+            current_leader: Some(2),
+            committed_index: Some(100),
+            last_applied_index: Some(100),
+            voter_ids: vec![1, 2, 3],
+            learner_ids: vec![],
+            maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
+                running: true,
+                recovery_ready: state.cluster.recovery_gate_ready.load(Ordering::SeqCst),
+                accepting_transfers: true,
+                membership_joint: false,
+                membership_log_index: Some(0),
+                stopped_for_operator: false,
+            },
+            last_log_index: Some(100),
+            committed_term: Some(1),
+            last_applied_term: Some(1),
+            snapshot_term: None,
+            snapshot_index: None,
+            purged_term: None,
+            purged_index: None,
+            log_bytes_since_snapshot: 0,
+            log_entries_since_snapshot: 0,
+            last_snapshot_bytes: 0,
+            has_snapshot: false,
+        });
+        metrics.raft_maintenance = Some(ursula_proto::admin::RaftMaintenanceReport {
+            version: ursula_proto::admin::SchemaVersion,
+            node_id: state.node_id,
+            lag_tolerance: 0,
+            expected_groups: std::collections::BTreeMap::from([(
+                7,
+                std::collections::BTreeSet::from([1, 2, 3]),
+            )]),
+            node_issues: vec![],
+            group_issues: std::collections::BTreeMap::new(),
+        });
+        Json(metrics)
     }
 
     async fn mock_drain(State(state): State<MockNode>) -> StatusCode {
@@ -661,47 +685,24 @@ mod tests {
         applied: u64,
         committed: u64,
     ) -> RaftGroupView {
-        RaftGroupView {
+        crate::metrics::test_group(
             raft_group_id,
             node_id,
-            current_term: Some(1),
+            1,
             current_leader,
-            committed_index: Some(committed),
-            last_applied_index: Some(applied),
-            voter_ids: vec![1, 2, 3],
-            learner_ids: vec![],
-            maintenance: None,
-        }
+            Some(committed),
+            Some(applied),
+            vec![1, 2, 3],
+        )
     }
 
     #[test]
     fn cluster_readiness_formats_each_unready_node() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(1, "10.0.0.1"),
-                    groups: vec![group(7, 1, Some(1), 50, 50)],
-                    raft_maintenance: None,
-                },
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(2, "10.0.0.2"),
-                    groups: vec![group(7, 2, Some(1), 100, 100)],
-                    raft_maintenance: None,
-                },
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(3, "10.0.0.3"),
-                    groups: vec![group(7, 3, Some(1), 95, 100)],
-                    raft_maintenance: None,
-                },
+                crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(7, 1, Some(1), 50, 50)]),
+                crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(1), 100, 100)]),
+                crate::metrics::test_view(n(3, "10.0.0.3"), vec![group(7, 3, Some(1), 95, 100)]),
             ],
         };
 
@@ -715,14 +716,13 @@ mod tests {
     #[test]
     fn missing_target_timeout_hint_points_to_the_leaders_rebuild() {
         let snapshot = ClusterSnapshot {
-            per_node: vec![NodeMetricsView {
-                process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                maintenance_fence: None,
-                maintenance_fence_uncertain: false,
-                node: n(2, "10.0.0.2"),
-                groups: vec![group(7, 2, Some(2), 100, 100)],
-                raft_maintenance: None,
-            }],
+            per_node: vec![crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(
+                7,
+                2,
+                Some(2),
+                100,
+                100,
+            )])],
         };
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
@@ -811,22 +811,8 @@ mod tests {
     fn missing_target_timeout_hint_absent_when_target_has_applied_entries() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(1, "10.0.0.1"),
-                    groups: vec![group(7, 1, Some(2), 50, 50)],
-                    raft_maintenance: None,
-                },
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(2, "10.0.0.2"),
-                    groups: vec![group(7, 2, Some(2), 100, 100)],
-                    raft_maintenance: None,
-                },
+                crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(7, 1, Some(2), 50, 50)]),
+                crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(2), 100, 100)]),
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
@@ -838,30 +824,9 @@ mod tests {
     fn drain_uses_every_nodes_leader_reports() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(1, "10.0.0.1"),
-                    groups: vec![group(7, 1, Some(2), 100, 100)],
-                    raft_maintenance: None,
-                },
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(2, "10.0.0.2"),
-                    groups: vec![group(7, 2, Some(2), 100, 100)],
-                    raft_maintenance: None,
-                },
-                NodeMetricsView {
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(1),
-                    maintenance_fence: None,
-                    maintenance_fence_uncertain: false,
-                    node: n(3, "10.0.0.3"),
-                    groups: vec![group(7, 3, Some(1), 100, 100)],
-                    raft_maintenance: None,
-                },
+                crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(7, 1, Some(2), 100, 100)]),
+                crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(7, 2, Some(2), 100, 100)]),
+                crate::metrics::test_view(n(3, "10.0.0.3"), vec![group(7, 3, Some(1), 100, 100)]),
             ],
         };
 

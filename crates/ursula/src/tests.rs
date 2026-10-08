@@ -1214,6 +1214,12 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
 
     let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
+    let decoded: ursula_proto::admin::NodeMetrics = serde_json::from_str(body).unwrap();
+    assert!(!decoded.maintenance_fence_uncertain);
+    assert_eq!(
+        decoded.maintenance_fence,
+        ursula_proto::admin::MaintenanceFenceState::Unclaimed
+    );
     assert!(body.contains("\"accepted_appends\":2"));
     assert!(body.contains("\"applied_mutations\":3"));
     assert!(body.contains("\"active_cores\":1"));
@@ -1980,6 +1986,25 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     assert!(metrics_body.contains("\"node_id\":1"));
     assert!(metrics_body.contains("\"voter_ids\":[1]"));
 
+    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).unwrap();
+    let node = ursula_ctl::NodeInfo {
+        id: 1,
+        host: addr.to_string(),
+        admin_url: format!("http://{addr}").parse().unwrap(),
+        http_url: None,
+        metrics_url: None,
+        expected_process_incarnation: None,
+        expected_maintenance_fence: None,
+    };
+    let observed = client
+        .fetch_node(&node)
+        .await
+        .expect("shared server/client metrics schema");
+    assert_eq!(observed.groups.len(), 1);
+    assert_eq!(observed.groups[0].voter_ids, vec![1]);
+    assert!(observed.groups[0].maintenance.running);
+    assert!(!observed.maintenance_fence_uncertain);
+
     let mut network = ursula_raft::GrpcRaftNetwork::new(
         Arc::default(),
         RaftGroupId(0),
@@ -2099,7 +2124,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
     let proof = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
         .await
         .unwrap();
-    assert!(proof.participation_certified);
+    assert_eq!(proof.process_incarnations.len(), 3);
     assert_eq!(proof.prefixes.len(), 6);
     assert_eq!(proof.applied.len(), 3);
     for (id, prefix) in proof.prefixes {

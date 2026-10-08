@@ -243,7 +243,9 @@ fn minority_admission_requires_fresh_certified_survivors_and_the_acknowledged_fl
             3 => {
                 proof.verification.verification.applied.remove(&3);
             }
-            4 => proof.verification.verification.participation_certified = false,
+            4 => {
+                proof.verification.verification.prefixes.clear();
+            }
             5 => {
                 proof
                     .verification

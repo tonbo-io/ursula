@@ -124,10 +124,7 @@ fn candidate_retirement_requires_current_fresh_survivors_and_retains_the_new_pre
         let mut observation = survivors(&state, 3200, 100);
         match mutation {
             0 => {
-                observation
-                    .verification
-                    .verification
-                    .participation_certified = false;
+                observation.verification.verification.prefixes.clear();
             }
             1 => {
                 observation
@@ -278,10 +275,7 @@ fn restaged_state_preserves_schema_and_cannot_prune_its_floor() {
     };
     let next = fenced.recover_host(action).unwrap();
     let encoded = serde_json::to_value(&next).unwrap();
-    assert_eq!(
-        encoded["version"],
-        super::super::super::RESERVATION_SCHEMA_VERSION
-    );
+    assert_eq!(encoded["version"], 1);
     serde_json::from_value::<Reservation>(encoded.clone())
         .unwrap()
         .validate()
