@@ -1166,9 +1166,8 @@ fn persist_snapshot_metadata(
         file.sync_all()?;
     }
     std::fs::rename(&temporary, path)?;
-    if let Some(parent) = path.parent()
-        && let Ok(directory) = std::fs::File::open(parent)
-    {
+    if let Some(parent) = path.parent() {
+        let directory = std::fs::File::open(parent)?;
         directory.sync_all()?;
     }
     Ok(())
@@ -1176,6 +1175,34 @@ fn persist_snapshot_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, not(madsim)))]
+    #[test]
+    fn snapshot_metadata_rejects_an_unsyncable_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("snapshot.json");
+        let meta = SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "directory-sync-failure".to_owned(),
+        };
+        // Write/search permits file creation and rename; lack of read permission
+        // prevents opening the directory for fsync after the rename succeeds.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+        let can_open = std::fs::File::open(root.path());
+        let result = persist_snapshot_metadata(Some(&path), &meta, b"pointer");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            can_open.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "test requires a non-root user so directory read permissions apply"
+        );
+        assert!(
+            path.exists(),
+            "the metadata rename must finish before the injected failure"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn canceled_metadata_waiter_retains_serial_until_publication() {
