@@ -46,8 +46,8 @@ impl MetricsClient {
         request: &ursula_control::OperationRequest,
     ) -> Result<ursula_control::ControlResponse> {
         // Reconcile resumes the same durable operation/action receipts. A 503
-        // during leader discovery is retryable; other intents may create new
-        // operations and must never be replayed automatically.
+        // during leader discovery is retryable. Other intents may be replayed
+        // only when the server explicitly proves dispatch never happened.
         tokio::time::timeout(self.timeout, async {
             loop {
                 let url = node.admin_url.join("/__ursula/control/operation")?;
@@ -63,8 +63,13 @@ impl MetricsClient {
                     .text()
                     .await
                     .context("read meta operation result")?;
-                if matches!(request, ursula_control::OperationRequest::Reconcile { .. })
-                    && status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                let not_dispatched = matches!(
+                    serde_json::from_str::<ursula_control::OperationSubmissionError>(&body),
+                    Ok(ursula_control::OperationSubmissionError::NotDispatched { .. })
+                );
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && (not_dispatched
+                        || matches!(request, ursula_control::OperationRequest::Reconcile { .. }))
                 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -702,11 +707,14 @@ mod tests {
         use ursula_control::OperationRequest;
         use ursula_control::OperationToken;
 
-        for (initial, recover, reconcile, expected_success) in [
-            (StatusCode::SERVICE_UNAVAILABLE, true, true, true),
-            (StatusCode::CONFLICT, false, true, false),
-            (StatusCode::SERVICE_UNAVAILABLE, false, false, false),
-            (StatusCode::SERVICE_UNAVAILABLE, false, true, false),
+        for (initial, recover, reconcile, expected_success, before_dispatch) in [
+            (StatusCode::SERVICE_UNAVAILABLE, true, true, true, false),
+            (StatusCode::CONFLICT, false, true, false, false),
+            (StatusCode::SERVICE_UNAVAILABLE, false, false, false, false),
+            (StatusCode::SERVICE_UNAVAILABLE, false, true, false, false),
+            (StatusCode::SERVICE_UNAVAILABLE, true, false, true, true),
+            (StatusCode::SERVICE_UNAVAILABLE, false, false, false, true),
+            (StatusCode::CONFLICT, false, false, false, true),
         ] {
             let token = OperationToken {
                 operation_id: 7,
@@ -716,7 +724,7 @@ mod tests {
             let request = if reconcile {
                 OperationRequest::Reconcile { token }
             } else {
-                OperationRequest::CollectEvidence { token }
+                OperationRequest::Complete { token }
             };
             let expected = serde_json::to_value(&request).unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
@@ -736,7 +744,19 @@ mod tests {
                                 .unwrap(),
                             )
                         } else {
-                            (initial, "leader unavailable".to_owned())
+                            (
+                                initial,
+                                if before_dispatch {
+                                    serde_json::to_string(
+                                        &ursula_control::OperationSubmissionError::NotDispatched {
+                                            detail: "leader unavailable".into(),
+                                        },
+                                    )
+                                    .unwrap()
+                                } else {
+                                    "leader unavailable".to_owned()
+                                },
+                            )
                         }
                     }
                 }),
@@ -765,7 +785,7 @@ mod tests {
             let count = calls.load(Ordering::SeqCst);
             if recover {
                 assert_eq!(count, 2);
-            } else if reconcile && initial == StatusCode::SERVICE_UNAVAILABLE {
+            } else if (reconcile || before_dispatch) && initial == StatusCode::SERVICE_UNAVAILABLE {
                 assert!(count >= 2);
                 assert!(started.elapsed() < Duration::from_millis(750));
             } else {

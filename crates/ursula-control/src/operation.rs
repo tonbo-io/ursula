@@ -2104,3 +2104,10 @@ pub enum ActionRejection {
     Drained,
     LeadershipChanged { detail: String },
 }
+
+/// HTTP submission failure that proves no operation was dispatched. This is
+/// distinct from an unavailable response after a write, whose outcome is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OperationSubmissionError {
+    NotDispatched { detail: String },
+}

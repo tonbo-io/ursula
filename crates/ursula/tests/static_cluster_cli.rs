@@ -2868,64 +2868,30 @@ mod lifecycle_support {
         request: OperationRequest,
         children: &[ChildGuard],
     ) -> OperationOutcome {
-        if matches!(request, OperationRequest::Reconcile { .. }) {
-            let operator = ursula_ctl::MetricsClient::new(Duration::from_secs(60)).unwrap();
-            let node = ursula_ctl::NodeInfo {
-                id: 1,
-                admin_url: admin.parse().unwrap(),
-                host: "127.0.0.1".into(),
-                http_url: None,
-                metrics_url: None,
-                expected_process_incarnation: None,
-            };
-            return match operator.submit_operation(&node, &request).await {
-                Ok(ControlResponse::Operation(Ok(outcome))) => outcome,
-                result => {
-                    let observed = client
-                        .get(format!("{admin}/__ursula/control/state"))
-                        .send()
-                        .await;
-                    let snapshot = match observed {
-                        Ok(response) => response.text().await,
-                        Err(error) => Err(error),
-                    };
-                    let reports = children.iter().map(child_report).collect::<Vec<_>>();
-                    panic!("{request:?}: {result:?}; control={snapshot:?}; children={reports:#?}");
-                }
-            };
-        }
-
-        // Evidence collection may race follower application of the membership
-        // commit. Retrying this read-and-observe step preserves the same token.
-        for attempt in 0..100 {
-            let response = admin_test_post(client, format!("{admin}/__ursula/control/operation"))
-                .await
-                .json(&request)
-                .send()
-                .await
-                .expect("operation transport");
-            let status = response.status();
-            let body = response.text().await.expect("operation body");
-            let parsed = serde_json::from_str::<ControlResponse>(&body);
-            if matches!(request, OperationRequest::CollectEvidence { .. })
-                && matches!(
-                    &parsed,
-                    Ok(ControlResponse::Operation(Err(
-                        ursula_control::OperationError::MissingEvidence { .. }
-                    )))
-                )
-                && attempt < 99
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+        let operator = ursula_ctl::MetricsClient::new(Duration::from_secs(60)).unwrap();
+        let node = ursula_ctl::NodeInfo {
+            id: 1,
+            admin_url: admin.parse().unwrap(),
+            host: "127.0.0.1".into(),
+            http_url: None,
+            metrics_url: None,
+            expected_process_incarnation: None,
+        };
+        match operator.submit_operation(&node, &request).await {
+            Ok(ControlResponse::Operation(Ok(outcome))) => outcome,
+            result => {
+                let observed = client
+                    .get(format!("{admin}/__ursula/control/state"))
+                    .send()
+                    .await;
+                let snapshot = match observed {
+                    Ok(response) => response.text().await,
+                    Err(error) => Err(error),
+                };
+                let reports = children.iter().map(child_report).collect::<Vec<_>>();
+                panic!("{request:?}: {result:?}; control={snapshot:?}; children={reports:#?}");
             }
-            assert!(status.is_success(), "{request:?}: {status}: {body}");
-            return match parsed.expect("typed operation response") {
-                ControlResponse::Operation(Ok(outcome)) => outcome,
-                other => panic!("{request:?}: {other:?}"),
-            };
         }
-        panic!("evidence retry limit");
     }
 }
 

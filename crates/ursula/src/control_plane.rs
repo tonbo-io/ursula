@@ -40,6 +40,11 @@ pub(crate) const EVIDENCE_PATH: &str = "/__ursula/control/group/{group}/evidence
 
 #[derive(Debug, thiserror::Error)]
 enum ControlHttpError {
+    #[error("operation was not dispatched: {source}")]
+    BeforeDispatch {
+        #[source]
+        source: Box<ControlHttpError>,
+    },
     #[error("meta Raft is not configured")]
     Unavailable,
     #[error("no data leader with a fresh quorum proof for group {group:?}")]
@@ -91,6 +96,15 @@ enum ControlHttpError {
 
 impl IntoResponse for ControlHttpError {
     fn into_response(self) -> Response {
+        if let Self::BeforeDispatch { source } = self {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ursula_control::OperationSubmissionError::NotDispatched {
+                    detail: source.to_string(),
+                }),
+            )
+                .into_response();
+        }
         let status = match &self {
             Self::Operation(_) | Self::MissingPeer { .. } | Self::EvidenceRejected { .. } => {
                 StatusCode::CONFLICT
@@ -166,7 +180,14 @@ async fn apply_request(
     state: &HttpState,
     request: OperationRequest,
 ) -> Result<ControlResponse, ControlHttpError> {
-    let snapshot = linear_state(state).await?;
+    // Only this preflight is known to precede every write and side effect.
+    // Later failures deliberately retain outcome-unknown semantics.
+    let snapshot =
+        linear_state(state)
+            .await
+            .map_err(|source| ControlHttpError::BeforeDispatch {
+                source: Box::new(source),
+            })?;
     let meta = state
         .meta_control
         .as_ref()
@@ -2143,6 +2164,49 @@ mod tests {
     }
 
     #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn operation_preflight_failure_proves_no_dispatch_but_write_errors_do_not() {
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        let runtime = ursula_runtime::ShardRuntime::spawn(
+            ursula_runtime::RuntimeConfig::from_ursula_config(&config.runtime, 1),
+        )
+        .unwrap();
+        let http = HttpState::with_raft_registry(runtime.clone(), Default::default());
+        let response = operation(
+            State(http),
+            Json(OperationRequest::Complete {
+                token: OperationToken {
+                    operation_id: 1,
+                    generation: 1,
+                    executor: ursula_proto::admin::ProcessIncarnation::from_bits(1),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ursula_control::OperationSubmissionError>(&body).unwrap(),
+            ursula_control::OperationSubmissionError::NotDispatched { .. }
+        ));
+        // The same unavailable transport status after entering the dispatcher
+        // does not certify that a command was not committed.
+        let response = ControlHttpError::Meta(ursula_raft::MetaRaftError::new(
+            "write",
+            "reply lost after submission",
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<ursula_control::OperationSubmissionError>(&body).unwrap_err();
+        assert!(runtime.shutdown_owners().await.is_empty());
+    }
+
     #[tokio::test]
     async fn pending_prepare_survives_participant_restart_and_operator_takeover() {
         use std::sync::Arc;

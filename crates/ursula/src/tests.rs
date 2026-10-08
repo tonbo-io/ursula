@@ -3049,7 +3049,15 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .build_snapshot_for_transfer(RaftGroupId(0))
         .await
         .expect("build leader snapshot");
-    let vote = ursula_raft::UrsulaVote::new(1, 1);
+    // Election/recovery may have advanced beyond term 1. Snapshot replication
+    // must carry the actual committed leader vote, just like AppendEntries.
+    let proof = nodes[0]
+        .registry
+        .confirm_quorum_prefix(RaftGroupId(0))
+        .await
+        .expect("confirm snapshot sender is the current quorum leader");
+    assert_eq!(proof.leader_id, 1);
+    let vote = ursula_raft::UrsulaVote::new_committed(proof.leader_term, proof.leader_id);
     let mut snapshot_network =
         ursula_raft::GrpcRaftNetwork::new(Arc::default(), RaftGroupId(0), 2, peers[1].1.clone());
     let _: SnapshotResponse<UrsulaRaftTypeConfig> = snapshot_network

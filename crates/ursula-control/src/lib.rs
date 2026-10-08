@@ -39,6 +39,7 @@ pub use operation::OperationOutcome;
 pub use operation::OperationPhase;
 pub use operation::OperationRequest;
 pub use operation::OperationState;
+pub use operation::OperationSubmissionError;
 pub use operation::OperationToken;
 pub use operation::PrefixEvidence;
 pub use operation::ProcessIdentity;
