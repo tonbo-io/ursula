@@ -59,6 +59,10 @@ pub struct ApplyFailure {
 pub enum ApplyFailureKind {
     Panic,
     InvariantViolation,
+    /// A kind a newer server of the same minor version reports that this
+    /// build does not know. The group is still stopped.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A mutation must carry the incarnation observed before its maintenance plan.
@@ -285,11 +289,28 @@ impl From<ProcessIncarnation> for String {
 #[cfg(test)]
 mod tests {
     use super::AcceptUnsyncedLossRequest;
+    use super::ApplyFailure;
+    use super::ApplyFailureKind;
     use super::MaintenanceFence;
     use super::ProcessIncarnation;
     use super::RaftMaintenanceIssue;
     use super::RaftMaintenanceReport;
     use super::TransferRejection;
+
+    /// A newer server may report a failure kind this build does not know.
+    /// The stopped group's diagnostics still decode.
+    #[test]
+    fn unknown_apply_failure_kinds_decode() {
+        let failure: ApplyFailure = serde_json::from_str(
+            r#"{"term": 2, "index": 9, "kind": "a_future_kind", "message": "stopped"}"#,
+        )
+        .unwrap();
+        assert_eq!(failure.kind, ApplyFailureKind::Unknown);
+        assert_eq!(
+            serde_json::from_str::<ApplyFailureKind>(r#""invariant_violation""#).unwrap(),
+            ApplyFailureKind::InvariantViolation
+        );
+    }
 
     /// A newer server of the same minor version may report an issue or a
     /// rejection this build does not know. It decodes, never reads as ready
