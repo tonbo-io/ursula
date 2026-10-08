@@ -8,15 +8,17 @@ A panic or invariant violation while applying a committed command stops that
 local Raft group. Other groups remain running. Isolation relies on Rust panic
 unwinding, so a process abort, OOM kill or machine failure is outside it. The
 failed command receives no successful application response, and the applied
-index does not advance past it. A normal stream rejection (for example, deleting a missing stream) remains
-a deterministic application result and does not stop the group.
+index does not advance past it. A normal stream rejection (for example,
+deleting a missing stream) remains a deterministic application result and does
+not stop the group.
 
 `/__ursula/metrics` reports `raft_groups[].apply_failure` with the log term,
 index, failure kind and diagnostic message. The affected group's
 `maintenance.running` is false. The maintenance report names the group with
 `apply_stopped`, so `ursulactl wait-ready` and rollouts refuse another
-disruption. The node's `/__ursula/ready` stays 200 and its other groups keep
-serving. Requests to the stopped group answer a typed `503`. Invariant violations can have partially
+disruption. The node's `/__ursula/ready` stays 200, its other groups keep
+serving, and planned leadership handoffs of those groups continue. Requests to
+the stopped group answer a typed `503`. Invariant violations can have partially
 modified memory: that state must not be read, flushed, or made into a snapshot.
 A previously captured snapshot only contains its earlier successful prefix.
 
@@ -34,8 +36,9 @@ operation to bypass a poison record.
 2. Preserve the WAL directories, snapshot pointers and referenced cold objects.
    Have a corrected binary ready before stopping the affected server to take
    a consistent filesystem backup. Keep node IDs, membership and storage paths
-   unchanged. Do not delete the failed group's data to make the pod healthy. If restarting automatically repeats
-   the failure, suspend that restart loop while retaining the volumes.
+   unchanged. Do not delete the failed group's data to make the pod healthy. A
+   restart with the faulty binary keeps the stopped group stopped and the other
+   groups serving, so it is safe but does not repair anything.
 3. Correct the deterministic application bug, keeping command encoding and
    semantics compatible with the retained history. Reproduce the failing
    record on an isolated copy. Verify the last acknowledged records and the
@@ -54,9 +57,9 @@ operation to bypass a poison record.
 If the failure occurs during initial WAL replay, the owner retains an
 `ApplyStopped` terminal group instead of a live Raft handle. Other groups can
 start and serve. Metrics retain the failing committed term and index and the
-last successfully applied prefix. Node and maintenance readiness stay unready.
-Requests to the stopped group return `ApplyStopped` without repeatedly opening
-its WAL. A corrected compatible binary must restart and replay the original
+last successfully applied prefix. Maintenance readiness refuses disruption
+while the node stays ready. Requests to the stopped group return
+`ApplyStopped` without repeatedly opening its WAL. A corrected compatible binary must restart and replay the original
 history before that group can serve again. Ordinary configuration, WAL-open
 and snapshot-restore errors still fail startup. They are not application
 failures and are not silently converted to isolated groups.
@@ -72,10 +75,17 @@ Run `cargo test -p ursula-raft --lib apply_failure_tests`. It uses real disk WAL
 with `fsync=always`, a partial-mutation panic and an invariant violation,
 and a three-replica in-process Raft network. It verifies stopped-group
 isolation, unchanged applied boundary, retained records, same-code replay
-failure with healthy-group reads/writes on the same owner thread, and payload preservation after corrected-code replay. The
-three-replica drill waits for a surviving follower to elect a new leader and
-encounter the committed poison through normal Raft replication. This is an
-application-failure drill, not a power-loss or Kubernetes Chaos qualification.
+failure with healthy-group reads and writes on the same owner thread, and
+payload preservation after corrected-code replay. The three-replica drill waits
+for a surviving follower to elect a new leader and encounter the committed
+poison through normal Raft replication.
+
+The deterministic simulation `a_poison_record_isolates_its_group_until_corrected_replay`
+(`RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib disk_tests`) runs the
+same poison on every voter of one group while another group shares each node's
+core journal. It restarts a node with the faulty code and then replays every
+journal with corrected code. These are application-failure drills, not
+power-loss or Kubernetes Chaos qualifications.
 
 ## WAL retention cost
 
