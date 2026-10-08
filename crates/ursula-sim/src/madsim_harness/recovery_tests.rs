@@ -267,6 +267,15 @@ async fn power_loss_and_restart(cluster: &mut JournalCluster, node_id: u64) -> u
     report.dropped_pages
 }
 
+/// Power loss of `node_id` that loses every page written since the last
+/// `fsync`, and its restart.
+async fn unsynced_loss_and_restart(cluster: &mut JournalCluster, node_id: u64) -> usize {
+    cluster.stop_node(node_id).await;
+    let report = cluster.wals[&node_id].power_loss_losing_unsynced().await;
+    cluster.start_node(node_id).await;
+    report.dropped_pages
+}
+
 fn assert_host_crash_opening(cluster: &JournalCluster, node_id: u64, context: &str) {
     let opening = cluster.wals[&node_id].opening();
     assert_eq!(
@@ -984,9 +993,9 @@ fn a_genesis_vote_floor_survives_a_restart_before_the_first_election() {
 #[test]
 fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
     let _guard = sim_test_guard();
-    // The read-only genesis readiness handshake shifts the deterministic schedule:
-    // seed 7 drops both tails. Keep both loss and pending-joint preconditions asserted.
-    for seed in seeds_from_env("JOINT_LOSS_SEEDS", &[7]) {
+    // Both power losses drop every unsynced page, so every seed loses both
+    // tails, whatever the schedule before them.
+    for seed in seeds_from_env("JOINT_LOSS_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
         run_with_madsim(seed, async move {
             let mut cluster =
                 JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;
@@ -1017,7 +1026,7 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
             // Keep B alive, but prevent it from acknowledging RemoveVoter(A).
             cluster.policy.partition_bidirectional(leader, b);
             cluster.policy.partition_bidirectional(a, b);
-            assert!(power_loss_and_restart(&mut cluster, a).await > 0);
+            assert!(unsynced_loss_and_restart(&mut cluster, a).await > 0);
             let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
             let joint_group = loop {
                 if let Some(group) = JOURNAL_GROUPS.into_iter().find(|group| {
@@ -1040,7 +1049,7 @@ fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks
             assert!(joint.committed < *joint.membership_config.log_id());
             // B loses its tail only after A's removal is pending.
             let before_loss = metrics(&cluster, joint_group, b).last_log_index;
-            assert!(power_loss_and_restart(&mut cluster, b).await > 0);
+            assert!(unsynced_loss_and_restart(&mut cluster, b).await > 0);
             assert!(metrics(&cluster, joint_group, b).last_log_index < before_loss);
             cluster.policy.clear();
             wait_healed(&cluster, &context, Duration::from_secs(15)).await;

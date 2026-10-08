@@ -10,7 +10,6 @@
 //!   host loses power before the new run writes: every acknowledged write
 //!   survives, or the group is gated.
 //! - A voter that lost its disk never lets a leader of an older term commit.
-//!   Ignored until the recovery gate screens appends as it screens votes.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -509,14 +508,17 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// A voter that lost its disk also lost its vote. While its gate is closed
-/// it refuses votes, but it accepts appends from any leader whose vote is not
-/// lower than its own, and it has none. Schedule, under `always`:
+/// A voter that lost its disk also lost its vote, so it cannot tell a stale
+/// leader from a current one. It refuses replication until a fresh quorum
+/// proof gives it a vote floor, and an operator's acceptance of unsynced
+/// loss cannot replace that proof. Schedule, under `always`:
 ///
 /// 1. L leads term T. Cut off from both followers, they elect N in a later
 ///    term with V's vote, and N commits E.
 /// 2. V loses its disk and restarts empty; it reaches L but not N.
-/// 3. L's process restarts with its log intact and appends X.
+/// 3. L restarts with its log intact, after a clean shutdown or a process
+///    crash, and appends X. Only the clean half reproduces #405: a crashed L
+///    restarts demoted, which alone keeps X from committing.
 /// 4. Everything heals.
 ///
 /// No index is ever committed with two different entries, and every
@@ -624,21 +626,37 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                 assert!(!cluster.rejoins[&(group, wiped)].vote_gate_open());
                 drop(admin);
 
-                // A clean restart retains its committed self vote. Cover this
-                // separately: crash demotion alone can mask the lost-voter bug.
+                // A clean restart retains its committed self vote, so only
+                // the vote floor keeps X from committing. A crashed old L
+                // restarts demoted, which alone keeps X from committing.
                 restart(&mut cluster, stale_leader, restart_kind).await;
                 madsim::time::sleep(Duration::from_millis(500)).await;
-                if matches!(restart_kind, Restart::Clean) {
-                    let stale = metrics(&cluster, group, stale_leader);
-                    assert_eq!(
-                        stale.state,
-                        ServerState::Leader,
-                        "{context}: clean old L must still lead before X"
-                    );
-                    assert_eq!(
-                        stale.vote, old_vote,
-                        "{context}: old L must retain the original stale vote"
-                    );
+                let stale = metrics(&cluster, group, stale_leader);
+                match restart_kind {
+                    Restart::Clean => {
+                        assert_eq!(
+                            stale.state,
+                            ServerState::Leader,
+                            "{context}: clean old L must still lead before X"
+                        );
+                        assert_eq!(
+                            stale.vote, old_vote,
+                            "{context}: old L must retain the original stale vote"
+                        );
+                    }
+                    Restart::ProcessCrash => {
+                        assert_ne!(
+                            stale.state,
+                            ServerState::Leader,
+                            "{context}: crashed old L must not lead before X"
+                        );
+                        assert!(
+                            !stale.vote.is_committed(),
+                            "{context}: crashed old L must hold an uncommitted vote before X, not \
+                             {}",
+                            stale.vote
+                        );
+                    }
                 }
                 let x_acknowledged = attempt_append(&mut cluster, group, stale_leader, b"XXXX;")
                     .await
