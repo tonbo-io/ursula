@@ -694,3 +694,90 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
         }
     }
 }
+
+/// Even under `never`, the first accepted membership must survive a complete
+/// power loss: accepting data loss cannot recreate a missing voter set.
+#[test]
+fn bootstrap_membership_survives_full_cluster_power_loss_under_never() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("bootstrap membership seed {seed}");
+            let mut cluster = JournalCluster::unstarted("bootstrap-membership", WalFsync::Never);
+            for node in NODES {
+                cluster.start_node(node).await;
+            }
+            // No stream creation or clean shutdown is allowed to make this
+            // bootstrap durable incidentally. Observe the real Raft commit.
+            for group in JOURNAL_GROUPS {
+                let leader = wait_leader(&cluster, group, &context).await;
+                for node in NODES {
+                    cluster.engines[&(group, node)]
+                        .raft_handle()
+                        .wait(Some(Duration::from_secs(5)))
+                        .metrics(
+                            |m| {
+                                m.membership_config
+                                    .membership()
+                                    .voter_ids()
+                                    .collect::<Vec<_>>()
+                                    == NODES
+                                    && m.membership_config.log_id().is_some()
+                                    && m.last_applied >= *m.membership_config.log_id()
+                            },
+                            "bootstrap membership applied",
+                        )
+                        .await
+                        .expect("every voter applied bootstrap membership");
+                }
+                let elected = metrics(&cluster, group, leader);
+                assert!(
+                    elected.committed >= *elected.membership_config.log_id(),
+                    "{context}"
+                );
+            }
+            for node in NODES {
+                cluster.stop_node(node).await;
+            }
+            for node in NODES {
+                cluster.wals[&node].power_loss_losing_unsynced().await;
+            }
+            for node in NODES {
+                cluster.start_node(node).await;
+            }
+            for group in JOURNAL_GROUPS {
+                for node in NODES {
+                    cluster.engines[&(group, node)]
+                        .raft_handle()
+                        .wait(Some(Duration::from_secs(5)))
+                        .metrics(
+                            |m| {
+                                m.membership_config
+                                    .membership()
+                                    .voter_ids()
+                                    .collect::<Vec<_>>()
+                                    == NODES
+                            },
+                            "restored bootstrap membership",
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("{context}: node {node} lost its bootstrap voter set: {error}")
+                        });
+                }
+            }
+            madsim::time::sleep(RECOVERY_STALL_AFTER * 2).await;
+            for group in JOURNAL_GROUPS {
+                for node in NODES {
+                    if gate(&cluster, group, node) == RecoveryGateStatus::Stalled {
+                        accept_observed_loss(&cluster, group, node)
+                            .await
+                            .expect("accept loss against retained membership and vote");
+                    }
+                }
+                wait_leader(&cluster, group, &context).await;
+            }
+            wait_healed(&cluster, &context, Duration::from_secs(10)).await;
+        });
+    }
+}

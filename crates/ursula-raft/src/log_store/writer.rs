@@ -1635,7 +1635,10 @@ fn write_core_log_batch(
                     }
                 }
                 journal_records = journal_records.saturating_add(1);
-                requires_sync |= raft_group_log_record_requires_sync(&record.record);
+                requires_sync |= raft_group_log_record_requires_sync(
+                    &record.record,
+                    journal.context.tuning.fsync,
+                );
                 if raft_group_log_record_initializes(&record.record) {
                     metadata_changed |= journal.metadata.initialize(record.group_id, *first);
                 }
@@ -1657,17 +1660,16 @@ fn write_core_log_batch(
             )
         )
     });
-    let sync_journal = requires_sync && journal.context.tuning.fsync == WalFsync::Always;
     let written = flushed
         .and_then(|()| journal.active.flush())
         .and_then(|()| {
             let write_ns = elapsed_ns(write_started_at);
-            if !sync_journal && !metadata_changed {
+            if !requires_sync && !metadata_changed {
                 return Ok((write_ns, 0, 0));
             }
             let sync_started_at = Instant::now();
             let mut fsyncs = 0_u64;
-            if sync_journal {
+            if requires_sync {
                 fsyncs = fsyncs.saturating_add(journal.active.sync()?);
             }
             if metadata_changed {
@@ -1684,7 +1686,7 @@ fn write_core_log_batch(
         }
     };
 
-    let fsync_records = match (sync_journal, metadata_changed) {
+    let fsync_records = match (requires_sync, metadata_changed) {
         (true, true) => journal_records.saturating_add(metadata_ops),
         (true, false) => journal_records,
         (false, true) => metadata_ops,
@@ -1937,20 +1939,30 @@ pub(crate) fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize 
     }
 }
 
-/// Whether OpenRaft requires this record to reach stable storage before the
-/// storage method returns under `fsync = always`.
+/// Whether a journal record must reach stable storage before acknowledgment.
+/// Membership batches always sync, including under `never`: losing every
+/// bootstrap membership leaves no voter set from which to recover.
+/// Ordinary appends and purge follow the configured policy.
 ///
 /// Committed and truncate markers are replay optimizations. Losing either in a
 /// crash leaves the durable entries intact and OpenRaft re-establishes the
-/// marker after restart. Append durability is a consensus safety
-/// requirement. Purge remains durable because reclaim may delete the
-/// segments holding the entries it covers. Votes are not journal records:
-/// the metadata file holds them and is always `fsync`ed.
-pub(crate) fn raft_group_log_record_requires_sync(record: &RaftGroupLogRecord) -> bool {
-    matches!(
-        record,
-        RaftGroupLogRecord::Append(_) | RaftGroupLogRecord::Purge(_)
-    )
+/// marker after restart. Reclaim syncs any outstanding purge markers before
+/// deleting the segments they cover, under both policies. Votes are not journal
+/// records: the metadata file holds them and is always `fsync`ed.
+pub(crate) fn raft_group_log_record_requires_sync(
+    record: &RaftGroupLogRecord,
+    fsync: WalFsync,
+) -> bool {
+    match record {
+        RaftGroupLogRecord::Append(entries) => {
+            fsync == WalFsync::Always
+                || entries
+                    .iter()
+                    .any(|entry| matches!(entry.payload, openraft::EntryPayload::Membership(_)))
+        }
+        RaftGroupLogRecord::Purge(_) => fsync == WalFsync::Always,
+        RaftGroupLogRecord::SaveCommitted(_) | RaftGroupLogRecord::TruncateAfter(_) => false,
+    }
 }
 
 /// Whether this record shows the group was initialized on this replica: it
