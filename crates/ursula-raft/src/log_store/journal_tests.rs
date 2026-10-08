@@ -273,16 +273,20 @@ fn journal_error(err: &CoreJournalError) -> Option<&JournalError> {
 #[test]
 fn fsync_policy_keeps_only_replay_hints_best_effort() {
     assert!(raft_group_log_record_requires_sync(
-        &RaftGroupLogRecord::Append(vec![blank_entry(1)])
+        &RaftGroupLogRecord::Append(vec![blank_entry(1)]),
+        WalFsync::Always
     ));
     assert!(raft_group_log_record_requires_sync(
-        &RaftGroupLogRecord::Purge(log_id(1))
+        &RaftGroupLogRecord::Purge(log_id(1)),
+        WalFsync::Always
     ));
     assert!(!raft_group_log_record_requires_sync(
-        &RaftGroupLogRecord::SaveCommitted(Some(log_id(1)))
+        &RaftGroupLogRecord::SaveCommitted(Some(log_id(1))),
+        WalFsync::Always
     ));
     assert!(!raft_group_log_record_requires_sync(
-        &RaftGroupLogRecord::TruncateAfter(Some(log_id(1)))
+        &RaftGroupLogRecord::TruncateAfter(Some(log_id(1))),
+        WalFsync::Always
     ));
 }
 
@@ -1030,11 +1034,16 @@ async fn never_fsync_syncs_membership_without_syncing_each_data_batch() {
         ]),
     )
     .unwrap();
-    append(&mut store, [Entry::new(
-        log_id(3),
-        EntryPayload::Membership(membership),
-    )])
-    .await;
+    let membership_entry = Entry::new(log_id(3), EntryPayload::Membership(membership));
+    assert!(raft_group_log_record_requires_sync(
+        &RaftGroupLogRecord::Append(vec![membership_entry.clone()]),
+        WalFsync::Never
+    ));
+    assert!(!raft_group_log_record_requires_sync(
+        &RaftGroupLogRecord::Append(vec![blank_entry(4)]),
+        WalFsync::Never
+    ));
+    append(&mut store, [membership_entry]).await;
     let after_membership = core.metrics.snapshot().wal_fsyncs;
     assert_eq!(after_membership.checked_sub(before_data), Some(1));
     append(&mut store, [blank_entry(4)]).await;
