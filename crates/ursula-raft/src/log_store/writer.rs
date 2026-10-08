@@ -1570,6 +1570,7 @@ fn write_core_log_batch(
     let mut journal_records = 0_u64;
     let mut metadata_ops = 0_u64;
     let mut requires_sync = false;
+    let mut membership_sync = false;
     let mut metadata_changed = false;
     let mut batch = batch.into_iter();
     while let Some(request) = batch.next() {
@@ -1636,6 +1637,8 @@ fn write_core_log_batch(
                 }
                 journal_records = journal_records.saturating_add(1);
                 requires_sync |= raft_group_log_record_requires_sync(&record.record);
+                membership_sync |= matches!(&record.record, RaftGroupLogRecord::Append(entries)
+                    if entries.iter().any(|entry| matches!(entry.payload, openraft::EntryPayload::Membership(_))));
                 if raft_group_log_record_initializes(&record.record) {
                     metadata_changed |= journal.metadata.initialize(record.group_id, *first);
                 }
@@ -1657,7 +1660,10 @@ fn write_core_log_batch(
             )
         )
     });
-    let sync_journal = requires_sync && journal.context.tuning.fsync == WalFsync::Always;
+    // Losing every bootstrap membership leaves no voter set that an operator
+    // can reopen after a full-cluster power loss, even when data loss is allowed.
+    let sync_journal =
+        membership_sync || (requires_sync && journal.context.tuning.fsync == WalFsync::Always);
     let written = flushed
         .and_then(|()| journal.active.flush())
         .and_then(|()| {

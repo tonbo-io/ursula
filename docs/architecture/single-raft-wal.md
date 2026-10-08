@@ -9,8 +9,11 @@ journal described in [Production Raft WAL](raft-wal-production.md).
   backend is removed. Configurations that select it are refused at startup;
   there is no migration path because no deployment depends on it.
 - `raft.wal.fsync` chooses when journal appends reach stable storage:
-  - `never` (default): appends are written to the page cache and acknowledged
-    without `fsync`.
+  - `never` (default): ordinary data appends are written to the page cache and
+    acknowledged without `fsync`. Batches containing a Raft membership entry
+    are always synced before acknowledgement. This preserves the voter set
+    needed to recover after a full-cluster power loss, even when unsynced data
+    loss is accepted.
   - `always`: every batch is acknowledged only after `fsync`, which is the
     current behaviour.
 
