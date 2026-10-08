@@ -72,9 +72,9 @@ it("a file with a sidecar opens only while attached here: not before an attach, 
 	const again = openPlain(file);
 	again.exec("INSERT INTO t VALUES ('r2')");
 	again.close();
-	// A failed re-attach of the bound path drops its binding. Nothing listens on port 1: creating
-	// the stream fails.
-	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/create/);
+	// A failed re-attach of the bound path drops its binding. Nothing listens on port 1: the HEAD
+	// fails.
+	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/head http:\/\/127\.0\.0\.1:1\//);
 	expect(() => openPlain(file)).toThrow(/unable to open/);
 	expect(() => status(file)).toThrow(/last attach failed/);
 	attach(file, url);

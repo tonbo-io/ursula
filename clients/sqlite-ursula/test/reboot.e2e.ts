@@ -141,6 +141,26 @@ it("(e) attaching the cache of one stream to another, or to its stream that lost
 	expect(statSync(file).size).toBeGreaterThan(0);
 });
 
+// A stream deleted behind a file that holds data (by mistake, by TTL expiry, or by a fresh install
+// that did not carry it over) leaves the local files as the only copy: attach refuses to create an
+// empty stream over them and keeps them. A file that holds no data still creates its stream.
+it("(j) a missing stream is not recreated under a file that holds data", async () => {
+	const url = ursulaUrl() + streamPath();
+	const file = freshFile();
+	const child = runChild(file, url, FIRST, { CHILD_EXIT: "1" });
+	expect((await child.exited).code).toBe(0);
+	expect((await fetch(url, { method: "DELETE" })).ok).toBe(true);
+	const [db, sidecar] = [readFileSync(file), readFileSync(`${file}-ursula`)];
+	expect(() => attach(file, url)).toThrow(/is missing and .* holds data/);
+	expect((await fetch(url, { method: "HEAD" })).status).toBe(404);
+	expect(readFileSync(file).equals(db)).toBe(true);
+	expect(readFileSync(`${file}-ursula`).equals(sidecar)).toBe(true);
+	expect(() => status(file)).toThrow(/last attach failed .*is missing/);
+	const empty = freshFile();
+	attach(empty, url);
+	expect((await fetch(url, { method: "HEAD" })).status).toBe(200);
+});
+
 /** Runs `sqls` in an owner that is SIGKILLed afterwards: its WAL stays as it is, never checkpointed. */
 async function killedOwner(file: string, url: string, sqls: string[]): Promise<void> {
 	const child = runChild(file, url, sqls);

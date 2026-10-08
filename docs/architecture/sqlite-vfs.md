@@ -90,11 +90,13 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
 `ursula_attach`:
 
 1. Takes the host lock; refuses if a connection to the file is open in this process.
-2. `HEAD`s the stream for its `Stream-Incarnation` (an opaque token that changes when the stream
-   is deleted and recreated at the same path; a stream without one is refused), then reads the
-   sidecar, before anything opens the file through SQLite. A file with content and no sidecar was
-   never attached and is refused (it may be a database whose pages were never in the stream). A
-   sidecar for another stream path is refused. The local files are trusted when the sidecar was
+2. Reads the sidecar of a file with content, then `HEAD`s the stream for its `Stream-Incarnation`
+   (an opaque token that changes when the stream is deleted and recreated at the same path; a
+   stream without one is refused), before anything opens the file through SQLite. A file with
+   content and no sidecar was never attached and is refused (it may be a database whose pages were
+   never in the stream). A sidecar for another stream path is refused. A missing stream is created
+   for a file without content, and refused for one with content (§6, wrong stream): the local
+   files may be the only copy left. The local files are trusted when the sidecar was
    written in this boot, from this incarnation of the stream, for this db file, and the local WAL
    holds what the sidecar claims of it (§6); anything else (another or unknown boot id, another
    incarnation, an older version's sidecar, a torn one, a replaced db file, a WAL behind its
@@ -400,9 +402,10 @@ What attach does in each case:
   stream's end means the stream lost acknowledged data: attach refuses and keeps the files (delete
   `<db>` to rebuild). After an operator restore from backup (same incarnation), delete `<db>`:
   attach refuses while the stream ends before the sidecar's offset, but trusts the files once it
-  has grown past it. Attach creates a missing stream, so attaching after the stream was deleted
-  (by mistake, or by a fresh install that did not carry it over) creates an empty one and discards
-  the local files, which may be the only copy left: copy `<db>` aside first. A recreate during
+  has grown past it. A stream deleted (by mistake, by TTL expiry, or by a fresh install that did not
+  carry it over) leaves the local files as possibly the only copy: attach creates a missing stream
+  only for a file without content, refuses one with content and keeps its files. To start over
+  from an empty stream, delete `<db>`, or attach under another stream URL. A recreate during
   attach fails that round, and attach rebuilds from the recreated stream (§3).
   While attached, every request of the owner carries its incarnation as the `Stream-Incarnation`
   precondition, which the server checks atomically with the request (an append when Raft applies
@@ -482,7 +485,8 @@ rebuild, delete `<db>`.
   its sidecar is rebuilt and the stream stays intact, one whose WAL is ahead is trusted; discarding
   is refused while another process has the file open; a replaced db file is rebuilt; a file without
   a sidecar, the cache of another stream, and files whose sidecar offset lies beyond their stream's
-  end are refused (also with an older version's sidecar); a format-1 sidecar (numeric offset) behind
+  end are refused (also with an older version's sidecar), and so is a file with content whose stream
+  was deleted (its files kept, no empty stream created); a format-1 sidecar (numeric offset) behind
   a stream another owner extended is rebuilt; the cache of a deleted stream is rebuilt from the
   stream recreated at its path, both shorter than the file's offset and grown past it), a file with
   a sidecar opening only while attached in the process (refused before an attach, and after a failed

@@ -423,17 +423,11 @@ fn attach_files_rebuilding(
 /// Decides whether the local files can be trusted (or discards them), brings them to the stream's
 /// tail and claims it (`sync`), then builds the new attachment for `attach` to bind.
 fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), Error> {
-    create_stream(url)?;
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
     let boot = boot.as_deref();
-    let incarnation = head(url, &|| false)?
-        .incarnation
-        .ok_or_else(|| Error::NoIncarnation {
-            url: url.to_owned(),
-        })?;
-    let (mut local, mut emptied) = (None, None);
-    if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+    // The sidecar of a file that holds data (`None` without data; `Some(None)`: torn).
+    let found = if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
         let s = read_sidecar(&sidecar).map_err(|e| Error::NoSidecar {
             path: path.to_owned(),
@@ -448,6 +442,32 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
                 wanted: stream_key(url).to_owned(),
             });
         }
+        Some(s)
+    } else {
+        None
+    };
+    let head = match head(url, &|| false) {
+        Ok(head) => head,
+        // A missing stream is created for a file that holds no data. Behind one that does, the
+        // stream was deleted (by mistake, by TTL expiry, or by a fresh install that did not carry
+        // it over) and the files may be the only copy left: refused, and kept.
+        Err(Error::Status { status: 404, .. }) if found.is_none() => {
+            create_stream(url)?;
+            head(url, &|| false)?
+        }
+        Err(Error::Status { status: 404, .. }) => {
+            return Err(Error::StreamMissing {
+                path: path.to_owned(),
+                url: url.to_owned(),
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let incarnation = head.incarnation.ok_or_else(|| Error::NoIncarnation {
+        url: url.to_owned(),
+    })?;
+    let (mut local, mut emptied) = (None, None);
+    if let Some(s) = found {
         match s {
             Some(s) if s.trusted(path, boot, &incarnation) => local = Some(s),
             // Written before a reboot (a power loss may have left any prefix of any write), by an
