@@ -306,12 +306,15 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         )
         .ready()
     );
-    assert!(!restarted_registry.recovery_barriers_ready());
+    // The stopped group closes only its own participation: planned handoffs
+    // of the node's other groups stay open.
+    assert!(restarted_registry.recovery_barriers_ready());
     let participation = restarted_registry.participation_status();
-    assert!(!participation.should_campaign);
-    assert!(!participation.should_accept_transfer);
+    assert!(participation.should_campaign);
+    assert!(participation.should_accept_transfer);
     assert!(!restarted_registry.may_campaign(RaftGroupId(999)));
     assert!(!restarted_registry.may_campaign(RaftGroupId(0)));
+    assert!(restarted_registry.may_campaign(RaftGroupId(1)));
     assert!(restarted_registry.get(RaftGroupId(0)).is_none());
     assert!(restarted_registry.contains_group(RaftGroupId(0)));
     use crate::raft_internal_proto::raft_internal_server::RaftInternal;

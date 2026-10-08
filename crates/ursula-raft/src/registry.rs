@@ -765,15 +765,15 @@ impl RaftGroupHandleRegistry {
         }
     }
 
+    /// Every recovery gate on this node is open. A group stopped by an apply
+    /// failure has no gate to open: its own campaign and transfer eligibility
+    /// close, and it must not close planned handoffs of the node's other groups.
     pub fn recovery_barriers_ready(&self) -> bool {
         self.groups.load().values().all(|entry| {
-            entry.active().is_some_and(|entry| {
-                entry.apply_health.failure().is_none()
-                    && entry
-                        .recovery
-                        .as_ref()
-                        .is_none_or(|gate| gate.may_campaign())
-            })
+            entry
+                .active()
+                .and_then(|entry| entry.recovery.as_ref())
+                .is_none_or(|gate| gate.may_campaign())
         })
     }
 
