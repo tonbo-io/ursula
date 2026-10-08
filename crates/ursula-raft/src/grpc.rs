@@ -5,7 +5,6 @@ use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -37,7 +36,6 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
-use tonic::transport::Endpoint;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ursula_runtime::ColdIndexPageCache;
@@ -58,6 +56,7 @@ use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
 use crate::format_epoch::observe_outbound_status;
 use crate::format_epoch::record_format_epoch_mismatch;
 use crate::forward::write_commands_on_raft;
+use crate::peer_channel::peer_endpoint;
 use crate::raft_internal_proto;
 use crate::rejoin::GroupRejoin;
 use crate::types::UrsulaAppendEntriesRequest;
@@ -75,8 +74,6 @@ fn reply_to<T>(tx: oneshot::Sender<T>, value: T) {
     }
 }
 
-pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
-    OnceLock::new();
 /// Shared only by groups constructed on one owner core. Connections and
 /// encoders are created by that core, never by a process-wide first caller.
 #[derive(Debug)]
@@ -1407,7 +1404,7 @@ fn shared_raft_client(
     endpoint: &str,
     observed_generation: Option<u64>,
 ) -> (Result<RaftClient, String>, u64) {
-    let parsed = match Endpoint::from_shared(endpoint.to_owned()) {
+    let parsed = match peer_endpoint(endpoint) {
         Ok(parsed) => parsed,
         Err(err) => {
             return (
@@ -1865,6 +1862,7 @@ mod reconnect_tests {
     use openraft::entry::RaftEntry;
     use openraft::vote::RaftLeaderId;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Endpoint;
     use ursula_runtime::GroupWriteCommand;
     use ursula_stream::StreamCommand;
 

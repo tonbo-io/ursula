@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use openraft::BasicNode;
@@ -7,7 +11,6 @@ use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
-use tonic::transport::Endpoint;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
@@ -21,10 +24,11 @@ use ursula_shard::ShardPlacement;
 
 use crate::codec::decode_wire;
 use crate::codec::encode_wire;
-use crate::grpc::GRPC_LEADER_CHANNELS;
+use crate::format_epoch::observe_outbound_status;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
 use crate::grpc::RaftClient;
+use crate::peer_channel::peer_endpoint;
 use crate::raft_internal_proto;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::RaftGroupResponse;
@@ -37,13 +41,13 @@ use crate::types::UrsulaRaftTypeConfig;
 )]
 pub(crate) async fn forward_head_stream_to_leader(
     placement: ShardPlacement,
-    leader_node: &BasicNode,
+    leader_node: BasicNode,
     request: HeadStreamRequest,
 ) -> Result<HeadStreamResponse, GroupEngineError> {
     let head = head_stream_read_v1(&request);
     forward_typed_read_to_leader(
         placement,
-        leader_node,
+        &leader_node,
         request.stream_id,
         request.now_ms,
         "head",
@@ -59,13 +63,13 @@ pub(crate) async fn forward_head_stream_to_leader(
 )]
 pub(crate) async fn forward_read_stream_to_leader(
     placement: ShardPlacement,
-    leader_node: &BasicNode,
+    leader_node: BasicNode,
     request: ReadStreamRequest,
 ) -> Result<ReadStreamResponse, GroupEngineError> {
     let read = read_stream_read_v1(&request)?;
     forward_typed_read_to_leader(
         placement,
-        leader_node,
+        &leader_node,
         request.stream_id,
         request.now_ms,
         "read",
@@ -127,11 +131,7 @@ pub(crate) async fn forward_group_read_to_leader(
     now_ms: u64,
     read: raft_internal_proto::group_read_request_v1::Read,
 ) -> Result<raft_internal_proto::GroupReadResponseV1, GroupEngineError> {
-    let channel = grpc_leader_channel(&leader_node.addr).await?;
-    let mut client = RaftClient::new(channel)
-        .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
-    let mut grpc_request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
+    let request = raft_internal_proto::GroupReadRequestV1 {
         raft_group_id: placement.raft_group_id.0,
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
@@ -140,18 +140,16 @@ pub(crate) async fn forward_group_read_to_leader(
         now_ms,
         read: Some(read),
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-    });
-    // Carry this request's trace context to the leader so the forwarded read
-    // joins the originating trace. No-op when no propagator is installed.
-    crate::telemetry::inject_current_context(grpc_request.metadata_mut());
-    client
-        .group_read(grpc_request)
-        .await
-        .map(|response| response.into_inner())
-        .map_err(|err| {
-            crate::format_epoch::observe_outbound_status("GroupRead", &err);
-            GroupEngineError::new(format!("forward group read to leader: {err}"))
-        })
+    };
+    call_leader(
+        placement,
+        &leader_node.addr,
+        ForwardedRpc::GroupRead,
+        request,
+        |mut client, request| async move { client.group_read(request).await },
+    )
+    .await
+    .map_err(ForwardError::into_engine_error)
 }
 
 /// Forward the cluster-wide administrative bucket purge to the known
@@ -164,11 +162,7 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     leader_node: &BasicNode,
     bucket_id: String,
 ) -> Result<PurgeBucketResponse, GroupEngineError> {
-    let channel = grpc_leader_channel(&leader_node.addr).await?;
-    let mut client = RaftClient::new(channel)
-        .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
-    let mut grpc_request = tonic::Request::new(raft_internal_proto::GroupWriteRequestV1 {
+    let request = raft_internal_proto::GroupWriteRequestV1 {
         raft_group_id: placement.raft_group_id.0,
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
@@ -176,16 +170,16 @@ pub(crate) async fn forward_purge_bucket_to_leader(
             ursula_stream::StreamCommand::PurgeBucket { bucket_id },
         ))],
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-    });
-    crate::telemetry::inject_current_context(grpc_request.metadata_mut());
-    let response = client
-        .group_write(grpc_request)
-        .await
-        .map_err(|err| {
-            crate::format_epoch::observe_outbound_status("GroupWrite", &err);
-            GroupEngineError::new(format!("forward group write to leader: {err}"))
-        })?
-        .into_inner();
+    };
+    let response = call_leader(
+        placement,
+        &leader_node.addr,
+        ForwardedRpc::GroupWrite,
+        request,
+        |mut client, request| async move { client.group_write(request).await },
+    )
+    .await
+    .map_err(ForwardError::into_engine_error)?;
     let mut results = response.results.into_iter();
     let result = results
         .next()
@@ -210,27 +204,322 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     }
 }
 
-pub(crate) async fn grpc_leader_channel(addr: &str) -> Result<Channel, GroupEngineError> {
-    let cache = GRPC_LEADER_CHANNELS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Some(channel) = cache
-        .lock()
-        .map_err(|_poisoned| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
-        .get(addr)
-        .cloned()
-    {
-        return Ok(channel);
+/// Deadline of one forwarded leader RPC, connect included. It ends a call
+/// to a leader that still answers HTTP/2 PINGs but not the call (a silent
+/// one is cut off sooner, see [`crate::peer_channel`]). It leaves the
+/// leader room for a ReadIndex round (at most `election_timeout_min`) and a
+/// cold-tier GET, and stays well below a gateway's 30 s header timeout, so
+/// the client gets this node's retryable answer.
+const FORWARD_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The leader RPCs a follower forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardedRpc {
+    /// A read or HEAD the leader serves.
+    GroupRead,
+    /// A bucket purge the leader proposes.
+    GroupWrite,
+}
+
+impl ForwardedRpc {
+    fn route(self) -> &'static str {
+        match self {
+            Self::GroupRead => "GroupRead",
+            Self::GroupWrite => "GroupWrite",
+        }
     }
-    let endpoint = Endpoint::from_shared(addr.to_owned())
-        .map_err(|err| GroupEngineError::new(format!("invalid gRPC leader endpoint: {err}")))?;
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|err| GroupEngineError::new(format!("connect gRPC leader: {err}")))?;
-    cache
-        .lock()
-        .map_err(|_poisoned| GroupEngineError::new("gRPC leader channel cache mutex poisoned"))?
-        .insert(addr.to_owned(), channel.clone());
-    Ok(channel)
+}
+
+impl std::fmt::Display for ForwardedRpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.route())
+    }
+}
+
+/// Why a forwarded leader RPC got no answer from the leader's group.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ForwardError {
+    #[error("invalid gRPC leader endpoint {address}")]
+    InvalidEndpoint {
+        address: String,
+        #[source]
+        source: tonic::transport::Error,
+    },
+    /// No connection to the leader: nothing was sent.
+    #[error("connect to the group leader at {address}")]
+    Connect {
+        address: String,
+        #[source]
+        source: tonic::transport::Error,
+    },
+    /// The call failed at the transport (a broken or silent connection) or
+    /// the leader could not serve it right now (`Unavailable`).
+    #[error("{rpc} to the group leader at {address} failed at the transport")]
+    Transport {
+        rpc: ForwardedRpc,
+        address: String,
+        #[source]
+        source: tonic::Status,
+    },
+    #[error("{rpc} to the group leader at {address} did not complete within {timeout:?}")]
+    TimedOut {
+        rpc: ForwardedRpc,
+        address: String,
+        timeout: Duration,
+    },
+    /// The leader refused the call (protocol mismatch, unknown group, a
+    /// malformed request).
+    #[error("{rpc} to the group leader at {address} was refused")]
+    Refused {
+        rpc: ForwardedRpc,
+        address: String,
+        #[source]
+        source: tonic::Status,
+    },
+}
+
+impl ForwardError {
+    /// True when this node could not reach the leader, or the leader could
+    /// not serve: retrying once the connection or the election settles may
+    /// succeed.
+    fn leader_unreachable(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect { .. } | Self::Transport { .. } | Self::TimedOut { .. }
+        )
+    }
+
+    /// The engine-level answer, decided here only. A leader this node
+    /// cannot reach is, to the client, a leader it does not know:
+    /// leader-unknown (HTTP 503 with `Retry-After`), retried once the
+    /// election or the connection settles. Its message names no internal
+    /// address; the full error is logged where it happens.
+    fn into_engine_error(self) -> GroupEngineError {
+        if self.leader_unreachable() {
+            // A purge whose request reached the leader's socket may have
+            // committed there.
+            let proposal_may_have_started = matches!(
+                &self,
+                Self::Transport {
+                    rpc: ForwardedRpc::GroupWrite,
+                    ..
+                } | Self::TimedOut {
+                    rpc: ForwardedRpc::GroupWrite,
+                    ..
+                }
+            );
+            let message = "the raft group leader is unreachable; retry";
+            return if proposal_may_have_started {
+                GroupEngineError::forward_to_leader(message, None, None)
+            } else {
+                GroupEngineError::forward_to_leader_before_proposal(message, None, None)
+            };
+        }
+        GroupEngineError::new(ErrorChain(&self).to_string())
+    }
+}
+
+/// Status codes of a forwarded call that failed at the transport or found
+/// the leader unable to serve. Tonic reports this side's failures as
+/// `Unavailable` (connect), `Cancelled` (deadline), `Unknown` (a broken
+/// connection or a keepalive timeout); a leader answers `Unavailable` while
+/// its group owner is stopped.
+fn is_transport_failure(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::Unknown
+    )
+}
+
+/// One forwarded leader RPC under [`FORWARD_RPC_TIMEOUT`]. A call that fails
+/// at the transport drops its cached channel, so the next one reconnects.
+async fn call_leader<Req, Resp, Fut>(
+    placement: ShardPlacement,
+    address: &str,
+    rpc: ForwardedRpc,
+    request: Req,
+    send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
+) -> Result<Resp, ForwardError>
+where
+    Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+{
+    let started = crate::rt::time::Instant::now();
+    let timed_out = || ForwardError::TimedOut {
+        rpc,
+        address: address.to_owned(),
+        timeout: FORWARD_RPC_TIMEOUT,
+    };
+    let connected =
+        crate::rt::time::timeout(FORWARD_RPC_TIMEOUT, LEADER_CHANNELS.connect(address)).await;
+    let mut dropped_channel = false;
+    let error = match connected {
+        Err(_elapsed) => timed_out(),
+        Ok(Err(error)) => error,
+        Ok(Ok(leader)) => {
+            let remaining = FORWARD_RPC_TIMEOUT.saturating_sub(started.elapsed());
+            let client = RaftClient::new(leader.channel.clone())
+                .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
+            let mut request = tonic::Request::new(request);
+            // The leader stops working on the call when this side gives up.
+            request.set_timeout(remaining);
+            // Carry this request's trace context to the leader so the
+            // forwarded call joins the originating trace. No-op when no
+            // propagator is installed.
+            crate::telemetry::inject_current_context(request.metadata_mut());
+            let error = match crate::rt::time::timeout(remaining, send(client, request)).await {
+                Ok(Ok(response)) => return Ok(response.into_inner()),
+                Ok(Err(status)) => {
+                    observe_outbound_status(rpc.route(), &status);
+                    if is_transport_failure(&status) {
+                        ForwardError::Transport {
+                            rpc,
+                            address: address.to_owned(),
+                            source: status,
+                        }
+                    } else {
+                        ForwardError::Refused {
+                            rpc,
+                            address: address.to_owned(),
+                            source: status,
+                        }
+                    }
+                }
+                Err(_elapsed) => timed_out(),
+            };
+            dropped_channel =
+                error.leader_unreachable() && LEADER_CHANNELS.evict(address, leader.generation);
+            error
+        }
+    };
+    if dropped_channel {
+        tracing::warn!(
+            group = placement.raft_group_id.0,
+            leader = address,
+            error = %ErrorChain(&error),
+            "dropped the forwarding channel to a group leader after a transport failure"
+        );
+    } else {
+        tracing::debug!(
+            group = placement.raft_group_id.0,
+            leader = address,
+            error = %ErrorChain(&error),
+            "forwarded leader RPC failed"
+        );
+    }
+    Err(error)
+}
+
+/// Renders an error with its sources, for logs.
+struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(error) = source {
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}
+
+/// The forwarding channels of this process, one HTTP/2 channel per leader
+/// address shared by every group. A call that fails at the transport drops
+/// its channel, so the next call connects afresh (bounded by the peer
+/// endpoint's connect timeout) and an address that stopped answering is
+/// not kept.
+static LEADER_CHANNELS: LeaderChannels = LeaderChannels::new();
+
+struct LeaderChannels(Mutex<LeaderChannelsInner>);
+
+struct LeaderChannelsInner {
+    by_address: BTreeMap<String, LeaderChannel>,
+    next_generation: u64,
+}
+
+/// A cached channel and the generation that tells it apart from a newer
+/// channel to the same address.
+#[derive(Clone)]
+struct LeaderChannel {
+    generation: u64,
+    channel: Channel,
+}
+
+impl LeaderChannels {
+    const fn new() -> Self {
+        Self(Mutex::new(LeaderChannelsInner {
+            by_address: BTreeMap::new(),
+            next_generation: 0,
+        }))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LeaderChannelsInner> {
+        // Every critical section leaves the map consistent.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cached channel to `address`, or a new connection to it.
+    async fn connect(&self, address: &str) -> Result<LeaderChannel, ForwardError> {
+        if let Some(cached) = self.lock().by_address.get(address) {
+            return Ok(cached.clone());
+        }
+        let channel = peer_endpoint(address)
+            .map_err(|source| ForwardError::InvalidEndpoint {
+                address: address.to_owned(),
+                source,
+            })?
+            .connect()
+            .await
+            .map_err(|source| ForwardError::Connect {
+                address: address.to_owned(),
+                source,
+            })?;
+        let mut inner = self.lock();
+        // A concurrent caller may have connected first; share its channel.
+        if let Some(cached) = inner.by_address.get(address) {
+            return Ok(cached.clone());
+        }
+        inner.next_generation = inner.next_generation.wrapping_add(1);
+        let connected = LeaderChannel {
+            generation: inner.next_generation,
+            channel,
+        };
+        inner
+            .by_address
+            .insert(address.to_owned(), connected.clone());
+        Ok(connected)
+    }
+
+    /// Drops the channel to `address` unless a newer one replaced it.
+    /// Returns whether it dropped one.
+    fn evict(&self, address: &str, generation: u64) -> bool {
+        let mut inner = self.lock();
+        if inner
+            .by_address
+            .get(address)
+            .is_some_and(|cached| cached.generation == generation)
+        {
+            inner.by_address.remove(address);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn contains(&self, address: &str) -> bool {
+        self.lock().by_address.contains_key(address)
+    }
+}
+
+/// Whether this process holds a forwarding channel to `address`.
+#[cfg(test)]
+pub(crate) fn has_leader_channel(address: &str) -> bool {
+    LEADER_CHANNELS.contains(address)
 }
 
 pub(crate) async fn write_commands_on_raft(

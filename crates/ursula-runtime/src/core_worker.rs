@@ -22,6 +22,8 @@ use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
 use crate::engine::GroupEngineFactory;
 use crate::engine::GroupEngineMetrics;
+use crate::engine::GroupLeaderReadFuture;
+use crate::engine::GroupReadRoute;
 use crate::error::RuntimeError;
 use crate::group_actor::GroupActor;
 use crate::group_actor::GroupCommand;
@@ -515,8 +517,8 @@ impl CoreWorker {
         response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
     ) {
         let exec_started_at = Instant::now();
-        let parts = group
-            .read_stream_parts(request, placement)
+        let route = group
+            .route_read_stream(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err));
         metrics.record_group_engine_exec(
@@ -524,14 +526,52 @@ impl CoreWorker {
             placement.raft_group_id,
             elapsed_ns(exec_started_at),
         );
-        match parts {
-            Ok(parts) => {
+        match route {
+            Ok(GroupReadRoute::Local(parts)) => {
                 Self::send_read_parts_response(placement, read_materialization, parts, response_tx);
+            }
+            Ok(GroupReadRoute::Leader(parts)) => {
+                let response = Box::pin(async move { parts.await?.into_response().await });
+                Self::send_leader_answer(placement, read_materialization, response, response_tx);
             }
             Err(err) => {
                 reply(response_tx, Err(err));
             }
         }
+    }
+
+    /// Answers `response_tx` with the group leader's answer to a read this
+    /// replica forwarded, outside the group actor, which goes on with its
+    /// mailbox meanwhile. The forwarded RPC holds a read-materialization
+    /// permit (the node's bound on read work that left its actor), ends at
+    /// its own deadline, and is dropped once the caller stops waiting.
+    fn send_leader_answer<T: Send + 'static>(
+        placement: ShardPlacement,
+        read_materialization: Arc<Semaphore>,
+        answer: GroupLeaderReadFuture<T>,
+        mut response_tx: oneshot::Sender<Result<T, RuntimeError>>,
+    ) {
+        crate::rt::spawn(async move {
+            let answer = async move {
+                let _permit = read_materialization
+                    .acquire_owned()
+                    .await
+                    .map_err(|_closed| RuntimeError::MailboxClosed {
+                        core_id: placement.core_id,
+                    })?;
+                answer
+                    .await
+                    .map_err(|err| RuntimeError::group_engine(placement, err))
+            };
+            let response = {
+                let caller_gone = std::pin::pin!(response_tx.closed());
+                match futures_util::future::select(caller_gone, std::pin::pin!(answer)).await {
+                    futures_util::future::Either::Left(((), _answer)) => return,
+                    futures_util::future::Either::Right((response, _caller_gone)) => response,
+                }
+            };
+            reply(response_tx, response);
+        });
     }
 
     pub(crate) fn send_read_parts_response(
@@ -1285,12 +1325,14 @@ impl CoreWorker {
     pub(crate) async fn head_stream(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
         request: HeadStreamRequest,
         placement: ShardPlacement,
-    ) -> Result<HeadStreamResponse, RuntimeError> {
+        response_tx: oneshot::Sender<Result<HeadStreamResponse, RuntimeError>>,
+    ) {
         let exec_started_at = Instant::now();
-        let response = group
-            .head_stream(request, placement)
+        let route = group
+            .route_head_stream(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err));
         metrics.record_group_engine_exec(
@@ -1298,7 +1340,13 @@ impl CoreWorker {
             placement.raft_group_id,
             elapsed_ns(exec_started_at),
         );
-        response
+        match route {
+            Ok(GroupReadRoute::Local(head)) => reply(response_tx, Ok(head)),
+            Ok(GroupReadRoute::Leader(head)) => {
+                Self::send_leader_answer(placement, read_materialization, head, response_tx);
+            }
+            Err(err) => reply(response_tx, Err(err)),
+        }
     }
 
     pub(crate) async fn snapshot_group(

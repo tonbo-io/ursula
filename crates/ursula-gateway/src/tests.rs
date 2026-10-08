@@ -191,6 +191,73 @@ async fn gateway_evicts_cached_leader_on_retryable_leader_unknown_response() {
     assert_eq!(metrics.leader_cache_entries, 0);
 }
 
+fn get_stream() -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/bucket/stream")
+        .body(Body::empty())
+        .expect("request")
+}
+
+/// A cached leader whose node is gone (a deleted pod, a host that lost
+/// power) is dropped from the cache on the transport failure, and the client
+/// gets a retryable 503 instead of an empty 502, so its retry reaches a live
+/// node.
+#[tokio::test]
+async fn gateway_drops_an_unreachable_cached_leader_and_answers_retryable_503() {
+    // A port nothing listens on: connects are refused.
+    let gone = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        format!("http://{}", listener.local_addr().expect("local addr"))
+    };
+    let gateway = Gateway::new(test_config(vec![gone.clone()]));
+    gateway.remember_leader("/bucket/stream".to_owned(), gone.clone());
+
+    let response = gateway.handle(get_stream()).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .map(HeaderValue::as_bytes),
+        Some(&b"1"[..])
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    assert!(!body.is_empty());
+    assert!(!String::from_utf8_lossy(&body).contains(&gone));
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(metrics.leader_cache_evictions, 1);
+    assert_eq!(metrics.leader_cache_entries, 0);
+}
+
+/// A cached leader that accepts the request and never answers is dropped
+/// too. The request may have reached it, so the answer is a 504, not a
+/// retry invitation.
+#[tokio::test]
+async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
+    let silent = spawn_upstream(
+        Router::new().route("/bucket/stream", get(std::future::pending::<&'static str>)),
+    )
+    .await;
+    let gateway = gateway_with_response_header_timeout(&silent.url, Duration::from_millis(200));
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+
+    let response = gateway.handle(get_stream()).await;
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(metrics.leader_cache_evictions, 1);
+    assert_eq!(metrics.leader_cache_entries, 0);
+}
+
 #[test]
 fn upstream_pin_key_ignores_subresource_and_internal_routes() {
     let bootstrap: Uri = "/bucket/stream/bootstrap".parse().expect("uri");
