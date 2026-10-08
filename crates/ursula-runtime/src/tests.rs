@@ -3384,6 +3384,61 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
     assert_eq!(second.payload, b"ready");
 }
 
+#[test]
+fn materialization_release_can_follow_readiness_synchronously() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    struct ReleaseOnReadiness(Arc<Notify>);
+    impl Wake for ReleaseOnReadiness {
+        fn wake(self: Arc<Self>) {
+            self.0.notify_waiters();
+        }
+    }
+    let materialized = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let readiness_waker = Waker::from(Arc::new(ReleaseOnReadiness(release.clone())));
+    let mut readiness = std::pin::pin!(materialized.notified());
+    assert!(
+        readiness
+            .as_mut()
+            .poll(&mut Context::from_waker(&readiness_waker))
+            .is_pending()
+    );
+    let parts = PreparedGroupReadStreamParts {
+        placement: ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        },
+        incarnation: 0,
+        offset: 0,
+        next_offset: 5,
+        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+        up_to_date: true,
+        closed: false,
+        body: GroupReadStreamBody::Blocking {
+            entered: Arc::new(Notify::new()),
+            materialized: materialized.clone(),
+            release,
+            payload: b"ready".to_vec(),
+        },
+    };
+    let mut response = std::pin::pin!(parts.into_response());
+    // Readiness wakes its observer synchronously, before the materializer can
+    // reach its next await. The broadcast must already have a registered waiter.
+    let Poll::Ready(result) = response
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("synchronous broadcast release was lost");
+    };
+    assert_eq!(result.unwrap().payload, b"ready");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_materialization_admission_is_independent_per_owner() {
     let factory = BlockingReadFactory::block_materialization();
@@ -3416,7 +3471,12 @@ async fn read_materialization_admission_is_independent_per_owner() {
     assert!(readers.iter().all(|reader| !reader.is_finished()));
     factory.release.notify_waiters();
     for reader in readers {
-        assert_eq!(reader.await.expect("join").expect("read").payload, b"ready");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+            .await
+            .expect("registered materialization waiter receives broadcast release")
+            .expect("join")
+            .expect("read");
+        assert_eq!(result.payload, b"ready");
     }
 }
 

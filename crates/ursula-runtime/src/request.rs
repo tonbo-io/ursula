@@ -377,9 +377,14 @@ impl PreparedGroupReadStreamParts {
                 release,
                 payload,
             } => {
+                // Publish readiness only after the broadcast release waiter
+                // is registered; notify_waiters does not retain a permit.
+                let released = release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
                 entered.notify_one();
                 materialized.notify_one();
-                release.notified().await;
+                released.await;
                 payload.clone()
             }
         };
