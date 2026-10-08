@@ -1192,12 +1192,9 @@ mod tests {
         let can_open = std::fs::File::open(root.path());
         let result = persist_snapshot_metadata(Some(&path), &meta, b"pointer");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let Err(error) = can_open else {
-            tracing::warn!(
-                "skipping directory-permission fault injection: this user/filesystem bypasses directory read permissions"
-            );
-            return;
-        };
+        let error = can_open.expect_err(
+            "directory-permission fault must be exercised: run this test as an unprivileged user on a filesystem that enforces directory read permissions",
+        );
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(
             path.exists(),
