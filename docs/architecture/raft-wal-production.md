@@ -144,6 +144,18 @@ possibly partial frame or retries an `fsync` whose dirty pages the kernel may
 already have dropped. The process then aborts, because only a restart can
 re-read what is really on disk. Deterministic simulation keeps the poisoned
 writer instead, so it can observe it and restart the node.
+Recording the poisoned run is best effort because the same disk may reject
+that write. The deterministic poison-publication matrix crosses journal write,
+partial-write and fsync errors with marker write, file-sync, rename and
+directory-sync errors, followed by either a process crash or host power loss.
+It checks the acknowledged prefix and vote, and keeps a successfully published
+poison state gated. A separate two-crash schedule covers a failed journal fsync
+and failed marker, a same-boot restart and another acknowledged append, then
+power loss. Clean-but-lost pages can make that history unreadable. Startup must
+refuse it without truncating the acknowledged suffix, including on retry.
+This is fail-closed recovery, not proof that every failed marker permits an
+automatic restart. Restoring such a replica requires a healthy durable copy.
+
 Both modes refuse unknown versions, a damaged segment header, oversized frames
 and frames whose checksums verify but whose payload does not decode. The
 decoder bounds a single frame at 512 MiB before allocating. No write depends on

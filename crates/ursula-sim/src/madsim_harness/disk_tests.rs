@@ -2135,3 +2135,6 @@ fn wal_topology_publication_survives_power_loss() {
         });
     }
 }
+
+#[path = "poison_marker_tests.rs"]
+mod poison_marker;
