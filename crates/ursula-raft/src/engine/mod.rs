@@ -64,11 +64,14 @@ use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPlanSharedRefCompactionFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
+use ursula_runtime::GroupReadRoute;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRepairColdIndexFuture;
+use ursula_runtime::GroupRouteHeadStreamFuture;
+use ursula_runtime::GroupRouteReadStreamFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
@@ -674,6 +677,20 @@ impl RaftGroupEngine {
     }
 }
 
+/// A read the group leader answers: the forwarded RPC, which the runtime
+/// awaits outside the group actor.
+fn leader_read(
+    placement: ShardPlacement,
+    leader_node: BasicNode,
+    request: ReadStreamRequest,
+) -> GroupReadRoute<GroupReadStreamParts> {
+    GroupReadRoute::Leader(Box::pin(async move {
+        forward_read_stream_to_leader(placement, leader_node, request)
+            .await
+            .map(GroupReadStreamParts::from_response)
+    }))
+}
+
 impl GroupEngine for RaftGroupEngine {
     fn accepts_local_writes(&self) -> bool {
         self.raft.is_leader()
@@ -752,10 +769,25 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a> {
         Box::pin(async move {
+            self.route_head_stream(request, placement)
+                .await?
+                .resolve()
+                .await
+        })
+    }
+
+    fn route_head_stream<'a>(
+        &'a mut self,
+        request: HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteHeadStreamFuture<'a> {
+        Box::pin(async move {
             if !self.raft.is_leader()
                 && let Some(leader_node) = self.current_leader_node().await
             {
-                return forward_head_stream_to_leader(placement, &leader_node, request).await;
+                return Ok(GroupReadRoute::Leader(Box::pin(
+                    forward_head_stream_to_leader(placement, leader_node, request),
+                )));
             }
             if request.linearizable {
                 self.require_linearizable_leader_read("head_stream", request.read_index)
@@ -773,6 +805,7 @@ impl GroupEngine for RaftGroupEngine {
                 })
             })
             .await?
+            .map(GroupReadRoute::Local)
         })
     }
 
@@ -818,6 +851,19 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
+            self.route_read_stream(request, placement)
+                .await?
+                .resolve()
+                .await
+        })
+    }
+
+    fn route_read_stream<'a>(
+        &'a mut self,
+        request: ReadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteReadStreamFuture<'a> {
+        Box::pin(async move {
             let original_request = request.clone();
             // A live read pinned to its owner's confirmed read index is
             // served only here, while this replica leads and has applied
@@ -834,9 +880,7 @@ impl GroupEngine for RaftGroupEngine {
                 if !self.raft.is_leader()
                     && let Some(leader_node) = self.current_leader_node().await
                 {
-                    let response =
-                        forward_read_stream_to_leader(placement, &leader_node, request).await?;
-                    return Ok(GroupReadStreamParts::from_response(response));
+                    return Ok(leader_read(placement, leader_node, request));
                 }
                 self.require_linearizable_leader_read(
                     "leader-only read_stream",
@@ -855,10 +899,7 @@ impl GroupEngine for RaftGroupEngine {
                     Ok(false) => {}
                     Ok(true) | Err(_) => {
                         if let Some(leader_node) = self.current_leader_node().await {
-                            let response =
-                                forward_read_stream_to_leader(placement, &leader_node, request)
-                                    .await?;
-                            return Ok(GroupReadStreamParts::from_response(response));
+                            return Ok(leader_read(placement, leader_node, request));
                         }
                         self.require_local_leader_for_read("read_stream").await?;
                     }
@@ -898,13 +939,7 @@ impl GroupEngine for RaftGroupEngine {
                         // whether this stream/cursor actually exists.
                         let mut authoritative_request = original_request;
                         authoritative_request.leader_only = true;
-                        let response = forward_read_stream_to_leader(
-                            placement,
-                            &leader_node,
-                            authoritative_request,
-                        )
-                        .await?;
-                        return Ok(GroupReadStreamParts::from_response(response));
+                        return Ok(leader_read(placement, leader_node, authoritative_request));
                     }
                     return Err(self.not_leader_for_read("read_stream boundary").await);
                 }
@@ -924,14 +959,11 @@ impl GroupEngine for RaftGroupEngine {
                 if parts.payload_is_empty()
                     && let Some(leader_node) = self.current_leader_node().await
                 {
-                    let response =
-                        forward_read_stream_to_leader(placement, &leader_node, original_request)
-                            .await?;
-                    return Ok(GroupReadStreamParts::from_response(response));
+                    return Ok(leader_read(placement, leader_node, original_request));
                 }
                 parts.up_to_date = false;
             }
-            Ok(parts)
+            Ok(GroupReadRoute::Local(parts))
         })
     }
 

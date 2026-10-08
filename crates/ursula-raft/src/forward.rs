@@ -41,13 +41,13 @@ use crate::types::UrsulaRaftTypeConfig;
 )]
 pub(crate) async fn forward_head_stream_to_leader(
     placement: ShardPlacement,
-    leader_node: &BasicNode,
+    leader_node: BasicNode,
     request: HeadStreamRequest,
 ) -> Result<HeadStreamResponse, GroupEngineError> {
     let head = head_stream_read_v1(&request);
     forward_typed_read_to_leader(
         placement,
-        leader_node,
+        &leader_node,
         request.stream_id,
         request.now_ms,
         "head",
@@ -63,13 +63,13 @@ pub(crate) async fn forward_head_stream_to_leader(
 )]
 pub(crate) async fn forward_read_stream_to_leader(
     placement: ShardPlacement,
-    leader_node: &BasicNode,
+    leader_node: BasicNode,
     request: ReadStreamRequest,
 ) -> Result<ReadStreamResponse, GroupEngineError> {
     let read = read_stream_read_v1(&request)?;
     forward_typed_read_to_leader(
         placement,
-        leader_node,
+        &leader_node,
         request.stream_id,
         request.now_ms,
         "read",

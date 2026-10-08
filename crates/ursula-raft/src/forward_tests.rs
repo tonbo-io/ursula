@@ -13,11 +13,15 @@ use std::time::Instant;
 use futures_util::Stream;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use ursula_runtime::GroupEngineCreateFuture;
+use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupLeaderHint;
+use ursula_runtime::RuntimeError;
 
 use super::*;
 use crate::raft_internal_proto as pb;
@@ -31,6 +35,7 @@ const SILENT_LEADER_BOUND: Duration = Duration::from_secs(8);
 /// A peer whose host lost power: connections complete and then hang.
 struct SilentPeer {
     url: String,
+    accepted: watch::Receiver<usize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -43,13 +48,30 @@ impl SilentPeer {
             "http://{}",
             listener.local_addr().expect("silent peer address")
         );
+        let (accepted_tx, accepted) = watch::channel(0);
         let task = tokio::spawn(async move {
             let mut held: Vec<TcpStream> = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
                 held.push(socket);
+                accepted_tx.send_replace(held.len());
             }
         });
-        Self { url, task }
+        Self {
+            url,
+            accepted,
+            task,
+        }
+    }
+
+    /// Waits until a connection to this peer is held open.
+    async fn wait_connected(&mut self) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.accepted.wait_for(|accepted| *accepted > 0),
+        )
+        .await
+        .expect("the forward connects to the silent leader")
+        .expect("silent peer task");
     }
 }
 
@@ -293,5 +315,110 @@ async fn a_forwarded_read_to_a_wedged_leader_ends_at_the_deadline() {
     assert!(!crate::forward::has_leader_channel(&url));
 
     server.abort();
+    shutdown_all(&engines).await;
+}
+
+#[track_caller]
+fn assert_runtime_leader_unknown(what: &str, err: &RuntimeError, url: &str) {
+    match err {
+        RuntimeError::GroupEngine { error, .. } => assert_leader_unknown(what, error, url),
+        other => panic!("{what}: expected a group engine error, got {other:?}"),
+    }
+}
+
+/// Hands the runtime one prebuilt engine for its only group.
+struct PrebuiltEngine(std::sync::Mutex<Option<RaftGroupEngine>>);
+
+impl GroupEngineFactory for PrebuiltEngine {
+    fn create<'a>(
+        &'a self,
+        _placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupEngineCreateFuture<'a> {
+        let engine = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        Box::pin(async move {
+            let engine = engine.ok_or_else(|| GroupEngineError::new("engine handed out"))?;
+            Ok(Box::new(engine) as Box<dyn GroupEngine>)
+        })
+    }
+}
+
+/// The group actor runs one command at a time. A forwarded read waiting on
+/// a silent leader must not hold it: in the chaos run every later command of
+/// the group (appends after this node won the election, HEADs, state gauges)
+/// queued behind one such read for 16 minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_waiting_on_a_silent_leader_does_not_hold_the_group_actor() {
+    let mut peer = SilentPeer::bind().await;
+    let (mut engines, leader_index, stream_id, _wal_roots) =
+        cluster_advertising("forward-silent-actor", &peer.url).await;
+    let follower = engines.remove((leader_index + 1) % 3);
+    wait_for_leader(&follower).await;
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        hosted_config(1, 1),
+        PrebuiltEngine(std::sync::Mutex::new(Some(follower))),
+    )
+    .expect("spawn the runtime over the follower");
+
+    let started = Instant::now();
+    let read = tokio::spawn({
+        let runtime = runtime.clone();
+        let request = ReadStreamRequest {
+            leader_only: true,
+            ..read_req(stream_id.clone(), 64)
+        };
+        async move { runtime.read_stream(request).await }
+    });
+    peer.wait_connected().await;
+    let head = tokio::spawn({
+        let runtime = runtime.clone();
+        let request = HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: 0,
+            linearizable: true,
+            read_index: None,
+        };
+        async move { runtime.head_stream(request).await }
+    });
+
+    // The read and the HEAD are waiting on the silent leader. The group's
+    // next command is answered at once (a follower redirects an append).
+    let append = tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.append(AppendRequest::from_bytes(
+            stream_id.clone(),
+            b"next".to_vec(),
+        )),
+    )
+    .await
+    .expect("the append does not wait behind the forwarded read")
+    .expect_err("a follower does not append");
+    assert!(
+        append.leader_hint().is_some(),
+        "a follower redirects the append: {append:?}"
+    );
+    assert!(
+        !read.is_finished() && !head.is_finished(),
+        "the forwarded read and HEAD are still waiting on the silent leader"
+    );
+
+    let read = tokio::time::timeout(SILENT_LEADER_BOUND, read)
+        .await
+        .expect("the forwarded read is bounded")
+        .expect("read task")
+        .expect_err("a silent leader answers nothing");
+    assert_runtime_leader_unknown("runtime read", &read, &peer.url);
+    let head = tokio::time::timeout(SILENT_LEADER_BOUND, head)
+        .await
+        .expect("the forwarded HEAD is bounded")
+        .expect("HEAD task")
+        .expect_err("a silent leader answers nothing");
+    assert_runtime_leader_unknown("runtime HEAD", &head, &peer.url);
+    assert!(started.elapsed() < SILENT_LEADER_BOUND);
+
     shutdown_all(&engines).await;
 }

@@ -91,6 +91,44 @@ pub type GroupReadStreamPartsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupReadStreamParts, GroupEngineError>> + Send + 'a>>;
 pub type GroupOpenLiveReadFuture<'a> =
     Pin<Box<dyn Future<Output = Result<LiveReadOwner, GroupEngineError>> + Send + 'a>>;
+pub type GroupRouteReadStreamFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<GroupReadRoute<GroupReadStreamParts>, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupRouteHeadStreamFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<GroupReadRoute<HeadStreamResponse>, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// The group leader's answer to a read this replica forwarded. It owns
+/// everything it needs, so the group actor hands it off and goes on with its
+/// mailbox while the forwarded RPC waits on the network.
+pub type GroupLeaderReadFuture<T> =
+    Pin<Box<dyn Future<Output = Result<T, GroupEngineError>> + Send + 'static>>;
+
+/// Where a read is answered.
+pub enum GroupReadRoute<T> {
+    /// This replica answered it.
+    Local(T),
+    /// The group leader answers it, through this forwarded RPC.
+    Leader(GroupLeaderReadFuture<T>),
+}
+
+impl<T> GroupReadRoute<T> {
+    /// The answer, waiting in place for a forwarded one.
+    pub async fn resolve(self) -> Result<T, GroupEngineError> {
+        match self {
+            Self::Local(answer) => Ok(answer),
+            Self::Leader(answer) => answer.await,
+        }
+    }
+}
 pub type GroupPublishSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PublishSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAdvanceRetentionFuture<'a> =
@@ -254,6 +292,38 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async move {
             let response = self.read_stream(request, placement).await?;
             Ok(GroupReadStreamParts::from_response(response))
+        })
+    }
+
+    /// [`Self::read_stream_parts`] for a caller that must not wait on the
+    /// network: a read this replica forwards to its group leader comes back
+    /// as [`GroupReadRoute::Leader`], unanswered. The group actor answers it
+    /// outside the actor, so one forwarded read waiting on a silent leader
+    /// does not hold every later command of the group. The default, for an
+    /// engine that never forwards, answers locally.
+    fn route_read_stream<'a>(
+        &'a mut self,
+        request: ReadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteReadStreamFuture<'a> {
+        Box::pin(async move {
+            self.read_stream_parts(request, placement)
+                .await
+                .map(GroupReadRoute::Local)
+        })
+    }
+
+    /// [`Self::head_stream`], with a forwarded HEAD left unanswered as in
+    /// [`Self::route_read_stream`].
+    fn route_head_stream<'a>(
+        &'a mut self,
+        request: HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteHeadStreamFuture<'a> {
+        Box::pin(async move {
+            self.head_stream(request, placement)
+                .await
+                .map(GroupReadRoute::Local)
         })
     }
 
