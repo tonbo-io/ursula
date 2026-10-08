@@ -877,6 +877,13 @@ impl RaftGroupHandleRegistry {
         vote: VoteOf<UrsulaRaftTypeConfig>,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError> {
+        // A refused install must not queue for the group's lock or the
+        // node's permit. The floor only rises and the Raft core's vote never
+        // falls below it, so Raft refuses a vote the floor overtakes while
+        // this request waits.
+        if let Some(floor) = self.check_recovery_vote(raft_group_id, vote)? {
+            return Ok(SnapshotResponse::new(floor));
+        }
         // Wait in the RPC future, so canceled queued requests retain neither
         // an owned task nor shutdown-drain admission. Recheck the active engine
         // only after both bounded installation resources are available.
@@ -904,9 +911,6 @@ impl RaftGroupHandleRegistry {
             })?;
             (raft, lifetime)
         };
-        if let Some(floor) = self.check_recovery_vote(raft_group_id, vote)? {
-            return Ok(SnapshotResponse::new(floor));
-        }
         let registry = self.clone();
         // The admitted task retains prefetch and permits through Raft consumption,
         // even when the RPC waiter disconnects or is canceled.

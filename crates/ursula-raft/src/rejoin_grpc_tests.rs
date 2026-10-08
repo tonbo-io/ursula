@@ -794,10 +794,20 @@ async fn a_lost_vote_refuses_heartbeat_ack_until_the_proven_floor_is_durable() {
         meta: Default::default(),
         snapshot: std::io::Cursor::new(Vec::new()),
     };
+    // Another install holds the node's only install permit. A refused
+    // install answers without queueing for it.
+    let busy = registry
+        .snapshot_install_coordinator()
+        .acquire()
+        .await
+        .unwrap();
     assert!(matches!(
-        registry
-            .install_full_snapshot(placement().raft_group_id, proven, snapshot())
-            .await,
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.install_full_snapshot(placement().raft_group_id, proven, snapshot()),
+        )
+        .await
+        .expect("a refused install does not wait for the install permit"),
         Err(crate::SnapshotInstallError::Group(
             ursula_runtime::GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
@@ -839,14 +849,18 @@ async fn a_lost_vote_refuses_heartbeat_ack_until_the_proven_floor_is_durable() {
         registry.append_entries(placement().raft_group_id, heartbeat(UrsulaVote::new_committed(3, 2))).await.unwrap(),
         openraft::raft::AppendEntriesResponse::HigherVote(vote) if vote == proven
     ));
-    let stale_snapshot = registry
-        .install_full_snapshot(
+    let stale_snapshot = tokio::time::timeout(
+        Duration::from_secs(1),
+        registry.install_full_snapshot(
             placement().raft_group_id,
             UrsulaVote::new_committed(3, 2),
             snapshot(),
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .expect("a below-floor install does not wait for the install permit")
+    .unwrap();
+    drop(busy);
     assert_eq!(stale_snapshot.vote, proven);
     assert_eq!(
         engine.raft.metrics().borrow_watched().snapshot,
@@ -894,7 +908,7 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
             let peer = peer.clone();
             let observations = observations.clone();
             async move {
-                let response = peer.screen_vote(&crate::bootstrap_probe_vote(1)).unwrap();
+                let response = peer.screen_vote(&crate::bootstrap_probe_vote()).unwrap();
                 let state = crate::PeerGroupLog::from_vote_response(&response);
                 observations.send(state).unwrap();
                 Some(state)

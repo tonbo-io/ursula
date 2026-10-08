@@ -140,8 +140,8 @@ pub(crate) enum VoteScreen {
     Refuse,
 }
 
-/// The catch-up point from a fresh outbound quorum-confirmed probe. The legacy
-/// RPC bridge uses the leader's last log as a conservative bound.
+/// The catch-up point from a fresh outbound quorum-confirmed barrier: the
+/// leader's committed vote and the commit index the replica must apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatchUpTarget {
     leader: UrsulaVote,
@@ -641,18 +641,22 @@ impl GroupRejoin {
         self.recovery_vote().is_some_and(|floor| vote >= floor)
     }
 
+    /// The higher of the floor and the Raft core's current vote, read on
+    /// every inbound AppendEntries and snapshot: only the vote is copied out
+    /// of the metrics.
     pub(crate) fn recovery_vote(&self) -> Option<UrsulaVote> {
         let floor = (*self
             .vote_floor
             .lock()
             .unwrap_or_else(PoisonError::into_inner))?;
-        Some(self.metrics().map_or(floor, |metrics| {
-            if metrics.vote > floor {
-                metrics.vote
-            } else {
-                floor
-            }
-        }))
+        let current = self
+            .metrics
+            .get()
+            .map(|metrics| metrics.borrow_watched().vote);
+        Some(match current {
+            Some(vote) if vote > floor => vote,
+            Some(_) | None => floor,
+        })
     }
 
     pub(crate) async fn establish_vote_floor(

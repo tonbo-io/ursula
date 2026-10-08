@@ -435,7 +435,6 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 crate::recovery_transport::GrpcRecoveryTransport {
                     transport,
                     placement,
-                    node_id: self.node_id,
                     timeout: self.engine_config.bootstrap_peer_connect,
                 },
                 crate::rejoin::RecoveryConfig {

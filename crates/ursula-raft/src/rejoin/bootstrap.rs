@@ -74,7 +74,7 @@ pub fn bootstrap_decision<'a>(
 
 /// The reserved minimum vote is a read-only probe on a recovery-gated peer.
 /// Its grant bit reports durable genesis readiness without changing the vote.
-pub fn bootstrap_probe_vote(_node_id: u64) -> UrsulaVoteRequest {
+pub fn bootstrap_probe_vote() -> UrsulaVoteRequest {
     UrsulaVoteRequest::new(UrsulaVote::new(0, 0), None)
 }
 
