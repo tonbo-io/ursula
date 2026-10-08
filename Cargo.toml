@@ -64,8 +64,13 @@ opentelemetry-otlp = { version = "0.30", default-features = false, features = ["
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "zstd"] }
 foyer = { version = "0.22.3", features = ["nightly"] }
 fs4 = "0.13"
+# OpenRaft and the crates it publishes in lockstep stay on one exact release.
+# OpenRaft names its macros and runtime crates with a prerelease range, so
+# without these pins `cargo update` could move them to a later alpha.
 openraft = { version = "=0.10.0-alpha.28", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
+openraft-macros = "=0.10.0-alpha.28"
 openraft-rt = "=0.10.0-alpha.28"
+openraft-rt-tokio = "=0.10.0-alpha.28"
 pin-project-lite = "0.2"
 prost = "0.13"
 prost-build = "0.13"

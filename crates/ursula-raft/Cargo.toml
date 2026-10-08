@@ -18,6 +18,9 @@ futures-util = { workspace = true }
 fs4 = { workspace = true }
 openraft-rt = { workspace = true }
 openraft = { workspace = true }
+# Not used directly: pins OpenRaft's own dependencies to its release.
+openraft-macros = { workspace = true }
+openraft-rt-tokio = { workspace = true }
 opentelemetry = { workspace = true }
 prost = { workspace = true }
 rmp-serde = { workspace = true }
