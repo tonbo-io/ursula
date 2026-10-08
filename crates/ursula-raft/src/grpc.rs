@@ -176,12 +176,6 @@ pub(crate) enum RecoveryProbeError {
     NotLeader,
     #[error("recovery peer changed its vote across the ReadIndex proof")]
     LeadershipChanged,
-    #[error("recovery peer has no log")]
-    MissingLog,
-    #[error("recovery HEAD unexpectedly found an empty-named stream")]
-    UnexpectedHead,
-    #[error("recovery HEAD did not confirm leadership: {0}")]
-    HeadRejected(#[source] ursula_runtime::GroupEngineError),
 }
 
 /// Confirm a group's current quorum without issuing an application write.
@@ -230,7 +224,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     address: &str,
     timeout: Duration,
 ) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
-    let mut network = GrpcRaftNetwork::new(transport, placement.raft_group_id, leader_id, address);
+    let network = GrpcRaftNetwork::new(transport, placement.raft_group_id, leader_id, address);
     let mut client = network.client()?;
     let envelope = network.vote_envelope(crate::rejoin::bootstrap_probe_vote(node_id));
     GRPC_VOTE_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -274,54 +268,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
             Err(status) => return Err(status.into()),
         }
     }
-    let mut request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
-        raft_group_id: placement.raft_group_id.0,
-        core_id: u32::from(placement.core_id.0),
-        shard_id: placement.shard_id.0,
-        // Neither empty name can be created through the HTTP API. This probe
-        // performs no application write or TTL renewal.
-        bucket_id: String::new(),
-        stream_id: String::new(),
-        now_ms: 0,
-        read: Some(raft_internal_proto::group_read_request_v1::Read::Head(
-            raft_internal_proto::HeadStreamReadV1 {
-                applied_state_only: false,
-            },
-        )),
-        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-    });
-    request.set_timeout(timeout);
-    let response = client.group_read(request).await?.into_inner();
-    if response.ok {
-        return Err(RecoveryProbeError::UnexpectedHead);
-    }
-    let error: ursula_runtime::GroupEngineError =
-        decode_wire(&response.payload, "rejoin HEAD error")?;
-    if !matches!(
-        error.code(),
-        Some(ursula_stream::StreamErrorCode::InvalidBucketId)
-    ) {
-        return Err(RecoveryProbeError::HeadRejected(error));
-    }
-    let response = network
-        .vote(
-            crate::rejoin::bootstrap_probe_vote(node_id),
-            RPCOption::new(timeout),
-        )
-        .await?;
-    if !response.vote.is_committed() || *response.vote.leader_id().node_id() != leader_id {
-        return Err(RecoveryProbeError::NotLeader);
-    }
-    if response.vote != observed_vote {
-        return Err(RecoveryProbeError::LeadershipChanged);
-    }
-    Ok((
-        response.vote,
-        response
-            .last_log_id
-            .ok_or(RecoveryProbeError::MissingLog)?
-            .index(),
-    ))
+    Err(tonic::Status::unimplemented("peer does not support RejoinBarrier").into())
 }
 
 #[derive(Debug, Clone)]
@@ -634,7 +581,13 @@ pub fn raft_grpc_service(
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
 
-fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
+pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
+    if matches!(
+        error.infra(),
+        Some(ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. })
+    ) {
+        return tonic::Status::unavailable(error.to_string());
+    }
     if matches!(
         error.infra(),
         Some(ursula_runtime::GroupInfraError::OwnerStopped)
@@ -837,7 +790,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .install_full_snapshot(raft_group_id, vote, snapshot)
             .await
-            .map_err(group_rpc_status)?;
+            .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
@@ -993,6 +946,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
+                        snapshot_installs: Arc::default(),
+                        metadata_serial: Arc::default(),
                         recovery_tasks: crate::rejoin::RecoveryGate::default(),
                         raft,
                         placement,

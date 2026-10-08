@@ -522,7 +522,7 @@ impl CoreFileLogWriter {
         create_dir_all_durable(&dir).map_err(|source| CoreJournalError::io(&dir, source))?;
         let lock = acquire_journal_lock(&dir)?;
         let metadata_path = core_metadata_path(&dir);
-        let mut metadata = CoreMetadata::load(&metadata_path)?;
+        let (mut metadata, metadata_missing) = CoreMetadata::load_with_presence(&metadata_path)?;
         let replay_mode = core_replay_mode(metadata.verified_epoch(), options.recovery_epoch);
         let cache_bytes = options.tuning.group_cache_bytes;
         let recovery_started_at = Instant::now();
@@ -592,14 +592,19 @@ impl CoreFileLogWriter {
         // initialized but whose journal holds nothing of it lost its log (a
         // replaced or wiped journal): it recovers.
         let mut metadata_changed = metadata.set_verified_epoch(options.recovery_epoch);
-        let repaired = match options.node_recovery {
-            RecoveryState::Normal => GroupLogState::Initialized,
-            RecoveryState::Recovering { .. } => GroupLogState::Recovering,
+        // Without metadata, surviving records do not prove the lost vote.
+        let damaged = metadata_missing;
+        let repaired = match (options.node_recovery, damaged) {
+            (RecoveryState::Normal, false) => GroupLogState::Initialized,
+            _ => GroupLogState::Recovering,
         };
         for (group_id, log) in &logs {
             if log.holds_log() {
                 metadata_changed |= metadata.initialize(*group_id, repaired);
             }
+        }
+        if damaged {
+            metadata_changed |= metadata.mark_recovering();
         }
         let lost = metadata
             .groups()

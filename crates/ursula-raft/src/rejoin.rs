@@ -499,6 +499,7 @@ pub struct GroupRejoin {
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
+    vote_floor: Mutex<Option<UrsulaVote>>,
     reverted: Mutex<RevertedFollowers>,
     /// The group's log store, which keeps its log state and where the gate
     /// records that it opened. Weak, so a stopped group's store closes even
@@ -569,6 +570,11 @@ impl GroupRejoin {
             raft_group_id,
             metrics: OnceLock::new(),
             gate: Mutex::new(gate),
+            vote_floor: Mutex::new(
+                store
+                    .vote()
+                    .filter(|vote| vote.leader_id.term > 0 || vote.is_committed()),
+            ),
             reverted: Mutex::new(RevertedFollowers::default()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
@@ -605,7 +611,7 @@ impl GroupRejoin {
 
     /// Whether the vote gate is open.
     pub fn vote_gate_open(&self) -> bool {
-        self.gate().is_open()
+        self.gate().is_open() && !self.needs_vote_floor()
     }
 
     /// The gate as status reports show it.
@@ -621,8 +627,51 @@ impl GroupRejoin {
             .is_some_and(|store| store.log_state().is_initialized())
     }
 
+    pub(crate) fn needs_vote_floor(&self) -> bool {
+        self.vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// A replica that lost its vote must not help a stale leader prove a quorum.
+    /// This includes empty heartbeats and snapshot acknowledgements.
+    pub(crate) fn replication_allowed(&self, vote: UrsulaVote) -> bool {
+        self.vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|floor| vote >= floor)
+    }
+
+    pub(crate) async fn establish_vote_floor(
+        &self,
+        vote: UrsulaVote,
+    ) -> Result<(), RecoveryGateError> {
+        let store = self.store.upgrade().ok_or(RecoveryGateError::StoreClosed {
+            raft_group_id: self.raft_group_id,
+        })?;
+        let vote = store.persist_recovery_vote(vote).await.map_err(|source| {
+            RecoveryGateError::Record {
+                raft_group_id: self.raft_group_id,
+                source,
+            }
+        })?;
+        let mut floor = self
+            .vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if floor.is_none_or(|current| vote > current) {
+            *floor = Some(vote);
+        }
+        drop(floor);
+        self.changes.send_if_modified(|()| true);
+        Ok(())
+    }
+
     pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
-        self.gate().confirm_barrier(leader, commit_index);
+        if self.replication_allowed(leader) {
+            self.gate().confirm_barrier(leader, commit_index);
+        }
     }
 
     /// Campaigning is subject to both this gate and the node's shed policy.
@@ -635,6 +684,10 @@ impl GroupRejoin {
         let store = self.store.upgrade().ok_or(RecoveryGateError::StoreClosed {
             raft_group_id: self.raft_group_id,
         })?;
+        if self.needs_vote_floor() && !matches!(why, GateOpening::CaughtUp) {
+            self.establish_vote_floor(self.metrics().map_or(UrsulaVote::new(0, 0), |m| m.vote))
+                .await?;
+        }
         store
             .record_recovered()
             .await
@@ -668,6 +721,9 @@ impl GroupRejoin {
     /// Opens the gate once the replica has applied its barrier. Returns
     /// whether the gate is open.
     pub(crate) async fn try_open(&self) -> Result<bool, RecoveryGateError> {
+        if self.needs_vote_floor() {
+            return Ok(false);
+        }
         let Some(metrics) = self.metrics() else {
             return Ok(self.vote_gate_open());
         };
@@ -770,7 +826,22 @@ impl GroupRejoin {
         let metrics = self.metrics()?;
         let candidate = *request.vote.leader_id().node_id();
         let candidate_index = log_index(request.last_log_id.as_ref());
-        let screen = self.gate().screen(candidate_index);
+        let floor = *self
+            .vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if request.vote == UrsulaVote::new(0, 0) && request.last_log_id.is_none() {
+            return Some(UrsulaVoteResponse::new(
+                metrics.vote,
+                self.last_log_id().or(metrics.last_applied),
+                floor.is_some(),
+            ));
+        }
+        let screen = if floor.is_some_and(|floor| request.vote < floor) || floor.is_none() {
+            VoteScreen::Refuse
+        } else {
+            self.gate().screen(candidate_index)
+        };
         match screen {
             VoteScreen::Pass => None,
             VoteScreen::Refuse => {
@@ -1177,6 +1248,11 @@ mod tests {
             bootstrap_decision(&Vec::new()),
             BootstrapDecision::Initialize
         );
+        // An empty voter must finish its durable floor before initialization.
+        assert_eq!(
+            bootstrap_decision(&[empty, Some(PeerGroupLog::Unprepared)]),
+            BootstrapDecision::Wait
+        );
         // A silent voter might hold the group: wait for it.
         assert_eq!(bootstrap_decision(&[empty, None]), BootstrapDecision::Wait);
         // One voter with entries or a leader is enough to rejoin.
@@ -1192,7 +1268,7 @@ mod tests {
 
     #[test]
     fn a_probe_answer_with_entries_or_a_leader_means_initialized() {
-        let empty = UrsulaVoteResponse::new(vote(0, 2), None, false);
+        let empty = UrsulaVoteResponse::new(vote(0, 0), None, true);
         assert_eq!(
             PeerGroupLog::from_vote_response(&empty),
             PeerGroupLog::Empty
@@ -1200,7 +1276,7 @@ mod tests {
         let candidate = UrsulaVoteResponse::new(vote(1, 2), None, false);
         assert_eq!(
             PeerGroupLog::from_vote_response(&candidate),
-            PeerGroupLog::Empty
+            PeerGroupLog::Initialized
         );
         let following = UrsulaVoteResponse::new(leader(3, 1), None, false);
         assert_eq!(

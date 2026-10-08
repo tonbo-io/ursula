@@ -387,7 +387,9 @@ async fn build_three_node_cluster(
     Vec<tempfile::TempDir>,
 ) {
     let registry = InProcessRaftRegistry::default();
-    let config = raft_config(cluster_name, 50, 100);
+    // OpenRaft also uses election_timeout_min as the vote RPC deadline.
+    // Leave room for concurrent tests fsyncing votes on the same executor host.
+    let config = raft_config(cluster_name, 500, 1_000);
     let mut nodes = BTreeMap::new();
     for node_id in 1..=3 {
         nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
@@ -2001,8 +2003,9 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         Config {
             cluster_name: "ursula-lagging-learner-snapshot-test".to_owned(),
             heartbeat_interval: 10,
-            election_timeout_min: 50,
-            election_timeout_max: 100,
+            // Vote RPCs include a metadata fsync, also under parallel test load.
+            election_timeout_min: 500,
+            election_timeout_max: 1_000,
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,
             replication_lag_threshold: 0,

@@ -217,16 +217,22 @@ impl PreviousRun {
         }
     }
 
-    /// How to read the journals the previous run left. Even under `always`
-    /// a host crash needs the verified prefix: committed and truncate
-    /// markers are written without `fsync`, so writeback can leave a hole
-    /// before acknowledged frames.
+    /// How to read the journals the previous run left. Under `always`,
+    /// corruption must fail before repair can discard acknowledged frames.
+    /// Strict replay still truncates an incomplete newest tail.
     pub fn replay_mode(self) -> JournalReplayMode {
         match self {
-            Self::Absent | Self::Clean | Self::ProcessCrash => JournalReplayMode::Strict,
-            Self::Unrecorded | Self::HostCrash { .. } | Self::Poisoned => {
-                JournalReplayMode::VerifiedPrefix
+            Self::Absent
+            | Self::Clean
+            | Self::ProcessCrash
+            | Self::HostCrash {
+                fsync: WalFsync::Always,
+            } => JournalReplayMode::Strict,
+            Self::Unrecorded
+            | Self::HostCrash {
+                fsync: WalFsync::Never,
             }
+            | Self::Poisoned => JournalReplayMode::VerifiedPrefix,
         }
     }
 
@@ -726,7 +732,7 @@ mod tests {
                 Records,
                 Some("b"),
                 PreviousRun::HostCrash { fsync: Always },
-                PREFIX,
+                STRICT,
                 NORMAL,
             ),
             // An unknown boot id without a clean end counts as a host crash.
@@ -751,7 +757,7 @@ mod tests {
                 Records,
                 Some("a"),
                 PreviousRun::HostCrash { fsync: Always },
-                PREFIX,
+                STRICT,
                 NORMAL,
             ),
             // An I/O error stopped the previous run, under either policy.
@@ -891,7 +897,7 @@ mod tests {
 
         // A host crash starts epoch 5; a process crash right after it, before
         // a core was read, keeps epoch 5, so that core still reads its prefix.
-        let crashed = previous(Some("a"), WalFsync::Always, RunStatus::Running);
+        let crashed = previous(Some("a"), WalFsync::Never, RunStatus::Running);
         let after_host_crash = WalOpening::decide(
             Some(&crashed),
             JournalHistory::Records,

@@ -129,6 +129,8 @@ pub struct RaftGroupEngineOptions {
 }
 
 pub struct RaftGroupEngine {
+    pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
+    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
     pub(crate) recovery_tasks: crate::rejoin::RecoveryGate,
     pub(crate) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     pub(crate) placement: ShardPlacement,
@@ -340,6 +342,7 @@ impl RaftGroupEngine {
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.
         let cold_index_cache = state_machine.engine.cold_index_cache();
+        let metadata_serial = state_machine.metadata_serial.clone();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
@@ -352,6 +355,8 @@ impl RaftGroupEngine {
 
         Ok(Self {
             recovery_tasks: crate::rejoin::RecoveryGate::default(),
+            snapshot_installs: Arc::default(),
+            metadata_serial,
             read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
             raft,
             placement,
@@ -407,11 +412,18 @@ impl RaftGroupEngine {
     }
 
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {
+        self.snapshot_installs.close();
         self.recovery_tasks.shutdown().await;
-        self.raft
+        let result = self
+            .raft
             .shutdown()
             .await
-            .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")))
+            .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")));
+        self.snapshot_installs.drain().await;
+        // Cancellation cannot stop an admitted blocking fsync; wait for its
+        // publication before releasing/reopening the group's durable store.
+        let _published = self.metadata_serial.lock().await;
+        result
     }
 
     /// This replica's applied group state, leader or follower (simulation

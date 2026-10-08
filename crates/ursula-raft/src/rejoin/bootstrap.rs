@@ -20,8 +20,10 @@ use crate::types::UrsulaVoteResponse;
 /// What one probed voter reported about a group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerGroupLog {
-    /// No committed entry and no leader.
+    /// No history, and the minimum genesis vote floor is durable.
     Empty,
+    /// No history, but genesis admission has not been persisted yet.
+    Unprepared,
     /// The peer holds committed entries or follows a leader.
     Initialized,
 }
@@ -30,10 +32,12 @@ impl PeerGroupLog {
     /// Classify a peer's answer to the bootstrap probe vote.
     pub fn from_vote_response(response: &UrsulaVoteResponse) -> Self {
         let has_entries = log_index(response.last_log_id.as_ref()).is_some_and(|index| index >= 1);
-        if has_entries || response.vote.is_committed() {
+        if has_entries || response.vote.is_committed() || response.vote.leader_id.term > 0 {
             Self::Initialized
-        } else {
+        } else if response.vote_granted {
             Self::Empty
+        } else {
+            Self::Unprepared
         }
     }
 }
@@ -58,7 +62,7 @@ pub fn bootstrap_decision<'a>(
         match answer {
             Some(PeerGroupLog::Initialized) => return BootstrapDecision::Rejoin,
             Some(PeerGroupLog::Empty) => {}
-            None => all_answered = false,
+            None | Some(PeerGroupLog::Unprepared) => all_answered = false,
         }
     }
     if all_answered {
@@ -68,12 +72,10 @@ pub fn bootstrap_decision<'a>(
     }
 }
 
-/// The probe vote: the lowest vote a node can send, with no log. A peer that
-/// holds the group refuses it. A peer with no vote yet may grant it, which
-/// only records a term-0 vote: harmless, since that never counts as
-/// initialized and `Initialize` overwrites it.
-pub fn bootstrap_probe_vote(node_id: u64) -> UrsulaVoteRequest {
-    UrsulaVoteRequest::new(UrsulaVote::new(0, node_id), None)
+/// The reserved minimum vote is a read-only probe on a recovery-gated peer.
+/// Its grant bit reports durable genesis readiness without changing the vote.
+pub fn bootstrap_probe_vote(_node_id: u64) -> UrsulaVoteRequest {
+    UrsulaVoteRequest::new(UrsulaVote::new(0, 0), None)
 }
 
 /// How a group bootstrap ended.

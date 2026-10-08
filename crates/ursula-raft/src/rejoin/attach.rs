@@ -172,6 +172,37 @@ impl RecoveryGate {
             config.interval,
             config.stall_after,
         )));
+        if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
+            let rejoin = rejoin.clone();
+            let nodes = nodes.clone();
+            let transport = transport.clone();
+            self.push(crate::rt::spawn(async move {
+                while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
+                    let mut all_empty = true;
+                    for (peer, node) in &nodes {
+                        if *peer != rejoin.node_id
+                            && !matches!(
+                                transport.probe(*peer, node.addr.clone()).await,
+                                Some(PeerGroupLog::Empty | PeerGroupLog::Unprepared)
+                            )
+                        {
+                            all_empty = false;
+                            break;
+                        }
+                    }
+                    if all_empty {
+                        if let Err(error) = rejoin.establish_vote_floor(UrsulaVote::new(0, 0)).await
+                        {
+                            // Journal I/O failures poison/stop the writer. Never retry
+                            // bootstrap after them or publish admission without fsync.
+                            tracing::error!(%error, "genesis vote persistence failed; leaving recovery closed");
+                        }
+                        return;
+                    }
+                    crate::rt::time::sleep(config.bootstrap_interval).await;
+                }
+            }));
+        }
         if config.initialize && !rejoin.holds_group_history() {
             let raft = engine.raft_handle();
             self.push(crate::rt::spawn(async move {

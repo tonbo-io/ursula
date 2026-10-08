@@ -729,14 +729,14 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
             cluster.stop_node(victim).await;
             let report = cluster.wals[&victim].power_loss().await;
             cluster.start_node(victim).await;
-            // Unsynced replay hints can leave holes, so the journals are read
-            // as a verified prefix, but every acknowledged append was synced.
+            // Every acknowledged append was synced. Strict recovery accepts
+            // an incomplete newest tail but refuses complete corruption.
             assert_opening(
                 cluster.wals[&victim].opening(),
                 PreviousRun::HostCrash {
                     fsync: WalFsync::Always,
                 },
-                JournalReplayMode::VerifiedPrefix,
+                JournalReplayMode::Strict,
                 RecoveryState::Normal,
                 &format!("seed {seed}"),
             );
@@ -744,10 +744,7 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
                 let store = cluster.wals[&victim]
                     .store(RaftGroupId(group))
                     .expect("running store");
-                assert_eq!(
-                    store.journal_replay_mode(),
-                    JournalReplayMode::VerifiedPrefix
-                );
+                assert_eq!(store.journal_replay_mode(), JournalReplayMode::Strict);
             }
             let after = cluster.durable_logs(victim).await;
             for group in JOURNAL_GROUPS {
@@ -1180,19 +1177,18 @@ async fn reopen_after_a_reordered_unsynced_tail(
 
 const UNSYNCED_TAIL_SEEDS: [u64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-/// A reordered writeback of unsynced committed markers can leave a hole
-/// that strict recovery refuses (`log_store` unit tests cover the refusal).
-/// After the power loss the run state selects the verified prefix, even
-/// under `always`, which recovers every synced entry and the vote.
+/// Under `always`, a power loss selects strict recovery: complete corrupt
+/// frames fail closed (`log_store` tests cover that refusal). These tail
+/// schedules must retain every acknowledged entry and the vote.
 #[test]
-fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
+fn strict_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
         let (synced, opening, reopened) = run_with_madsim(
             seed,
             reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Kept),
         );
-        assert_eq!(opening.replay_mode, JournalReplayMode::VerifiedPrefix);
+        assert_eq!(opening.replay_mode, JournalReplayMode::Strict);
         assert_eq!(
             reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),
             synced,

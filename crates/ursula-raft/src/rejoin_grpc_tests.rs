@@ -23,9 +23,6 @@ struct RecoveryTestService {
     pause_replication: Arc<AtomicBool>,
     legacy: Arc<AtomicBool>,
     unknown_rpc_requests: Arc<AtomicUsize>,
-    // 1 arms a term change after the legacy HEAD; 2 corrupts only its
-    // following Vote response, without changing the actual Raft handlers.
-    legacy_vote_change: Arc<AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -94,19 +91,6 @@ impl RaftInternal for RecoveryTestService {
                 .metadata_mut()
                 .remove(crate::grpc::REJOIN_BARRIER_CAPABILITY);
         }
-        if self
-            .legacy_vote_change
-            .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let mut vote: UrsulaVoteResponse =
-                decode_wire(&response.get_ref().payload, "test vote").unwrap();
-            vote.vote = UrsulaVote::new_committed(
-                vote.vote.leader_id().term().saturating_add(1),
-                *vote.vote.leader_id().node_id(),
-            );
-            response.get_mut().payload = encode_wire(&vote);
-        }
         Ok(response)
     }
 
@@ -128,11 +112,7 @@ impl RaftInternal for RecoveryTestService {
         &self,
         request: Request<pb::GroupReadRequestV1>,
     ) -> Result<Response<pb::GroupReadResponseV1>, Status> {
-        let response = self.inner.group_read(request).await;
-        let _armed =
-            self.legacy_vote_change
-                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
-        response
+        self.inner.group_read(request).await
     }
 
     async fn rejoin_barrier(
@@ -243,7 +223,6 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             pause_replication: Arc::new(AtomicBool::new(false)),
             legacy: Arc::new(AtomicBool::new(false)),
             unknown_rpc_requests: Arc::new(AtomicUsize::new(0)),
-            legacy_vote_change: Arc::new(AtomicUsize::new(0)),
         };
         let wire_service = pb::raft_internal_server::RaftInternalServer::new(service.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -291,6 +270,11 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .collect::<BTreeMap<_, _>>();
     // This fixture represents an initial bootstrap after proving every voter
     // empty.
+    for gate in &gates {
+        gate.establish_vote_floor(UrsulaVote::new(0, 0))
+            .await
+            .unwrap();
+    }
     gates[1].allow_fresh_bootstrap().await.unwrap();
     registries[1].refresh_group_elections(placement().raft_group_id);
     engines[1].raft.initialize(nodes).await.unwrap();
@@ -373,7 +357,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .await
         .unwrap();
     let mut client = pb::raft_internal_client::RaftInternalClient::new(channel);
-    client
+    let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
@@ -381,13 +365,12 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             payload: encode_wire(&delayed),
         }))
         .await
-        .expect("delayed valid Append over TCP");
-    engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .applied_index_at_least(Some(baseline.log_id.index()), "delayed prefix applied")
-        .await
-        .unwrap();
+        .expect_err("unknown history must not acknowledge a delayed Append");
+    assert_eq!(rejected.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        engines[0].raft.metrics().borrow_watched().last_applied,
+        None
+    );
     assert!(!gates[0].vote_gate_open());
     assert!(!registries[0].recovery_barriers_ready());
     let term = engines[0].raft.metrics().borrow_watched().current_term;
@@ -453,40 +436,23 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .applied_index_at_least(Some(acked.log_id.index()), "C repaired suffix")
         .await
         .unwrap();
+    // Peers without the explicit protocol fail closed; no HEAD bridge remains.
     services[1].legacy.store(true, Ordering::SeqCst);
-    services[1].legacy_vote_change.store(1, Ordering::SeqCst);
-    let changed_vote =
-        crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
-            .await
-            .unwrap_err();
-    assert!(matches!(
-        changed_vote,
-        crate::grpc::RecoveryProbeError::LeadershipChanged
-    ));
-    for legacy in [false, true, false] {
-        services[1].legacy.store(legacy, Ordering::SeqCst);
-        if legacy {
-            let mut raw =
-                pb::raft_internal_client::RaftInternalClient::connect(endpoints[1].clone())
-                    .await
-                    .unwrap();
-            let error = raw
-                .rejoin_barrier(pb::RejoinBarrierRequestV1 {
-                    raft_group_id: placement().raft_group_id.0,
-                    protocol_version: ursula_stream::FORMAT_EPOCH,
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(
-                error.code(),
-                tonic::Code::Internal,
-                "legacy mux HTTP 400 is not gRPC Unimplemented"
-            );
-            assert_eq!(
-                services[1].unknown_rpc_requests.swap(0, Ordering::SeqCst),
-                1
-            );
-        }
+    let unsupported = probe_rejoin_vote_barrier(
+        Arc::default(),
+        placement(),
+        1,
+        2,
+        &endpoints[1],
+        Duration::from_secs(1),
+    )
+    .await
+    .expect_err("legacy recovery protocol is refused");
+    assert!(
+        matches!(unsupported, crate::grpc::RecoveryProbeError::Rpc(status) if status.code() == tonic::Code::Unimplemented)
+    );
+    services[1].legacy.store(false, Ordering::SeqCst);
+    {
         let proof = probe_rejoin_vote_barrier(
             Arc::default(),
             placement(),
@@ -496,7 +462,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             Duration::from_secs(1),
         )
         .await
-        .expect("fresh recovery proof, including legacy bridge");
+        .expect("fresh recovery proof");
         assert!(proof.1 >= acked.log_id.index());
         let observed =
             crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_secs(1))
@@ -505,6 +471,12 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         assert_eq!(observed.leader_id, 2);
         assert_eq!(observed.raft_group_id, placement().raft_group_id.0);
         assert!(observed.required_applied_index >= acked.log_id.index());
+        engines[0]
+            .raft
+            .vote(UrsulaVoteRequest::new(proof.0, None))
+            .await
+            .unwrap();
+        gates[0].establish_vote_floor(proof.0).await.unwrap();
         gates[0].confirm_barrier(proof.0, proof.1);
         assert!(
             !gates[0].try_open().await.unwrap(),
@@ -546,7 +518,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     stores[0] = store;
     gates[0] = gate;
     wal_roots[0] = wal_root;
-    client
+    let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
@@ -554,13 +526,12 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             payload: encode_wire(&delayed),
         }))
         .await
-        .unwrap();
-    engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .applied_index_at_least(Some(baseline.log_id.index()), "second stale prefix")
-        .await
-        .unwrap();
+        .expect_err("a new lost disk needs a new proven floor");
+    assert_eq!(rejected.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        engines[0].raft.metrics().borrow_watched().last_applied,
+        None
+    );
     registries[0].mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     registries[0].clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     engines[0].raft.runtime_config().tick(true);
@@ -625,6 +596,12 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         }
     };
     assert!(proof.1 >= acked.log_id.index());
+    engines[0]
+        .raft
+        .vote(UrsulaVoteRequest::new(proof.0, None))
+        .await
+        .unwrap();
+    gates[0].establish_vote_floor(proof.0).await.unwrap();
     gates[0].confirm_barrier(proof.0, proof.1);
     assert!(
         !gates[0].try_open().await.unwrap(),
@@ -685,7 +662,6 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
             pause_replication: Arc::new(AtomicBool::new(false)),
             legacy: Arc::new(AtomicBool::new(false)),
             unknown_rpc_requests: Arc::new(AtomicUsize::new(0)),
-            legacy_vote_change: Arc::new(AtomicUsize::new(0)),
         };
         let wire = pb::raft_internal_server::RaftInternalServer::new(service.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
@@ -705,6 +681,11 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
         .enumerate()
         .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
         .collect::<BTreeMap<_, _>>();
+    for gate in &gates {
+        gate.establish_vote_floor(UrsulaVote::new(0, 0))
+            .await
+            .unwrap();
+    }
     gates[1].allow_fresh_bootstrap().await.unwrap();
     engines[1].raft.runtime_config().elect(true);
     engines[1].raft.initialize(nodes).await.unwrap();
@@ -820,4 +801,152 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     for server in servers {
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn a_lost_vote_refuses_heartbeat_ack_until_the_proven_floor_is_durable() {
+    use openraft::storage::RaftLogReader;
+
+    let registry = RaftGroupHandleRegistry::default();
+    let config = Arc::new(
+        Config {
+            enable_tick: false,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let (engine, mut store, gate, _root) = new_recovery_engine(1, config, &registry).await;
+    // Freeze an all-empty observation before the newer proof reaches the owner.
+    let (release_genesis, delayed_genesis) = tokio::sync::oneshot::channel();
+    let delayed_gate = gate.clone();
+    let genesis = tokio::spawn(async move {
+        delayed_genesis.await.unwrap();
+        delayed_gate
+            .establish_vote_floor(UrsulaVote::new(0, 0))
+            .await
+            .unwrap();
+    });
+    let proven = UrsulaVote::new_committed(4, 2);
+    let heartbeat = |vote| openraft::raft::AppendEntriesRequest {
+        vote,
+        prev_log_id: None,
+        entries: Vec::new(),
+        leader_commit: None,
+    };
+    assert!(matches!(
+        registry
+            .append_entries(placement().raft_group_id, heartbeat(proven))
+            .await,
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
+        ))
+    ));
+    assert_eq!(store.read_vote().await.unwrap(), None);
+    // This is the same adoption path used only after the driver's fresh quorum proof.
+    engine
+        .raft
+        .vote(UrsulaVoteRequest::new(proven, None))
+        .await
+        .unwrap();
+    assert_eq!(store.read_vote().await.unwrap(), Some(proven));
+    assert!(
+        !gate.replication_allowed(proven),
+        "durable vote alone does not publish admission"
+    );
+    gate.establish_vote_floor(proven).await.unwrap();
+    registry
+        .append_entries(placement().raft_group_id, heartbeat(proven))
+        .await
+        .unwrap();
+    assert!(matches!(
+        registry
+            .append_entries(
+                placement().raft_group_id,
+                heartbeat(UrsulaVote::new_committed(3, 2))
+            )
+            .await,
+        Err(ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
+        ))
+    ));
+    // A racing genesis observation must never lower a persisted or published floor.
+    release_genesis.send(()).unwrap();
+    genesis.await.unwrap();
+    assert_eq!(store.read_vote().await.unwrap(), Some(proven));
+    assert!(!gate.replication_allowed(UrsulaVote::new_committed(3, 2)));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
+    use openraft::storage::RaftLogReader;
+
+    let config = Arc::new(
+        Config {
+            enable_tick: false,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let first_registry = RaftGroupHandleRegistry::default();
+    let second_registry = RaftGroupHandleRegistry::default();
+    let (first, _first_store, first_gate, _first_root) =
+        new_recovery_engine(1, config.clone(), &first_registry).await;
+    let (second, mut second_store, second_gate, _second_root) =
+        new_recovery_engine(2, config, &second_registry).await;
+    first_gate
+        .establish_vote_floor(UrsulaVote::new(0, 0))
+        .await
+        .unwrap();
+    let (observations, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let peer = second_gate.clone();
+    let bootstrap = tokio::spawn(crate::run_group_bootstrap(
+        1,
+        first.raft_handle(),
+        first_gate,
+        BTreeMap::from([(1, BasicNode::new("one")), (2, BasicNode::new("two"))]),
+        move |_id, _address| {
+            let peer = peer.clone();
+            let observations = observations.clone();
+            async move {
+                let response = peer.screen_vote(&crate::bootstrap_probe_vote(1)).unwrap();
+                let state = crate::PeerGroupLog::from_vote_response(&response);
+                observations.send(state).unwrap();
+                Some(state)
+            }
+        },
+        Duration::from_millis(1),
+        Duration::from_secs(5),
+    ));
+    // Seeing a second probe proves the first Unprepared answer was processed.
+    for _ in 0..2 {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), observed.recv())
+                .await
+                .unwrap(),
+            Some(crate::PeerGroupLog::Unprepared)
+        );
+    }
+    assert!(!first.raft.is_initialized().await.unwrap());
+    assert_eq!(
+        second_store.read_vote().await.unwrap(),
+        None,
+        "read-only probe cannot create a vote floor"
+    );
+    second_gate
+        .establish_vote_floor(UrsulaVote::new(0, 0))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), bootstrap)
+            .await
+            .unwrap()
+            .unwrap(),
+        crate::GroupBootstrap::Initialized
+    );
+    assert!(first.raft.is_initialized().await.unwrap());
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
 }

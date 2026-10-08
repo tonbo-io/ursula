@@ -149,6 +149,7 @@ pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
+pub use registry::SnapshotInstallError;
 pub use rejoin::AcceptUnsyncedLossOutcome;
 pub use rejoin::AcceptUnsyncedLossReport;
 pub use rejoin::GroupBootstrap;

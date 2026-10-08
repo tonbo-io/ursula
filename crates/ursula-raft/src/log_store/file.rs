@@ -246,6 +246,22 @@ impl RaftGroupFileLogStore {
         .await
     }
 
+    /// Serialize genesis/proven-floor publication with ordinary Raft vote writes.
+    /// A delayed genesis scan must never overwrite a subsequently proven vote.
+    pub(crate) async fn persist_recovery_vote(
+        &self,
+        vote: VoteOf<UrsulaRaftTypeConfig>,
+    ) -> Result<VoteOf<UrsulaRaftTypeConfig>, CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        if let Some(current) = self.vote()
+            && current >= vote
+        {
+            return Ok(current);
+        }
+        self.record_vote(vote).await?;
+        Ok(vote)
+    }
+
     /// Records `vote` in the metadata file, which is always `fsync`ed, and
     /// then runs with it. Call with `write_order` held.
     async fn record_vote(

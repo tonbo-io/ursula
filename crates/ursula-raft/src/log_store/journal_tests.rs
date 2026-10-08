@@ -162,12 +162,25 @@ impl Core {
     fn open(&self, mode: JournalReplayMode) -> Result<Arc<CoreFileLogWriter>, CoreJournalError> {
         let recovery_epoch = match mode {
             JournalReplayMode::Strict => 0,
-            JournalReplayMode::VerifiedPrefix => 1,
+            JournalReplayMode::VerifiedPrefix if self.tuning.fsync == WalFsync::Never => 1,
+            JournalReplayMode::VerifiedPrefix => 0,
         };
-        CoreFileLogWriter::open(
-            self.dir.clone(),
-            self.options(recovery_epoch, RecoveryState::Normal),
-        )
+        let mut options = self.options(
+            recovery_epoch,
+            if mode == JournalReplayMode::VerifiedPrefix && self.tuning.fsync == WalFsync::Never {
+                RecoveryState::Recovering {
+                    reason: RecoveryReason::HostCrash,
+                }
+            } else {
+                RecoveryState::Normal
+            },
+        );
+        if mode == JournalReplayMode::VerifiedPrefix {
+            options.previous_run = super::run_state::PreviousRun::HostCrash {
+                fsync: self.tuning.fsync,
+            };
+        }
+        CoreFileLogWriter::open(self.dir.clone(), options)
     }
 
     fn writer(&self) -> Arc<CoreFileLogWriter> {
@@ -584,6 +597,9 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
         for index in 1..=30 {
             append(&mut store, [payload_entry(index, 512)]).await;
         }
+        let mut sibling = core.store(&writer, 2);
+        append(&mut sibling, [blank_entry(1)]).await;
+        drop(sibling);
         drop(store);
         drop(writer);
         let newest = *core.segments().last().expect("segments");
@@ -592,6 +608,17 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
 
         let writer = core.open(mode).expect("recover a torn tail");
         let store = core.store(&writer, 1);
+        let sibling = core.store(&writer, 2);
+        assert_eq!(
+            store.log_state(),
+            GroupLogState::Initialized,
+            "an unacknowledged partial frame cannot gate a healthy group"
+        );
+        assert_eq!(
+            sibling.log_state(),
+            GroupLogState::Initialized,
+            "a sibling sharing the journal stays available"
+        );
         assert_eq!(
             log_ids(&store).await,
             (1..=30).collect::<Vec<_>>(),
@@ -603,6 +630,138 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
             "{mode:?}: the torn frame is gone"
         );
     }
+}
+
+#[tokio::test]
+async fn complete_corruption_under_always_fails_without_changing_any_segment() {
+    for sealed in [false, true] {
+        let core = Core::small(WalFsync::Always);
+        let writer = core.writer();
+        let mut store = core.store(&writer, 1);
+        let entries = if sealed { 40 } else { 2 };
+        for index in 1..=entries {
+            append(&mut store, [payload_entry(index, 512)]).await;
+        }
+        drop((store, writer));
+        let ids = core.segments();
+        let id = if sealed { ids[0] } else { *ids.last().unwrap() };
+        let path = core.segment(id);
+        let bytes = fs::read(&path).unwrap();
+        let offset = u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap();
+        overwrite(&path, offset, &[bytes.last().unwrap() ^ 0xff]);
+        let before = ids
+            .iter()
+            .map(|id| (*id, fs::read(core.segment(*id)).unwrap()))
+            .collect::<Vec<_>>();
+        for configured_fsync in [WalFsync::Always, WalFsync::Never] {
+            let mut options = core.options(0, RecoveryState::Normal);
+            options.tuning.fsync = configured_fsync;
+            options.previous_run = super::run_state::PreviousRun::HostCrash {
+                fsync: WalFsync::Always,
+            };
+            let error = CoreFileLogWriter::open(core.dir.clone(), options)
+                .expect_err("durable corruption fails closed even after changing fsync policy");
+            assert!(
+                matches!(
+                    journal_error(&error),
+                    Some(JournalError::CorruptFrame {
+                        defect: FrameDefect::PayloadChecksum,
+                        ..
+                    })
+                ),
+                "{error}"
+            );
+            assert_eq!(core.segments(), ids);
+            for (id, bytes) in &before {
+                assert_eq!(fs::read(core.segment(*id)).unwrap(), *bytes);
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
+    use super::run_state::NodeWal;
+    use super::run_state::RUN_STATE_FILE;
+
+    let core = Core::small(WalFsync::Always);
+    let root = core._root.path();
+    let topology = ursula_shard::StaticShardMap::new(1, 2).unwrap();
+    drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    for index in 1..=40 {
+        append(&mut store, [payload_entry(index, 512)]).await;
+    }
+    drop((store, writer));
+    // Unknown boot identity forces a host crash on the first real startup.
+    RunStateFile::new(root.join(RUN_STATE_FILE), RunState {
+        boot_id: None,
+        fsync: WalFsync::Always,
+        status: RunStatus::Running,
+        recovery_epoch: 0,
+    })
+    .record(RunStatus::Running, "test host crash")
+    .unwrap();
+    let ids = core.segments();
+    let path = core.segment(ids[0]);
+    let bytes = fs::read(&path).unwrap();
+    overwrite(
+        &path,
+        u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap(),
+        &[bytes.last().unwrap() ^ 0xff],
+    );
+    let before = ids
+        .iter()
+        .map(|id| (*id, fs::read(core.segment(*id)).unwrap()))
+        .collect::<Vec<_>>();
+    for _ in 0..2 {
+        let node = NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap();
+        let opening = node.opening();
+        assert_eq!(opening.recovery_epoch, 0);
+        let mut options = core.options(opening.recovery_epoch, opening.recovery);
+        options.previous_run = opening.previous_run;
+        options.run_state = node.run_state().clone();
+        let error = CoreFileLogWriter::open(core.dir.clone(), options).unwrap_err();
+        assert!(matches!(
+            journal_error(&error),
+            Some(JournalError::CorruptFrame {
+                defect: FrameDefect::PayloadChecksum,
+                ..
+            })
+        ));
+        assert_eq!(core.segments(), ids);
+        for (id, bytes) in &before {
+            assert_eq!(fs::read(core.segment(*id)).unwrap(), *bytes);
+        }
+    }
+}
+
+#[tokio::test]
+async fn never_host_crash_repair_remains_gated_when_switching_to_always() {
+    let core = Core::small(WalFsync::Never);
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [payload_entry(1, 512)]).await;
+    append(&mut store, [payload_entry(2, 512)]).await;
+    drop((store, writer));
+    let path = core.segment(*core.segments().last().unwrap());
+    let bytes = fs::read(&path).unwrap();
+    let offset = u64::try_from(bytes.len()).unwrap().checked_sub(1).unwrap();
+    overwrite(&path, offset, &[bytes.last().unwrap() ^ 0xff]);
+    // NodeWal marks existing groups before opening a possibly lossy journal.
+    assert!(super::core_meta::mark_core_recovering(&core_metadata_path(&core.dir)).unwrap());
+    let mut options = core.options(1, RecoveryState::Recovering {
+        reason: RecoveryReason::HostCrash,
+    });
+    options.previous_run = super::run_state::PreviousRun::HostCrash {
+        fsync: WalFsync::Never,
+    };
+    options.tuning.fsync = WalFsync::Always;
+    let writer = CoreFileLogWriter::open(core.dir.clone(), options).unwrap();
+    assert_eq!(writer.replay_mode(), JournalReplayMode::VerifiedPrefix);
+    let store = core.store(&writer, 1);
+    assert_eq!(log_ids(&store).await, [1]);
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
 }
 
 /// An incomplete frame at the end of a sealed segment cannot be a crash:
@@ -634,7 +793,7 @@ async fn an_incomplete_sealed_segment_fails_strict() {
 /// prefix keeps the frames before it and drops every later segment.
 #[tokio::test]
 async fn corruption_in_an_older_segment_fails_strict_and_ends_the_verified_prefix() {
-    let core = Core::small(WalFsync::Always);
+    let core = Core::small(WalFsync::Never);
     let writer = core.writer();
     let mut store = core.store(&writer, 1);
     for index in 1..=40 {
@@ -709,7 +868,7 @@ async fn corruption_in_an_older_segment_fails_strict_and_ends_the_verified_prefi
 /// written: strict recovery fails, a verified prefix stops before the gap.
 #[tokio::test]
 async fn a_missing_segment_fails_strict_and_ends_the_verified_prefix() {
-    let core = Core::small(WalFsync::Always);
+    let core = Core::small(WalFsync::Never);
     let writer = core.writer();
     let mut store = core.store(&writer, 1);
     for index in 1..=40 {
@@ -1026,12 +1185,12 @@ async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
 }
 
 /// A crash between a group's first journal write and the metadata write
-/// leaves entries without the flag; recovery restores it, as recovering
-/// when the node is recovering.
+/// leaves entries without the flag. Missing metadata also means missing votes,
+/// so recovery restores the flag as recovering regardless of the run state.
 #[test]
 fn recovery_restores_a_missing_initialized_flag() {
     for (node_recovery, expected) in [
-        (RecoveryState::Normal, GroupLogState::Initialized),
+        (RecoveryState::Normal, GroupLogState::Recovering),
         (
             RecoveryState::Recovering {
                 reason: RecoveryReason::HostCrash,
@@ -1390,4 +1549,26 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     for engine in engines {
         engine.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn missing_metadata_beside_a_nonempty_journal_closes_the_recovery_gate() {
+    let core = Core::small(WalFsync::Always);
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [blank_entry(1)]).await;
+    store
+        .save_vote(&openraft::Vote::new_committed(5, 2))
+        .await
+        .expect("vote");
+    drop((store, writer));
+    fs::remove_file(core.dir.join("journal.meta")).expect("lose metadata");
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert_eq!(store.read_vote().await.expect("vote"), None);
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("gate");
+    assert!(!gate.vote_gate_open());
 }

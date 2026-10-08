@@ -101,7 +101,7 @@ treated as an unclean crash.
 | No run state, a journal holds records | Unknown history | Verified prefix | Every initialized group |
 | `clean` | Every write is on disk | Strict | No |
 | `running`, same boot id | Process crash; the page cache survived | Strict | No |
-| `running`, other or unknown boot id, policy `always` | Host crash; every acknowledged write was fsynced | Verified prefix, because committed and truncate markers are unsynced | No |
+| `running`, other or unknown boot id, policy `always` | Host crash with every acknowledged write fsynced | Strict | No |
 | `running`, other or unknown boot id, policy `never` | Host crash; writeback may have left holes | Verified prefix | Every initialized group |
 | `poisoned` | An I/O error stopped the previous run | Verified prefix | Every initialized group |
 
@@ -109,6 +109,11 @@ Strict tolerates only an incomplete final frame; any other corruption fails
 closed. Verified prefix keeps the frames up to the first one that fails
 verification and truncates the rest, and the journal is rewritten before the
 core writes again.
+
+Recovery uses the previous run's recorded policy, even when configuration has
+changed. Complete checksum damage or a damaged sealed segment after an `always`
+run fails before the journal is modified. An incomplete newest tail remains
+recoverable without gating healthy groups.
 
 Writeback after a host crash can persist later pages before earlier ones.
 Verification therefore cannot skip a bad frame. Because frame checksums cover
@@ -173,17 +178,21 @@ log moved since the operator looked is no longer the one the operator chose.
 The admin incarnation precondition still applies, so a restarted process
 refuses a plan made against the one before it.
 
-### Known gap: a wiped voter accepts appends from a stale leader
+### Lost vote history
 
-The gate screens votes but not appends. A voter that lost its disk also lost
-its vote, so it accepts appends from any leader, including one of a term it
-had already voted past. A leader of an older term that reaches only that
-voter can then commit an entry at an index a newer leader also committed.
-Closing the gap needs the replica to refuse such leaders before its gate
-opens, which this design does not do yet
-([#405](https://github.com/tonbo-io/ursula/issues/405)). The DST schedule that shows it,
-`a_wiped_voter_never_lets_a_stale_leader_commit`, asserts that no index is
-committed with two different entries and stays ignored until then.
+A replica with a missing vote rejects appends, heartbeats and snapshots until
+it establishes a durable vote floor. It asks a reachable leader for the existing
+ReadIndex barrier. Since the replica cannot acknowledge replication yet, that
+proof requires a current quorum without it. The proven vote passes through
+OpenRaft and is persisted before replication is admitted. Missing `journal.meta`
+beside surviving records is also treated as lost vote history.
+
+This extra admission step applies only to replicas that lost their vote. A
+recovering replica with a retained vote can receive replication immediately.
+Initial cluster bootstrap separately waits for every configured peer to confirm
+empty history and persist its initial floor. The regression
+`a_wiped_voter_never_lets_a_stale_leader_commit` covers both clean and crashed
+old-leader restarts and rejects conflicting entries at the same committed index.
 
 ## Journal hardening
 
