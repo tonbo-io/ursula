@@ -201,9 +201,9 @@ A gated replica that applies nothing for 30 seconds reports itself stalled:
 readiness answers `503` with reason `recovery_stalled` and lists the group. The
 group stays stopped. An operator then accepts the loss of the unsynced tail on
 the replicas with the longest last log id until a majority of the voters is
-open, and normal election picks the longest verified log. Metrics show each
-replica's last log index but not its term, so the operator runbook ranks by
-index. Accepting
+open, and normal election picks the longest verified log. Metrics report each
+replica's `last_log_term` and `last_log_index`, so the operator ranks replicas
+by that last log id as an election does. Accepting
 on more replicas than needed lets election choose any log at least as long as
 a majority's. This replaces `adopt-survivor` and `reinitialize`. A group whose
 state is `Initialized` or `Recovering` never runs `Initialize`, which replaces

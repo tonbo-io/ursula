@@ -159,8 +159,8 @@ leader and refuses writes. The groups are listed under
 If the stalled replicas retain their voting history, an operator can accept
 the loss of writes acknowledged after the last `fsync`, with
 `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated
-replicas with the highest `last_log_index`, until the open replicas form a
-majority. A replica without a durable vote floor refuses this call and still
+replicas with the most up-to-date last log id (highest `last_log_term`, then
+highest `last_log_index`), until the open replicas form a majority. A replica without a durable vote floor refuses this call and still
 needs a fresh quorum proof. The request body names the replica's
 `last_log_index` and `current_term` from `/__ursula/metrics`. A voter of the
 group that was never gated does not report `recovery_stalled`. It answers
