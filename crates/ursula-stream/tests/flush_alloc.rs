@@ -1,3 +1,6 @@
+//! Run alone: this file deliberately contains one test because dhat profiling
+//! is process-wide. Put additional allocation probes in separate test binaries.
+
 //! Per-process allocation regression for bounded cold-flush planning.
 #[path = "../benches/fixture.rs"]
 mod fixture;
