@@ -31,8 +31,8 @@ This phase provides:
 - A placement projection model for data Raft groups.
 - Node registration state, node lifecycle state, and migration eligibility
   validation.
-- A single active migration intent with target-voter validation.
-- Placement commit and migration finish semantics.
+- One maintenance operation kernel for move, rebuild and decommission.
+- Process and replica identity pins, explicit action outcomes, and evidence-checked placement completion.
 - A meta Raft type config, state machine, and snapshot support, with an
   in-memory log store that only its tests use.
 - Tests for the control-plane lifecycle and the meta state-machine plumbing.
@@ -58,30 +58,28 @@ The important state is:
   labels, node state, and timestamps.
 - `placements`: one `DataGroupPlacement` per `RaftGroupId`, with `voters`,
   `learners`, `draining`, `epoch`, and `updated_at_ms`.
-- `migrations`: historical and active `GroupMigration` records.
-- `active_migration`: the single in-flight migration id, if any.
-- `next_migration_id`: monotonically assigned migration ids.
+- `operations`: process and replica identity records, one active operation, and a monotonically assigned operation id.
 
-The relevant commands are:
+All changes enter through `ControlPlaneState::apply(ControlCommand)`. Node
+registration and initial placement seeding remain control commands. `Operation`
+dispatches typed maintenance commands to the same replicated state. While an
+operation is active, other mutations are rejected. Initial seeding is idempotent
+but cannot overwrite an existing placement. Only evidence-checked operation
+completion changes existing voters or marks a node removed.
 
-- `RegisterNode`: persist a data-capable node and its URLs.
-- `SeedPlacement`: record initial data-group voters during bootstrap.
-- `BeginMigration`: create a migration intent and acquire the active lock.
-- `CommitPlacement`: write the final placement projection after the data-group
-  membership change.
-- `FinishMigration`: mark the active migration as succeeded or failed and
-  release the active lock.
-- `EvictLearner`: remove retained learner/draining metadata later.
+`Begin` checks the exact affected inventory, registered participants and their
+current process identities. A rebuild covers every source-hosted group; a move
+names a nonempty subset; a decommission supplies replacements for the entire
+inventory. The operation pins previous and desired voters. Executor takeover
+advances a generation and invalidates observations without erasing pending
+work or lowering the observed prefix floor.
 
-`BeginMigration` validates that:
-
-- no other migration is active;
-- target voters are not empty;
-- every target voter is registered and migration-eligible;
-- the group already has a placement.
-
-It records `from_voters`, `target_voters`, `added_nodes`, `removed_voters`,
-`retain_removed`, and learner status for newly added nodes.
+The kernel accepts externally verified observations. It checks identity pins,
+uniform membership, freshness, committed/applied prefix bounds and all-survivor
+replica-fence installation. It does not authenticate an observation or make it
+true: the future transport and driver must obtain evidence through production
+Raft entry points. Process retirement in this model alone is not data-plane
+fencing.
 
 ## Placement Model
 
@@ -106,9 +104,10 @@ The sets have different meanings:
 - `draining`: nodes that should be treated as non-serving during migration or
   cleanup.
 
-`CommitPlacement` rejects inconsistent placement, such as an unregistered
-voter or a node listed as both voter and learner. If the voter set changes, the
-placement epoch increments.
+`Complete` requires the final uniform membership and applied-prefix evidence
+for every affected group before atomically advancing placement epochs. It
+rejects an unresolved action. There is no separate `CommitPlacement` or legacy
+migration path that can bypass these checks.
 
 ## Target Architecture
 
@@ -153,25 +152,34 @@ tests and follow-up integration work, but it is not a persistent production
 control plane. A durable meta log store and production bootstrap/configuration
 path are required before meta state can be treated as cluster-critical state.
 
-## Migration Lifecycle
+## Operation and Action Lifecycle
 
-A migration record is created by `BeginMigration` and completed by
-`FinishMigration`. The state model has named phases for future automation:
+The operation has `Preparing` and, for rebuild/decommission, `Retired` phases.
+Each external action has a sequence, executor process pin and exact parameters:
 
 ```text
-Validating
-PreparingLocalEngines
-AddingLearners
-ChangingVoters
-VerifyingMembership
-CommittingPlacement
-Finalizing
-Succeeded
-Failed
+PrepareAction -> Prepared -> MarkActionDispatched -> OutcomeUnknown
+                     |                                  |
+             CancelPreparedAction             verified result / drain
+                     |                                  |
+                NotDispatched                 finish / reassign
 ```
 
-In the first phase, these phases are state-model vocabulary only. No automatic
-executor advances them, and no public operator command drives the workflow.
+The driver must durably mark dispatch before issuing the effect. A duplicate
+mark is rejected; a lost response therefore cannot authorize another dispatch.
+Only a prepared action can be canceled without reconciliation. A prepared
+receipt bound to a restarted process cannot be dispatched. An unknown action
+survives takeover, restart and serialization. Reassignment requires an exact
+drain receipt, whose authenticity and completion the future executor must
+verify. Retirement of a maintenance process is not proof that its queued data
+Raft effect cannot still commit.
+
+The old migration command/state vocabulary has been removed. Old snapshots
+with those fields are rejected rather than silently interpreted as an idle
+new authority. This is a pre-production format boundary, not an in-place
+migration mechanism.
+
+No public operator workflow or automatic executor is enabled by this change.
 
 ## Follow-Up Work
 
@@ -190,7 +198,7 @@ Before dynamic membership is usable on a running cluster, later PRs need to:
 ## Implementation Map
 
 - `crates/ursula-control`: control-plane state, commands, placement views, and
-  migration validation.
+  operation transitions, evidence checks and property tests.
 - `crates/ursula-raft/src/meta.rs`: meta OpenRaft type config, state machine,
   snapshots, and `MetaRaftHandle`.
 - `crates/ursula-raft/src/log_store`: the per-core journal of the data Raft

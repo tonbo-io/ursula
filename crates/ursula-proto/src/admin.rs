@@ -87,12 +87,16 @@ impl ProcessIncarnation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("process incarnation must be 32 lowercase hexadecimal characters")]
+pub struct InvalidProcessIncarnation;
+
 impl TryFrom<String> for ProcessIncarnation {
-    type Error = &'static str;
+    type Error = InvalidProcessIncarnation;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if !canonical_identity(&value) {
-            return Err("process incarnation must be 32 lowercase hexadecimal characters");
+            return Err(InvalidProcessIncarnation);
         }
         Ok(Self(value))
     }

@@ -9,22 +9,18 @@ use crate::command::ControlCommand;
 use crate::command::ControlResponse;
 use crate::model::ClusterNode;
 use crate::model::DataGroupPlacement;
-use crate::model::GroupMigration;
-use crate::model::LearnerStatus;
 use crate::model::MetaConfig;
-use crate::model::MigrationPhase;
 use crate::model::NodeId;
 use crate::model::NodeState;
 use crate::view::GroupPlacementView;
 use crate::view::PlacementNode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlPlaneState {
     pub nodes: BTreeMap<NodeId, ClusterNode>,
     pub placements: BTreeMap<RaftGroupId, DataGroupPlacement>,
-    pub migrations: BTreeMap<u64, GroupMigration>,
-    pub active_migration: Option<u64>,
-    pub next_migration_id: u64,
+    pub operations: crate::OperationState,
     pub config: MetaConfig,
 }
 
@@ -39,14 +35,16 @@ impl ControlPlaneState {
         Self {
             nodes: BTreeMap::new(),
             placements: BTreeMap::new(),
-            migrations: BTreeMap::new(),
-            active_migration: None,
-            next_migration_id: 1,
+            operations: crate::OperationState::default(),
             config,
         }
     }
 
     pub fn apply(&mut self, command: ControlCommand) -> ControlResponse {
+        if self.operations.active.is_some() && !matches!(command, ControlCommand::Operation { .. })
+        {
+            return ControlResponse::Operation(Err(crate::OperationError::Busy));
+        }
         match command {
             ControlCommand::RegisterNode {
                 node_id,
@@ -65,51 +63,40 @@ impl ControlPlaneState {
                 voters,
                 now_ms,
             } => self.seed_placement(raft_group_id, voters, now_ms),
-            ControlCommand::CommitPlacement {
-                raft_group_id,
-                voters,
-                learners,
-                draining,
-                now_ms,
-            } => self.commit_placement(raft_group_id, voters, learners, draining, now_ms),
-            ControlCommand::BeginMigration {
-                raft_group_id,
-                target_voters,
-                retain_removed,
-                now_ms,
-            } => self.begin_migration(raft_group_id, target_voters, retain_removed, now_ms),
-            ControlCommand::AdvanceMigration {
-                migration_id,
-                phase,
-                now_ms,
-            } => self.advance_migration(migration_id, phase, now_ms),
-            ControlCommand::SetLearnerStatus {
-                migration_id,
-                node_id,
-                status,
-                now_ms,
-            } => self.set_learner_status(migration_id, node_id, status, now_ms),
-            ControlCommand::RecordMigrationError {
-                migration_id,
-                error,
-                now_ms,
-            } => self.record_migration_error(migration_id, error, now_ms),
-            ControlCommand::FinishMigration {
-                migration_id,
-                success,
-                now_ms,
-            } => self.finish_migration(migration_id, success, now_ms),
-            ControlCommand::EvictLearner {
-                raft_group_id,
-                node_id,
-                now_ms,
-            } => self.evict_learner(raft_group_id, node_id, now_ms),
+            ControlCommand::Operation { command, now_ms } => self.apply_operation(command, now_ms),
         }
     }
 
-    pub fn active_migration(&self) -> Option<&GroupMigration> {
-        self.active_migration
-            .and_then(|id| self.migrations.get(&id))
+    fn apply_operation(
+        &mut self,
+        command: crate::OperationCommand,
+        now_ms: u64,
+    ) -> ControlResponse {
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.state != NodeState::Removed)
+            .map(|(id, _)| *id)
+            .collect();
+        let decommissioned = self
+            .operations
+            .active
+            .as_ref()
+            .and_then(|operation| match operation.kind {
+                crate::OperationKind::DecommissionNode { node_id, .. } => Some(node_id),
+                _ => None,
+            });
+        let result = self
+            .operations
+            .apply(command, now_ms, &nodes, &mut self.placements);
+        if matches!(result, Ok(crate::OperationOutcome::Completed))
+            && let Some(node_id) = decommissioned
+            && let Some(node) = self.nodes.get_mut(&node_id)
+        {
+            node.state = NodeState::Removed;
+            node.updated_at_ms = now_ms;
+        }
+        ControlResponse::Operation(result)
     }
 
     pub fn placement_view(&self, raft_group_id: RaftGroupId) -> Option<GroupPlacementView> {
@@ -153,23 +140,31 @@ impl ControlPlaneState {
         let client_url = normalize_url(client_url);
         let cluster_url = normalize_url(cluster_url);
         if client_url.is_empty() {
-            return reject("client_url must not be empty".to_owned());
+            return reject(crate::ControlError::EmptyAddress {
+                node_id,
+                endpoint: crate::NodeEndpoint::Client,
+            });
         }
         if cluster_url.is_empty() {
-            return reject("cluster_url must not be empty".to_owned());
+            return reject(crate::ControlError::EmptyAddress {
+                node_id,
+                endpoint: crate::NodeEndpoint::Cluster,
+            });
         }
 
-        let (registered_at_ms, state) =
-            self.nodes
-                .get(&node_id)
-                .map_or((now_ms, NodeState::Active), |node| {
-                    let state = if node.state == NodeState::Removed {
-                        NodeState::Active
-                    } else {
-                        node.state
-                    };
-                    (node.registered_at_ms, state)
-                });
+        if self
+            .nodes
+            .get(&node_id)
+            .is_some_and(|node| node.state == NodeState::Removed)
+        {
+            return reject(crate::ControlError::RemovedNode { node_id });
+        }
+        let (registered_at_ms, state) = self
+            .nodes
+            .get(&node_id)
+            .map_or((now_ms, NodeState::Active), |node| {
+                (node.registered_at_ms, node.state)
+            });
         self.nodes.insert(node_id, ClusterNode {
             node_id,
             client_url,
@@ -189,8 +184,14 @@ impl ControlPlaneState {
         now_ms: u64,
     ) -> ControlResponse {
         let Some(node) = self.nodes.get_mut(&node_id) else {
-            return reject(format!("node {node_id} is not registered"));
+            return reject(crate::ControlError::UnknownNode { node_id });
         };
+        if node.state == NodeState::Removed {
+            return reject(crate::ControlError::RemovedNode { node_id });
+        }
+        if state == NodeState::Removed {
+            return reject(crate::ControlError::RemovalRequiresOperation { node_id });
+        }
         node.state = state;
         node.updated_at_ms = now_ms;
         ControlResponse::Ok
@@ -203,9 +204,30 @@ impl ControlPlaneState {
         now_ms: u64,
     ) -> ControlResponse {
         if voters.is_empty() {
-            return reject("placement voters must not be empty".to_owned());
+            return reject(crate::ControlError::EmptyVoters { raft_group_id });
         }
 
+        for node_id in &voters {
+            let Some(node) = self.nodes.get(node_id) else {
+                return reject(crate::ControlError::UnknownNode { node_id: *node_id });
+            };
+            if node.state != NodeState::Active {
+                return reject(crate::ControlError::IneligibleNode {
+                    node_id: *node_id,
+                    state: node.state,
+                });
+            }
+        }
+        if let Some(existing) = self.placements.get(&raft_group_id) {
+            return if existing.voters == voters
+                && existing.learners.is_empty()
+                && existing.draining.is_empty()
+            {
+                ControlResponse::Ok
+            } else {
+                reject(crate::ControlError::PlacementExists { raft_group_id })
+            };
+        }
         self.placements.insert(raft_group_id, DataGroupPlacement {
             raft_group_id,
             voters,
@@ -216,258 +238,12 @@ impl ControlPlaneState {
         });
         ControlResponse::Ok
     }
-
-    fn commit_placement(
-        &mut self,
-        raft_group_id: RaftGroupId,
-        voters: BTreeSet<NodeId>,
-        learners: BTreeSet<NodeId>,
-        draining: BTreeSet<NodeId>,
-        now_ms: u64,
-    ) -> ControlResponse {
-        if voters.is_empty() {
-            return reject("placement voters must not be empty".to_owned());
-        }
-        if let Some(response) = self.validate_placement_nodes(&voters, &learners, &draining) {
-            return response;
-        }
-
-        let placement = self
-            .placements
-            .entry(raft_group_id)
-            .or_insert_with(|| DataGroupPlacement::empty(raft_group_id));
-        if placement.voters != voters {
-            placement.epoch = placement.epoch.saturating_add(1);
-        }
-        placement.voters = voters;
-        placement.learners = learners;
-        placement.draining = draining;
-        placement.updated_at_ms = now_ms;
-        ControlResponse::Ok
-    }
-
-    fn validate_placement_nodes(
-        &self,
-        voters: &BTreeSet<NodeId>,
-        learners: &BTreeSet<NodeId>,
-        draining: &BTreeSet<NodeId>,
-    ) -> Option<ControlResponse> {
-        if let Some(node_id) = voters.intersection(learners).next() {
-            return Some(reject(format!(
-                "node {node_id} cannot be both voter and learner"
-            )));
-        }
-        if let Some(response) = self.validate_registered_nodes("voter", voters, true) {
-            return Some(response);
-        }
-        if let Some(response) = self.validate_registered_nodes("learner", learners, false) {
-            return Some(response);
-        }
-        self.validate_registered_nodes("draining", draining, false)
-    }
-
-    fn validate_registered_nodes(
-        &self,
-        role: &str,
-        node_ids: &BTreeSet<NodeId>,
-        require_migration_eligible: bool,
-    ) -> Option<ControlResponse> {
-        for node_id in node_ids {
-            let Some(node) = self.nodes.get(node_id) else {
-                return Some(reject(format!("{role} node {node_id} is not registered")));
-            };
-            if require_migration_eligible && !node.state.is_migration_eligible() {
-                return Some(reject(format!(
-                    "{role} node {node_id} is not migration eligible: {:?}",
-                    node.state
-                )));
-            }
-        }
-        None
-    }
-
-    fn begin_migration(
-        &mut self,
-        raft_group_id: RaftGroupId,
-        target_voters: BTreeSet<NodeId>,
-        retain_removed: bool,
-        now_ms: u64,
-    ) -> ControlResponse {
-        if let Some(active) = self.active_migration {
-            return reject(format!("migration {active} is already running"));
-        }
-        if target_voters.is_empty() {
-            return reject("target voters must not be empty".to_owned());
-        }
-        for node_id in &target_voters {
-            let Some(node) = self.nodes.get(node_id) else {
-                return reject(format!("node {node_id} is not registered"));
-            };
-            if !node.state.is_migration_eligible() {
-                return reject(format!(
-                    "node {node_id} is not migration eligible: {:?}",
-                    node.state
-                ));
-            }
-        }
-
-        let Some(placement) = self.placements.get(&raft_group_id) else {
-            return reject(format!("group {} has no placement", raft_group_id.0));
-        };
-        let from_voters = placement.voters.clone();
-        let added_nodes = target_voters
-            .difference(&from_voters)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let removed_voters = from_voters
-            .difference(&target_voters)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let per_node_learner_status = added_nodes
-            .iter()
-            .copied()
-            .map(|node_id| (node_id, LearnerStatus::Pending))
-            .collect();
-
-        let migration_id = self.next_migration_id.max(1);
-        self.next_migration_id = migration_id.saturating_add(1);
-        self.migrations.insert(migration_id, GroupMigration {
-            migration_id,
-            raft_group_id,
-            from_voters,
-            target_voters,
-            added_nodes,
-            removed_voters,
-            retain_removed,
-            phase: MigrationPhase::Validating,
-            per_node_learner_status,
-            last_error: None,
-            retry_count: 0,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        });
-        self.active_migration = Some(migration_id);
-
-        ControlResponse::MigrationStarted { migration_id }
-    }
-
-    fn advance_migration(
-        &mut self,
-        migration_id: u64,
-        phase: MigrationPhase,
-        now_ms: u64,
-    ) -> ControlResponse {
-        if !phase.is_running() {
-            return reject(format!(
-                "migration {migration_id} must finish through FinishMigration"
-            ));
-        }
-        let Some(migration) = self.migrations.get_mut(&migration_id) else {
-            return reject(format!("migration {migration_id} does not exist"));
-        };
-        if migration.phase == phase {
-            return ControlResponse::Ok;
-        }
-        if !migration.phase.can_advance_to(phase) {
-            return reject(format!(
-                "migration {migration_id} cannot advance from {:?} to {:?}",
-                migration.phase, phase
-            ));
-        }
-        migration.phase = phase;
-        migration.updated_at_ms = now_ms;
-        ControlResponse::Ok
-    }
-
-    fn set_learner_status(
-        &mut self,
-        migration_id: u64,
-        node_id: NodeId,
-        status: LearnerStatus,
-        now_ms: u64,
-    ) -> ControlResponse {
-        let Some(migration) = self.migrations.get_mut(&migration_id) else {
-            return reject(format!("migration {migration_id} does not exist"));
-        };
-        if !migration.is_running() {
-            return reject(format!("migration {migration_id} is not running"));
-        }
-        if !migration.added_nodes.contains(&node_id) {
-            return reject(format!(
-                "node {node_id} is not an added learner for migration {migration_id}"
-            ));
-        }
-        migration.per_node_learner_status.insert(node_id, status);
-        migration.updated_at_ms = now_ms;
-        ControlResponse::Ok
-    }
-
-    fn record_migration_error(
-        &mut self,
-        migration_id: u64,
-        error: String,
-        now_ms: u64,
-    ) -> ControlResponse {
-        let Some(migration) = self.migrations.get_mut(&migration_id) else {
-            return reject(format!("migration {migration_id} does not exist"));
-        };
-        migration.last_error = Some(error);
-        migration.retry_count = migration.retry_count.saturating_add(1);
-        migration.updated_at_ms = now_ms;
-        ControlResponse::Ok
-    }
-
-    fn finish_migration(
-        &mut self,
-        migration_id: u64,
-        success: bool,
-        now_ms: u64,
-    ) -> ControlResponse {
-        let Some(migration) = self.migrations.get_mut(&migration_id) else {
-            return reject(format!("migration {migration_id} does not exist"));
-        };
-        if self.active_migration != Some(migration_id) {
-            return reject(format!("migration {migration_id} is not active"));
-        }
-        if !migration.is_running() {
-            return reject(format!("migration {migration_id} is not running"));
-        }
-        migration.phase = if success {
-            MigrationPhase::Succeeded
-        } else {
-            MigrationPhase::Failed
-        };
-        migration.updated_at_ms = now_ms;
-        self.active_migration = None;
-        ControlResponse::Ok
-    }
-
-    fn evict_learner(
-        &mut self,
-        raft_group_id: RaftGroupId,
-        node_id: NodeId,
-        now_ms: u64,
-    ) -> ControlResponse {
-        let Some(placement) = self.placements.get_mut(&raft_group_id) else {
-            return reject(format!("group {} has no placement", raft_group_id.0));
-        };
-        if placement.voters.contains(&node_id) {
-            return reject(format!(
-                "node {node_id} is a voter of group {} and cannot be evicted as a learner",
-                raft_group_id.0
-            ));
-        }
-        placement.learners.remove(&node_id);
-        placement.draining.remove(&node_id);
-        placement.updated_at_ms = now_ms;
-        ControlResponse::Ok
-    }
 }
 
 fn normalize_url(value: String) -> String {
     value.trim().trim_end_matches('/').to_owned()
 }
 
-fn reject(reason: String) -> ControlResponse {
+fn reject(reason: crate::ControlError) -> ControlResponse {
     ControlResponse::Rejected { reason }
 }

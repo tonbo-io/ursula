@@ -1244,11 +1244,14 @@ async fn meta_raft_handle_rejects_invalid_initial_data_nodes_body() {
         )
         .await
         .expect_err("reject invalid initial data node");
-    assert!(
-        err.to_string()
-            .contains("node 2 rejected: client_url must not be empty"),
-        "unexpected error: {err}"
-    );
+    assert!(matches!(
+        std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<ursula_control::ControlError>()),
+        Some(ursula_control::ControlError::EmptyAddress {
+            node_id: 2,
+            endpoint: ursula_control::NodeEndpoint::Client
+        })
+    ));
 
     handle
         .shutdown()

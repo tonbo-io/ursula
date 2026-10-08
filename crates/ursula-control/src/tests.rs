@@ -120,66 +120,6 @@ fn control_command_display_names_variants() {
             },
             "seed_placement",
         ),
-        (
-            ControlCommand::BeginMigration {
-                raft_group_id: RaftGroupId(1),
-                target_voters: set([2, 3, 4]),
-                retain_removed: true,
-                now_ms: 10,
-            },
-            "begin_migration",
-        ),
-        (
-            ControlCommand::AdvanceMigration {
-                migration_id: 1,
-                phase: crate::MigrationPhase::AddingLearners,
-                now_ms: 10,
-            },
-            "advance_migration",
-        ),
-        (
-            ControlCommand::SetLearnerStatus {
-                migration_id: 1,
-                node_id: 4,
-                status: crate::LearnerStatus::CaughtUp,
-                now_ms: 10,
-            },
-            "set_learner_status",
-        ),
-        (
-            ControlCommand::RecordMigrationError {
-                migration_id: 1,
-                error: "timeout".to_owned(),
-                now_ms: 10,
-            },
-            "record_migration_error",
-        ),
-        (
-            ControlCommand::CommitPlacement {
-                raft_group_id: RaftGroupId(1),
-                voters: set([2, 3, 4]),
-                learners: set([1]),
-                draining: set([1]),
-                now_ms: 10,
-            },
-            "commit_placement",
-        ),
-        (
-            ControlCommand::FinishMigration {
-                migration_id: 1,
-                success: true,
-                now_ms: 10,
-            },
-            "finish_migration",
-        ),
-        (
-            ControlCommand::EvictLearner {
-                raft_group_id: RaftGroupId(1),
-                node_id: 1,
-                now_ms: 10,
-            },
-            "evict_learner",
-        ),
     ];
 
     for (command, expected) in cases {
@@ -192,12 +132,12 @@ fn control_response_display_names_variants() {
     let cases = [
         (ControlResponse::Ok, "ok"),
         (
-            ControlResponse::MigrationStarted { migration_id: 1 },
-            "migration_started",
+            ControlResponse::Operation(Ok(crate::OperationOutcome::Completed)),
+            "operation",
         ),
         (
             ControlResponse::Rejected {
-                reason: "invalid".to_owned(),
+                reason: crate::ControlError::UnknownNode { node_id: 99 },
             },
             "rejected",
         ),
@@ -275,6 +215,7 @@ fn register_node_command_preserves_non_removed_state_on_update() {
 #[test]
 fn seed_placement_records_initial_voters_without_bumping_epoch() {
     let mut state = ControlPlaneState::default();
+    register_active_nodes(&mut state, [1, 2, 3]);
 
     let response = state.apply(ControlCommand::SeedPlacement {
         raft_group_id: RaftGroupId(1),
@@ -303,13 +244,16 @@ fn placement_view_from_state_includes_voters_learners_and_draining_nodes() {
             now_ms: 10,
         });
     }
-    state.apply(ControlCommand::CommitPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1]),
-        learners: set([2]),
-        draining: set([3]),
-        now_ms: 30,
-    });
+    state
+        .placements
+        .insert(RaftGroupId(1), crate::DataGroupPlacement {
+            raft_group_id: RaftGroupId(1),
+            voters: set([1]),
+            learners: set([2]),
+            draining: set([3]),
+            epoch: 1,
+            updated_at_ms: 30,
+        });
 
     let view = state.placement_view(RaftGroupId(1)).expect("view exists");
 
@@ -335,337 +279,260 @@ fn register_active_nodes(state: &mut ControlPlaneState, nodes: impl IntoIterator
 }
 
 #[test]
-fn control_plane_lifecycle_registers_migrates_commits_and_finishes_group() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
+fn seeding_never_overwrites_existing_placement_or_accepts_unknown_voters() {
+    let mut state = ControlPlaneState::default();
+    register_active_nodes(&mut state, [1, 2]);
+    let seed = |voters| ControlCommand::SeedPlacement {
+        raft_group_id: RaftGroupId(1),
+        voters,
+        now_ms: 20,
+    };
+    assert_eq!(state.apply(seed(set([1, 9]))), ControlResponse::Rejected {
+        reason: crate::ControlError::UnknownNode { node_id: 9 },
+    });
+    assert!(state.placements.is_empty());
+    assert_eq!(state.apply(seed(set([1]))), ControlResponse::Ok);
+    let before = state.clone();
+    assert_eq!(state.apply(seed(set([1]))), ControlResponse::Ok);
+    assert_eq!(state, before);
+    assert_eq!(state.apply(seed(set([2]))), ControlResponse::Rejected {
+        reason: crate::ControlError::PlacementExists {
+            raft_group_id: RaftGroupId(1)
+        },
+    });
+    assert_eq!(state, before);
+}
 
-    register_active_nodes(&mut state, 1..=4);
+#[test]
+fn removed_nodes_cannot_be_resurrected_by_registration() {
+    let mut state = ControlPlaneState::default();
+    register_active_nodes(&mut state, [1]);
     assert_eq!(
-        state.apply(ControlCommand::SeedPlacement {
-            raft_group_id: RaftGroupId(7),
-            voters: set([1, 2, 3]),
+        state.apply(ControlCommand::SetNodeState {
+            node_id: 1,
+            state: NodeState::Removed,
             now_ms: 20,
         }),
-        ControlResponse::Ok
+        ControlResponse::Rejected {
+            reason: crate::ControlError::RemovalRequiresOperation { node_id: 1 }
+        }
     );
-
+    // A completed decommission leaves this terminal tombstone.
+    state.nodes.get_mut(&1).unwrap().state = NodeState::Removed;
+    let before = state.clone();
     assert_eq!(
-        state.apply(ControlCommand::BeginMigration {
-            raft_group_id: RaftGroupId(7),
-            target_voters: set([2, 3, 4]),
-            retain_removed: true,
+        state.apply(ControlCommand::RegisterNode {
+            node_id: 1,
+            client_url: "http://replacement".into(),
+            cluster_url: "http://replacement".into(),
+            labels: BTreeMap::new(),
             now_ms: 30,
         }),
-        ControlResponse::MigrationStarted { migration_id: 1 }
+        ControlResponse::Rejected {
+            reason: crate::ControlError::RemovedNode { node_id: 1 }
+        }
     );
-    let migration = state.active_migration().expect("active migration");
-    assert_eq!(migration.from_voters, set([1, 2, 3]));
-    assert_eq!(migration.target_voters, set([2, 3, 4]));
-    assert_eq!(migration.added_nodes, set([4]));
-    assert_eq!(migration.removed_voters, set([1]));
+    assert_eq!(state, before);
+}
 
+#[test]
+fn legacy_migration_snapshot_cannot_silently_become_an_idle_new_authority() {
+    let mut serialized = serde_json::to_value(ControlPlaneState::default()).unwrap();
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .insert("active_migration".into(), 1.into());
+    serde_json::from_value::<ControlPlaneState>(serialized)
+        .expect_err("legacy migration state requires an explicit storage cutover");
+}
+
+#[test]
+fn one_dispatcher_owns_membership_from_intent_through_placement() {
+    use crate::OperationCommand;
+    use crate::OperationOutcome;
+    let mut state = ControlPlaneState::default();
+    register_active_nodes(&mut state, [1, 2, 3, 4]);
     assert_eq!(
-        state.apply(ControlCommand::CommitPlacement {
-            raft_group_id: RaftGroupId(7),
+        state.apply(ControlCommand::SeedPlacement {
+            raft_group_id: RaftGroupId(0),
+            voters: set([1, 2, 3]),
+            now_ms: 10
+        }),
+        ControlResponse::Ok
+    );
+    let mut participants = BTreeMap::new();
+    for node_id in 1..=4 {
+        let ControlResponse::Operation(Ok(OperationOutcome::ProcessClaimed(identity))) = state
+            .apply(ControlCommand::Operation {
+                command: OperationCommand::ClaimProcess {
+                    node_id,
+                    expected_epoch: 0,
+                    incarnation: crate::ProcessIncarnation::from_bits(u128::from(node_id)),
+                },
+                now_ms: 10,
+            })
+        else {
+            panic!("claim");
+        };
+        participants.insert(node_id, identity);
+    }
+    let target = crate::ReplicaIdentity {
+        generation: 1,
+        incarnation: crate::ProcessIncarnation::from_bits(4),
+    };
+    assert_eq!(
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::RegisterReplica {
+                node_id: 4,
+                process: participants[&4].clone(),
+                identity: target.clone()
+            },
+            now_ms: 10
+        }),
+        ControlResponse::Operation(Ok(OperationOutcome::ReplicaRegistered))
+    );
+    let ControlResponse::Operation(Ok(OperationOutcome::Acquired(token))) =
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::Begin {
+                kind: crate::OperationKind::MoveReplicas {
+                    source: 1,
+                    target: 4,
+                    groups: BTreeSet::from([RaftGroupId(0)]),
+                },
+                executor: crate::ProcessIncarnation::from_bits(100),
+                participants: participants.clone(),
+                meta_voters: set([1, 2, 3]),
+            },
+            now_ms: 10,
+        })
+    else {
+        panic!("begin");
+    };
+    let before = state.clone();
+    assert_eq!(
+        state.apply(ControlCommand::SeedPlacement {
+            raft_group_id: RaftGroupId(0),
             voters: set([2, 3, 4]),
-            learners: set([1]),
-            draining: set([1]),
-            now_ms: 40,
+            now_ms: 10
         }),
-        ControlResponse::Ok
+        ControlResponse::Operation(Err(crate::OperationError::Busy))
     );
+    assert_eq!(state, before);
     assert_eq!(
-        state.apply(ControlCommand::FinishMigration {
-            migration_id: 1,
-            success: true,
-            now_ms: 50,
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::Complete {
+                token: token.clone()
+            },
+            now_ms: 10
         }),
-        ControlResponse::Ok
+        ControlResponse::Operation(Err(crate::OperationError::MissingEvidence {
+            raft_group_id: RaftGroupId(0)
+        }))
     );
+    assert_eq!(state, before);
 
-    assert_eq!(state.active_migration, None);
-    let placement = state.placements.get(&RaftGroupId(7)).expect("placement");
-    assert_eq!(placement.voters, set([2, 3, 4]));
-    assert_eq!(placement.learners, set([1]));
-    assert_eq!(placement.draining, set([1]));
-    assert_eq!(placement.epoch, 1);
-
-    let migration = state.migrations.get(&1).expect("migration history");
-    assert_eq!(migration.phase, crate::MigrationPhase::Succeeded);
-    assert_eq!(migration.updated_at_ms, 50);
-}
-
-#[test]
-fn begin_migration_records_added_and_removed_nodes() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, 1..=5);
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-
-    let response = state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(1),
-        target_voters: set([2, 4, 5]),
-        retain_removed: true,
-        now_ms: 30,
-    });
-
-    assert_eq!(response, ControlResponse::MigrationStarted {
-        migration_id: 1
-    });
-    assert_eq!(state.active_migration, Some(1));
-    let migration = state.migrations.get(&1).expect("migration");
-    assert_eq!(migration.from_voters, set([1, 2, 3]));
-    assert_eq!(migration.target_voters, set([2, 4, 5]));
-    assert_eq!(migration.added_nodes, set([4, 5]));
-    assert_eq!(migration.removed_voters, set([1, 3]));
-    assert_eq!(migration.phase, crate::MigrationPhase::Validating);
-    assert!(migration.retain_removed);
-}
-
-#[test]
-fn migration_lock_rejects_second_running_migration() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, 1..=4);
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(2),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(1),
-        target_voters: set([2, 3, 4]),
-        retain_removed: true,
-        now_ms: 30,
-    });
-
-    let response = state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(2),
-        target_voters: set([2, 3, 4]),
-        retain_removed: true,
-        now_ms: 31,
-    });
-
-    assert_eq!(response, ControlResponse::Rejected {
-        reason: "migration 1 is already running".to_owned(),
-    });
-}
-
-#[test]
-fn finish_migration_releases_lock_and_commit_records_retained_learners() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, 1..=4);
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(1),
-        target_voters: set([2, 3, 4]),
-        retain_removed: true,
-        now_ms: 30,
-    });
-
+    let ControlResponse::Operation(Ok(OperationOutcome::ActionPrepared(receipt))) =
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::PrepareAction {
+                token: token.clone(),
+                group: RaftGroupId(0),
+                leader: 2,
+                action: crate::MembershipAction::InstallReplicaIdentity {
+                    node_id: 4,
+                    identity: target.clone(),
+                },
+            },
+            now_ms: 10,
+        })
+    else {
+        panic!("admission action");
+    };
     assert_eq!(
-        state.apply(ControlCommand::CommitPlacement {
-            raft_group_id: RaftGroupId(1),
-            voters: set([2, 3, 4]),
-            learners: set([1]),
-            draining: set([1]),
-            now_ms: 40,
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::MarkActionDispatched {
+                token: token.clone(),
+                sequence: receipt.sequence
+            },
+            now_ms: 10
         }),
-        ControlResponse::Ok
+        ControlResponse::Operation(Ok(OperationOutcome::ActionOutcome(
+            crate::ActionOutcome::Unknown
+        )))
     );
     assert_eq!(
-        state.apply(ControlCommand::FinishMigration {
-            migration_id: 1,
-            success: true,
-            now_ms: 41,
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::Observe {
+                token: token.clone(),
+                evidence: crate::PrefixEvidence {
+                    raft_group_id: RaftGroupId(0),
+                    leader: 2,
+                    term: 3,
+                    committed_index: 99,
+                    voters: set([1, 2, 3]),
+                    joint: false,
+                    replicas: participants
+                        .iter()
+                        .filter(|(id, _)| **id != 4)
+                        .map(|(id, process)| (*id, crate::ReplicaEvidence {
+                            process: process.clone(),
+                            applied_index: 99,
+                            installed_replica_identities: BTreeMap::from([(4, target.clone())])
+                        }))
+                        .collect(),
+                    observed_at_ms: 10
+                }
+            },
+            now_ms: 10
         }),
-        ControlResponse::Ok
+        ControlResponse::Operation(Ok(OperationOutcome::EvidenceRecorded))
     );
-
-    let placement = state.placements.get(&RaftGroupId(1)).expect("placement");
-    assert_eq!(placement.voters, set([2, 3, 4]));
-    assert_eq!(placement.learners, set([1]));
-    assert_eq!(placement.draining, set([1]));
-    assert_eq!(placement.epoch, 1);
-    assert_eq!(state.active_migration, None);
     assert_eq!(
-        state.migrations.get(&1).expect("migration").phase,
-        crate::MigrationPhase::Succeeded
-    );
-}
-
-#[test]
-fn advance_migration_rejects_terminal_phases_so_finish_releases_lock() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, 1..=4);
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(1),
-        target_voters: set([2, 3, 4]),
-        retain_removed: true,
-        now_ms: 30,
-    });
-
-    assert_eq!(
-        state.apply(ControlCommand::AdvanceMigration {
-            migration_id: 1,
-            phase: crate::MigrationPhase::Succeeded,
-            now_ms: 40,
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::FinishReplicaFence {
+                token: token.clone(),
+                sequence: receipt.sequence,
+                committed_index: 99
+            },
+            now_ms: 10
         }),
-        ControlResponse::Rejected {
-            reason: "migration 1 must finish through FinishMigration".to_owned(),
-        }
+        ControlResponse::Operation(Ok(OperationOutcome::ActionOutcome(
+            crate::ActionOutcome::Completed
+        )))
     );
-    assert_eq!(state.active_migration, Some(1));
     assert_eq!(
-        state.migrations.get(&1).expect("migration").phase,
-        crate::MigrationPhase::Validating
-    );
-}
-
-#[test]
-fn learner_status_rejects_nodes_that_were_not_added_as_learners() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, 1..=4);
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(1),
-        target_voters: set([2, 3, 4]),
-        retain_removed: true,
-        now_ms: 30,
-    });
-
-    assert_eq!(
-        state.apply(ControlCommand::SetLearnerStatus {
-            migration_id: 1,
-            node_id: 2,
-            status: crate::LearnerStatus::CaughtUp,
-            now_ms: 40,
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::Observe {
+                token: token.clone(),
+                evidence: crate::PrefixEvidence {
+                    raft_group_id: RaftGroupId(0),
+                    leader: 2,
+                    term: 3,
+                    committed_index: 100,
+                    voters: set([2, 3, 4]),
+                    joint: false,
+                    replicas: participants
+                        .into_iter()
+                        .filter(|(id, _)| *id != 1)
+                        .map(|(id, process)| (id, crate::ReplicaEvidence {
+                            process,
+                            applied_index: 100,
+                            installed_replica_identities: BTreeMap::new()
+                        }))
+                        .collect(),
+                    observed_at_ms: 10,
+                }
+            },
+            now_ms: 10,
         }),
-        ControlResponse::Rejected {
-            reason: "node 2 is not an added learner for migration 1".to_owned(),
-        }
+        ControlResponse::Operation(Ok(OperationOutcome::EvidenceRecorded))
     );
     assert_eq!(
-        state.apply(ControlCommand::SetLearnerStatus {
-            migration_id: 1,
-            node_id: 4,
-            status: crate::LearnerStatus::CaughtUp,
-            now_ms: 41,
+        state.apply(ControlCommand::Operation {
+            command: OperationCommand::Complete { token },
+            now_ms: 10
         }),
-        ControlResponse::Ok
+        ControlResponse::Operation(Ok(OperationOutcome::Completed))
     );
-}
-
-#[test]
-fn finish_migration_rejects_inactive_history_records() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, 1..=4);
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(1),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::SeedPlacement {
-        raft_group_id: RaftGroupId(2),
-        voters: set([1, 2, 3]),
-        now_ms: 20,
-    });
-    state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(1),
-        target_voters: set([2, 3, 4]),
-        retain_removed: true,
-        now_ms: 30,
-    });
-    assert_eq!(
-        state.apply(ControlCommand::FinishMigration {
-            migration_id: 1,
-            success: true,
-            now_ms: 40,
-        }),
-        ControlResponse::Ok
-    );
-    state.apply(ControlCommand::BeginMigration {
-        raft_group_id: RaftGroupId(2),
-        target_voters: set([1, 3, 4]),
-        retain_removed: true,
-        now_ms: 50,
-    });
-
-    assert_eq!(
-        state.apply(ControlCommand::FinishMigration {
-            migration_id: 1,
-            success: false,
-            now_ms: 60,
-        }),
-        ControlResponse::Rejected {
-            reason: "migration 1 is not active".to_owned(),
-        }
-    );
-    assert_eq!(
-        state.migrations.get(&1).expect("migration").phase,
-        crate::MigrationPhase::Succeeded
-    );
-    assert_eq!(state.active_migration, Some(2));
-}
-
-#[test]
-fn commit_placement_rejects_inconsistent_node_sets() {
-    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
-    register_active_nodes(&mut state, [1, 2]);
-
-    assert_eq!(
-        state.apply(ControlCommand::CommitPlacement {
-            raft_group_id: RaftGroupId(1),
-            voters: set([1]),
-            learners: set([1]),
-            draining: BTreeSet::new(),
-            now_ms: 20,
-        }),
-        ControlResponse::Rejected {
-            reason: "node 1 cannot be both voter and learner".to_owned(),
-        }
-    );
-    assert_eq!(
-        state.apply(ControlCommand::CommitPlacement {
-            raft_group_id: RaftGroupId(1),
-            voters: set([1]),
-            learners: BTreeSet::new(),
-            draining: set([9]),
-            now_ms: 21,
-        }),
-        ControlResponse::Rejected {
-            reason: "draining node 9 is not registered".to_owned(),
-        }
-    );
-    assert_eq!(
-        state.apply(ControlCommand::CommitPlacement {
-            raft_group_id: RaftGroupId(1),
-            voters: set([1, 9]),
-            learners: BTreeSet::new(),
-            draining: BTreeSet::new(),
-            now_ms: 22,
-        }),
-        ControlResponse::Rejected {
-            reason: "voter node 9 is not registered".to_owned(),
-        }
-    );
+    assert_eq!(state.placements[&RaftGroupId(0)].voters, set([2, 3, 4]));
+    assert_eq!(state.placements[&RaftGroupId(0)].epoch, 1);
 }
