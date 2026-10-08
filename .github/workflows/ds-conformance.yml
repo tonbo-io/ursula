@@ -22,7 +22,7 @@ env:
 
 jobs:
   conformance:
-    name: DS conformance (single node, memory)
+    name: DS conformance (single node)
     runs-on: depot-ubuntu-24.04-8
     steps:
       - name: Checkout
