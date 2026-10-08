@@ -1703,6 +1703,12 @@ impl ShardRuntime {
         .await
     }
 
+    /// Drain one group using its configured owner placement.
+    pub async fn shutdown_group(&self, group: RaftGroupId) -> Result<(), RuntimeError> {
+        self.shutdown_group_engine(self.placement_for_group(group)?)
+            .await
+    }
+
     /// Shut down and remove one hosted group engine, waiting for its durable
     /// resources (including an exclusive WAL lock) to be released.
     pub async fn shutdown_group_engine(

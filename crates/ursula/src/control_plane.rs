@@ -750,6 +750,160 @@ pub(crate) async fn action(
     }
 }
 
+/// Reactivate only a certified, currently nonvoting target. A removed replica
+/// may retain a WAL from before another member's replacement, so normal replay
+/// cannot even authenticate the leader carrying its missing fence entries.
+async fn prepare_replica(
+    state: &HttpState,
+    snapshot: &ControlPlaneState,
+    request: &ursula_control::ActionRequest,
+) -> Result<(), ControlHttpError> {
+    let group = request.action.group;
+    let target = request.action.leader;
+    let operation = snapshot
+        .operations
+        .active
+        .as_ref()
+        .ok_or(OperationError::StaleExecutor)?;
+    let desired = operation
+        .desired
+        .get(&group)
+        .ok_or(OperationError::InventoryMismatch)?;
+    if !desired.contains(&target) {
+        return Err(OperationError::InvalidTransition.into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|source| ControlHttpError::Peer {
+            node_id: target,
+            source,
+        })?;
+    let candidates = operation
+        .previous
+        .get(&group)
+        .into_iter()
+        .flatten()
+        .chain(desired)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut leader = None;
+    for node_id in candidates {
+        if let Ok(observed) = peer_observation(&client, snapshot, node_id, group).await
+            && let Some(proof) = &observed.quorum
+            && proof.leader_id == node_id
+            && observed.metrics.current_leader == Some(node_id)
+            && observed.metrics.current_term == Some(proof.leader_term)
+            && !observed.metrics.maintenance.membership_joint
+        {
+            leader = Some(observed);
+            break;
+        }
+    }
+    let leader = leader.ok_or(ControlHttpError::NoDataLeader { group })?;
+    // A retry after successful promotion must not stop an active voter.
+    if leader.metrics.voter_ids.contains(&target) {
+        let registry = state.raft_registry().ok_or(ControlHttpError::Unavailable)?;
+        registry.set_replica_reactivation(
+            group,
+            request.token.operation_id,
+            BTreeSet::new(),
+            BTreeMap::new(),
+            0,
+        );
+        state.runtime.warm_group(group).await?;
+        return Ok(());
+    }
+    let (identities, required_index) =
+        replica_reactivation_certificate(snapshot, group, target, &leader)?;
+    let refreshed = linear_state(state).await?;
+    if refreshed
+        .operations
+        .active
+        .as_ref()
+        .filter(|active| active.token == request.token)
+        .and_then(|active| active.pending_action.as_ref())
+        != Some(&request.action)
+    {
+        return Err(OperationError::StaleExecutor.into());
+    }
+    let registry = state.raft_registry().ok_or(ControlHttpError::Unavailable)?;
+    // Set the pre-open certificate first so any concurrent warm also receives
+    // the election gate. Shutdown drains owned snapshot and metadata work.
+    registry.set_replica_reactivation(
+        group,
+        request.token.operation_id,
+        leader.metrics.voter_ids.iter().copied().collect(),
+        identities,
+        required_index,
+    );
+    state.runtime.shutdown_group(group).await?;
+    registry.allow_dynamic_group_hosting(group);
+    state.runtime.warm_group(group).await?;
+    Ok(())
+}
+
+fn replica_reactivation_certificate(
+    snapshot: &ControlPlaneState,
+    group: RaftGroupId,
+    target: u64,
+    leader: &GroupObservation,
+) -> Result<(BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>, u64), ControlHttpError> {
+    if leader.metrics.voter_ids.contains(&target) || leader.metrics.maintenance.membership_joint {
+        return Err(OperationError::InvalidTransition.into());
+    }
+    let mut identities = BTreeMap::new();
+    let mut required_index = 0;
+    for (node_id, replica) in &snapshot.operations.replicas {
+        if let ursula_control::ReplicaState::Active {
+            identity,
+            installed_groups,
+        } = replica
+            && let Some(index) = installed_groups
+                .get(&group)
+                .copied()
+                .filter(|index| *index > 0)
+        {
+            required_index = required_index.max(index);
+            identities.insert(*node_id, identity.clone());
+        }
+    }
+    // Require an explicit target admission. Also import the current survivor
+    // prefix below: on repeated moves its admission may predate a later removal.
+    if !identities.contains_key(&target)
+        || leader
+            .quorum
+            .as_ref()
+            .is_none_or(|proof| proof.required_applied_index < required_index)
+        || identities.iter().any(|(node, identity)| {
+            leader.metrics.installed_replica_identities.get(node) != Some(identity)
+        })
+    {
+        return Err(OperationError::MissingEvidence {
+            raft_group_id: group,
+        }
+        .into());
+    }
+    let proof = leader
+        .quorum
+        .as_ref()
+        .ok_or(ControlHttpError::NoDataLeader { group })?;
+    if leader
+        .metrics
+        .maintenance
+        .membership_log_index
+        .is_none_or(|index| index > proof.required_applied_index)
+    {
+        return Err(OperationError::MissingEvidence {
+            raft_group_id: group,
+        }
+        .into());
+    }
+    required_index = required_index.max(proof.required_applied_index);
+    Ok((identities, required_index))
+}
+
 async fn execute_action(
     state: &HttpState,
     request: ursula_control::ActionRequest,
@@ -799,11 +953,7 @@ async fn execute_action(
         request.action.action,
         ursula_control::MembershipAction::PrepareReplica
     ) {
-        state
-            .raft_registry()
-            .ok_or(ControlHttpError::Unavailable)?
-            .allow_dynamic_group_hosting(request.action.group);
-        state.runtime.warm_group(request.action.group).await?;
+        prepare_replica(state, &snapshot, &request).await?;
         *completed = applied;
         return Ok(ActionResult { fence_index: None });
     }
@@ -1786,6 +1936,100 @@ mod tests {
         state
     }
 
+    #[test]
+    fn reactivation_certificate_covers_later_removal_and_excludes_uncertified_identities() {
+        let mut state = topology();
+        let group = RaftGroupId(0);
+        let replica = |bits| ursula_proto::admin::ReplicaIdentity {
+            generation: 1,
+            incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(bits),
+        };
+        state
+            .operations
+            .replicas
+            .insert(3, ursula_control::ReplicaState::Active {
+                identity: replica(3),
+                installed_groups: BTreeMap::from([(group, 17)]),
+            });
+        state
+            .operations
+            .replicas
+            .insert(4, ursula_control::ReplicaState::Active {
+                identity: replica(4),
+                installed_groups: BTreeMap::new(),
+            });
+        let mut leader = GroupObservation {
+            process: ProcessIdentity {
+                epoch: 1,
+                incarnation: replica(2).incarnation,
+            },
+            metrics: RaftGroupMetrics {
+                apply_failure: None,
+                installed_replica_identities: BTreeMap::from([(3, replica(3))]),
+                raft_group_id: 0,
+                node_id: 2,
+                current_term: Some(2),
+                current_leader: Some(2),
+                committed_index: Some(25),
+                last_applied_index: Some(25),
+                voter_ids: vec![1, 2, 4],
+                learner_ids: vec![3],
+                maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
+                    running: true,
+                    recovery_ready: true,
+                    membership_log_index: Some(24),
+                    ..Default::default()
+                },
+                last_log_index: Some(25),
+                committed_term: Some(2),
+                last_applied_term: Some(2),
+                snapshot_term: None,
+                snapshot_index: None,
+                purged_term: None,
+                purged_index: None,
+                log_bytes_since_snapshot: 0,
+                log_entries_since_snapshot: 0,
+                last_snapshot_bytes: 0,
+                has_snapshot: false,
+            },
+            quorum: Some(QuorumPrefix {
+                raft_group_id: 0,
+                leader_id: 2,
+                leader_term: 2,
+                required_applied_index: 25,
+            }),
+        };
+        let (identities, prefix) =
+            replica_reactivation_certificate(&state, group, 3, &leader).unwrap();
+        assert_eq!(identities, BTreeMap::from([(3, replica(3))]));
+        assert_eq!(prefix, 25, "admission17 must not bypass later removal24");
+        leader.metrics.voter_ids.push(3);
+        assert!(matches!(
+            replica_reactivation_certificate(&state, group, 3, &leader),
+            Err(ControlHttpError::Operation(
+                OperationError::InvalidTransition
+            ))
+        ));
+        leader.metrics.voter_ids.pop();
+        leader.metrics.maintenance.membership_joint = true;
+        assert!(matches!(
+            replica_reactivation_certificate(&state, group, 3, &leader),
+            Err(ControlHttpError::Operation(
+                OperationError::InvalidTransition
+            ))
+        ));
+        leader.metrics.maintenance.membership_joint = false;
+        leader.metrics.maintenance.membership_log_index = Some(26);
+        assert!(matches!(
+            replica_reactivation_certificate(&state, group, 3, &leader),
+            Err(ControlHttpError::Operation(
+                OperationError::MissingEvidence {
+                    raft_group_id: RaftGroupId(0)
+                }
+            ))
+        ));
+    }
+
     #[tokio::test]
     async fn learner_catchup_confirms_a_leader_outside_the_desired_voter_set() {
         let mut state = topology();
@@ -1924,12 +2168,18 @@ mod tests {
             meta.wait_for_current_leader(1, Duration::from_secs(5))
                 .await
                 .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let evidence_url = format!("http://{}", listener.local_addr().unwrap());
             for node_id in [1_u64, 2, 4] {
                 assert_eq!(
                     meta.write(ControlCommand::RegisterNode {
                         node_id,
                         client_url: format!("http://node{node_id}"),
-                        cluster_url: format!("http://node{node_id}"),
+                        cluster_url: if node_id == 4 {
+                            evidence_url.clone()
+                        } else {
+                            format!("http://node{node_id}")
+                        },
                         labels: BTreeMap::new(),
                         now_ms: 1,
                     })
@@ -2030,10 +2280,55 @@ mod tests {
                 ursula_runtime::RuntimeConfig::from_ursula_config(&config.runtime, 1),
             )
             .unwrap();
-            let mut old_http = HttpState::with_raft_registry(runtime.clone(), Default::default())
+            // A previous attempt already prepared/promoted the target but lost
+            // its reply. Serve a real Raft quorum proof for that retry path.
+            let registry = ursula_raft::RaftGroupHandleRegistry::default();
+            let placement = ursula_shard::ShardPlacement {
+                core_id: ursula_shard::CoreId(0),
+                shard_id: ursula_shard::ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            };
+            let wal = ursula_raft::wal::RaftWal::start(
+                dir.path().join("data"),
+                ursula_config::WalFsync::Always,
+                &ursula_shard::StaticShardMap::new(1, 1).unwrap(),
+            )
+            .unwrap();
+            let store = wal
+                .open(
+                    placement,
+                    ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+                )
+                .unwrap();
+            let engine = ursula_raft::RaftGroupEngine::new_single_node(
+                placement,
+                4,
+                openraft::BasicNode::new(evidence_url.clone()),
+                Arc::new(openraft::Config::default().validate().unwrap()),
+                store,
+                ursula_raft::RaftGroupEngineOptions::default(),
+            )
+            .await
+            .unwrap();
+            engine
+                .wait_for_current_leader(4, Duration::from_secs(5))
+                .await
+                .unwrap();
+            registry.register_engine(&engine, None);
+            let mut old_http = HttpState::with_raft_registry(runtime.clone(), registry.clone())
                 .with_meta_control(meta.clone());
             old_http.configured_node_id = Some(4);
             old_http.process_incarnation = receipt.process.incarnation.clone();
+            let served = Arc::new(std::sync::Mutex::new(old_http.clone()));
+            let endpoint = served.clone();
+            let router = axum::Router::new().route(
+                "/__ursula/control/group/0/evidence",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let http = endpoint.lock().unwrap().clone();
+                    async move { evidence(State(http), Path(0), headers).await }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             execute_action(&old_http, ursula_control::ActionRequest {
                 token: token.clone(),
                 action: receipt.clone(),
@@ -2113,10 +2408,11 @@ mod tests {
                 };
                 token = next;
             }
-            let mut http = HttpState::with_raft_registry(runtime.clone(), Default::default())
+            let mut http = HttpState::with_raft_registry(runtime.clone(), registry)
                 .with_meta_control(meta.clone());
             http.configured_node_id = Some(4);
             http.process_incarnation = receipt.process.incarnation.clone();
+            *served.lock().unwrap() = http.clone();
             if restarted == Some(4) || restarted.is_none() {
                 assert!(matches!(
                     execute_action(&http, original).await,
@@ -2151,6 +2447,9 @@ mod tests {
                     .pending_action
                     .is_none()
             );
+            server.abort();
+            server.await.expect_err("evidence listener stopped");
+            engine.shutdown().await.unwrap();
             assert!(runtime.shutdown_owners().await.is_empty());
             meta.shutdown().await.unwrap();
         }

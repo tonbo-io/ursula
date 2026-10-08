@@ -761,6 +761,29 @@ impl RaftGroupStateMachine {
             .await
     }
 
+    pub(crate) async fn restore_replica_reactivation(
+        &self,
+        identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
+        required_index: u64,
+        voters: std::collections::BTreeSet<u64>,
+    ) -> Result<(), crate::replica_fence::ReplicaFencePersistenceError> {
+        let identities = self.replica_fences.merge(identities)?;
+        let recovery =
+            (!voters.is_empty()).then_some(crate::replica_fence::ReplicaRecoveryMembership {
+                voters,
+                required_index,
+            });
+        self.replica_fences
+            .persist_with_recovery(
+                self.metadata_serial.clone(),
+                crate::replica_fence::ReplicaFences::path(self.snapshot_metadata_path.as_ref()),
+                identities,
+                required_index,
+                recovery,
+            )
+            .await
+    }
+
     pub(crate) async fn seed_replica_fences(
         &self,
         identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,

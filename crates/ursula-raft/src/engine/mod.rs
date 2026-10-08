@@ -400,6 +400,23 @@ impl RaftGroupEngine {
                     )
                 })?;
         }
+        if let Some(registry) = &process_authority
+            && let Some(certificate) = registry.replica_reactivation(placement.raft_group_id)
+        {
+            state_machine
+                .restore_replica_reactivation(
+                    certificate.identities,
+                    certificate.required_index,
+                    certificate.voters,
+                )
+                .await
+                .map_err(|error| {
+                    GroupEngineError::backend(
+                        ursula_runtime::BackendOperation::RestoreSnapshot,
+                        error,
+                    )
+                })?;
+        }
         let config = if state_machine.replica_fences.required_index()
             > state_machine
                 .last_applied_log_id

@@ -134,8 +134,7 @@ pub(crate) enum VoteScreen {
     Refuse,
 }
 
-/// The catch-up point from a fresh outbound quorum-confirmed probe. The legacy
-/// RPC bridge uses the leader's last log as a conservative bound.
+/// The catch-up point from a fresh outbound quorum-confirmed probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatchUpTarget {
     leader: UrsulaVote,

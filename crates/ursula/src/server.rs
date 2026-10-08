@@ -387,7 +387,7 @@ async fn init_state(
                     u32::try_from(raw_group_id)
                         .expect("runtime config validates raft group ids fit u32"),
                 );
-                if registry.control_hosts_group(group, config.raft.node_id) == Some(true) {
+                if registry.control_can_open_group(group, config.raft.node_id) == Some(true) {
                     runtime.warm_group(group).await?;
                 }
             }

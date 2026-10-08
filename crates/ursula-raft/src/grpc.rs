@@ -616,7 +616,9 @@ fn validate_replica_leader(
     let admitted = registry.replica_sender_is_voter(group, sender.node_id)
         || continuing_vote.is_some_and(|vote| {
             *vote.leader_id().node_id() == sender.node_id
-                && registry.replica_sender_has_accepted_vote(group, vote)
+                && (registry.replica_sender_has_accepted_vote(group, vote)
+                    || (vote.is_committed()
+                        && registry.replica_sender_is_recovery_voter(group, sender.node_id)))
         });
     if sender.node_id != leader || !admitted {
         return Err(GrpcRpcError::failed_precondition(

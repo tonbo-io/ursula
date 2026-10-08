@@ -180,8 +180,19 @@ struct GroupEntry {
     recovery: Option<Arc<GroupRejoin>>,
 }
 
+/// A control-plane-certified recovery map, installed before reopening a dormant
+/// replica. Unlike genesis, this can advance an existing durable fence map.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicaReactivation {
+    pub operation_id: u64,
+    pub voters: BTreeSet<u64>,
+    pub identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
+    pub required_index: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
+    replica_reactivations: Arc<Mutex<BTreeMap<RaftGroupId, ReplicaReactivation>>>,
     genesis_initialization_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     replica_genesis_prefixes: Arc<Mutex<BTreeMap<RaftGroupId, u64>>>,
     replica_authority: Arc<Mutex<Option<(u64, ursula_proto::admin::ReplicaIdentity)>>>,
@@ -206,6 +217,7 @@ impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
         let (transport_shutdown, _) = watch::channel(false);
         Self {
+            replica_reactivations: Arc::default(),
             genesis_initialization_groups: Arc::default(),
             replica_genesis_prefixes: Arc::default(),
             replica_authority: Arc::default(),
@@ -313,6 +325,39 @@ impl RaftGroupHandleRegistry {
             .expect("replica authority mutex") = Some((node_id, identity));
     }
 
+    /// Authorize an explicit dormant-target reopen. The caller must hold the
+    /// serialized PrepareReplica receipt, verify a fresh uniform survivor
+    /// quorum excludes this target, and supply only committed per-group
+    /// admission certificates, including the target's own admission prefix.
+    /// An already-promoted target may authorize ordinary opening with an empty
+    /// map and zero prefix; active voters must never import a recovery map.
+    pub fn set_replica_reactivation(
+        &self,
+        group: RaftGroupId,
+        operation_id: u64,
+        voters: BTreeSet<u64>,
+        identities: BTreeMap<u64, ursula_proto::admin::ReplicaIdentity>,
+        required_index: u64,
+    ) {
+        self.replica_reactivations
+            .lock()
+            .expect("replica reactivation mutex")
+            .insert(group, ReplicaReactivation {
+                operation_id,
+                voters,
+                identities,
+                required_index,
+            });
+    }
+
+    pub(crate) fn replica_reactivation(&self, group: RaftGroupId) -> Option<ReplicaReactivation> {
+        self.replica_reactivations
+            .lock()
+            .expect("replica reactivation mutex")
+            .get(&group)
+            .cloned()
+    }
+
     /// Only bootstrap may install the immutable genesis map, before opening groups.
     pub fn set_replica_genesis(
         &self,
@@ -394,6 +439,31 @@ impl RaftGroupHandleRegistry {
             // An uninitialized learner must receive its first membership. Its
             // independent recovery gate still forbids voting or campaigning.
             membership.voter_ids().next().is_none() || membership.voter_ids().any(|id| id == node)
+        })
+    }
+
+    /// A freshly certified survivor can deliver the prefix that removed this
+    /// dormant target even when the target's old membership predates that voter.
+    /// This exception expires on apply and never authorizes Vote or Transfer.
+    pub(crate) fn replica_sender_is_recovery_voter(&self, group: RaftGroupId, node: u64) -> bool {
+        self.groups.load().get(&group.0).is_some_and(|entry| {
+            entry
+                .replica_fences
+                .recovery_membership()
+                .is_some_and(|certificate| {
+                    certificate.voters.contains(&node)
+                        && entry.replica_fences.required_index() >= certificate.required_index
+                        && entry
+                            .recovery
+                            .as_ref()
+                            .is_some_and(|gate| !gate.vote_gate_open())
+                        && entry
+                            .raft
+                            .metrics()
+                            .borrow_watched()
+                            .last_applied
+                            .is_none_or(|log| log.index() < certificate.required_index)
+                })
         })
     }
 
@@ -816,6 +886,28 @@ impl RaftGroupHandleRegistry {
                     .and_then(|operation| operation.desired.get(&group))
                     .is_some_and(|voters| voters.contains(&node_id)),
         )
+    }
+
+    /// Pending targets cannot replay obsolete voter membership before their
+    /// serialized preparation installs a current recovery certificate.
+    pub fn control_can_open_group(&self, group: RaftGroupId, node_id: u64) -> Option<bool> {
+        let state = self.control_state()?;
+        if state
+            .placements
+            .get(&group)
+            .is_some_and(|placement| placement.hosts(node_id))
+        {
+            return Some(true);
+        }
+        Some(state.operations.active.as_ref().is_some_and(|operation| {
+            operation
+                .desired
+                .get(&group)
+                .is_some_and(|voters| voters.contains(&node_id))
+                && self.replica_reactivation(group).is_some_and(|certificate| {
+                    certificate.operation_id == operation.token.operation_id
+                })
+        }))
     }
 
     pub fn forget_unhosted_group(&self, group: RaftGroupId, node_id: u64) {

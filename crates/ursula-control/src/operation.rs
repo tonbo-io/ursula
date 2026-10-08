@@ -565,7 +565,7 @@ impl OperationState {
             || evidence.committed_index < committed_index
             || evidence.observed_at_ms > now_ms
             || now_ms.saturating_sub(evidence.observed_at_ms) > EVIDENCE_MAX_AGE_MS
-            || installed <= survivors.len() / 2
+            || installed != survivors.len()
         {
             return Err(missing());
         }
@@ -1223,6 +1223,111 @@ mod tests {
                 })
                 .collect(),
             observed_at_ms: 10,
+        }
+    }
+
+    #[test]
+    fn replica_fence_requires_every_survivor_not_only_a_majority() {
+        let (mut state, mut nodes, mut placements) = setup();
+        nodes.insert(5);
+        state
+            .processes
+            .insert(5, ProcessState::Active(identity(1, 5)));
+        placements.get_mut(&RaftGroupId(0)).unwrap().voters = BTreeSet::from([1, 2, 3, 4]);
+        let admitted = ReplicaIdentity {
+            generation: 1,
+            incarnation: ProcessIncarnation::from_bits(55),
+        };
+        state
+            .apply(
+                OperationCommand::RegisterReplica {
+                    node_id: 5,
+                    process: identity(1, 5),
+                    identity: admitted.clone(),
+                },
+                10,
+                &nodes,
+                &mut placements,
+            )
+            .unwrap();
+        let token = begin(
+            &mut state,
+            &nodes,
+            &mut placements,
+            OperationKind::MoveReplicas {
+                source: 1,
+                target: 5,
+                groups: BTreeSet::from([RaftGroupId(0)]),
+            },
+            &[1, 2, 3, 4, 5],
+        );
+        let OperationOutcome::ActionPrepared(action) = state
+            .apply(
+                OperationCommand::PrepareAction {
+                    token: token.clone(),
+                    group: RaftGroupId(0),
+                    leader: 2,
+                    action: MembershipAction::InstallReplicaIdentity {
+                        node_id: 5,
+                        identity: admitted.clone(),
+                    },
+                },
+                10,
+                &nodes,
+                &mut placements,
+            )
+            .unwrap()
+        else {
+            panic!("action receipt");
+        };
+        for replicas in [&[1, 2, 3][..], &[1, 2, 3, 4][..]] {
+            let mut proof = evidence(&[1, 2, 3, 4], replicas, 100);
+            for replica in proof.replicas.values_mut() {
+                replica
+                    .installed_replica_identities
+                    .insert(5, admitted.clone());
+            }
+            state
+                .apply(
+                    OperationCommand::Observe {
+                        token: token.clone(),
+                        evidence: proof,
+                    },
+                    10,
+                    &nodes,
+                    &mut placements,
+                )
+                .unwrap();
+            let finished = state.apply(
+                OperationCommand::FinishReplicaFence {
+                    token: token.clone(),
+                    sequence: action.sequence,
+                    committed_index: 100,
+                },
+                10,
+                &nodes,
+                &mut placements,
+            );
+            if replicas.len() == 3 {
+                assert!(matches!(
+                    finished,
+                    Err(OperationError::MissingEvidence {
+                        raft_group_id: RaftGroupId(0),
+                    })
+                ));
+                assert_eq!(
+                    state.active.as_ref().unwrap().pending_action.as_ref(),
+                    Some(&action)
+                );
+                assert!(matches!(state.replicas.get(&5), Some(ReplicaState::Active {
+                    installed_groups, ..
+                }) if installed_groups.is_empty()));
+            } else {
+                assert_eq!(finished.unwrap(), OperationOutcome::ActionFinished);
+                assert!(matches!(state.replicas.get(&5), Some(ReplicaState::Active {
+                    installed_groups, ..
+                }) if installed_groups.get(&RaftGroupId(0)) == Some(&100)));
+            }
         }
     }
 

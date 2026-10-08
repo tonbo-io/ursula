@@ -359,7 +359,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
         if let Some(hosts) = self
             .registry
-            .control_hosts_group(placement.raft_group_id, self.node_id)
+            .control_can_open_group(placement.raft_group_id, self.node_id)
         {
             return hosts;
         }
@@ -646,6 +646,62 @@ mod tests {
             }));
             assert!(!factory.should_initialize_membership(RaftGroupId(0)));
         }
+    }
+
+    #[cfg(not(madsim))]
+    #[test]
+    fn pending_target_cannot_open_before_this_operations_explicit_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = factory_for_node(1, &root);
+        let registry = &factory.registry;
+        let group = RaftGroupId(0);
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: group,
+        };
+        let mut state = ursula_control::ControlPlaneState::default();
+        let mut committed = ursula_control::DataGroupPlacement::empty(group);
+        committed.voters = BTreeSet::from([2, 3, 4]);
+        state.placements.insert(group, committed);
+        state.operations.active = Some(ursula_control::MaintenanceOperation {
+            token: ursula_control::OperationToken {
+                operation_id: 1,
+                generation: 1,
+                executor: ursula_proto::admin::ProcessIncarnation::from_bits(1),
+            },
+            kind: ursula_control::OperationKind::MoveReplicas {
+                source: 2,
+                target: 1,
+                groups: BTreeSet::from([group]),
+            },
+            phase: ursula_control::OperationPhase::Preparing,
+            participants: BTreeMap::new(),
+            meta_voters: BTreeSet::new(),
+            previous: BTreeMap::from([(group, BTreeSet::from([2, 3, 4]))]),
+            desired: BTreeMap::from([(group, BTreeSet::from([1, 3, 4]))]),
+            evidence: BTreeMap::new(),
+            prefix_floor: BTreeMap::new(),
+            pending_action: None,
+            last_action_sequence: 0,
+            recovering_processes: BTreeSet::new(),
+        });
+        let (sender, receiver) = tokio::sync::watch::channel(state.clone());
+        registry.set_control_topology(receiver);
+        assert_eq!(registry.control_hosts_group(group, 1), Some(true));
+        assert!(!factory.hosts_group(placement));
+        registry.set_replica_reactivation(group, 1, BTreeSet::from([2, 3, 4]), BTreeMap::new(), 25);
+        assert!(factory.hosts_group(placement));
+        // Neither a process restart nor a later move may reuse old permission.
+        let restarted = crate::RaftGroupHandleRegistry::default();
+        restarted.set_control_topology(sender.subscribe());
+        assert_eq!(restarted.control_can_open_group(group, 1), Some(false));
+        state.operations.active.as_mut().unwrap().token.operation_id = 2;
+        sender.send_replace(state.clone());
+        assert!(!factory.hosts_group(placement));
+        state.placements.get_mut(&group).unwrap().voters.insert(1);
+        sender.send_replace(state);
+        assert!(factory.hosts_group(placement));
     }
 
     #[test]

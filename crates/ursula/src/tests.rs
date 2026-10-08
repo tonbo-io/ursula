@@ -5045,6 +5045,18 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     );
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
     registry.clear_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    // The listener is available before this empty-WAL replica can vote.
+    let metrics = http_get(&app, "/__ursula/metrics").await;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics: ursula_proto::admin::NodeMetrics =
+        serde_json::from_slice(&body_bytes(metrics).await).unwrap();
+    assert!(
+        metrics
+            .diagnostics
+            .recovery_gates
+            .as_ref()
+            .is_some_and(|report| !report.gated.is_empty())
+    );
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();

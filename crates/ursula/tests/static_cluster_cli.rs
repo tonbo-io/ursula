@@ -523,14 +523,21 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     ];
 
     let client = reqwest::Client::new();
+    let phase = std::cell::Cell::new("spawned");
+    // Bound the entire exercise, including any HTTP request/body future. Do
+    // not add request retries: an interrupted append has an unknown outcome.
+    let exercise = tokio::time::timeout(Duration::from_secs(60), async {
+    phase.set("initial readiness");
     for (_, base_url) in &peers {
         wait_until_ready(&client, base_url, &mut children).await;
     }
+    phase.set("create stream");
     put_until_created(
         &client,
         &format!("{}/benchcmp/cli-durable-cluster", peers[0].1),
     )
     .await;
+    phase.set("initial append");
     post_until_no_content(
         &client,
         &format!("{}/benchcmp/cli-durable-cluster", peers[0].1),
@@ -538,6 +545,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     )
     .await;
 
+    phase.set("initial follower read");
     let payload = read_until_replicated(
         &client,
         &format!(
@@ -548,17 +556,61 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     .await;
     assert_eq!(payload, b"cli-durable-cluster-payload");
 
+    // Metrics and forwarded reads do not prove local recovery is complete.
+    // Capture applied (committed) prefixes before faulting this healthy cluster.
+    phase.set("capture healthy cluster prefixes");
+    let mut prefixes = std::collections::BTreeMap::<u64, u64>::new();
+    for (_, url) in &peers {
+        let metrics: ursula_proto::admin::NodeMetrics = client
+            .get(format!("{url}/__ursula/metrics"))
+            .send().await.expect("local metrics")
+            .error_for_status().expect("metrics status")
+            .json().await.expect("typed local metrics");
+        for group in metrics.raft_groups {
+            if let Some(index) = group.last_applied_index {
+                prefixes.entry(group.raft_group_id)
+                    .and_modify(|bound| *bound = (*bound).max(index))
+                    .or_insert(index);
+            }
+        }
+    }
+    assert_eq!(prefixes.keys().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3],
+        "each initialized group must have an actual applied prefix");
+    phase.set("all replicas locally caught up before fault");
+    for (node_id, url) in &peers {
+        loop {
+            let metrics: ursula_proto::admin::NodeMetrics = client
+                .get(format!("{url}/__ursula/metrics"))
+                .send().await.expect("local metrics")
+                .error_for_status().expect("metrics status")
+                .json().await.expect("typed local metrics");
+            let healthy = metrics.diagnostics.recovery_gates.as_ref()
+                .is_some_and(|report| report.gated.is_empty())
+                && prefixes.iter().all(|(group_id, bound)| metrics.raft_groups.iter()
+                    .any(|group| group.raft_group_id == *group_id
+                        && group.node_id == *node_id
+                        && group.voter_ids == [1, 2, 3]
+                        && group.last_applied_index.is_some_and(|index| index >= *bound)));
+            if healthy { break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     // Restart one follower, append while it is absent, then prove the same
     // disk WAL can reopen and catch up without duplicate application.
+    phase.set("stop follower3");
     drop(children.remove(1));
+    phase.set("append while follower3 absent");
     post_until_no_content(
         &client,
         &format!("{}/benchcmp/cli-durable-cluster", peers[0].1),
         "-after-follower-restart",
     )
     .await;
+    phase.set("restart follower3");
     children.push(spawn_node_with_cluster_config(binary, &configs[2]));
     wait_until_ready(&client, &peers[2].1, &mut children).await;
+    phase.set("restarted follower3 catchup read");
     let recovered_payload = read_until_matches(
         &client,
         &format!(
@@ -579,6 +631,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     // disks. Poll for the journal up to ~5s per node before asserting, so the
     // test only fails when a node truly never persists, not when it persists
     // a beat later than the read.
+    phase.set("journal persistence");
     for node_id in 1..=3 {
         let core_dir = root
             .join(format!("node-{node_id}-log"))
@@ -595,6 +648,31 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
         assert!(
             last_len > 0,
             "node {node_id} journal should contain records after polling for ~5s (saw len={last_len})",
+        );
+    }
+
+    }).await;
+    if exercise.is_err() {
+        let diagnostic = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("diagnostic client");
+        let mut metrics = Vec::new();
+        for (_, url) in &peers {
+            let observed = match diagnostic
+                .get(format!("{url}/__ursula/metrics"))
+                .send()
+                .await
+            {
+                Ok(response) => response.text().await,
+                Err(error) => Err(error),
+            };
+            metrics.push((url, observed));
+        }
+        let reports = children.iter().map(child_report).collect::<Vec<_>>();
+        panic!(
+            "durable replication deadline in phase {}; metrics={metrics:#?}; children={reports:#?}",
+            phase.get()
         );
     }
 
@@ -2158,91 +2236,14 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
-    use ursula_control::ControlPlaneState;
+    use lifecycle_support::operation;
+    use lifecycle_support::state;
     use ursula_control::ControlResponse;
     use ursula_control::OperationKind;
     use ursula_control::OperationOutcome;
     use ursula_control::OperationRequest;
     use ursula_proto::admin::ProcessIncarnation;
     use ursula_shard::RaftGroupId;
-
-    async fn state(client: &reqwest::Client, admin: &str) -> ControlPlaneState {
-        client
-            .get(format!("{admin}/__ursula/control/state"))
-            .send()
-            .await
-            .expect("read meta state")
-            .error_for_status()
-            .expect("linearizable meta read")
-            .json()
-            .await
-            .expect("typed meta state")
-    }
-    async fn operation(
-        client: &reqwest::Client,
-        admin: &str,
-        request: OperationRequest,
-        children: &[ChildGuard],
-    ) -> OperationOutcome {
-        if matches!(request, OperationRequest::Reconcile { .. }) {
-            let operator = ursula_ctl::MetricsClient::new(Duration::from_secs(60)).unwrap();
-            let node = ursula_ctl::NodeInfo {
-                id: 1,
-                admin_url: admin.parse().unwrap(),
-                host: "127.0.0.1".into(),
-                http_url: None,
-                metrics_url: None,
-                expected_process_incarnation: None,
-            };
-            return match operator.submit_operation(&node, &request).await {
-                Ok(ControlResponse::Operation(Ok(outcome))) => outcome,
-                result => {
-                    let observed = client
-                        .get(format!("{admin}/__ursula/control/state"))
-                        .send()
-                        .await;
-                    let snapshot = match observed {
-                        Ok(response) => response.text().await,
-                        Err(error) => Err(error),
-                    };
-                    let reports = children.iter().map(child_report).collect::<Vec<_>>();
-                    panic!("{request:?}: {result:?}; control={snapshot:?}; children={reports:#?}");
-                }
-            };
-        }
-
-        // Evidence collection may race follower application of the membership
-        // commit. Retrying this read-and-observe step preserves the same token.
-        for attempt in 0..100 {
-            let response = admin_test_post(client, format!("{admin}/__ursula/control/operation"))
-                .await
-                .json(&request)
-                .send()
-                .await
-                .expect("operation transport");
-            let status = response.status();
-            let body = response.text().await.expect("operation body");
-            let parsed = serde_json::from_str::<ControlResponse>(&body);
-            if matches!(request, OperationRequest::CollectEvidence { .. })
-                && matches!(
-                    &parsed,
-                    Ok(ControlResponse::Operation(Err(
-                        ursula_control::OperationError::MissingEvidence { .. }
-                    )))
-                )
-                && attempt < 99
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            assert!(status.is_success(), "{request:?}: {status}: {body}");
-            return match parsed.expect("typed operation response") {
-                ControlResponse::Operation(Ok(outcome)) => outcome,
-                other => panic!("{request:?}: {other:?}"),
-            };
-        }
-        panic!("evidence retry limit");
-    }
 
     let _guard = static_cluster_cli_test_guard().await;
     let root = tempfile::tempdir().expect("drill root");
@@ -2429,9 +2430,21 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
     .into_iter()
     .enumerate()
     {
-        if matches!(kind, OperationKind::RebuildReplica { .. }) {
-            // Exercise demotion of the actual leader, not only a follower:
-            // retain=true can otherwise leave a learner sending heartbeats.
+        let required_leader = match &kind {
+            OperationKind::RebuildReplica { .. } => Some(2_u64),
+            // Returning node3 has missed node2's replacement fence. Force the
+            // new identity to lead its catchup, rather than letting another
+            // leader conceal an obsolete admission map.
+            OperationKind::MoveReplicas {
+                source: 1,
+                target: 3,
+                ..
+            } => Some(2),
+            // Preserve direct coverage of removing the incumbent leader.
+            OperationKind::DecommissionNode { node_id: 3, .. } => Some(3),
+            _ => None,
+        };
+        if let Some(required_leader) = required_leader {
             let started = std::time::Instant::now();
             loop {
                 let metrics: ursula_proto::admin::NodeMetrics = client
@@ -2447,18 +2460,21 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
                     .iter()
                     .find(|group| group.raft_group_id == 0)
                     .and_then(|group| group.current_leader);
-                if leader == Some(2) {
+                if leader == Some(required_leader) {
                     break;
                 }
                 assert!(
                     started.elapsed() < Duration::from_secs(30),
-                    "source never became leader"
+                    "required node {required_leader} never became leader"
                 );
                 if let Some(leader) = leader {
                     let index = usize::try_from(leader).unwrap().checked_sub(1).unwrap();
                     let response = admin_test_post(
                         &client,
-                        format!("{}/__ursula/raft/0/leader/transfer/2", admins[index]),
+                        format!(
+                            "{}/__ursula/raft/0/leader/transfer/{required_leader}",
+                            admins[index]
+                        ),
                     )
                     .await
                     .send()
@@ -2788,4 +2804,380 @@ async fn cli_meta_authority_boot_restart_move_rebuild_decommission() {
         b"durable-before-maintenance-after-decommission",
     )
     .await;
+}
+
+mod lifecycle_support {
+    use ursula_control::ControlPlaneState;
+    use ursula_control::ControlResponse;
+    use ursula_control::OperationOutcome;
+    use ursula_control::OperationRequest;
+
+    use super::*;
+    pub(super) async fn state(client: &reqwest::Client, admin: &str) -> ControlPlaneState {
+        client
+            .get(format!("{admin}/__ursula/control/state"))
+            .send()
+            .await
+            .expect("read meta state")
+            .error_for_status()
+            .expect("linearizable meta read")
+            .json()
+            .await
+            .expect("typed meta state")
+    }
+    pub(super) async fn operation(
+        client: &reqwest::Client,
+        admin: &str,
+        request: OperationRequest,
+        children: &[ChildGuard],
+    ) -> OperationOutcome {
+        if matches!(request, OperationRequest::Reconcile { .. }) {
+            let operator = ursula_ctl::MetricsClient::new(Duration::from_secs(60)).unwrap();
+            let node = ursula_ctl::NodeInfo {
+                id: 1,
+                admin_url: admin.parse().unwrap(),
+                host: "127.0.0.1".into(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+            };
+            return match operator.submit_operation(&node, &request).await {
+                Ok(ControlResponse::Operation(Ok(outcome))) => outcome,
+                result => {
+                    let observed = client
+                        .get(format!("{admin}/__ursula/control/state"))
+                        .send()
+                        .await;
+                    let snapshot = match observed {
+                        Ok(response) => response.text().await,
+                        Err(error) => Err(error),
+                    };
+                    let reports = children.iter().map(child_report).collect::<Vec<_>>();
+                    panic!("{request:?}: {result:?}; control={snapshot:?}; children={reports:#?}");
+                }
+            };
+        }
+
+        // Evidence collection may race follower application of the membership
+        // commit. Retrying this read-and-observe step preserves the same token.
+        for attempt in 0..100 {
+            let response = admin_test_post(client, format!("{admin}/__ursula/control/operation"))
+                .await
+                .json(&request)
+                .send()
+                .await
+                .expect("operation transport");
+            let status = response.status();
+            let body = response.text().await.expect("operation body");
+            let parsed = serde_json::from_str::<ControlResponse>(&body);
+            if matches!(request, OperationRequest::CollectEvidence { .. })
+                && matches!(
+                    &parsed,
+                    Ok(ControlResponse::Operation(Err(
+                        ursula_control::OperationError::MissingEvidence { .. }
+                    )))
+                )
+                && attempt < 99
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            assert!(status.is_success(), "{request:?}: {status}: {body}");
+            return match parsed.expect("typed operation response") {
+                ControlResponse::Operation(Ok(outcome)) => outcome,
+                other => panic!("{request:?}: {other:?}"),
+            };
+        }
+        panic!("evidence retry limit");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_replica_replacement_waits_for_an_offline_survivor() {
+    use lifecycle_support::operation;
+    use lifecycle_support::state;
+    use ursula_control::OperationKind;
+    use ursula_control::OperationOutcome;
+    use ursula_control::OperationRequest;
+    use ursula_control::ReplicaState;
+    use ursula_proto::admin::NodeMetrics;
+    use ursula_proto::admin::ProcessIncarnation;
+    use ursula_shard::RaftGroupId;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let root = tempfile::tempdir().unwrap();
+    let ports: Vec<_> = (0..5).map(|_| free_port()).collect();
+    let meta_ports: Vec<_> = (0..5).map(|_| free_port()).collect();
+    let peers: Vec<_> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, id)| (id, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let mut configs = Vec::new();
+    let mut admins = Vec::new();
+    for (index, (id, _)) in peers.iter().enumerate() {
+        let config = root.path().join(format!("node-{id}.toml"));
+        let admin = write_cluster_config(
+            &config,
+            ports[index],
+            *id,
+            1,
+            &peers,
+            true,
+            &root.path().join(format!("wal-{id}")),
+        );
+        let mut contents = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace("meta = { enabled = false }\n", "")
+            .replace("flush_interval = \"1s\"", "flush_interval = \"1h\"");
+        contents.push_str(&format!("\n[[raft.groups]]\nraft_group_id = 0\nvoters = [1, 2, 3, 4, 5]\n\n[raft.meta]\nenabled = true\nlisten = \"127.0.0.1:{}\"\nauth_token_file = {:?}\n", meta_ports[index], meta_auth_token_file(&config)));
+        for (port, peer) in meta_ports.iter().zip(1_u64..) {
+            contents.push_str(&format!(
+                "\n[[raft.meta.peers]]\nnode_id = {peer}\nurl = \"http://127.0.0.1:{port}\"\n"
+            ));
+        }
+        std::fs::write(&config, contents).unwrap();
+        configs.push(config);
+        admins.push(format!("http://127.0.0.1:{admin}"));
+    }
+    let binary = env!("CARGO_BIN_EXE_ursula");
+    let mut children: Vec<_> = configs
+        .iter()
+        .map(|config| spawn_node_with_cluster_config(binary, config))
+        .collect();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let phase = std::cell::Cell::new("bootstrap");
+    let exercise = tokio::time::timeout(Duration::from_secs(180), async {
+        for (_, url) in &peers {
+            wait_until_ready(&client, url, &mut children).await;
+        }
+        let stream = format!("{}/meta/offline-survivor", peers[0].1);
+        put_with_body_until_created(&client, &stream, "before-replacement").await;
+        let admin = &admins[0];
+        let before = state(&client, admin).await;
+        let survivor_identity = before.operations.replicas[&5].clone();
+        let OperationOutcome::Acquired(token) = operation(
+            &client,
+            admin,
+            OperationRequest::Begin {
+                kind: OperationKind::RebuildReplica { node_id: 2 },
+                executor: ProcessIncarnation::from_bits(501),
+            },
+            &children,
+        )
+        .await
+        else {
+            panic!("begin rebuild");
+        };
+        operation(
+            &client,
+            admin,
+            OperationRequest::CollectEvidence {
+                token: token.clone(),
+            },
+            &children,
+        )
+        .await;
+        operation(
+            &client,
+            admin,
+            OperationRequest::RetireSource {
+                token: token.clone(),
+            },
+            &children,
+        )
+        .await;
+        children[1].child.kill().unwrap();
+        children[1].child.wait().unwrap();
+        std::fs::remove_dir_all(root.path().join("wal-2")).unwrap();
+        children[1] = spawn_node_with_cluster_config(binary, &configs[1]);
+        phase.set("replacement pending");
+        let replacement = loop {
+            let observed = state(&client, admin).await;
+            if let ReplicaState::Pending { replacement, .. } = &observed.operations.replicas[&2] {
+                break replacement.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        // Three of four survivors remain: enough for data and meta quorums,
+        // but deliberately insufficient for the required all-survivor fence.
+        children[4].child.kill().unwrap();
+        children[4].child.wait().unwrap();
+        let request = admin_test_post(&client, format!("{admin}/__ursula/control/operation"))
+            .await
+            .json(&OperationRequest::Reconcile {
+                token: token.clone(),
+            });
+        let reconcile = tokio::spawn(async move {
+            let response = request.send().await?;
+            let status = response.status();
+            Ok::<_, reqwest::Error>((status, response.text().await?))
+        });
+        phase.set("quorum has fence but offline survivor blocks activation");
+        loop {
+            let mut installed = true;
+            for index in [0, 2, 3] {
+                let metrics: NodeMetrics = client
+                    .get(format!("{}/__ursula/metrics", peers[index].1))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                installed &= metrics.raft_groups.iter().any(|group| {
+                    group.raft_group_id == 0
+                        && group.installed_replica_identities.get(&2) == Some(&replacement)
+                });
+            }
+            if installed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let blocked = state(&client, admin).await;
+        assert!(
+            matches!(&blocked.operations.replicas[&2], ReplicaState::Pending {
+            replacement: current, installed_groups, ..
+        } if current == &replacement && installed_groups.is_empty())
+        );
+        assert!(
+            blocked
+                .operations
+                .active
+                .as_ref()
+                .unwrap()
+                .pending_action
+                .is_some()
+        );
+        phase.set("same-WAL survivor returns");
+        children[4] = spawn_node_with_cluster_config(binary, &configs[4]);
+        wait_until_ready(&client, &peers[4].1, &mut children).await;
+        let attempted = reconcile.await.unwrap();
+        if let Ok((status, body)) = &attempted {
+            assert!(
+                status.is_success() || *status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "unexpected reconcile refusal: {status}: {body}"
+            );
+        }
+        operation(
+            &client,
+            admin,
+            OperationRequest::Reconcile {
+                token: token.clone(),
+            },
+            &children,
+        )
+        .await;
+        let active = state(&client, admin).await;
+        assert_eq!(active.operations.replicas[&5], survivor_identity);
+        let ReplicaState::Active {
+            identity,
+            installed_groups,
+        } = &active.operations.replicas[&2]
+        else {
+            panic!("replacement not active");
+        };
+        assert_eq!(identity, &replacement);
+        let required = installed_groups[&RaftGroupId(0)];
+        phase.set("rebuilt replica becomes leader");
+        loop {
+            let metrics: NodeMetrics = client
+                .get(format!("{}/__ursula/metrics", peers[0].1))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let leader = metrics
+                .raft_groups
+                .iter()
+                .find(|group| group.raft_group_id == 0)
+                .and_then(|group| group.current_leader);
+            if leader == Some(2) {
+                break;
+            }
+            if let Some(leader) = leader {
+                let index = usize::try_from(leader).unwrap().checked_sub(1).unwrap();
+                let response = admin_test_post(
+                    &client,
+                    format!("{}/__ursula/raft/0/leader/transfer/2", admins[index]),
+                )
+                .await
+                .send()
+                .await
+                .unwrap();
+                assert!(
+                    response.status().is_success()
+                        || response.status() == reqwest::StatusCode::CONFLICT
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        phase.set("survivor local prefix and installed identity");
+        loop {
+            let metrics: NodeMetrics = client
+                .get(format!("{}/__ursula/metrics", peers[4].1))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if metrics.raft_groups.iter().any(|group| {
+                group.node_id == 5
+                    && group.voter_ids == [1, 2, 3, 4, 5]
+                    && group
+                        .last_applied_index
+                        .is_some_and(|index| index >= required)
+                    && group.installed_replica_identities.get(&2) == Some(&replacement)
+            }) && metrics
+                .diagnostics
+                .recovery_gates
+                .as_ref()
+                .is_some_and(|gates| gates.gated.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        operation(
+            &client,
+            admin,
+            OperationRequest::CollectEvidence {
+                token: token.clone(),
+            },
+            &children,
+        )
+        .await;
+        assert_eq!(
+            operation(
+                &client,
+                admin,
+                OperationRequest::Complete { token },
+                &children
+            )
+            .await,
+            OperationOutcome::Completed
+        );
+        post_until_no_content(&client, &stream, "-after-replacement").await;
+        read_until_matches(
+            &client,
+            &format!("{}/meta/offline-survivor?offset=-1", peers[4].1),
+            b"before-replacement-after-replacement",
+        )
+        .await;
+    })
+    .await;
+    if exercise.is_err() {
+        let reports = children.iter().map(child_report).collect::<Vec<_>>();
+        panic!(
+            "offline-survivor deadline in {}; children={reports:#?}",
+            phase.get()
+        );
+    }
 }

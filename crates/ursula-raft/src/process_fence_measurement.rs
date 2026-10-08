@@ -117,6 +117,213 @@ async fn installed_replica_fence_rejects_old_identity_without_meta_reads() {
 }
 
 #[tokio::test]
+async fn certified_reactivation_persists_peer_fences_and_gates_old_membership() {
+    let (root, engine, registry) = fixture().await;
+    engine.read_barrier.round().await.unwrap();
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    drop(registry);
+    let placement = ShardPlacement {
+        core_id: CoreId(0),
+        shard_id: ShardId(0),
+        raft_group_id: RaftGroupId(0),
+    };
+    for import_certificate in [true, false] {
+        let wal = crate::log_store::RaftWal::start(
+            root.path(),
+            ursula_config::WalFsync::Always,
+            &ursula_shard::StaticShardMap::new(1, 1).unwrap(),
+        )
+        .unwrap();
+        let registry = crate::RaftGroupHandleRegistry::default();
+        registry.set_replica_authority(1, identity(1, 1));
+        // Genesis cannot refresh an existing map, including this uncertified node5.
+        registry.set_replica_genesis(BTreeMap::from([(1, identity(1, 1)), (5, identity(1, 5))]));
+        if import_certificate {
+            registry.set_replica_reactivation(
+                RaftGroupId(0),
+                3,
+                std::collections::BTreeSet::from([1, 2, 4]),
+                BTreeMap::from([
+                    (1, identity(1, 1)),
+                    (2, identity(5, 22)),
+                    (4, identity(1, 4)),
+                ]),
+                20,
+            );
+        }
+        let store = wal
+            .open(
+                placement,
+                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+            )
+            .unwrap();
+        let gate = Arc::new(
+            crate::GroupRejoin::durable(1, RaftGroupId(0), &store)
+                .await
+                .unwrap(),
+        );
+        let engine = crate::RaftGroupEngine::new_node(
+            placement,
+            1,
+            Arc::new(
+                openraft::Config {
+                    enable_tick: false,
+                    ..Default::default()
+                }
+                .validate()
+                .unwrap(),
+            ),
+            crate::grpc::GrpcRaftNetworkFactory::new(Arc::default(), RaftGroupId(0)),
+            store,
+            crate::RaftGroupEngineOptions {
+                process_authority: Some(registry.clone()),
+                snapshot_metadata_path: Some(root.path().join("group-0.snapshot.json")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine
+            .raft_handle()
+            .wait(Some(std::time::Duration::from_secs(2)))
+            .metrics(
+                |metrics| metrics.membership_config.membership().voter_ids().eq([1]),
+                "restore old voter membership before exercising certificate",
+            )
+            .await
+            .unwrap();
+        gate.set_replica_fence_required_index(engine.replica_fences.required_index());
+        gate.bind(&engine.raft_handle());
+        registry.register_engine(&engine, Some(gate.clone()));
+        assert_eq!(engine.replica_fences.required_index(), 20);
+        assert!(!gate.vote_gate_open());
+        assert!(!gate.may_campaign());
+        for (node_id, replica) in [
+            (1, identity(1, 1)),
+            (2, identity(5, 22)),
+            (4, identity(1, 4)),
+        ] {
+            validate_process_fence(
+                &registry,
+                0,
+                &crate::codec::encode_wire(&FencedProcess {
+                    node_id,
+                    identity: replica,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        for (node_id, replica) in [(2, identity(1, 2)), (5, identity(1, 5))] {
+            let error = validate_process_fence(
+                &registry,
+                0,
+                &crate::codec::encode_wire(&FencedProcess {
+                    node_id,
+                    identity: replica,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        }
+        use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+        let service = crate::grpc::RaftGrpcService::new(registry.clone());
+        for (node_id, replica) in [(2, identity(5, 22)), (4, identity(1, 4))] {
+            assert!(!registry.replica_sender_is_voter(RaftGroupId(0), node_id));
+            let sender = crate::codec::encode_wire(&FencedProcess {
+                node_id,
+                identity: replica,
+            });
+            let request = crate::UrsulaAppendEntriesRequest {
+                vote: crate::UrsulaVote::new_committed(
+                    if import_certificate { 30 } else { 50 },
+                    node_id,
+                ),
+                prev_log_id: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            };
+            let response = service
+                .append(tonic::Request::new(
+                    crate::raft_internal_proto::RaftRpcEnvelopeV1 {
+                        protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                        node_id: 1,
+                        raft_group_id: 0,
+                        payload: crate::codec::encode_wire(&request),
+                        process_identity: sender.clone(),
+                    },
+                ))
+                .await;
+            let ack: openraft::raft::AppendEntriesResponse<crate::UrsulaRaftTypeConfig> =
+                rmp_serde::from_slice(&response.unwrap().into_inner().payload).unwrap();
+            assert!(matches!(
+                ack,
+                openraft::raft::AppendEntriesResponse::Success
+            ));
+            let candidate =
+                crate::UrsulaVoteRequest::new(crate::UrsulaVote::new(40, node_id), None);
+            let error = service
+                .vote(tonic::Request::new(
+                    crate::raft_internal_proto::RaftRpcEnvelopeV1 {
+                        protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                        node_id: 1,
+                        raft_group_id: 0,
+                        payload: crate::codec::encode_wire(&candidate),
+                        process_identity: sender,
+                    },
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        }
+        if import_certificate {
+            let snapshot = registry
+                .build_snapshot_for_transfer(RaftGroupId(0))
+                .await
+                .unwrap();
+            service
+                .full_snapshot(tonic::Request::new(
+                    crate::raft_internal_proto::RaftFullSnapshotRequestV1 {
+                        protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                        node_id: 1,
+                        raft_group_id: 0,
+                        vote: crate::codec::encode_wire(&crate::UrsulaVote::new_committed(31, 4)),
+                        snapshot_meta: crate::codec::encode_wire(&snapshot.meta),
+                        snapshot_payload: snapshot.snapshot.into_inner().into(),
+                        process_identity: crate::codec::encode_wire(&FencedProcess {
+                            node_id: 4,
+                            identity: identity(1, 4),
+                        }),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert_eq!(engine.replica_fences.required_index(), 20);
+            assert!(
+                !gate.may_campaign(),
+                "old snapshot must not lower certified prefix"
+            );
+        }
+        engine.shutdown().await.unwrap();
+        drop(engine);
+        drop(registry);
+    }
+    // Same-generation conflicting certificates fail closed; neither that error
+    // nor an older replay/certificate may replace the already durable identity.
+    let path = root.path().join("group-0.snapshot.replicas.json");
+    let fences = crate::replica_fence::ReplicaFences::load(Some(&path)).unwrap();
+    assert!(matches!(
+        fences.merge(BTreeMap::from([(2, identity(5, 23))])),
+        Err(crate::replica_fence::ReplicaFenceError::Conflict { node_id: 2 })
+    ));
+    let merged = fences.merge(BTreeMap::from([(2, identity(1, 2))])).unwrap();
+    assert_eq!(merged.get(&2), Some(&identity(5, 22)));
+    assert_eq!(fences.required_index(), 20);
+}
+
+#[tokio::test]
 async fn initialized_wal_with_missing_fence_map_cannot_seed_from_meta() {
     let (root, engine, registry) = fixture().await;
     engine.shutdown().await.unwrap();
