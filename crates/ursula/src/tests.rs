@@ -8804,8 +8804,9 @@ async fn self_election_uses_the_observed_vote_and_respects_the_recovery_gate() {
         runtime.clone(),
         registry.clone(),
     ));
+    let observed_term = raft.metrics().borrow_watched().current_term;
     let request = SelfElectionRequest {
-        current_term: raft.metrics().borrow_watched().current_term,
+        current_term: observed_term,
     };
     let response = http_post(
         &admin,
@@ -8815,6 +8816,16 @@ async fn self_election_uses_the_observed_vote_and_respects_the_recovery_gate() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // The observed vote matches the persisted one, so OpenRaft drops the
+    // leader lease and runs a real election: the term advances and the
+    // single voter is elected again.
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.current_term > observed_term && metrics.current_leader == Some(1),
+            "self-election elects a leader in a newer term",
+        )
+        .await
+        .unwrap();
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
     let request = SelfElectionRequest {
         current_term: raft.metrics().borrow_watched().current_term,
