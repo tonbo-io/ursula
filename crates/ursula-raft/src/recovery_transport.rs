@@ -16,7 +16,6 @@ use crate::rejoin::bootstrap_probe_vote;
 pub(crate) struct GrpcRecoveryTransport {
     pub transport: std::sync::Arc<crate::grpc::CoreRaftTransport>,
     pub placement: ShardPlacement,
-    pub node_id: u64,
     pub timeout: Duration,
 }
 impl RecoveryTransport for GrpcRecoveryTransport {
@@ -28,10 +27,7 @@ impl RecoveryTransport for GrpcRecoveryTransport {
             peer,
             &address,
         )
-        .vote(
-            bootstrap_probe_vote(self.node_id),
-            RPCOption::new(self.timeout),
-        )
+        .vote(bootstrap_probe_vote(), RPCOption::new(self.timeout))
         .await
         .ok()
         .map(|response| PeerGroupLog::from_vote_response(&response))

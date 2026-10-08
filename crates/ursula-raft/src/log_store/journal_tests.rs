@@ -44,9 +44,11 @@ use super::RecoveryState;
 use super::RunState;
 use super::RunStatus;
 use super::core_meta::CoreMetadata;
+use super::core_meta::MarkRecoveringError;
 use super::core_meta::core_metadata_path;
 use super::journal::FrameDefect;
 use super::journal::JournalWriter;
+use super::run_state::PreviousRun;
 use super::run_state::RunStateFile;
 use super::segment::SegmentId;
 use super::segment::list_segments;
@@ -138,7 +140,7 @@ impl Core {
 
     fn options(&self, recovery_epoch: u64, node_recovery: RecoveryState) -> CoreJournalOptions {
         CoreJournalOptions {
-            previous_run: super::run_state::PreviousRun::Absent,
+            previous_run: PreviousRun::Absent,
             core: CoreId(0),
             tuning: self.tuning,
             recovery_epoch,
@@ -157,34 +159,35 @@ impl Core {
         }
     }
 
-    /// Opens the journal as a run in `mode` does: strictly in epoch 0, as
-    /// a verified prefix in a later epoch it was not read in.
-    fn open(&self, mode: JournalReplayMode) -> Result<Arc<CoreFileLogWriter>, CoreJournalError> {
-        let recovery_epoch = match mode {
+    /// Opens the journal as the run after `previous_run` does, with the
+    /// replay mode and the node's recovery state that run derives from it.
+    /// A run that reads a verified prefix starts recovery epoch 1, which
+    /// this journal was not read in yet. A recovering run first moves the
+    /// core's initialized groups into recovery, as the node does.
+    fn open_after(
+        &self,
+        previous_run: PreviousRun,
+    ) -> Result<Arc<CoreFileLogWriter>, CoreJournalError> {
+        let recovery_epoch = match previous_run.replay_mode() {
             JournalReplayMode::Strict => 0,
-            JournalReplayMode::VerifiedPrefix if self.tuning.fsync == WalFsync::Never => 1,
-            JournalReplayMode::VerifiedPrefix => 0,
+            JournalReplayMode::VerifiedPrefix => 1,
         };
-        let mut options = self.options(
-            recovery_epoch,
-            if mode == JournalReplayMode::VerifiedPrefix && self.tuning.fsync == WalFsync::Never {
-                RecoveryState::Recovering {
-                    reason: RecoveryReason::HostCrash,
-                }
-            } else {
-                RecoveryState::Normal
-            },
-        );
-        if mode == JournalReplayMode::VerifiedPrefix {
-            options.previous_run = super::run_state::PreviousRun::HostCrash {
-                fsync: self.tuning.fsync,
-            };
+        let recovery = previous_run.recovery_state();
+        if let RecoveryState::Recovering { .. } = recovery {
+            super::core_meta::mark_core_recovering(&core_metadata_path(&self.dir)).map_err(
+                |error| match error {
+                    MarkRecoveringError::Read(source) => CoreJournalError::from(source),
+                    MarkRecoveringError::Write(source) => CoreJournalError::from(source),
+                },
+            )?;
         }
+        let mut options = self.options(recovery_epoch, recovery);
+        options.previous_run = previous_run;
         CoreFileLogWriter::open(self.dir.clone(), options)
     }
 
     fn writer(&self) -> Arc<CoreFileLogWriter> {
-        self.open(JournalReplayMode::Strict)
+        self.open_after(PreviousRun::Absent)
             .expect("open the core writer")
     }
 
@@ -586,12 +589,15 @@ async fn evicted_entries_read_back_from_disk_identical() {
     );
 }
 
-/// Strict recovery reads every segment in order and truncates an
-/// incomplete final frame only in the newest one.
+/// Recovery reads every segment in order and truncates an incomplete final
+/// frame only in the newest one, whether a host crash under `always` reads
+/// the journal strictly or one under `never` reads its verified prefix.
 #[tokio::test]
 async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
-    for mode in [JournalReplayMode::Strict, JournalReplayMode::VerifiedPrefix] {
-        let core = Core::small(WalFsync::Always);
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        let previous_run = PreviousRun::HostCrash { fsync };
+        let mode = previous_run.replay_mode();
+        let core = Core::small(fsync);
         let writer = core.writer();
         let mut store = core.store(&writer, 1);
         for index in 1..=30 {
@@ -606,18 +612,21 @@ async fn a_torn_tail_in_the_newest_segment_is_truncated_in_both_modes() {
         let len = file_len(&core.segment(newest));
         append_raw(&core.segment(newest), &[200, 0, 0, 0, 1, 2]);
 
-        let writer = core.open(mode).expect("recover a torn tail");
+        let writer = core.open_after(previous_run).expect("recover a torn tail");
+        assert_eq!(writer.replay_mode(), mode, "{previous_run:?}");
         let store = core.store(&writer, 1);
         let sibling = core.store(&writer, 2);
-        assert_eq!(
-            store.log_state(),
-            GroupLogState::Initialized,
-            "an unacknowledged partial frame cannot gate a healthy group"
-        );
+        // An unacknowledged partial frame gates no group. Only the host crash
+        // under `never` gates them, for what the page cache may have lost.
+        let expected = match previous_run.recovery_state() {
+            RecoveryState::Normal => GroupLogState::Initialized,
+            RecoveryState::Recovering { .. } => GroupLogState::Recovering,
+        };
+        assert_eq!(store.log_state(), expected, "{mode:?}");
         assert_eq!(
             sibling.log_state(),
-            GroupLogState::Initialized,
-            "a sibling sharing the journal stays available"
+            expected,
+            "{mode:?}: a sibling sharing the journal"
         );
         assert_eq!(
             log_ids(&store).await,
@@ -655,7 +664,7 @@ async fn complete_corruption_under_always_fails_without_changing_any_segment() {
     for configured_fsync in [WalFsync::Always, WalFsync::Never] {
         let mut options = core.options(0, RecoveryState::Normal);
         options.tuning.fsync = configured_fsync;
-        options.previous_run = super::run_state::PreviousRun::HostCrash {
+        options.previous_run = PreviousRun::HostCrash {
             fsync: WalFsync::Always,
         };
         let error = CoreFileLogWriter::open(core.dir.clone(), options)
@@ -755,7 +764,7 @@ async fn newest_tail_is_unchanged_when_persisting_its_recovery_gate_fails() {
     // Atomic metadata publication cannot create its temporary file.
     fs::create_dir(core.dir.join("journal.meta.tmp")).unwrap();
     for _ in 0..2 {
-        let error = core.open(JournalReplayMode::Strict).unwrap_err();
+        let error = core.open_after(PreviousRun::Absent).unwrap_err();
         assert!(matches!(
             journal_error(&error),
             Some(JournalError::Io { .. })
@@ -847,7 +856,7 @@ async fn never_host_crash_repair_remains_gated_when_switching_to_always() {
     let mut options = core.options(1, RecoveryState::Recovering {
         reason: RecoveryReason::HostCrash,
     });
-    options.previous_run = super::run_state::PreviousRun::HostCrash {
+    options.previous_run = PreviousRun::HostCrash {
         fsync: WalFsync::Never,
     };
     options.tuning.fsync = WalFsync::Always;
@@ -872,7 +881,7 @@ async fn an_incomplete_sealed_segment_fails_strict() {
     drop(writer);
     append_raw(&core.segment(1), &[200, 0, 0]);
     let err = core
-        .open(JournalReplayMode::Strict)
+        .open_after(PreviousRun::Absent)
         .expect_err("strict fails closed");
     assert!(
         matches!(
@@ -910,8 +919,10 @@ async fn sealed_corruption_and_missing_segments_fail_without_mutation_under_neve
             .into_iter()
             .map(|id| (id, fs::read(core.segment(id)).unwrap()))
             .collect::<Vec<_>>();
-        for mode in [JournalReplayMode::Strict, JournalReplayMode::VerifiedPrefix] {
-            let error = core.open(mode).unwrap_err();
+        for previous_run in [PreviousRun::Absent, PreviousRun::HostCrash {
+            fsync: WalFsync::Never,
+        }] {
+            let error = core.open_after(previous_run).unwrap_err();
             match (missing, journal_error(&error)) {
                 (
                     true,
@@ -964,7 +975,7 @@ async fn core_file_log_rejects_a_second_owner() {
     let core = Core::small(WalFsync::Always);
     let first = core.writer();
     let err = core
-        .open(JournalReplayMode::Strict)
+        .open_after(PreviousRun::Absent)
         .expect_err("second core owner must fail");
     assert!(
         matches!(&err, CoreJournalError::Locked { owner: Some(owner), .. } if owner.starts_with("pid=")),
@@ -1164,8 +1175,6 @@ async fn a_recovering_leaders_demotion_survives_a_clean_restart() {
 /// A clean stop before any election must not resurrect the old committed vote.
 #[tokio::test]
 async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
-    use super::run_state::PreviousRun;
-
     for fsync in [WalFsync::Always, WalFsync::Never] {
         for previous in [PreviousRun::ProcessCrash, PreviousRun::Clean] {
             let core = Core::small(fsync);

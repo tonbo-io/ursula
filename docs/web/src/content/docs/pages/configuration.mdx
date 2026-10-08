@@ -87,7 +87,12 @@ once, the group has no leader and refuses writes until an operator accepts the
 loss (see [Operations](/docs/operations#recovering-after-a-host-crash)).
 
 With `fsync = "always"`, a host crash loses no acknowledged write. Every batch
-waits for an `fsync`, which costs write latency.
+waits for an `fsync`, which costs write latency. A host crash can still leave a
+complete invalid frame after the last `fsync` in a journal's newest segment.
+Recovery cannot tell it from media corruption, so it gates that core's groups as
+above. A group gated on a majority of its voters, or a single-voter group, then
+waits for an operator although nothing was lost (see
+[Operations](/docs/operations#recovering-after-a-host-crash)).
 
 ## Cold storage
 

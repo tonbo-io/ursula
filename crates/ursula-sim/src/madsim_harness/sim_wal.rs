@@ -163,6 +163,15 @@ impl SimNodeWal {
         SimDisk::power_loss(&self.root).expect("cut the power of a stopped simulated node")
     }
 
+    /// Cuts the node's power after its engines have stopped, and loses
+    /// everything written since the last `fsync`.
+    #[cfg(test)]
+    pub(super) async fn power_loss_losing_unsynced(&self) -> SimPowerLoss {
+        self.stop().await;
+        SimDisk::power_loss_losing_unsynced(&self.root)
+            .expect("cut the power of a stopped simulated node")
+    }
+
     /// Crashes the node's process after its engines have stopped: the page
     /// cache survives.
     #[cfg(test)]

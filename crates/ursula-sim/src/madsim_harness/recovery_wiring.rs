@@ -90,7 +90,7 @@ pub(super) async fn in_process_probe(
         return None;
     }
     registry
-        .vote(peer_id, ursula_raft::bootstrap_probe_vote(node_id))
+        .vote(peer_id, ursula_raft::bootstrap_probe_vote())
         .await
         .ok()
         .map(|response| PeerGroupLog::from_vote_response(&response))

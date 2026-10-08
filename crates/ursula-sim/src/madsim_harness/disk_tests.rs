@@ -729,8 +729,10 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
             cluster.stop_node(victim).await;
             let report = cluster.wals[&victim].power_loss().await;
             cluster.start_node(victim).await;
-            // Every acknowledged append was synced. Strict recovery accepts
-            // an incomplete newest tail but refuses complete corruption.
+            // Every acknowledged append was synced, so the node does not
+            // recover. Sealed segments read strictly, and the newest one keeps
+            // its verified prefix: an incomplete final frame is cut, and a
+            // complete invalid frame is cut after the core's groups are gated.
             assert_opening(
                 cluster.wals[&victim].opening(),
                 PreviousRun::HostCrash {

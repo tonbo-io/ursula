@@ -55,13 +55,25 @@ Ursula ports these techniques instead:
 | --- | --- | --- |
 | Process crash, same boot (OOM, panic, kill) | No loss | No loss: the page cache holds every write |
 | Graceful shutdown | No loss | No loss: shutdown `fsync`s every journal |
-| One voter's host crashes or loses power | No loss | That voter keeps its verified prefix and rejoins through the recovery gate. The other voters hold every acknowledged write. |
-| A majority of voters crash at once | No loss | Writes acknowledged within the unsynced window can be lost. The group stays stopped until an operator accepts that loss. |
+| One voter's host crashes or loses power | No loss. If the crash leaves a complete invalid frame in a core's newest segment, that core's groups rejoin through the recovery gate. | That voter keeps its verified prefix and rejoins through the recovery gate. The other voters hold every acknowledged write. |
+| A majority of voters crash at once | No loss. If the crashes leave a complete invalid frame in the newest segment on a majority of a group's voters, the group stays stopped until an operator accepts a loss, although none happened. | Writes acknowledged within the unsynced window can be lost. The group stays stopped until an operator accepts that loss. |
 | One voter loses its disk | Rejoins empty through the recovery gate | Same |
 
 `never` turns a quorum of simultaneous host crashes from an outage into a
 bounded loss of the most recent writes. Choosing it is an explicit operator
 decision.
+
+`always` can still need the operator call. The newest segment can still hold
+bytes written after the last `fsync`: an unacknowledged batch, or a commit or
+truncate marker. A host crash can leave a complete frame there that fails
+verification, such as a hole, a zero-filled tail or a torn sector inside an
+unacknowledged batch. Recovery cannot tell such a cut from media corruption of
+an acknowledged write, so it gates every group on that core before it cuts the
+frame. That is the safe choice, and it is deliberate. A group whose other
+voters are healthy rejoins without an operator. A single-voter group, or a
+group with a majority of its voters gated together, for example by a rack
+power loss, stays stopped until an operator runs `accept-unsynced-loss`,
+although no acknowledged write was lost.
 
 ## Metadata and run state
 
@@ -98,19 +110,22 @@ treated as an unclean crash.
 | Previous run | Interpretation | Journal read | Recovery gate |
 | --- | --- | --- | --- |
 | No run state, no journal | New node or new disk | None | Bootstrap probe; never initialize a group that a peer reports initialized |
-| No run state, a journal holds records | Unknown history | Verified prefix | Every initialized group |
-| `clean` | Every write was synced | Verified newest tail | Only if a complete invalid frame is cut |
-| `running`, same boot id | Process crash; the page cache survived | Verified newest tail | Only if a complete invalid frame is cut |
+| No run state, a journal holds records | Unknown history | Strict sealed segments, verified newest tail, kept segments rewritten | Every initialized group |
+| `clean` | Every write was synced | Strict sealed segments, verified newest tail | Only if a complete invalid frame is cut |
+| `running`, same boot id | Process crash; the page cache survived | Strict sealed segments, verified newest tail | Only if a complete invalid frame is cut |
 | `running`, other or unknown boot id, policy `always` | Host crash with every acknowledged write fsynced | Strict sealed segments, verified newest tail | Initialized groups if a complete invalid frame is cut |
-| `running`, other or unknown boot id, policy `never` | Host crash; writeback may have left holes | Verified prefix | Every initialized group |
-| `poisoned` | An I/O error stopped the previous run | Verified prefix | Every initialized group |
+| `running`, other or unknown boot id, policy `never` | Host crash; writeback may have left holes | Strict sealed segments, verified newest tail, kept segments rewritten | Every initialized group |
+| `poisoned` | An I/O error stopped the previous run | Strict sealed segments, verified newest tail, kept segments rewritten | Every initialized group |
 
-Sealed segments are always read strictly. Invalid or incomplete sealed frames
-and missing segment sequences fail startup without changing the journal.
-The newest segment keeps only the prefix before the first frame that fails
-verification. Before cutting a complete invalid frame, recovery durably closes the
-core's recovery gates. This rule also applies after a clean or process restart,
-so another crash during startup cannot change the repair policy.
+Sealed segments are always read strictly, whatever the previous run was.
+Invalid or incomplete sealed frames and missing segment sequences fail startup
+without changing the journal. The newest segment keeps only the prefix before
+the first frame that fails verification. Before cutting a complete invalid
+frame, recovery durably closes the core's recovery gates. This rule also
+applies after a clean or process restart, so another crash during startup
+cannot change the repair policy. After a run that may have lost writes, the
+kept segments are also written again and `fsync`ed, because a failed `fsync`
+can leave frames that only the page cache holds.
 
 Recovery uses the previous run's recorded policy, even when configuration has
 changed. The newest segment may contain an unacknowledged
@@ -197,9 +212,19 @@ beside surviving records is also treated as lost vote history.
 This extra admission step applies only to replicas that lost their vote. A
 recovering replica with a retained vote can receive replication immediately.
 Initial cluster bootstrap separately waits for every configured peer to confirm
-empty history and persist its initial floor. The regression
-`a_wiped_voter_never_lets_a_stale_leader_commit` covers both clean and crashed
-old-leader restarts and rejects conflicting entries at the same committed index.
+empty history and persist its initial floor, the vote `(0, 0)`. That floor
+survives a restart like any durable vote: granting a vote or acknowledging a
+leader persists a higher vote first, so a durable `(0, 0)` proves that neither
+happened. A peer that restarts between the initializer's `Initialize` and its
+first vote therefore still votes in the group's first election.
+
+The regression `a_wiped_voter_never_lets_a_stale_leader_commit` reproduces the
+lost vote with a clean restart of the old leader, which still leads with its
+committed vote, and rejects conflicting entries at the same committed index.
+Its process-crash half checks only that the crashed old leader restarts
+demoted, with an uncommitted vote, before it writes. That demotion alone keeps
+the old leader from committing, so the crash half does not exercise the vote
+floor.
 
 ## Journal hardening
 

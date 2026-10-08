@@ -15,6 +15,8 @@
 //!   madsim's deterministic RNG, so a later page can survive while an earlier
 //!   one is lost (writeback reordering, which leaves zero-filled holes), and
 //!   reverts directory operations that were not `fsync`ed.
+//!   [`SimDisk::power_loss_losing_unsynced`] drops every unsynced page, for
+//!   a schedule that needs the loss to happen.
 //! - [`SimDisk::inject_fault`] fails the next write, `fsync` or removal on a
 //!   path. A failed `fsync` marks the pages clean without persisting them, as
 //!   Linux does, so a later successful `fsync` does not make them durable.
@@ -271,21 +273,22 @@ impl Inode {
     }
 
     /// Keeps or drops every unsynced page, then makes the result both the
-    /// durable and the visible contents.
-    fn lose_power(&mut self, report: &mut SimPowerLoss) {
+    /// durable and the visible contents. `reaches_disk` decides, in order,
+    /// whether an unsynced truncation and then each unsynced page landed.
+    fn lose_power(&mut self, reaches_disk: &mut impl FnMut() -> bool, report: &mut SimPowerLoss) {
         if self.dirty.is_empty() && self.data == self.durable {
             return;
         }
         report.files = report.files.saturating_add(1);
         let mut image = self.durable.clone();
-        if self.data.len() < image.len() && madsim::rand::random::<bool>() {
+        if self.data.len() < image.len() && reaches_disk() {
             image.truncate(self.data.len());
         }
         for page in std::mem::take(&mut self.dirty) {
             if self.page_bounds(page).is_none() {
                 continue;
             }
-            if madsim::rand::random::<bool>() {
+            if reaches_disk() {
                 self.copy_page(page, &mut image);
                 report.kept_pages = report.kept_pages.saturating_add(1);
             } else {
@@ -415,7 +418,11 @@ impl DiskState {
         Ok(())
     }
 
-    fn power_loss(&mut self, prefix: &Path) -> Result<SimPowerLoss, SimDiskError> {
+    fn power_loss(
+        &mut self,
+        prefix: &Path,
+        reaches_disk: &mut impl FnMut() -> bool,
+    ) -> Result<SimPowerLoss, SimDiskError> {
         if let Some(lock) = self.locks.iter().find(|lock| lock.starts_with(prefix)) {
             return Err(SimDiskError::NodeRunning {
                 prefix: prefix.to_owned(),
@@ -435,7 +442,7 @@ impl DiskState {
             })
             .collect::<BTreeSet<_>>();
         for inode in inodes {
-            self.inode_mut(inode).lose_power(&mut report);
+            self.inode_mut(inode).lose_power(reaches_disk, &mut report);
         }
 
         let visible = self
@@ -511,7 +518,15 @@ impl SimDisk {
     /// already be stopped. Unsynced pages are kept or dropped page by page and
     /// directory entries revert to their last `fsync`ed state.
     pub fn power_loss(prefix: &Path) -> io::Result<SimPowerLoss> {
-        io_with_disk(|state| state.power_loss(prefix))
+        io_with_disk(|state| state.power_loss(prefix, &mut madsim::rand::random::<bool>))
+    }
+
+    /// Simulates a power loss of the disk under `prefix` in which nothing
+    /// written since the last `fsync` reaches the disk: every unsynced page
+    /// and unsynced truncation is lost, and directory entries revert to their
+    /// last `fsync`ed state. The node must already be stopped.
+    pub fn power_loss_losing_unsynced(prefix: &Path) -> io::Result<SimPowerLoss> {
+        io_with_disk(|state| state.power_loss(prefix, &mut || false))
     }
 
     /// Fails the next write or `fsync` of `path` with an I/O error.

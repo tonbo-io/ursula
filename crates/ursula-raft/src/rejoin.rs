@@ -140,8 +140,8 @@ pub(crate) enum VoteScreen {
     Refuse,
 }
 
-/// The catch-up point from a fresh outbound quorum-confirmed probe. The legacy
-/// RPC bridge uses the leader's last log as a conservative bound.
+/// The catch-up point from a fresh outbound quorum-confirmed barrier: the
+/// leader's committed vote and the commit index the replica must apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatchUpTarget {
     leader: UrsulaVote,
@@ -572,11 +572,10 @@ impl GroupRejoin {
             raft_group_id,
             metrics: OnceLock::new(),
             gate: Mutex::new(gate),
-            vote_floor: Mutex::new(
-                store
-                    .vote()
-                    .filter(|vote| vote.leader_id.term > 0 || vote.is_committed()),
-            ),
+            // Any durable vote is a floor, the genesis `(0, 0)` included:
+            // granting a vote or acknowledging a leader persists a higher
+            // vote first, so a durable `(0, 0)` proves neither happened.
+            vote_floor: Mutex::new(store.vote()),
             reverted: Mutex::new(RevertedFollowers::default()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
@@ -642,18 +641,22 @@ impl GroupRejoin {
         self.recovery_vote().is_some_and(|floor| vote >= floor)
     }
 
+    /// The higher of the floor and the Raft core's current vote, read on
+    /// every inbound AppendEntries and snapshot: only the vote is copied out
+    /// of the metrics.
     pub(crate) fn recovery_vote(&self) -> Option<UrsulaVote> {
         let floor = (*self
             .vote_floor
             .lock()
             .unwrap_or_else(PoisonError::into_inner))?;
-        Some(self.metrics().map_or(floor, |metrics| {
-            if metrics.vote > floor {
-                metrics.vote
-            } else {
-                floor
-            }
-        }))
+        let current = self
+            .metrics
+            .get()
+            .map(|metrics| metrics.borrow_watched().vote);
+        Some(match current {
+            Some(vote) if vote > floor => vote,
+            Some(_) | None => floor,
+        })
     }
 
     pub(crate) async fn establish_vote_floor(
