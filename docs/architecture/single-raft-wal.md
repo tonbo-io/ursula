@@ -99,16 +99,25 @@ treated as an unclean crash.
 | --- | --- | --- | --- |
 | No run state, no journal | New node or new disk | None | Bootstrap probe; never initialize a group that a peer reports initialized |
 | No run state, a journal holds records | Unknown history | Verified prefix | Every initialized group |
-| `clean` | Every write is on disk | Strict | No |
-| `running`, same boot id | Process crash; the page cache survived | Strict | No |
-| `running`, other or unknown boot id, policy `always` | Host crash; every acknowledged write was fsynced | Verified prefix, because committed and truncate markers are unsynced | No |
+| `clean` | Every write was synced | Verified newest tail | Only if a complete invalid frame is cut |
+| `running`, same boot id | Process crash; the page cache survived | Verified newest tail | Only if a complete invalid frame is cut |
+| `running`, other or unknown boot id, policy `always` | Host crash with every acknowledged write fsynced | Strict sealed segments, verified newest tail | Initialized groups if a complete invalid frame is cut |
 | `running`, other or unknown boot id, policy `never` | Host crash; writeback may have left holes | Verified prefix | Every initialized group |
 | `poisoned` | An I/O error stopped the previous run | Verified prefix | Every initialized group |
 
-Strict tolerates only an incomplete final frame; any other corruption fails
-closed. Verified prefix keeps the frames up to the first one that fails
-verification and truncates the rest, and the journal is rewritten before the
-core writes again.
+Sealed segments are always read strictly. Invalid or incomplete sealed frames
+and missing segment sequences fail startup without changing the journal.
+The newest segment keeps only the prefix before the first frame that fails
+verification. Before cutting a complete invalid frame, recovery durably closes the
+core's recovery gates. This rule also applies after a clean or process restart,
+so another crash during startup cannot change the repair policy.
+
+Recovery uses the previous run's recorded policy, even when configuration has
+changed. The newest segment may contain an unacknowledged
+write or an unsynced commit or truncate marker. Recovery keeps its verified
+prefix and records the core's groups as recovering before cutting a complete
+invalid frame. An incomplete newest frame remains recoverable without gating healthy
+groups.
 
 Writeback after a host crash can persist later pages before earlier ones.
 Verification therefore cannot skip a bad frame. Because frame checksums cover
@@ -167,23 +176,30 @@ the S3 initialized markers and the restart guard.
 An acceptance is a compare-and-act on what the operator saw. Its request names
 the replica's last log index and current term, as the group's metrics showed
 them. The replica refuses it with `409 Conflict`, and changes nothing, unless
-its gate is stalled and it still holds that log. A gate that awaits or
+its gate is stalled, it still holds that log, and it has a durable vote floor.
+Accepting unsynced data loss cannot replace lost voting history. A replica
+without a floor must obtain a fresh quorum proof before it can accept
+replication or open its gate. A gate that awaits or
 applies a barrier may still open without losing anything, and a replica whose
 log moved since the operator looked is no longer the one the operator chose.
 The admin incarnation precondition still applies, so a restarted process
 refuses a plan made against the one before it.
 
-### Known gap: a wiped voter accepts appends from a stale leader
+### Lost vote history
 
-The gate screens votes but not appends. A voter that lost its disk also lost
-its vote, so it accepts appends from any leader, including one of a term it
-had already voted past. A leader of an older term that reaches only that
-voter can then commit an entry at an index a newer leader also committed.
-Closing the gap needs the replica to refuse such leaders before its gate
-opens, which this design does not do yet
-([#405](https://github.com/tonbo-io/ursula/issues/405)). The DST schedule that shows it,
-`a_wiped_voter_never_lets_a_stale_leader_commit`, asserts that no index is
-committed with two different entries and stays ignored until then.
+A replica with a missing vote rejects appends, heartbeats and snapshots until
+it establishes a durable vote floor. It asks a reachable leader for the existing
+ReadIndex barrier. Since the replica cannot acknowledge replication yet, that
+proof requires a current quorum without it. The proven vote passes through
+OpenRaft and is persisted before replication is admitted. Missing `journal.meta`
+beside surviving records is also treated as lost vote history.
+
+This extra admission step applies only to replicas that lost their vote. A
+recovering replica with a retained vote can receive replication immediately.
+Initial cluster bootstrap separately waits for every configured peer to confirm
+empty history and persist its initial floor. The regression
+`a_wiped_voter_never_lets_a_stale_leader_commit` covers both clean and crashed
+old-leader restarts and rejects conflicting entries at the same committed index.
 
 ## Journal hardening
 

@@ -522,100 +522,157 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// No index is ever committed with two different entries, and every
 /// acknowledged write survives.
 #[test]
-#[ignore = "#405: a wiped voter can ack a stale leader because the recovery gate screens votes, not appends"]
 fn a_wiped_voter_never_lets_a_stale_leader_commit() {
     let _guard = sim_test_guard();
-    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
-        run_with_madsim(seed, async move {
-            let context = format!("seed {seed}");
-            let group = 0;
-            let mut committed = CommittedEntries::default();
-            let mut cluster =
-                JournalCluster::start_with_fsync("gate-wiped-voter-stale-leader", WalFsync::Always)
-                    .await;
-            for group in JOURNAL_GROUPS {
-                cluster.append(group, 4).await;
-            }
-            let stale_leader = wait_leader(&cluster, group, &context).await;
-            let old_vote = metrics(&cluster, group, stale_leader).vote;
-            let others = NODES
-                .into_iter()
-                .filter(|node_id| *node_id != stale_leader)
-                .collect::<Vec<_>>();
-            for node_id in &others {
-                cluster
-                    .policy
-                    .partition_bidirectional(stale_leader, *node_id);
-            }
-            let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
-            let new_leader = loop {
-                if let Some(leader) = others.iter().copied().find(|node_id| {
-                    let replica = metrics(&cluster, group, *node_id);
-                    replica.state == ServerState::Leader && replica.vote > old_vote
-                }) {
-                    break leader;
-                }
-                assert!(
-                    madsim::time::Instant::now() < deadline,
-                    "{context}: no new leader"
-                );
-                madsim::time::sleep(Duration::from_millis(25)).await;
-            };
-            let wiped = others
-                .iter()
-                .copied()
-                .find(|node_id| *node_id != new_leader)
-                .expect("the other follower");
-            let e_acknowledged = attempt_append(&mut cluster, group, new_leader, b"EEEE;").await
-                == Attempt::Acknowledged;
-            madsim::time::sleep(Duration::from_millis(200)).await;
-            committed.observe(&cluster, group).await;
-
-            // V loses its disk and can reach the stale leader only.
-            cluster.stop_node(wiped).await;
-            cluster.wals.insert(
-                wiped,
-                SimNodeWal::provision_with_fsync(
-                    &format!("gate-wiped-voter-replacement-{wiped}"),
+    for restart_kind in [Restart::Clean, Restart::ProcessCrash] {
+        for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+            run_with_madsim(seed, async move {
+                let context = format!("seed {seed}, stale leader {restart_kind:?}");
+                let group = 0;
+                let mut committed = CommittedEntries::default();
+                let mut cluster = JournalCluster::start_with_fsync(
+                    "gate-wiped-voter-stale-leader",
                     WalFsync::Always,
-                ),
-            );
-            cluster.policy.partition_bidirectional(wiped, new_leader);
-            cluster.policy.heal_bidirectional(wiped, stale_leader);
-            cluster.start_node(wiped).await;
+                )
+                .await;
+                for group in JOURNAL_GROUPS {
+                    cluster.append(group, 4).await;
+                }
+                let stale_leader = wait_leader(&cluster, group, &context).await;
+                let old_vote = metrics(&cluster, group, stale_leader).vote;
+                let others = NODES
+                    .into_iter()
+                    .filter(|node_id| *node_id != stale_leader)
+                    .collect::<Vec<_>>();
+                for node_id in &others {
+                    cluster
+                        .policy
+                        .partition_bidirectional(stale_leader, *node_id);
+                }
+                let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
+                let new_leader = loop {
+                    if let Some(leader) = others.iter().copied().find(|node_id| {
+                        let replica = metrics(&cluster, group, *node_id);
+                        replica.state == ServerState::Leader && replica.vote > old_vote
+                    }) {
+                        break leader;
+                    }
+                    assert!(
+                        madsim::time::Instant::now() < deadline,
+                        "{context}: no new leader"
+                    );
+                    madsim::time::sleep(Duration::from_millis(25)).await;
+                };
+                let wiped = others
+                    .iter()
+                    .copied()
+                    .find(|node_id| *node_id != new_leader)
+                    .expect("the other follower");
+                let e_acknowledged = attempt_append(&mut cluster, group, new_leader, b"EEEE;")
+                    .await
+                    == Attempt::Acknowledged;
+                assert!(
+                    e_acknowledged,
+                    "{context}: E must be acknowledged before losing V"
+                );
+                madsim::time::sleep(Duration::from_millis(200)).await;
+                committed.observe(&cluster, group).await;
 
-            // The stale leader's process restarts.
-            cluster.stop_node(stale_leader).await;
-            cluster.wals[&stale_leader].process_crash().await;
-            cluster.start_node(stale_leader).await;
-            madsim::time::sleep(Duration::from_millis(500)).await;
-            let x_acknowledged = attempt_append(&mut cluster, group, stale_leader, b"XXXX;").await
-                == Attempt::Acknowledged;
-            madsim::time::sleep(Duration::from_millis(200)).await;
-            committed.observe(&cluster, group).await;
-            committed.assert_consistent(&context);
+                // V loses its disk and can reach the stale leader only.
+                cluster.stop_node(wiped).await;
+                cluster.wals.insert(
+                    wiped,
+                    SimNodeWal::provision_with_fsync(
+                        &format!("gate-wiped-voter-replacement-{wiped}"),
+                        WalFsync::Always,
+                    ),
+                );
+                cluster.policy.partition_bidirectional(wiped, new_leader);
+                cluster.policy.heal_bidirectional(wiped, stale_leader);
+                cluster.start_node(wiped).await;
 
-            // Everything heals and the group converges.
-            cluster.policy.clear();
-            madsim::time::sleep(Duration::from_secs(5)).await;
-            let final_leader = wait_leader(&cluster, group, &context).await;
-            assert_eq!(
-                attempt_append(&mut cluster, group, final_leader, b"after;").await,
-                Attempt::Acknowledged,
-                "{context}: the healed group accepts no write"
-            );
-            madsim::time::sleep(Duration::from_millis(500)).await;
-            committed.observe(&cluster, group).await;
-            committed.assert_consistent(&context);
-            let stream = read_local(&cluster, group, final_leader).await;
-            assert!(
-                !e_acknowledged || contains(&stream, b"EEEE;"),
-                "{context}: the acknowledged write E was lost"
-            );
-            assert!(
-                !x_acknowledged || contains(&stream, b"XXXX;"),
-                "{context}: the acknowledged write X was lost"
-            );
-        });
+                // Lost vote history is not an operator-accepted log-tail loss.
+                let stalled_by = madsim::time::Instant::now() + RECOVERY_STALL_AFTER * 3;
+                while gate(&cluster, group, wiped) != RecoveryGateStatus::Stalled {
+                    assert!(
+                        madsim::time::Instant::now() < stalled_by,
+                        "{context}: wiped replica never reported stalled"
+                    );
+                    madsim::time::sleep(Duration::from_millis(25)).await;
+                }
+                let admin = ursula_raft::RaftGroupHandleRegistry::default();
+                admin.register(
+                    group_placement(group),
+                    cluster.engines[&(group, wiped)].raft_handle(),
+                );
+                admin.register_rejoin(RaftGroupId(group), cluster.rejoins[&(group, wiped)].clone());
+                let seen = metrics(&cluster, group, wiped);
+                let error = admin
+                    .accept_unsynced_loss(RaftGroupId(group), &AcceptUnsyncedLossRequest {
+                        expected_last_log_index: seen.last_log_index,
+                        expected_current_term: seen.current_term,
+                    })
+                    .await
+                    .expect_err(
+                        "the production admin entry point must reject unknown vote history",
+                    );
+                assert!(
+                    matches!(error, RecoveryGateError::MissingVoteFloor { raft_group_id } if raft_group_id == RaftGroupId(group)),
+                    "{context}: {error:?}"
+                );
+                assert_eq!(gate(&cluster, group, wiped), RecoveryGateStatus::Stalled);
+                assert!(!cluster.rejoins[&(group, wiped)].vote_gate_open());
+                drop(admin);
+
+                // A clean restart retains its committed self vote. Cover this
+                // separately: crash demotion alone can mask the lost-voter bug.
+                restart(&mut cluster, stale_leader, restart_kind).await;
+                madsim::time::sleep(Duration::from_millis(500)).await;
+                if matches!(restart_kind, Restart::Clean) {
+                    let stale = metrics(&cluster, group, stale_leader);
+                    assert_eq!(
+                        stale.state,
+                        ServerState::Leader,
+                        "{context}: clean old L must still lead before X"
+                    );
+                    assert_eq!(
+                        stale.vote, old_vote,
+                        "{context}: old L must retain the original stale vote"
+                    );
+                }
+                let x_acknowledged = attempt_append(&mut cluster, group, stale_leader, b"XXXX;")
+                    .await
+                    == Attempt::Acknowledged;
+                madsim::time::sleep(Duration::from_millis(200)).await;
+                committed.observe(&cluster, group).await;
+                committed.assert_consistent(&context);
+
+                // Everything heals and the group converges.
+                cluster.policy.clear();
+                madsim::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    metrics(&cluster, group, stale_leader).vote > old_vote,
+                    "{context}: the stale leadership must end after encountering the newer vote"
+                );
+                let final_leader = wait_leader(&cluster, group, &context).await;
+                assert_eq!(
+                    attempt_append(&mut cluster, group, final_leader, b"after;").await,
+                    Attempt::Acknowledged,
+                    "{context}: the healed group accepts no write"
+                );
+                madsim::time::sleep(Duration::from_millis(500)).await;
+                committed.observe(&cluster, group).await;
+                committed.assert_consistent(&context);
+                let stream = read_local(&cluster, group, final_leader).await;
+                assert!(
+                    !e_acknowledged || contains(&stream, b"EEEE;"),
+                    "{context}: the acknowledged write E was lost"
+                );
+                assert!(
+                    !x_acknowledged || contains(&stream, b"XXXX;"),
+                    "{context}: the acknowledged write X was lost"
+                );
+            });
+        }
     }
 }

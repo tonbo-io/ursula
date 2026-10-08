@@ -8,17 +8,25 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::time::Duration;
 
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotStoreError;
 
 use crate::rt::sync::Mutex as AsyncMutex;
+use crate::rt::time::Instant;
 
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotReferences {
-    serial: AsyncMutex<()>,
+    serial: AsyncMutex<PublicationRetry>,
     state: Mutex<ReferenceState>,
+}
+
+#[derive(Debug, Default)]
+struct PublicationRetry {
+    failures: u32,
+    not_before: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -109,7 +117,10 @@ impl SnapshotReferences {
         store: &SharedSnapshotStore,
         group: u32,
     ) -> Result<(), SnapshotStoreError> {
-        let _serial = self.serial.lock().await;
+        let mut retry = self.serial.lock().await;
+        if let Some(not_before) = retry.not_before {
+            crate::rt::time::sleep_until(not_before).await;
+        }
         let (known, current) = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             (state.current_known, state.current.clone())
@@ -132,6 +143,18 @@ impl SnapshotReferences {
             .unwrap_or_else(PoisonError::into_inner)
             .retained();
         let cleanup = store.reconcile_reference_pins(group, &retained).await;
-        publication.and(cleanup)
+        let result = publication.and(cleanup);
+        if result.is_err() {
+            retry.failures = retry.failures.saturating_add(1);
+            let delay = Duration::from_millis(
+                100_u64
+                    .saturating_mul(2_u64.saturating_pow(retry.failures.saturating_sub(1).min(6))),
+            )
+            .min(Duration::from_secs(5));
+            retry.not_before = Instant::now().checked_add(delay);
+        } else {
+            *retry = PublicationRetry::default();
+        }
+        result
     }
 }

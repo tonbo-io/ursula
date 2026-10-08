@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
@@ -741,6 +742,8 @@ pub struct StreamEngineError {
 /// structured source, so it keeps an owned `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
+    #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
+    RecoveryVoteFloor { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]
     OwnerStopped,
     #[error("write outcome is unknown; the proposal may have committed")]

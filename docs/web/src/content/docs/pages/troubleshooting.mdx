@@ -106,16 +106,22 @@ once a leader is reachable. See
 A gated group on this node has seen no leader barrier and applied nothing for
 `30s`. A majority of the group's voters are probably gated, so the group has no
 leader and refuses writes. The groups are listed under
-`recovery_stalled_groups`. The group recovers only when an operator accepts the
-loss of writes acknowledged after the last `fsync`, with
+`recovery_stalled_groups`. Restore connectivity to a healthy quorum first.
+If the stalled replicas retain their voting history, an operator can accept
+the loss of writes acknowledged after the last `fsync`, with
 `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated
-replicas with the longest logs. The request body names the replica's
+replicas with the longest logs. A replica without a durable vote floor
+refuses this call and still needs a fresh quorum proof. The request body names the replica's
 `last_log_index` and `current_term` from `/__ursula/metrics`. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### `accept-unsynced-loss` answers `409 Conflict`
 
-Nothing changed. The body says why. Either the replica's recovery gate is not
+Nothing changed. A replica that lost its voting history must first obtain a
+durable vote floor from a fresh quorum proof; the call cannot bypass that
+requirement. Restore connectivity to intact voters.
+
+The call also refuses when the replica's recovery gate is not
 stalled, so it may still open through a leader's barrier without losing
 anything, or the replica no longer holds the `last_log_index` and
 `current_term` the request names. Wait for `recovery_stalled`, read

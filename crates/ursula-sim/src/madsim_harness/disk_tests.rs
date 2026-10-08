@@ -729,14 +729,14 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
             cluster.stop_node(victim).await;
             let report = cluster.wals[&victim].power_loss().await;
             cluster.start_node(victim).await;
-            // Unsynced replay hints can leave holes, so the journals are read
-            // as a verified prefix, but every acknowledged append was synced.
+            // Every acknowledged append was synced. Strict recovery accepts
+            // an incomplete newest tail but refuses complete corruption.
             assert_opening(
                 cluster.wals[&victim].opening(),
                 PreviousRun::HostCrash {
                     fsync: WalFsync::Always,
                 },
-                JournalReplayMode::VerifiedPrefix,
+                JournalReplayMode::Strict,
                 RecoveryState::Normal,
                 &format!("seed {seed}"),
             );
@@ -744,10 +744,7 @@ fn power_loss_restart_keeps_every_acknowledged_write() {
                 let store = cluster.wals[&victim]
                     .store(RaftGroupId(group))
                     .expect("running store");
-                assert_eq!(
-                    store.journal_replay_mode(),
-                    JournalReplayMode::VerifiedPrefix
-                );
+                assert_eq!(store.journal_replay_mode(), JournalReplayMode::Strict);
             }
             let after = cluster.durable_logs(victim).await;
             for group in JOURNAL_GROUPS {
@@ -1129,8 +1126,18 @@ enum RunStateAfterPowerLoss {
 /// how a store reopened then fared.
 async fn reopen_after_a_reordered_unsynced_tail(
     run_state: RunStateAfterPowerLoss,
-) -> (DurableGroupLog, WalOpening, Result<DurableGroupLog, String>) {
-    let wal = SimNodeWal::provision("unsynced-tail");
+) -> (
+    DurableGroupLog,
+    WalOpening,
+    Result<DurableGroupLog, String>,
+    bool,
+) {
+    // The simulator defaults to one-page segments, whose rotation fsync
+    // prevents multi-page holes. Keep this entire unacknowledged tail active.
+    let wal = SimNodeWal::provision_with_tuning("unsynced-tail", JournalTuning {
+        segment_bytes: 1024 * 1024,
+        ..JournalTuning::new(WalFsync::Always)
+    });
     let placement = group_placement(0);
     let metrics = standalone_wal_metrics(placement);
     let mut engine = RaftGroupEngine::new_single_node_on_log_store(
@@ -1154,51 +1161,79 @@ async fn reopen_after_a_reordered_unsynced_tail(
     // Committed markers are journaled without an fsync.
     let mut store = wal.open(placement, metrics.clone()).await;
     let synced = DurableGroupLog::read(&store).await;
-    let (first, last) = (
-        *synced.log_ids.first().expect("synced entries"),
-        *synced.log_ids.last().expect("synced entries"),
-    );
-    for marker in 0..256 {
-        let committed = if marker % 2 == 0 { first } else { last };
+    let last = *synced.log_ids.last().expect("synced entries");
+    for marker in 0..4096 {
+        // The compacted log may retain only one entry. Alternate None/Some
+        // so every marker is distinct instead of silently deduplicating.
+        let committed = if marker % 2 == 0 { None } else { Some(last) };
         store
-            .save_committed(Some(committed))
+            .save_committed(committed)
             .await
             .expect("journal a committed marker");
     }
     drop(store);
     let report = wal.power_loss().await;
+    assert!(
+        report.kept_pages + report.dropped_pages >= 4,
+        "multiple dirty pages: {report:?}"
+    );
+    let bytes = SimDisk::read(&active_segments(wal.root())[0]).unwrap();
+    let hole = bytes
+        .chunks(PAGE)
+        .any(|page| page.len() == PAGE && page.iter().all(|byte| *byte == 0));
     if let RunStateAfterPowerLoss::Removed = run_state {
         SimDisk::remove_file(&wal.root().join(RUN_STATE_FILE)).expect("remove the run state");
     }
     let opening = wal.opening();
     let reopened = match wal.try_open(placement, metrics).await {
-        Ok(store) => Ok(DurableGroupLog::read(&store).await),
+        Ok(store) => {
+            let recovered = DurableGroupLog::read(&store).await;
+            if hole {
+                assert_eq!(
+                    store.log_state(),
+                    GroupLogState::Recovering,
+                    "a complete invalid tail must close the durable recovery gate: {report:?}"
+                );
+                assert!(
+                    !GroupRejoin::durable(1, placement.raft_group_id, &store)
+                        .await
+                        .unwrap()
+                        .vote_gate_open()
+                );
+            }
+            Ok(recovered)
+        }
         Err(err) => Err(format!("{report:?}: {}", err.message())),
     };
-    (synced, opening, reopened)
+    (synced, opening, reopened, hole)
 }
 
 const UNSYNCED_TAIL_SEEDS: [u64; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-/// A reordered writeback of unsynced committed markers can leave a hole
-/// that strict recovery refuses (`log_store` unit tests cover the refusal).
-/// After the power loss the run state selects the verified prefix, even
-/// under `always`, which recovers every synced entry and the vote.
+/// A multi-page unsynced tail may contain zero holes after power loss.
+/// Only the newest segment is repaired, with a durable recovery gate;
+/// every acknowledged entry and the vote must survive.
 #[test]
-fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tail() {
+fn gated_newest_tail_repair_keeps_every_acknowledged_write_after_reordered_pages() {
     let _guard = sim_test_guard();
+    let mut holes = 0;
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
-        let (synced, opening, reopened) = run_with_madsim(
+        let (synced, opening, reopened, hole) = run_with_madsim(
             seed,
             reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Kept),
         );
-        assert_eq!(opening.replay_mode, JournalReplayMode::VerifiedPrefix);
+        holes += usize::from(hole);
+        assert_eq!(opening.replay_mode, JournalReplayMode::Strict);
         assert_eq!(
             reopened.unwrap_or_else(|err| panic!("seed {seed}: {err}")),
             synced,
             "seed {seed}"
         );
     }
+    assert!(
+        holes > 0,
+        "the schedules must exercise a complete zero hole"
+    );
 }
 
 /// A run state removed while the journal holds records says nothing about
@@ -1209,7 +1244,7 @@ fn verified_prefix_recovery_keeps_every_acknowledged_write_after_a_reordered_tai
 fn a_removed_run_state_still_reads_the_journal_as_a_verified_prefix() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("UNSYNCED_TAIL_SEEDS", &UNSYNCED_TAIL_SEEDS) {
-        let (synced, opening, reopened) = run_with_madsim(
+        let (synced, opening, reopened, _hole) = run_with_madsim(
             seed,
             reopen_after_a_reordered_unsynced_tail(RunStateAfterPowerLoss::Removed),
         );

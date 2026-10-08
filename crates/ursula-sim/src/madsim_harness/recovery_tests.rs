@@ -926,9 +926,9 @@ fn bootstrap_with_absent_peers_advances_time_and_recovers_when_they_arrive() {
 #[test]
 fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
     let _guard = sim_test_guard();
-    // With owner mailbox dispatch, seed 5 drops both tails. Keep the loss and
-    // joint-membership preconditions asserted so scheduling drift cannot skip the scenario.
-    for seed in seeds_from_env("JOINT_LOSS_SEEDS", &[5]) {
+    // The read-only genesis readiness handshake shifts the deterministic schedule:
+    // seed 7 drops both tails. Keep both loss and pending-joint preconditions asserted.
+    for seed in seeds_from_env("JOINT_LOSS_SEEDS", &[7]) {
         run_with_madsim(seed, async move {
             let mut cluster =
                 JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;

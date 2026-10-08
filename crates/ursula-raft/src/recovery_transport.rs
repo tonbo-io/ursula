@@ -44,7 +44,6 @@ impl RecoveryTransport for GrpcRecoveryTransport {
         probe_rejoin_vote_barrier(
             self.transport.clone(),
             self.placement,
-            self.node_id,
             leader,
             &address,
             crate::rejoin::RECOVERY_BARRIER_TIMEOUT,

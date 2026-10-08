@@ -118,20 +118,18 @@ durable before any frame goes to it. Every older segment is therefore complete
 on disk under either fsync policy, and a crash can only cut the newest one
 short.
 
-Replay reads the segments in order and has two modes:
+Replay reads sealed segments strictly under both fsync policies. Invalid
+frames, incomplete sealed frames and missing segment sequences fail recovery
+without changing the journal. Rotation fsyncs a segment before sealing it.
 
-- `Strict` tolerates only an incomplete final frame of the newest segment,
-  which it truncates, and a newest segment without a whole header (a rotation
-  a crash cut short), which it removes. Any other frame that fails
-  verification, an incomplete frame at the end of an older segment, or a
-  missing sequence fails recovery with the segment, frame number and offset.
-- `VerifiedPrefix` keeps the frames before the first one that fails
-  verification, in whatever segment, and drops the rest of that segment and
-  every later segment. It removes the later segments and `fsync`s the
-  directory before it truncates that segment, so a second crash cannot bring
-  them back after a shorter segment and replay them over a hole.
+The newest segment can contain writes that were never acknowledged. Recovery
+can keep its verified prefix when its tail fails validation, but records the
+core's groups as recovering before truncating an invalid frame. An incomplete
+final frame or torn newest header can be removed without introducing a new
+recovery gate.
 
-Startup recovery picks the mode from the run state (below). A journal read as a
+These segment rules apply on every startup, including a retry after startup
+failed. The run state also determines the recovery epoch (below). A journal read as a
 verified prefix is always rewritten: each kept segment is copied to a new file
 with the same contents, synced and renamed over the old one, so every frame it
 keeps is on disk before the core writes again, even a frame whose `fsync`
@@ -215,22 +213,24 @@ length and a CRC32, and a damaged file fails startup.
 
 At startup the node reads the run state, decides how to read the journals,
 and durably records itself as `running` with the current boot id before any
-journal write:
+journal write. The replay classification controls recovery epochs and
+rewriting. Both classifications validate sealed segments strictly and repair
+only the newest tail:
 
-| Previous run | Replay | Recovery state |
+| Previous run | Replay classification | Recovery state |
 | --- | --- | --- |
 | No run state, no core journal holds a record | `Strict` | normal |
 | No run state, a core journal holds records | `VerifiedPrefix` | recovering (unknown history) |
-| `clean` | `Strict` | normal |
-| `running`, same boot id (process crash) | `Strict` | normal |
-| `running`, other or unknown boot id (host crash), policy `always` | `VerifiedPrefix` | normal |
+| `clean` | `Strict` | normal unless an invalid newest tail is repaired |
+| `running`, same boot id (process crash) | `Strict` | normal unless an invalid newest tail is repaired |
+| `running`, other or unknown boot id (host crash), policy `always` | `Strict` | normal unless an invalid newest tail is repaired |
 | `running`, other or unknown boot id (host crash), policy `never` | `VerifiedPrefix` | recovering |
 | `poisoned` | `VerifiedPrefix` | recovering |
 
-A host crash needs the verified prefix even under `always`, because committed
-and truncate markers are written without `fsync` and writeback can leave a
-hole before acknowledged frames. A run that starts after a host crash or a
-poisoned run begins a new recovery epoch. Cores open lazily, so a core whose
+Even under `always`, committed and truncate markers are written without
+`fsync`, and an unacknowledged batch may leave an invalid newest tail. A host
+crash under `never`, an unknown history or a poisoned run begins a new recovery
+epoch. Cores open lazily, so a core whose
 metadata shows an older epoch has not been read since the crash and is still
 read as a verified prefix, however the runs in between ended.
 
@@ -296,8 +296,10 @@ group stalled: a majority of the voters may be gated, so the group has no
 leader and refuses writes. Readiness answers `recovery_stalled`, and
 `recovery_gates` in the metrics JSON and the `ursula.raft.recovery_gates`
 gauge list it. `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
-opens the gate on one stalled replica whose `last_log_index` and
-`current_term` still match the request body, recording `initialized`; run on
+opens the gate on one stalled replica with a durable vote floor whose
+`last_log_index` and `current_term` still match the request body, recording
+`initialized`. A replica that lost its vote must obtain a fresh quorum proof
+first. Accepting unsynced data loss never supplies a default floor. Run on
 the gated replicas with the longest logs until the open ones are a majority,
 an election then needs a candidate whose log is at least as long as theirs.
 

@@ -27,8 +27,9 @@
 //!   goes through. It still accepts appends from any leader whose vote is
 //!   not lower than its persisted vote; the WAL restores that vote before
 //!   the Raft core starts, so a leader of an older term is refused. A
-//!   replica that lost its disk lost its vote too and accepts appends from
-//!   any leader, a known gap the gate does not close.
+//!   replica that lost its vote refuses all replication ACKs until a fresh
+//!   ReadIndex quorum excluding it proves a vote that is durably adopted.
+//!   Older votes receive HigherVote so stale leaders step down.
 //! - **Opening the gate** ([`run_rejoin_vote_barrier`]): the replica asks
 //!   the current leader for a fresh outbound ReadIndex barrier and opens the
 //!   gate once it has applied the barrier's committed index. Inbound
@@ -50,10 +51,9 @@
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   configured voter answers a probe `Vote` with an empty log and no
-//!   leader. The probe carries the lowest possible vote (term 0, the
-//!   prober's id) and no log. A peer that holds the group refuses it; a peer
-//!   with no vote yet may grant it, which only records a term-0 vote that
-//!   `Initialize` overwrites. A replica that ever held the group never runs
+//!   leader and has persisted its genesis floor. The reserved T0-N0 probe
+//!   is read-only; its grant bit reports this readiness. A replica that ever
+//!   held the group never runs
 //!   `Initialize`.
 //!
 //! If a majority of a group's voters are gated, no leader can confirm a
@@ -62,7 +62,7 @@
 //! accepts the loss of the unsynced tail opens the gate on enough replicas
 //! ([`GroupRejoin::accept_unsynced_loss`]); a normal election then needs a
 //! candidate whose log is at least as long as each of theirs. An acceptance
-//! opens only a stalled gate, and only while the replica still holds the log
+//! opens only a stalled gate with a known vote floor, and only while the replica still holds the log
 //! the operator saw: a gate that awaits or applies a barrier may still open
 //! without losing anything.
 
@@ -453,6 +453,8 @@ pub enum RecoveryGateError {
     NotRegistered { raft_group_id: RaftGroupId },
     #[error("raft group {} has stopped: its log store is closed", .raft_group_id.0)]
     StoreClosed { raft_group_id: RaftGroupId },
+    #[error("raft group {} lost its vote history; accepting an unsynced log tail cannot restore it", .raft_group_id.0)]
+    MissingVoteFloor { raft_group_id: RaftGroupId },
     #[error("record that raft group {}'s recovery gate opened: {source}", .raft_group_id.0)]
     Record {
         raft_group_id: RaftGroupId,
@@ -499,6 +501,7 @@ pub struct GroupRejoin {
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
+    vote_floor: Mutex<Option<UrsulaVote>>,
     reverted: Mutex<RevertedFollowers>,
     /// The group's log store, which keeps its log state and where the gate
     /// records that it opened. Weak, so a stopped group's store closes even
@@ -569,6 +572,11 @@ impl GroupRejoin {
             raft_group_id,
             metrics: OnceLock::new(),
             gate: Mutex::new(gate),
+            vote_floor: Mutex::new(
+                store
+                    .vote()
+                    .filter(|vote| vote.leader_id.term > 0 || vote.is_committed()),
+            ),
             reverted: Mutex::new(RevertedFollowers::default()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
@@ -605,7 +613,7 @@ impl GroupRejoin {
 
     /// Whether the vote gate is open.
     pub fn vote_gate_open(&self) -> bool {
-        self.gate().is_open()
+        self.gate().is_open() && !self.needs_vote_floor()
     }
 
     /// The gate as status reports show it.
@@ -621,8 +629,62 @@ impl GroupRejoin {
             .is_some_and(|store| store.log_state().is_initialized())
     }
 
+    pub(crate) fn needs_vote_floor(&self) -> bool {
+        self.vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// A replica that lost its vote must not help a stale leader prove a quorum.
+    /// This includes empty heartbeats and snapshot acknowledgements.
+    pub(crate) fn replication_allowed(&self, vote: UrsulaVote) -> bool {
+        self.recovery_vote().is_some_and(|floor| vote >= floor)
+    }
+
+    pub(crate) fn recovery_vote(&self) -> Option<UrsulaVote> {
+        let floor = (*self
+            .vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))?;
+        Some(self.metrics().map_or(floor, |metrics| {
+            if metrics.vote > floor {
+                metrics.vote
+            } else {
+                floor
+            }
+        }))
+    }
+
+    pub(crate) async fn establish_vote_floor(
+        &self,
+        vote: UrsulaVote,
+    ) -> Result<(), RecoveryGateError> {
+        let store = self.store.upgrade().ok_or(RecoveryGateError::StoreClosed {
+            raft_group_id: self.raft_group_id,
+        })?;
+        let vote = store.persist_recovery_vote(vote).await.map_err(|source| {
+            RecoveryGateError::Record {
+                raft_group_id: self.raft_group_id,
+                source,
+            }
+        })?;
+        let mut floor = self
+            .vote_floor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if floor.is_none_or(|current| vote > current) {
+            *floor = Some(vote);
+        }
+        drop(floor);
+        self.changes.send_if_modified(|()| true);
+        Ok(())
+    }
+
     pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
-        self.gate().confirm_barrier(leader, commit_index);
+        if self.replication_allowed(leader) {
+            self.gate().confirm_barrier(leader, commit_index);
+        }
     }
 
     /// Campaigning is subject to both this gate and the node's shed policy.
@@ -635,6 +697,10 @@ impl GroupRejoin {
         let store = self.store.upgrade().ok_or(RecoveryGateError::StoreClosed {
             raft_group_id: self.raft_group_id,
         })?;
+        if self.needs_vote_floor() && matches!(why, GateOpening::FreshBootstrap) {
+            self.establish_vote_floor(self.metrics().map_or(UrsulaVote::new(0, 0), |m| m.vote))
+                .await?;
+        }
         store
             .record_recovered()
             .await
@@ -668,6 +734,9 @@ impl GroupRejoin {
     /// Opens the gate once the replica has applied its barrier. Returns
     /// whether the gate is open.
     pub(crate) async fn try_open(&self) -> Result<bool, RecoveryGateError> {
+        if self.needs_vote_floor() {
+            return Ok(false);
+        }
         let Some(metrics) = self.metrics() else {
             return Ok(self.vote_gate_open());
         };
@@ -707,6 +776,9 @@ impl GroupRejoin {
         expected: &AcceptUnsyncedLossRequest,
     ) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
         let raft_group_id = self.raft_group_id;
+        if self.needs_vote_floor() {
+            return Err(RecoveryGateError::MissingVoteFloor { raft_group_id });
+        }
         let store = self
             .store
             .upgrade()
@@ -748,7 +820,13 @@ impl GroupRejoin {
     /// Returns whether the gate just stalled.
     fn stall(&self) -> bool {
         let stalled = self.gate().stall();
-        if stalled {
+        if stalled && self.needs_vote_floor() {
+            tracing::error!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery stalled with lost vote history; a fresh quorum proof is required; accept-unsynced-loss cannot open this gate"
+            );
+        } else if stalled {
             tracing::error!(
                 node_id = self.node_id,
                 raft_group_id = self.raft_group_id.0,
@@ -770,7 +848,19 @@ impl GroupRejoin {
         let metrics = self.metrics()?;
         let candidate = *request.vote.leader_id().node_id();
         let candidate_index = log_index(request.last_log_id.as_ref());
-        let screen = self.gate().screen(candidate_index);
+        let floor = self.recovery_vote();
+        if request.vote == UrsulaVote::new(0, 0) && request.last_log_id.is_none() {
+            return Some(UrsulaVoteResponse::new(
+                floor.unwrap_or(metrics.vote),
+                self.last_log_id().or(metrics.last_applied),
+                floor.is_some(),
+            ));
+        }
+        let screen = if floor.is_some_and(|floor| request.vote < floor) || floor.is_none() {
+            VoteScreen::Refuse
+        } else {
+            self.gate().screen(candidate_index)
+        };
         match screen {
             VoteScreen::Pass => None,
             VoteScreen::Refuse => {
@@ -783,7 +873,7 @@ impl GroupRejoin {
                     "recovery gate: refusing a vote until this replica has caught up"
                 );
                 Some(UrsulaVoteResponse::new(
-                    metrics.vote,
+                    floor.unwrap_or(metrics.vote),
                     self.last_log_id().or(metrics.last_applied),
                     false,
                 ))
@@ -1177,6 +1267,11 @@ mod tests {
             bootstrap_decision(&Vec::new()),
             BootstrapDecision::Initialize
         );
+        // An empty voter must finish its durable floor before initialization.
+        assert_eq!(
+            bootstrap_decision(&[empty, Some(PeerGroupLog::Unprepared)]),
+            BootstrapDecision::Wait
+        );
         // A silent voter might hold the group: wait for it.
         assert_eq!(bootstrap_decision(&[empty, None]), BootstrapDecision::Wait);
         // One voter with entries or a leader is enough to rejoin.
@@ -1192,7 +1287,7 @@ mod tests {
 
     #[test]
     fn a_probe_answer_with_entries_or_a_leader_means_initialized() {
-        let empty = UrsulaVoteResponse::new(vote(0, 2), None, false);
+        let empty = UrsulaVoteResponse::new(vote(0, 0), None, true);
         assert_eq!(
             PeerGroupLog::from_vote_response(&empty),
             PeerGroupLog::Empty
@@ -1200,7 +1295,7 @@ mod tests {
         let candidate = UrsulaVoteResponse::new(vote(1, 2), None, false);
         assert_eq!(
             PeerGroupLog::from_vote_response(&candidate),
-            PeerGroupLog::Empty
+            PeerGroupLog::Initialized
         );
         let following = UrsulaVoteResponse::new(leader(3, 1), None, false);
         assert_eq!(
@@ -1398,6 +1493,22 @@ mod tests {
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(!gate.may_campaign());
         assert!(!gate.holds_group_history());
+        assert!(gate.stall());
+        let missing_floor = gate
+            .accept_unsynced_loss(&AcceptUnsyncedLossRequest {
+                expected_last_log_index: None,
+                expected_current_term: 0,
+            })
+            .await
+            .expect_err("accepting lost entries cannot replace a lost vote history");
+        assert!(matches!(
+            missing_floor,
+            RecoveryGateError::MissingVoteFloor {
+                raft_group_id: RaftGroupId(0)
+            }
+        ));
+        assert!(!gate.replication_allowed(leader(1, 2)));
+        assert_eq!(store.read_vote().await.expect("read unchanged vote"), None);
         // Every voter reported an empty group: the gate opens and the first
         // entry records the group initialized.
         gate.allow_fresh_bootstrap().await.expect("fresh bootstrap");

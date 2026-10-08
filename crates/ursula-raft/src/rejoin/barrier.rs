@@ -68,36 +68,72 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
             // The leader whose barrier led nowhere may be asked again.
             last_barrier_leader = None;
         }
-        if let Some(leader_id) = metrics.current_leader
-            && last_barrier_leader != Some(metrics.vote)
+        if last_barrier_leader != Some(metrics.vote)
             && last_probe.is_none_or(|(vote, at): (_, crate::rt::time::Instant)| {
                 vote != metrics.vote || at.elapsed() >= interval
             })
-            && let Some(node) = nodes.get(&leader_id)
         {
-            // A failed probe can itself publish metrics. Wake on those changes
-            // to observe progress, but do not let them create a retry loop.
             last_probe = Some((metrics.vote, crate::rt::time::Instant::now()));
-            let outcome =
-                crate::rt::time::timeout(probe_timeout, probe(leader_id, node.addr.clone())).await;
-            match outcome {
-                Ok(Ok((leader, index))) => {
-                    rejoin.confirm_barrier(leader, index);
-                    last_barrier_leader = Some(leader);
-                    last_progress = crate::rt::time::Instant::now();
-                    tracing::info!(
-                        node_id = metrics.id,
-                        raft_group_id = raft_group_id.0,
-                        barrier_index = index,
-                        "recovery gate: a fresh leader barrier confirmed; catching up"
-                    );
+            let mut candidates = nodes.clone();
+            candidates.extend(
+                metrics
+                    .membership_config
+                    .membership()
+                    .nodes()
+                    .map(|(id, node)| (*id, node.clone())),
+            );
+            candidates.remove(&metrics.id);
+            for (leader_id, node) in candidates {
+                if !rejoin.needs_vote_floor() && metrics.current_leader != Some(leader_id) {
                     continue;
                 }
-                other => tracing::debug!(
-                    raft_group_id = raft_group_id.0,
-                    ?other,
-                    "recovery barrier probe failed"
-                ),
+                let outcome =
+                    crate::rt::time::timeout(probe_timeout, probe(leader_id, node.addr)).await;
+                match outcome {
+                    Ok(Ok((leader, index))) => {
+                        if rejoin.needs_vote_floor() {
+                            // This replica has refused every replication ACK. Therefore this fresh
+                            // ReadIndex used a current quorum excluding it; a stale leader cannot
+                            // manufacture a proof by counting the replica whose vote was lost.
+                            let last_log_id = rejoin.last_log_id();
+                            let result = raft
+                                .call(move |raft| async move {
+                                    raft.vote(crate::types::UrsulaVoteRequest::new(
+                                        leader,
+                                        last_log_id,
+                                    ))
+                                    .await
+                                })
+                                .await;
+                            match result {
+                                Ok(Ok(response)) if response.vote >= leader => {
+                                    if let Err(error) =
+                                        rejoin.establish_vote_floor(response.vote).await
+                                    {
+                                        tracing::warn!(%error, "could not persist recovery vote floor");
+                                        continue;
+                                    }
+                                }
+                                other => {
+                                    tracing::debug!(?other, "could not adopt proven recovery vote");
+                                    continue;
+                                }
+                            }
+                        }
+                        rejoin.confirm_barrier(leader, index);
+                        if !rejoin.replication_allowed(leader) {
+                            continue;
+                        }
+                        last_barrier_leader = Some(leader);
+                        last_progress = crate::rt::time::Instant::now();
+                        break;
+                    }
+                    other => tracing::debug!(
+                        raft_group_id = raft_group_id.0,
+                        ?other,
+                        "recovery barrier probe failed"
+                    ),
+                }
             }
         }
         if !wait_recovery_change(&mut observed, &mut changes, interval).await {

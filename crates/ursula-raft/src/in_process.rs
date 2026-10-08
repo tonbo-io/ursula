@@ -668,7 +668,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel)
             .await?;
         self.registry.record_full_snapshot(self.target);
-        let target = self.registry.get(self.target).ok_or_else(|| {
+        let target = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -683,7 +683,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             kind: InProcessRaftRpcKind::FullSnapshot,
         });
         target
-            .install_full_snapshot(vote, snapshot)
+            .install_full_snapshot(ursula_shard::RaftGroupId(0), vote, snapshot)
             .await
             .map_err(|err| {
                 StreamingError::Network(NetworkError::from_string(format!(
