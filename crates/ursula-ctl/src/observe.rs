@@ -1,6 +1,6 @@
-//! Read-only verbs that operate on `/__ursula/metrics`. These are direct ports
-//! of the retired `ursula_ec2.py` `status` / `wait-ready` — same metrics surface, no SSH
-//! dependency.
+//! Read-only verbs that operate on `/__ursula/metrics` and `/__ursula/ready`.
+//! These are direct ports of the retired `ursula_ec2.py` `status` and
+//! `wait-ready`, without the SSH dependency.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -150,9 +150,13 @@ pub fn check_maintenance_snapshot(
     Ok(())
 }
 
-/// Wait for complete metrics evidence and the existing local serving probe.
-/// Retry transport failures through the deadline. Decoding and identity failures
-/// are terminal. Every error retains its original source.
+/// Wait for complete metrics evidence and the local serving probe. Transport
+/// failures are retried until the deadline. Decoding failures and a process
+/// that differs from the manifest's pinned identity are terminal. Every error
+/// retains its original source.
+///
+/// Each poll observes the processes afresh with `client`'s HTTP settings. A
+/// node without a pinned identity may therefore restart during the wait.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -162,11 +166,12 @@ pub async fn wait_ready(
 ) -> Result<ClusterSnapshot> {
     let started = Instant::now();
     loop {
+        let poll = MetricsClient::new(client.timeout())?;
         let observation: Result<ClusterSnapshot> = async {
-            let snapshot = client.fetch_cluster(nodes).await?;
+            let snapshot = poll.fetch_cluster(nodes).await?;
             check_maintenance_snapshot(&snapshot, nodes.len(), expected_groups)?;
             for node in nodes {
-                let (status, report) = client.serving_readiness(node).await?;
+                let (status, report) = poll.serving_readiness(node).await?;
                 if status != reqwest::StatusCode::OK || !report.ready {
                     return Err(ReadinessRefusal::Serving {
                         node_id: node.id,
@@ -409,6 +414,105 @@ mod tests {
             }
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn wait_ready_follows_an_unpinned_restart_but_not_a_pinned_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        use ursula_proto::admin::ProcessIncarnation;
+        use ursula_proto::admin::RaftMaintenanceIssue;
+
+        let polls = Arc::new(AtomicU64::new(0));
+        let metrics_polls = Arc::clone(&polls);
+        let app = axum::Router::new()
+            .route(
+                "/__ursula/metrics",
+                axum::routing::get(move || {
+                    // The first process still lags. Its replacement is ready.
+                    let poll = metrics_polls.fetch_add(1, Ordering::SeqCst);
+                    let incarnation = if poll == 0 { 1 } else { 2 };
+                    let mut metrics = crate::metrics::test_metrics(
+                        1,
+                        Some(ProcessIncarnation::from_bits(incarnation)),
+                    );
+                    let mut replica = group(0, Some(1));
+                    replica.node_id = 1;
+                    metrics.groups.push(replica);
+                    let mut report = crate::metrics::test_maintenance_report(1, &metrics.groups);
+                    if poll == 0 {
+                        report
+                            .group_issues
+                            .insert(0, vec![RaftMaintenanceIssue::ApplyLag]);
+                    }
+                    metrics.raft_maintenance = Some(report);
+                    async move { axum::Json(metrics) }
+                }),
+            )
+            .route(
+                "/__ursula/ready",
+                axum::routing::get(|| async {
+                    axum::Json(ursula_proto::admin::ServingReadiness {
+                        ready: true,
+                        reason: None,
+                        format_epoch_mismatch: false,
+                        recovery_barriers_ready: true,
+                        raft_maintenance: None,
+                        recovery_stalled_groups: vec![],
+                        wal_disk_pressure: false,
+                        wal_available_bytes: 0,
+                        wal_min_available_bytes: 0,
+                        wal_resume_available_bytes: 0,
+                        wal_disk_stat_errors: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut node = node(1);
+        node.http_url = Some(base.clone());
+        node.admin_url = base;
+        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
+        let timeout = Duration::from_secs(5);
+
+        let snapshot = wait_ready(
+            &client,
+            std::slice::from_ref(&node),
+            1,
+            timeout,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot.per_node[0].process_incarnation,
+            ProcessIncarnation::from_bits(2)
+        );
+
+        // A plan pinned to the first process must not accept its replacement.
+        polls.store(0, Ordering::SeqCst);
+        node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
+        let started = Instant::now();
+        let error = wait_ready(&client, &[node], 1, timeout, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<ReadinessRefusal>().is_none(),
+            "{error:#}"
+        );
+        assert!(
+            error.downcast_ref::<reqwest::Error>().is_none(),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < timeout);
+        task.abort();
     }
 
     fn node(id: u64) -> NodeInfo {

@@ -174,7 +174,7 @@ Wait until every node reports `--expected-groups` initialized Raft groups with l
 ursulactl wait-ready --config cluster.json --expected-groups 4
 ```
 
-Exits non-zero with the maintenance report or serving refusal when the timeout passes. Transport failures are retried until the timeout, retaining the last error. Invalid responses and process identity changes stop the wait with their original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
+Exits non-zero with the maintenance report or serving refusal when the timeout passes. Connection failures are retried until the timeout, so the wait can start while a node restarts. Every poll observes the processes afresh. Only a node whose process differs from its pinned `expected_process_incarnation`, or an invalid response, stops the wait early with its original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
 
 ## Underlying HTTP surface
 
