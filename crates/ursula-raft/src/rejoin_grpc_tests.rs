@@ -381,15 +381,33 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .await
             .unwrap();
     }
-    let proof = probe_rejoin_vote_barrier(
-        Arc::default(),
-        placement(),
-        2,
-        &endpoints[1],
-        Duration::from_secs(1),
-    )
-    .await
-    .expect("fresh explicit barrier");
+    // Establish the fixture with an actual fresh quorum proof. A loaded test
+    // runner can exhaust one ReadIndex round before any fault is injected.
+    let began = tokio::time::Instant::now();
+    let proof = loop {
+        match probe_rejoin_vote_barrier(
+            Arc::default(),
+            placement(),
+            2,
+            &endpoints[1],
+            Duration::from_secs(1).min(Duration::from_secs(5).saturating_sub(began.elapsed())),
+        )
+        .await
+        {
+            Ok(proof) => break proof,
+            Err(crate::grpc::RecoveryProbeError::Rpc(status))
+                if status.code() == tonic::Code::Unavailable
+                    && began.elapsed() < Duration::from_secs(5) =>
+            {
+                tokio::time::sleep(
+                    Duration::from_millis(10)
+                        .min(Duration::from_secs(5).saturating_sub(began.elapsed())),
+                )
+                .await;
+            }
+            Err(error) => panic!("fresh explicit barrier: {error}"),
+        }
+    };
     assert!(proof.1 >= baseline.log_id.index());
     for gate in &gates {
         gate.confirm_barrier(proof.0, proof.1);
