@@ -815,6 +815,22 @@ pub enum UnproposableCommand {
     CreateBucket,
 }
 
+/// Serializable startup classification. The WAL facade retains the native
+/// source chain; the engine boundary logs it before converting to this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalOpenFailureKind {
+    Io,
+    Corrupt,
+    IncompatibleFormat,
+    Locked,
+    DuplicateGroup,
+    Stopped,
+    InvalidConfiguration,
+    InvalidRecord,
+    Poisoned,
+}
+
 /// Infra error variants with structured fields render their human message on
 /// demand (`message`) instead of storing a denormalized copy alongside the
 /// fields. `Internal` is the exception: it carries free-form text with no
@@ -849,6 +865,12 @@ pub enum GroupInfraError {
     },
     #[error("command {command:?} cannot be proposed to a data Raft group")]
     InvalidRaftCommand { command: UnproposableCommand },
+    #[error("open WAL for raft group {raft_group_id:?} on core {core_id:?}: {failure:?}")]
+    WalOpen {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+        failure: WalOpenFailureKind,
+    },
     #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
     RecoveryVoteFloor { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]

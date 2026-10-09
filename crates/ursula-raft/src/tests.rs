@@ -134,15 +134,11 @@ impl
 /// Opens `placement()`'s store on a fresh per-core journal under `root`; the
 /// store owns the core writer, so dropping it closes the journal.
 #[cfg(not(madsim))]
-fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
-    RaftWal::start(
-        root,
-        WalFsync::Always,
-        &ursula_shard::StaticShardMap::new(1, 1)
-            .map_err(|err| GroupEngineError::new(err.to_string()))?,
-    )
-    .map_err(|err| GroupEngineError::new(err.to_string()))?
-    .open(
+fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, crate::RaftWalError> {
+    fn topology() -> ursula_shard::StaticShardMap {
+        ursula_shard::StaticShardMap::new(1, 1).expect("valid test topology")
+    }
+    RaftWal::start(root, WalFsync::Always, &topology())?.open(
         placement(),
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )

@@ -322,9 +322,21 @@ pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> Jour
     }
 }
 
-/// Failure to start or shut down a node's Raft WAL.
+/// Failure to start, open a group on, or shut down a node's Raft WAL.
 #[derive(Debug, thiserror::Error)]
 pub enum RaftWalError {
+    #[error("open the journal for core {core:?}: {source}")]
+    OpenCore {
+        core: ursula_shard::CoreId,
+        #[source]
+        source: super::CoreJournalError,
+    },
+    #[error("open raft group {:?} on core {:?}: {source}", .placement.raft_group_id, .placement.core_id)]
+    OpenGroup {
+        placement: ursula_shard::ShardPlacement,
+        #[source]
+        source: super::CoreJournalError,
+    },
     #[error("WAL topology mismatch at '{}': stored core_count={stored_core_count}, group_count={stored_group_count}, configured core_count={configured_core_count}, group_count={configured_group_count}. Restore the stored counts, or rebuild this replica on an empty WAL from a healthy quorum using the cluster's existing routing counts. See https://ursula.tonbo.io/docs/operations#wal-routing-configuration", .root.display())]
     TopologyMismatch {
         root: PathBuf,

@@ -23,12 +23,12 @@ use ursula_config::WalFsync;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
+use ursula_raft::RaftWalError;
 #[cfg(test)]
 use ursula_raft::WalOpening;
 use ursula_raft::wal::diagnostics::SimDisk;
 #[cfg(test)]
 use ursula_raft::wal::diagnostics::SimPowerLoss;
-use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::RaftGroupId;
@@ -102,13 +102,12 @@ impl SimNodeWal {
     }
 
     /// The node's current run, started when the node is down.
-    fn run(&self) -> Result<RaftWal, GroupEngineError> {
+    fn run(&self) -> Result<RaftWal, RaftWalError> {
         let mut run = self.run.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(run) = run.as_ref() {
             return Ok(run.clone());
         }
-        let started = RaftWal::start_with(&self.root, self.tuning, &self.topology)
-            .map_err(|err| GroupEngineError::new(format!("start the Raft WAL: {err}")))?;
+        let started = RaftWal::start_with(&self.root, self.tuning, &self.topology)?;
         *run = Some(started.clone());
         Ok(started)
     }
@@ -138,7 +137,7 @@ impl SimNodeWal {
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
-    ) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
+    ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
         if let Some(previous) = self.handed_out(placement.raft_group_id) {
             wait_released(&previous).await;
         }

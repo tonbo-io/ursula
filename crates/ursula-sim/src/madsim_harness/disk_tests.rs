@@ -1247,7 +1247,7 @@ async fn reopen_after_a_reordered_unsynced_tail(
             }
             Ok(recovered)
         }
-        Err(err) => Err(format!("{report:?}: {}", err.message())),
+        Err(err) => Err(format!("{report:?}: {err}")),
     };
     (synced, opening, reopened, hole)
 }
@@ -1815,12 +1815,7 @@ fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
             let mut store = wal
                 .try_open(placement, metrics)
                 .await
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "seed {seed}: the store reopens ({report:?}): {}",
-                        err.message()
-                    )
-                });
+                .unwrap_or_else(|err| panic!("seed {seed}: the store reopens ({report:?}): {err}"));
             let state = store.get_log_state().await.expect("log state");
             assert_eq!(
                 state.last_purged_log_id,
