@@ -16,6 +16,15 @@ pub(super) struct StreamColdState {
     cold_generation: u64,
 }
 
+/// The objects of the refs [`StreamColdState::compact_before`] dropped.
+#[derive(Debug, Default)]
+pub(super) struct Compacted {
+    /// Slices of shared packs, released by reference count.
+    pub(super) shared_paths: Vec<String>,
+    /// The stream's own external payloads, not offloaded to a page yet: nothing else names them.
+    pub(super) external_paths: Vec<String>,
+}
+
 impl StreamColdState {
     pub(super) fn cold_chunks(&self) -> &[ColdChunkRef] {
         &self.cold_chunks
@@ -80,21 +89,27 @@ impl StreamColdState {
         !self.cold_chunks.is_empty() || !self.external_segments.is_empty()
     }
 
-    pub(super) fn compact_before(&mut self, retained_offset: u64) -> Vec<String> {
-        let mut dropped_cold_paths = Vec::new();
+    /// Drops the refs wholly below `retained_offset` and returns their objects.
+    pub(super) fn compact_before(&mut self, retained_offset: u64) -> Compacted {
+        let mut dropped = Compacted::default();
         self.cold_chunks.retain(|chunk| {
             let retain = chunk.end_offset > retained_offset;
             if !retain {
-                dropped_cold_paths.push(chunk.s3_path.clone());
+                dropped.shared_paths.push(chunk.s3_path.clone());
             }
             retain
         });
-        self.external_segments
-            .retain(|object| object.end_offset > retained_offset);
+        self.external_segments.retain(|object| {
+            let retain = object.end_offset > retained_offset;
+            if !retain {
+                dropped.external_paths.push(object.s3_path.clone());
+            }
+            retain
+        });
         // F7: return the capacity retention freed.
         shrink_vec_if_slack(&mut self.cold_chunks);
         shrink_vec_if_slack(&mut self.external_segments);
-        dropped_cold_paths
+        dropped
     }
 
     pub(super) fn shared_object_paths(&self) -> impl Iterator<Item = &str> {

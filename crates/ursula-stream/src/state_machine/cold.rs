@@ -720,12 +720,22 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before retained-prefix compaction");
-        let dropped_cold_paths = slot.cold.compact_before(retained_offset);
+        let dropped = slot.cold.compact_before(retained_offset);
         self.release_shared_cold_objects(
             &stream_id.bucket_id,
-            dropped_cold_paths,
+            dropped.shared_paths,
             gc_not_before_ms,
         );
+        // External payloads still held in state (not offloaded to a page yet) are named by
+        // nothing else: queued with the same grace as the pack slices. A page an in-flight
+        // offload writes for one names it only below retention, where nothing reads.
+        if !dropped.external_paths.is_empty() {
+            self.cold_gc.enqueue_after(
+                stream_id.bucket_id.clone(),
+                ColdGcTarget::Paths(dropped.external_paths),
+                gc_not_before_ms,
+            );
+        }
 
         let slot = self
             .stream_slot_mut(stream_id)
