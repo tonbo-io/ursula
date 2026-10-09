@@ -5,7 +5,7 @@ sidebarTitle: SQLite (VFS)
 
 `sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula), published to npm as `@tonbo/sqlite-ursula` with the extension prebuilt.
 
-It is experimental: the extension speaks plain HTTP without credentials, and its formats and API may change in a minor release. What it still needs for production use is tracked in [#468](https://github.com/tonbo-io/ursula/issues/468).
+It is experimental: its formats and API may change in a minor release. What it still needs for production use is tracked in [#468](https://github.com/tonbo-io/ursula/issues/468).
 
 How it works:
 
