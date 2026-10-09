@@ -32,8 +32,10 @@ Ursula 0.7's root-opening path reads `topology.bin` before journal recovery,
 run-state writes or runtime construction. Its existing version-3 decoder
 rejects the version-4 header before decoding. This applies to standalone/lazy
 cores as well as static clusters. The same magic is retained deliberately so
-the old version check is reached. The new reader understands both root modes
-but never silently downgrades a managed marker. No rollback conversion is
+the old version check is reached. The data-only constructor reads the root
+exactly as 0.7 does and refuses a managed root with the same version error.
+Only the managed constructor reads both root modes, and it never silently
+downgrades a managed marker. No rollback conversion is
 provided; retain a separate pre-upgrade root if binary rollback is required.
 
 A guard in only the meta core's metadata is insufficient: standalone startup

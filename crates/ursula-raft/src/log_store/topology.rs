@@ -75,16 +75,7 @@ pub(super) fn check_or_create_with_mode(
 ) -> Result<(), RaftWalError> {
     let configured = WalTopology::from(map);
     let path = root.join(TOPOLOGY_FILE);
-    let (stored, stored_mode) =
-        match state_file::read::<WalTopology>(StateFileKind::ManagedTopology, &path) {
-            Ok(stored) => (stored, WalMode::Managed),
-            Err(StateFileError::UnsupportedVersion { version: 3, .. }) => (
-                state_file::read::<WalTopology>(StateFileKind::Topology, &path)
-                    .map_err(RaftWalError::ReadTopology)?,
-                WalMode::DataOnly,
-            ),
-            Err(source) => return Err(RaftWalError::ReadTopology(source)),
-        };
+    let (stored, stored_mode) = read_topology(&path, mode)?;
     match TopologyDecision::decide(stored, configured, has_prior_state) {
         TopologyDecision::Create => {
             state_file::write(mode.kind(), &path, &path.with_extension("tmp"), &configured)
@@ -92,9 +83,6 @@ pub(super) fn check_or_create_with_mode(
             Ok(())
         }
         TopologyDecision::Match => match (stored_mode, mode) {
-            (WalMode::Managed, WalMode::DataOnly) => Err(RaftWalError::ManagedModeRequired {
-                root: root.to_owned(),
-            }),
             (WalMode::DataOnly, WalMode::Managed) => {
                 // Under the node root lock, before recovery/run-state writes or
                 // returning a handle from which any core can be opened.
@@ -114,6 +102,29 @@ pub(super) fn check_or_create_with_mode(
         TopologyDecision::Missing => Err(RaftWalError::MissingTopology {
             root: root.to_owned(),
         }),
+    }
+}
+
+/// Reads the stored topology and the mode it records. A data-only start reads
+/// the file exactly as 0.7.0 does, so it refuses a managed root with the same
+/// version error. Only an explicitly managed start reads a managed root.
+fn read_topology(
+    path: &Path,
+    mode: WalMode,
+) -> Result<(Option<WalTopology>, WalMode), RaftWalError> {
+    match (
+        state_file::read::<WalTopology>(StateFileKind::Topology, path),
+        mode,
+    ) {
+        (Ok(stored), _) => Ok((stored, WalMode::DataOnly)),
+        (Err(StateFileError::UnsupportedVersion { version, .. }), WalMode::Managed)
+            if version == StateFileKind::ManagedTopology.version() =>
+        {
+            let stored = state_file::read::<WalTopology>(StateFileKind::ManagedTopology, path)
+                .map_err(RaftWalError::ReadTopology)?;
+            Ok((stored, WalMode::Managed))
+        }
+        (Err(source), _) => Err(RaftWalError::ReadTopology(source)),
     }
 }
 
@@ -212,7 +223,9 @@ mod tests {
             let run_before = std::fs::read(dir.path().join(RUN_STATE_FILE)).unwrap();
             assert!(matches!(
                 RaftWal::start(dir.path(), fsync, &map),
-                Err(RaftWalError::ManagedModeRequired { .. })
+                Err(RaftWalError::ReadTopology(
+                    StateFileError::UnsupportedVersion { version: 4, .. }
+                ))
             ));
             assert_eq!(
                 std::fs::read(dir.path().join(RUN_STATE_FILE)).unwrap(),
@@ -357,7 +370,9 @@ mod simulated_tests {
                 let before = SimDisk::read(&root.join(RUN_STATE_FILE)).unwrap();
                 assert!(matches!(
                     RaftWal::start(&root, fsync, &map),
-                    Err(RaftWalError::ManagedModeRequired { .. })
+                    Err(RaftWalError::ReadTopology(
+                        StateFileError::UnsupportedVersion { version: 4, .. }
+                    ))
                 ));
                 assert_eq!(SimDisk::read(&root.join(RUN_STATE_FILE)).unwrap(), before);
                 let managed =

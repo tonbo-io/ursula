@@ -50,7 +50,7 @@ pub enum StateFileKind {
 }
 
 impl StateFileKind {
-    fn version(self) -> u16 {
+    pub(crate) fn version(self) -> u16 {
         match self {
             Self::Topology => 3,
             Self::ManagedTopology => 4,
@@ -92,7 +92,10 @@ pub enum StateFileError {
     },
     #[error("'{}' is not an Ursula WAL {kind:?} file", .path.display())]
     WrongKind { path: PathBuf, kind: StateFileKind },
-    #[error("WAL state file '{}' uses unsupported local version {version}", .path.display())]
+    #[error("{}", ursula_stream::format_epoch_refusal(
+        &format!("WAL state file '{}'", .path.display()),
+        &format!("uses Ursula WAL version {version}"),
+    ))]
     UnsupportedVersion { path: PathBuf, version: u16 },
     #[error("WAL state file '{}' is corrupt: {defect}", .path.display())]
     Corrupt {

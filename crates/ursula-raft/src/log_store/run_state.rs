@@ -307,8 +307,6 @@ pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> Jour
 /// Failure to start or shut down a node's Raft WAL.
 #[derive(Debug, thiserror::Error)]
 pub enum RaftWalError {
-    #[error("WAL root '{}' requires explicitly configured managed mode; refusing data-only startup", .root.display())]
-    ManagedModeRequired { root: PathBuf },
     #[error("WAL topology mismatch at '{}': stored core_count={stored_core_count}, group_count={stored_group_count}, configured core_count={configured_core_count}, group_count={configured_group_count}. Restore the stored counts, or rebuild this replica on an empty WAL from a healthy quorum using the cluster's existing routing counts. See https://ursula.tonbo.io/docs/operations#wal-routing-configuration", .root.display())]
     TopologyMismatch {
         root: PathBuf,
