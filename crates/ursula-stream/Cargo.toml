@@ -21,16 +21,13 @@ ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
 serde_json = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 
 [[bench]]
 name = "plan_next_cold_flush"
-harness = false
-
-[[bench]]
-name = "plan_next_cold_flush_alloc"
 harness = false
 
 [lints]
