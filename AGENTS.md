@@ -343,7 +343,7 @@ verifies them, and only then creates the Git tag and GitHub Release:
 - Clippy lints warn on `unwrap_used`, `panic`, `string_slice`, `indexing_slicing`, and arithmetic side effects.
 - Protobuf compilation uses `protoc-bin-vendored` to avoid system protoc dependencies.
 - Docker image runs as non-root user.
-- SBOM and provenance generation enabled for published Docker images.
+- Published Docker images carry build provenance and an SPDX SBOM as GitHub artifact attestations, verifiable with `gh attestation verify oci://ghcr.io/tonbo-io/ursula:<version> --repo tonbo-io/ursula` (add `--predicate-type https://spdx.dev/Document/v2.3` for the SBOM).
 
 ## Development Tips
 

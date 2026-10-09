@@ -48,6 +48,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
           REPOSITORY: ${{ github.repository }}
+          RUN_REF: ${{ github.ref }}
+          RUN_SHA: ${{ github.sha }}
           SOURCE_REVISION: ${{ inputs.source_revision }}
         run: |
           set -euo pipefail
@@ -55,6 +57,11 @@ jobs:
           ./scripts/validate-release-version.sh "$RELEASE_VERSION" >/dev/null
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          # The image attestations name the ref and commit this run was
+          # dispatched on as the build source, so dispatch it on main at the
+          # commit it releases.
+          test "$RUN_REF" = refs/heads/main
+          test "$RUN_SHA" = "$SOURCE_REVISION"
 
           git fetch origin main --no-tags
           test "$(git rev-parse origin/main)" = "$SOURCE_REVISION"
@@ -176,8 +183,10 @@ jobs:
           CHAOS_CHART_DIGEST: ${{ needs.chaos_helm.outputs.digest }}
           CHAOS_IMAGE_DIGEST: ${{ needs.chaos_docker.outputs.digest }}
           CHART_DIGEST: ${{ needs.helm.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
           IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
           SOURCE_REVISION: ${{ needs.validate.outputs.source_revision }}
         run: |
           set -euo pipefail
@@ -187,27 +196,44 @@ jobs:
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           done
 
-          image="$(docker buildx imagetools inspect \
-            "ghcr.io/${{ github.repository }}@$IMAGE_DIGEST" \
-            --format '{{json .Image}}')"
-          jq -e --arg revision "$SOURCE_REVISION" --arg version "$RELEASE_VERSION" --argjson image "$image" '
-            ["linux/amd64", "linux/arm64"] as $platforms |
-            all($platforms[]; . as $platform |
-              $image[$platform].config.Labels["org.opencontainers.image.revision"] == $revision and
-              $image[$platform].config.Labels["org.opencontainers.image.version"] == $version
-            )
-          ' -n >/dev/null
+          # The release tag resolves to the published index, which holds
+          # exactly the two platform images and no attestation manifests.
+          # Provenance and the SBOM are GitHub artifact attestations on the
+          # index digest, signed by the image's publish workflow on main at
+          # the released commit.
+          verify_image() {
+            local image="$1" digest="$2" workflow="$3"
+            local index config predicate_type
+            index="$(docker buildx imagetools inspect "$image:$RELEASE_VERSION" \
+              --format '{{json .Manifest}}')"
+            jq -e --arg digest "$digest" '
+              .digest == $digest and
+              ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length) == 0 and
+              ([.manifests[].platform | "\(.os)/\(.architecture)" + (if .variant then "/\(.variant)" else "" end)] | sort) ==
+                ["linux/amd64", "linux/arm64"]
+            ' <<<"$index" >/dev/null
 
-          chaos_image="$(docker buildx imagetools inspect \
-            "ghcr.io/${{ github.repository }}-chaos-agent@$CHAOS_IMAGE_DIGEST" \
-            --format '{{json .Image}}')"
-          jq -e --arg revision "$SOURCE_REVISION" --arg version "$RELEASE_VERSION" --argjson image "$chaos_image" '
-            ["linux/amd64", "linux/arm64"] as $platforms |
-            all($platforms[]; . as $platform |
-              $image[$platform].config.Labels["org.opencontainers.image.revision"] == $revision and
-              $image[$platform].config.Labels["org.opencontainers.image.version"] == $version
-            )
-          ' -n >/dev/null
+            config="$(docker buildx imagetools inspect "$image@$digest" --format '{{json .Image}}')"
+            jq -e --arg revision "$SOURCE_REVISION" --arg version "$RELEASE_VERSION" --argjson image "$config" '
+              ["linux/amd64", "linux/arm64"] as $platforms |
+              all($platforms[]; . as $platform |
+                $image[$platform].config.Labels["org.opencontainers.image.revision"] == $revision and
+                $image[$platform].config.Labels["org.opencontainers.image.version"] == $version
+              )
+            ' -n >/dev/null
+
+            for predicate_type in https://slsa.dev/provenance/v1 https://spdx.dev/Document/v2.3; do
+              gh attestation verify "oci://$image:$RELEASE_VERSION" \
+                --repo "$REPOSITORY" \
+                --signer-workflow "$REPOSITORY/.github/workflows/$workflow" \
+                --source-ref refs/heads/main \
+                --source-digest "$SOURCE_REVISION" \
+                --predicate-type "$predicate_type"
+            done
+          }
+
+          verify_image "ghcr.io/$REPOSITORY" "$IMAGE_DIGEST" docker-publish.yml
+          verify_image "ghcr.io/$REPOSITORY-chaos-agent" "$CHAOS_IMAGE_DIGEST" chaos-docker-publish.yml
 
           chart="$(helm show chart "oci://ghcr.io/${{ github.repository_owner }}/charts/ursula@$CHART_DIGEST")"
           test "$(yq -r .version <<<"$chart")" = "$RELEASE_VERSION"
