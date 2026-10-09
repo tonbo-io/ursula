@@ -5,7 +5,9 @@
 //! over the old file and published with an `fsync` of its directory, all
 //! through the [`Disk`] seam. A crash at any step leaves either the old or the
 //! new version. The file also carries a checksum, so damage is reported
-//! instead of read as state.
+//! instead of read as state. [`replace_file`] is that publication protocol on
+//! its own, for files with their own encoding such as each group's snapshot
+//! pointer.
 //!
 //! Layout, little-endian:
 //!
@@ -201,24 +203,30 @@ pub(crate) fn read<T: DeserializeOwned>(
     decode(kind, path, &bytes).map(Some)
 }
 
-/// Replaces the state file at `path` with `value`: writes `temp`, `fsync`s
-/// it, renames it over `path` and `fsync`s the directory. Returns the number
-/// of `fsync`s. Callers that may write the same file concurrently pass
-/// different `temp` paths.
+/// Replaces the state file at `path` with `value` through [`replace_file`].
+/// Returns the number of `fsync`s. Callers that may write the same file
+/// concurrently pass different `temp` paths.
 pub(crate) fn write<T: Serialize>(
     kind: StateFileKind,
     path: &Path,
     temp: &Path,
     value: &T,
 ) -> Result<u64, JournalError> {
-    let bytes = encode(kind, value);
+    replace_file(path, temp, &encode(kind, value))
+}
+
+/// Replaces the file at `path` with `bytes`: writes `temp`, `fsync`s it,
+/// renames it over `path` and `fsync`s the directory. A crash at any step
+/// leaves either the old or the new file, and the new one is durable once
+/// this returns. Returns the number of `fsync`s.
+pub(crate) fn replace_file(path: &Path, temp: &Path, bytes: &[u8]) -> Result<u64, JournalError> {
     if Disk::exists(temp) {
         Disk::remove_file(temp)
             .map_err(|source| JournalError::io(temp, JournalOp::Remove, source))?;
     }
     let mut file = Disk::open_append(temp)
         .map_err(|source| JournalError::io(temp, JournalOp::Open, source))?;
-    file.append(&bytes)
+    file.append(bytes)
         .map_err(|source| JournalError::io(temp, JournalOp::Append, source))?;
     file.sync_data()
         .map_err(|source| JournalError::io(temp, JournalOp::Sync, source))?;
