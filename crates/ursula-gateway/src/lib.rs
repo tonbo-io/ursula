@@ -44,7 +44,6 @@ use axum::http::header::WWW_AUTHENTICATE;
 use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
 use percent_encoding::percent_decode_str;
-use rand::prelude::IndexedRandom;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
@@ -72,6 +71,7 @@ use crate::auth::AuthorizationDecision;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
+use crate::ejection::Clock;
 use crate::ejection::EJECTION_BASE;
 use crate::ejection::EJECTION_MAX;
 use crate::ejection::Ejections;
@@ -165,6 +165,7 @@ pub struct Gateway {
     shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
     ejections: Arc<Ejections>,
+    clock: Clock,
     metrics: Arc<GatewayMetrics>,
     cors: Option<crate::cors::CorsPolicy>,
 }
@@ -198,15 +199,16 @@ impl Gateway {
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
             ejections: Arc::new(Ejections::new(EJECTION_BASE, EJECTION_MAX)),
+            clock: Clock::default(),
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
         }
     }
 
-    /// Shorter ejection windows, so tests can watch one expire.
+    /// A clock tests move by hand, so ejection windows expire without sleeps.
     #[cfg(test)]
-    fn with_ejection_windows(mut self, base: Duration, max: Duration) -> Self {
-        self.ejections = Arc::new(Ejections::new(base, max));
+    fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -439,7 +441,7 @@ impl Gateway {
     }
 
     fn pick_upstream(&self, uri: &Uri) -> Option<String> {
-        let now = Instant::now();
+        let now = self.clock.now();
         if let Some(key) = upstream_pin_key(uri, self.shard_map.as_ref()) {
             // Its own statement: the cache's lock is released before the
             // branches below, which may take it again.
@@ -450,24 +452,22 @@ impl Gateway {
                 .get(&key)
                 .cloned();
             if let Some(upstream) = cached {
-                if !self.ejections.is_ejected(&upstream, now) {
+                if self.ejections.admit(&upstream, now) {
                     self.metrics
                         .leader_cache_hits
                         .fetch_add(1, Ordering::Relaxed);
                     return Some(upstream);
                 }
-                // A route learned before its upstream stopped answering.
+                // A route to an upstream that is ejected or being probed.
                 self.forget_leader_if_matches(&key, &upstream);
             }
         }
         self.metrics
             .leader_cache_misses
             .fetch_add(1, Ordering::Relaxed);
-        let mut rng = rand::rng();
         self.ejections
-            .eligible(&self.config.upstreams, now)
-            .choose(&mut rng)
-            .map(|upstream| (*upstream).clone())
+            .pick(&self.config.upstreams, now, &mut rand::rng())
+            .cloned()
     }
 
     async fn forward(
@@ -595,7 +595,7 @@ impl Gateway {
             self.forget_leader_if_matches(key, upstream);
         }
         if let Failed::Ejected { window, failures } =
-            self.ejections.failed(upstream, Instant::now())
+            self.ejections.failed(upstream, self.clock.now())
         {
             self.metrics
                 .upstream_ejections
@@ -751,7 +751,7 @@ impl Gateway {
             leader_redirect_ns: self.metrics.leader_redirect_ns.load(Ordering::Relaxed),
             leader_cache_entries,
             upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
-            ejected_upstreams: self.ejections.count(Instant::now()),
+            ejected_upstreams: self.ejections.count(self.clock.now()),
         }
     }
 }

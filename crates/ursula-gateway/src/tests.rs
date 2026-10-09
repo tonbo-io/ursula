@@ -260,12 +260,31 @@ async fn answering_upstream() -> TestUpstream {
     spawn_upstream(Router::new().route("/{bucket}/{stream}", any(|| async { "ok" }))).await
 }
 
+/// Accepts requests and never answers them.
+async fn silent_upstream() -> TestUpstream {
+    spawn_upstream(Router::new().route(
+        "/{bucket}/{stream}",
+        any(std::future::pending::<&'static str>),
+    ))
+    .await
+}
+
 /// Makes `gone` fail one request through `gateway`, as a dead node's first
 /// failure does.
 async fn fail_once(gateway: &Gateway, gone: &str) {
     gateway.remember_leader("/bucket/stream".to_owned(), gone.to_owned());
     let response = gateway.handle(get_stream()).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// `count` requests to distinct streams, each answered 200.
+async fn all_answered(gateway: &Gateway, prefix: &str, count: usize) {
+    for i in 0..count {
+        let response = gateway
+            .handle(get_path(&format!("/bucket/{prefix}{i}")))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{prefix}{i}");
+    }
 }
 
 /// After an upstream fails at the transport, requests stop picking it at
@@ -283,43 +302,35 @@ async fn gateway_leaves_an_upstream_that_failed_out_of_selection() {
     fail_once(&gateway, &gone).await;
 
     // 60 random picks among three would miss `gone` with probability (2/3)^60.
-    for i in 0..60 {
-        let response = gateway.handle(get_path(&format!("/bucket/s{i}"))).await;
-        assert_eq!(response.status(), StatusCode::OK, "request {i}");
-    }
+    all_answered(&gateway, "s", 60).await;
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.upstream_ejections, 1);
     assert_eq!(metrics.ejected_upstreams, 1);
 }
 
-/// When its window expires, an ejected upstream is probed again; another
-/// failure ejects it for a doubled window, and a response clears it.
+/// When its window expires, a request probes the upstream; another failure
+/// ejects it for a doubled window. Time moves only on the test's clock.
 #[tokio::test]
 async fn gateway_probes_an_ejected_upstream_after_its_window() {
     let gone = refusing_upstream().await;
     let live = answering_upstream().await;
-    let gateway = Gateway::new(test_config(vec![gone.clone(), live.url.clone()]))
-        .with_ejection_windows(Duration::from_millis(100), Duration::from_secs(5));
+    let clock = Clock::manual();
+    let gateway =
+        Gateway::new(test_config(vec![gone.clone(), live.url.clone()])).with_clock(clock.clone());
     fail_once(&gateway, &gone).await;
-    for i in 0..20 {
-        let response = gateway.handle(get_path(&format!("/bucket/s{i}"))).await;
-        assert_eq!(response.status(), StatusCode::OK, "request {i}");
-    }
+    all_answered(&gateway, "s", 20).await;
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    clock.advance(Duration::from_secs(10));
     assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
     // Two upstreams: 40 picks miss the probe with probability 2^-40.
-    let probed = {
-        let mut probed = false;
-        for i in 0..40 {
-            let response = gateway.handle(get_path(&format!("/bucket/p{i}"))).await;
-            if response.status() == StatusCode::SERVICE_UNAVAILABLE {
-                probed = true;
-                break;
-            }
+    let mut probed = false;
+    for i in 0..40 {
+        let response = gateway.handle(get_path(&format!("/bucket/p{i}"))).await;
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            probed = true;
+            break;
         }
-        probed
-    };
+    }
     assert!(
         probed,
         "the expired window let a request probe the upstream"
@@ -328,12 +339,142 @@ async fn gateway_probes_an_ejected_upstream_after_its_window() {
     assert_eq!(metrics.upstream_ejections, 2);
     assert_eq!(metrics.ejected_upstreams, 1);
 
-    // Every upstream ejected: requests still go out rather than nowhere.
-    let only_gone = Gateway::new(test_config(vec![gone.clone()]));
-    fail_once(&only_gone, &gone).await;
-    let response = only_gone.handle(get_path("/bucket/again")).await;
+    // The second window is 20 s.
+    clock.advance(Duration::from_secs(19));
+    all_answered(&gateway, "t", 20).await;
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
+}
+
+/// While one request probes an expired upstream, every other request skips
+/// it, through a cached route or at random.
+#[tokio::test]
+async fn gateway_sends_one_probe_at_a_time() {
+    let silent = silent_upstream().await;
+    let live = answering_upstream().await;
+    let clock = Clock::manual();
+    let gateway = Arc::new(
+        Gateway::new(test_config(vec![silent.url.clone(), live.url.clone()]))
+            .with_clock(clock.clone()),
+    );
+    gateway.upstream_failed(None, &silent.url);
+    clock.advance(Duration::from_secs(10));
+    assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
+
+    // The probe: a cached route to the silent upstream, which never answers.
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+    let probe = tokio::spawn({
+        let gateway = Arc::clone(&gateway);
+        async move { gateway.handle(get_stream()).await }
+    });
+    for _ in 0..1000 {
+        if gateway.metrics_snapshot().ejected_upstreams == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 1);
+
+    all_answered(&gateway, "s", 40).await;
+    gateway.remember_leader("/bucket/other".to_owned(), silent.url.clone());
+    let response = gateway.handle(get_path("/bucket/other")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 1);
+
+    // A probe outstanding for a base window no longer holds the others back.
+    clock.advance(Duration::from_secs(10));
+    assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
+    probe.abort();
+}
+
+/// An upstream that answers its probe is back in selection at once.
+#[tokio::test]
+async fn gateway_restores_an_upstream_that_answers_its_probe() {
+    let live = answering_upstream().await;
+    let other = answering_upstream().await;
+    let clock = Clock::manual();
+    let gateway = Gateway::new(test_config(vec![live.url.clone(), other.url.clone()]))
+        .with_clock(clock.clone());
+    gateway.upstream_failed(None, &live.url);
+    clock.advance(Duration::from_secs(10));
+
+    gateway.remember_leader("/bucket/stream".to_owned(), live.url.clone());
+    let response = gateway.handle(get_stream()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Unanswered, the probe would keep it out for another base window.
+    assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
+}
+
+/// An upstream that accepts a request and sends no response headers in time
+/// is ejected like one that refuses connections.
+#[tokio::test]
+async fn gateway_ejects_an_upstream_that_sends_no_response_headers() {
+    let silent = silent_upstream().await;
+    let live = answering_upstream().await;
+    let mut config = test_config(vec![silent.url.clone(), live.url.clone()]);
+    config.response_header_timeout = Duration::from_millis(200);
+    let gateway = Gateway::new(config);
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+
+    let response = gateway.handle(get_stream()).await;
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
+    all_answered(&gateway, "s", 40).await;
+}
+
+/// The leader a follower redirects to is ejected when it fails, and the
+/// follower, which answered, is not.
+#[tokio::test]
+async fn gateway_ejects_an_unreachable_redirect_leader() {
+    let gone = refusing_upstream().await;
+    let leader_url = format!("{gone}/bucket/stream");
+    let follower = spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        any(move || {
+            let leader_url = leader_url.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [
+                        ("location", leader_url),
+                        ("x-ursula-raft-leader-id", "2".to_owned()),
+                    ],
+                    "redirecting",
+                )
+            }
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(test_config(vec![follower.url.clone(), gone.clone()]));
+    gateway.remember_leader("/bucket/stream".to_owned(), follower.url.clone());
+
+    let response = gateway.handle(get_stream()).await;
+
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(only_gone.metrics_snapshot().upstream_ejections, 1);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(metrics.upstream_ejections, 1);
+    assert_eq!(metrics.ejected_upstreams, 1);
+    // Every request now goes to the follower, which redirects again.
+    for i in 0..20 {
+        let response = gateway.handle(get_path(&format!("/bucket/r{i}"))).await;
+        assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "r{i}");
+    }
+}
+
+/// With every upstream ejected, requests still go out rather than nowhere.
+#[tokio::test]
+async fn gateway_still_sends_when_every_upstream_is_ejected() {
+    let gone = refusing_upstream().await;
+    let gateway = Gateway::new(test_config(vec![gone.clone()]));
+    fail_once(&gateway, &gone).await;
+
+    let response = gateway.handle(get_path("/bucket/again")).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
 }
 
 /// A cached route to an ejected upstream is not followed: the request picks

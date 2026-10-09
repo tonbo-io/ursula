@@ -4,14 +4,18 @@ The `ursula gateway` role is a small HTTP/SSE gateway for Ursula clusters. It gi
 clients one stable HTTP endpoint while keeping internal Ursula node addresses
 out of public responses.
 
-The gateway is intentionally thin: it does not own stream routing state,
-terminate SSE streams, or cache Raft leaders. It buffers request bodies up to a
-configured limit only so it can replay requests when Ursula identifies the Raft
-leader.
+The gateway is intentionally thin: it does not own stream routing state or
+terminate SSE streams. It keeps two things in memory: the Raft leader it last
+learned for each stream (or each Raft group, with `--raft-group-count`), and
+which upstreams it is skipping after transport failures. It buffers request
+bodies up to a configured limit only so it can replay requests when Ursula
+identifies the Raft leader.
 
 ## Behavior
 
-- Picks one configured upstream Ursula node for each incoming request.
+- Sends each incoming request to the cached leader of its stream, or else to
+  a configured upstream Ursula node picked at random, skipping upstreams that
+  recently failed at the transport.
 - Buffers request bodies up to `--max-request-body-bytes`; larger requests
   receive `413 Payload Too Large` before reaching an upstream.
 - Follows Ursula Raft leader redirects internally when the response includes
@@ -137,11 +141,19 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
   force-deleted pod or a powered-off host, fails the requests waiting on them
   within `--upstream-tcp-user-timeout` with `502`. The request may have
   reached the node, so the client decides whether to retry it.
-- Upstreams are selected randomly per request.
+- An upstream that fails at the transport (refuses or times out the
+  connection, drops the exchange, or sends no response headers in time) is
+  skipped for 10 s, doubling up to 60 s while it keeps failing. Once a window
+  expires, one request probes it, and the others keep skipping it until that
+  probe answers or fails. Any response puts it back. If every upstream is
+  skipped, requests go to all of them again rather than to none.
+- `/__ursula/gateway/metrics` reports `upstream_ejections` (times an upstream
+  was skipped after a failure) and `ejected_upstreams` (skipped now), next to
+  the leader-cache counters.
 - Request bodies are buffered up to `--max-request-body-bytes` because internal
   leader redirects require replaying the request to a different upstream.
-- The gateway is stateless. It does not cache Raft leaders or maintain cluster
-  membership.
+- The gateway keeps no durable state and does not maintain cluster membership.
+  Its leader cache and upstream ejections live in memory and start empty.
 - `RUST_LOG=ursula_gateway=debug` enables request forwarding and redirect logs.
 
 ## Verify
