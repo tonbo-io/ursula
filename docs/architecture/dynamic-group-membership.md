@@ -161,7 +161,9 @@ path are required before meta state can be treated as cluster-critical state.
 The operation starts `Preparing`. Dispatching the first membership transition
 (`AddLearner`, `ChangeVoters` or `RetireReplica`) moves it to `Reconfiguring`,
 and a rebuild or decommission moves to `Retired` when its source retires.
-`Abort` discards the operation only while it is `Preparing`: any pending action
+A decommission retires its source only after its replacements are admitted in
+every group, since admission is refused once the source retires. `Abort`
+discards the operation only while it is `Preparing`: any pending action
 was either never dispatched or cannot change membership, so the previous
 placement is still accurate. In `Reconfiguring` or `Retired`, `Abort` is
 refused with `Irreversible` and recovery reconciles forward. The model has no

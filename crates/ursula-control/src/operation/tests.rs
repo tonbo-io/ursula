@@ -1588,3 +1588,73 @@ fn a_blocked_operation_can_still_abort_before_the_point_of_no_return() {
         Some(ProcessState::Active(ProcessIdentity { epoch: 2, .. }))
     ));
 }
+
+#[test]
+fn decommission_retires_its_source_only_after_admitting_replacements() {
+    let (mut state, nodes, mut placements) = setup();
+    let token = begin(
+        &mut state,
+        &nodes,
+        &mut placements,
+        OperationKind::DecommissionNode {
+            node_id: 1,
+            replacements: BTreeMap::from([(RaftGroupId(0), 4)]),
+        },
+        &[1, 2, 3, 4],
+    );
+    // Final membership alone is not enough: once the source retires, the
+    // replacement can no longer be admitted.
+    state
+        .apply(
+            OperationCommand::Observe {
+                token: token.clone(),
+                evidence: evidence(&[2, 3, 4], &[2, 3, 4], 100),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    let before = state.clone();
+    assert_eq!(
+        state.apply(
+            OperationCommand::RetireSource {
+                token: token.clone()
+            },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Err(OperationError::ReplicaChanged { node_id: 4 })
+    );
+    assert_eq!(state, before);
+    install_admission(
+        &mut state,
+        &nodes,
+        &mut placements,
+        &token,
+        4,
+        replica(4),
+        &[1, 2, 3],
+    );
+    state
+        .apply(
+            OperationCommand::Observe {
+                token: token.clone(),
+                evidence: evidence(&[2, 3, 4], &[2, 3, 4], 101),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    assert_eq!(
+        state.apply(
+            OperationCommand::RetireSource { token },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Ok(OperationOutcome::SourceRetired)
+    );
+}

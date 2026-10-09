@@ -26,6 +26,8 @@
 mod actions;
 mod command;
 mod evidence;
+#[cfg(test)]
+mod lifecycle_tests;
 mod model;
 mod placement;
 mod process;

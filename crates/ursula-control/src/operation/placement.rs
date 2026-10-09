@@ -180,6 +180,15 @@ impl OperationState {
         } else {
             RetirementReason::Rebuild
         };
+        // Replacements are admitted only before retirement, so a decommission
+        // that retired without them could never complete.
+        if reason == RetirementReason::Decommission {
+            let operation = self.active.as_ref().ok_or(OperationError::StaleExecutor)?;
+            for group in operation.desired.keys() {
+                self.require_replica_admissions(operation, *group)?;
+            }
+        }
+        let operation = self.authorized(token)?;
         operation.phase = OperationPhase::Retired;
         operation.evidence.clear();
         self.processes
