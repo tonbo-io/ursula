@@ -126,7 +126,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         upstreams,
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
-        upstream_tcp_user_timeout: Some(Duration::from_secs(5)),
+        upstream_tcp_user_timeout: Duration::from_secs(5),
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         raft_group_count: None,
         cors_allowed_origins: Vec::new(),
@@ -1658,4 +1658,22 @@ mod credential_deadline {
             "an already-expired credential must not rewrite a finite response"
         );
     }
+}
+
+// Idle upstream connections are probed at a fifth of the user timeout, at
+// least once a second, so several probes fit before it gives up (#495).
+#[test]
+fn upstream_keepalive_probes_several_times_within_the_user_timeout() {
+    assert_eq!(
+        upstream_keepalive(Duration::from_secs(5)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        upstream_keepalive(Duration::from_secs(30)),
+        Duration::from_secs(6)
+    );
+    assert_eq!(
+        upstream_keepalive(Duration::from_secs(1)),
+        Duration::from_secs(1)
+    );
 }

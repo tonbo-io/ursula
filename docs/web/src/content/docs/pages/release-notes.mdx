@@ -7,6 +7,10 @@ description: Changes that affect clients and operators, newest first.
 
 - **Rust library APIs changed.** The `ursula-control`, `ursula-raft` (`MetaRaftHandle` migration methods) and `ursula-proto` (`ProcessIncarnation::try_from` error type) Rust APIs changed, with no wire or on-disk change.
 
+### Fixed
+
+- **The gateway gives up on a connection to a vanished node within seconds.** A voter pod deleted with `--force`, or a host that loses power, leaves the gateway's pooled connections to it open without an answer. A request sent on one waited up to 30 s, reqwest's default `TCP_USER_TIMEOUT`, which is longer than the SQLite VFS's 10 s request timeout, so owners stalled for 10 to 22 s in failover tests. Upstream connections now give up after 5 s of unacknowledged data (`--upstream-tcp-user-timeout`, Linux), and the request fails with `502` for the client to retry. Idle connections are probed at a fifth of that, so one lost packet does not close a healthy long-poll or SSE read.
+
 ## 0.7.0
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.

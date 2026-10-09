@@ -112,14 +112,12 @@ pub struct GatewayConfig {
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
     /// How long data sent to an upstream may stay unacknowledged before the
-    /// connection is closed and its request fails (Linux `TCP_USER_TIMEOUT`;
-    /// ignored elsewhere). An upstream that vanishes without closing its
-    /// connections, as a force-deleted pod's address does, otherwise holds a
-    /// request on a pooled connection until `response_header_timeout`. It
-    /// also bounds the keepalive probes of an idle connection, so a dead one
-    /// leaves the pool before it is reused. `None` keeps the kernel default
-    /// (retransmissions for about 15 minutes).
-    pub upstream_tcp_user_timeout: Option<Duration>,
+    /// connection is closed and its request fails (Linux `TCP_USER_TIMEOUT`).
+    /// An upstream that vanishes without closing its connections, as a
+    /// force-deleted pod's address or a powered-off host does, otherwise
+    /// holds a request on a pooled connection for reqwest's default of 30 s.
+    /// Idle connections are probed at a fifth of it (see `upstream_client`).
+    pub upstream_tcp_user_timeout: Duration,
     pub max_request_body_bytes: usize,
     /// Raft topology used to share one learned leader across every stream in
     /// the same group. `None` preserves per-stream affinity for standalone
@@ -699,23 +697,37 @@ impl Gateway {
     }
 }
 
-/// Idle time before an upstream connection is probed, and the time between
-/// probes.
-const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
-const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-/// Unanswered probes before an idle connection is dropped where
-/// `TCP_USER_TIMEOUT` does not bound them.
-const UPSTREAM_KEEPALIVE_RETRIES: u32 = 3;
+/// Keepalive probes on an idle upstream connection where `TCP_USER_TIMEOUT`
+/// does not decide when to give up (not Linux).
+const UPSTREAM_KEEPALIVE_RETRIES: u32 = 5;
+
+/// The idle time before the first keepalive probe of an upstream connection,
+/// and between probes: a fifth of the user timeout, at least 1 s.
+///
+/// On Linux the user timeout also ends keepalive probing: a connection that
+/// has received nothing for that long while a probe is unanswered is closed.
+/// A probe's acknowledgement counts as received, so with probes this frequent
+/// about four in a row must go unanswered. One lost packet then does not close
+/// a healthy idle connection, such as a long-poll or an SSE read waiting for
+/// data, while one to a vanished upstream still closes within the user
+/// timeout. Probing only after the timeout had passed would leave a single
+/// probe to decide.
+fn upstream_keepalive(user_timeout: Duration) -> Duration {
+    user_timeout
+        .checked_div(5)
+        .unwrap_or_default()
+        .max(Duration::from_secs(1))
+}
 
 /// The client for every upstream request. Redirects are the gateway's to
 /// follow. A connection to an upstream that stopped answering fails within
-/// `upstream_tcp_user_timeout` while a request waits on it, and within the
-/// keepalive bounds while it idles in the pool.
+/// `upstream_tcp_user_timeout`, whether a request waits on it or it is idle.
 fn upstream_client(config: &GatewayConfig) -> reqwest::Client {
+    let keepalive = upstream_keepalive(config.upstream_tcp_user_timeout);
     let builder = reqwest::Client::builder()
         .connect_timeout(config.connect_timeout)
-        .tcp_keepalive(UPSTREAM_KEEPALIVE_IDLE)
-        .tcp_keepalive_interval(UPSTREAM_KEEPALIVE_INTERVAL)
+        .tcp_keepalive(keepalive)
+        .tcp_keepalive_interval(keepalive)
         .tcp_keepalive_retries(UPSTREAM_KEEPALIVE_RETRIES)
         .redirect(reqwest::redirect::Policy::none());
     #[cfg(target_os = "linux")]
