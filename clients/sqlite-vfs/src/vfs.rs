@@ -44,6 +44,8 @@ use crate::host::OK;
 use crate::host::unix;
 use crate::local::sidecar_line;
 use crate::local::write_sidecar;
+use crate::log;
+use crate::log::Level;
 use crate::wal::FRAME;
 use crate::wal::FRAME_HDR;
 use crate::wal::FRAME_HDR_LEN;
@@ -281,7 +283,7 @@ pub(crate) unsafe extern "C" fn x_open(
         && let Some(db) = name.and_then(|n| n.strip_suffix("-journal"))
         && lookup(db).is_some()
     {
-        eprintln!("sqlite-ursula-vfs: {db}: rollback journal refused (journal_mode must be WAL)");
+        log::emit(Level::Warn, "journal_refused", &[("file", &db)]);
         return ffi::SQLITE_CANTOPEN;
     }
     // Counted before the open, so attach (which refuses while any is counted) and an open
@@ -297,7 +299,10 @@ pub(crate) unsafe extern "C" fn x_open(
             if db.is_none()
                 && let Some(why) = refused(&reg, name)
             {
-                eprintln!("sqlite-ursula-vfs: {name}: open refused: {why}");
+                log::emit(Level::Warn, "open_refused", &[
+                    ("file", &name),
+                    ("reason", &why),
+                ]);
                 return ffi::SQLITE_CANTOPEN;
             }
             let open = reg.open.entry(name.to_owned()).or_default();
@@ -742,11 +747,15 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     db.log = db.log.saturating_add(body.len() as u64);
     db.pages = size;
     db.acked = db.acked.saturating_add(1);
+    db.append_retries = db
+        .append_retries
+        .saturating_add(u64::from(attempts.saturating_sub(1)));
     if abort_after_ack() == Some(db.acked) {
-        eprintln!(
-            "sqlite-ursula-vfs: URSULA_VFS_ABORT_AFTER_ACK={}: aborting after the ack",
-            db.acked
-        );
+        log::emit(Level::Error, "test_hook_abort", &[
+            ("hook", &"URSULA_VFS_ABORT_AFTER_ACK"),
+            ("file", &db.path),
+            ("acked", &db.acked),
+        ]);
         std::process::abort();
     }
     // The commit frame's number (1-based); past `u32` (never) no publish check can pass.

@@ -17,6 +17,8 @@ use crate::config::retry_budget;
 use crate::error::Attempt;
 use crate::error::Error;
 use crate::error::Gone;
+use crate::log;
+use crate::log::Level;
 
 /// `Producer-Id` prefix; the stream incarnation follows (`producer_id`).
 const PRODUCER: &str = "sqlite-ursula-vfs";
@@ -64,15 +66,17 @@ fn tls() -> TlsConfig {
                 })
                 .collect(),
             Err(e) => {
-                eprintln!("sqlite-ursula-vfs: URSULA_VFS_CA_FILE {path}: {e}");
+                log::emit(Level::Error, "ca_file_unreadable", &[
+                    ("path", &path),
+                    ("error", &e),
+                ]);
                 Vec::new()
             }
         };
         if certs.is_empty() {
-            eprintln!(
-                "sqlite-ursula-vfs: URSULA_VFS_CA_FILE {path} has no certificate: no TLS endpoint \
-                 is trusted"
-            );
+            log::emit(Level::Error, "ca_file_without_certificates", &[(
+                "path", &path,
+            )]);
         }
         TlsConfig::builder()
             .root_certs(RootCerts::new_with_certs(&certs))
@@ -223,6 +227,7 @@ pub(crate) fn append(
     epoch: u64,
     seq: u64,
 ) -> Append {
+    let started = Instant::now();
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
     let mut attempts: u32 = 0;
@@ -302,6 +307,13 @@ pub(crate) fn append(
             }
             Err(e) => Attempt::Transport(Box::new(e)),
         };
+        // A retried commit is a stall the application sees: say why, attempt by attempt.
+        log::emit(Level::Warn, "append_retry", &[
+            ("stream", &url),
+            ("attempt", &attempts),
+            ("elapsed_ms", &started.elapsed().as_millis()),
+            ("reason", &unknown),
+        ]);
         if !pause(retry_after, &mut backoff, deadline) {
             return Append::Failed(if refused {
                 unauthorized("append", url, 401)

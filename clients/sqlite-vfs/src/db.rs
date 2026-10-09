@@ -18,6 +18,8 @@ use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
 use crate::error::Error;
 use crate::host::OK;
+use crate::log;
+use crate::log::Level;
 use crate::snapshotter::Snapper;
 use crate::wal::db_len;
 
@@ -96,6 +98,15 @@ pub(crate) struct Db {
     /// the snapshot it installed (`START`: none).
     pub(crate) attached_from: String,
     pub(crate) installed: String,
+    /// How long the attach took.
+    pub(crate) attach_ms: u64,
+    /// Append attempts beyond the first, over every acknowledged commit.
+    pub(crate) append_retries: u64,
+    /// When this owner last saw a snapshot published (its own, or a newer one it found).
+    pub(crate) snapshot_published_at: Option<Instant>,
+    /// Snapshot attempts that failed since the last one that did not, and the last failure.
+    pub(crate) snapshot_failures: u32,
+    pub(crate) snapshot_error: Option<String>,
 }
 
 pub(crate) struct SnapshotStat {
@@ -130,10 +141,12 @@ impl Db {
     }
 
     pub(crate) fn poison(&mut self, why: Error) -> c_int {
-        eprintln!(
-            "sqlite-ursula-vfs: {}: {why}; database poisoned (re-attach to recover)",
-            self.url
-        );
+        log::emit(Level::Warn, "poisoned", &[
+            ("file", &self.path),
+            ("stream", &self.url),
+            ("fenced", &why.is_fenced()),
+            ("reason", &why),
+        ]);
         self.poisoned = Some(why);
         self.overlay.clear();
         self.committed = false;

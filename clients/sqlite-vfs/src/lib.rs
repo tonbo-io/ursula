@@ -59,10 +59,12 @@
 //!   only then advances the stream's retention to the *previous* snapshot's offset. Attach installs
 //!   the latest snapshot when the local file is missing or behind it, then replays the tail.
 //! * `SELECT ursula_status(path)` returns
-//!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained","local","installed"}`
-//!   (offsets as strings; `local`: the stream offset of the local state attach started from, `-1`
-//!   when it rebuilt the file; `installed`: the offset of the snapshot attach installed, `-1` for
-//!   none; `snapshot`, `retained`: `-1` for none);
+//!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained","local","installed",
+//!   "attach_ms","commits","append_retries","log_bytes","snapshot_due_bytes","snapshot_age_ms",
+//!   "snapshot_failures","snapshot_error"}` (offsets as strings; `local`: the stream offset of the
+//!   local state attach started from, `-1` when it rebuilt the file; `installed`: the offset of the
+//!   snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none; the rest are
+//!   the owner's health, see `status`);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
@@ -85,6 +87,7 @@
 //! - `extension`: the entry point and the SQL functions.
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
+//! - `log`: log lines (logfmt) on the host's stderr.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
 //! - `status`: `ursula_status` and `ursula_stats`.
 //! - `vfs`: the VFS file methods and the commit path.
@@ -101,6 +104,7 @@ mod extension;
 pub mod frame;
 mod host;
 mod local;
+mod log;
 pub mod snapshot;
 mod snapshotter;
 mod status;

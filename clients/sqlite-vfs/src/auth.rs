@@ -9,6 +9,8 @@ use std::sync::PoisonError;
 use std::time::SystemTime;
 
 use crate::config::token_file;
+use crate::log;
+use crate::log::Level;
 
 /// The token the application set, if any.
 static SET: Mutex<Option<String>> = Mutex::new(None);
@@ -50,7 +52,10 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
         let token = match fs::read_to_string(path) {
             Ok(text) => usable(&text),
             Err(e) => {
-                eprintln!("sqlite-ursula-vfs: URSULA_VFS_TOKEN_FILE {path}: {e}; sending no token");
+                log::emit(Level::Warn, "token_file_unreadable", &[
+                    ("path", &path),
+                    ("error", &e),
+                ]);
                 None
             }
         };

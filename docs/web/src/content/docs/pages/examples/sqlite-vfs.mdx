@@ -79,6 +79,26 @@ setToken(accessToken);
 
 The token is process-wide. A request whose token is refused (`401`) is sent again, with the token read again, within the retry budget (`URSULA_VFS_RETRY_MS`). A commit still refused then fails, and the file must be attached again, as after any failed commit. A `403` from the gateway's authorizer fails the request at once. Neither marks the owner fenced. The gateway answers `404` for a private bucket to a client without a token, so attach then reports the stream as missing.
 
+## Health and alerts
+
+`status(file)` (`ursula_status`) reports the owner's health along with its offsets:
+
+- `commits`, `append_retries`: commits acknowledged since the attach, and append attempts beyond the first (unknown outcomes, `429`, `503`, a refused token).
+- `log_bytes`, `snapshot_due_bytes`: the log since the latest snapshot, which a rebuild replays, and the size at which a snapshot is taken (the database's size, or `URSULA_VFS_SNAPSHOT_MIN_BYTES` if larger).
+- `snapshot_age_ms`, `snapshot_failures`, `snapshot_error`: milliseconds since this owner last saw a snapshot published (`null` for none since the attach), and the snapshot attempts that failed in a row with the last reason.
+- `attach_ms`: how long the attach took.
+
+`instrument(file, meter)` reports the same as metrics on an OpenTelemetry `Meter` (any object with `createHistogram`, `createCounter` and `createObservableGauge`; the package does not depend on OpenTelemetry): `sqlite_ursula.commit.duration` and `sqlite_ursula.append.duration` (ms), `sqlite_ursula.append.retries`, `sqlite_ursula.stream.bytes`, and the gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`, `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned` and `sqlite_ursula.fenced`. It drains `drainStats` every 10 seconds, so do not drain the same file elsewhere. Call the function it returns to stop.
+
+The extension logs one line per event on stderr, in logfmt: `sqlite-ursula-vfs level=warn event=poisoned file=... stream=... fenced=true reason="..."`. The events: `poisoned`, `append_retry` (a commit's append was retried, with the attempt, the time since the commit's first attempt and the reason), `snapshot_failed`, `open_refused`, `journal_refused`, `local_files_discarded`, `attach_retrying`, `attach_rebuilding`, `token_file_unreadable`, `ca_file_unreadable`, `ca_file_without_certificates`.
+
+Alerts worth setting:
+
+- `poisoned` is 1: commits fail until the file is attached again. `reason` says why. Attach again once the cause is fixed.
+- `fenced` is 1 without a planned handoff: another process claimed the stream. Find the second owner before attaching again.
+- `log_bytes` stays above a few times `snapshot_due_bytes`, or `snapshot_failures` keeps growing: snapshots are not being published, for example a body over the gateway's `--max-request-body-bytes` or a long reader pinning WAL frames. Every rebuild then replays the whole log.
+- The p99 of `sqlite_ursula.commit.duration` rises: look at the Ursula cluster first. A commit waits for its append.
+
 ## Pi Durable
 
 `openUrsulaPiStorage` attaches the file and opens it with Pi's own node driver:
