@@ -16,7 +16,7 @@
 //! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
 //! - `ejection`: leaves upstreams that failed at the transport out of selection
-//!   for a backoff window (#454).
+//!   for a backoff window, then lets one request at a time probe them (#454).
 
 use std::collections::HashMap;
 use std::error::Error as _;
@@ -71,9 +71,6 @@ use crate::auth::AuthorizationDecision;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
-use crate::ejection::Clock;
-use crate::ejection::EJECTION_BASE;
-use crate::ejection::EJECTION_MAX;
 use crate::ejection::Ejections;
 use crate::ejection::Failed;
 use crate::usage::PrincipalRef;
@@ -113,8 +110,9 @@ struct GatewayMetricsSnapshot {
     leader_cache_entries: usize,
     /// Times an upstream was left out of selection after a transport failure.
     upstream_ejections: u64,
-    /// Upstreams left out of selection now.
-    ejected_upstreams: usize,
+    /// Upstreams left out of selection now: inside their window, or with a
+    /// probe outstanding.
+    upstream_ejected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +163,6 @@ pub struct Gateway {
     shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
     ejections: Arc<Ejections>,
-    clock: Clock,
     metrics: Arc<GatewayMetrics>,
     cors: Option<crate::cors::CorsPolicy>,
 }
@@ -187,6 +184,12 @@ impl Gateway {
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
         let client = upstream_client(&config);
         let response_header_timeout = config.response_header_timeout;
+        // The longest a request to a dead upstream takes to fail at the
+        // transport, so a probe that has neither answered nor failed by then
+        // is not waiting on a dead node.
+        let probe_deadline = config.connect_timeout.saturating_add(Duration::from_secs(
+            config.upstream_tcp_user_timeout_secs.get(),
+        ));
         let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
         Self {
             config,
@@ -198,18 +201,10 @@ impl Gateway {
             usage: None,
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
-            ejections: Arc::new(Ejections::new(EJECTION_BASE, EJECTION_MAX)),
-            clock: Clock::default(),
+            ejections: Arc::new(Ejections::new(probe_deadline)),
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
         }
-    }
-
-    /// A clock tests move by hand, so ejection windows expire without sleeps.
-    #[cfg(test)]
-    fn with_clock(mut self, clock: Clock) -> Self {
-        self.clock = clock;
-        self
     }
 
     /// Installs provider-neutral authentication and authorization hooks.
@@ -440,34 +435,46 @@ impl Gateway {
         Ok(None)
     }
 
+    /// The cached leader route of the request's stream or group, unless its
+    /// upstream is ejected, else an upstream that is not ejected at random
+    /// (see `ejection`).
     fn pick_upstream(&self, uri: &Uri) -> Option<String> {
-        let now = self.clock.now();
-        if let Some(key) = upstream_pin_key(uri, self.shard_map.as_ref()) {
-            // Its own statement: the cache's lock is released before the
-            // branches below, which may take it again.
-            let cached = self
-                .leader_affinity
+        let key = upstream_pin_key(uri, self.shard_map.as_ref());
+        // Its own statement: the cache's lock is released before the
+        // ejection lock is taken and before the cache may be taken again.
+        let cached = key.as_ref().and_then(|key| {
+            self.leader_affinity
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&key)
-                .cloned();
-            if let Some(upstream) = cached {
-                if self.ejections.admit(&upstream, now) {
-                    self.metrics
-                        .leader_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Some(upstream);
-                }
-                // A route to an upstream that is ejected or being probed.
-                self.forget_leader_if_matches(&key, &upstream);
+                .get(key)
+                .cloned()
+        });
+        let pick = self.ejections.pick(
+            cached.as_deref(),
+            &self.config.upstreams,
+            Instant::now(),
+            &mut rand::rng(),
+        )?;
+        if pick.cached {
+            self.metrics
+                .leader_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics
+                .leader_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            // A route to an upstream that is ejected or being probed.
+            if let (Some(key), Some(cached)) = (&key, &cached) {
+                self.forget_leader_if_matches(key, cached);
             }
         }
-        self.metrics
-            .leader_cache_misses
-            .fetch_add(1, Ordering::Relaxed);
-        self.ejections
-            .pick(&self.config.upstreams, now, &mut rand::rng())
-            .cloned()
+        if pick.probe {
+            debug!(
+                upstream = pick.upstream,
+                "probing an upstream whose ejection window expired"
+            );
+        }
+        Some(pick.upstream.to_owned())
     }
 
     async fn forward(
@@ -598,7 +605,7 @@ impl Gateway {
             return;
         }
         if let Failed::Ejected { window, failures } =
-            self.ejections.failed(upstream, self.clock.now())
+            self.ejections.failed(upstream, Instant::now())
         {
             self.metrics
                 .upstream_ejections
@@ -754,7 +761,7 @@ impl Gateway {
             leader_redirect_ns: self.metrics.leader_redirect_ns.load(Ordering::Relaxed),
             leader_cache_entries,
             upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
-            ejected_upstreams: self.ejections.count(self.clock.now()),
+            upstream_ejected: self.ejections.active(Instant::now()),
         }
     }
 }
