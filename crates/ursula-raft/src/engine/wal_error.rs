@@ -34,9 +34,11 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         RaftWalError::TopologyMismatch { .. } | RaftWalError::MissingTopology { .. } => {
             WalOpenFailureKind::InvalidConfiguration
         }
-        RaftWalError::ReadTopology(source) | RaftWalError::ReadRunState(source) => {
-            state_failure(source)
-        }
+        RaftWalError::ReadTopology(source)
+        | RaftWalError::ReadRunState(source)
+        | RaftWalError::ReadCoreMetadata(source) => state_failure(source),
+        // Only corrupt or forged core metadata can hold the last epoch.
+        RaftWalError::RecoveryEpochExhausted { .. } => WalOpenFailureKind::Corrupt,
         RaftWalError::RecordTopology(source)
         | RaftWalError::RecordRunState(source)
         | RaftWalError::ReadJournal { source, .. }
