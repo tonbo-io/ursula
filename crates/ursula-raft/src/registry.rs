@@ -1439,6 +1439,7 @@ mod tests {
         replacement.shutdown().await.unwrap();
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn snapshot_reference_put_failures_retry_without_restarting_raft() {
         snapshot_reference_put_failures_retry_without_restarting_raft_body().await;
