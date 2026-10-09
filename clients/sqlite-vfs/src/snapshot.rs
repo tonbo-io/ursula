@@ -30,6 +30,13 @@ pub struct Snapshot {
 pub enum SnapshotError {
     #[error("bad header")]
     Header,
+    /// A body of another minor version's format (an incompatible change bumps the magic).
+    #[error(
+        "snapshot magic \"{}\": this extension reads \"USS2\" snapshots, so the snapshot was \
+         taken by an extension of another minor version",
+        .found.escape_ascii()
+    )]
+    Magic { found: [u8; 4] },
     #[error("the offset is not UTF-8: {0}")]
     OffsetUtf8(#[source] std::str::Utf8Error),
     #[error("page count does not match the compressed image")]
@@ -83,6 +90,9 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, SnapshotError> {
     let Some((magic, rest)) = body.split_first_chunk::<4>() else {
         return Err(SnapshotError::Header);
     };
+    if magic != MAGIC {
+        return Err(SnapshotError::Magic { found: *magic });
+    }
     let Some((&n, rest)) = rest.split_first() else {
         return Err(SnapshotError::Header);
     };
@@ -98,9 +108,6 @@ pub fn decode(body: &[u8]) -> Result<Snapshot, SnapshotError> {
     let Some((crc, payload)) = rest.split_first_chunk::<4>() else {
         return Err(SnapshotError::Header);
     };
-    if magic != MAGIC {
-        return Err(SnapshotError::Header);
-    }
     let offset = std::str::from_utf8(offset)
         .map_err(SnapshotError::OffsetUtf8)?
         .to_owned();
@@ -164,5 +171,19 @@ mod tests {
             encode("o", 1, &image[1..]),
             Err(SnapshotError::PartialPage(_))
         ));
+    }
+
+    // A body of another format fails closed and names what it found (§7, versions), before
+    // anything of its layout is read.
+    #[test]
+    fn another_format_is_refused_by_its_magic() {
+        let mut body = encode("o", 1, &[0u8; PAGE]).unwrap();
+        body[3] = b'1';
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(err, SnapshotError::Magic { found } if &found == b"USS1"));
+        assert!(
+            err.to_string()
+                .starts_with("snapshot magic \"USS1\": this extension reads \"USS2\"")
+        );
     }
 }
