@@ -588,10 +588,10 @@ chart's `examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit),
 settings. Server image: main `bb7a61b` (`0.0.0-main.bb7a61b1c968`) with the chart's defaults: the
 Raft WAL on a gp3 volume with `raft.wal.fsync = never`, and no gateway quota policy, so no client
 saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the cold-start cells. Extension:
-#488 at `398369d`, and `ee5e278` for two of the three failover runs (it adds the `append_retry` log
-line and changes nothing on the commit path). Clients: `m6i.2xlarge` pods (Node 22.20) in
-us-east-1a, one process per database, through the gateway Service. The tools are in
-`clients/sqlite-ursula/bench/`.
+#488 at `398369d`, and `ee5e278` for two of the three failover runs (it changes nothing on the
+commit path except a log line when an append is retried, `append_retry`). Clients: `m6i.2xlarge`
+pods (Node 22.20) in us-east-1a, one process per database, through the gateway Service. The tools
+are in `clients/sqlite-ursula/bench/`.
 
 Workload: Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`, a real `Harness` with
 a faux model, turns of text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit`
@@ -648,8 +648,12 @@ Where one database's commit goes (1 db at agent pace, p50, ms):
 The append is the commit, and what it costs depends on where the stream's leader and the
 connection's gateway are. Through the Service, each connection lands on one of the three gateways,
 one per AZ, and the stream's group is led from one of the three nodes. To separate the VFS from
-placement, six fresh streams each ran one database flat out for 30 s and then raw appends of the
-VFS's frame size (4.8 KB) on the same stream, both through the gateway pod in the client's AZ:
+placement, an ad hoc run outside the committed tools (`raw.ts` creates its own streams, sends 5 to
+7 KiB bodies and goes through the Service) used six fresh streams. On each, one database ran flat
+out for 30 s, and then raw appends of the VFS's frame size (4.8 KB) went to the same stream, both
+sent to the gateway pod in the client's AZ rather than through the Service. The VFS appends with
+ureq from inside the extension and the raw appends use Node's `fetch`, so the difference includes
+the two HTTP clients:
 
 | leader's AZ | VFS append p50, ms | raw append p50 on the same stream, ms |
 | --- | --- | --- |
@@ -657,9 +661,10 @@ VFS's frame size (4.8 KB) on the same stream, both through the gateway pod in th
 | us-east-1b | 1.66, 1.39 | 1.53, 1.28 |
 | us-east-1c | 2.33, 2.39 | 2.26, 2.35 |
 
-The VFS adds 0.04 to 0.13 ms to an append. The one-database cells' 4.0 to 4.3 ms went through
-the Service, where the connection's gateway can also be in another AZ, and that placement was not
-recorded. Over 16 and 128 databases at agent pace the VFS's append p50 was 3.5 to 3.7 ms.
+The VFS, with its HTTP client, adds 0.04 to 0.13 ms to an append over `fetch`. The one-database
+cells' 4.0 to 4.3 ms went through the Service, where the connection's gateway can also be in another
+AZ, and that placement was not recorded. Over 16 and 128 databases at agent pace the VFS's append
+p50 was 3.5 to 3.7 ms.
 
 **The 2026-10-03 problems.** Neither reproduced. At 128 databases flat out no database was
 poisoned, no append was retried, no node logged `rebuilding channel`, and there were no
@@ -675,7 +680,10 @@ out, so 3.6 KB per commit at agent pace and 4.6 to 4.8 KB flat out. A snapshot i
 outgrows the database, at least 8 MiB (§4.1). The agent-pace databases had about 7 MB of log after
 10.5 min and took none. The retained log (tail minus retention) ended at no more than 7.0 MB at
 agent pace, 16.8 MB in the 16- and 128-database flat-out cells, and 25.4 MB for the single
-flat-out database (13.8 MB).
+flat-out database. Retention trails one snapshot behind (§4.3), so the retained log reaches about
+twice the snapshot threshold, plus what is committed while a snapshot is taken: 16.8 MB is twice
+the 8 MiB minimum, and the single flat-out database had grown to 13.8 MB, which set its threshold
+above the minimum.
 
 **Back-to-back large transactions** (5 MB table, 2,000-row updates, frames of about 1 MB, no pause,
 300 s): 3,429 commits at p50 91 / p99 182 / max 1,138 ms, 3.35 GB written, 381 snapshots. The
@@ -683,11 +691,12 @@ retained log never exceeded 19.5 MB (sampled every 10 s) and ended at 15.7 MB. S
 2.94 GB for the stream 29 minutes after the writes: the external payloads that #475 leaves behind,
 fixed by #487, which this image predates.
 
-**Cold start**: a fresh host attaching new files, three times, best with the first in parentheses.
-A newly built database has no snapshot yet, because one is due only once its log outgrows the
-database (§4.1), so the first column replays the whole log. For the second, rows were rewritten
-after the build until a snapshot was published, as a database that has lived a while would have
-one:
+**Cold start**: a fresh host attaching new files, three times, best with the first in parentheses
+(`bench/coldstart.ts`; the log replayed, and the tail after a snapshot, are the attached file's
+`log_bytes`). A newly built database has no snapshot yet, because one is due only once its log
+outgrows the database (§4.1), so the first column replays the whole log. For the second, rows were
+rewritten after the build until a snapshot was published, as a database that has lived a while would
+have one:
 
 | database | log only: log replayed, attach | with a snapshot: body (publish time), tail after it, attach |
 | --- | --- | --- |
@@ -720,7 +729,8 @@ container still held the WAL lock, then started. Two snapshot uploads during the
 gateway's `504` after its own 30 s upstream timeout, the same cause, and the next attempt published
 them. The snapshot read-back `503` of the 2026-10-03 run did not recur.
 
-**S3.** Requests per minute, whole bucket, median (range) over the minutes wholly inside each cell:
+**S3.** Requests per minute (CloudWatch S3 request metrics), whole bucket, median (range) over the
+minutes wholly inside each cell:
 
 | cell | PUT | GET |
 | --- | --- | --- |
