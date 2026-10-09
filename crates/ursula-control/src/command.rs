@@ -6,8 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
-use crate::model::LearnerStatus;
-use crate::model::MigrationPhase;
+use crate::OperationId;
 use crate::model::NodeId;
 use crate::model::NodeState;
 
@@ -31,43 +30,8 @@ pub enum ControlCommand {
         voters: BTreeSet<NodeId>,
         now_ms: u64,
     },
-    BeginMigration {
-        raft_group_id: RaftGroupId,
-        target_voters: BTreeSet<NodeId>,
-        retain_removed: bool,
-        now_ms: u64,
-    },
-    AdvanceMigration {
-        migration_id: u64,
-        phase: MigrationPhase,
-        now_ms: u64,
-    },
-    SetLearnerStatus {
-        migration_id: u64,
-        node_id: NodeId,
-        status: LearnerStatus,
-        now_ms: u64,
-    },
-    RecordMigrationError {
-        migration_id: u64,
-        error: String,
-        now_ms: u64,
-    },
-    CommitPlacement {
-        raft_group_id: RaftGroupId,
-        voters: BTreeSet<NodeId>,
-        learners: BTreeSet<NodeId>,
-        draining: BTreeSet<NodeId>,
-        now_ms: u64,
-    },
-    FinishMigration {
-        migration_id: u64,
-        success: bool,
-        now_ms: u64,
-    },
-    EvictLearner {
-        raft_group_id: RaftGroupId,
-        node_id: NodeId,
+    Operation {
+        command: crate::OperationCommand,
         now_ms: u64,
     },
 }
@@ -78,13 +42,7 @@ impl ControlCommand {
             Self::RegisterNode { now_ms, .. }
             | Self::SetNodeState { now_ms, .. }
             | Self::SeedPlacement { now_ms, .. }
-            | Self::BeginMigration { now_ms, .. }
-            | Self::AdvanceMigration { now_ms, .. }
-            | Self::SetLearnerStatus { now_ms, .. }
-            | Self::RecordMigrationError { now_ms, .. }
-            | Self::CommitPlacement { now_ms, .. }
-            | Self::FinishMigration { now_ms, .. }
-            | Self::EvictLearner { now_ms, .. } => *now_ms,
+            | Self::Operation { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -95,13 +53,7 @@ impl fmt::Display for ControlCommand {
             Self::RegisterNode { .. } => "register_node",
             Self::SetNodeState { .. } => "set_node_state",
             Self::SeedPlacement { .. } => "seed_placement",
-            Self::BeginMigration { .. } => "begin_migration",
-            Self::AdvanceMigration { .. } => "advance_migration",
-            Self::SetLearnerStatus { .. } => "set_learner_status",
-            Self::RecordMigrationError { .. } => "record_migration_error",
-            Self::CommitPlacement { .. } => "commit_placement",
-            Self::FinishMigration { .. } => "finish_migration",
-            Self::EvictLearner { .. } => "evict_learner",
+            Self::Operation { .. } => "operation",
         })
     }
 }
@@ -109,13 +61,13 @@ impl fmt::Display for ControlCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
     Ok,
-    MigrationStarted { migration_id: u64 },
-    Rejected { reason: String },
+    Operation(Result<crate::OperationOutcome, crate::OperationError>),
+    Rejected { reason: ControlError },
 }
 
 impl ControlResponse {
     pub fn is_rejected(&self) -> bool {
-        matches!(self, Self::Rejected { .. })
+        matches!(self, Self::Rejected { .. } | Self::Operation(Err(_)))
     }
 }
 
@@ -123,8 +75,39 @@ impl fmt::Display for ControlResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Ok => "ok",
-            Self::MigrationStarted { .. } => "migration_started",
+            Self::Operation(_) => "operation",
             Self::Rejected { .. } => "rejected",
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeEndpoint {
+    Client,
+    Cluster,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ControlError {
+    #[error("node {node_id} has an empty {endpoint:?} address")]
+    EmptyAddress {
+        node_id: NodeId,
+        endpoint: NodeEndpoint,
+    },
+    #[error("node {node_id} is not registered")]
+    UnknownNode { node_id: NodeId },
+    #[error("node {node_id} has been removed")]
+    RemovedNode { node_id: NodeId },
+    #[error("node {node_id} removal requires the decommission operation")]
+    RemovalRequiresOperation { node_id: NodeId },
+    #[error("node {node_id} is not eligible: {state:?}")]
+    IneligibleNode { node_id: NodeId, state: NodeState },
+    #[error("group {raft_group_id:?} requires at least one voter")]
+    EmptyVoters { raft_group_id: RaftGroupId },
+    #[error("group {raft_group_id:?} already has a placement")]
+    PlacementExists { raft_group_id: RaftGroupId },
+    /// Only an address refresh of a registered node is accepted while an
+    /// operation is active.
+    #[error("maintenance operation {operation_id:?} is active")]
+    OperationActive { operation_id: OperationId },
 }

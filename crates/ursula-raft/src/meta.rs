@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::io;
 use std::io::Cursor;
@@ -28,7 +27,6 @@ use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
 use ursula_control::NodeId;
-use ursula_shard::RaftGroupId;
 
 use crate::registry::SingleNodeRaftNetworkFactory;
 
@@ -80,6 +78,15 @@ impl MetaRaftError {
     pub fn operation(&self) -> &'static str {
         self.operation
     }
+}
+
+/// A node registration answered with a response that is neither success nor a
+/// typed rejection.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("node {node_id} registration returned unexpected response {response}")]
+pub struct UnexpectedRegistrationResponse {
+    pub node_id: NodeId,
+    pub response: ControlResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,54 +237,6 @@ impl MetaRaftHandle {
         self.write(registration.into_command(now_ms)).await
     }
 
-    pub async fn begin_migration(
-        &self,
-        raft_group_id: RaftGroupId,
-        target_voters: BTreeSet<u64>,
-        retain_removed: bool,
-        now_ms: u64,
-    ) -> Result<ControlResponse, MetaRaftError> {
-        self.write(ControlCommand::BeginMigration {
-            raft_group_id,
-            target_voters,
-            retain_removed,
-            now_ms,
-        })
-        .await
-    }
-
-    pub async fn commit_placement(
-        &self,
-        raft_group_id: RaftGroupId,
-        voters: BTreeSet<u64>,
-        learners: BTreeSet<u64>,
-        draining: BTreeSet<u64>,
-        now_ms: u64,
-    ) -> Result<ControlResponse, MetaRaftError> {
-        self.write(ControlCommand::CommitPlacement {
-            raft_group_id,
-            voters,
-            learners,
-            draining,
-            now_ms,
-        })
-        .await
-    }
-
-    pub async fn finish_migration(
-        &self,
-        migration_id: u64,
-        success: bool,
-        now_ms: u64,
-    ) -> Result<ControlResponse, MetaRaftError> {
-        self.write(ControlCommand::FinishMigration {
-            migration_id,
-            success,
-            now_ms,
-        })
-        .await
-    }
-
     pub async fn register_initial_data_nodes(
         &self,
         registrations: impl IntoIterator<Item = MetaNodeRegistration>,
@@ -287,16 +246,18 @@ impl MetaRaftHandle {
             let node_id = registration.node_id;
             match self.register_node(registration, now_ms).await? {
                 ControlResponse::Ok => {}
+                // Includes `OperationActive`: only an address refresh is
+                // accepted while a maintenance operation is active.
                 ControlResponse::Rejected { reason } => {
-                    return Err(MetaRaftError::new(
+                    return Err(MetaRaftError::with_source(
                         "register initial data-capable node",
-                        format!("node {node_id} rejected: {reason}"),
+                        reason,
                     ));
                 }
-                response => {
-                    return Err(MetaRaftError::new(
+                response @ ControlResponse::Operation(_) => {
+                    return Err(MetaRaftError::with_source(
                         "register initial data-capable node",
-                        format!("node {node_id} returned unexpected response {response}"),
+                        UnexpectedRegistrationResponse { node_id, response },
                     ));
                 }
             }
@@ -589,7 +550,10 @@ mod tests {
         assert_eq!(
             machine.last_response(),
             Some(&ControlResponse::Rejected {
-                reason: "client_url must not be empty".to_owned(),
+                reason: ursula_control::ControlError::EmptyAddress {
+                    node_id: 5,
+                    endpoint: ursula_control::NodeEndpoint::Client,
+                },
             })
         );
     }

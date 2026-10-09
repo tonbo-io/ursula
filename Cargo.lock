@@ -4493,7 +4493,11 @@ dependencies = [
 name = "ursula-control"
 version = "0.7.0"
 dependencies = [
+ "proptest",
  "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "ursula-proto",
  "ursula-shard",
 ]
 
@@ -4600,6 +4604,7 @@ dependencies = [
  "protoc-bin-vendored",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
