@@ -300,3 +300,63 @@ fn snapshot_with_staged_locators_round_trips() {
         "{response:?}"
     );
 }
+
+// Retention that passes an external payload still held in state (not offloaded to a page yet)
+// queues its object for the cold GC with the retention grace, as it does a dropped pack slice.
+// Nothing else names the object: before, it waited for the orphan sweep's one-day grace.
+#[test]
+fn retention_queues_the_external_payloads_it_drops_from_state() {
+    const NOW_MS: u64 = 1_000_000;
+    let mut machine = fresh_machine();
+    append_external(&mut machine, "s/external/a.bin", 10);
+    append_external(&mut machine, "s/external/b.bin", 10);
+    let published = machine.apply(StreamCommand::PublishSnapshot {
+        stream_id: stream("s"),
+        snapshot_offset: 10,
+        content_type: OCTET.to_owned(),
+        payload: bytes::Bytes::from_static(b"state"),
+        now_ms: 3,
+        expected_incarnation: None,
+    });
+    assert!(
+        matches!(published, StreamResponse::SnapshotPublished { .. }),
+        "{published:?}"
+    );
+    let retained = machine.apply(StreamCommand::AdvanceRetention {
+        stream_id: stream("s"),
+        retained_offset: 10,
+        now_ms: NOW_MS,
+        expected_incarnation: None,
+    });
+    assert!(
+        matches!(retained, StreamResponse::RetentionAdvanced { .. }),
+        "{retained:?}"
+    );
+    assert_eq!(machine.external_segments(&stream("s")), &[object(
+        10,
+        20,
+        "s/external/b.bin"
+    )]);
+    let pending = machine.pending_cold_gc_batch(8);
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(
+        pending[0].target,
+        ColdGcTarget::Paths(vec!["s/external/a.bin".to_owned()])
+    );
+    assert_eq!(
+        pending[0].not_before_ms,
+        NOW_MS + super::cold::RETENTION_COLD_GC_GRACE_MS
+    );
+    // The entry is replicated state: a restored replica keeps it.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(restored.pending_cold_gc_batch(8), pending);
+    // An offload that proposed the dropped ref before retention removes nothing.
+    let offloaded = offload(&mut machine, vec![object(0, 10, "s/external/a.bin")]);
+    assert!(
+        matches!(offloaded, StreamResponse::ColdRefsOffloaded {
+            removed: 0,
+            remaining: 1
+        }),
+        "{offloaded:?}"
+    );
+}

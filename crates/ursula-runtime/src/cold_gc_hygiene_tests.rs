@@ -10,10 +10,12 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdGcTarget;
+use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamReadColdIndexSegment;
 
 use crate::AdvanceRetentionRequest;
+use crate::AppendExternalRequest;
 use crate::AppendRequest;
 use crate::ColdStore;
 use crate::ColdStoreFaultEffect;
@@ -344,6 +346,79 @@ async fn retain_past_last_pack_reference() -> (Arc<ColdStore>, String) {
 async fn f14i_retention_keeps_dropped_pack_slices_for_the_grace() {
     let (cold_store, pack_path) = retain_past_last_pack_reference().await;
     assert!(object_exists(&cold_store, &pack_path).await);
+}
+
+/// #475: retention past an external payload still held in state (not offloaded to a page yet)
+/// queues its object, and the GC deletes it once the retention grace has passed (retention applies
+/// at time 0 here, so the grace is long over). Before, nothing deleted it until the orphan sweep's
+/// one-day grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_reclaims_external_payloads_still_held_in_state() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    let group = RaftGroupId(1);
+    let stream = stream_on_group(&runtime, group, "external");
+    create(&runtime, &stream).await;
+    let [below, above] = ["below", "above"].map(|name| format!("{stream}/external/{name}.bin"));
+    for path in [&below, &above] {
+        cold_store
+            .write_chunk(path, b"xyz")
+            .await
+            .expect("stage external payload");
+        runtime
+            .append_external(AppendExternalRequest {
+                stream_id: stream.clone(),
+                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                payload: ExternalPayloadRef {
+                    s3_path: path.clone(),
+                    payload_len: 3,
+                    object_size: 3,
+                },
+                record_ends: Vec::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                now_ms: 0,
+                if_incarnation: None,
+            })
+            .await
+            .expect("append external");
+    }
+    runtime
+        .publish_snapshot(PublishSnapshotRequest {
+            stream_id: stream.clone(),
+            snapshot_offset: 3,
+            content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+            payload: Bytes::from_static(b"state"),
+            cold_body: None,
+            now_ms: 0,
+            expected_incarnation: None,
+            if_incarnation: None,
+        })
+        .await
+        .expect("publish checkpoint");
+    runtime
+        .advance_retention(AdvanceRetentionRequest {
+            stream_id: stream.clone(),
+            retained_offset: 3,
+            now_ms: 0,
+            expected_incarnation: None,
+            if_incarnation: None,
+        })
+        .await
+        .expect("advance retention");
+    assert!(
+        pending_gc(&runtime, group)
+            .await
+            .iter()
+            .any(|entry| entry.target == ColdGcTarget::Paths(vec![below.clone()]))
+    );
+    runtime
+        .run_cold_gc_group_once(group, 16)
+        .await
+        .expect("cold gc pass");
+    assert!(!object_exists(&cold_store, &below).await);
+    assert!(object_exists(&cold_store, &above).await);
 }
 
 /// Wave-1 follow-up: a replica's cached cold-index page is dropped when a
