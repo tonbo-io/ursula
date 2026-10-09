@@ -110,8 +110,11 @@ jobs:
         with:
           rustflags: ""
 
-      - name: Audit DST guards (all 7 audits)
+      - name: Audit DST guards (all 8 audits)
         run: python3 -m scripts.dst all
+
+      - name: Test Raft units under madsim
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib
 
       - name: Run madsim smoke corpus and PR seed set
         run: |
@@ -246,7 +249,7 @@ jobs:
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             rotation_purge_and_rewrite_survive_crashes a_purge_is_durable_before_the_segments \
-            a_lagging_follower_catches_up --nocapture
+            a_lagging_follower_catches_up disk_tests --nocapture
 
       # Strict replay: madsim's check_determinism runs a three-node cluster on
       # the per-core journal twice per seed and fails at the first scheduling

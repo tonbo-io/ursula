@@ -514,16 +514,19 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
 mod tests {
     use std::collections::BTreeSet;
 
+    #[cfg(not(madsim))]
     use ursula_config::WalFsync;
     use ursula_shard::CoreId;
     use ursula_shard::ShardId;
 
     use super::*;
 
+    #[cfg(not(madsim))]
     fn peer_ids(nodes: BTreeMap<u64, BasicNode>) -> Vec<u64> {
         nodes.keys().copied().collect()
     }
 
+    #[cfg(not(madsim))]
     fn per_group_voters(groups: &[(u32, &[u64])]) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
         groups
             .iter()
@@ -531,6 +534,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(not(madsim))]
     fn factory_for_node(
         node_id: u64,
         wal_root: &tempfile::TempDir,
@@ -555,6 +559,7 @@ mod tests {
         .with_per_group_voters(per_group_voters(&[(0, &[1, 2, 3]), (1, &[2, 3, 4])]))
     }
 
+    #[cfg(not(madsim))]
     #[test]
     fn per_group_static_voters_override_default_peer_set() {
         let wal_root = tempfile::tempdir().expect("WAL root");
@@ -577,6 +582,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(madsim))]
     #[test]
     fn per_group_initializers_are_chosen_from_group_voters() {
         let wal_root = tempfile::tempdir().expect("WAL root");

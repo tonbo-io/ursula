@@ -108,7 +108,7 @@ impl CoreMetadata {
         changed
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(madsim)))]
     pub(crate) fn group(&self, group_id: u32) -> GroupMetadata {
         self.groups.get(&group_id).copied().unwrap_or_default()
     }

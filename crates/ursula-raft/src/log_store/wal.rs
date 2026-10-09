@@ -230,7 +230,7 @@ impl RaftWal {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 mod tests {
     use ursula_shard::RaftGroupId;
     use ursula_shard::ShardId;

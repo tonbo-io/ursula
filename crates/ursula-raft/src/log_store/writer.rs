@@ -2178,7 +2178,7 @@ impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn read_wire_frames<T: Serialize + DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<Vec<T>, JournalError> {

@@ -6,10 +6,13 @@
 //! themselves are pinned once, against the in-memory engine, by
 //! `ursula-runtime`'s cold-path tests.
 
+#[cfg(not(madsim))]
 use std::sync::Arc;
 
 use futures_util::stream;
+#[cfg(not(madsim))]
 use openraft::BasicNode;
+#[cfg(not(madsim))]
 use openraft::Config;
 use openraft::Entry;
 use openraft::EntryPayload;
@@ -18,16 +21,26 @@ use openraft::entry::RaftEntry;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
+#[cfg(not(madsim))]
 use ursula_runtime::AppendRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::ColdIndexPageStore;
+#[cfg(not(madsim))]
 use ursula_runtime::ColdStore;
+#[cfg(not(madsim))]
 use ursula_runtime::ColdStoreColdIndexPageStore;
+#[cfg(not(madsim))]
 use ursula_runtime::ColdWriteAdmission;
+#[cfg(not(madsim))]
 use ursula_runtime::CreateStreamRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::FlushColdRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupWriteCommand;
+#[cfg(not(madsim))]
 use ursula_runtime::ReadStreamRequest;
+#[cfg(not(madsim))]
 use ursula_runtime::StreamErrorCode;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -38,7 +51,9 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 
+#[cfg(not(madsim))]
 use crate::RaftWal;
+#[cfg(not(madsim))]
 use crate::engine::RaftGroupEngine;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
@@ -59,6 +74,7 @@ fn bsid(name: &str) -> BucketStreamId {
     BucketStreamId::new("benchcmp", name)
 }
 
+#[cfg(not(madsim))]
 fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStreamRequest {
     ReadStreamRequest {
         stream_id,
@@ -72,6 +88,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
 
 /// A single-node group with `cold_store`, on the per-core journal in the
 /// returned directory, which must outlive the engine.
+#[cfg(not(madsim))]
 async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::TempDir) {
     let wal_root = tempfile::tempdir().expect("WAL root");
     let config = Arc::new(
@@ -118,6 +135,7 @@ fn external_payload(s3_path: &str, len: u64) -> ExternalPayloadRef {
     }
 }
 
+#[cfg(not(madsim))]
 fn append_req(
     stream_id: &BucketStreamId,
     payload: &[u8],
@@ -140,6 +158,7 @@ fn chunk(start_offset: u64, end_offset: u64, s3_path: &str) -> ColdChunkRef {
     }
 }
 
+#[cfg(not(madsim))]
 async fn stage(cold_store: &ColdStore, path: &str, payload: &[u8]) {
     cold_store
         .write_chunk(path, payload)
@@ -232,6 +251,7 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
 
 /// F14e: a stale flush on the Raft engine is rejected before it writes a
 /// page entry, so no entry is left behind for an unreferenced chunk.
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn stale_flush_leaves_no_page_entry() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
@@ -319,6 +339,7 @@ async fn stale_flush_leaves_no_page_entry() {
 /// cold-index page cache, so the page invalidation that runs when a
 /// replicated `FlushCold` applies (on every replica) also drops the pages the
 /// read path cached.
+#[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
