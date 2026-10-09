@@ -1,14 +1,18 @@
-name: Commit Candidate Publish
+name: Commit Candidate Build
 
 # A commit candidate is a canary deployment artifact, not a Ursula release.
 # It never creates a Git tag, GitHub Release, stable image alias, or source
-# version bump. Stable releases are published only after the candidate has
-# passed the reviewed EKS rollout and recovery checks.
+# version bump, and it writes nothing to GHCR. A dispatched build is saved in
+# the Depot Registry for the Depot project's image retention period, and its
+# chart is installed from a checkout of the same commit. The run summary says
+# how to pull the image and install the chart. Pull requests only build.
+# Stable releases are published only after the candidate has passed the
+# reviewed EKS rollout and recovery checks.
 on:
   pull_request:
     paths:
       - .dockerignore
-      - .github/workflows/commit-candidate-publish.yml
+      - .github/workflows/commit-candidate-build.yml
       - Dockerfile
       - charts/ursula/**
       - scripts/helm_template_test.py
@@ -19,15 +23,13 @@ on:
         required: true
         type: string
       confirm:
-        description: Type publish-main-commit-candidate or publish-open-pr-commit-candidate
+        description: Type build-main-commit-candidate or build-open-pr-commit-candidate
         required: true
         type: string
 
 permissions:
   contents: read
   pull-requests: read
-  packages: write
-  attestations: write
   id-token: write
 
 concurrency:
@@ -36,8 +38,7 @@ concurrency:
 
 env:
   CHART_DIR: charts/ursula
-  CHART_REGISTRY: oci://ghcr.io/${{ github.repository_owner }}/charts
-  IMAGE: ghcr.io/${{ github.repository }}
+  DEPOT_PROJECT: ls2d88cjpz
   DOCKER_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
@@ -68,10 +69,10 @@ jobs:
             [[ "$REQUESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
             [ "$commit" = "$REQUESTED_COMMIT" ]
             git fetch origin main --no-tags
-            if [[ "$CONFIRM" == publish-main-commit-candidate ]]; then
+            if [[ "$CONFIRM" == build-main-commit-candidate ]]; then
               [ "$(git rev-parse origin/main)" = "$commit" ]
               channel="main"
-            elif [[ "$CONFIRM" == publish-open-pr-commit-candidate ]]; then
+            elif [[ "$CONFIRM" == build-open-pr-commit-candidate ]]; then
               matching_prs="$(
                 gh api \
                   -H 'Accept: application/vnd.github+json' \
@@ -115,80 +116,76 @@ jobs:
       - name: Set up Depot
         uses: depot/setup-action@v1
 
-      - name: Log in to GHCR
-        if: github.event_name == 'workflow_dispatch'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # A dispatched build is saved in the Depot Registry under its build ID.
+      # Like the release build, it writes no attestation manifests, so the
+      # candidate index has the same shape as a release index.
       - name: Build candidate image
         id: image
         uses: depot/build-push-action@v1
         with:
-          project: ls2d88cjpz
+          project: ${{ env.DEPOT_PROJECT }}
           context: .
           file: ./Dockerfile
           platforms: ${{ env.DOCKER_PLATFORMS }}
-          push: ${{ github.event_name == 'workflow_dispatch' }}
-          tags: ${{ env.IMAGE }}:${{ steps.candidate.outputs.version }}
+          push: false
+          save: ${{ github.event_name == 'workflow_dispatch' }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.candidate.outputs.commit }}
             org.opencontainers.image.version=${{ steps.candidate.outputs.version }}
-          provenance: true
-          sbom: true
-
-      - name: Package candidate chart
-        id: chart
-        env:
-          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist/charts
-          helm package "$CHART_DIR" \
-            --destination dist/charts \
-            --version "$CANDIDATE_VERSION" \
-            --app-version "$CANDIDATE_VERSION"
-          package="dist/charts/ursula-${CANDIDATE_VERSION}.tgz"
-          test -f "$package"
-          echo "package=$package" >>"$GITHUB_OUTPUT"
-
-      - name: Push candidate chart
-        if: github.event_name == 'workflow_dispatch'
-        id: chart_push
-        env:
-          PACKAGE: ${{ steps.chart.outputs.package }}
-        run: |
-          set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            helm registry login ghcr.io \
-              --username "${{ github.actor }}" \
-              --password-stdin
-          result="$(helm push "$PACKAGE" "$CHART_REGISTRY")"
-          printf '%s\n' "$result"
-          digest="$(sed -n 's/^Digest: //p' <<<"$result" | tail -n 1)"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          provenance: false
+          sbom: false
 
       - name: Record candidate evidence
         if: github.event_name == 'workflow_dispatch'
         env:
+          BUILD_ID: ${{ steps.image.outputs.build-id }}
           CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
-          CHART_DIGEST: ${{ steps.chart_push.outputs.digest }}
           COMMIT: ${{ steps.candidate.outputs.commit }}
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           set -euo pipefail
+          [[ "$BUILD_ID" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
           [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          repository="registry.depot.dev/$DEPOT_PROJECT"
           {
             echo "## Commit candidate"
             echo
             echo "- Commit: \`$COMMIT\`"
             echo "- Candidate: \`$CANDIDATE_VERSION\`"
+            echo "- Depot build: \`$BUILD_ID\`"
+            echo "- Image: \`$repository:$BUILD_ID\`"
             echo "- Image digest: \`$IMAGE_DIGEST\`"
-            echo "- Chart digest: \`$CHART_DIGEST\`"
             echo
+            echo "The image is in the Depot Registry, not GHCR, until the Depot project's image retention period ends."
             echo "This is not a stable release and created no Git tag or GitHub Release."
+            echo
+            echo "### Pull the image"
+            echo
+            echo "Registry logins use the username \`x-token\` with a Depot token as the password."
+            echo "\`depot pull-token\` prints a read-only token for this build that expires after one hour."
+            echo "A node that pulls the image after that fails, so a canary that runs longer needs a Depot project token in its pull secret,"
+            echo "or a copy of the build in the cluster's own registry made with \`depot push\`."
+            echo
+            echo '```bash'
+            echo "depot pull --project $DEPOT_PROJECT $BUILD_ID"
+            echo "depot pull-token --project $DEPOT_PROJECT $BUILD_ID"
+            echo "kubectl --namespace <namespace> create secret docker-registry depot-registry \\"
+            echo "  --docker-server=registry.depot.dev \\"
+            echo "  --docker-username=x-token \\"
+            echo "  --docker-password=<token>"
+            echo '```'
+            echo
+            echo "### Install the chart from the same commit"
+            echo
+            echo "Add the cluster's values files as for any install."
+            echo
+            echo '```bash'
+            echo "git fetch origin $COMMIT"
+            echo "git checkout --detach $COMMIT"
+            echo "helm upgrade --install ursula ./charts/ursula --namespace <namespace> \\"
+            echo "  --set global.image.repository=$repository \\"
+            echo "  --set global.image.tag=$BUILD_ID \\"
+            echo "  --set 'global.imagePullSecrets[0].name=depot-registry'"
+            echo '```'
           } >>"$GITHUB_STEP_SUMMARY"

@@ -11,6 +11,10 @@ on:
       - scripts/validate-release-version.sh
   workflow_call:
     inputs:
+      latest:
+        description: Point latest at this release, which is the highest stable version
+        required: true
+        type: boolean
       publish:
         required: true
         type: boolean
@@ -80,15 +84,22 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest comes only from the caller's decision, never from
+          # metadata-action, which cannot see the other release tags.
+          flavor: latest=false
           tags: |
             type=ref,event=pr
             type=raw,value=${{ inputs.version }},enable=${{ inputs.publish == true }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish == true && !contains(inputs.version, '-') }}
+            type=raw,value=latest,enable=${{ inputs.publish == true && inputs.latest == true && !contains(inputs.version, '-') }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ inputs.source_revision || github.sha }}
             org.opencontainers.image.version=${{ inputs.version || format('pr-{0}', github.event.number) }}
 
+      # GHCR holds only the release index and its two platform images.
+      # Provenance and the SBOM go to GitHub's attestation store below, keyed
+      # by the index digest, so the build writes no attestation manifests.
       - name: Build and publish chaos-agent image
         id: build
         uses: depot/build-push-action@v1
@@ -101,5 +112,38 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
-          provenance: true
-          sbom: true
+          provenance: false
+          sbom: false
+
+      - name: Attest chaos-agent build provenance
+        if: inputs.publish
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: false
+
+      # The SBOM describes the linux/amd64 image. Both platform images come
+      # from one Dockerfile with the same package set. The SPDX version is
+      # pinned because the release verifies its predicate type.
+      - name: Generate chaos-agent SBOM
+        if: inputs.publish
+        uses: anchore/sbom-action@v0
+        env:
+          SYFT_PLATFORM: linux/amd64
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json@2.3
+          output-file: ${{ runner.temp }}/ursula-chaos-agent-image.spdx.json
+          artifact-name: ursula-chaos-agent-image.spdx.json
+
+      - name: Attest chaos-agent SBOM
+        if: inputs.publish
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/ursula-chaos-agent-image.spdx.json
+          push-to-registry: false

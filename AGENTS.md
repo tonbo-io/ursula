@@ -337,13 +337,19 @@ verifies them, and only then creates the Git tag and GitHub Release:
 - Docker image: `ghcr.io/tonbo-io/ursula`
 - Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula`
 
+GHCR holds only what tagged stable releases publish: the images, the charts,
+and nothing else. Image indexes carry no attestation manifests. Commit
+candidates come from the Commit Candidate Build workflow, which saves the image
+in the Depot Registry. A candidate's chart is installed from a checkout of the
+same commit.
+
 ## Security Considerations
 
 - `unsafe_code = "deny"` at the workspace level.
 - Clippy lints warn on `unwrap_used`, `panic`, `string_slice`, `indexing_slicing`, and arithmetic side effects.
 - Protobuf compilation uses `protoc-bin-vendored` to avoid system protoc dependencies.
 - Docker image runs as non-root user.
-- SBOM and provenance generation enabled for published Docker images.
+- Published Docker images carry build provenance and an SPDX SBOM as GitHub artifact attestations, verifiable with `gh attestation verify oci://ghcr.io/tonbo-io/ursula:<version> --repo tonbo-io/ursula` (add `--predicate-type https://spdx.dev/Document/v2.3` for the SBOM).
 
 ## Development Tips
 
