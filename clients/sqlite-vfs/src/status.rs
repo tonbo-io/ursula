@@ -1,11 +1,9 @@
 //! `ursula_status` and `ursula_stats` as JSON.
 
-use crate::config::snapshot_min_bytes;
 use crate::db::attached;
 use crate::db::lock;
 use crate::error::Error;
 use crate::host::full_pathname;
-use crate::wal::db_len;
 
 fn json_str(s: &str) -> String {
     let mut out = String::from("\"");
@@ -45,10 +43,7 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
         ("commits", db.acked.to_string()),
         ("append_retries", db.append_retries.to_string()),
         ("log_bytes", db.log.to_string()),
-        (
-            "snapshot_due_bytes",
-            db_len(db.pages).max(snapshot_min_bytes()).to_string(),
-        ),
+        ("snapshot_due_bytes", db.snapshot_due_bytes().to_string()),
         (
             "snapshot_age_ms",
             db.snapshot_published_at

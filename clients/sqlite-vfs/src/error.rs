@@ -244,7 +244,7 @@ pub(crate) enum Gone {
 /// Another owner, or a writer outside this protocol, holds the stream.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Fence {
-    #[error("epoch {epoch} superseded by {current:?} (403)")]
+    #[error("epoch {epoch} superseded by {} (403)", epoch_or_unknown(.current))]
     Superseded { epoch: u64, current: Option<u64> },
     #[error(
         "append at {offset} answered as a duplicate without a receipt: another writer (a foreign \
@@ -321,6 +321,11 @@ impl Error {
     }
 }
 
+/// An epoch a server answer named, or `unknown`.
+fn epoch_or_unknown(epoch: &Option<u64>) -> String {
+    epoch.map_or_else(|| "unknown".to_owned(), |epoch| epoch.to_string())
+}
+
 /// A response body appended to a status, when there is one.
 fn with_body(body: &str) -> String {
     let body = body.trim();
@@ -353,11 +358,12 @@ mod tests {
             current: Some(3),
         });
         assert!(superseded.is_fenced() && !superseded.is_recreated());
-        assert!(
-            superseded
-                .to_string()
-                .ends_with("superseded by Some(3) (403)")
-        );
+        assert!(superseded.to_string().ends_with("superseded by 3 (403)"));
+        let unknown = Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: None,
+        });
+        assert!(unknown.to_string().ends_with("superseded by unknown (403)"));
         let gone = Error::Gone(Gone::SnapshotSuperseded { offset: "7".into() });
         assert!(gone.is_gone() && !gone.is_fenced() && !gone.is_recreated());
         let local = Error::LocalWalWrite(10);

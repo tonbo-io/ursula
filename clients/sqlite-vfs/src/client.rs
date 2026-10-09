@@ -2,6 +2,7 @@
 //! snapshot and retention requests, and their retries.
 
 use std::fs;
+use std::io::Read;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -173,23 +174,33 @@ pub(crate) fn header_offset(r: &ureq::http::Response<ureq::Body>, name: &str) ->
     offset_token(r.headers().get(name)?.to_str().ok()?.trim())
 }
 
-/// Waits before the next retry: no sooner than `retry_after`, and at least `backoff`, which then
-/// doubles (up to 1 s). Returns false, without waiting, when the wait would end past `deadline`
-/// (or overflow, for an absurd Retry-After).
-pub(crate) fn pause(
+/// The wait before the next retry: no sooner than `retry_after`, and at least `backoff`. `None`
+/// when the wait would end past `deadline` (or overflow, for an absurd Retry-After): no retry.
+fn next_wait(
     retry_after: Option<Duration>,
-    backoff: &mut Duration,
+    backoff: Duration,
     deadline: Instant,
-) -> bool {
-    let wait = retry_after.map_or(*backoff, |after| after.max(*backoff));
-    if Instant::now()
+) -> Option<Duration> {
+    let wait = retry_after.map_or(backoff, |after| after.max(backoff));
+    Instant::now()
         .checked_add(wait)
-        .is_none_or(|end| end > deadline)
-    {
-        return false;
-    }
+        .is_some_and(|end| end <= deadline)
+        .then_some(wait)
+}
+
+/// Sleeps `wait` (from `next_wait`), then doubles `backoff` (up to 1 s).
+fn back_off(wait: Duration, backoff: &mut Duration) {
     std::thread::sleep(wait);
     *backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+}
+
+/// Waits before the next retry (`next_wait`, then `back_off`). Returns false, without waiting,
+/// when there is no retry.
+fn pause(retry_after: Option<Duration>, backoff: &mut Duration, deadline: Instant) -> bool {
+    let Some(wait) = next_wait(retry_after, *backoff, deadline) else {
+        return false;
+    };
+    back_off(wait, backoff);
     true
 }
 
@@ -347,14 +358,21 @@ pub(crate) fn append(
             }
             Err(e) => Attempt::Transport(Box::new(e)),
         };
-        // A retried commit is a stall the application sees: say why, attempt by attempt.
-        log::emit(Level::Warn, "append_retry", &[
+        // A retried commit is a stall the application sees: say why, attempt by attempt, and
+        // whether another attempt follows.
+        let wait = next_wait(retry_after, backoff, deadline);
+        let event = if wait.is_some() {
+            "append_retry"
+        } else {
+            "append_gave_up"
+        };
+        log::emit(Level::Warn, event, &[
             ("stream", &url),
             ("attempt", &attempts),
             ("elapsed_ms", &started.elapsed().as_millis()),
             ("reason", &unknown),
         ]);
-        if !pause(retry_after, &mut backoff, deadline) {
+        let Some(wait) = wait else {
             return Append::Failed(if token_refused {
                 unauthorized("append", url, 401)
             } else {
@@ -363,7 +381,8 @@ pub(crate) fn append(
                     last: unknown,
                 }
             });
-        }
+        };
+        back_off(wait, &mut backoff);
     }
 }
 
@@ -405,9 +424,25 @@ fn http_error(op: &'static str, url: &str, e: ureq::Error) -> Error {
     }
 }
 
-/// A response's body as text, for an error message (empty when it cannot be read).
+/// The most of a response body an error message or a log line shows.
+const BODY_SHOWN: usize = 256;
+
+/// The start of a response's body as text, for an error message or a log line: at most
+/// `BODY_SHOWN` bytes, followed by `...` when there is more (a gateway's error page, say), and
+/// what could be read when the body breaks off.
 fn body_text(r: &mut ureq::http::Response<ureq::Body>) -> String {
-    r.body_mut().read_to_string().unwrap_or_default()
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(BODY_SHOWN.saturating_add(1)).unwrap_or(u64::MAX);
+    if let Err(_broken) = r.body_mut().as_reader().take(limit).read_to_end(&mut bytes) {
+        // Keep what arrived before the break.
+    }
+    let more = bytes.len() > BODY_SHOWN;
+    bytes.truncate(BODY_SHOWN);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if more {
+        text.push_str("...");
+    }
+    text
 }
 
 /// One read from `offset` of stream incarnation `incarnation` (a 412 when it is not, see
@@ -825,5 +860,23 @@ mod tests {
         assert!(!clear("http://127.0.0.1:4437/b/s"));
         assert!(!clear("http://localhost:4437/b/s"));
         assert!(!clear("http://[::1]:4437/b/s"));
+    }
+
+    // An error message or a log line shows the start of a response body only: a gateway's error
+    // page is not repeated whole on every retried attempt.
+    #[test]
+    fn response_bodies_are_cut_for_messages() {
+        let long = "x".repeat(4_000);
+        let (url, server) = serve(vec![format!(
+            "HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{long}",
+            long.len()
+        )]);
+        let rejected = append(&url, "i1", "p", b"x", 1, 1);
+        let Append::Failed(Error::AppendRejected { status, body }) = rejected else {
+            panic!("not rejected");
+        };
+        assert_eq!(status, 400);
+        assert_eq!(body, format!("{}...", "x".repeat(256)));
+        server.join().unwrap();
     }
 }

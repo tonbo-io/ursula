@@ -131,12 +131,19 @@ pub(crate) struct SnapshotStat {
 }
 
 impl Db {
-    /// The log since the latest snapshot outgrew the database (and the configured minimum). The log
-    /// is counted in frame bytes, not taken from offsets (opaque): what attach replayed after the
-    /// snapshot it started from (plus, from trusted local files, the sidecar's count), and every
-    /// frame acknowledged since; a snapshot taken subtracts what it covers.
+    /// The log since the latest snapshot outgrew the database (and the configured minimum,
+    /// `snapshot_due_bytes`). The log is counted in frame bytes, not taken from offsets (opaque):
+    /// what attach replayed after the snapshot it started from (plus, from trusted local files, the
+    /// sidecar's count), and every frame acknowledged since; a snapshot taken subtracts what it
+    /// covers.
     pub(crate) fn snapshot_due(&self) -> bool {
-        self.log > db_len(self.pages).max(snapshot_min_bytes())
+        self.log > self.snapshot_due_bytes()
+    }
+
+    /// The log size past which a snapshot is due: the database's size, or the configured minimum
+    /// (`URSULA_VFS_SNAPSHOT_MIN_BYTES`) when larger.
+    pub(crate) fn snapshot_due_bytes(&self) -> u64 {
+        db_len(self.pages).max(snapshot_min_bytes())
     }
 
     pub(crate) fn overlay_end(&self) -> i64 {
@@ -303,17 +310,9 @@ pub(crate) fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    use super::Db;
-    use crate::client::START;
-    use crate::error::Error;
-    use crate::error::Fence;
-    use crate::snapshotter::Snapper;
-
-    fn db() -> Db {
+impl Db {
+    /// An attachment of nothing: the state alone, for tests of its bookkeeping.
+    pub(crate) fn for_tests() -> Db {
         Db {
             url: "http://h/b/s".into(),
             incarnation: "i1".into(),
@@ -323,7 +322,7 @@ mod tests {
             path: "/data/app.db".into(),
             epoch: 2,
             seq: 0,
-            offset: START.into(),
+            offset: crate::client::START.into(),
             log: 0,
             poisoned: None,
             overlay: BTreeMap::new(),
@@ -339,14 +338,14 @@ mod tests {
             checkpoint_started: None,
             checkpoints: Vec::new(),
             pages: 0,
-            snapshot: START.into(),
-            retained: START.into(),
+            snapshot: crate::client::START.into(),
+            retained: crate::client::START.into(),
             snapper: Arc::new(Snapper::default()),
             window: false,
             window_wanted: false,
             snapshot_stats: Vec::new(),
-            attached_from: START.into(),
-            installed: START.into(),
+            attached_from: crate::client::START.into(),
+            installed: crate::client::START.into(),
             attach_ms: 0,
             append_retries: 0,
             snapshot_published_at: None,
@@ -354,13 +353,20 @@ mod tests {
             snapshot_error: None,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Db;
+    use crate::error::Error;
+    use crate::error::Fence;
 
     // The first poison's reason stays, whatever fails after it (the rest of the transaction, a
     // lost page read again, the snapshot thread's own fence). A fence and a lost write stick
     // whenever they come: `fenced` and `damaged` never flip back, in either order.
     #[test]
     fn a_later_poison_does_not_replace_a_fence() {
-        let mut d = db();
+        let mut d = Db::for_tests();
         d.poison(Error::Fenced(Fence::Superseded {
             epoch: 2,
             current: Some(3),
@@ -384,7 +390,7 @@ mod tests {
             }))
         ));
         // A fence after another reason: `fenced` too, and the first reason stays.
-        let mut d = db();
+        let mut d = Db::for_tests();
         d.poison(Error::LostWrite { offset: 56 });
         assert!(!d.fenced() && d.damaged());
         d.poison(Error::Fenced(Fence::Reclaim));
