@@ -1660,20 +1660,69 @@ mod credential_deadline {
     }
 }
 
-// Idle upstream connections are probed at a fifth of the user timeout, at
-// least once a second, so several probes fit before it gives up (#495).
-#[test]
-fn upstream_keepalive_probes_several_times_within_the_user_timeout() {
-    assert_eq!(
-        upstream_keepalive(Duration::from_secs(5)),
-        Duration::from_secs(1)
-    );
-    assert_eq!(
-        upstream_keepalive(Duration::from_secs(30)),
-        Duration::from_secs(6)
-    );
-    assert_eq!(
-        upstream_keepalive(Duration::from_secs(1)),
-        Duration::from_secs(1)
-    );
+/// Keepalive derived from the upstream user timeout T (#495).
+mod upstream_keepalive {
+    use std::time::Duration;
+
+    use super::UpstreamKeepalive;
+
+    fn secs(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    fn keepalive(idle: u64, interval: u64) -> UpstreamKeepalive {
+        UpstreamKeepalive {
+            idle: secs(idle),
+            interval: secs(interval),
+            retries: 3,
+        }
+    }
+
+    // Unset: probing alone closes a dead idle connection, after about 16 s.
+    #[test]
+    fn zero_leaves_probing_to_the_retry_count() {
+        assert_eq!(
+            UpstreamKeepalive::for_user_timeout(Duration::ZERO),
+            keepalive(10, 2)
+        );
+    }
+
+    // Below 5 s, both steps stay at the 1 s the kernel can express.
+    #[test]
+    fn one_second_floors_both_steps() {
+        assert_eq!(
+            UpstreamKeepalive::for_user_timeout(secs(1)),
+            keepalive(1, 1)
+        );
+    }
+
+    // The default: probes after 2, 3 and 4 s of silence, closed at about 5 s.
+    #[test]
+    fn five_seconds_probes_three_times_before_closing() {
+        assert_eq!(
+            UpstreamKeepalive::for_user_timeout(secs(5)),
+            keepalive(2, 1)
+        );
+    }
+
+    #[test]
+    fn thirty_seconds_scales_both_steps() {
+        assert_eq!(
+            UpstreamKeepalive::for_user_timeout(secs(30)),
+            keepalive(12, 6)
+        );
+    }
+
+    // Linux closes an idle connection once T passes with a probe unanswered,
+    // so all three probes go out only if the third is sent before T. With
+    // steps of at least 1 s that needs T >= 4 s: at T = 3 s the third probe
+    // would fall at T.
+    #[test]
+    fn three_probes_go_out_before_the_user_timeout() {
+        for t in (4..=600).map(secs) {
+            let k = UpstreamKeepalive::for_user_timeout(t);
+            let third_probe = k.idle.saturating_add(k.interval.saturating_mul(2));
+            assert!(third_probe < t, "T = {t:?}: {k:?}");
+        }
+    }
 }

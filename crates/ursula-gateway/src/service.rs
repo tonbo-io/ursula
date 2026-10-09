@@ -167,9 +167,10 @@ pub struct GatewayArgs {
     /// connection is closed and its request fails with 502 (Linux
     /// `TCP_USER_TIMEOUT`). Bounds how long a request waits on a connection
     /// to a node that vanished without closing it, such as a force-deleted
-    /// pod or a powered-off host. Idle connections are probed at a fifth of
-    /// it. Before 0.7.1 the gateway used reqwest's default of 30 s.
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    /// pod or a powered-off host. Idle connections are probed three times
+    /// within it. 0 leaves TCP_USER_TIMEOUT unset (kernel default, about 15
+    /// minutes; 0.7.0 effectively used reqwest's 30 s default).
+    #[arg(long, default_value_t = 5)]
     upstream_tcp_user_timeout: u64,
 
     /// Maximum request body bytes buffered for leader-redirect replay.
@@ -265,9 +266,9 @@ mod tests {
     }
 
     // A request on a connection to a vanished upstream fails after 5 s unless
-    // configured otherwise (#495). There is no "off": 0 is refused.
+    // configured otherwise (#495). 0 is accepted and means unset.
     #[test]
-    fn upstream_tcp_user_timeout_defaults_to_five_seconds_and_refuses_zero() {
+    fn upstream_tcp_user_timeout_defaults_to_five_seconds_and_accepts_zero() {
         assert_eq!(
             config_from(&[]).upstream_tcp_user_timeout,
             Duration::from_secs(5)
@@ -276,17 +277,10 @@ mod tests {
             config_from(&["--upstream-tcp-user-timeout", "30"]).upstream_tcp_user_timeout,
             Duration::from_secs(30)
         );
-        let refused = Cli::try_parse_from([
-            "ursulagw",
-            "--upstream",
-            "http://node:4437",
-            "--upstream-tcp-user-timeout",
-            "0",
-        ]);
-        assert!(matches!(
-            refused.map(|_| ()).unwrap_err().kind(),
-            clap::error::ErrorKind::ValueValidation
-        ));
+        assert_eq!(
+            config_from(&["--upstream-tcp-user-timeout", "0"]).upstream_tcp_user_timeout,
+            Duration::ZERO
+        );
     }
 
     #[tokio::test]
