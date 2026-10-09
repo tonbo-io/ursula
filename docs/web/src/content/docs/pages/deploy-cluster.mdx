@@ -61,7 +61,7 @@ helm test ursula --namespace ursula
 helm test ursula
 ```
 
-The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`. It requires the expected group inventory and leaders, a complete uniform voter set in each maintenance report, no uncertain maintenance fence, and a 200 response from every node's `/__ursula/ready` probe. To query a node directly:
+Gate on this test, not on `helm install --wait`. Helm does not wait for a StatefulSet with the `OnDelete` update strategy, so `--wait` can report the release deployed before any voter is ready. The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`. It requires the expected group inventory and leaders, a complete uniform voter set in each maintenance report, no uncertain maintenance fence, and a 200 response from every node's `/__ursula/ready` probe. To query a node directly:
 
 ```bash
 kubectl port-forward svc/ursula 4437:4437
@@ -79,6 +79,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
   comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface
   is bound to pod loopback (`127.0.0.1:4438`) and is reached with
   `kubectl port-forward`.
+- `helm uninstall` leaves the graceful-rollout state ConfigMap (`<statefulset>-rollout-state`, for example `ursula-rollout-state`) behind. Delete it before you install again under the same name, so the rollout hook does not resume a rollout of the old release.
 - Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
 
 ## Optional: event-time indexer (experimental)

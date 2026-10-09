@@ -174,7 +174,7 @@ Leadership handoffs (draining, balancing, a node that sheds its leaderships, the
 
 While at most a minority of a group's voters lost their tail, the other voters hold every acknowledged write and nothing is lost. Wait for every group to open the gate on a node before you stop another voter.
 
-**A majority of a group's voters lost their tail at once.** The gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that. For each stalled group:
+**A majority of a group's voters lost their tail at once.** If the group's leader kept its log, it stays leader and its barrier opens the gated replicas as above. Otherwise the gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that. For each stalled group:
 
 1. On every voter, read the group's gate under `recovery_gates.gated` in `GET /__ursula/metrics` (a group missing there is open), and its `last_log_term`, `last_log_index` and `current_term` under `raft_groups`. The call below succeeds only on a replica that reports the group `stalled`.
 2. Rank the stalled replicas by last log id, as a Raft election does: highest `last_log_term` first, then highest `last_log_index`. An empty log (`null`) ranks last. On the first, run the call below through its admin listener. Its body names the `last_log_index` and `current_term` you read on that replica. Repeat down the ranking until the replicas whose gate is open form a majority of the voters. A replica that was not gated counts as open.
@@ -212,7 +212,7 @@ admins=(http://127.0.0.1:5441 http://127.0.0.1:5442 http://127.0.0.1:5443)
 
 # 1. Observe every replica of every group once.
 for admin in "${admins[@]}"; do
-  curl --fail "${admin}/__ursula/metrics" | jq -c --arg admin "${admin}" '
+  curl -sS --fail "${admin}/__ursula/metrics" | jq -c --arg admin "${admin}" '
     .process_incarnation as $incarnation | (.recovery_gates.gated // {}) as $gated
     | .raft_groups[]
     | {admin: $admin, process_incarnation: $incarnation, raft_group_id, node_id,
@@ -234,7 +234,7 @@ jq -sc 'group_by(.raft_group_id)[]
 
 # 3. Accept the loss on each planned replica. Stop at the first refusal and observe again.
 while read -r replica; do
-  curl --fail -H "x-ursula-process-incarnation: $(jq -r .process_incarnation <<<"${replica}")" \
+  curl -sS --fail -w '\n' -H "x-ursula-process-incarnation: $(jq -r .process_incarnation <<<"${replica}")" \
     -H "content-type: application/json" \
     -d "$(jq -c '{expected_last_log_index, expected_current_term}' <<<"${replica}")" \
     -X POST "$(jq -r '"\(.admin)/__ursula/raft/\(.raft_group_id)/recovery/accept-unsynced-loss"' <<<"${replica}")" || break
