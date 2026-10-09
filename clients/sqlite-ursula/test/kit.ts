@@ -68,6 +68,11 @@ export type ChildLine = {
 	snapshots?: number;
 	snapshot?: string;
 	retained?: string;
+	/** On `done`: the snapshot attach installed and the offset of the local files it trusted. */
+	installed?: string;
+	local?: string;
+	/** On a `@query:` step: the rows. */
+	rows?: Record<string, unknown>[];
 	/** On `done`: the owner's health fields from `ursula_status`. */
 	health?: Pick<AttachStatus, "commits" | "append_retries" | "attach_ms" | "log_bytes" | "snapshot_due_bytes" | "snapshot_age_ms" | "snapshot_failures" | "snapshot_error">;
 };
@@ -82,8 +87,9 @@ export interface Child {
 
 const childScript = join(dirname(fileURLToPath(import.meta.url)), "child.mjs");
 
-export function runChild(file: string, url: string, sqls: readonly string[], env: Record<string, string> = {}): Child {
-	const proc = spawn(process.execPath, [childScript, vfsPath(), file, url, ...sqls], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+/** Runs `child.mjs` with this build's extension, or with `ext`'s. */
+export function runChild(file: string, url: string, sqls: readonly string[], env: Record<string, string> = {}, ext = vfsPath()): Child {
+	const proc = spawn(process.execPath, [childScript, ext, file, url, ...sqls], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
 	const lines: ChildLine[] = [];
 	let err = "";
 	let buf = "";
