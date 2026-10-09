@@ -74,7 +74,8 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     needs: source
-    runs-on: ${{ matrix.runner }}
+    # Linux entries are RunsOn labels that take the run id; `macos-15` has no placeholder.
+    runs-on: ${{ format(matrix.runner, github.run_id) }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -83,14 +84,14 @@ jobs:
           # Built on glibc 2.28 (manylinux_2_28, AlmaLinux 8), so the library loads on any glibc at
           # least that new: Debian 11, Ubuntu 20.04, Amazon Linux 2023, RHEL 8 and later.
           - platform: linux-x64-gnu
-            runner: depot-ubuntu-24.04-8
+            runner: runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64
             image: quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1@sha256:39df0042d5cc900b085aa25a0659368b42a0006c54c474299b785b44c1b4ff82
           - platform: linux-arm64-gnu
-            runner: depot-ubuntu-24.04-arm-8
+            runner: runs-on={0}/cpu=8/ram=32/family=m8g+m7g/image=ubuntu24-full-arm64
             image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.03-1@sha256:f5f03dedf61b47d69d0742d36047db78adeee3bdb7a9910ff52304750ecf2514
           # Linked dynamically against musl: Alpine's node cannot load a statically linked library.
           - platform: linux-x64-musl
-            runner: depot-ubuntu-24.04-8
+            runner: runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64
             image: public.ecr.aws/docker/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
           - platform: darwin-arm64
             runner: macos-15
@@ -237,7 +238,8 @@ jobs:
   smoke:
     name: Smoke ${{ matrix.platform }}
     needs: [source, pack]
-    runs-on: ${{ matrix.runner }}
+    # Linux entries are RunsOn labels that take the run id; `macos-15` has no placeholder.
+    runs-on: ${{ format(matrix.runner, github.run_id) }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -246,13 +248,13 @@ jobs:
         # libraries: Debian 11 (glibc 2.31) and Alpine 3.22 (musl).
         include:
           - platform: linux-x64-gnu
-            runner: depot-ubuntu-24.04-8
+            runner: runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64
             image: public.ecr.aws/docker/library/node:22.19.0-bullseye-slim@sha256:8efd3ed25d83b4328df873ed9853a5bd97ffce8eb3498785e45c3e7297571f0e
           - platform: linux-arm64-gnu
-            runner: depot-ubuntu-24.04-arm-8
+            runner: runs-on={0}/cpu=8/ram=32/family=m8g+m7g/image=ubuntu24-full-arm64
             image: public.ecr.aws/docker/library/node:22.19.0-bullseye-slim@sha256:8efd3ed25d83b4328df873ed9853a5bd97ffce8eb3498785e45c3e7297571f0e
           - platform: linux-x64-musl
-            runner: depot-ubuntu-24.04-8
+            runner: runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64
             image: public.ecr.aws/docker/library/node:22.19.0-alpine3.22@sha256:d2166de198f26e17e5a442f537754dd616ab069c47cc57b889310a717e0abbf9
           - platform: darwin-arm64
             runner: macos-15
