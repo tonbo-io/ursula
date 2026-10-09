@@ -1351,7 +1351,6 @@ async fn meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_
             },
             executor: ursula_control::ProcessIncarnation::from_bits(100),
             participants,
-            meta_voters: BTreeSet::from([1]),
         }))
         .await
         .expect("begin operation")

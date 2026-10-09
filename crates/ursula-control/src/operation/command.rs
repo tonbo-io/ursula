@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -80,7 +79,6 @@ pub enum OperationCommand {
         kind: OperationKind,
         executor: ProcessIncarnation,
         participants: BTreeMap<NodeId, ProcessIdentity>,
-        meta_voters: BTreeSet<NodeId>,
     },
     TakeOver {
         expected: OperationToken,

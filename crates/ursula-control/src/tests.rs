@@ -21,39 +21,42 @@ fn placement_node(node_id: u64, state: NodeState) -> PlacementNode {
 }
 
 #[test]
-fn placement_view_distinguishes_hosting_from_client_traffic() {
+fn placement_view_serves_clients_only_from_active_voters() {
     let view = GroupPlacementView {
         raft_group_id: RaftGroupId(1),
         voters: set([1, 2]),
-        learners: set([3]),
-        draining: set([2]),
         epoch: 7,
         nodes: BTreeMap::from([
             (1, placement_node(1, NodeState::Active)),
-            (2, placement_node(2, NodeState::Active)),
+            (2, placement_node(2, NodeState::Draining)),
             (3, placement_node(3, NodeState::Active)),
         ]),
     };
 
     assert!(view.hosts(1));
-    assert!(view.hosts(3));
-    assert!(!view.hosts(4));
+    assert!(view.hosts(2));
+    assert!(!view.hosts(3));
     assert!(view.serves_client_traffic(1));
     assert!(!view.serves_client_traffic(2));
     assert!(!view.serves_client_traffic(3));
+    assert_eq!(
+        view.cluster_endpoints(),
+        BTreeMap::from([
+            (1, "http://node1:4492".to_owned()),
+            (2, "http://node2:4492".to_owned()),
+        ])
+    );
 }
 
 #[test]
-fn placement_view_selects_active_non_draining_voter_for_redirect() {
+fn placement_view_selects_an_active_voter_for_redirect() {
     let view = GroupPlacementView {
         raft_group_id: RaftGroupId(1),
         voters: set([1, 2, 3]),
-        learners: BTreeSet::new(),
-        draining: set([2]),
         epoch: 1,
         nodes: BTreeMap::from([
             (1, placement_node(1, NodeState::Active)),
-            (2, placement_node(2, NodeState::Active)),
+            (2, placement_node(2, NodeState::Draining)),
             (3, placement_node(3, NodeState::Disabled)),
         ]),
     };
@@ -215,41 +218,30 @@ fn seed_placement_records_initial_voters_without_bumping_epoch() {
     assert_eq!(response, ControlResponse::Ok);
     let placement = state.placements.get(&RaftGroupId(1)).expect("placement");
     assert_eq!(placement.voters, set([1, 2, 3]));
-    assert_eq!(placement.learners, BTreeSet::new());
-    assert_eq!(placement.draining, BTreeSet::new());
     assert_eq!(placement.epoch, 0);
     assert_eq!(placement.updated_at_ms, 20);
 }
 
 #[test]
-fn placement_view_from_state_includes_voters_learners_and_draining_nodes() {
+fn placement_view_from_state_lists_voter_nodes() {
     let mut state = ControlPlaneState::default();
-    for node_id in 1..=3 {
-        state.apply(ControlCommand::RegisterNode {
-            node_id,
-            client_url: format!("http://node{node_id}:4491"),
-            cluster_url: format!("http://node{node_id}:4492"),
-            labels: BTreeMap::new(),
-            now_ms: 10,
-        });
-    }
-    state
-        .placements
-        .insert(RaftGroupId(1), crate::DataGroupPlacement {
+    register_active_nodes(&mut state, [1, 2, 3]);
+    assert_eq!(
+        state.apply(ControlCommand::SeedPlacement {
             raft_group_id: RaftGroupId(1),
-            voters: set([1]),
-            learners: set([2]),
-            draining: set([3]),
-            epoch: 1,
-            updated_at_ms: 30,
-        });
+            voters: set([1, 3]),
+            now_ms: 30,
+        }),
+        ControlResponse::Ok
+    );
 
     let view = state.placement_view(RaftGroupId(1)).expect("view exists");
 
-    assert_eq!(view.voters, set([1]));
-    assert_eq!(view.learners, set([2]));
-    assert_eq!(view.draining, set([3]));
-    assert_eq!(view.nodes.len(), 3);
+    assert_eq!(view.voters, set([1, 3]));
+    assert_eq!(
+        view.nodes.keys().copied().collect::<BTreeSet<_>>(),
+        set([1, 3])
+    );
 }
 
 fn register_active_nodes(state: &mut ControlPlaneState, nodes: impl IntoIterator<Item = u64>) {
@@ -390,7 +382,6 @@ fn one_dispatcher_owns_membership_from_intent_through_placement() {
                 },
                 executor: crate::ProcessIncarnation::from_bits(100),
                 participants: participants.clone(),
-                meta_voters: set([1, 2, 3]),
             },
             now_ms: 10,
         })
@@ -593,7 +584,6 @@ fn begin_operation(state: &mut ControlPlaneState, kind: crate::OperationKind) ->
             kind,
             executor: crate::ProcessIncarnation::from_bits(100),
             participants,
-            meta_voters: set([1, 2, 3]),
         },
         now_ms: 10,
     })

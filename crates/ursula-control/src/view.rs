@@ -20,20 +20,17 @@ pub struct PlacementNode {
 pub struct GroupPlacementView {
     pub raft_group_id: RaftGroupId,
     pub voters: BTreeSet<NodeId>,
-    pub learners: BTreeSet<NodeId>,
-    pub draining: BTreeSet<NodeId>,
     pub epoch: u64,
     pub nodes: BTreeMap<NodeId, PlacementNode>,
 }
 
 impl GroupPlacementView {
     pub fn hosts(&self, node_id: NodeId) -> bool {
-        self.voters.contains(&node_id) || self.learners.contains(&node_id)
+        self.voters.contains(&node_id)
     }
 
     pub fn serves_client_traffic(&self, node_id: NodeId) -> bool {
         self.voters.contains(&node_id)
-            && !self.draining.contains(&node_id)
             && self
                 .nodes
                 .get(&node_id)

@@ -150,7 +150,6 @@ pub struct MaintenanceOperation {
     pub kind: OperationKind,
     pub phase: OperationPhase,
     pub participants: BTreeMap<NodeId, ProcessIdentity>,
-    pub meta_voters: BTreeSet<NodeId>,
     pub previous: BTreeMap<RaftGroupId, BTreeSet<NodeId>>,
     pub desired: BTreeMap<RaftGroupId, BTreeSet<NodeId>>,
     pub evidence: BTreeMap<RaftGroupId, PrefixEvidence>,

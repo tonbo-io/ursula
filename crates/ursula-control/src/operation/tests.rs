@@ -45,8 +45,6 @@ fn setup() -> (
     let placement = DataGroupPlacement {
         raft_group_id: RaftGroupId(0),
         voters: BTreeSet::from([1, 2, 3]),
-        learners: BTreeSet::new(),
-        draining: BTreeSet::new(),
         epoch: 1,
         updated_at_ms: 0,
     };
@@ -64,7 +62,6 @@ fn begin(
         kind,
         executor: ProcessIncarnation::from_bits(99),
         participants: ids.iter().map(|id| (*id, identity(1, *id))).collect(),
-        meta_voters: nodes.keys().copied().collect(),
     };
     let OperationOutcome::Acquired(token) = state.apply(command, 10, nodes, placements).unwrap()
     else {
@@ -1314,7 +1311,6 @@ fn begin_requires_an_active_replica_on_every_joining_node() {
                     kind,
                     executor: ProcessIncarnation::from_bits(99),
                     participants: [1, 2, 3, 4].map(|id| (id, identity(1, id))).into(),
-                    meta_voters: nodes.keys().copied().collect(),
                 },
                 10,
                 &nodes,
@@ -1332,7 +1328,6 @@ fn begin_requires_an_active_replica_on_every_joining_node() {
                 kind: OperationKind::RebuildReplica { node_id: 1 },
                 executor: ProcessIncarnation::from_bits(99),
                 participants: [1, 2, 3].map(|id| (id, identity(1, id))).into(),
-                meta_voters: nodes.keys().copied().collect(),
             },
             10,
             &nodes,

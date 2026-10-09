@@ -27,7 +27,6 @@ impl OperationState {
         kind: OperationKind,
         executor: ProcessIncarnation,
         participants: BTreeMap<NodeId, ProcessIdentity>,
-        meta_voters: BTreeSet<NodeId>,
         nodes: &NodeStates,
         placements: &BTreeMap<RaftGroupId, DataGroupPlacement>,
     ) -> Result<OperationOutcome, OperationError> {
@@ -120,13 +119,6 @@ impl OperationState {
             .copied()
             .collect::<BTreeSet<_>>();
         required.insert(source);
-        if meta_voters.is_empty()
-            || meta_voters
-                .iter()
-                .any(|node_id| !nodes.contains_key(node_id))
-        {
-            return Err(OperationError::InventoryMismatch);
-        }
         if participants.keys().copied().collect::<BTreeSet<_>>() != required {
             return Err(OperationError::InventoryMismatch);
         }
@@ -149,7 +141,6 @@ impl OperationState {
             kind,
             phase: OperationPhase::Preparing,
             participants,
-            meta_voters,
             previous,
             desired,
             evidence: BTreeMap::new(),
@@ -233,8 +224,6 @@ impl OperationState {
         for (group, voters) in &operation.desired {
             if let Some(placement) = placements.get_mut(group) {
                 placement.voters = voters.clone();
-                placement.learners.retain(|node| !voters.contains(node));
-                placement.draining.clear();
                 placement.epoch = placement.epoch.saturating_add(1);
                 placement.updated_at_ms = now_ms;
             }

@@ -59,7 +59,7 @@ The important state is:
 - `nodes`: registered data-capable nodes, including client URL, cluster URL,
   labels, node state, and timestamps.
 - `placements`: one `DataGroupPlacement` per `RaftGroupId`, with `voters`,
-  `learners`, `draining`, `epoch`, and `updated_at_ms`.
+  `epoch`, and `updated_at_ms`.
 - `operations`: process and replica identity records, one active operation, and a monotonically assigned operation id.
 
 All changes enter through `ControlPlaneState::apply(ControlCommand)`. Node
@@ -98,20 +98,15 @@ A placement projection describes how a single data group should be served:
 DataGroupPlacement {
     raft_group_id,
     voters,
-    learners,
-    draining,
     epoch,
     updated_at_ms,
 }
 ```
 
-The sets have different meanings:
-
-- `voters`: nodes that are OpenRaft voters for the group and eligible to serve
-  normal data traffic.
-- `learners`: non-voting replicas retained in placement metadata.
-- `draining`: nodes that should be treated as non-serving during migration or
-  cleanup.
+`voters` are the group's committed OpenRaft voters. A voter serves client
+traffic while its node is `Active`. Placement records only committed voters.
+Learners added during an operation exist only in the data group's membership
+and the operation's `desired` set until `Complete` commits the new voters.
 
 `Complete` requires the final uniform membership and applied-prefix evidence
 for every affected group before atomically advancing placement epochs. It
@@ -217,6 +212,9 @@ Before dynamic membership is usable on a running cluster, later PRs need to:
 - expose a supported HTTP admin surface with authentication and error semantics;
 - add `ursulactl` commands over that supported surface;
 - implement or document the data-plane learner/add-voter/remove-voter workflow;
+- remove a decommissioned node's meta Raft role after its data placement is
+  safe. The kernel does not model meta membership, so `Begin` takes no meta
+  voter set;
 - add end-to-end tests that start real multi-node clusters and move one group;
 - decide whether migration progression remains manual-first or gets a
   background executor.

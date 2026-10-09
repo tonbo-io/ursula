@@ -120,12 +120,9 @@ impl ControlPlaneState {
 
     pub fn placement_view(&self, raft_group_id: RaftGroupId) -> Option<GroupPlacementView> {
         let placement = self.placements.get(&raft_group_id)?;
-        let node_ids = placement
+        let nodes = placement
             .voters
             .iter()
-            .chain(placement.learners.iter())
-            .chain(placement.draining.iter());
-        let nodes = node_ids
             .filter_map(|node_id| {
                 self.nodes.get(node_id).map(|node| {
                     (*node_id, PlacementNode {
@@ -141,8 +138,6 @@ impl ControlPlaneState {
         Some(GroupPlacementView {
             raft_group_id,
             voters: placement.voters.clone(),
-            learners: placement.learners.clone(),
-            draining: placement.draining.clone(),
             epoch: placement.epoch,
             nodes,
         })
@@ -238,10 +233,7 @@ impl ControlPlaneState {
             }
         }
         if let Some(existing) = self.placements.get(&raft_group_id) {
-            return if existing.voters == voters
-                && existing.learners.is_empty()
-                && existing.draining.is_empty()
-            {
+            return if existing.voters == voters {
                 ControlResponse::Ok
             } else {
                 reject(crate::ControlError::PlacementExists { raft_group_id })
@@ -250,8 +242,6 @@ impl ControlPlaneState {
         self.placements.insert(raft_group_id, DataGroupPlacement {
             raft_group_id,
             voters,
-            learners: BTreeSet::new(),
-            draining: BTreeSet::new(),
             epoch: 0,
             updated_at_ms: now_ms,
         });

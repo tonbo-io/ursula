@@ -44,27 +44,8 @@ pub struct ClusterNode {
 pub struct DataGroupPlacement {
     pub raft_group_id: RaftGroupId,
     pub voters: BTreeSet<NodeId>,
-    pub learners: BTreeSet<NodeId>,
-    pub draining: BTreeSet<NodeId>,
     pub epoch: u64,
     pub updated_at_ms: u64,
-}
-
-impl DataGroupPlacement {
-    pub fn empty(raft_group_id: RaftGroupId) -> Self {
-        Self {
-            raft_group_id,
-            voters: BTreeSet::new(),
-            learners: BTreeSet::new(),
-            draining: BTreeSet::new(),
-            epoch: 0,
-            updated_at_ms: 0,
-        }
-    }
-
-    pub fn hosts(&self, node_id: NodeId) -> bool {
-        self.voters.contains(&node_id) || self.learners.contains(&node_id)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
