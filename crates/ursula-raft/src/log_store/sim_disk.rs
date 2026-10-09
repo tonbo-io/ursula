@@ -17,9 +17,11 @@
 //!   reverts directory operations that were not `fsync`ed.
 //!   [`SimDisk::power_loss_losing_unsynced`] drops every unsynced page, for
 //!   a schedule that needs the loss to happen.
-//! - [`SimDisk::inject_fault`] fails the next write, `fsync`, removal or rename
-//!   to a path. A failed `fsync` marks the pages clean without persisting them, as
-//!   Linux does, so a later successful `fsync` does not make them durable.
+//! - [`SimDisk::inject_fault`] fails the next matching file operation. A
+//!   partial write exposes half the bytes before failing, and a rename fault
+//!   matches its destination. A failed `fsync` marks the pages clean without
+//!   persisting them, as Linux does, so a later successful `fsync` does not make
+//!   them durable.
 //!
 //! The disk also stands in for the host's boot id
 //! ([`JournalDisk::boot_id`]): a power loss under a prefix starts a new boot
@@ -61,6 +63,8 @@ pub struct SimDisk;
 pub enum SimDiskFault {
     /// The next append to the file fails and writes nothing.
     Write,
+    /// The next append writes half its bytes, then reports an I/O error.
+    PartialWrite,
     /// The next `fsync` of the file or directory fails.
     Sync,
     /// The next removal of the file fails and removes nothing.
@@ -531,8 +535,7 @@ impl SimDisk {
         io_with_disk(|state| state.power_loss(prefix, &mut || false))
     }
 
-    /// Fails the next matching operation on `path` with an I/O error.
-    /// Rename faults are keyed by the destination path.
+    /// Arms a one-shot fault on `path`; rename faults match the destination.
     pub fn inject_fault(path: &Path, fault: SimDiskFault) -> io::Result<()> {
         with_disk(|state| {
             state.faults.insert((path.to_owned(), fault));
@@ -701,6 +704,11 @@ impl JournalFile for SimFile {
     fn append(&mut self, buf: &[u8]) -> io::Result<()> {
         io_with_disk(|state| {
             state.take_fault(&self.path, SimDiskFault::Write)?;
+            if let Err(error) = state.take_fault(&self.path, SimDiskFault::PartialWrite) {
+                let prefix = buf.get(..buf.len() / 2).unwrap_or_default();
+                state.inode_mut(self.inode).append(prefix);
+                return Err(error);
+            }
             state.inode_mut(self.inode).append(buf);
             Ok(())
         })
