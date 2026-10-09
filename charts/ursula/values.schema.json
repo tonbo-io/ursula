@@ -901,8 +901,8 @@
         },
         "upstreamTcpUserTimeoutSeconds": {
           "type": "integer",
-          "minimum": 0,
-          "description": "Seconds data sent to an upstream may stay unacknowledged before the connection closes (Linux TCP_USER_TIMEOUT). 0 leaves it unset."
+          "minimum": 1,
+          "description": "Seconds data sent to an upstream may stay unacknowledged before the connection closes (Linux TCP_USER_TIMEOUT)."
         },
         "maxRequestBodyBytes": {
           "type": "integer",

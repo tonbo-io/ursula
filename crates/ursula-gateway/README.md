@@ -119,10 +119,8 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     How long data sent to an upstream may stay unacknowledged before the
     connection closes and its request fails with 502 (Linux TCP_USER_TIMEOUT).
     Idle connections are probed three times within it: first after 2/5 of it,
-    then every 1/5, each at least 1 s. 0 leaves TCP_USER_TIMEOUT unset (kernel
-    default, about 15 minutes; 0.7.0 effectively used reqwest's 30 s default),
-    and idle connections are then probed after 10 s, every 2 s, three times.
-    Defaults to 5.
+    then every 1/5, each at least 1 s. 0.7.0 effectively used reqwest's 30 s
+    default. Defaults to 5. At least 1.
 
 --max-request-body-bytes <BYTES>
     Maximum request body bytes buffered for leader-redirect replay.

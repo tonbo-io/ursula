@@ -136,7 +136,7 @@ fn gateway_config(args: &GatewayArgs) -> GatewayConfig {
         upstreams: args.upstream.clone(),
         response_header_timeout: Duration::from_secs(args.response_header_timeout),
         connect_timeout: Duration::from_secs(args.connect_timeout),
-        upstream_tcp_user_timeout: Duration::from_secs(args.upstream_tcp_user_timeout),
+        upstream_tcp_user_timeout_secs: args.upstream_tcp_user_timeout,
         max_request_body_bytes: args.max_request_body_bytes,
         raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
         cors_allowed_origins: args.cors_allowed_origin.clone(),
@@ -168,10 +168,9 @@ pub struct GatewayArgs {
     /// `TCP_USER_TIMEOUT`). Bounds how long a request waits on a connection
     /// to a node that vanished without closing it, such as a force-deleted
     /// pod or a powered-off host. Idle connections are probed three times
-    /// within it. 0 leaves TCP_USER_TIMEOUT unset (kernel default, about 15
-    /// minutes; 0.7.0 effectively used reqwest's 30 s default).
-    #[arg(long, default_value_t = 5)]
-    upstream_tcp_user_timeout: u64,
+    /// within it. At least 1. 0.7.0 effectively used reqwest's 30 s default.
+    #[arg(long, default_value = "5")]
+    upstream_tcp_user_timeout: NonZeroU64,
 
     /// Maximum request body bytes buffered for leader-redirect replay.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
@@ -242,6 +241,7 @@ pub struct GatewayArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::time::Duration;
 
     use axum::Router;
@@ -266,21 +266,28 @@ mod tests {
     }
 
     // A request on a connection to a vanished upstream fails after 5 s unless
-    // configured otherwise (#495). 0 is accepted and means unset.
+    // configured otherwise (#495). There is no "off": 0 is refused.
     #[test]
-    fn upstream_tcp_user_timeout_defaults_to_five_seconds_and_accepts_zero() {
+    fn upstream_tcp_user_timeout_defaults_to_five_seconds_and_refuses_zero() {
         assert_eq!(
-            config_from(&[]).upstream_tcp_user_timeout,
-            Duration::from_secs(5)
+            config_from(&[]).upstream_tcp_user_timeout_secs,
+            NonZeroU64::new(5).unwrap()
         );
         assert_eq!(
-            config_from(&["--upstream-tcp-user-timeout", "30"]).upstream_tcp_user_timeout,
-            Duration::from_secs(30)
+            config_from(&["--upstream-tcp-user-timeout", "30"]).upstream_tcp_user_timeout_secs,
+            NonZeroU64::new(30).unwrap()
         );
-        assert_eq!(
-            config_from(&["--upstream-tcp-user-timeout", "0"]).upstream_tcp_user_timeout,
-            Duration::ZERO
-        );
+        let refused = Cli::try_parse_from([
+            "ursulagw",
+            "--upstream",
+            "http://node:4437",
+            "--upstream-tcp-user-timeout",
+            "0",
+        ]);
+        assert!(matches!(
+            refused.map(|_| ()).unwrap_err().kind(),
+            clap::error::ErrorKind::ValueValidation
+        ));
     }
 
     #[tokio::test]

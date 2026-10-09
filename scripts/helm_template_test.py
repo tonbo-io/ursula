@@ -380,14 +380,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
     def test_gateway_passes_the_upstream_tcp_user_timeout(self) -> None:
         flag = '- --upstream-tcp-user-timeout\n            - "{}"'
         self.assertIn(flag.format(5), render_chart("--set", "s3.bucket=bkt"))
-        # 0 leaves TCP_USER_TIMEOUT unset rather than being refused.
         self.assertIn(
-            flag.format(0),
-            render_chart("--set", "s3.bucket=bkt", "--set", "gateway.upstreamTcpUserTimeoutSeconds=0"),
+            flag.format(30),
+            render_chart("--set", "s3.bucket=bkt", "--set", "gateway.upstreamTcpUserTimeoutSeconds=30"),
         )
+        # The gateway refuses 0, so the chart does too.
         result = subprocess.run(
             ["helm", "template", "test", "charts/ursula", "--set", "s3.bucket=bkt",
-             "--set", "gateway.upstreamTcpUserTimeoutSeconds=-1"],
+             "--set", "gateway.upstreamTcpUserTimeoutSeconds=0"],
             text=True,
             capture_output=True,
         )

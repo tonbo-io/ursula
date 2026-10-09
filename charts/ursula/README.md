@@ -533,7 +533,7 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `gateway.rustLog` | `ursula_gateway=info` | `RUST_LOG` tracing filter for the gateway. |
 | `gateway.connectTimeoutSeconds` | `5` | TCP connect timeout per upstream attempt in seconds. |
 | `gateway.responseHeaderTimeoutSeconds` | `30` | Timeout for upstream response headers in seconds. |
-| `gateway.upstreamTcpUserTimeoutSeconds` | `5` | Seconds data sent to an upstream may stay unacknowledged before the connection closes and its request fails with `502` (Linux `TCP_USER_TIMEOUT`). Idle connections are probed three times within it. `0` leaves `TCP_USER_TIMEOUT` unset (kernel default, about 15 minutes). |
+| `gateway.upstreamTcpUserTimeoutSeconds` | `5` | Seconds data sent to an upstream may stay unacknowledged before the connection closes and its request fails with `502` (Linux `TCP_USER_TIMEOUT`). Idle connections are probed three times within it. At least `1`. |
 | `gateway.maxRequestBodyBytes` | `33554432` | Maximum request body bytes the gateway buffers for leader-redirect replay before returning `413 Payload Too Large`. |
 | `gateway.gracefulShutdownTimeoutSeconds` | `3600` | Maximum graceful shutdown drain time after SIGTERM, in seconds. |
 | `gateway.extraArgs` | `[]` | Extra CLI args appended after generated gateway args. |
