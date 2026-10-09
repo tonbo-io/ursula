@@ -30,9 +30,5 @@ proptest = { workspace = true }
 name = "plan_next_cold_flush"
 harness = false
 
-[[bench]]
-name = "plan_next_cold_flush_alloc"
-harness = false
-
 [lints]
 workspace = true
