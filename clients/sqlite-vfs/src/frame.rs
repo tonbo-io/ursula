@@ -38,10 +38,12 @@ pub enum Decoded {
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     /// Not a frame this extension reads: a frame of another minor version's format (an
-    /// incompatible change bumps the magic), or not a frame at all.
+    /// incompatible change bumps the magic), or not a frame at all (bytes not written by the
+    /// extension, or a read that does not start at a frame, as a claim's scan can meet).
     #[error(
-        "frame magic \"{}\": this extension reads \"USQ1\" frames, so the stream was written by \
-         an extension of another minor version, or not by the extension",
+        "frame magic \"{}\": this extension reads \"USQ1\" frames, so these bytes are a frame \
+         of another minor version's extension, were not written by the extension, or are not the \
+         start of a frame",
         .found.escape_ascii()
     )]
     Magic { found: Vec<u8> },

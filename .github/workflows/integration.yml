@@ -219,28 +219,53 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      # Same-minor compatibility (docs/architecture/sqlite-vfs.md §7): the previous published patch
-      # of this minor and this build must take over each other's streams (test/compat.e2e.ts). Until
-      # the minor has an earlier patch on npm, the test runs this build against itself.
+      # Same-minor compatibility (docs/architecture/sqlite-vfs.md §7): the latest published patch of
+      # this minor up to package.json's version (the same version included: between releases main
+      # carries the released one) and this build must take over each other's streams
+      # (test/compat.e2e.ts). Only when the minor has no published patch yet does the test run this
+      # build against itself. A registry failure fails the step.
       - name: Previous patch of this minor
+        shell: bash
         run: |
+          # npm's answer, retried: stdout of the last attempt only.
+          npm_retry() {
+            local out
+            for attempt in 1 2 3; do
+              if out=$("$@"); then
+                printf '%s' "$out"
+                return 0
+              fi
+              echo "::warning::$* failed (attempt $attempt of 3)" >&2
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+            done
+            return 1
+          }
           current=$(node -p "require('./clients/sqlite-ursula/package.json').version")
-          previous=$(npm view @tonbo/sqlite-ursula versions --json | node -e '
-            const [major, minor, patch] = process.argv[1].split(".").map(Number);
-            const earlier = [JSON.parse(require("fs").readFileSync(0, "utf8"))].flat()
+          series=$(node -p "process.argv[1].split('.').slice(0, 2).join('.')" "$current")
+          versions=$(npm_retry npm view @tonbo/sqlite-ursula versions --json)
+          previous=$(printf '%s' "$versions" | node -e '
+            const version = /^(\d+)\.(\d+)\.(\d+)/.exec(process.argv[1]);
+            if (version === null) throw new Error(`package.json version ${process.argv[1]} is not major.minor.patch`);
+            const [major, minor, patch] = version.slice(1).map(Number);
+            const listed = [JSON.parse(require("fs").readFileSync(0, "utf8"))].flat();
+            if (listed.length === 0 || !listed.every((v) => typeof v === "string")) {
+              throw new Error(`npm view did not answer a version list: ${JSON.stringify(listed)}`);
+            }
+            const candidates = listed
               .filter((v) => /^\d+\.\d+\.\d+$/.test(v))
               .map((v) => v.split(".").map(Number))
-              .filter(([a, b, c]) => a === major && b === minor && c < patch)
+              .filter(([a, b, c]) => a === major && b === minor && c <= patch)
               .sort((x, y) => x[2] - y[2]);
-            console.log(earlier.length === 0 ? "" : earlier.at(-1).join("."));
+            console.log(candidates.length === 0 ? "" : candidates.at(-1).join("."));
           ' "$current")
           if [ -z "$previous" ]; then
-            echo "::notice::No earlier ${current%.*}.x patch of @tonbo/sqlite-ursula is published; the compatibility e2e runs this build against itself."
+            echo "::notice::No $series.x patch up to $current of @tonbo/sqlite-ursula is published: the compatibility e2e runs this build against itself."
             echo "SQLITE_URSULA_VFS_PREVIOUS=$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" >> "$GITHUB_ENV"
           else
             mkdir -p "$RUNNER_TEMP/previous"
             cd "$RUNNER_TEMP/previous"
-            file=$(npm pack "@tonbo/sqlite-ursula-linux-x64-gnu@$previous" --json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename')
+            packed=$(npm_retry npm pack "@tonbo/sqlite-ursula-linux-x64-gnu@$previous" --json)
+            file=$(printf '%s' "$packed" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename')
             tar xzf "$file"
             echo "Compatibility e2e: $previous against this build ($current)"
             echo "SQLITE_URSULA_VFS_PREVIOUS=$RUNNER_TEMP/previous/package/libsqlite_ursula_vfs.so" >> "$GITHUB_ENV"

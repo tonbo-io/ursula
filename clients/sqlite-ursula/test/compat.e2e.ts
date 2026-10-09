@@ -42,19 +42,29 @@ describe.skipIf(previous === undefined || previous.length === 0)("same-minor com
 			const head = await fetch(url, { method: "HEAD" });
 			expect(head.headers.get("stream-snapshot-offset")).not.toBeNull();
 
-			// A new host: installs the writer's snapshot, replays its frames, claims and commits.
-			const t = runChild(freshFile(), url, ["@query:SELECT x FROM t ORDER BY x", "INSERT INTO t VALUES ('t1')", "@query:SELECT x FROM t ORDER BY x"], DONE, versions[to]);
-			expect((await t.exited).code).toBe(0);
-			expect(xs(t, 0)).toEqual(["w1", "w2", "w3"]);
-			expect(ok(t, 1)).toBe(true);
-			expect(xs(t, 2)).toEqual(["t1", "w1", "w2", "w3"]);
-			expect(t.lines.find((l) => l.done)?.installed).not.toBe("-1");
+			// A new host: installs the writer's snapshot, replays its frames and claims, then waits
+			// before its first commit.
+			const fileT = freshFile();
+			const goT = `${fileT}.go`;
+			const t = runChild(fileT, url, ["@query:SELECT x FROM t ORDER BY x", `@wait:${goT}`, "INSERT INTO t VALUES ('t1')", "@query:SELECT x FROM t ORDER BY x"], DONE, versions[to]);
+			await t.waitFor((l) => l.step === 1 && l.phase === "start");
 
-			// The writer is fenced: its next commit fails and it is poisoned.
+			// The writer commits after the claim and before the new owner's first commit, so only the
+			// claim's epoch fences it: a `Producer-Id` that changed within the minor would let this
+			// commit through (or, after the new owner's commit, fence it by `Stream-Seq` instead).
 			writeFileSync(go, "");
 			expect((await w.exited).code).toBe(0);
 			expect(ok(w, w4)).toBe(false);
-			expect(w.lines.find((l) => l.done)?.poisoned).toBe(true);
+			const wDone = w.lines.find((l) => l.done);
+			expect(wDone).toMatchObject({ poisoned: true, fenced: true });
+			expect(wDone?.reason).toMatch(/superseded/);
+
+			writeFileSync(goT, "");
+			expect((await t.exited).code).toBe(0);
+			expect(xs(t, 0)).toEqual(["w1", "w2", "w3"]);
+			expect(ok(t, 2)).toBe(true);
+			expect(xs(t, 3)).toEqual(["t1", "w1", "w2", "w3"]);
+			expect(t.lines.find((l) => l.done)?.installed).not.toBe("-1");
 
 			// The writer's version reads the frames the new owner wrote.
 			const r = runChild(freshFile(), url, ["@query:SELECT x FROM t ORDER BY x"], DONE, versions[from]);
