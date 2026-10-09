@@ -1897,3 +1897,159 @@ async fn missing_metadata_beside_a_nonempty_journal_closes_the_recovery_gate() {
         .expect("gate");
     assert!(!gate.vote_gate_open());
 }
+/// Records the run that holds `root` as poisoned, as a journal writer's I/O
+/// failure does, so the next run starts a new recovery epoch.
+fn record_poisoned(root: &Path) {
+    let path = root.join(super::RUN_STATE_FILE);
+    let running = super::state_file::read::<RunState>(super::StateFileKind::RunState, &path)
+        .expect("read the run state")
+        .expect("a run holds the WAL root");
+    assert_eq!(running.status, RunStatus::Running);
+    RunStateFile::new(path, running)
+        .record(RunStatus::Poisoned, "poisoned")
+        .expect("record the run as poisoned");
+}
+
+fn core_verified_epoch(wal: &super::RaftWal, core: u16) -> u64 {
+    CoreMetadata::load(&core_metadata_path(&wal.core_dir(CoreId(core))))
+        .expect("read core metadata")
+        .verified_epoch()
+}
+
+/// Every core's metadata keeps the epoch in which a run last read it. A lost
+/// run state must not restart the count below any of them, however often it
+/// is lost and whichever core holds the greatest epoch.
+#[tokio::test]
+async fn missing_run_state_advances_past_every_surviving_core_epoch() {
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let map = ursula_shard::StaticShardMap::new(2, 2).unwrap();
+        let metrics = RuntimeMetrics::new(2, 2);
+        let open = |wal: &super::RaftWal, group: u32| {
+            wal.open(
+                map.placement(RaftGroupId(group)).unwrap(),
+                metrics.group_engine_metrics(),
+            )
+            .unwrap()
+        };
+        let wal = super::RaftWal::start(root, fsync, &map).unwrap();
+        for group in [0, 1] {
+            let mut store = open(&wal, group);
+            append(&mut store, [blank_entry(1)]).await;
+        }
+        record_poisoned(root);
+        drop(wal);
+        // Each poisoned run starts an epoch and reads only the core it opens:
+        // core 0 last in epoch 1, core 1 last in epoch 3.
+        for (epoch, group) in [(1, 0), (2, 1), (3, 1)] {
+            let wal = super::RaftWal::start(root, fsync, &map).unwrap();
+            assert_eq!(wal.opening().recovery_epoch, epoch);
+            drop(open(&wal, group));
+            assert_eq!(
+                core_verified_epoch(&wal, u16::try_from(group).unwrap()),
+                epoch
+            );
+            record_poisoned(root);
+        }
+        // The greatest surviving epoch is core 1's at the first loss and core
+        // 0's at the second.
+        for expected in [4, 5] {
+            fs::remove_file(root.join(super::RUN_STATE_FILE)).unwrap();
+            let wal = super::RaftWal::start(root, fsync, &map).unwrap();
+            let opening = wal.opening();
+            assert_eq!(opening.previous_run, PreviousRun::Unrecorded);
+            assert_eq!(opening.replay_mode, JournalReplayMode::VerifiedPrefix);
+            assert_eq!(opening.recovery_epoch, expected);
+            let store = open(&wal, 0);
+            assert_eq!(log_ids(&store).await, [1]);
+            assert_eq!(store.log_state(), GroupLogState::Recovering);
+            assert_eq!(core_verified_epoch(&wal, 0), expected);
+            assert_eq!(core_verified_epoch(&wal, 1), 3);
+            drop((store, wal));
+        }
+    }
+}
+
+/// Without a run state, metadata that cannot be read or an epoch that
+/// cannot advance refuses startup before anything is written.
+#[tokio::test]
+async fn missing_run_state_refuses_unreadable_or_exhausted_core_epochs() {
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+            let placement = map.placement(RaftGroupId(0)).unwrap();
+            let metrics = RuntimeMetrics::new(1, 1);
+            // A poisoned run at the last epoch but one; the next run reads
+            // the core in the last epoch.
+            drop(super::RaftWal::start(root, fsync, &map).unwrap());
+            RunStateFile::new(root.join(super::RUN_STATE_FILE), RunState {
+                boot_id: None,
+                fsync,
+                status: RunStatus::Poisoned,
+                recovery_epoch: u64::MAX.checked_sub(1).unwrap(),
+            })
+            .record(RunStatus::Poisoned, "poisoned")
+            .unwrap();
+            let wal = super::RaftWal::start(root, fsync, &map).unwrap();
+            assert_eq!(wal.opening().recovery_epoch, u64::MAX);
+            let mut store = wal.open(placement, metrics.group_engine_metrics()).unwrap();
+            append(&mut store, [blank_entry(1)]).await;
+            assert_eq!(core_verified_epoch(&wal, 0), u64::MAX);
+            drop((store, wal));
+            let path = core_metadata_path(&super::core_dir(root, 0));
+            if corrupt {
+                fs::write(&path, b"broken core metadata").unwrap();
+            }
+            fs::remove_file(root.join(super::RUN_STATE_FILE)).unwrap();
+            let before = fs::read(&path).unwrap();
+            for _ in 0..2 {
+                let error = super::RaftWal::start(root, fsync, &map).unwrap_err();
+                if corrupt {
+                    assert!(
+                        matches!(error, super::RaftWalError::ReadCoreMetadata(_)),
+                        "{error}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, super::RaftWalError::RecoveryEpochExhausted {
+                            recovery_epoch: u64::MAX
+                        }),
+                        "{error}"
+                    );
+                }
+                assert!(!root.join(super::RUN_STATE_FILE).exists());
+                assert_eq!(fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_exhausted_recorded_epoch_refuses_a_new_poisoned_recovery() {
+    for fsync in [WalFsync::Always, WalFsync::Never] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let map = ursula_shard::StaticShardMap::new(1, 3).unwrap();
+        drop(super::RaftWal::start(root, fsync, &map).unwrap());
+        let path = root.join(super::RUN_STATE_FILE);
+        RunStateFile::new(path.clone(), RunState {
+            boot_id: None,
+            fsync,
+            status: RunStatus::Poisoned,
+            recovery_epoch: u64::MAX,
+        })
+        .record(RunStatus::Poisoned, "exhausted epoch")
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            super::RaftWal::start(root, fsync, &map),
+            Err(super::RaftWalError::RecoveryEpochExhausted {
+                recovery_epoch: u64::MAX
+            })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}

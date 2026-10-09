@@ -109,10 +109,18 @@ pub struct RunState {
 /// Whether the core journals under a WAL root hold records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalHistory {
-    /// No core journal holds a record.
-    Empty,
+    /// No core journal holds a record; metadata may retain a verified epoch.
+    Empty { verified_epoch: u64 },
     /// Some core journal holds records.
-    Records,
+    Records { verified_epoch: u64 },
+}
+
+impl JournalHistory {
+    fn verified_epoch(self) -> u64 {
+        match self {
+            Self::Empty { verified_epoch } | Self::Records { verified_epoch } => verified_epoch,
+        }
+    }
 }
 
 /// How the previous run that opened the journals ended, read from its run
@@ -120,10 +128,10 @@ pub enum JournalHistory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PreviousRun {
-    /// No run state and no journal record: a new node or a new disk.
+    /// No run state, journal record or prior verification: a new node or disk.
     Absent,
-    /// No run state, but core journals hold records: the run state was
-    /// removed or lost, so how the run that wrote them ended is unknown.
+    /// No run state, but core journals retain records or verification: the
+    /// run state was lost, so how the run that wrote them ended is unknown.
     Unrecorded,
     /// The previous run shut down cleanly: every journal was `fsync`ed.
     Clean,
@@ -201,8 +209,10 @@ impl PreviousRun {
     ) -> Self {
         let Some(previous) = previous else {
             return match journals {
-                JournalHistory::Empty => Self::Absent,
-                JournalHistory::Records => Self::Unrecorded,
+                JournalHistory::Empty { verified_epoch: 0 } => Self::Absent,
+                // Even an empty journal with prior verification is surviving
+                // history, not evidence of a fresh disk.
+                JournalHistory::Empty { .. } | JournalHistory::Records { .. } => Self::Unrecorded,
             };
         };
         match previous.status {
@@ -270,13 +280,21 @@ impl WalOpening {
         journals: JournalHistory,
         boot_id: Option<&BootId>,
         fsync: WalFsync,
-    ) -> Self {
+    ) -> Result<Self, RaftWalError> {
         let previous_run = PreviousRun::interpret(previous, journals, boot_id);
         let replay_mode = previous_run.replay_mode();
-        let prior_epoch = previous.map_or(0, |previous| previous.recovery_epoch);
+        let prior_epoch = previous
+            .map_or(0, |previous| previous.recovery_epoch)
+            .max(journals.verified_epoch());
         let recovery_epoch = match replay_mode {
             JournalReplayMode::Strict => prior_epoch,
-            JournalReplayMode::VerifiedPrefix => prior_epoch.saturating_add(1),
+            JournalReplayMode::VerifiedPrefix => {
+                prior_epoch
+                    .checked_add(1)
+                    .ok_or(RaftWalError::RecoveryEpochExhausted {
+                        recovery_epoch: prior_epoch,
+                    })?
+            }
         };
         let journal_sync = match (previous_run, previous.map(|previous| previous.fsync), fsync) {
             (PreviousRun::ProcessCrash, Some(WalFsync::Never), WalFsync::Always) => {
@@ -284,13 +302,13 @@ impl WalOpening {
             }
             _ => JournalSync::NotNeeded,
         };
-        Self {
+        Ok(Self {
             previous_run,
             replay_mode,
             recovery: previous_run.recovery_state(),
             recovery_epoch,
             journal_sync,
-        }
+        })
     }
 }
 
@@ -344,6 +362,10 @@ pub enum RaftWalError {
     },
     #[error("read the Raft WAL run state: {0}")]
     ReadRunState(#[source] StateFileError),
+    #[error("read core metadata while recovering epochs: {0}")]
+    ReadCoreMetadata(#[source] StateFileError),
+    #[error("Raft WAL recovery epoch {recovery_epoch} cannot advance")]
+    RecoveryEpochExhausted { recovery_epoch: u64 },
     #[error("list the core journals under '{}': {source}", .root.display())]
     ListCores {
         root: PathBuf,
@@ -455,7 +477,7 @@ impl NodeWal {
         super::topology::check_or_create(&root, topology, previous.is_some() || !cores.is_empty())?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
-        let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync);
+        let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync)?;
         log_opening(&root, previous.as_ref(), boot_id.as_ref(), fsync, &opening);
         // Before this run records itself, so a crash in between marks the
         // cores again on the next start.
@@ -542,17 +564,25 @@ fn core_dirs(root: &Path) -> Result<Vec<PathBuf>, RaftWalError> {
         .collect())
 }
 
-/// Whether any of the `cores`' journals holds records.
+/// Gather journal records and the greatest surviving verification epoch.
+/// This performs I/O only; `WalOpening::decide` owns the recovery policy.
 fn journal_history(cores: &[PathBuf]) -> Result<JournalHistory, RaftWalError> {
+    let mut records = false;
+    let mut verified_epoch = 0;
     for core in cores {
-        if segment::holds_records(core).map_err(|source| RaftWalError::ReadJournal {
+        records |= segment::holds_records(core).map_err(|source| RaftWalError::ReadJournal {
             path: core.clone(),
             source,
-        })? {
-            return Ok(JournalHistory::Records);
-        }
+        })?;
+        let metadata = super::core_meta::CoreMetadata::load(&core_metadata_path(core))
+            .map_err(RaftWalError::ReadCoreMetadata)?;
+        verified_epoch = verified_epoch.max(metadata.verified_epoch());
     }
-    Ok(JournalHistory::Empty)
+    Ok(if records {
+        JournalHistory::Records { verified_epoch }
+    } else {
+        JournalHistory::Empty { verified_epoch }
+    })
 }
 
 fn log_opening(
@@ -647,8 +677,8 @@ mod tests {
     /// with the boot id known or not.
     #[test]
     fn opening_the_journal_follows_the_decision_table() {
-        use JournalHistory::Empty;
-        use JournalHistory::Records;
+        const EMPTY: JournalHistory = JournalHistory::Empty { verified_epoch: 0 };
+        const RECORDS: JournalHistory = JournalHistory::Records { verified_epoch: 0 };
         use RunStatus::Clean;
         use RunStatus::Poisoned;
         use RunStatus::Running;
@@ -657,12 +687,12 @@ mod tests {
 
         let rows: &[Row] = &[
             // No run state and no journal record: a new node or a new disk.
-            (None, Empty, Some("b"), PreviousRun::Absent, STRICT, NORMAL),
-            (None, Empty, None, PreviousRun::Absent, STRICT, NORMAL),
+            (None, EMPTY, Some("b"), PreviousRun::Absent, STRICT, NORMAL),
+            (None, EMPTY, None, PreviousRun::Absent, STRICT, NORMAL),
             // No run state, but journals hold records: fail safe.
             (
                 None,
-                Records,
+                RECORDS,
                 Some("b"),
                 PreviousRun::Unrecorded,
                 PREFIX,
@@ -670,7 +700,7 @@ mod tests {
             ),
             (
                 None,
-                Records,
+                RECORDS,
                 None,
                 PreviousRun::Unrecorded,
                 PREFIX,
@@ -679,7 +709,7 @@ mod tests {
             // A clean shutdown, under either policy, on any boot.
             (
                 Some(previous(Some("a"), Always, Clean)),
-                Records,
+                RECORDS,
                 Some("b"),
                 PreviousRun::Clean,
                 STRICT,
@@ -687,7 +717,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Never, Clean)),
-                Records,
+                RECORDS,
                 Some("a"),
                 PreviousRun::Clean,
                 STRICT,
@@ -695,7 +725,7 @@ mod tests {
             ),
             (
                 Some(previous(None, Never, Clean)),
-                Records,
+                RECORDS,
                 None,
                 PreviousRun::Clean,
                 STRICT,
@@ -704,7 +734,7 @@ mod tests {
             // Same boot: a process crash; the page cache kept every write.
             (
                 Some(previous(Some("a"), Never, Running)),
-                Records,
+                RECORDS,
                 Some("a"),
                 PreviousRun::ProcessCrash,
                 STRICT,
@@ -712,7 +742,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Always, Running)),
-                Records,
+                RECORDS,
                 Some("a"),
                 PreviousRun::ProcessCrash,
                 STRICT,
@@ -721,7 +751,7 @@ mod tests {
             // Another boot: a host crash.
             (
                 Some(previous(Some("a"), Never, Running)),
-                Records,
+                RECORDS,
                 Some("b"),
                 PreviousRun::HostCrash { fsync: Never },
                 PREFIX,
@@ -729,7 +759,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Always, Running)),
-                Records,
+                RECORDS,
                 Some("b"),
                 PreviousRun::HostCrash { fsync: Always },
                 STRICT,
@@ -738,7 +768,7 @@ mod tests {
             // An unknown boot id without a clean end counts as a host crash.
             (
                 Some(previous(None, Never, Running)),
-                Records,
+                RECORDS,
                 None,
                 PreviousRun::HostCrash { fsync: Never },
                 PREFIX,
@@ -746,7 +776,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Never, Running)),
-                Records,
+                RECORDS,
                 None,
                 PreviousRun::HostCrash { fsync: Never },
                 PREFIX,
@@ -754,7 +784,7 @@ mod tests {
             ),
             (
                 Some(previous(None, Always, Running)),
-                Records,
+                RECORDS,
                 Some("a"),
                 PreviousRun::HostCrash { fsync: Always },
                 STRICT,
@@ -763,7 +793,7 @@ mod tests {
             // An I/O error stopped the previous run, under either policy.
             (
                 Some(previous(Some("a"), Always, Poisoned)),
-                Records,
+                RECORDS,
                 Some("a"),
                 PreviousRun::Poisoned,
                 PREFIX,
@@ -771,7 +801,7 @@ mod tests {
             ),
             (
                 Some(previous(Some("a"), Never, Poisoned)),
-                Records,
+                RECORDS,
                 Some("b"),
                 PreviousRun::Poisoned,
                 PREFIX,
@@ -784,13 +814,16 @@ mod tests {
             let fsync = previous
                 .as_ref()
                 .map_or(WalFsync::Never, |previous| previous.fsync);
-            let opening = WalOpening::decide(previous.as_ref(), *journals, boot_id.as_ref(), fsync);
+            let opening = WalOpening::decide(previous.as_ref(), *journals, boot_id.as_ref(), fsync)
+                .expect("valid recovery epoch");
             let prior_epoch = previous
                 .as_ref()
                 .map_or(0, |previous| previous.recovery_epoch);
             let recovery_epoch = match replay_mode {
                 JournalReplayMode::Strict => prior_epoch,
-                JournalReplayMode::VerifiedPrefix => prior_epoch.saturating_add(1),
+                JournalReplayMode::VerifiedPrefix => {
+                    prior_epoch.checked_add(1).expect("test epoch fits")
+                }
             };
             assert_eq!(
                 opening,
@@ -868,10 +901,11 @@ mod tests {
             let boot_id = boot_id.map(boot);
             let opening = WalOpening::decide(
                 previous.as_ref(),
-                JournalHistory::Records,
+                JournalHistory::Records { verified_epoch: 0 },
                 boot_id.as_ref(),
                 fsync,
-            );
+            )
+            .expect("valid recovery epoch");
             let expected = if sync {
                 JournalSync::BeforeRecording
             } else {
@@ -884,6 +918,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_marker_advances_beyond_surviving_verification_even_without_records() {
+        for fsync in [WalFsync::Always, WalFsync::Never] {
+            for journals in [
+                JournalHistory::Records { verified_epoch: 7 },
+                JournalHistory::Empty { verified_epoch: 7 },
+            ] {
+                let opening = WalOpening::decide(None, journals, Some(&boot("b")), fsync)
+                    .expect("epoch can advance");
+                assert_eq!(opening.previous_run, PreviousRun::Unrecorded);
+                assert_eq!(opening.recovery, UNKNOWN_HISTORY);
+                assert_eq!(opening.replay_mode, PREFIX);
+                assert_eq!(opening.recovery_epoch, 8);
+                assert_eq!(core_replay_mode(7, opening.recovery_epoch), PREFIX);
+            }
+            let fresh = WalOpening::decide(
+                None,
+                JournalHistory::Empty { verified_epoch: 0 },
+                Some(&boot("b")),
+                fsync,
+            )
+            .expect("fresh disk");
+            assert_eq!(fresh.previous_run, PreviousRun::Absent);
+            assert_eq!(fresh.replay_mode, STRICT);
+            assert_eq!(fresh.recovery_epoch, 0);
+        }
+    }
+
+    #[test]
+    fn epoch_floor_is_the_maximum_of_recorded_and_surviving_history() {
+        for (recorded, surviving) in [(4, 7), (9, 2)] {
+            for status in [RunStatus::Clean, RunStatus::Poisoned] {
+                let prior = RunState {
+                    recovery_epoch: recorded,
+                    ..previous(Some("a"), WalFsync::Never, status)
+                };
+                let opening = WalOpening::decide(
+                    Some(&prior),
+                    JournalHistory::Records {
+                        verified_epoch: surviving,
+                    },
+                    Some(&boot("a")),
+                    WalFsync::Never,
+                )
+                .expect("epoch can advance");
+                let expected = recorded.max(surviving);
+                assert_eq!(
+                    opening.recovery_epoch,
+                    if status == RunStatus::Clean {
+                        expected
+                    } else {
+                        expected.checked_add(1).unwrap()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_prefix_recovery_uses_the_same_checked_epoch_increment() {
+        for fsync in [WalFsync::Always, WalFsync::Never] {
+            for journals in [
+                JournalHistory::Records {
+                    verified_epoch: u64::MAX,
+                },
+                JournalHistory::Empty {
+                    verified_epoch: u64::MAX,
+                },
+            ] {
+                assert!(matches!(
+                    WalOpening::decide(None, journals, Some(&boot("b")), fsync),
+                    Err(super::RaftWalError::RecoveryEpochExhausted {
+                        recovery_epoch: u64::MAX
+                    })
+                ));
+            }
+            let mut prior = RunState {
+                recovery_epoch: u64::MAX,
+                ..previous(Some("a"), fsync, RunStatus::Poisoned)
+            };
+            let journals = JournalHistory::Records { verified_epoch: 0 };
+            assert!(matches!(
+                WalOpening::decide(Some(&prior), journals, Some(&boot("a")), fsync),
+                Err(super::RaftWalError::RecoveryEpochExhausted {
+                    recovery_epoch: u64::MAX
+                })
+            ));
+            prior.status = RunStatus::Clean;
+            let clean = WalOpening::decide(Some(&prior), journals, Some(&boot("a")), fsync)
+                .expect("strict recovery does not advance the epoch");
+            assert_eq!(clean.recovery_epoch, u64::MAX);
+            assert_eq!(clean.replay_mode, STRICT);
+        }
+    }
+
     /// A journal not read back since the recovery epoch began is still read
     /// as a verified prefix, however the runs since then ended.
     #[test]
@@ -891,8 +1020,8 @@ mod tests {
         assert_eq!(core_replay_mode(0, 0), STRICT);
         assert_eq!(core_replay_mode(3, 3), STRICT);
         assert_eq!(core_replay_mode(2, 3), PREFIX);
-        // A run state removed by hand restarts the count; the journal was
-        // verified since.
+        // The low-level comparison is monotonic; opening a WAL must never
+        // supply an epoch lower than surviving metadata.
         assert_eq!(core_replay_mode(5, 0), STRICT);
 
         // A host crash starts epoch 5; a process crash right after it, before
@@ -900,10 +1029,11 @@ mod tests {
         let crashed = previous(Some("a"), WalFsync::Never, RunStatus::Running);
         let after_host_crash = WalOpening::decide(
             Some(&crashed),
-            JournalHistory::Records,
+            JournalHistory::Records { verified_epoch: 0 },
             Some(&boot("b")),
             WalFsync::Always,
-        );
+        )
+        .expect("valid recovery epoch");
         assert_eq!(after_host_crash.recovery_epoch, 5);
         let restarted = RunState {
             boot_id: Some(boot("b")),
@@ -912,10 +1042,11 @@ mod tests {
         };
         let after_process_crash = WalOpening::decide(
             Some(&restarted),
-            JournalHistory::Records,
+            JournalHistory::Records { verified_epoch: 0 },
             Some(&boot("b")),
             WalFsync::Always,
-        );
+        )
+        .expect("valid recovery epoch");
         assert_eq!(after_process_crash.replay_mode, STRICT);
         assert_eq!(after_process_crash.recovery_epoch, 5);
         assert_eq!(

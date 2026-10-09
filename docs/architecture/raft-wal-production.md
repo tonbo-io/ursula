@@ -219,8 +219,8 @@ only the newest tail:
 
 | Previous run | Replay classification | Recovery state |
 | --- | --- | --- |
-| No run state, no core journal holds a record | `Strict` | normal |
-| No run state, a core journal holds records | `VerifiedPrefix` | recovering (unknown history) |
+| No run state, no core journal record and no verified epoch in core metadata | `Strict` | normal |
+| No run state, a core journal holds records or core metadata records a verified epoch | `VerifiedPrefix` | recovering (unknown history) |
 | `clean` | `Strict` | normal unless an invalid newest tail is repaired |
 | `running`, same boot id (process crash) | `Strict` | normal unless an invalid newest tail is repaired |
 | `running`, other or unknown boot id (host crash), policy `always` | `Strict` | normal unless an invalid newest tail is repaired |
@@ -233,6 +233,12 @@ crash under `never`, an unknown history or a poisoned run begins a new recovery
 epoch. Cores open lazily, so a core whose
 metadata shows an older epoch has not been read since the crash and is still
 read as a verified prefix, however the runs in between ended.
+
+Startup reads every core's metadata file. A run's recovery epoch never falls
+below the greatest epoch a core recorded, so a missing run-state file cannot
+restart the count, and the new epoch it begins is above every core's.
+Unreadable metadata or an epoch that cannot advance refuses startup before the
+run records itself.
 
 "Recovering" means the node's logs may be missing entries it acknowledged.
 The node logs it at warn, reports it in the metrics JSON (`wal_recovery`), as
