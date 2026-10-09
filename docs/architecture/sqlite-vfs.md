@@ -520,154 +520,177 @@ rebuild, delete `<db>`.
 
 ## 9. Performance
 
-One run, 2026-10-03. EKS 1.33 in us-east-1: three `m6i.xlarge` Ursula nodes, one per AZ (the chart's
-`examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit), three gateways, real S3
-for the cold tier and snapshots with Ursula's default S3 settings (`server_side_encryption =
-"aes256"`), snapshot bodies in the cold tier. Server image: main `05132e0`. Extension: `05132e0` for the memory-WAL
-cells, `6ba4e60` for the disk-WAL cells (the difference is 429/503 retry and recovery, not the
-commit path). Both builds predate #332, which removed the local WAL fsync and the sidecar's fsyncs
-from the commit path (about 4.7 ms of the agent-pace p50s, per the breakdown below); every VFS
-number in this section, the Durable Object comparison included, was measured before it and not
-re-measured. Clients: `m6i.2xlarge` pods (node 22) in us-east-1a, one process per database,
-through the gateway Service. The chart deploys the gateway without a quota policy, so there was no
-rate limit and no client saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the 1 GB
-snapshot; everything else is the chart default.
-
-The memory-WAL cells below record a Raft log store that Ursula has since removed. They are kept as
-measured. The disk WAL is now the only Raft WAL. Its cells here predate `raft.wal.fsync` and
-fsynced every batch, as `always` does today, while the default is now `never`.
+One run, 2026-10-09 UTC. EKS 1.37 in us-east-1: three `m6i.xlarge` Ursula nodes, one per AZ (the
+chart's `examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit), three gateways on
+`m6i.large` nodes, one per AZ, and real S3 for the cold tier and snapshots with Ursula's default S3
+settings. Server image: main `bb7a61b` (`0.0.0-main.bb7a61b1c968`) with the chart's defaults: the
+Raft WAL on a gp3 volume with `raft.wal.fsync = never`, and no gateway quota policy, so no client
+saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the cold-start cells. Extension:
+#488 at `398369d`, and `ee5e278` for two of the three failover runs (it adds the `append_retry` log
+line and changes nothing on the commit path). Clients: `m6i.2xlarge` pods (Node 22.20) in
+us-east-1a, one process per database, through the gateway Service. The tools are in
+`clients/sqlite-ursula/bench/`.
 
 Workload: Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`, a real `Harness` with
 a faux model, turns of text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit`
-wall time after a 30 s warm-up; each cell runs 10.5 min. Agent pace: one turn per 2 s per database.
+wall time after a 30 s warm-up. Each cell runs 10.5 min. Agent pace: one turn per 2 s per database.
 Baselines on the same client node type:
 
 - B1: the same Pi workload on Pi's own `openNodeSqliteStorage` on the pod's disk, no extension
-  (WAL, `synchronous=NORMAL`).
-- B2: the same with `PRAGMA synchronous=FULL` (the WAL synced on every commit).
-- B3: raw appends, no SQLite: closed-loop writers, one stream each, 5 to 7 KiB random bodies (the
-  VFS's compressed frames are 4.5 to 7.4 KB) with producer headers, through the gateway or straight
-  to the stream's leader (node Service, `307` followed and the leader kept). 120 s cells (memory
-  WAL) and 75 s cells (disk WAL), 15 s warm-up.
+  (WAL, `synchronous=NORMAL`). Measured on 2026-10-03. It involves no server.
+- B2: the same with `PRAGMA synchronous=FULL` (the WAL synced on every commit). Also 2026-10-03.
+- B3: raw appends, no SQLite: closed-loop writers, one stream each, 5 to 7 KiB random bodies with
+  producer headers, through the gateway or straight to the stream's leader (node Service, `307`
+  followed and the leader kept). 75 s cells after a 15 s warm-up, on the fresh cluster and again
+  right after the 128-database cells.
 
-Pi commit latency, ms, p50 / p99 (p99.9 / max where they matter), and Pi commits/s flat out:
+Pi commit latency, ms, p50 / p99 (p99.9 / max), and Pi commits/s:
 
-| cell | B1 local, NORMAL | B2 local, FULL | VFS, memory WAL | VFS, disk WAL |
-| --- | --- | --- | --- | --- |
-| 1 db, agent pace | 0.11 / 7.6 | 1.8 / 4.6 | 9.7 / 12.8 | 16.5 / 20.0 |
-| 1 db, flat out | 0.16 / 8.9; 115/s | 2.2 / 4.9; 100/s | 9.4 / 12.8 (42 / 147); 60/s | 15.2 / 18.7 (65 / 124); 46/s |
-| 16 dbs, agent pace | 0.11 / 6.5 | 1.6 / 4.8 | not run | 16.0 / 182 (3,043 / 8,960) [1] |
-| 16 dbs, flat out | 0.20 / 13.1; 651/s | 2.8 / 19.1; 652/s | 13.0 / 31.8 (50 / 132); 565/s | 21.7 / 37.1 (110 / 363); 499/s |
-| 128 dbs, flat out [2] | | | 49.9 / 120 (5,041 / 10,097); 1,900/s | 46.3 / 2,123 (4,826 / 26,220); 841/s |
-
-[1] Run on the disk cluster after the 128-database and failover cells; see the issues below.
-[2] Two client nodes, 64 databases each, both saturated (load average 31 to 38 on 8 vCPU), so this
-row measures the clients as much as Ursula.
-
-Raw append floor (B3), ms p50 / p99 (p99.9), and appends/s:
-
-| writers | memory WAL, gateway | memory WAL, leader | disk WAL, gateway | disk WAL, leader |
-| --- | --- | --- | --- | --- |
-| 1 | 1.15 / 1.75 (7.2); 796/s | 1.12 / 1.55 (8.8); 833/s | 8.2 / 8.8 (16); 121/s | 8.7 / 9.2 (20); 114/s |
-| 16 | 2.4 / 7.4 (18); 6,274/s | 1.9 / 7.6 (20); 6,957/s | 16.9 / 27.3 (93); 916/s | 15.1 / 28.2 (247); 1,000/s |
-
-The disk-WAL row is from a freshly deployed cluster. On the disk cluster that had just run the
-128-database cell, the same 16-writer cells had p99 330 ms (p99.9 2.0 and 2.4 s), and the
-leader-direct writers got 763 `503`s.
-
-Where one database's commit goes (agent pace, p50, ms):
-
-| component | memory WAL | disk WAL |
-| --- | --- | --- |
-| Pi + SQLite, no fsync (B1) | 0.1 | 0.1 |
-| local WAL fsync (B2 minus B1) | 1.7 | 1.7 |
-| VFS commit hook: frame build and local WAL write | 0.2 | 0.1 |
-| VFS commit hook: the append request | 4.0 | 10.9 |
-| sidecar replace: temp file, fsync, rename, directory fsync (measured alone) | 3.0 | 3.0 |
-| sum | 9.0 | 15.8 |
-| measured Pi commit | 9.7 | 16.5 |
-| for reference: raw append, same frame sizes (B3, gateway, 1 writer) | 1.15 | 8.2 |
-
-Measured before #332 (see the run description): its WAL fsync and sidecar fsyncs, about 4.7 ms of
-these p50s, are gone.
-
-The VFS's append request was 1.4 to 2.8 ms above the raw floor: 4.0 and 10.9 ms at agent pace, and
-3.8 and 9.6 ms for one database flat out. It reuses its connection (one `TIME_WAIT` socket in 15 s of commits), so connection
-setup is not the cause; each of these is a single stream, so the leader's placement differs between
-them, and a same-stream comparison is still to do.
-
-**128 databases.** Memory WAL: 1,900 commits/s, no database poisoned, 1 retried append in 1.2
-million. Node RSS rose from 0.9 to 2.6 GB and fell back to 1.6 to 1.8 GB after the load (8 GiB
-limit). No AppendStream backpressure rejections. Disk WAL: 841 commits/s, RSS peak 2.8 GB, 367
-AppendStream backpressure rejections on two of the nodes, 55 appends retried (up to 13 attempts)
-and acknowledged, and one of the 128 databases poisoned (below).
-
-**Stream and snapshots.** 10.9 pages per commit (10.6 at agent pace). zstd ratio 6.1 to 7.3 flat
-out, 9.8 at agent pace. 4.5 KB per commit at agent pace and 6.0 to 7.4 KB flat out, which is 22
-KB and 30 to 37 KB per turn. Snapshot bodies were 0.09 to 0.5 MB for 0.9 to 5.2 MB databases,
-taking 40 to 78 ms p50 (180 to 235 ms at 128 databases). The retained log (tail minus retention)
-stayed at or below 16.8 MB per database in every cell.
-
-**Back-to-back large transactions** (5 MB table, 2,000-row updates, 1.4 MB frames, no pause, 300
-s). Memory WAL: 352 snapshots. Disk WAL: 336. The first came at 9.7 MB of log, while 3.4 and 3.2 GB
-were written. The retained log never exceeded 20.7 MB (sampled every 10 s) and ended at 15.2 and
-11.0 MB. Commit p50 was 118 and 124 ms.
-
-**Cold start** (fresh host: snapshot install plus tail replay; best of three, first attach in
-parentheses). The 27.8 MB and 278 MB snapshots were published to S3 with the default encryption
-setting:
-
-| database | snapshot (publish time, memory / disk) | memory WAL | disk WAL |
+| cell | B1 local, NORMAL | B2 local, FULL | VFS |
 | --- | --- | --- | --- |
-| 10 MB | 2.8 MB (0.2 / 0.2 s) | 107 ms (205) | 110 ms (222) |
-| 100 MB | 27.8 MB (2.7 / 1.8 s) | 0.91 s (2.17) | 0.79 s (1.80) |
-| 1 GB | 278 MB (18.7 / 15.7 s) | 16.9 s (27.1) | 16.1 s (25.0) |
+| 1 db, agent pace | 0.11 / 7.6 | 1.8 / 4.6 | 4.7 / 7.9 (11.6 / 11.9) |
+| 1 db, flat out | 0.16 / 8.9; 115/s | 2.2 / 4.9; 100/s | 4.4 / 7.0 (51 / 144); 81/s |
+| 16 dbs, agent pace | 0.11 / 6.5 | 1.6 / 4.8 | 4.1 / 7.4 (13 / 162) |
+| 16 dbs, flat out [1] | 0.20 / 13.1; 651/s | 2.8 / 19.1; 652/s | 8.1 / 28.4 (58 / 199); 541/s |
+| 128 dbs, agent pace [2] | | | 3.9 / 6.0 (13 / 171); 320/s |
+| 128 dbs, flat out [2] | | | 26.7 / 105 (191 / 883); 2,051/s |
 
-The tail after the snapshot was 2.8 MB, 21 to 34 MB and 133 to 169 MB: what the writer committed
-while the snapshot was being taken.
+[1] 16 processes on one 8-vCPU client node, which ran at about 70% CPU while each Ursula node used
+0.3 to 0.6 cores, so this row measures the client too.
+[2] Two client nodes, 64 databases each, pooled. Each Ursula node used up to 2.5 of its 4 cores in
+the first minutes of the flat-out cell and 0.8 to 1.1 later, with RSS at 1.4 to 1.8 GB. Client CPU
+was not recorded.
 
-**Failover** (16 databases flat out; `kubectl delete --force` at 120 s of the node leading the
-most groups, 86 of 256). Memory WAL: 5 databases stalled 19.3 to 22.3 s, two for 1.3 and 2.3 s, and
-the rest under 0.15 s. Disk WAL: 7 stalled 8.3 to 10.1 s and the rest 1.7 to 4.0 s. No commit
-failed. Afterwards every owner's file and a fresh rebuild from its stream were identical row for
-row, with `integrity_check` ok (16 of 16 on both WALs).
+No database was poisoned, no commit failed, and none of the 1.85 million commits in these cells
+retried its append. The 2026-10-03 run measured a disk WAL that fsynced every
+batch and an extension that still fsynced its local WAL and sidecar on each commit (before #332).
+It read 16.5 / 20.0 ms for one database at agent pace, 46 commits/s for one database flat out,
+499/s at 16 and 841/s at 128 with a p99 of 2,123 ms, and one of the 128 databases was poisoned.
 
-**S3.** Retention frees cold chunks. One minute after the memory-WAL failover cell, its 16 streams
-still held 2 or 3 chunks wholly below retention minus 64 MiB. Ten minutes later, and in a later
-check of the disk cluster, no chunk object of any of 167 and 218 streams lay below that line. A
-279 MB stream retained from 262 MB held 85 MB in S3 (its first chunk starts at 193 MB); a 211 MB
-stream retained from 202 MB held 17 MB.
+Raw append floor (B3), ms p50 / p99 (p99.9), and appends/s. No raw cell saw a `503` or a `429`:
 
-Requests per minute (CloudWatch, whole bucket):
+| writers | gateway | leader | gateway, after 128 dbs | leader, after 128 dbs |
+| --- | --- | --- | --- | --- |
+| 1 | 1.54 / 2.53 (19.8); 593/s | 1.20 / 2.38 (12.7); 747/s | | |
+| 16 | 2.94 / 7.53 (75); 4,662/s | 2.87 / 7.25 (75); 4,752/s | 2.92 / 7.65 (81); 4,696/s | 2.82 / 7.92 (80); 4,677/s |
 
-| load | PUT | GET |
+Where one database's commit goes (1 db at agent pace, p50, ms):
+
+| component | ms |
+| --- | --- |
+| Pi and SQLite outside the VFS's commit | 0.18 |
+| VFS commit hook without the append | 0.12 |
+| the append request | 4.31 |
+| measured Pi commit | 4.66 |
+
+The append is the commit, and what it costs depends on where the stream's leader and the
+connection's gateway are. Through the Service, each connection lands on one of the three gateways,
+one per AZ, and the stream's group is led from one of the three nodes. To separate the VFS from
+placement, six fresh streams each ran one database flat out for 30 s and then raw appends of the
+VFS's frame size (4.8 KB) on the same stream, both through the gateway pod in the client's AZ:
+
+| leader's AZ | VFS append p50, ms | raw append p50 on the same stream, ms |
 | --- | --- | --- |
-| 1 database at agent pace | 0 to 11 | under 30 |
-| 1 database flat out | 6 to 37 | 31 to 81 |
-| 16 databases flat out | 110 to 350 | 340 to 870 |
-| 128 databases, memory WAL (1,900 commits/s) | 1,060 to 1,540 | 3,100 to 4,150 |
-| 128 databases, disk WAL (841 commits/s) | 500 to 600 | 1,550 to 1,920 |
+| us-east-1a (the client's) | 1.31, 1.29 | 1.22, 1.21 |
+| us-east-1b | 1.66, 1.39 | 1.53, 1.28 |
+| us-east-1c | 2.33, 2.39 | 2.26, 2.35 |
 
-A freshly deployed cluster made 1,400 to 1,550 PUTs in its first 2 to 3 minutes.
+The VFS adds 0.04 to 0.13 ms to an append. The one-database cells' 4.0 to 4.3 ms went through
+the Service, where the connection's gateway can also be in another AZ, and that placement was not
+recorded. Over 16 and 128 databases at agent pace the VFS's append p50 was 3.5 to 3.7 ms.
 
-**Open issues seen in this run.**
+**The 2026-10-03 problems.** Neither reproduced. At 128 databases flat out no database was
+poisoned, no append was retried, no node logged `rebuilding channel`, and there were no
+AppendStream backpressure rejections. Right after the 128-database cells, the 16-writer raw cells
+and 16 databases at agent pace (4.2 / 7.2 (17 / 59)) read as on the fresh cluster. What remains is
+#496. During the 16-writer raw cells and the 128-database flat-out cell, the leaders' AppendStream
+calls to followers exceeded OpenRaft's hard TTL, with failed heartbeats (400 to 900 warnings per
+node in the 128-database cell, most in its first minute). The client tails above (p99.9 75 ms on
+raw appends, maxima of 0.5 to 1.4 s) line up with them only in part.
 
-- Disk WAL, 128 databases: one database was poisoned. Its append hit the VFS's 10 s per-request
-  timeout three times, using up the 30 s budget (`append: timeout: global (outcome unknown after
-  3 attempts); database poisoned`). Acknowledged commits reached 26.2 s. Each node logged 3,700 to
-  5,300 `rebuilding channel ... after 8 consecutive AppendStream failures` warnings during the
-  11-minute cell. Outside it there were 64 to 160 at deploy, about 180 at the failover kill, and
-  bursts of 24 to 119 later.
-- Disk WAL after that load: 16 databases at agent pace (40 commits/s in total) had p99 182 ms,
-  p99.9 3.0 s and max 9.0 s, and raw 16-writer appends p99 330 ms with 763 `503`s. On a fresh disk
-  cluster the raw p99 was 27 to 28 ms. The nodes were reclaiming 100 to 137 MB WAL journals online
-  in this period.
-- Memory WAL, 128 databases: the p99.9 sits at 5.0 s in both client halves, with a max of 10.1 s.
-- Retention does not reclaim external payload objects (appends of 1 MiB or more). The two
-  back-to-back streams still held 3.41 and 3.25 GB in S3 16 and 25 minutes after the writes ended,
-  although retention had passed all but their last 15 and 11 MB.
-- A snapshot read-back `GET` through the gateway was answered `503` ("read_snapshot has to forward
-  request to leader") instead of being forwarded; the VFS retried it.
+**Stream and snapshots.** 7 pages per commit. zstd ratio 9.4 at agent pace and 6.1 to 6.2 flat
+out, so 3.6 KB per commit at agent pace and 4.6 to 4.8 KB flat out. A snapshot is due once the log
+outgrows the database, at least 8 MiB (§4.1). The agent-pace databases had about 7 MB of log after
+10.5 min and took none. The retained log (tail minus retention) ended at no more than 7.0 MB at
+agent pace, 16.8 MB in the 16- and 128-database flat-out cells, and 25.4 MB for the single
+flat-out database (13.8 MB).
+
+**Back-to-back large transactions** (5 MB table, 2,000-row updates, frames of about 1 MB, no pause,
+300 s): 3,429 commits at p50 91 / p99 182 / max 1,138 ms, 3.35 GB written, 381 snapshots. The
+retained log never exceeded 19.5 MB (sampled every 10 s) and ended at 15.7 MB. S3 still held
+2.94 GB for the stream 29 minutes after the writes: the external payloads that #475 leaves behind,
+fixed by #487, which this image predates.
+
+**Cold start**: a fresh host attaching new files, three times, best with the first in parentheses.
+A newly built database has no snapshot yet, because one is due only once its log outgrows the
+database (§4.1), so the first column replays the whole log. For the second, rows were rewritten
+after the build until a snapshot was published, as a database that has lived a while would have
+one:
+
+| database | log only: log replayed, attach | with a snapshot: body (publish time), tail after it, attach |
+| --- | --- | --- |
+| 10 MB | 2.5 MB, 48 ms (77) | |
+| 100 MB | 24.6 MB, 0.28 s (1.11) | 23.8 MB (6.7 s), 11 MB, 0.85 s (1.10) |
+| 1 GB | 246 MB, 8.0 s (12.8) | 237 MB (10.9 s), 74 MB, 15.5 s (18.7) |
+
+Installing a snapshot is slower than replaying as many bytes of log (#497): 237 MB of snapshot and
+74 MB of tail took 15.5 s, 246 MB of log 8.0 s. On 2026-10-03 a 1 GB database took 16.1 to 16.9 s (first
+attach 25 to 27 s) from a 278 MB snapshot and 133 to 169 MB of tail.
+
+**Failover**: 16 databases flat out, and at 120 s `kubectl delete --force` of the node leading the
+most groups (86 of 256), three runs. No commit failed and no database was poisoned. Afterwards every
+owner's file and a fresh rebuild from its stream were identical row for row, with
+`integrity_check` ok (48 of 48). The longest commit around the kill, per database:
+
+| run | over 10 s | 2 to 10 s | 0.5 to 2 s | under 0.5 s |
+| --- | --- | --- | --- | --- |
+| 1 | 21.9 | 11 (2.1 to 4.4) | 0 | 4 |
+| A | 21.4, 21.4, 13.2, 13.2, 12.2, 11.5 | 7 (2.2 to 6.1) | 0 | 3 |
+| B | 21.8, 10.4 | 9 (2.0 to 2.4) | 1 | 4 |
+
+Elections took up to about 5 s: the VFS got `503` from the groups' nodes once a second for that
+long. The stalls over 10 s are whole 10 s VFS request timeouts, one or two in a row (the
+`append_retry` lines of runs A and B). They are requests the gateway sent over pooled connections
+to the deleted pod, which never answered (#495). Two in a row use 21 s of the VFS's 30 s retry
+budget. The 2026-10-03 run's disk-WAL stalls of 8.3 to 10.1 s fit one such timeout each. The
+replacement pod exited twice with `the Raft WAL is already in use` while the force-deleted
+container still held the WAL lock, then started. Two snapshot uploads during the kills got the
+gateway's `504` after its own 30 s upstream timeout, the same cause, and the next attempt published
+them. The snapshot read-back `503` of the 2026-10-03 run did not recur.
+
+**S3.** Requests per minute, whole bucket, median (range) over the minutes wholly inside each cell:
+
+| cell | PUT | GET |
+| --- | --- | --- |
+| 1 db, agent pace | 11 (2 to 98) | 189 (145 to 529) |
+| 1 db, flat out | 42 (29 to 52) | 275 (219 to 329) |
+| 16 dbs, agent pace | 3 (2 to 115) | 181 (159 to 560) |
+| 16 dbs, flat out | 253 (180 to 498) | 978 (816 to 1,800) |
+| 128 dbs, agent pace | 67 (9 to 767) | 673 (377 to 2,613) |
+| 128 dbs, flat out | 1,317 (916 to 1,721) | 4,921 (2,957 to 5,647) |
+| 16 dbs, agent pace, after the 128-db cells | 61 (26 to 181) | 1,220 (1,093 to 1,593) |
+| back-to-back large transactions | 701 (595 to 723) | 1,537 (1,327 to 1,653) |
+
+Two background costs grow over a run, which is why later cells read higher than earlier ones at
+the same load:
+
+- The cold-index repair cursor (bounded-stream-state F19). Every 60 s each group's leader reads
+  the index pages of up to 16 of its streams. A stream with cold data therefore costs one or two
+  GETs a minute whether or not it is written, until a group has more than 16 such streams. With no
+  client running (05:05 to 05:21 UTC) and about 310 such streams, the stream prefixes took 550 to
+  615 GETs and at most 6 PUTs a minute. Near the end, with over 600 streams, about 1,000 GETs a
+  minute.
+- Raft snapshots in the S3 snapshot store. Every voter uploads its own object per snapshot,
+  several MB for a busy group, and prunes after its own builds, past a 1 h grace. In the
+  128-database flat-out cell the snapshot prefix took 450 to 950 PUTs and 1,900 to 3,900 GETs a
+  minute. At 05:49 UTC the store held 5,448 objects (15.8 GB), 3.9 GB of them past the grace. A
+  group that stops building snapshots never prunes (#494), and a pin released between listing and
+  reading aborts a prune (#490).
+
+**Open issues seen in this run.** #495 (failover stalls of 10 to 22 s through the gateway), #496
+(AppendStream calls past the OpenRaft hard TTL under load), #494 and #490 (Raft snapshot objects in
+S3), #475 (external payloads kept after retention, fixed by #487 after this image), and #497
+(installing a snapshot is slower than replaying as many bytes of log).
 
 ### Baseline: Pi Durable in a Durable Object (Cloudflare PiHarness)
 
@@ -698,12 +721,13 @@ turn.
 followers, each in a different physical data center, report that they received it; a follower keeps
 what it receives in a buffer on local disk. Changes then go to object storage in batches of up to
 10 s or 16 MB, whichever comes first (Cloudflare, "Zero-latency SQLite storage in every Durable
-Object", https://blog.cloudflare.com/sqlite-in-durable-objects/). In these cells a VFS append was acknowledged
-when 2 of the group's 3 replicas, one per AZ, held it: in memory with the memory WAL, or written and
-flushed to the Raft log on local disk with the disk WAL. The memory WAL was volatile, and has since been
-removed: a restarted memory-WAL replica came back empty, so until its leaders had rebuilt it a VFS
-commit had two real copies, not three. The disk-WAL column is the like-for-like one. Spreading followers over data centers rather than AZs is likely the stronger geographic
-guarantee, which favours the DO.
+Object", https://blog.cloudflare.com/sqlite-in-durable-objects/). In the §9 run a VFS append was acknowledged
+when 2 of the group's 3 replicas, one per AZ, had written it to the Raft log on local disk, in the
+page cache without `fsync` (`raft.wal.fsync = never`, the default). A process crash loses nothing. A
+host crash can cost that replica the unsynced tail, which it then recovers from the group behind
+its recovery gate, and a write acknowledged after the last `fsync` is lost only if a majority of
+the group's voters crash at once. Spreading followers over data centers rather than AZs is likely
+the stronger geographic guarantee, which favours the DO.
 
 **Timing.** On deployed Workers an object's clock does not advance while JavaScript runs. It catches
 up at a later, unpredictable I/O (`results/clockprobe*.json`). A span read on the object's own clock
@@ -724,23 +748,24 @@ the non-durable reference.
 
 **Durable commit latency**, ms, p50 / p99 (p99.9 / max), pi path, IAD. "Per object" gives the
 median and range across objects of each object's own p50 and p99. The interval is a 95% bootstrap
-over objects (2,000 resamples of the objects, all samples of a drawn object pooled). VFS columns are
-from the table above.
+over objects (2,000 resamples of the objects, all samples of a drawn object pooled). The VFS column is
+from §9 (2026-10-09), measured on the same Pi workload but not at the same time.
 
-| cell | DO durable commit | n | per object p50 | per object p99 | 95% interval, pooled p99 | VFS memory WAL | VFS disk WAL |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 db, agent pace, 64 objects, gaps 1.5 to 2.5 s (re-run 3) | 18 / 52 (190 / 6,494) | 95,058 | 18.5 (9 to 29) | 41 (17 to 122) | 37 to 67 | 9.7 / 12.8 | 16.5 / 20.0 |
-| 1 db, agent pace, 64 objects, fixed 2 s (re-run 3) [3] | 19 / 43 (213 / 5,506) | 78,871 | 19 (9 to 29) | 30 (21 to 257) | 34 to 64 | 9.7 / 12.8 | 16.5 / 20.0 |
-| 1 db, agent pace, 8 objects, fixed 2 s (re-run 2) | 20 / 68 (210 / 641) | 12,000 | 19 (11 to 28) | 33.5 (25 to 146) | 32 to 113 | 9.7 / 12.8 | 16.5 / 20.0 |
-| 1 db, flat out, 8 objects (re-run 2) | 20 / 41 (167 / 2,955) | 148,130 | 19.5 (18 to 28) | 41 (30 to 75) | 35 to 53 | 9.4 / 12.8 (42 / 147) | 15.2 / 18.7 (65 / 124) |
-| 16 dbs, flat out (re-run 2) [1] | 19 / 46 (180 / 723) | 315,291 | 20 (10 to 20) | 46 (28 to 56) | 41 to 49 | 13.0 / 31.8 (50 / 132) | 21.7 / 37.1 (110 / 363) |
-| 128 dbs, flat out (re-run 2) [2] | 19 / 63 (205 / 5,335) | 2,561,957 | 19 (10 to 29) | 51 (19 to 143) | 60 to 67 | not comparable | not comparable |
+| cell | DO durable commit | n | per object p50 | per object p99 | 95% interval, pooled p99 | VFS |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 db, agent pace, 64 objects, gaps 1.5 to 2.5 s (re-run 3) | 18 / 52 (190 / 6,494) | 95,058 | 18.5 (9 to 29) | 41 (17 to 122) | 37 to 67 | 4.7 / 7.9 |
+| 1 db, agent pace, 64 objects, fixed 2 s (re-run 3) [3] | 19 / 43 (213 / 5,506) | 78,871 | 19 (9 to 29) | 30 (21 to 257) | 34 to 64 | 4.7 / 7.9 |
+| 1 db, agent pace, 8 objects, fixed 2 s (re-run 2) | 20 / 68 (210 / 641) | 12,000 | 19 (11 to 28) | 33.5 (25 to 146) | 32 to 113 | 4.7 / 7.9 |
+| 1 db, flat out, 8 objects (re-run 2) | 20 / 41 (167 / 2,955) | 148,130 | 19.5 (18 to 28) | 41 (30 to 75) | 35 to 53 | 4.4 / 7.0 (51 / 144) |
+| 16 dbs, flat out (re-run 2) [1] | 19 / 46 (180 / 723) | 315,291 | 20 (10 to 20) | 46 (28 to 56) | 41 to 49 | 8.1 / 28.4 (58 / 199) |
+| 128 dbs, flat out (re-run 2) [2] | 19 / 63 (205 / 5,335) | 2,561,957 | 19 (10 to 29) | 51 (19 to 143) | 60 to 67 | not comparable |
 
-[1] The VFS ran its 16 databases as 16 processes on one client pod (6 CPU requested). On that pod B1
-falls from 115 to 41 commits/s per database and its p99 rises from 8.9 to 13.1 ms, so the VFS row
-includes client scheduling delay, mostly in the memory-WAL column and in p99. The DO's 16 owners ran
-in 16 isolates.
-[2] The VFS's two client nodes were saturated in this cell. Run 1 of the DO's 128-owner cell read
+[1] The VFS ran its 16 databases as 16 processes on one client node, at about 70% of its 8 vCPU.
+On a 6-CPU client pod on 2026-10-03, B1 fell from 115 to 41 commits/s per database and its p99 rose
+from 8.9 to 13.1 ms at 16 databases, so the VFS row includes client scheduling delay, mostly in
+p99. The DO's 16 owners ran in 16 isolates.
+[2] The VFS ran 64 databases on each of two client nodes. On 2026-10-03 both were saturated. The
+§9 run did not record their CPU, but each database managed 16 commits/s against 34 at 16 databases. Run 1 of the DO's 128-owner cell read
 18 / 67 (216 / 3,035), but two of its owners lost 51% and 35% of their marks to a broken stub (below).
 [3] Recorded from 30 to 522 s. The driver's laptop went to sleep 522 s into the cell, and the owners
 stopped 60 s later, as designed when no drain arrives. The records up to then are complete: at least
@@ -758,8 +783,8 @@ observer shared an isolate with an owner. The paired correction lowers two maxim
 Per object, the largest commit at the median object is 116 ms at agent pace with fixed gaps (range
 28 to 5,506 ms over the 64 objects), 191 ms with jittered gaps (84 to 6,494), 513 ms for 1 db flat
 out (217 to 2,955), 419 ms at 16 dbs (243 to 723) and 466 ms at 128 dbs (174 to 5,335). An object in
-the 1-db flat-out cell has about 18,500 samples. The VFS's single database had about 36,000 (memory
-WAL) and 28,000 (disk WAL), with maxima of 147 and 124 ms.
+the 1-db flat-out cell has about 18,500 samples. The VFS's single database had about 48,000, with a
+maximum of 144 ms.
 
 **Where the DO's tail comes from.**
 
@@ -788,11 +813,11 @@ WAL) and 28,000 (disk WAL), with maxima of 147 and 124 ms.
 
 **Throughput**, Pi commits/s from the owners' own counters over 30 to 630 s, pi path, durable.
 
-| cell | DO per owner, median (range) | DO total | VFS memory WAL | VFS disk WAL |
-| --- | --- | --- | --- | --- |
-| 1 db, flat out (8 objects) | 31.0 (26.9 to 33.8) | 247 | 60 | 46 |
-| 16 dbs, flat out | 32.2 (28.7 to 45.2) | 525 | 565 | 499 |
-| 128 dbs, flat out | 32.5 (24.2 to 48.4) | 4,267 | 1,900 [2] | 841 [2] |
+| cell | DO per owner, median (range) | DO total | VFS |
+| --- | --- | --- | --- |
+| 1 db, flat out (8 objects) | 31.0 (26.9 to 33.8) | 247 | 81 |
+| 16 dbs, flat out | 32.2 (28.7 to 45.2) | 525 | 541 |
+| 128 dbs, flat out | 32.5 (24.2 to 48.4) | 4,267 | 2,051 [2] |
 
 DO throughput falls within a cell. With 1 db flat out it goes from 42.1 commits/s in the first
 minute to 24.2 in the last half minute, while commit p50 stays at 20 ms. The owner's time between
@@ -915,16 +940,15 @@ estimates from the published rates; the OAuth token cannot read billing.
 
 **In short.**
 
-- Waiting for a confirmed write costs about 18 to 20 ms at p50 in a DO in IAD, against 9.7 ms
-  (memory WAL, since removed) and 16.5 ms (disk WAL) on the VFS at agent pace. At p50 the DO is about
-  1.1 to 1.2x the production-equivalent disk WAL.
+- Waiting for a confirmed write costs about 18 to 20 ms at p50 in a DO in IAD, against 4.7 ms on
+  the VFS at agent pace, so about 4x.
 - The DO's tail is wider. At agent pace on 64 objects its p99 is 52 ms with jittered gaps (95%
-  interval 37 to 67) and 43 ms with fixed 2 s gaps (34 to 64), against 20.0 ms on the disk WAL. The
+  interval 37 to 67) and 43 ms with fixed 2 s gaps (34 to 64), against 7.9 ms on the VFS. The
   slow commits are mostly the first commit of a turn and a 10 s cycle per object, and single commits
   reached 5 to 6.5 s.
 - The DO's latency depends on the object: per-object p50 runs from 9 to 29 ms in one colo.
-- Flat out, a DO owner manages 31 durable commits/s against 46 (disk WAL) and 60 (memory WAL) on the
-  VFS, and its rate falls as Pi's transcript grows. That is Pi's CPU on Workers, not storage.
+- Flat out, a DO owner manages 31 durable commits/s against 81 on the VFS, and its rate falls as
+  Pi's transcript grows. That is Pi's CPU on Workers, not storage.
 - As shipped, Pi on a DO does not wait for each commit, so it runs at 58 commits/s per owner with
   each turn confirmed before its model calls and its reply; through `PiHarness.submit` it runs at
   22. The VFS has no such mode.
