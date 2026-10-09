@@ -60,9 +60,12 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
 - **Outcome unknown** (timeout, connection loss, 5xx): retried with the same sequence until the
   server answers, for up to `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
 - **401** (an authorizer in front of the stream, such as `ursula gateway --auth-*`, refused the
-  token): retried like an unknown outcome, with the token read again (§7). A **403 without
-  `Producer-Epoch`** is an authorizer's denial and final. Both fail the write as unauthorized,
-  never as fenced: only the server's 403 carries `Producer-Epoch`.
+  token): retried like an unknown outcome, with the token read again (§7). On a synchronous host
+  (node:sqlite) a set token cannot change meanwhile, because the committing thread is the one that
+  would call `ursula_set_token`: one that expires fails the commit once the budget runs out, so
+  applications refresh it before it expires. A **403 without `Producer-Epoch`** is an authorizer's
+  denial and final. Both fail the write as unauthorized, never as fenced: only the server's 403
+  carries `Producer-Epoch` (one classifier, `refused`, tells them apart for every request).
 - **403 with `Producer-Epoch`** (a newer epoch claimed the stream), a definite rejection, or an
   exhausted budget: the write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back,
   nothing of it reaches the local WAL, and the database is poisoned until it is re-attached.
@@ -224,6 +227,9 @@ API both rewrite pages, and are not). The thread:
    checkpoint can write newer frames into the db file (a reader at mark 0 blocks backfill; at a
    later mark it caps it) and no closing connection can checkpoint (that needs an EXCLUSIVE lock),
    so the pages are those of `W`. Ends the read transaction.
+6. Fsyncs the WAL and the db file through the private connection's own handles, which reports a
+   write-back error of a page the checkpoints or the copy read (§6). A failed fsync poisons the
+   database, and so does a lost write the owner found meanwhile: either way nothing is published.
 
 Commits wait only for steps 3 and 4 (a passive checkpoint of the few frames committed since step
 1, and the start of a read transaction) and, once a snapshot is due, for the window to open
@@ -325,7 +331,9 @@ be written into the stream. Trust is therefore verified against the files, not i
   commit that starts a generation, cuts only the previous generation's tail, already synced by
   (1)); (3) at attach, after folding the WAL and before the sidecar that drops its claim (`:0`; the
   WAL is deleted after it), and again before the final sidecar whenever attach wrote the db file.
-  A failed fsync poisons the database (or fails the attach).
+  A failed fsync poisons the database (or fails the attach). The snapshot thread also fsyncs the
+  WAL and the db file after reading them, off the commit path (§4.2, step 6): that reports lost
+  write-backs, and the claim does not rely on it.
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
   claim checkable.
@@ -410,8 +418,16 @@ What attach does in each case:
   has grown past it. A stream deleted (by mistake, by TTL expiry, or by a fresh install that did not
   carry it over) leaves the local files as possibly the only copy: attach creates a missing stream
   only for a file without content, refuses one with content and keeps its files. To start over
-  from an empty stream, delete `<db>`, or attach under another stream URL. A recreate during
-  attach fails that round, and attach rebuilds from the recreated stream (§3).
+  from an empty stream, delete `<db>` (attach then creates the stream), or attach a new file under
+  another stream URL: the files attach to no other URL (the sidecar names this one), and a copy of
+  them has no sidecar, so attach refuses it as never attached. To salvage the data, copy `<db>` and
+  `<db>-wal` to a new name before deleting anything (an attached file's WAL persists and may hold
+  commits not yet checkpointed), open the copy, which has no sidecar and so opens as a plain SQLite
+  file, and export its rows into a newly attached database. An empty file attached at the same URL
+  after the delete (another host, a fresh install) creates a new incarnation, and the original
+  owner's next attach then discards its files as the cache of a recreated stream: moving them aside
+  instead is a follow-up. A recreate during attach fails that round, and attach rebuilds from the
+  recreated stream (§3).
   While attached, every request of the owner carries its incarnation as the `Stream-Incarnation`
   precondition, which the server checks atomically with the request (an append when Raft applies
   it, so a commit proposed before a delete and recreate and applied after is refused too): the
@@ -436,22 +452,33 @@ What attach does in each case:
   the log grows, nothing is lost; retention simply does not advance.
 
 A disk write-back I/O error underneath a running process (EIO from the device, a
-thin-provisioned volume out of space). The WAL is never fsynced and the db file only at WAL
-restarts, truncates and attach, so nothing reports such an error when it happens. Once the dirty
-page is evicted, a read gets the old block back, and SQLite does not check WAL frames on a read:
-the owner's next commits would append page images built on it, losing acknowledged changes from
-the stream itself, not only from the cache. So the VFS remembers the crc32c of every WAL page this
-process writes in the WAL's current generation, by offset (4 bytes per page), and checks every
-page its connections read back. A page that reads back other bytes fails the read and poisons the
-database before any commit can build on it. An error writing back the db file is reported (Linux
-reports it to an fsync on any descriptor opened before it) by the next fsync of the db file. That
-fsync comes before the commit that restarts the WAL, which is normally the first commit after a
-complete checkpoint, the point from which readers read checkpointed pages from the db file
+thin-provisioned volume out of space). The commit path never fsyncs the WAL, and the db file only
+at WAL restarts, truncates and attach, so nothing reports such an error when it happens. Once the
+dirty page is evicted, a read gets the old block back, and SQLite does not check WAL frames on a
+read: the owner's next commits would append page images built on it, losing acknowledged changes
+from the stream itself, not only from the cache. So the VFS remembers the crc32c of every WAL page
+this process writes in the WAL's current generation, by offset (4 bytes per page), and checks
+every page its connections read back. A page that reads back other bytes fails the read and poisons
+the database before any commit can build on it. An error writing back the db file is reported
+(Linux reports it to an fsync on any descriptor opened before it) by the next fsync of the db file.
+That fsync comes before the commit that restarts the WAL, which is normally the first commit after
+a complete checkpoint, the point from which readers read checkpointed pages from the db file
 instead of the WAL.
 
+The snapshot thread's private connection reads the WAL (its checkpoints) and the db file (its
+page copy) outside the VFS, so it does not see that check. A lost page it published would become
+permanent once the next snapshot moves retention past the frames that hold the good one. So after
+reading, it fsyncs both files through its own handles (§4.2, step 6) and publishes nothing when an
+fsync fails (which poisons the database) or the owner is poisoned for a lost write. On Linux an
+fsync reports a write-back error that no fsync has reported yet, from any descriptor, and in the
+process only the owner's fsync of the db file could have reported it first, which poisons too.
+
 Residual risk:
-- The snapshot thread's private connection reads the WAL outside the VFS when it checkpoints, so
-  a lost WAL page that no connection of the owner read back can be checkpointed into the db file.
+- The snapshot's fsyncs rely on the kernel reporting an earlier write-back error to a later fsync
+  on another descriptor, which Linux does. Elsewhere (macOS) a lost page the checkpoints or the
+  copy read, and no connection of the owner read back, can still be published.
+- A page changed by anything but a failed write-back (unsupported, below) is reported by no fsync:
+  unless a connection of the owner read it back first, a snapshot can publish it.
 - A commit that cannot restart the WAL, because another connection still reads from it, can read
   a db page that lost its write-back since the last fsync and append the damage.
 
@@ -478,7 +505,11 @@ rebuild, delete `<db>`.
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.
 - HTTP, or TLS for `https://` URLs with the bundled Mozilla roots, or only the certificate
   authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
-  content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401.
+  content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401. A read of
+  the file that finds no token (empty, half-written, missing) keeps the last one it held: sent
+  without one, a request is concealed as a missing stream (404), which poisons at once. A token
+  sent over `http://` to a host that is not loopback is logged once (`token_in_clear`). The SQL
+  functions are direct-only: a trigger or view of an untrusted database cannot call them.
 
 ### Versions
 
@@ -557,10 +588,10 @@ chart's `examples/production-eks.yaml` shape: 256 groups, 4 cores, 8 GiB limit),
 settings. Server image: main `bb7a61b` (`0.0.0-main.bb7a61b1c968`) with the chart's defaults: the
 Raft WAL on a gp3 volume with `raft.wal.fsync = never`, and no gateway quota policy, so no client
 saw a 429. Gateway `maxRequestBodyBytes` was raised to 1 GiB for the cold-start cells. Extension:
-#488 at `398369d`, and `ee5e278` for two of the three failover runs (it adds the `append_retry` log
-line and changes nothing on the commit path). Clients: `m6i.2xlarge` pods (Node 22.20) in
-us-east-1a, one process per database, through the gateway Service. The tools are in
-`clients/sqlite-ursula/bench/`.
+#488 at `398369d`, and `ee5e278` for two of the three failover runs (it changes nothing on the
+commit path except a log line when an append is retried, `append_retry`). Clients: `m6i.2xlarge`
+pods (Node 22.20) in us-east-1a, one process per database, through the gateway Service. The tools
+are in `clients/sqlite-ursula/bench/`.
 
 Workload: Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`, a real `Harness` with
 a faux model, turns of text, text, tool (5.0 Pi commits per turn). Latency is `Storage.commit`
@@ -617,8 +648,12 @@ Where one database's commit goes (1 db at agent pace, p50, ms):
 The append is the commit, and what it costs depends on where the stream's leader and the
 connection's gateway are. Through the Service, each connection lands on one of the three gateways,
 one per AZ, and the stream's group is led from one of the three nodes. To separate the VFS from
-placement, six fresh streams each ran one database flat out for 30 s and then raw appends of the
-VFS's frame size (4.8 KB) on the same stream, both through the gateway pod in the client's AZ:
+placement, an ad hoc run outside the committed tools (`raw.ts` creates its own streams, sends 5 to
+7 KiB bodies and goes through the Service) used six fresh streams. On each, one database ran flat
+out for 30 s, and then raw appends of the VFS's frame size (4.8 KB) went to the same stream, both
+sent to the gateway pod in the client's AZ rather than through the Service. The VFS appends with
+ureq from inside the extension and the raw appends use Node's `fetch`, so the difference includes
+the two HTTP clients:
 
 | leader's AZ | VFS append p50, ms | raw append p50 on the same stream, ms |
 | --- | --- | --- |
@@ -626,9 +661,10 @@ VFS's frame size (4.8 KB) on the same stream, both through the gateway pod in th
 | us-east-1b | 1.66, 1.39 | 1.53, 1.28 |
 | us-east-1c | 2.33, 2.39 | 2.26, 2.35 |
 
-The VFS adds 0.04 to 0.13 ms to an append. The one-database cells' 4.0 to 4.3 ms went through
-the Service, where the connection's gateway can also be in another AZ, and that placement was not
-recorded. Over 16 and 128 databases at agent pace the VFS's append p50 was 3.5 to 3.7 ms.
+The VFS, with its HTTP client, adds 0.04 to 0.13 ms to an append over `fetch`. The one-database
+cells' 4.0 to 4.3 ms went through the Service, where the connection's gateway can also be in another
+AZ, and that placement was not recorded. Over 16 and 128 databases at agent pace the VFS's append
+p50 was 3.5 to 3.7 ms.
 
 **The 2026-10-03 problems.** Neither reproduced. At 128 databases flat out no database was
 poisoned, no append was retried, no node logged `rebuilding channel`, and there were no
@@ -644,7 +680,10 @@ out, so 3.6 KB per commit at agent pace and 4.6 to 4.8 KB flat out. A snapshot i
 outgrows the database, at least 8 MiB (§4.1). The agent-pace databases had about 7 MB of log after
 10.5 min and took none. The retained log (tail minus retention) ended at no more than 7.0 MB at
 agent pace, 16.8 MB in the 16- and 128-database flat-out cells, and 25.4 MB for the single
-flat-out database (13.8 MB).
+flat-out database. Retention trails one snapshot behind (§4.3), so the retained log reaches about
+twice the snapshot threshold, plus what is committed while a snapshot is taken: 16.8 MB is twice
+the 8 MiB minimum, and the single flat-out database had grown to 13.8 MB, which set its threshold
+above the minimum.
 
 **Back-to-back large transactions** (5 MB table, 2,000-row updates, frames of about 1 MB, no pause,
 300 s): 3,429 commits at p50 91 / p99 182 / max 1,138 ms, 3.35 GB written, 381 snapshots. The
@@ -652,11 +691,12 @@ retained log never exceeded 19.5 MB (sampled every 10 s) and ended at 15.7 MB. S
 2.94 GB for the stream 29 minutes after the writes: the external payloads that #475 leaves behind,
 fixed by #487, which this image predates.
 
-**Cold start**: a fresh host attaching new files, three times, best with the first in parentheses.
-A newly built database has no snapshot yet, because one is due only once its log outgrows the
-database (§4.1), so the first column replays the whole log. For the second, rows were rewritten
-after the build until a snapshot was published, as a database that has lived a while would have
-one:
+**Cold start**: a fresh host attaching new files, three times, best with the first in parentheses
+(`bench/coldstart.ts`; the log replayed, and the tail after a snapshot, are the attached file's
+`log_bytes`). A newly built database has no snapshot yet, because one is due only once its log
+outgrows the database (§4.1), so the first column replays the whole log. For the second, rows were
+rewritten after the build until a snapshot was published, as a database that has lived a while would
+have one:
 
 | database | log only: log replayed, attach | with a snapshot: body (publish time), tail after it, attach |
 | --- | --- | --- |
@@ -689,7 +729,8 @@ container still held the WAL lock, then started. Two snapshot uploads during the
 gateway's `504` after its own 30 s upstream timeout, the same cause, and the next attempt published
 them. The snapshot read-back `503` of the 2026-10-03 run did not recur.
 
-**S3.** Requests per minute, whole bucket, median (range) over the minutes wholly inside each cell:
+**S3.** Requests per minute (CloudWatch S3 request metrics), whole bucket, median (range) over the
+minutes wholly inside each cell:
 
 | cell | PUT | GET |
 | --- | --- | --- |

@@ -18,9 +18,22 @@ static SET: Mutex<Option<String>> = Mutex::new(None);
 static FILE: Mutex<Option<Cached>> = Mutex::new(None);
 
 struct Cached {
+    /// The file's modification time and length when it was read.
     modified: Option<SystemTime>,
     len: Option<u64>,
+    /// The last usable token the file held.
     token: Option<String>,
+    /// The last read found no usable token (logged once, until a read finds one again).
+    unusable: bool,
+}
+
+/// Why the token file gave no token.
+#[derive(Debug, thiserror::Error)]
+enum Unusable {
+    #[error("{0}")]
+    Read(#[source] std::io::Error),
+    #[error("it holds no token (empty, or not printable ASCII without spaces)")]
+    NoToken,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -39,33 +52,51 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
     if let Some(token) = lock(&SET).clone() {
         return Some(token);
     }
-    let path = token_file()?;
+    file_token(token_file()?, refresh, &FILE)
+}
+
+/// The token in the file at `path`, read again when it changed (or on `refresh`), outside the
+/// cache's lock. A read that finds no usable token (the file is missing, empty, or caught
+/// half-written by a writer that truncates it first) keeps the last token the file held: a
+/// request sent without one is refused as if the stream did not exist (an authorizer conceals it
+/// with a 404), which fails an attach and poisons a commit at once, whereas a stale token is
+/// refused with a 401, which is retried with the file read again.
+fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> Option<String> {
     let meta = fs::metadata(path).ok();
     let modified = meta.as_ref().and_then(|m| m.modified().ok());
     let len = meta.as_ref().map(fs::Metadata::len);
-    let mut cached = lock(&FILE);
-    if refresh
-        || cached
+    if !refresh
+        && let Some(c) = lock(cache)
             .as_ref()
-            .is_none_or(|c| c.modified != modified || c.len != len)
+            .filter(|c| c.modified == modified && c.len == len)
     {
-        let token = match fs::read_to_string(path) {
-            Ok(text) => usable(&text),
-            Err(e) => {
+        return c.token.clone();
+    }
+    let read = fs::read_to_string(path)
+        .map_err(Unusable::Read)
+        .and_then(|text| usable(&text).ok_or(Unusable::NoToken));
+    let mut cached = lock(cache);
+    let last = cached.as_ref().and_then(|c| c.token.clone());
+    let (token, unusable) = match read {
+        Ok(token) => (Some(token), false),
+        Err(e) => {
+            if !cached.as_ref().is_some_and(|c| c.unusable) {
                 log::emit(Level::Warn, "token_file_unreadable", &[
                     ("path", &path),
                     ("error", &e),
+                    ("kept_previous", &last.is_some()),
                 ]);
-                None
             }
-        };
-        *cached = Some(Cached {
-            modified,
-            len,
-            token,
-        });
-    }
-    cached.as_ref().and_then(|c| c.token.clone())
+            (last, true)
+        }
+    };
+    *cached = Some(Cached {
+        modified,
+        len,
+        token: token.clone(),
+        unusable,
+    });
+    token
 }
 
 /// A token as `Authorization: Bearer` carries it: trimmed, non-empty, printable ASCII without
@@ -77,6 +108,10 @@ fn usable(token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::sync::Mutex;
+
+    use super::file_token;
     use super::usable;
 
     #[test]
@@ -86,5 +121,31 @@ mod tests {
         assert_eq!(usable("  \n"), None);
         assert_eq!(usable("two words"), None);
         assert_eq!(usable("caf\u{e9}"), None);
+    }
+
+    // A token file that holds no usable token (empty, half-written, or missing for a moment while
+    // it is replaced) keeps the last token it held, so requests never go out without one.
+    #[test]
+    fn a_token_file_without_a_token_keeps_the_last_one() {
+        let dir = std::env::temp_dir().join(format!("ursula-token-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        let file = path.to_str().unwrap();
+        let cache = Mutex::new(None);
+        fs::write(&path, "").unwrap();
+        assert_eq!(file_token(file, true, &cache), None);
+        fs::write(&path, "t1\n").unwrap();
+        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        fs::write(&path, "").unwrap();
+        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        fs::write(&path, "half written").unwrap();
+        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t1"));
+        fs::write(&path, "t2").unwrap();
+        assert_eq!(file_token(file, true, &cache).as_deref(), Some("t2"));
+        // Unchanged since the last read: the cached token, without reading the file.
+        assert_eq!(file_token(file, false, &cache).as_deref(), Some("t2"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

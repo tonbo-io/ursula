@@ -70,5 +70,5 @@ it("snapshots show in the age and failure fields, and a poisoned owner logs a lo
 	expect(done.health?.snapshot_age_ms).not.toBeNull();
 	expect(done.health).toMatchObject({ snapshot_failures: 0, snapshot_error: null });
 	await child.exited;
-	expect(child.stderr()).toMatch(/^sqlite-ursula-vfs level=warn event=poisoned file=\S+ stream=\S+ fenced=true reason="fenced: epoch \d+ superseded by Some\(\d+\) \(403\)"$/m);
+	expect(child.stderr()).toMatch(/^sqlite-ursula-vfs level=warn event=poisoned file=\S+ stream=\S+ fenced=true reason="fenced: epoch \d+ superseded by \d+ \(403\)"$/m);
 });

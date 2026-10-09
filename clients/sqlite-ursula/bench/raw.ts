@@ -15,7 +15,8 @@ const run = Date.now().toString(36);
 const started = performance.now();
 const measureFrom = started + Number(warmup) * 1000;
 const end = measureFrom + Number(duration) * 1000;
-let status503 = 0;
+// Answers of 503 or 429, each retried.
+let retriedBusy = 0;
 let otherErrors = 0;
 
 async function writer(i: number): Promise<number[]> {
@@ -35,7 +36,7 @@ async function writer(i: number): Promise<number[]> {
 				continue;
 			}
 			if (r.status === 503 || r.status === 429) {
-				status503++;
+				retriedBusy++;
 				await new Promise((res) => setTimeout(res, 20));
 				continue;
 			}
@@ -60,7 +61,7 @@ const summary = {
 	appends: all.length,
 	append_ms: { p50: pct(50), p99: pct(99), p999: pct(99.9), max: Math.round((s[s.length - 1] ?? Number.NaN) * 100) / 100 },
 	appends_per_s: Math.round((all.length / Number(duration)) * 10) / 10,
-	retried_503_429: status503,
+	retried_503_429: retriedBusy,
 	other_errors: otherErrors,
 };
 mkdirSync(join(outDir, label), { recursive: true });

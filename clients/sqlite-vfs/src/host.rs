@@ -101,9 +101,9 @@ pub(crate) enum Checkpoint {
 }
 
 /// A private connection on the "unix" VFS, outside this VFS's bookkeeping: attach giving an empty
-/// file its WAL format, and the snapshot thread's checkpoint, read transaction and page copy.
-/// `synchronous=OFF`: the local files are a cache (see the crate docs), so its checkpoints never
-/// fsync.
+/// file its WAL format, and the snapshot thread's checkpoint, read transaction, page copy and
+/// fsyncs. `synchronous=OFF`: the local files are a cache (see the crate docs), so its checkpoints
+/// never fsync.
 pub(crate) struct Private {
     /// From `sqlite3_open_v2` (possibly a failed open's handle, which still needs closing).
     db: *mut ffi::sqlite3,
@@ -215,30 +215,37 @@ impl Private {
         Ok(())
     }
 
-    /// Pages `1..=n` of the db file, read through the connection's own file handle (closing a
-    /// descriptor of our own would drop the process's POSIX locks on the file).
+    /// One of the connection's own open files and its io methods, through `op`: `FILE_POINTER`
+    /// for the db file, `JOURNAL_POINTER` for the WAL (open once a read or checkpoint ran). Live
+    /// while the connection is (closing a descriptor of our own instead would drop the process's
+    /// POSIX locks on the file).
+    fn file(
+        &self,
+        op: c_int,
+        file: &'static str,
+    ) -> Result<(*mut ffi::sqlite3_file, &'static ffi::sqlite3_io_methods), Error> {
+        let file_control = routine!(file_control)?;
+        let mut f: *mut ffi::sqlite3_file = null_mut();
+        // SAFETY: `db` is open, "main" is NUL-terminated, and FILE_POINTER and JOURNAL_POINTER
+        // write a `sqlite3_file*` of the main database at the pointer.
+        let rc = unsafe { file_control(self.db, c"main".as_ptr(), op, (&raw mut f).cast()) };
+        // SAFETY: when non-null, `f` is a file of the connection, live while `db` is.
+        let opened = unsafe { f.as_ref() };
+        // SAFETY: an open file's methods are its VFS's io methods, a static table (null while the
+        // file is closed).
+        let methods = opened.and_then(|o| unsafe { o.pMethods.as_ref() });
+        match methods {
+            Some(methods) if rc == OK => Ok((f, methods)),
+            _ => Err(Error::FileHandle { file, code: rc }),
+        }
+    }
+
+    /// Pages `1..=n` of the db file, read through the connection's own file handle (see `file`).
     pub(crate) fn read_pages(&self, n: u32) -> Result<Vec<u8>, Error> {
         /// The most read at once: 256 pages.
         const CHUNK: usize = 256 * PAGE;
-        let file_control = routine!(file_control)?;
-        let mut f: *mut ffi::sqlite3_file = null_mut();
-        // SAFETY: `db` is open, "main" is NUL-terminated, and FILE_POINTER writes the main db
-        // file's `sqlite3_file*` at the pointer.
-        let rc = unsafe {
-            file_control(
-                self.db,
-                c"main".as_ptr(),
-                ffi::SQLITE_FCNTL_FILE_POINTER,
-                (&raw mut f).cast(),
-            )
-        };
-        // SAFETY: when non-null, `f` is the connection's open main db file, live while `db` is.
-        let file = unsafe { f.as_ref() };
-        // SAFETY: an open file's methods are its VFS's io methods, which outlive it.
-        let methods = file.and_then(|file| unsafe { file.pMethods.as_ref() });
-        let Some(read) = methods.and_then(|m| m.xRead).filter(|_| rc == OK) else {
-            return Err(Error::DbFileHandle(rc));
-        };
+        let (f, methods) = self.file(ffi::SQLITE_FCNTL_FILE_POINTER, "db file")?;
+        let read = methods.xRead.ok_or(Error::MissingRoutine("xRead"))?;
         let too_large = || Error::ReadPages {
             code: ffi::SQLITE_TOOBIG,
             pages: n,
@@ -259,6 +266,27 @@ impl Private {
             at = at.saturating_add(i64::from(amt));
         }
         Ok(image)
+    }
+
+    /// Fsyncs the WAL, then the db file, through the connection's own handles (see `file`). On
+    /// Linux an fsync reports a write-back error of the file that no fsync has reported yet,
+    /// whichever descriptor wrote the page: [`Error::FileSync`] when a write-back may have been
+    /// lost.
+    pub(crate) fn sync_files(&self) -> Result<(), Error> {
+        let files = [
+            (ffi::SQLITE_FCNTL_JOURNAL_POINTER, "WAL"),
+            (ffi::SQLITE_FCNTL_FILE_POINTER, "db file"),
+        ];
+        for (op, file) in files {
+            let (f, methods) = self.file(op, file)?;
+            let sync = methods.xSync.ok_or(Error::MissingRoutine("xSync"))?;
+            // SAFETY: `f` is the open file `sync` belongs to.
+            let rc = unsafe { sync(f, ffi::SQLITE_SYNC_NORMAL) };
+            if rc != OK {
+                return Err(Error::FileSync { file, code: rc });
+            }
+        }
+        Ok(())
     }
 }
 

@@ -59,9 +59,11 @@ export type ChildLine = {
 	error?: string;
 	errcode?: number;
 	done?: boolean;
-	/** On `done`: append attempts per commit, whether the file is poisoned, its stream offset. */
+	/** On `done`: append attempts per commit, whether the file is poisoned (fenced, and why), its stream offset. */
 	attempts?: number[];
 	poisoned?: boolean;
+	fenced?: boolean;
+	reason?: string | null;
 	offset?: string;
 	epoch?: number;
 	/** On `done`: snapshots published, the latest known snapshot and the retention this owner set. */

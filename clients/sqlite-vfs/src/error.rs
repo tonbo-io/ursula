@@ -70,10 +70,14 @@ pub(crate) enum Error {
         cached: String,
         wanted: String,
     },
+    /// The files attach to no other URL (`OtherStream`) and a copy of them has no sidecar
+    /// (`NoSidecar`), so the data is salvaged by reading a copy as a plain SQLite file.
     #[error(
         "{url} is missing (or hidden from this client's credentials) and {path} holds data: \
-         refusing to create an empty stream over it (delete {path} to start over, or attach it \
-         under another URL)"
+         refusing to create an empty stream over it, and keeping the files (to salvage the data, \
+         copy {path} and {path}-wal to a new name and export the copy's rows into a newly \
+         attached database; to start over, delete {path}, or attach a new file under another \
+         URL)"
     )]
     StreamMissing { path: String, url: String },
     #[error("spawn the snapshot thread: {0}")]
@@ -90,8 +94,8 @@ pub(crate) enum Error {
     NoResultRow { sql: &'static CStr },
     #[error("persist WAL: {0}")]
     PersistWal(c_int),
-    #[error("db file handle: {0}")]
-    DbFileHandle(c_int),
+    #[error("{file} handle of a private connection: {code}")]
+    FileHandle { file: &'static str, code: c_int },
     #[error("read db file pages: {code} (file shorter than {pages} pages?)")]
     ReadPages { code: c_int, pages: u32 },
     #[error("the host's SQLite has no {0}")]
@@ -221,6 +225,8 @@ pub(crate) enum Error {
          write-back failed, or something else wrote the file)"
     )]
     LostWrite { offset: i64 },
+    #[error("fsync of the {file} failed ({code}): a write-back to it may have been lost")]
+    FileSync { file: &'static str, code: c_int },
 }
 
 /// The data asked for lies below the stream's retention (or a snapshot was superseded): a
@@ -238,7 +244,7 @@ pub(crate) enum Gone {
 /// Another owner, or a writer outside this protocol, holds the stream.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Fence {
-    #[error("epoch {epoch} superseded by {current:?} (403)")]
+    #[error("epoch {epoch} superseded by {} (403)", epoch_or_unknown(.current))]
     Superseded { epoch: u64, current: Option<u64> },
     #[error(
         "append at {offset} answered as a duplicate without a receipt: another writer (a foreign \
@@ -303,6 +309,21 @@ impl Error {
     pub(crate) fn is_fenced(&self) -> bool {
         matches!(self, Error::Fenced(_) | Error::Recreated { .. })
     }
+
+    /// The local files may hold other pages than this process wrote (a write-back was lost, or
+    /// something else wrote them): nothing read from them may reach the stream, not even in a
+    /// snapshot.
+    pub(crate) fn is_local_damage(&self) -> bool {
+        matches!(
+            self,
+            Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. }
+        )
+    }
+}
+
+/// An epoch a server answer named, or `unknown`.
+fn epoch_or_unknown(epoch: &Option<u64>) -> String {
+    epoch.map_or_else(|| "unknown".to_owned(), |epoch| epoch.to_string())
 }
 
 /// A response body appended to a status, when there is one.
@@ -337,15 +358,33 @@ mod tests {
             current: Some(3),
         });
         assert!(superseded.is_fenced() && !superseded.is_recreated());
-        assert!(
-            superseded
-                .to_string()
-                .ends_with("superseded by Some(3) (403)")
-        );
+        assert!(superseded.to_string().ends_with("superseded by 3 (403)"));
+        let unknown = Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: None,
+        });
+        assert!(unknown.to_string().ends_with("superseded by unknown (403)"));
         let gone = Error::Gone(Gone::SnapshotSuperseded { offset: "7".into() });
         assert!(gone.is_gone() && !gone.is_fenced() && !gone.is_recreated());
         let local = Error::LocalWalWrite(10);
         assert!(!local.is_fenced() && !local.is_gone() && !local.is_recreated());
+        // A lost write-back (found on a read, or reported by an fsync) keeps every page of the
+        // local files out of a snapshot; a fence does not.
+        let lost_page = Error::LostWrite { offset: 56 };
+        let lost_sync = Error::FileSync {
+            file: "WAL",
+            code: 10,
+        };
+        assert!(lost_page.is_local_damage() && lost_sync.is_local_damage());
+        assert!(!lost_page.is_fenced() && !superseded.is_local_damage());
+        assert!(!local.is_local_damage());
+        let missing = Error::StreamMissing {
+            path: "/data/app.db".into(),
+            url: "http://h/b/s".into(),
+        }
+        .to_string();
+        assert!(missing.starts_with("http://h/b/s is missing") && missing.contains("holds data"));
+        assert!(missing.contains("attach a new file under another URL"));
         let lost = Error::LostData {
             url: "http://h/b/s".into(),
             offset: "9".into(),

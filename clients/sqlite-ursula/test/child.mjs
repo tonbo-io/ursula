@@ -43,6 +43,8 @@ say({
 	done: true,
 	attempts: stats.commits.map((c) => c.attempts),
 	poisoned: status.poisoned,
+	fenced: status.fenced,
+	reason: status.reason,
 	offset: status.offset,
 	epoch: status.epoch,
 	snapshots: stats.snapshots.length,

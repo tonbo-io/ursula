@@ -45,14 +45,19 @@ await new Promise((r) => setTimeout(r, 15_000));
 const snapshots = drainStats(file).snapshots;
 const s = status(file);
 db.close();
-const attaches: number[] = [];
+// Each attach's time, what it replayed (`log_bytes`: the whole log, or the tail after the snapshot
+// it installed) and the snapshot it installed (`"-1"`: none).
+const attaches: { ms: number; log_bytes: number; installed: string }[] = [];
 for (let i = 0; i < 3; i++) {
 	const fresh = freshFile();
 	const at = performance.now();
 	attach(fresh, url);
-	attaches.push(Math.round(performance.now() - at));
+	const ms = Math.round(performance.now() - at);
+	const { log_bytes, installed } = status(fresh);
+	attaches.push({ ms, log_bytes, installed });
 	rmSync(fresh, { force: true });
 }
+const attachMs = attaches.map((a) => a.ms);
 const latest = snapshots.at(-1);
 const summary = {
 	label,
@@ -63,7 +68,8 @@ const summary = {
 	snapshots: snapshots.length,
 	latest_snapshot: latest === undefined ? null : { body_bytes: latest.bytes, db_bytes: latest.raw, publish_ms: Math.round(latest.total_us / 1000) },
 	snapshot_offset: s.snapshot,
-	attach_ms: { first: attaches[0], best: Math.min(...attaches), all: attaches },
+	attach_ms: { first: attachMs[0], best: Math.min(...attachMs), all: attachMs },
+	replayed: attaches.map(({ log_bytes, installed }) => ({ log_bytes, installed })),
 };
 mkdirSync(join(outDir, label), { recursive: true });
 writeFileSync(join(outDir, label, "summary.json"), JSON.stringify(summary, null, 2));

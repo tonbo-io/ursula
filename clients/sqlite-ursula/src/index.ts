@@ -40,8 +40,12 @@ export function attach(file: string, streamUrl: string): StreamOffset {
 /**
  * Sets the bearer token every request of the extension carries from now on, process-wide (for an
  * endpoint behind `ursula gateway --auth-*`). `null` goes back to the file named by
- * `URSULA_VFS_TOKEN_FILE`, which is read again whenever it changes. A request whose token is
- * refused (401) is retried, with the token read again, within the retry budget.
+ * `URSULA_VFS_TOKEN_FILE`, which is read again whenever it changes and after a refused token (401).
+ *
+ * Call it with a fresh token before the current one expires. node:sqlite is synchronous, so a
+ * commit whose token is refused retries on the thread that would call `setToken`: it waits out the
+ * retry budget (`URSULA_VFS_RETRY_MS`, 30 s by default) and fails, and the file must be attached
+ * again. For tokens that expire on their own schedule, prefer the token file.
  */
 export function setToken(token: string | null): void {
 	loadUrsulaVfs().prepare("SELECT ursula_set_token(?)").get(token ?? "");
@@ -61,8 +65,9 @@ export interface AttachStatus {
 	readonly epoch: number;
 	/** Every later commit fails until the file is re-attached. */
 	readonly poisoned: boolean;
-	/** Poisoned because a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq`. */
+	/** Poisoned, and a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq` (the first failure or a later one). Never reset until the file is attached again. */
 	readonly fenced: boolean;
+	/** Why it is poisoned: the first failure, which a later one never replaces. */
 	readonly reason: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;

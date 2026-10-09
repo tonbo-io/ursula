@@ -1,5 +1,5 @@
 // Back-to-back large transactions (docs/architecture/sqlite-vfs.md §9): a 5 MB table, 2,000-row
-// updates (about 1.4 MB frames), no pause. Reports commit latency, snapshots taken, and the
+// updates (frames of about 1 MB), no pause. Reports commit latency, snapshots taken, and the
 // retained log (tail minus retention, from the stream's HEAD every 10 s; this tool reads the
 // server's offsets as numbers, which the VFS itself never does).
 //

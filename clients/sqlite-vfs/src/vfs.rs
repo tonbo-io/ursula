@@ -233,14 +233,12 @@ impl Db {
             (0, [0; 8])
         };
         if mx_frame < self.commit_frame_no {
-            // Already poisoned (the snapshot thread's fence fails the rest of the transaction's
-            // WAL writes): keep that reason.
-            if self.poisoned.is_none() {
-                self.poison(Error::NotPublished {
-                    mx_frame,
-                    frame: self.commit_frame_no,
-                });
-            }
+            // Already poisoned when the snapshot thread's fence failed the rest of the
+            // transaction's WAL writes: that reason stays (`set_poisoned`).
+            self.poison(Error::NotPublished {
+                mx_frame,
+                frame: self.commit_frame_no,
+            });
             return;
         }
         let wal = WalClaim {

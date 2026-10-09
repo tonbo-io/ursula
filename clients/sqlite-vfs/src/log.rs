@@ -8,6 +8,7 @@
 //! are quoted when they are empty or hold a space, `=`, `"` or a control character.
 
 use std::fmt::Display;
+use std::io::Write;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Level {
@@ -26,9 +27,11 @@ impl Level {
     }
 }
 
-/// Writes one event to stderr.
+/// Writes one event to stderr. A line that cannot be written (stderr closed: EPIPE) is dropped:
+/// this runs inside SQLite's callbacks, where a panic (`eprintln!`'s) would abort the host.
 pub(crate) fn emit(level: Level, event: &str, fields: &[(&str, &dyn Display)]) {
-    eprintln!("{}", line(level, event, fields));
+    let line = line(level, event, fields);
+    if let Err(_unwritable) = writeln!(std::io::stderr().lock(), "{line}") {}
 }
 
 fn line(level: Level, event: &str, fields: &[(&str, &dyn Display)]) -> String {
@@ -71,7 +74,7 @@ mod tests {
 
     #[test]
     fn values_are_quoted_only_when_needed() {
-        let reason = "fenced: epoch 2 superseded by Some(3) (403)";
+        let reason = "fenced: epoch 2 superseded by 3 (403)";
         assert_eq!(
             line(Level::Warn, "poisoned", &[
                 ("file", &"/data/app.db"),
@@ -79,7 +82,7 @@ mod tests {
                 ("reason", &reason)
             ]),
             "sqlite-ursula-vfs level=warn event=poisoned file=/data/app.db fenced=true \
-             reason=\"fenced: epoch 2 superseded by Some(3) (403)\""
+             reason=\"fenced: epoch 2 superseded by 3 (403)\""
         );
         assert_eq!(
             line(Level::Info, "x", &[("a", &""), ("b", &"q\"\\\nz")]),

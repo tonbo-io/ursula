@@ -82,31 +82,71 @@ impl Snapper {
     }
 }
 
+/// What one snapshot attempt did (`snapshot_once`).
+#[derive(Clone, Copy, Debug)]
+enum Outcome {
+    /// Published at the window's offset and read back.
+    Published,
+    /// A snapshot at or past the window's offset exists already (another owner's, or this file's
+    /// before a re-attach).
+    Covered,
+    /// Nothing to take: not due, the database poisoned, or the thread stopped.
+    Skipped,
+    /// The stream is another incarnation now: the owner is fenced, and nothing of it landed there.
+    Fenced,
+    /// A write-back to the local files may have been lost: the owner is poisoned, and nothing was
+    /// published.
+    Damaged,
+    /// Not possible right now (a reader pins WAL frames the checkpoint needs, or another
+    /// checkpoint kept it busy): try again shortly.
+    Busy,
+}
+
+/// The snapshot health `ursula_status` reports, after an attempt: a snapshot at its offset (one
+/// published, or one already there) ends a run of failures, an error extends it, and any other
+/// outcome leaves it as it was (nothing was published, nor did anything fail).
+fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>) {
+    match attempt {
+        Ok(Outcome::Published | Outcome::Covered) => {
+            d.snapshot_failures = 0;
+            d.snapshot_error = None;
+        }
+        Ok(Outcome::Skipped | Outcome::Fenced | Outcome::Damaged | Outcome::Busy) => {}
+        Err(e) => {
+            d.snapshot_failures = d.snapshot_failures.saturating_add(1);
+            d.snapshot_error = Some(e.to_string());
+        }
+    }
+}
+
 pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
     // A pinned or busy checkpoint clears up quickly; a failing server may not.
     let (mut busy, mut failing) = (Duration::from_millis(10), Duration::from_millis(100));
     while snapper.wait() {
-        let (backoff, cap) = match snapshot_once(db, snapper) {
-            Ok(true) => {
+        let attempt = snapshot_once(db, snapper);
+        let mut d = lock(db);
+        record_attempt(&mut d, &attempt);
+        let (path, url, failures) = (d.path.clone(), d.url.clone(), d.snapshot_failures);
+        drop(d);
+        let (backoff, cap) = match attempt {
+            Ok(Outcome::Busy) => (&mut busy, Duration::from_secs(1)),
+            Ok(
+                Outcome::Published
+                | Outcome::Covered
+                | Outcome::Skipped
+                | Outcome::Fenced
+                | Outcome::Damaged,
+            ) => {
                 (busy, failing) = (Duration::from_millis(10), Duration::from_millis(100));
-                let mut d = lock(db);
-                d.snapshot_failures = 0;
-                d.snapshot_error = None;
-                drop(d);
                 continue;
             }
-            Ok(false) => (&mut busy, Duration::from_secs(1)),
             Err(e) => {
-                let mut d = lock(db);
-                d.snapshot_failures = d.snapshot_failures.saturating_add(1);
                 log::emit(Level::Warn, "snapshot_failed", &[
-                    ("file", &d.path),
-                    ("stream", &d.url),
-                    ("failures", &d.snapshot_failures),
+                    ("file", &path),
+                    ("stream", &url),
+                    ("failures", &failures),
                     ("reason", &e),
                 ]);
-                d.snapshot_error = Some(e.to_string());
-                drop(d);
                 (&mut failing, Duration::from_secs(30))
             }
         };
@@ -120,8 +160,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
     }
 }
 
-/// One snapshot attempt (see the crate docs). `Ok(false)`: not possible right now (a reader pins
-/// WAL frames the checkpoint needs, or another checkpoint kept it busy), try again shortly.
+/// One snapshot attempt (see the crate docs), and what it did.
 ///
 /// The image is exactly the stream's state at `offset`. The window opens once every acknowledged
 /// commit is published locally (`!committed`); until then the next commit waits for it at its
@@ -133,7 +172,7 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
 /// frames into the db file (a reader at mark 0 blocks backfill, one at a later mark caps it) and no
 /// closing connection can checkpoint (that needs an EXCLUSIVE lock), so the pages copied are those
 /// of `offset`. Commits wait only for the checkpoint and the start of the read transaction.
-fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
+fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
     let stopped = || snapper.stopped();
     let started = Instant::now();
     let path = lock(db).path.clone();
@@ -149,7 +188,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
             if !d.snapshot_due() || d.poisoned.is_some() || stopped() {
                 d.window_wanted = false;
                 snapper.window_cv.notify_all();
-                return Ok(true);
+                return Ok(Outcome::Skipped);
             }
             // Not while a commit is acknowledged but unpublished, nor while another connection
             // (typically the writer's auto-checkpoint, right after its commit) holds the
@@ -187,7 +226,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
                 tries = tries.saturating_add(1);
                 std::thread::sleep(Duration::from_millis(2));
             }
-            _ => return Ok(false),
+            _ => return Ok(Outcome::Busy),
         }
     }
     conn.query(c"BEGIN")?;
@@ -195,8 +234,28 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     drop(window);
     let copy_started = Instant::now();
     let image = conn.read_pages(pages)?;
-    drop(conn); // ends the read transaction
+    conn.query(c"COMMIT")?; // ends the read transaction
     let copy = copy_started.elapsed();
+    // The checkpoints above read WAL pages, and `read_pages` db pages, outside the VFS's check of
+    // pages read back (`overlay_read`): a page whose write-back failed reads back older bytes, and
+    // once published, the next snapshot's retention move makes the damage permanent. The commit
+    // path never fsyncs the WAL, and the db file only before the WAL restarts, so such an error is
+    // usually unreported yet: fsyncs after the reads report it (on Linux), unless the owner found
+    // it first (a lost page read back, a failed fsync of the db file) and is poisoned (`damaged`,
+    // kept even when a fence poisoned it before).
+    let synced = conn.sync_files();
+    drop(conn);
+    match synced {
+        Err(e) if e.is_local_damage() => {
+            lock(db).set_poisoned(e, Some(&format!("snapshot at {offset} not published")));
+            return Ok(Outcome::Damaged);
+        }
+        Err(e) => return Err(e),
+        Ok(()) => {}
+    }
+    if lock(db).damaged() {
+        return Ok(Outcome::Damaged);
+    }
     let body = snapshot::encode(&offset, epoch, &image).map_err(|source| Error::Snapshot {
         offset: offset.clone(),
         source,
@@ -208,15 +267,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     let fence = |what: String, e: Error| {
         // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
-        let mut d = lock(db);
-        log::emit(Level::Warn, "poisoned", &[
-            ("file", &d.path),
-            ("stream", &d.url),
-            ("fenced", &e.is_fenced()),
-            ("during", &what),
-            ("reason", &e),
-        ]);
-        d.poisoned = Some(e);
+        lock(db).set_poisoned(e, Some(&what));
     };
     match put_idempotent(
         &format!("{url}/snapshot/{offset}"),
@@ -230,7 +281,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
                 format!("snapshot at {offset} not published"),
                 recreated(&url, &incarnation),
             );
-            return Ok(true);
+            return Ok(Outcome::Fenced);
         }
         (409 | 410, _) => {
             // A snapshot at or past `offset` exists (another owner's, or this file's before a
@@ -242,7 +293,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
                     format!("snapshot at {offset} not published"),
                     recreated(&url, &incarnation),
                 );
-                return Ok(true);
+                return Ok(Outcome::Fenced);
             }
             let newer = head.snapshot;
             let mut d = lock(db);
@@ -251,7 +302,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
                 d.snapshot_published_at = Some(Instant::now());
             }
             d.log = d.log.saturating_sub(log);
-            return Ok(true);
+            return Ok(Outcome::Covered);
         }
         (status, mut r) => {
             return Err(Error::Status {
@@ -266,7 +317,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     let mut verified = false;
     for i in 1..=20 {
         if stopped() {
-            return Ok(true);
+            return Ok(Outcome::Skipped);
         }
         match get_snapshot(&url, &incarnation, &offset, &stopped) {
             Ok(read) if read.as_deref() == Some(&body[..]) => {
@@ -276,7 +327,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
             Ok(_) => {}
             Err(e) if e.is_recreated() => {
                 fence(format!("snapshot at {offset} not read back"), e);
-                return Ok(true);
+                return Ok(Outcome::Fenced);
             }
             Err(e) => return Err(e),
         }
@@ -318,7 +369,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
                     format!("retention not moved to {previous}"),
                     recreated(&url, &incarnation),
                 );
-                return Ok(true);
+                return Ok(Outcome::Fenced);
             }
             (200..=299, r) => {
                 let effective = header_offset(&r, "stream-retained-offset").unwrap_or(previous);
@@ -339,5 +390,46 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
             }
         }
     }
-    Ok(true)
+    Ok(Outcome::Published)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Outcome;
+    use super::record_attempt;
+    use crate::db::Db;
+    use crate::error::Error;
+
+    // Only a snapshot at the offset (published, or one already there) ends a run of failures: an
+    // attempt that published nothing (skipped, fenced, damaged local files, busy) leaves the run
+    // and its last error as they were.
+    #[test]
+    fn only_a_snapshot_at_the_offset_clears_the_failures() {
+        let mut d = Db::for_tests();
+        let failed = || Err(Error::SnapshotNotReadBack { offset: "7".into() });
+        record_attempt(&mut d, &failed());
+        record_attempt(&mut d, &failed());
+        assert_eq!(d.snapshot_failures, 2);
+        for outcome in [
+            Outcome::Skipped,
+            Outcome::Fenced,
+            Outcome::Damaged,
+            Outcome::Busy,
+        ] {
+            record_attempt(&mut d, &Ok(outcome));
+            assert_eq!(d.snapshot_failures, 2, "{outcome:?}");
+            assert!(d.snapshot_error.is_some(), "{outcome:?}");
+        }
+        record_attempt(&mut d, &Ok(Outcome::Covered));
+        assert_eq!(
+            (d.snapshot_failures, d.snapshot_error.as_deref()),
+            (0, None)
+        );
+        record_attempt(&mut d, &failed());
+        record_attempt(&mut d, &Ok(Outcome::Published));
+        assert_eq!(
+            (d.snapshot_failures, d.snapshot_error.as_deref()),
+            (0, None)
+        );
+    }
 }

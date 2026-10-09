@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::c_int;
+use std::fmt::Display;
 use std::fs::{self};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -51,8 +52,8 @@ pub(crate) struct Db {
     pub(crate) offset: String,
     /// Frame bytes since the latest snapshot, counted locally (see `snapshot_due`).
     pub(crate) log: u64,
-    /// Why the database is poisoned (re-attach to recover); [`Db::fenced`] tells the fenced ones.
-    pub(crate) poisoned: Option<Error>,
+    /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
+    pub(crate) poisoned: Option<Poisoned>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
@@ -109,6 +110,18 @@ pub(crate) struct Db {
     pub(crate) snapshot_error: Option<String>,
 }
 
+/// Why an attached database is poisoned: the first reason, and what any reason so far showed.
+pub(crate) struct Poisoned {
+    /// The first reason, which a later one never replaces.
+    pub(crate) first: Error,
+    /// A reason so far was a fence ([`Error::is_fenced`]), the first or a later one: once set, it
+    /// stays.
+    pub(crate) fenced: bool,
+    /// A reason so far says the local files may hold other pages than this process wrote
+    /// ([`Error::is_local_damage`]): once set, it stays.
+    pub(crate) damaged: bool,
+}
+
 pub(crate) struct SnapshotStat {
     pub(crate) offset: String,
     pub(crate) bytes: usize,
@@ -118,12 +131,19 @@ pub(crate) struct SnapshotStat {
 }
 
 impl Db {
-    /// The log since the latest snapshot outgrew the database (and the configured minimum). The log
-    /// is counted in frame bytes, not taken from offsets (opaque): what attach replayed after the
-    /// snapshot it started from (plus, from trusted local files, the sidecar's count), and every
-    /// frame acknowledged since; a snapshot taken subtracts what it covers.
+    /// The log since the latest snapshot outgrew the database (and the configured minimum,
+    /// `snapshot_due_bytes`). The log is counted in frame bytes, not taken from offsets (opaque):
+    /// what attach replayed after the snapshot it started from (plus, from trusted local files, the
+    /// sidecar's count), and every frame acknowledged since; a snapshot taken subtracts what it
+    /// covers.
     pub(crate) fn snapshot_due(&self) -> bool {
-        self.log > db_len(self.pages).max(snapshot_min_bytes())
+        self.log > self.snapshot_due_bytes()
+    }
+
+    /// The log size past which a snapshot is due: the database's size, or the configured minimum
+    /// (`URSULA_VFS_SNAPSHOT_MIN_BYTES`) when larger.
+    pub(crate) fn snapshot_due_bytes(&self) -> u64 {
+        db_len(self.pages).max(snapshot_min_bytes())
     }
 
     pub(crate) fn overlay_end(&self) -> i64 {
@@ -135,22 +155,59 @@ impl Db {
     }
 
     /// Another owner, a writer outside the protocol, or another incarnation of the stream holds
-    /// the stream (the poison's class, [`Error::is_fenced`]).
+    /// the stream: a fence was observed since the database was poisoned (`Poisoned::fenced`).
     pub(crate) fn fenced(&self) -> bool {
-        self.poisoned.as_ref().is_some_and(Error::is_fenced)
+        self.poisoned.as_ref().is_some_and(|p| p.fenced)
     }
 
+    /// The local files may hold other pages than this process wrote (`Poisoned::damaged`): nothing
+    /// read from them may reach the stream.
+    pub(crate) fn damaged(&self) -> bool {
+        self.poisoned.as_ref().is_some_and(|p| p.damaged)
+    }
+
+    /// Poisons the database (`set_poisoned`) and drops the write transaction's overlay: the write
+    /// that fails with the code returned rolls the transaction back.
     pub(crate) fn poison(&mut self, why: Error) -> c_int {
-        log::emit(Level::Warn, "poisoned", &[
-            ("file", &self.path),
-            ("stream", &self.url),
-            ("fenced", &why.is_fenced()),
-            ("reason", &why),
-        ]);
-        self.poisoned = Some(why);
+        self.set_poisoned(why, None);
         self.overlay.clear();
         self.committed = false;
         ffi::SQLITE_IOERR_WRITE
+    }
+
+    /// Records why the database is poisoned (`during`: what failed, for the log). The first reason
+    /// stays: a later one follows from it (the rest of a fenced transaction's writes, a lost page
+    /// read again) or changes nothing (every commit is refused already). But a fence and a lost
+    /// write are kept whenever they come (`Poisoned`), so [`Db::fenced`] and [`Db::damaged`] never
+    /// flip back. Logged when it poisons the database, and when it fences a poisoned one.
+    pub(crate) fn set_poisoned(&mut self, why: Error, during: Option<&str>) {
+        let fenced = why.is_fenced();
+        let damaged = why.is_local_damage();
+        if self.poisoned.as_ref().is_none_or(|p| fenced && !p.fenced) {
+            let mut fields: Vec<(&str, &dyn Display)> = vec![
+                ("file", &self.path),
+                ("stream", &self.url),
+                ("fenced", &fenced),
+            ];
+            if let Some(during) = &during {
+                fields.push(("during", during));
+            }
+            fields.push(("reason", &why));
+            log::emit(Level::Warn, "poisoned", &fields);
+        }
+        match &mut self.poisoned {
+            Some(p) => {
+                p.fenced |= fenced;
+                p.damaged |= damaged;
+            }
+            None => {
+                self.poisoned = Some(Poisoned {
+                    first: why,
+                    fenced,
+                    damaged,
+                });
+            }
+        }
     }
 
     /// A local operation of an acknowledged transaction (the rest of its WAL writes, -shm growth)
@@ -250,4 +307,98 @@ pub(crate) enum Refusal {
 
 pub(crate) fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+impl Db {
+    /// An attachment of nothing: the state alone, for tests of its bookkeeping.
+    pub(crate) fn for_tests() -> Db {
+        Db {
+            url: "http://h/b/s".into(),
+            incarnation: "i1".into(),
+            producer: "sqlite-ursula-vfs/i1".into(),
+            sidecar: "/data/app.db-ursula".into(),
+            stamp: String::new(),
+            path: "/data/app.db".into(),
+            epoch: 2,
+            seq: 0,
+            offset: crate::client::START.into(),
+            log: 0,
+            poisoned: None,
+            overlay: BTreeMap::new(),
+            wal_written: BTreeMap::new(),
+            committed: false,
+            commit_frame_no: 0,
+            wal_open: 0,
+            exclusive: 0,
+            writer: 0,
+            acked: 0,
+            fault_fired: false,
+            stats: Vec::new(),
+            checkpoint_started: None,
+            checkpoints: Vec::new(),
+            pages: 0,
+            snapshot: crate::client::START.into(),
+            retained: crate::client::START.into(),
+            snapper: Arc::new(Snapper::default()),
+            window: false,
+            window_wanted: false,
+            snapshot_stats: Vec::new(),
+            attached_from: crate::client::START.into(),
+            installed: crate::client::START.into(),
+            attach_ms: 0,
+            append_retries: 0,
+            snapshot_published_at: None,
+            snapshot_failures: 0,
+            snapshot_error: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Db;
+    use crate::error::Error;
+    use crate::error::Fence;
+
+    // The first poison's reason stays, whatever fails after it (the rest of the transaction, a
+    // lost page read again, the snapshot thread's own fence). A fence and a lost write stick
+    // whenever they come: `fenced` and `damaged` never flip back, in either order.
+    #[test]
+    fn a_later_poison_does_not_replace_a_fence() {
+        let mut d = Db::for_tests();
+        d.poison(Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: Some(3),
+        }));
+        assert!(d.fenced() && !d.damaged());
+        d.poison(Error::LostWrite { offset: 56 });
+        d.poison(Error::DbWriteOutsideCheckpoint);
+        d.set_poisoned(
+            Error::NotPublished {
+                mx_frame: 1,
+                frame: 2,
+            },
+            Some("snapshot at 7 not published"),
+        );
+        assert!(d.fenced() && d.damaged());
+        assert!(matches!(
+            d.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::Fenced(Fence::Superseded {
+                epoch: 2,
+                current: Some(3)
+            }))
+        ));
+        // A fence after another reason: `fenced` too, and the first reason stays.
+        let mut d = Db::for_tests();
+        d.poison(Error::LostWrite { offset: 56 });
+        assert!(!d.fenced() && d.damaged());
+        d.poison(Error::Fenced(Fence::Reclaim));
+        d.poison(Error::ProducerExpiredAgain);
+        assert!(d.fenced() && d.damaged());
+        assert!(matches!(
+            d.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::LostWrite { offset: 56 })
+        ));
+    }
 }
