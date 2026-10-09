@@ -64,10 +64,10 @@
 //!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained","local","installed",
 //!   "attach_ms","commits","append_retries","log_bytes","snapshot_due_bytes","snapshot_age_ms",
 //!   "snapshot_failures","snapshot_error"}` (offsets as strings; `reason`: the first poison's,
-//!   which a later one never replaces, so `fenced` never changes once set; `local`: the stream
-//!   offset of the local state attach started from, `-1` when it rebuilt the file; `installed`: the
-//!   offset of the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none;
-//!   the rest are the owner's health, see `status`);
+//!   which a later one never replaces; `fenced`: a fence was seen since, first or later, never
+//!   reset; `local`: the stream offset of the local state attach started from, `-1` when it rebuilt
+//!   the file; `installed`: the offset of the snapshot attach installed, `-1` for none; `snapshot`,
+//!   `retained`: `-1` for none; the rest are the owner's health, see `status`);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged

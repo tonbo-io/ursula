@@ -35,7 +35,7 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
             "reason",
             db.poisoned
                 .as_ref()
-                .map_or_else(null, |e| json_str(&e.to_string())),
+                .map_or_else(null, |p| json_str(&p.first.to_string())),
         ),
         ("snapshot", json_str(&db.snapshot)),
         ("retained", json_str(&db.retained)),

@@ -202,7 +202,8 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     // once published, the next snapshot's retention move makes the damage permanent. The commit
     // path never fsyncs the WAL, and the db file only before the WAL restarts, so such an error is
     // usually unreported yet: fsyncs after the reads report it (on Linux), unless the owner found
-    // it first (a lost page read back, a failed fsync of the db file) and is poisoned.
+    // it first (a lost page read back, a failed fsync of the db file) and is poisoned (`damaged`,
+    // kept even when a fence poisoned it before).
     let synced = conn.sync_files();
     drop(conn);
     match synced {
@@ -213,11 +214,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
         Err(e) => return Err(e),
         Ok(()) => {}
     }
-    if lock(db)
-        .poisoned
-        .as_ref()
-        .is_some_and(Error::is_local_damage)
-    {
+    if lock(db).damaged() {
         return Ok(true);
     }
     let body = snapshot::encode(&offset, epoch, &image).map_err(|source| Error::Snapshot {

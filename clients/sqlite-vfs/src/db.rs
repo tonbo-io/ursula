@@ -52,9 +52,8 @@ pub(crate) struct Db {
     pub(crate) offset: String,
     /// Frame bytes since the latest snapshot, counted locally (see `snapshot_due`).
     pub(crate) log: u64,
-    /// Why the database is poisoned (re-attach to recover): the first reason, which later ones
-    /// never replace (see `set_poisoned`); [`Db::fenced`] tells the fenced ones.
-    pub(crate) poisoned: Option<Error>,
+    /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
+    pub(crate) poisoned: Option<Poisoned>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
@@ -111,6 +110,18 @@ pub(crate) struct Db {
     pub(crate) snapshot_error: Option<String>,
 }
 
+/// Why an attached database is poisoned: the first reason, and what any reason so far showed.
+pub(crate) struct Poisoned {
+    /// The first reason, which a later one never replaces.
+    pub(crate) first: Error,
+    /// A reason so far was a fence ([`Error::is_fenced`]), the first or a later one: once set, it
+    /// stays.
+    pub(crate) fenced: bool,
+    /// A reason so far says the local files may hold other pages than this process wrote
+    /// ([`Error::is_local_damage`]): once set, it stays.
+    pub(crate) damaged: bool,
+}
+
 pub(crate) struct SnapshotStat {
     pub(crate) offset: String,
     pub(crate) bytes: usize,
@@ -137,9 +148,15 @@ impl Db {
     }
 
     /// Another owner, a writer outside the protocol, or another incarnation of the stream holds
-    /// the stream (the poison's class, [`Error::is_fenced`]).
+    /// the stream: a fence was observed since the database was poisoned (`Poisoned::fenced`).
     pub(crate) fn fenced(&self) -> bool {
-        self.poisoned.as_ref().is_some_and(Error::is_fenced)
+        self.poisoned.as_ref().is_some_and(|p| p.fenced)
+    }
+
+    /// The local files may hold other pages than this process wrote (`Poisoned::damaged`): nothing
+    /// read from them may reach the stream.
+    pub(crate) fn damaged(&self) -> bool {
+        self.poisoned.as_ref().is_some_and(|p| p.damaged)
     }
 
     /// Poisons the database (`set_poisoned`) and drops the write transaction's overlay: the write
@@ -151,26 +168,39 @@ impl Db {
         ffi::SQLITE_IOERR_WRITE
     }
 
-    /// Records why the database is poisoned (`during`: what failed, for the log), unless it already
-    /// is. The first reason stays: a later one follows from it (the rest of a fenced transaction's
-    /// writes, a lost page read again) or changes nothing (every commit is refused already), so
-    /// [`Db::fenced`] never changes once the database is poisoned.
+    /// Records why the database is poisoned (`during`: what failed, for the log). The first reason
+    /// stays: a later one follows from it (the rest of a fenced transaction's writes, a lost page
+    /// read again) or changes nothing (every commit is refused already). But a fence and a lost
+    /// write are kept whenever they come (`Poisoned`), so [`Db::fenced`] and [`Db::damaged`] never
+    /// flip back. Logged when it poisons the database, and when it fences a poisoned one.
     pub(crate) fn set_poisoned(&mut self, why: Error, during: Option<&str>) {
-        if self.poisoned.is_some() {
-            return;
-        }
         let fenced = why.is_fenced();
-        let mut fields: Vec<(&str, &dyn Display)> = vec![
-            ("file", &self.path),
-            ("stream", &self.url),
-            ("fenced", &fenced),
-        ];
-        if let Some(during) = &during {
-            fields.push(("during", during));
+        let damaged = why.is_local_damage();
+        if self.poisoned.as_ref().is_none_or(|p| fenced && !p.fenced) {
+            let mut fields: Vec<(&str, &dyn Display)> = vec![
+                ("file", &self.path),
+                ("stream", &self.url),
+                ("fenced", &fenced),
+            ];
+            if let Some(during) = &during {
+                fields.push(("during", during));
+            }
+            fields.push(("reason", &why));
+            log::emit(Level::Warn, "poisoned", &fields);
         }
-        fields.push(("reason", &why));
-        log::emit(Level::Warn, "poisoned", &fields);
-        self.poisoned = Some(why);
+        match &mut self.poisoned {
+            Some(p) => {
+                p.fenced |= fenced;
+                p.damaged |= damaged;
+            }
+            None => {
+                self.poisoned = Some(Poisoned {
+                    first: why,
+                    fenced,
+                    damaged,
+                });
+            }
+        }
     }
 
     /// A local operation of an acknowledged transaction (the rest of its WAL writes, -shm growth)
@@ -325,8 +355,9 @@ mod tests {
         }
     }
 
-    // The first poison wins: a fenced owner stays fenced whatever fails after the fence (the rest
-    // of its transaction, a lost page read again, the snapshot thread's own fence).
+    // The first poison's reason stays, whatever fails after it (the rest of the transaction, a
+    // lost page read again, the snapshot thread's own fence). A fence and a lost write stick
+    // whenever they come: `fenced` and `damaged` never flip back, in either order.
     #[test]
     fn a_later_poison_does_not_replace_a_fence() {
         let mut d = db();
@@ -334,7 +365,7 @@ mod tests {
             epoch: 2,
             current: Some(3),
         }));
-        assert!(d.fenced());
+        assert!(d.fenced() && !d.damaged());
         d.poison(Error::LostWrite { offset: 56 });
         d.poison(Error::DbWriteOutsideCheckpoint);
         d.set_poisoned(
@@ -344,19 +375,24 @@ mod tests {
             },
             Some("snapshot at 7 not published"),
         );
-        assert!(d.fenced());
+        assert!(d.fenced() && d.damaged());
         assert!(matches!(
-            d.poisoned,
+            d.poisoned.as_ref().map(|p| &p.first),
             Some(Error::Fenced(Fence::Superseded {
                 epoch: 2,
                 current: Some(3)
             }))
         ));
-        // And a first reason that is no fence stays too.
+        // A fence after another reason: `fenced` too, and the first reason stays.
         let mut d = db();
         d.poison(Error::LostWrite { offset: 56 });
+        assert!(!d.fenced() && d.damaged());
         d.poison(Error::Fenced(Fence::Reclaim));
-        assert!(!d.fenced());
-        assert!(matches!(d.poisoned, Some(Error::LostWrite { offset: 56 })));
+        d.poison(Error::ProducerExpiredAgain);
+        assert!(d.fenced() && d.damaged());
+        assert!(matches!(
+            d.poisoned.as_ref().map(|p| &p.first),
+            Some(Error::LostWrite { offset: 56 })
+        ));
     }
 }

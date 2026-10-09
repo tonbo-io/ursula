@@ -65,9 +65,9 @@ export interface AttachStatus {
 	readonly epoch: number;
 	/** Every later commit fails until the file is re-attached. */
 	readonly poisoned: boolean;
-	/** Poisoned because a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq`. */
+	/** Poisoned, and a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq` (the first failure or a later one). Never reset until the file is attached again. */
 	readonly fenced: boolean;
-	/** Why it is poisoned: the first failure, which a later one never replaces (so `fenced` never changes once set). */
+	/** Why it is poisoned: the first failure, which a later one never replaces. */
 	readonly reason: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;
