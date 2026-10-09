@@ -45,9 +45,14 @@ jobs:
   state-growth:
     name: State growth ratchet
     if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.suite == 'pr' || inputs.write_ratchet))
-    runs-on: depot-ubuntu-24.04-8
+    # Fork PRs stay on Depot: RunsOn runners run inside our AWS account.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'depot-ubuntu-24.04-8' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     timeout-minutes: 45
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -97,9 +102,13 @@ jobs:
   nightly:
     name: Bounded state nightly
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly' && !inputs.write_ratchet)
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'depot-ubuntu-24.04-8' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     timeout-minutes: 240
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 

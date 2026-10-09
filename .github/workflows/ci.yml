@@ -52,8 +52,13 @@ jobs:
 
   rust-lint:
     name: Rust lint
-    runs-on: depot-ubuntu-24.04-8
+    # Fork PRs stay on Depot: RunsOn runners run inside our AWS account.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'depot-ubuntu-24.04-8' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -69,15 +74,23 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   rust-test:
-    name: Rust tests (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    name: Rust tests (${{ matrix.arch }})
+    runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.depot || format(matrix.runs-on, github.run_id) }}
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - depot-ubuntu-24.04-8
-          - depot-ubuntu-24.04-arm-8
+        include:
+          - arch: x64
+            depot: depot-ubuntu-24.04-8
+            runs-on: runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
+          - arch: arm64
+            depot: depot-ubuntu-24.04-arm-8
+            runs-on: runs-on={0}/cpu=8/ram=32/family=m8g+m7g/image=ubuntu24-full-arm64/extras=s3-cache
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -100,8 +113,12 @@ jobs:
 
   deterministic-simulation:
     name: Deterministic simulation smoke
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'depot-ubuntu-24.04-8' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 
