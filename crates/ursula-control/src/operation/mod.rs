@@ -7,7 +7,21 @@
 //! - `actions`: durable action ownership and recovery.
 //! - `process`: process claims and replica admission state.
 //! - `evidence`: committed-prefix and all-survivor checks.
-//! - `placement`: begin, retire and complete transitions.
+//! - `placement`: begin, retire, complete and abort transitions.
+//!
+//! Recovery boundary: an operation is reversible only while it is
+//! `Preparing`, that is before any membership transition (`AddLearner`,
+//! `ChangeVoters`, `RetireReplica`) is dispatched. `Abort` then discards the
+//! intent and any pending action, because nothing it leaves behind can change
+//! membership. Once a membership transition is dispatched (`Reconfiguring`) or
+//! the source retires (`Retired`), `Abort` is refused with
+//! `OperationError::Irreversible` and recovery reconciles forward. This model
+//! has no reverse membership transition. A node whose replica completion
+//! depends on, and that claims a new process instead of restarting with its
+//! pinned one, is recorded in `MaintenanceOperation::blocked`. A blocked
+//! operation dispatches nothing new and cannot retire or complete. Before the
+//! point of no return it can be aborted. After it, it stays blocked until a
+//! later model can rebuild the lost participant within the operation.
 
 mod actions;
 mod command;
@@ -28,6 +42,7 @@ pub use model::ActionOutcome;
 pub use model::MaintenanceOperation;
 pub use model::MembershipAction;
 pub use model::OperationAction;
+pub use model::OperationBlock;
 pub use model::OperationKind;
 pub use model::OperationPhase;
 pub use model::OperationState;
@@ -114,6 +129,7 @@ impl OperationState {
             OperationCommand::Observe { token, evidence } => self.observe(&token, evidence, now_ms),
             OperationCommand::RetireSource { token } => self.retire(&token, now_ms),
             OperationCommand::Complete { token } => self.complete(&token, now_ms, placements),
+            OperationCommand::Abort { token } => self.abort(&token),
         }
     }
 

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
+use super::command::OperationError;
 use crate::NodeId;
 use crate::identity::ProcessIncarnation;
 use crate::identity::ReplicaIdentity;
@@ -88,10 +89,39 @@ pub struct OperationToken {
     pub executor: ProcessIncarnation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where an operation stands relative to its point of no return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationPhase {
+    /// No membership transition has been dispatched, so `Abort` can discard
+    /// the intent and leave `previous` accurate.
     Preparing,
+    /// The membership transition with sequence `since` was dispatched. The
+    /// data plane may no longer match `previous`, so recovery reconciles
+    /// forward.
+    Reconfiguring { since: ActionSequence },
+    /// The source process and replica are retired. Recovery reconciles forward.
     Retired,
+}
+
+impl OperationPhase {
+    /// Replica preparation and voter changes run before the source retires.
+    pub fn before_retirement(self) -> bool {
+        !matches!(self, Self::Retired)
+    }
+}
+
+/// Why an operation cannot progress until an operator or a later executor
+/// acts. Recorded durably, so it stays observable after the attempt that
+/// revealed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationBlock {
+    /// A node whose replica completion depends on claimed a new process
+    /// instead of restarting with its pinned one, so its durable replica is
+    /// presumed lost. Its evidence can no longer satisfy this operation.
+    ParticipantReplaced {
+        pinned: ProcessIdentity,
+        claimed: ProcessIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +158,36 @@ pub struct MaintenanceOperation {
     pub prefix_floor: BTreeMap<RaftGroupId, u64>,
     pub pending_action: Option<PendingAction>,
     pub last_action_sequence: ActionSequence,
+    /// Nodes that block progress, with the reason.
+    pub blocked: BTreeMap<NodeId, OperationBlock>,
+}
+
+impl MaintenanceOperation {
+    /// Nodes whose current replicas completion depends on. A rebuild source is
+    /// excluded because replacing its replica is the operation itself.
+    pub fn required_replicas(&self) -> BTreeSet<NodeId> {
+        let rebuilt = match self.kind {
+            OperationKind::RebuildReplica { node_id } => Some(node_id),
+            OperationKind::MoveReplicas { .. } | OperationKind::DecommissionNode { .. } => None,
+        };
+        self.desired
+            .values()
+            .flatten()
+            .copied()
+            .filter(|node_id| Some(*node_id) != rebuilt)
+            .collect()
+    }
+
+    /// The first recorded block, as a typed rejection.
+    pub(super) fn ensure_unblocked(&self) -> Result<(), OperationError> {
+        match self.blocked.iter().next() {
+            Some((node_id, block)) => Err(OperationError::Blocked {
+                node_id: *node_id,
+                block: block.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +222,17 @@ pub enum MembershipAction {
         node_id: NodeId,
         identity: ReplicaIdentity,
     },
+}
+
+impl MembershipAction {
+    /// Whether a dispatched effect may change the group's Raft membership.
+    /// Dispatching one is the operation's point of no return.
+    pub fn changes_membership(&self) -> bool {
+        match self {
+            Self::AddLearner { .. } | Self::ChangeVoters | Self::RetireReplica => true,
+            Self::PrepareReplica | Self::InstallReplicaIdentity { .. } => false,
+        }
+    }
 }
 
 /// A dispatched effect stays unresolved across takeover and participant restart.

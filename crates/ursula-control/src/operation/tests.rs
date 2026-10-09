@@ -8,6 +8,14 @@ fn identity(epoch: u64, node: u64) -> ProcessIdentity {
     }
 }
 
+/// The durable replica `setup` registers for `node`.
+fn replica(node: u64) -> ReplicaIdentity {
+    ReplicaIdentity {
+        generation: 1,
+        incarnation: ProcessIncarnation::from_bits(u128::from(node)),
+    }
+}
+
 fn setup() -> (
     OperationState,
     BTreeSet<NodeId>,
@@ -18,6 +26,15 @@ fn setup() -> (
         processes: nodes
             .iter()
             .map(|id| (*id, ProcessState::Active(identity(1, *id))))
+            .collect(),
+        replicas: nodes
+            .iter()
+            .map(|id| {
+                (*id, ReplicaState::Active {
+                    identity: replica(*id),
+                    installed_groups: BTreeMap::new(),
+                })
+            })
             .collect(),
         ..OperationState::default()
     };
@@ -276,9 +293,9 @@ fn rebuild_retirement_requires_survivors_and_fences_the_old_process() {
     assert!(matches!(
         state.apply(
             OperationCommand::ClaimProcess {
-                node_id: 2,
+                node_id: 4,
                 expected_epoch: 1,
-                incarnation: ProcessIncarnation::from_bits(22)
+                incarnation: ProcessIncarnation::from_bits(44)
             },
             11,
             &nodes,
@@ -833,10 +850,7 @@ fn drained_action_reassigns_without_retiring_the_healthy_process() {
 #[test]
 fn participant_restart_does_not_prove_an_unknown_action_was_drained() {
     let (mut state, nodes, mut placements) = setup();
-    let replica = ReplicaIdentity {
-        generation: 1,
-        incarnation: ProcessIncarnation::from_bits(22),
-    };
+    let replica = replica(2);
     state
         .apply(
             OperationCommand::RegisterReplica {
@@ -908,7 +922,7 @@ proptest::proptest! {
         let token = begin(&mut state, &nodes, &mut placements, OperationKind::RebuildReplica { node_id: 1 }, &[1, 2, 3]);
         for action in actions {
             let command = match action {
-                0 => OperationCommand::ClaimProcess { node_id: 2, expected_epoch: 1, incarnation: ProcessIncarnation::from_bits(100) },
+                0 => OperationCommand::ClaimProcess { node_id: 4, expected_epoch: 1, incarnation: ProcessIncarnation::from_bits(100) },
                 1 => OperationCommand::RetireSource { token: token.clone() },
                 2 => OperationCommand::Complete { token: token.clone() },
                 3 => OperationCommand::RegisterReplica { node_id: 1, process: identity(1, 1), identity: ReplicaIdentity { generation: 2, incarnation: ProcessIncarnation::from_bits(100) } },
@@ -957,10 +971,7 @@ fn dispatch_pending(
 #[test]
 fn prepared_action_cannot_dispatch_after_its_process_restarts() {
     let (mut state, nodes, mut placements) = setup();
-    let replica = ReplicaIdentity {
-        generation: 1,
-        incarnation: ProcessIncarnation::from_bits(22),
-    };
+    let replica = replica(2);
     state
         .apply(
             OperationCommand::RegisterReplica {
@@ -1230,4 +1241,351 @@ fn reassignment_applies_the_prepare_policy_to_the_new_leader() {
         Err(OperationError::StaleExecutor)
     );
     assert_eq!(state, before);
+}
+
+fn move_one_to_four(
+    state: &mut OperationState,
+    nodes: &BTreeSet<NodeId>,
+    placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
+) -> OperationToken {
+    begin(
+        state,
+        nodes,
+        placements,
+        OperationKind::MoveReplicas {
+            source: 1,
+            target: 4,
+            groups: BTreeSet::from([RaftGroupId(0)]),
+        },
+        &[1, 2, 3, 4],
+    )
+}
+
+fn prepare(
+    state: &mut OperationState,
+    nodes: &BTreeSet<NodeId>,
+    placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
+    token: &OperationToken,
+    action: MembershipAction,
+) -> OperationAction {
+    let OperationOutcome::ActionPrepared(receipt) = state
+        .apply(
+            OperationCommand::PrepareAction {
+                token: token.clone(),
+                group: RaftGroupId(0),
+                leader: 2,
+                action,
+            },
+            10,
+            nodes,
+            placements,
+        )
+        .unwrap()
+    else {
+        panic!("action receipt");
+    };
+    receipt
+}
+
+#[test]
+fn begin_requires_an_active_replica_on_every_joining_node() {
+    let (mut state, nodes, mut placements) = setup();
+    state.replicas.remove(&4);
+    let before = state.clone();
+    let kinds = [
+        OperationKind::MoveReplicas {
+            source: 1,
+            target: 4,
+            groups: BTreeSet::from([RaftGroupId(0)]),
+        },
+        OperationKind::DecommissionNode {
+            node_id: 1,
+            replacements: BTreeMap::from([(RaftGroupId(0), 4)]),
+        },
+    ];
+    for kind in kinds {
+        assert_eq!(
+            state.apply(
+                OperationCommand::Begin {
+                    kind,
+                    executor: ProcessIncarnation::from_bits(99),
+                    participants: [1, 2, 3, 4].map(|id| (id, identity(1, id))).into(),
+                    meta_voters: nodes.clone(),
+                },
+                10,
+                &nodes,
+                &mut placements,
+            ),
+            Err(OperationError::InactiveReplica { node_id: 4 })
+        );
+        assert_eq!(state, before);
+    }
+    state.replicas.insert(1, ReplicaState::Retired(replica(1)));
+    let before = state.clone();
+    assert_eq!(
+        state.apply(
+            OperationCommand::Begin {
+                kind: OperationKind::RebuildReplica { node_id: 1 },
+                executor: ProcessIncarnation::from_bits(99),
+                participants: [1, 2, 3].map(|id| (id, identity(1, id))).into(),
+                meta_voters: nodes.clone(),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        ),
+        Err(OperationError::InactiveReplica { node_id: 1 })
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn abort_discards_only_work_that_cannot_change_membership() {
+    let (mut state, nodes, mut placements) = setup();
+    let before = (state.processes.clone(), placements.clone());
+    let token = move_one_to_four(&mut state, &nodes, &mut placements);
+    // A dispatched effect that cannot change membership may be left unresolved.
+    prepare(
+        &mut state,
+        &nodes,
+        &mut placements,
+        &token,
+        MembershipAction::PrepareReplica,
+    );
+    dispatch_pending(&mut state, &nodes, &mut placements);
+    assert_eq!(
+        state.apply(
+            OperationCommand::Abort {
+                token: token.clone()
+            },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Ok(OperationOutcome::Aborted)
+    );
+    assert!(state.active.is_none());
+    assert_eq!((state.processes.clone(), placements.clone()), before);
+    assert_eq!(
+        state.apply(
+            OperationCommand::Abort { token },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Err(OperationError::StaleExecutor)
+    );
+
+    // A prepared membership transition was never dispatched, so it is discarded too.
+    let token = move_one_to_four(&mut state, &nodes, &mut placements);
+    let learner = MembershipAction::AddLearner { node_id: 4 };
+    prepare(&mut state, &nodes, &mut placements, &token, learner.clone());
+    assert_eq!(
+        state.apply(
+            OperationCommand::Abort { token },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Ok(OperationOutcome::Aborted)
+    );
+
+    // Dispatching one is the point of no return.
+    let token = move_one_to_four(&mut state, &nodes, &mut placements);
+    let receipt = prepare(&mut state, &nodes, &mut placements, &token, learner);
+    dispatch_pending(&mut state, &nodes, &mut placements);
+    let phase = OperationPhase::Reconfiguring {
+        since: receipt.sequence,
+    };
+    assert_eq!(state.active.as_ref().unwrap().phase, phase);
+    state
+        .apply(
+            OperationCommand::FinishAction {
+                token: token.clone(),
+                sequence: receipt.sequence,
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    let reconfiguring = state.clone();
+    assert_eq!(
+        state.apply(
+            OperationCommand::Abort { token },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Err(OperationError::Irreversible { phase })
+    );
+    assert_eq!(state, reconfiguring);
+}
+
+#[test]
+fn abort_is_refused_after_the_source_retires() {
+    let (mut state, nodes, mut placements) = setup();
+    let token = begin(
+        &mut state,
+        &nodes,
+        &mut placements,
+        OperationKind::RebuildReplica { node_id: 1 },
+        &[1, 2, 3],
+    );
+    state
+        .apply(
+            OperationCommand::Observe {
+                token: token.clone(),
+                evidence: evidence(&[1, 2, 3], &[2, 3], 100),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    state
+        .apply(
+            OperationCommand::RetireSource {
+                token: token.clone(),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    let retired = state.clone();
+    assert_eq!(
+        state.apply(
+            OperationCommand::Abort { token },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Err(OperationError::Irreversible {
+            phase: OperationPhase::Retired
+        })
+    );
+    assert_eq!(state, retired);
+}
+
+#[test]
+fn a_replaced_target_blocks_the_operation_observably() {
+    let (mut state, nodes, mut placements) = setup();
+    let token = move_one_to_four(&mut state, &nodes, &mut placements);
+    // The source is not needed for completion, so its claim stays refused.
+    assert_eq!(
+        state.apply(
+            OperationCommand::ClaimProcess {
+                node_id: 1,
+                expected_epoch: 1,
+                incarnation: ProcessIncarnation::from_bits(11),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        ),
+        Err(OperationError::Busy)
+    );
+    let receipt = prepare(
+        &mut state,
+        &nodes,
+        &mut placements,
+        &token,
+        MembershipAction::AddLearner { node_id: 4 },
+    );
+    dispatch_pending(&mut state, &nodes, &mut placements);
+    // The target lost its disk: it claims a new process instead of restarting.
+    let OperationOutcome::ProcessClaimed(claimed) = state
+        .apply(
+            OperationCommand::ClaimProcess {
+                node_id: 4,
+                expected_epoch: 1,
+                incarnation: ProcessIncarnation::from_bits(44),
+            },
+            11,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap()
+    else {
+        panic!("claim");
+    };
+    let block = OperationBlock::ParticipantReplaced {
+        pinned: identity(1, 4),
+        claimed,
+    };
+    let operation = state.active.as_ref().unwrap();
+    assert_eq!(operation.blocked.get(&4), Some(&block));
+    assert_eq!(operation.participants.get(&4), Some(&identity(1, 4)));
+    let blocked = Err(OperationError::Blocked {
+        node_id: 4,
+        block: block.clone(),
+    });
+    state
+        .apply(
+            OperationCommand::FinishAction {
+                token: token.clone(),
+                sequence: receipt.sequence,
+            },
+            11,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    let before = state.clone();
+    for command in [
+        OperationCommand::Complete {
+            token: token.clone(),
+        },
+        OperationCommand::PrepareAction {
+            token: token.clone(),
+            group: RaftGroupId(0),
+            leader: 2,
+            action: MembershipAction::ChangeVoters,
+        },
+    ] {
+        assert_eq!(state.apply(command, 11, &nodes, &mut placements), blocked);
+        assert_eq!(state, before);
+    }
+    assert!(matches!(
+        state.apply(
+            OperationCommand::Abort { token },
+            11,
+            &nodes,
+            &mut placements
+        ),
+        Err(OperationError::Irreversible { .. })
+    ));
+}
+
+#[test]
+fn a_blocked_operation_can_still_abort_before_the_point_of_no_return() {
+    let (mut state, nodes, mut placements) = setup();
+    let token = move_one_to_four(&mut state, &nodes, &mut placements);
+    state
+        .apply(
+            OperationCommand::ClaimProcess {
+                node_id: 3,
+                expected_epoch: 1,
+                incarnation: ProcessIncarnation::from_bits(33),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    assert!(state.active.as_ref().unwrap().blocked.contains_key(&3));
+    assert_eq!(
+        state.apply(
+            OperationCommand::Abort { token },
+            10,
+            &nodes,
+            &mut placements
+        ),
+        Ok(OperationOutcome::Aborted)
+    );
+    assert!(matches!(
+        state.processes.get(&3),
+        Some(ProcessState::Active(ProcessIdentity { epoch: 2, .. }))
+    ));
 }

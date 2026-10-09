@@ -70,7 +70,10 @@ completion changes existing voters or marks a node removed.
 `Begin` checks the exact affected inventory, registered participants and their
 current process identities. A rebuild covers every source-hosted group; a move
 names a nonempty subset; a decommission supplies replacements for the entire
-inventory. The operation pins previous and desired voters. Executor takeover
+inventory. Every node that gains a replica (a move or decommission target, or
+a rebuild source) must already have an active registered replica, because
+replica registration is refused while an operation is active. The operation
+pins previous and desired voters. Executor takeover
 advances a generation and invalidates observations without erasing pending
 work or lowering the observed prefix floor.
 
@@ -154,7 +157,24 @@ path are required before meta state can be treated as cluster-critical state.
 
 ## Operation and Action Lifecycle
 
-The operation has `Preparing` and, for rebuild/decommission, `Retired` phases.
+The operation starts `Preparing`. Dispatching the first membership transition
+(`AddLearner`, `ChangeVoters` or `RetireReplica`) moves it to `Reconfiguring`,
+and a rebuild or decommission moves to `Retired` when its source retires.
+`Abort` discards the operation only while it is `Preparing`: any pending action
+was either never dispatched or cannot change membership, so the previous
+placement is still accurate. In `Reconfiguring` or `Retired`, `Abort` is
+refused with `Irreversible` and recovery reconciles forward. The model has no
+reverse membership transition yet.
+
+A node that completion depends on and that claims a new process instead of
+restarting with its pinned identity has presumably lost its replica. The claim
+is accepted, the participant pin is kept, and the operation records
+`ParticipantReplaced` for that node. A blocked operation dispatches nothing
+new and cannot retire or complete, and those commands return `Blocked` with
+the node and reason. Before the point of no return the operator can abort it.
+After it, the operation stays blocked until a later model can rebuild the lost
+participant inside the operation.
+
 Each external action has a sequence, executor process pin and exact parameters:
 
 ```text

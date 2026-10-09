@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 
 use super::command::OperationError;
 use super::command::OperationOutcome;
+use super::model::OperationBlock;
 use super::model::OperationKind;
 use super::model::OperationPhase;
 use super::model::OperationState;
@@ -89,19 +90,34 @@ impl OperationState {
         }
         // A pending replacement has no data authority yet and can restart while
         // waiting for its fences. Its WAL identity still has to match exactly.
-        // An active executor cannot silently refresh its action's process pins.
-        if let Some(operation) = &self.active {
-            let rebuild = matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == node_id)
-                && operation.phase == OperationPhase::Retired;
-            let retired = matches!(current, Some(ProcessState::Retired { .. }));
-            let pending = matches!(
-                self.replicas.get(&node_id),
-                Some(ReplicaState::Pending { .. })
-            );
-            if !(rebuild && (retired || pending)) {
-                return Err(OperationError::Busy);
+        // An active executor cannot silently refresh its action's process pins:
+        // a node completion depends on that claims a new process instead of
+        // restarting is recorded as blocking the operation.
+        let blocked_pin = match &self.active {
+            None => None,
+            Some(operation) => {
+                let rebuild = matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == node_id)
+                    && operation.phase == OperationPhase::Retired;
+                let retired = matches!(current, Some(ProcessState::Retired { .. }));
+                let pending = matches!(
+                    self.replicas.get(&node_id),
+                    Some(ReplicaState::Pending { .. })
+                );
+                if rebuild && (retired || pending) {
+                    None
+                } else if operation.required_replicas().contains(&node_id) {
+                    Some(
+                        operation
+                            .participants
+                            .get(&node_id)
+                            .cloned()
+                            .ok_or(OperationError::InventoryMismatch)?,
+                    )
+                } else {
+                    return Err(OperationError::Busy);
+                }
             }
-        }
+        };
         let identity = ProcessIdentity {
             epoch: expected_epoch
                 .checked_add(1)
@@ -111,7 +127,19 @@ impl OperationState {
         self.processes
             .insert(node_id, ProcessState::Active(identity.clone()));
         if let Some(operation) = &mut self.active {
-            operation.participants.insert(node_id, identity.clone());
+            match blocked_pin {
+                Some(pinned) => {
+                    operation
+                        .blocked
+                        .insert(node_id, OperationBlock::ParticipantReplaced {
+                            pinned,
+                            claimed: identity.clone(),
+                        });
+                }
+                None => {
+                    operation.participants.insert(node_id, identity.clone());
+                }
+            }
             operation.evidence.clear();
         }
         Ok(OperationOutcome::ProcessClaimed(identity))

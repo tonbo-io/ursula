@@ -86,6 +86,23 @@ impl OperationState {
                 voters.insert(target);
             }
         }
+        // Every node that gains a replica must already have an admitted one:
+        // replica registration is refused while an operation is active.
+        let joining: BTreeSet<NodeId> = match &kind {
+            OperationKind::MoveReplicas { target, .. } => BTreeSet::from([*target]),
+            OperationKind::RebuildReplica { node_id } => BTreeSet::from([*node_id]),
+            OperationKind::DecommissionNode { replacements, .. } => {
+                replacements.values().copied().collect()
+            }
+        };
+        if let Some(node_id) = joining.into_iter().find(|node_id| {
+            !matches!(
+                self.replicas.get(node_id),
+                Some(ReplicaState::Active { .. })
+            )
+        }) {
+            return Err(OperationError::InactiveReplica { node_id });
+        }
         let mut required = previous
             .values()
             .chain(desired.values())
@@ -125,6 +142,7 @@ impl OperationState {
             prefix_floor: BTreeMap::new(),
             pending_action: None,
             last_action_sequence: ActionSequence(0),
+            blocked: BTreeMap::new(),
         });
         self.last_operation_id = operation_id;
         Ok(OperationOutcome::Acquired(token))
@@ -136,7 +154,8 @@ impl OperationState {
         now_ms: u64,
     ) -> Result<OperationOutcome, OperationError> {
         let operation = self.authorized(token)?;
-        if operation.phase != OperationPhase::Preparing
+        operation.ensure_unblocked()?;
+        if !operation.phase.before_retirement()
             || matches!(operation.kind, OperationKind::MoveReplicas { .. })
         {
             return Err(OperationError::InvalidTransition);
@@ -174,6 +193,7 @@ impl OperationState {
         placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
     ) -> Result<OperationOutcome, OperationError> {
         let operation = self.authorized(token)?;
+        operation.ensure_unblocked()?;
         if !matches!(operation.kind, OperationKind::MoveReplicas { .. })
             && operation.phase != OperationPhase::Retired
         {
@@ -207,5 +227,22 @@ impl OperationState {
         }
         self.active = None;
         Ok(OperationOutcome::Completed)
+    }
+
+    /// Discards a `Preparing` operation. Its pending action, if any, was
+    /// either never dispatched or cannot change membership, so `previous`
+    /// still describes every group and placement stays unchanged.
+    pub(super) fn abort(
+        &mut self,
+        token: &OperationToken,
+    ) -> Result<OperationOutcome, OperationError> {
+        let operation = self.authorized(token)?;
+        if operation.phase != OperationPhase::Preparing {
+            return Err(OperationError::Irreversible {
+                phase: operation.phase,
+            });
+        }
+        self.active = None;
+        Ok(OperationOutcome::Aborted)
     }
 }

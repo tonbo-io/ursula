@@ -9,7 +9,9 @@ use super::model::ActionOutcome;
 use super::model::ActionSequence;
 use super::model::MembershipAction;
 use super::model::OperationAction;
+use super::model::OperationBlock;
 use super::model::OperationKind;
+use super::model::OperationPhase;
 use super::model::OperationToken;
 use super::model::PrefixEvidence;
 use super::model::ProcessIdentity;
@@ -93,6 +95,11 @@ pub enum OperationCommand {
     Complete {
         token: OperationToken,
     },
+    /// Discard the intent while it is still `Preparing`. Placement is left
+    /// unchanged. Later phases are refused: recovery reconciles forward.
+    Abort {
+        token: OperationToken,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +113,7 @@ pub enum OperationOutcome {
     EvidenceRecorded,
     SourceRetired,
     Completed,
+    Aborted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -130,4 +138,13 @@ pub enum OperationError {
     EpochExhausted,
     #[error("group {raft_group_id:?} lacks fresh quorum and apply evidence")]
     MissingEvidence { raft_group_id: RaftGroupId },
+    #[error("node {node_id} has no active registered replica")]
+    InactiveReplica { node_id: NodeId },
+    #[error("operation passed irreversible work ({phase:?}); reconcile forward")]
+    Irreversible { phase: OperationPhase },
+    #[error("operation is blocked by node {node_id}: {block:?}")]
+    Blocked {
+        node_id: NodeId,
+        block: OperationBlock,
+    },
 }

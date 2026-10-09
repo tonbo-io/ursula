@@ -22,6 +22,7 @@ impl OperationState {
         sequence: ActionSequence,
     ) -> Result<OperationOutcome, OperationError> {
         let operation = self.authorized(&token)?;
+        operation.ensure_unblocked()?;
         let pending = operation
             .pending_action
             .clone()
@@ -37,8 +38,13 @@ impl OperationState {
                 node_id: pending.receipt().leader,
             });
         }
-        self.authorized(&token)?.pending_action =
-            Some(PendingAction::OutcomeUnknown(pending.receipt().clone()));
+        let operation = self.authorized(&token)?;
+        if pending.receipt().action.changes_membership()
+            && operation.phase == OperationPhase::Preparing
+        {
+            operation.phase = OperationPhase::Reconfiguring { since: sequence };
+        }
+        operation.pending_action = Some(PendingAction::OutcomeUnknown(pending.receipt().clone()));
         Ok(OperationOutcome::ActionOutcome(ActionOutcome::Unknown))
     }
 
@@ -125,6 +131,7 @@ impl OperationState {
         leader: NodeId,
         action: MembershipAction,
     ) -> Result<OperationOutcome, OperationError> {
+        self.authorized(&token)?.ensure_unblocked()?;
         self.validate_replica_action(&token, group, leader, &action)?;
         let current_process = match self.processes.get(&leader) {
             Some(ProcessState::Active(identity)) => identity.clone(),
@@ -160,7 +167,7 @@ impl OperationState {
             return Err(OperationError::InventoryMismatch);
         }
         if matches!(action, MembershipAction::RetireReplica)
-            && (operation.phase != OperationPhase::Preparing
+            && (!operation.phase.before_retirement()
                 || !matches!(operation.kind, OperationKind::RebuildReplica { .. }))
         {
             return Err(OperationError::InvalidTransition);
@@ -236,7 +243,7 @@ impl OperationState {
                 let replacement = operation.phase == OperationPhase::Retired
                     && matches!(operation.kind, OperationKind::RebuildReplica { node_id: source } if source == *node_id)
                     && matches!(self.replicas.get(node_id), Some(ReplicaState::Pending { replacement, .. }) if replacement == identity);
-                let admission = operation.phase == OperationPhase::Preparing
+                let admission = operation.phase.before_retirement()
                     && matches!(
                         operation.kind,
                         OperationKind::MoveReplicas { .. } | OperationKind::DecommissionNode { .. }

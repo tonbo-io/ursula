@@ -45,6 +45,7 @@ pub use operation::ExecutorGeneration;
 pub use operation::MaintenanceOperation;
 pub use operation::MembershipAction;
 pub use operation::OperationAction;
+pub use operation::OperationBlock;
 pub use operation::OperationCommand;
 pub use operation::OperationError;
 pub use operation::OperationId;
