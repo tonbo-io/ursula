@@ -144,6 +144,7 @@ pub use meta::MetaRaftHandle;
 pub use meta::MetaRaftSnapshotBuilder;
 pub use meta::MetaRaftStateMachine;
 pub use meta::MetaRaftTypeConfig;
+pub use meta::UnexpectedRegistrationResponse;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;
 pub use registry::LeadershipShedState;

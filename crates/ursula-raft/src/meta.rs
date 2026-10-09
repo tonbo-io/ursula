@@ -80,6 +80,15 @@ impl MetaRaftError {
     }
 }
 
+/// A node registration answered with a response that is neither success nor a
+/// typed rejection.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("node {node_id} registration returned unexpected response {response}")]
+pub struct UnexpectedRegistrationResponse {
+    pub node_id: NodeId,
+    pub response: ControlResponse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaNodeRegistration {
     pub node_id: NodeId,
@@ -237,16 +246,18 @@ impl MetaRaftHandle {
             let node_id = registration.node_id;
             match self.register_node(registration, now_ms).await? {
                 ControlResponse::Ok => {}
+                // Includes `OperationActive`: only an address refresh is
+                // accepted while a maintenance operation is active.
                 ControlResponse::Rejected { reason } => {
                     return Err(MetaRaftError::with_source(
                         "register initial data-capable node",
                         reason,
                     ));
                 }
-                response => {
-                    return Err(MetaRaftError::new(
+                response @ ControlResponse::Operation(_) => {
+                    return Err(MetaRaftError::with_source(
                         "register initial data-capable node",
-                        format!("node {node_id} returned unexpected response {response}"),
+                        UnexpectedRegistrationResponse { node_id, response },
                     ));
                 }
             }

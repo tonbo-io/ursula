@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::RaftGroupId;
 
+use crate::OperationId;
 use crate::model::NodeId;
 use crate::model::NodeState;
 
@@ -105,4 +106,8 @@ pub enum ControlError {
     EmptyVoters { raft_group_id: RaftGroupId },
     #[error("group {raft_group_id:?} already has a placement")]
     PlacementExists { raft_group_id: RaftGroupId },
+    /// Only an address refresh of a registered node is accepted while an
+    /// operation is active.
+    #[error("maintenance operation {operation_id:?} is active")]
+    OperationActive { operation_id: OperationId },
 }

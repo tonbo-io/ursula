@@ -65,7 +65,10 @@ The important state is:
 All changes enter through `ControlPlaneState::apply(ControlCommand)`. Node
 registration and initial placement seeding remain control commands. `Operation`
 dispatches typed maintenance commands to the same replicated state. While an
-operation is active, other mutations are rejected. Initial seeding is idempotent
+operation is active, other mutations are rejected with `OperationActive`,
+except a registered node re-registering with new addresses and unchanged
+labels. Operations pin process and replica identities, never addresses, so a
+restarted participant may come back at a new address. Initial seeding is idempotent
 but cannot overwrite an existing placement. Only evidence-checked operation
 completion changes existing voters or marks a node removed.
 

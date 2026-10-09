@@ -41,9 +41,13 @@ impl ControlPlaneState {
     }
 
     pub fn apply(&mut self, command: ControlCommand) -> ControlResponse {
-        if self.operations.active.is_some() && !matches!(command, ControlCommand::Operation { .. })
+        if let Some(operation) = &self.operations.active
+            && !matches!(command, ControlCommand::Operation { .. })
+            && !self.refreshes_addresses_only(&command)
         {
-            return ControlResponse::Operation(Err(crate::OperationError::Busy));
+            return reject(crate::ControlError::OperationActive {
+                operation_id: operation.token.operation_id,
+            });
         }
         match command {
             ControlCommand::RegisterNode {
@@ -65,6 +69,21 @@ impl ControlPlaneState {
             } => self.seed_placement(raft_group_id, voters, now_ms),
             ControlCommand::Operation { command, now_ms } => self.apply_operation(command, now_ms),
         }
+    }
+
+    /// Re-registration of a registered node that may change only its URLs.
+    /// No operation invariant reads node addresses: operations pin process
+    /// and replica identities, so a node may refresh them mid-operation.
+    fn refreshes_addresses_only(&self, command: &ControlCommand) -> bool {
+        let ControlCommand::RegisterNode {
+            node_id, labels, ..
+        } = command
+        else {
+            return false;
+        };
+        self.nodes
+            .get(node_id)
+            .is_some_and(|node| node.state != NodeState::Removed && &node.labels == labels)
     }
 
     fn apply_operation(

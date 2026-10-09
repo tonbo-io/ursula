@@ -1260,6 +1260,128 @@ async fn meta_raft_handle_rejects_invalid_initial_data_nodes_body() {
 }
 
 #[cfg(not(madsim))]
+#[tokio::test]
+async fn meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_source() {
+    meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_source_body().await;
+}
+#[cfg(madsim)]
+#[test]
+fn meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_source() {
+    crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            7,
+            meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_source_body(),
+        )
+        .await
+    });
+}
+async fn meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_source_body() {
+    use ursula_control::OperationCommand;
+    use ursula_control::OperationOutcome;
+    let config = raft_config("ursula-meta-operation-active-test", 30, 60);
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        MetaTestLogStore::shared(),
+    )
+    .await
+    .expect("create single-node meta raft handle");
+    let registration = |node_id: u64, host: &str| {
+        MetaNodeRegistration::new(
+            node_id,
+            format!("http://{host}:4491"),
+            format!("http://{host}:4492"),
+        )
+    };
+    handle
+        .register_initial_data_nodes((1..=4).map(|id| registration(id, &format!("node{id}"))), 10)
+        .await
+        .expect("register data nodes");
+    let operation = |command| ControlCommand::Operation {
+        command,
+        now_ms: 10,
+    };
+    assert_eq!(
+        handle
+            .write(ControlCommand::SeedPlacement {
+                raft_group_id: RaftGroupId(0),
+                voters: BTreeSet::from([1, 2, 3]),
+                now_ms: 10,
+            })
+            .await
+            .expect("seed placement"),
+        ursula_control::ControlResponse::Ok
+    );
+    let mut participants = BTreeMap::new();
+    for node_id in 1..=4_u64 {
+        let incarnation = ursula_control::ProcessIncarnation::from_bits(u128::from(node_id));
+        let ursula_control::ControlResponse::Operation(Ok(OperationOutcome::ProcessClaimed(
+            process,
+        ))) = handle
+            .write(operation(OperationCommand::ClaimProcess {
+                node_id,
+                expected_epoch: 0,
+                incarnation: incarnation.clone(),
+            }))
+            .await
+            .expect("claim process")
+        else {
+            panic!("claim process");
+        };
+        handle
+            .write(operation(OperationCommand::RegisterReplica {
+                node_id,
+                process: process.clone(),
+                identity: ursula_control::ReplicaIdentity {
+                    generation: 1,
+                    incarnation,
+                },
+            }))
+            .await
+            .expect("register replica");
+        participants.insert(node_id, process);
+    }
+    let ursula_control::ControlResponse::Operation(Ok(OperationOutcome::Acquired(token))) = handle
+        .write(operation(OperationCommand::Begin {
+            kind: ursula_control::OperationKind::MoveReplicas {
+                source: 1,
+                target: 4,
+                groups: BTreeSet::from([RaftGroupId(0)]),
+            },
+            executor: ursula_control::ProcessIncarnation::from_bits(100),
+            participants,
+            meta_voters: BTreeSet::from([1]),
+        }))
+        .await
+        .expect("begin operation")
+    else {
+        panic!("begin operation");
+    };
+
+    handle
+        .register_initial_data_nodes([registration(2, "node2-restarted")], 20)
+        .await
+        .expect("an address refresh is accepted during an operation");
+    let err = handle
+        .register_initial_data_nodes([registration(5, "node5")], 20)
+        .await
+        .expect_err("a new node waits for the operation");
+    assert_eq!(
+        std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<ursula_control::ControlError>()),
+        Some(&ursula_control::ControlError::OperationActive {
+            operation_id: token.operation_id
+        })
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown single-node meta raft handle");
+}
+
+#[cfg(not(madsim))]
 #[test]
 fn dynamic_group_hosting_allows_non_voter_warmup() {
     let wal_root = tempfile::tempdir().expect("WAL root");

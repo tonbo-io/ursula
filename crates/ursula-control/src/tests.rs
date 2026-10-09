@@ -404,7 +404,11 @@ fn one_dispatcher_owns_membership_from_intent_through_placement() {
             voters: set([2, 3, 4]),
             now_ms: 10
         }),
-        ControlResponse::Operation(Err(crate::OperationError::Busy))
+        ControlResponse::Rejected {
+            reason: crate::ControlError::OperationActive {
+                operation_id: token.operation_id
+            }
+        }
     );
     assert_eq!(state, before);
     assert_eq!(
@@ -673,4 +677,54 @@ fn new_replicas_need_active_nodes_while_any_unremoved_source_can_drain() {
         }))
     );
     assert_eq!(state, before);
+}
+
+#[test]
+fn an_active_operation_admits_only_address_refreshes() {
+    let mut state = ready_cluster(&[1, 2, 3, 4]);
+    let ControlResponse::Operation(Ok(crate::OperationOutcome::Acquired(token))) =
+        begin_operation(&mut state, crate::OperationKind::MoveReplicas {
+            source: 1,
+            target: 4,
+            groups: BTreeSet::from([RaftGroupId(0)]),
+        })
+    else {
+        panic!("begin");
+    };
+    let active = ControlResponse::Rejected {
+        reason: crate::ControlError::OperationActive {
+            operation_id: token.operation_id,
+        },
+    };
+    let register =
+        |node_id: u64, host: &str, labels: BTreeMap<String, String>| ControlCommand::RegisterNode {
+            node_id,
+            client_url: format!("http://{host}:4491"),
+            cluster_url: format!("http://{host}:4492"),
+            labels,
+            now_ms: 20,
+        };
+    // A restarted participant may come back at a new address.
+    assert_eq!(
+        state.apply(register(2, "node2-restarted", BTreeMap::new())),
+        ControlResponse::Ok
+    );
+    assert_eq!(state.nodes[&2].cluster_url, "http://node2-restarted:4492");
+    let before = state.clone();
+    for command in [
+        register(
+            2,
+            "node2-restarted",
+            BTreeMap::from([("zone".to_owned(), "b".to_owned())]),
+        ),
+        register(5, "node5", BTreeMap::new()),
+        ControlCommand::SetNodeState {
+            node_id: 3,
+            state: NodeState::Draining,
+            now_ms: 20,
+        },
+    ] {
+        assert_eq!(state.apply(command), active);
+        assert_eq!(state, before);
+    }
 }
