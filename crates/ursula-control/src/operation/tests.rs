@@ -1144,3 +1144,90 @@ fn install_admission(
         )
         .unwrap();
 }
+
+#[test]
+fn reassignment_applies_the_prepare_policy_to_the_new_leader() {
+    let (mut state, nodes, mut placements) = setup();
+    let target = ReplicaIdentity {
+        generation: 1,
+        incarnation: ProcessIncarnation::from_bits(4),
+    };
+    state
+        .apply(
+            OperationCommand::RegisterReplica {
+                node_id: 4,
+                process: identity(1, 4),
+                identity: target.clone(),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap();
+    let token = begin(
+        &mut state,
+        &nodes,
+        &mut placements,
+        OperationKind::MoveReplicas {
+            source: 1,
+            target: 4,
+            groups: BTreeSet::from([RaftGroupId(0)]),
+        },
+        &[1, 2, 3, 4],
+    );
+    let action = MembershipAction::InstallReplicaIdentity {
+        node_id: 4,
+        identity: target,
+    };
+    let OperationOutcome::ActionPrepared(receipt) = state
+        .apply(
+            OperationCommand::PrepareAction {
+                token: token.clone(),
+                group: RaftGroupId(0),
+                leader: 2,
+                action,
+            },
+            10,
+            &nodes,
+            &mut placements,
+        )
+        .unwrap()
+    else {
+        panic!("admission receipt");
+    };
+    dispatch_pending(&mut state, &nodes, &mut placements);
+    let before = state.clone();
+    // A prepare would refuse the admitted node as its own fence leader.
+    assert_eq!(
+        state.apply(
+            OperationCommand::ReassignAction {
+                token: token.clone(),
+                leader: 4,
+                drained: Some(receipt.clone()),
+            },
+            10,
+            &nodes,
+            &mut placements,
+        ),
+        Err(OperationError::ReplicaChanged { node_id: 4 })
+    );
+    assert_eq!(state, before);
+    let stale = OperationToken {
+        generation: token.generation.checked_add(1).unwrap(),
+        ..token
+    };
+    assert_eq!(
+        state.apply(
+            OperationCommand::ReassignAction {
+                token: stale,
+                leader: 3,
+                drained: None,
+            },
+            10,
+            &nodes,
+            &mut placements,
+        ),
+        Err(OperationError::StaleExecutor)
+    );
+    assert_eq!(state, before);
+}

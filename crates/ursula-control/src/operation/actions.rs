@@ -64,19 +64,11 @@ impl OperationState {
         leader: NodeId,
         drained: Option<OperationAction>,
     ) -> Result<OperationOutcome, OperationError> {
-        let process = match self.processes.get(&leader) {
-            Some(ProcessState::Active(identity)) => identity.clone(),
-            _ => return Err(OperationError::ProcessChanged { node_id: leader }),
-        };
         let old = self
-            .active
+            .authorized(&token)?
+            .pending_action
             .as_ref()
-            .and_then(|operation| {
-                operation
-                    .pending_action
-                    .as_ref()
-                    .map(PendingAction::receipt)
-            })
+            .map(PendingAction::receipt)
             .cloned()
             .ok_or(OperationError::InvalidTransition)?;
         if drained.as_ref().is_some_and(|receipt| receipt != &old) {
@@ -87,10 +79,16 @@ impl OperationState {
                 sequence: old.sequence,
             });
         }
-        let operation = self.authorized(&token)?;
         if matches!(old.action, MembershipAction::PrepareReplica) && leader != old.leader {
             return Err(OperationError::InventoryMismatch);
         }
+        // The new leader must pass the same action policy as a fresh prepare.
+        self.validate_replica_action(&token, old.group, leader, &old.action)?;
+        let process = match self.processes.get(&leader) {
+            Some(ProcessState::Active(identity)) => identity.clone(),
+            _ => return Err(OperationError::ProcessChanged { node_id: leader }),
+        };
+        let operation = self.authorized(&token)?;
         if !operation
             .previous
             .get(&old.group)
