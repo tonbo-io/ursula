@@ -227,6 +227,9 @@ API both rewrite pages, and are not). The thread:
    checkpoint can write newer frames into the db file (a reader at mark 0 blocks backfill; at a
    later mark it caps it) and no closing connection can checkpoint (that needs an EXCLUSIVE lock),
    so the pages are those of `W`. Ends the read transaction.
+6. Fsyncs the WAL and the db file through the private connection's own handles, which reports a
+   write-back error of a page the checkpoints or the copy read (§6). A failed fsync poisons the
+   database, and so does a lost write the owner found meanwhile: either way nothing is published.
 
 Commits wait only for steps 3 and 4 (a passive checkpoint of the few frames committed since step
 1, and the start of a read transaction) and, once a snapshot is due, for the window to open
@@ -328,7 +331,9 @@ be written into the stream. Trust is therefore verified against the files, not i
   commit that starts a generation, cuts only the previous generation's tail, already synced by
   (1)); (3) at attach, after folding the WAL and before the sidecar that drops its claim (`:0`; the
   WAL is deleted after it), and again before the final sidecar whenever attach wrote the db file.
-  A failed fsync poisons the database (or fails the attach).
+  A failed fsync poisons the database (or fails the attach). The snapshot thread also fsyncs the
+  WAL and the db file after reading them, off the commit path (§4.2, step 6): that reports lost
+  write-backs, and the claim does not rely on it.
 - The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
   checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
   claim checkable.
@@ -447,22 +452,33 @@ What attach does in each case:
   the log grows, nothing is lost; retention simply does not advance.
 
 A disk write-back I/O error underneath a running process (EIO from the device, a
-thin-provisioned volume out of space). The WAL is never fsynced and the db file only at WAL
-restarts, truncates and attach, so nothing reports such an error when it happens. Once the dirty
-page is evicted, a read gets the old block back, and SQLite does not check WAL frames on a read:
-the owner's next commits would append page images built on it, losing acknowledged changes from
-the stream itself, not only from the cache. So the VFS remembers the crc32c of every WAL page this
-process writes in the WAL's current generation, by offset (4 bytes per page), and checks every
-page its connections read back. A page that reads back other bytes fails the read and poisons the
-database before any commit can build on it. An error writing back the db file is reported (Linux
-reports it to an fsync on any descriptor opened before it) by the next fsync of the db file. That
-fsync comes before the commit that restarts the WAL, which is normally the first commit after a
-complete checkpoint, the point from which readers read checkpointed pages from the db file
+thin-provisioned volume out of space). The commit path never fsyncs the WAL, and the db file only
+at WAL restarts, truncates and attach, so nothing reports such an error when it happens. Once the
+dirty page is evicted, a read gets the old block back, and SQLite does not check WAL frames on a
+read: the owner's next commits would append page images built on it, losing acknowledged changes
+from the stream itself, not only from the cache. So the VFS remembers the crc32c of every WAL page
+this process writes in the WAL's current generation, by offset (4 bytes per page), and checks
+every page its connections read back. A page that reads back other bytes fails the read and poisons
+the database before any commit can build on it. An error writing back the db file is reported
+(Linux reports it to an fsync on any descriptor opened before it) by the next fsync of the db file.
+That fsync comes before the commit that restarts the WAL, which is normally the first commit after
+a complete checkpoint, the point from which readers read checkpointed pages from the db file
 instead of the WAL.
 
+The snapshot thread's private connection reads the WAL (its checkpoints) and the db file (its
+page copy) outside the VFS, so it does not see that check. A lost page it published would become
+permanent once the next snapshot moves retention past the frames that hold the good one. So after
+reading, it fsyncs both files through its own handles (§4.2, step 6) and publishes nothing when an
+fsync fails (which poisons the database) or the owner is poisoned for a lost write. On Linux an
+fsync reports a write-back error that no fsync has reported yet, from any descriptor, and in the
+process only the owner's fsync of the db file could have reported it first, which poisons too.
+
 Residual risk:
-- The snapshot thread's private connection reads the WAL outside the VFS when it checkpoints, so
-  a lost WAL page that no connection of the owner read back can be checkpointed into the db file.
+- The snapshot's fsyncs rely on the kernel reporting an earlier write-back error to a later fsync
+  on another descriptor, which Linux does. Elsewhere (macOS) a lost page the checkpoints or the
+  copy read, and no connection of the owner read back, can still be published.
+- A page changed by anything but a failed write-back (unsupported, below) is reported by no fsync:
+  unless a connection of the owner read it back first, a snapshot can publish it.
 - A commit that cannot restart the WAL, because another connection still reads from it, can read
   a db page that lost its write-back since the last fsync and append the damage.
 

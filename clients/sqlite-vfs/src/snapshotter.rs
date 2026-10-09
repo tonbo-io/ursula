@@ -195,8 +195,31 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     drop(window);
     let copy_started = Instant::now();
     let image = conn.read_pages(pages)?;
-    drop(conn); // ends the read transaction
+    conn.query(c"COMMIT")?; // ends the read transaction
     let copy = copy_started.elapsed();
+    // The checkpoints above read WAL pages, and `read_pages` db pages, outside the VFS's check of
+    // pages read back (`overlay_read`): a page whose write-back failed reads back older bytes, and
+    // once published, the next snapshot's retention move makes the damage permanent. The commit
+    // path never fsyncs the WAL, and the db file only before the WAL restarts, so such an error is
+    // usually unreported yet: fsyncs after the reads report it (on Linux), unless the owner found
+    // it first (a lost page read back, a failed fsync of the db file) and is poisoned.
+    let synced = conn.sync_files();
+    drop(conn);
+    match synced {
+        Err(e) if e.is_local_damage() => {
+            lock(db).set_poisoned(e, Some(&format!("snapshot at {offset} not published")));
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+        Ok(()) => {}
+    }
+    if lock(db)
+        .poisoned
+        .as_ref()
+        .is_some_and(Error::is_local_damage)
+    {
+        return Ok(true);
+    }
     let body = snapshot::encode(&offset, epoch, &image).map_err(|source| Error::Snapshot {
         offset: offset.clone(),
         source,

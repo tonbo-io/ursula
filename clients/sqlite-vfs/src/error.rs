@@ -94,8 +94,8 @@ pub(crate) enum Error {
     NoResultRow { sql: &'static CStr },
     #[error("persist WAL: {0}")]
     PersistWal(c_int),
-    #[error("db file handle: {0}")]
-    DbFileHandle(c_int),
+    #[error("{file} handle of a private connection: {code}")]
+    FileHandle { file: &'static str, code: c_int },
     #[error("read db file pages: {code} (file shorter than {pages} pages?)")]
     ReadPages { code: c_int, pages: u32 },
     #[error("the host's SQLite has no {0}")]
@@ -225,6 +225,8 @@ pub(crate) enum Error {
          write-back failed, or something else wrote the file)"
     )]
     LostWrite { offset: i64 },
+    #[error("fsync of the {file} failed ({code}): a write-back to it may have been lost")]
+    FileSync { file: &'static str, code: c_int },
 }
 
 /// The data asked for lies below the stream's retention (or a snapshot was superseded): a
@@ -307,6 +309,16 @@ impl Error {
     pub(crate) fn is_fenced(&self) -> bool {
         matches!(self, Error::Fenced(_) | Error::Recreated { .. })
     }
+
+    /// The local files may hold other pages than this process wrote (a write-back was lost, or
+    /// something else wrote them): nothing read from them may reach the stream, not even in a
+    /// snapshot.
+    pub(crate) fn is_local_damage(&self) -> bool {
+        matches!(
+            self,
+            Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. }
+        )
+    }
 }
 
 /// A response body appended to a status, when there is one.
@@ -350,6 +362,16 @@ mod tests {
         assert!(gone.is_gone() && !gone.is_fenced() && !gone.is_recreated());
         let local = Error::LocalWalWrite(10);
         assert!(!local.is_fenced() && !local.is_gone() && !local.is_recreated());
+        // A lost write-back (found on a read, or reported by an fsync) keeps every page of the
+        // local files out of a snapshot; a fence does not.
+        let lost_page = Error::LostWrite { offset: 56 };
+        let lost_sync = Error::FileSync {
+            file: "WAL",
+            code: 10,
+        };
+        assert!(lost_page.is_local_damage() && lost_sync.is_local_damage());
+        assert!(!lost_page.is_fenced() && !superseded.is_local_damage());
+        assert!(!local.is_local_damage());
         let missing = Error::StreamMissing {
             path: "/data/app.db".into(),
             url: "http://h/b/s".into(),
