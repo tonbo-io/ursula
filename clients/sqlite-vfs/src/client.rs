@@ -17,6 +17,8 @@ use crate::config::retry_budget;
 use crate::error::Attempt;
 use crate::error::Error;
 use crate::error::Gone;
+use crate::log;
+use crate::log::Level;
 
 /// `Producer-Id` prefix; the stream incarnation follows (`producer_id`).
 const PRODUCER: &str = "sqlite-ursula-vfs";
@@ -64,15 +66,17 @@ fn tls() -> TlsConfig {
                 })
                 .collect(),
             Err(e) => {
-                eprintln!("sqlite-ursula-vfs: URSULA_VFS_CA_FILE {path}: {e}");
+                log::emit(Level::Error, "ca_file_unreadable", &[
+                    ("path", &path),
+                    ("error", &e),
+                ]);
                 Vec::new()
             }
         };
         if certs.is_empty() {
-            eprintln!(
-                "sqlite-ursula-vfs: URSULA_VFS_CA_FILE {path} has no certificate: no TLS endpoint \
-                 is trusted"
-            );
+            log::emit(Level::Error, "ca_file_without_certificates", &[(
+                "path", &path,
+            )]);
         }
         TlsConfig::builder()
             .root_certs(RootCerts::new_with_certs(&certs))

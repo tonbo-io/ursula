@@ -8,6 +8,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::claim::claim;
 use crate::client::START;
@@ -41,6 +42,8 @@ use crate::local::sidecar_line;
 use crate::local::stamp;
 use crate::local::stream_key;
 use crate::local::write_sidecar;
+use crate::log;
+use crate::log::Level;
 use crate::snapshot;
 use crate::snapshotter::Snapper;
 use crate::snapshotter::snapshot_loop;
@@ -165,7 +168,10 @@ impl Applier {
             f.write_all_at(&data, page_offset(pgno)).map_err(err)?;
             written = written.saturating_add(1);
             if abort_in_replay() == Some(written) {
-                eprintln!("sqlite-ursula-vfs: URSULA_VFS_ABORT_IN_REPLAY: aborting mid-replay");
+                log::emit(Level::Error, "test_hook_abort", &[
+                    ("hook", &"URSULA_VFS_ABORT_IN_REPLAY"),
+                    ("file", &self.path),
+                ]);
                 std::process::abort();
             }
         }
@@ -376,7 +382,7 @@ pub(crate) fn attach(path: &str, url: &str) -> Result<String, Arc<Error>> {
     if let Some((snapper, thread)) = previous {
         snapper.stop();
         if thread.join().is_err() {
-            eprintln!("sqlite-ursula-vfs: {path}: the previous snapshot thread panicked");
+            log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
         }
     }
     let outcome = attach_files_rebuilding(&path, &url);
@@ -413,7 +419,11 @@ fn attach_files_rebuilding(
         match attach_files(path, url) {
             Err(e) if e.is_recreated() && tries < 3 => {
                 tries = tries.saturating_add(1);
-                eprintln!("sqlite-ursula-vfs: {path}: attach: {e}; rebuilding");
+                log::emit(Level::Warn, "attach_rebuilding", &[
+                    ("file", &path),
+                    ("stream", &url),
+                    ("reason", &e),
+                ]);
             }
             outcome => return outcome,
         }
@@ -423,6 +433,7 @@ fn attach_files_rebuilding(
 /// Decides whether the local files can be trusted (or discards them), brings them to the stream's
 /// tail and claims it (`sync`), then builds the new attachment for `attach` to bind.
 fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), Error> {
+    let started = Instant::now();
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
     let boot = boot.as_deref();
@@ -509,10 +520,11 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
                     None => "a torn sidecar".into(),
                 };
                 emptied = Some(discard_local(path)?);
-                eprintln!(
-                    "sqlite-ursula-vfs: {path}: local files untrusted ({why}); discarded them, \
-                     rebuilding from the stream"
-                );
+                log::emit(Level::Info, "local_files_discarded", &[
+                    ("file", &path),
+                    ("stream", &url),
+                    ("why", &why),
+                ]);
             }
         }
     }
@@ -560,7 +572,11 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
             Ok(r) => break r,
             Err(e) if e.is_gone() && tries < 10 => {
                 tries = tries.saturating_add(1);
-                eprintln!("sqlite-ursula-vfs: {url}: attach: {e}; retrying");
+                log::emit(Level::Info, "attach_retrying", &[
+                    ("file", &path),
+                    ("stream", &url),
+                    ("reason", &e),
+                ]);
                 std::thread::sleep(Duration::from_millis(50_u64.saturating_mul(tries)));
             }
             Err(e) => return Err(e),
@@ -625,6 +641,11 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
         window: false,
         window_wanted: false,
         snapshot_stats: Vec::new(),
+        attach_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        append_retries: 0,
+        snapshot_published_at: None,
+        snapshot_failures: 0,
+        snapshot_error: None,
         attached_from: from,
         installed,
     }));

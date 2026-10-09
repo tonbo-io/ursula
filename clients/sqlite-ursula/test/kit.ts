@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { expect, inject } from "vitest";
+import type { AttachStatus } from "../src/index.ts";
 
 let counter = 0;
 /** A fresh stream URL on the spawned node (bucket created by the global setup). */
@@ -67,6 +68,8 @@ export type ChildLine = {
 	snapshots?: number;
 	snapshot?: string;
 	retained?: string;
+	/** On `done`: the owner's health fields from `ursula_status`. */
+	health?: Pick<AttachStatus, "commits" | "append_retries" | "attach_ms" | "log_bytes" | "snapshot_due_bytes" | "snapshot_age_ms" | "snapshot_failures" | "snapshot_error">;
 };
 
 export interface Child {

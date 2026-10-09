@@ -72,6 +72,21 @@ export interface AttachStatus {
 	readonly local: StreamOffset;
 	/** Offset of the snapshot attach installed (`"-1"`: none). */
 	readonly installed: StreamOffset;
+	/** How long the attach took, in milliseconds. */
+	readonly attach_ms: number;
+	/** Commits acknowledged since the attach. */
+	readonly commits: number;
+	/** Append attempts beyond the first (unknown outcomes, 429, 503, a refused token), over those commits. */
+	readonly append_retries: number;
+	/** Bytes of log since the latest snapshot. A rebuild replays them, so they should stay near `snapshot_due_bytes`. */
+	readonly log_bytes: number;
+	/** The log a snapshot is taken at: the database's size, or `URSULA_VFS_SNAPSHOT_MIN_BYTES` if larger. */
+	readonly snapshot_due_bytes: number;
+	/** Milliseconds since this owner last saw a snapshot published; `null` for none since the attach. */
+	readonly snapshot_age_ms: number | null;
+	/** Snapshot attempts that failed in a row (0 once one succeeds), and the last failure. */
+	readonly snapshot_failures: number;
+	readonly snapshot_error: string | null;
 }
 
 export function status(file: string): AttachStatus {
@@ -155,4 +170,89 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 			throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, error instanceof AggregateError ? error.errors[0] : error);
 		});
 	return SqliteStorage.open(db);
+}
+
+/** Attributes on a measurement, as OpenTelemetry takes them. */
+export type MetricAttributes = Readonly<Record<string, string | number | boolean>>;
+
+/**
+ * The part of an OpenTelemetry `Meter` that {@link instrument} uses. A `Meter` from
+ * `@opentelemetry/api` satisfies it; the package does not depend on OpenTelemetry.
+ */
+export interface MeterLike {
+	createHistogram(name: string, options?: { description?: string; unit?: string }): { record(value: number, attributes?: MetricAttributes): void };
+	createCounter(name: string, options?: { description?: string; unit?: string }): { add(value: number, attributes?: MetricAttributes): void };
+	createObservableGauge(
+		name: string,
+		options?: { description?: string; unit?: string },
+	): {
+		addCallback(callback: (result: { observe(value: number, attributes?: MetricAttributes): void }) => void): void;
+		removeCallback(callback: (result: { observe(value: number, attributes?: MetricAttributes): void }) => void): void;
+	};
+}
+
+/**
+ * Reports an attached file's health as metrics on `meter`, until the returned function is called:
+ *
+ * - histograms `sqlite_ursula.commit.duration` (the VFS's commit hook: frame build, append, local
+ *   WAL write) and `sqlite_ursula.append.duration`, in ms;
+ * - counters `sqlite_ursula.append.retries` and `sqlite_ursula.stream.bytes`;
+ * - gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`
+ *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned` and `sqlite_ursula.fenced`
+ *   (0 or 1).
+ *
+ * Every measurement carries `sqlite.file` and `attributes`. The per-commit numbers come from
+ * {@link drainStats} every `intervalMs` (10 s by default), so do not call `drainStats` on the same
+ * file elsewhere while it runs.
+ */
+export function instrument(file: string, meter: MeterLike, options: { intervalMs?: number; attributes?: MetricAttributes } = {}): () => void {
+	const attributes: MetricAttributes = { "sqlite.file": file, ...options.attributes };
+	const commit = meter.createHistogram("sqlite_ursula.commit.duration", { unit: "ms", description: "VFS commit hook: frame build, append, local WAL write" });
+	const append = meter.createHistogram("sqlite_ursula.append.duration", { unit: "ms", description: "Append requests of a commit" });
+	const retries = meter.createCounter("sqlite_ursula.append.retries", { description: "Append attempts beyond the first" });
+	const bytes = meter.createCounter("sqlite_ursula.stream.bytes", { unit: "By", description: "Frame bytes appended to the stream" });
+	const drain = (): void => {
+		let stats: VfsStats;
+		try {
+			stats = drainStats(file);
+		} catch {
+			return; // not attached (any more)
+		}
+		for (const c of stats.commits) {
+			commit.record(c.vfs_us / 1000, attributes);
+			append.record(c.append_us / 1000, attributes);
+			if (c.attempts > 1) retries.add(c.attempts - 1, attributes);
+			bytes.add(c.bytes, attributes);
+		}
+	};
+	const gauges: [string, string | undefined, (s: AttachStatus) => number | null][] = [
+		["sqlite_ursula.log.bytes", "By", (s) => s.log_bytes],
+		["sqlite_ursula.snapshot.due_bytes", "By", (s) => s.snapshot_due_bytes],
+		["sqlite_ursula.snapshot.age", "ms", (s) => s.snapshot_age_ms],
+		["sqlite_ursula.snapshot.failures", undefined, (s) => s.snapshot_failures],
+		["sqlite_ursula.poisoned", undefined, (s) => (s.poisoned ? 1 : 0)],
+		["sqlite_ursula.fenced", undefined, (s) => (s.fenced ? 1 : 0)],
+	];
+	const observed = gauges.map(([name, unit, value]) => {
+		const gauge = meter.createObservableGauge(name, unit === undefined ? {} : { unit });
+		const callback = (result: { observe(value: number, attributes?: MetricAttributes): void }): void => {
+			let s: AttachStatus;
+			try {
+				s = status(file);
+			} catch {
+				return;
+			}
+			const v = value(s);
+			if (v !== null) result.observe(v, attributes);
+		};
+		gauge.addCallback(callback);
+		return () => gauge.removeCallback(callback);
+	});
+	const timer = setInterval(drain, options.intervalMs ?? 10_000);
+	timer.unref();
+	return () => {
+		clearInterval(timer);
+		drain();
+		for (const remove of observed) remove();
+	};
 }

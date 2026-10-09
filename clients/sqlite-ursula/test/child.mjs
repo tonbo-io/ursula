@@ -27,7 +27,18 @@ for (const [step, sql] of sqls.entries()) {
 }
 const stats = JSON.parse(control.prepare("SELECT ursula_stats(?) AS s").get(file).s);
 const status = JSON.parse(control.prepare("SELECT ursula_status(?) AS s").get(file).s);
-say({ done: true, attempts: stats.commits.map((c) => c.attempts), poisoned: status.poisoned, offset: status.offset, epoch: status.epoch, snapshots: stats.snapshots.length, snapshot: status.snapshot, retained: status.retained });
+const { commits, append_retries, attach_ms, log_bytes, snapshot_due_bytes, snapshot_age_ms, snapshot_failures, snapshot_error } = status;
+say({
+	done: true,
+	attempts: stats.commits.map((c) => c.attempts),
+	poisoned: status.poisoned,
+	offset: status.offset,
+	epoch: status.epoch,
+	snapshots: stats.snapshots.length,
+	snapshot: status.snapshot,
+	retained: status.retained,
+	health: { commits, append_retries, attach_ms, log_bytes, snapshot_due_bytes, snapshot_age_ms, snapshot_failures, snapshot_error },
+});
 if (process.env.CHILD_EXIT === "1") {
 	db.close();
 	process.exit(0);

@@ -16,6 +16,8 @@ use crate::db::lock;
 use crate::error::Error;
 use crate::host::Checkpoint;
 use crate::host::Private;
+use crate::log;
+use crate::log::Level;
 use crate::snapshot;
 
 /// Wakes an attached database's snapshot thread.
@@ -87,14 +89,24 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
         let (backoff, cap) = match snapshot_once(db, snapper) {
             Ok(true) => {
                 (busy, failing) = (Duration::from_millis(10), Duration::from_millis(100));
+                let mut d = lock(db);
+                d.snapshot_failures = 0;
+                d.snapshot_error = None;
+                drop(d);
                 continue;
             }
             Ok(false) => (&mut busy, Duration::from_secs(1)),
             Err(e) => {
-                eprintln!(
-                    "sqlite-ursula-vfs: {}: snapshot: {e}; retrying later",
-                    lock(db).url
-                );
+                let mut d = lock(db);
+                d.snapshot_failures = d.snapshot_failures.saturating_add(1);
+                log::emit(Level::Warn, "snapshot_failed", &[
+                    ("file", &d.path),
+                    ("stream", &d.url),
+                    ("failures", &d.snapshot_failures),
+                    ("reason", &e),
+                ]);
+                d.snapshot_error = Some(e.to_string());
+                drop(d);
                 (&mut failing, Duration::from_secs(30))
             }
         };
@@ -197,10 +209,13 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
         // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
         let mut d = lock(db);
-        eprintln!(
-            "sqlite-ursula-vfs: {}: {what}: {e}; database poisoned (re-attach to recover)",
-            d.url
-        );
+        log::emit(Level::Warn, "poisoned", &[
+            ("file", &d.path),
+            ("stream", &d.url),
+            ("fenced", &e.is_fenced()),
+            ("during", &what),
+            ("reason", &e),
+        ]);
         d.poisoned = Some(e);
     };
     match put_idempotent(
@@ -233,6 +248,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
             let mut d = lock(db);
             if let Some(newer) = newer.filter(|n| *n > d.snapshot) {
                 d.snapshot = newer;
+                d.snapshot_published_at = Some(Instant::now());
             }
             d.log = d.log.saturating_sub(log);
             return Ok(true);
@@ -276,6 +292,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
             d.snapshot.clone_from(&offset);
         }
         d.log = d.log.saturating_sub(log);
+        d.snapshot_published_at = Some(Instant::now());
         if d.snapshot_stats.len() < 100_000 {
             d.snapshot_stats.push(SnapshotStat {
                 offset: offset.clone(),
