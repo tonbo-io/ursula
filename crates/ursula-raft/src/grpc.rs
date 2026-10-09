@@ -140,16 +140,36 @@ static GRPC_APPEND_STREAM_EXPIRED_UNSENT: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_STALLS: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
-// Independent heartbeat and replication accounting must not share cache lines.
-static GRPC_APPEND_HEARTBEAT_REQUESTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static GRPC_APPEND_HEARTBEAT_REQUEST_BYTES: CachePadded<AtomicU64> =
-    CachePadded::new(AtomicU64::new(0));
-static GRPC_APPEND_REPLICATION_REQUESTS: CachePadded<AtomicU64> =
-    CachePadded::new(AtomicU64::new(0));
-static GRPC_APPEND_REPLICATION_REQUEST_BYTES: CachePadded<AtomicU64> =
-    CachePadded::new(AtomicU64::new(0));
-static GRPC_APPEND_REPLICATION_ENTRIES: CachePadded<AtomicU64> =
-    CachePadded::new(AtomicU64::new(0));
+/// Logical accounting for heartbeat Append RPCs. One call updates both
+/// counters, so they share a cache line.
+struct AppendHeartbeatCounters {
+    requests: AtomicU64,
+    request_bytes: AtomicU64,
+}
+
+/// Logical accounting for replicating Append RPCs, updated together like
+/// [`AppendHeartbeatCounters`].
+struct AppendReplicationCounters {
+    requests: AtomicU64,
+    request_bytes: AtomicU64,
+    entries: AtomicU64,
+}
+
+// Heartbeat and replication accounting run on different cores, so each kind
+// gets its own cache line. Padding every counter separately makes one call
+// touch two or three contended lines, which measured slower than no padding at
+// eight cores (`benches/support/grpc_counters.rs`).
+static GRPC_APPEND_HEARTBEAT: CachePadded<AppendHeartbeatCounters> =
+    CachePadded::new(AppendHeartbeatCounters {
+        requests: AtomicU64::new(0),
+        request_bytes: AtomicU64::new(0),
+    });
+static GRPC_APPEND_REPLICATION: CachePadded<AppendReplicationCounters> =
+    CachePadded::new(AppendReplicationCounters {
+        requests: AtomicU64::new(0),
+        request_bytes: AtomicU64::new(0),
+        entries: AtomicU64::new(0),
+    });
 static GRPC_APPEND_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -388,14 +408,18 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_server_buffered_bytes_max:
             GRPC_APPEND_STREAM_SERVER_BUFFERED_BYTES_MAX.load(Ordering::Relaxed),
-        raft_grpc_append_heartbeat_requests: GRPC_APPEND_HEARTBEAT_REQUESTS.load(Ordering::Relaxed),
-        raft_grpc_append_heartbeat_request_bytes: GRPC_APPEND_HEARTBEAT_REQUEST_BYTES
+        raft_grpc_append_heartbeat_requests: GRPC_APPEND_HEARTBEAT.requests.load(Ordering::Relaxed),
+        raft_grpc_append_heartbeat_request_bytes: GRPC_APPEND_HEARTBEAT
+            .request_bytes
             .load(Ordering::Relaxed),
-        raft_grpc_append_replication_requests: GRPC_APPEND_REPLICATION_REQUESTS
+        raft_grpc_append_replication_requests: GRPC_APPEND_REPLICATION
+            .requests
             .load(Ordering::Relaxed),
-        raft_grpc_append_replication_request_bytes: GRPC_APPEND_REPLICATION_REQUEST_BYTES
+        raft_grpc_append_replication_request_bytes: GRPC_APPEND_REPLICATION
+            .request_bytes
             .load(Ordering::Relaxed),
-        raft_grpc_append_replication_entries: GRPC_APPEND_REPLICATION_ENTRIES
+        raft_grpc_append_replication_entries: GRPC_APPEND_REPLICATION
+            .entries
             .load(Ordering::Relaxed),
         raft_grpc_append_response_bytes: GRPC_APPEND_RESPONSE_BYTES.load(Ordering::Relaxed),
         raft_grpc_vote_requests: GRPC_VOTE_REQUESTS.load(Ordering::Relaxed),
@@ -428,13 +452,23 @@ fn append_logical_sample(
 
 fn record_append_logical_sample(sample: AppendLogicalSample) {
     if sample.heartbeat {
-        GRPC_APPEND_HEARTBEAT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        GRPC_APPEND_HEARTBEAT_REQUEST_BYTES.fetch_add(sample.request_bytes, Ordering::Relaxed);
+        GRPC_APPEND_HEARTBEAT
+            .requests
+            .fetch_add(1, Ordering::Relaxed);
+        GRPC_APPEND_HEARTBEAT
+            .request_bytes
+            .fetch_add(sample.request_bytes, Ordering::Relaxed);
         return;
     }
-    GRPC_APPEND_REPLICATION_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    GRPC_APPEND_REPLICATION_REQUEST_BYTES.fetch_add(sample.request_bytes, Ordering::Relaxed);
-    GRPC_APPEND_REPLICATION_ENTRIES.fetch_add(sample.entries, Ordering::Relaxed);
+    GRPC_APPEND_REPLICATION
+        .requests
+        .fetch_add(1, Ordering::Relaxed);
+    GRPC_APPEND_REPLICATION
+        .request_bytes
+        .fetch_add(sample.request_bytes, Ordering::Relaxed);
+    GRPC_APPEND_REPLICATION
+        .entries
+        .fetch_add(sample.entries, Ordering::Relaxed);
 }
 
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";

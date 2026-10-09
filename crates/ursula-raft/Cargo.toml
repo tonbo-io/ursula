@@ -59,6 +59,7 @@ criterion = { workspace = true, features = ["async_tokio"] }
 raft-log = "0.4.5"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+core_affinity = { workspace = true }
 
 [[bench]]
 name = "disk_wal"

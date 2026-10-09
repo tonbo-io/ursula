@@ -4612,6 +4612,7 @@ dependencies = [
  "bitflags",
  "blake3",
  "bytes",
+ "core_affinity",
  "crc32fast",
  "criterion",
  "crossbeam-utils",
