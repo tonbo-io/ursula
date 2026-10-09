@@ -1,9 +1,10 @@
 # Recovery follow-ups and maintenance convergence
 
 Status: proposed split and design for review. This document changes no runtime
-behavior. The baseline is main `c374f709` (#427 and #428), compared with frozen
-#426 at `82a3f635`. The frozen branch is evidence and a source of candidate
-patches, not an implementation to merge wholesale.
+behavior. The released baseline is `v0.7.0` at `3ff0c56c`. References to frozen
+#426 at `82a3f635` describe candidate work, not released behavior. The frozen
+branch is evidence and a source of candidate patches, not an implementation to
+merge wholesale.
 
 ## Remaining scope
 
@@ -11,18 +12,17 @@ patches, not an implementation to merge wholesale.
 fault preconditions when extracting anything from #426. In particular, a
 persisted genesis vote is different from a missing vote.
 
-| Issue | Current boundary | Next independently reviewable change |
+| Issue | Released boundary in 0.7.0 | Remaining independently reviewable work |
 | --- | --- | --- |
-| #410 | The legacy incarnation CLI flag still exists on main. | Delete the option and permissive branch, retain fail-closed identity parsing and CLI tests. |
-| #411 | Recovery risks remain individually open. #427/#428 do not prove every case. | Separate genesis-without-membership, missing run state, failed poison-marker persistence, delayed pre-reboot ACK, and snapshot/directory durability cases. Each needs a reproduced regression or an explicit recovery decision. |
-| #412 | The Raft library still mixes native filesystem tests and simulation tests. | Classify tests, run eligible tests with the simulation runtime, explicitly gate native-only tests, and add the actual Raft suite to madsim CI. Do not hide failures by gating safety tests without equivalent coverage. |
-| #413 | Registry construction, metric contracts, WAL exports and typed errors are distinct tasks. | Start with shared fail-closed admin metrics, then single-path registry construction. Keep WAL ownership/export cleanup and error conversion as separate changes. |
-| #414 | Thread-per-core work includes independent hot-path and lifecycle changes. | Measure each proposed change first. Separate read forwarding, admission/counters, HTTP ownership and background task lifetime. |
-| #415 | The frozen serving/maintenance split is a candidate, not a verified deployment result. | Separate traffic readiness from permission to disrupt another replica. Keep main's maintenance mechanism until its replacement is supported. |
-| #416 | A pure control-state foundation exists on main. The frozen executor and identity design need review. | Follow the design and dependency order below. |
-| #417 | The frozen allocator cleanup is independent of control-plane changes. | Use dhat for runtime/stream allocation assertions in isolated test binaries. Keep the state probe's bucket-counting allocator. |
-| #418 | The frozen patch isolates some apply failures and supports replay with corrected code. | First ship isolation and diagnostics. Decide supported recovery semantics separately before closing the issue. |
-| #419, #420 | Performance comparison and extended Chaos/soak qualification. | Require separate acceptance evidence; code-level tests here do not satisfy these issues. |
+| #411 | [#439](https://github.com/tonbo-io/ursula/pull/439) makes membership batches durable under `never`. [#437](https://github.com/tonbo-io/ursula/pull/437) propagates snapshot parent-directory open errors. | Existing disks without membership still need a recovery decision. Track snapshot I/O and pins in [#445](https://github.com/tonbo-io/ursula/pull/445) and [#449](https://github.com/tonbo-io/ursula/pull/449), poison-marker publication in [#444](https://github.com/tonbo-io/ursula/pull/444), and epoch floors in [#432](https://github.com/tonbo-io/ursula/pull/432). The fault cases below remain separate evidence requirements. |
+| #412 | Native filesystem and simulation test boundaries still need consolidation. | [#433](https://github.com/tonbo-io/ursula/pull/433) classifies tests and runs the eligible Raft suite in madsim CI. Do not gate safety tests without equivalent coverage. |
+| #413 | Shared admin metrics and complete engine registration shipped in #434 and #441. | Keep WAL ownership/export cleanup and typed error conversion separate from the remaining control-plane responsibilities. |
+| #414 | [#450](https://github.com/tonbo-io/ursula/pull/450) moved forwarded reads off the group actor and bounded forwarded RPCs with deadlines. | Profile the remaining admission/counter sharing, HTTP ownership and background task lifetime work independently, with bounded-progress evidence. |
+| #415 | Serving readiness reports `raft_replica_unready`, not lost redundancy. `wait-ready` requires full redundancy. `ApplyStopped` is a maintenance issue only. | Complete the live-topology and replacement-operation integration. Preserve the serving/maintenance boundary and verify deployed Service/PDB behavior while a replica rebuilds. |
+| #416 | A pure control-state foundation exists. The managed executor and identity design are not released. | Follow the design and dependency order below, including the minor-release storage boundary. |
+| #417 | Allocator consolidation is independent of control-plane changes. | [#430](https://github.com/tonbo-io/ursula/pull/430) uses dhat for allocation assertions in isolated test binaries and keeps timing benchmarks uninstrumented. Retain the state probe's bucket-counting allocator. |
+| #418 | #436, #441 and #443 shipped apply-failure isolation and diagnostics. `ApplyStopped` is a maintenance issue, the frozen archive keeps log IDs only, and a stopped replica cannot vote, acknowledge replication or campaign. | Define the supported recovery contract and complete the multi-replica poison-pill drill. The 0.7.0 acceptance skipped that drill because the production image has no fault hooks. |
+| #419, #420 | The 0.7.0 acceptance covered S1–S6 on RC3 and an RC4 re-check. | Performance comparison and extended Chaos/soak qualification require separate evidence. Neither that release acceptance nor code-level tests satisfy these issues or count as a second qualification run. |
 
 ## Extraction rules
 
@@ -48,31 +48,26 @@ belongs to the final cutover PR, with a working ordinary-PVC-restart runbook.
 
 ### Specific #411 follow-ups
 
-- Membership records must survive an immediate full-cluster power loss under
-  `never`. Evaluate the frozen membership-fsync change independently, with a
-  real multi-voter regression and its fsync cost. Preventing new occurrences
-  does not recover existing disks that all lack membership.
-- A missing run-state must not reset the recovery epoch below a surviving
-  core's verified epoch. Cover multiple cores, repeated marker loss and
-  overflow without restoring the old permissive sealed-segment replay.
-- Inject failure while recording `poisoned`, including write, rename and sync,
-  after partial journal writes and fsync EIO. Test both same-boot and host-crash
-  recovery. A surviving page-cache prefix alone is insufficient coverage.
-- Delay a real replication response across reboot and recovery. Assert it
-  cannot make the leader commit using a retired replica's acknowledgement.
-- Route snapshot metadata through the same journal I/O abstraction and audit
-  publication ordering: temporary-file write, file sync, rename, parent-directory
-  sync, pointer publication, then purge. The current direct `std::fs` path is
+- #439 prevents new membership loss under `never`, but does not recover existing
+  disks that already lack membership. Define recovery for those disks separately.
+- [#432](https://github.com/tonbo-io/ursula/pull/432): a missing run-state must not
+  reset the recovery epoch below a surviving core's verified epoch. Cover multiple
+  cores, repeated marker loss and overflow without permissive sealed-segment replay.
+- [#444](https://github.com/tonbo-io/ursula/pull/444): inject failure while recording
+  `poisoned`, including write, rename and sync, after partial journal writes and
+  fsync EIO. Test both same-boot and host-crash recovery. A surviving page-cache
+  prefix alone is insufficient coverage.
+- Delay a real replication response across reboot and recovery. Assert it cannot
+  make the leader commit using a retired replica's acknowledgement.
+- [#445](https://github.com/tonbo-io/ursula/pull/445): route snapshot metadata through
+  the journal I/O abstraction and audit temporary-file write, file sync, rename,
+  parent-directory sync, pointer publication and purge. #437 already propagates
+  parent-directory open errors, but the released direct `std::fs` path remains
   invisible to SimDisk power-loss schedules. Test each boundary under both WAL
-  fsync policies, including restart after a lost directory entry; an in-memory
-  pointer or surviving page-cache prefix is not durability evidence.
-
-The snapshot parent-directory open error is a separate immediate fix, not gated
-on the wider #411 audit or the control-plane design. Main's
-`persist_snapshot_metadata` silently skips directory sync when `File::open(parent)`
-fails. Propagate the open error, preserve the previous published pointer, and
-cover the failure before the 0.7 release. This narrow fix does not by itself
-bring snapshot metadata into the simulated I/O path.
+  fsync policies, including restart after a lost directory entry.
+- [#449](https://github.com/tonbo-io/ursula/pull/449): retain snapshot pins after
+  metadata publication fails or its outcome is uncertain. A surviving in-memory
+  pointer or page-cache prefix does not establish durable publication.
 
 ## #416: authority and availability
 
@@ -89,12 +84,20 @@ bootstrap addresses, not a replacement placement map on every restart.
 The proposed rollout preserves current static deployments until an explicit
 managed-mode transition is supported. A standalone durable node must keep
 working with only `wal.path`, without configuring remote meta peers. Managed
-mode is explicit and durably recorded. Static mode uses the existing data memberships and exposes no new dynamic
-maintenance API. Managed mode uses meta exclusively for control intents. These
-are mutually exclusive persisted deployment modes, not an `enabled=false`
+mode is explicit and durably recorded. Static mode uses the existing data
+memberships and exposes no new dynamic maintenance API. Managed mode uses meta
+exclusively for control intents. These are mutually exclusive persisted
+deployment modes, not an `enabled=false`
 fallback inside a managed group. Static and managed writers must never
 operate concurrently on the same group. The conversion protocol, storage epoch
 and any unsupported upgrade boundary must be reviewed before enabling it.
+
+The persisted managed-mode record and the meta namespace in the per-core journal
+change the storage format. Under the same-minor compatibility policy, 0.7.x
+patches must interoperate and support in-place rolling upgrades. These format
+changes therefore require a minor release, 0.8 at the earliest, with a format-epoch
+bump and the upgrade boundary settled in design review. They must not ship in a
+0.7.x patch.
 
 The following table states the proposed acceptance contract, not the frozen
 implementation's current behavior.
@@ -130,8 +133,9 @@ replay and durability barriers. It is not a drop-in data-group allocation:
 `CoreJournalRecord` currently carries `UrsulaRaftTypeConfig` entries and a data
 `group_id`. The storage change must introduce a typed record/group namespace for
 meta, keep its identity outside client-visible shard routing, and define the
-storage-format upgrade boundary. A second WAL implementation needs a concrete
-reason that this shared representation cannot support the required lifecycle;
+storage-format upgrade boundary for 0.8 or a later minor release, as required
+above. A second WAL implementation needs a concrete reason that this shared
+representation cannot support the required lifecycle;
 a different Raft command type alone is not that reason.
 
 Test recovery under both `always` and `never`, including a full-cluster power
@@ -233,10 +237,10 @@ unavailable, and must expose the exact blocking condition.
 
 Restart recovery applies to every participant, not just the node currently
 executing an action. Same-volume participants reconstruct state from durable
-receipts and membership without requiring a rebuild. Deferring a boot claim while meta is unavailable
-does not authorize rebinding an old executor receipt to the new process.
-Property tests cover
-transition invariants, while production-path tests cover I/O and cancellation.
+receipts and membership without requiring a rebuild. Deferring a boot claim
+while meta is unavailable does not authorize rebinding an old executor receipt
+to the new process. Property tests cover transition invariants, while
+production-path tests cover I/O and cancellation.
 
 ## Node lifecycle
 
@@ -260,27 +264,32 @@ PR. Do not introduce per-data-RPC meta reads to implement authorization.
 
 Independent work can proceed alongside design review:
 
-- #410 and #417 each get their own cleanup PR.
-- #412 classifies native/simulated tests and exposes the intended CI suite.
-- #413 shared metrics and #415 readiness can follow together as dependent small
-  PRs. Test healthy survivors serving during a real three-node rebuild while
-  maintenance safety refuses a second disruption. Verify the rebuilding pod
-  stays unready and the deployed Service/PDB behavior.
-- #418 isolation requires panic, infrastructure error and normal business-reject
-  cases. A partially mutated failed group cannot serve or publish snapshots.
-  Another group on the same owner must keep working. Preserve the failed WAL
-  and prove corrected-code replay. A multi-replica poison-pill drill and the
-  supported operator recovery contract remain separate acceptance requirements.
-- #414 changes require a baseline profile and bounded-progress tests. Existing
-  biased selection in the Raft owner does not prove the new runtime service
+- #417 allocation assertions are covered by
+  [#430](https://github.com/tonbo-io/ursula/pull/430).
+- #412 test classification and madsim CI are covered by
+  [#433](https://github.com/tonbo-io/ursula/pull/433).
+- #411 recovery follow-ups remain split across #432, #444, #445 and #449 as
+  described above, with their own fault evidence and limitations.
+- #413 shared metrics and engine registration, and the released part of #415
+  readiness, are the baseline for later topology and maintenance integration.
+  Preserve healthy survivors serving during a rebuild while maintenance safety
+  refuses a second disruption. Verify the rebuilding pod stays unready and the
+  deployed Service/PDB behavior.
+- #418 isolation and diagnostics are released. Preserve their panic,
+  infrastructure-error and business-reject regressions, stopped-group behavior
+  and unaffected-group progress. The supported operator recovery contract and
+  the skipped multi-replica poison-pill drill remain separate acceptance work.
+- #414's remaining changes require a baseline profile and bounded-progress tests.
+  Existing biased selection in the Raft owner does not prove the runtime service
   queue is fair under continuous load.
 
 After this design is reviewed, #416 proceeds in dependency order:
 
 1. One pure operation model, including recovery outcomes and transition tests.
 2. Append-only meta storage in the shared per-core WAL and authenticated
-   transport with explicit managed-mode startup. Validate both fsync policies
-   through the native/SimDisk I/O seam. Keep it unenabled until the remaining
+   transport with explicit managed-mode startup, for 0.8 or a later minor release
+   with the reviewed format-epoch and upgrade boundary. Validate both fsync
+   policies through the native/SimDisk I/O seam. Keep it unenabled until the remaining
    integration is complete.
 3. Encapsulated request/response identity admission and simulated durable fences.
 4. Thin executor with participant restart and cancellation reconciliation.
