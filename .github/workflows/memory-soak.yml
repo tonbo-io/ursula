@@ -37,8 +37,13 @@ env:
 jobs:
   build-ursula:
     name: Build release ursula
-    runs-on: depot-ubuntu-24.04-8
+    # Fork PRs stay on Depot: RunsOn runners run inside our AWS account.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'depot-ubuntu-24.04-8' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a+m7i+m8i/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -61,7 +66,7 @@ jobs:
   soak:
     name: Soak (${{ github.event.inputs.owners || '128' }} owners)
     needs: build-ursula
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'depot-ubuntu-24.04-8' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a+m7i+m8i/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -71,6 +76,10 @@ jobs:
       # env-scraping code, not a boundary.
       NO_OIDC: env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
     steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on Depot and GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
       - name: Checkout
         uses: actions/checkout@v6
 
