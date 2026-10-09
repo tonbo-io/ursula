@@ -63,6 +63,7 @@ export interface AttachStatus {
 	readonly poisoned: boolean;
 	/** Poisoned because a newer owner claimed the stream, the stream was deleted and recreated, or another writer appended with a higher `Stream-Seq`. */
 	readonly fenced: boolean;
+	/** Why it is poisoned: the first failure, which a later one never replaces (so `fenced` never changes once set). */
 	readonly reason: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;

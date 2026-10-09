@@ -208,15 +208,7 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<bool, Error> {
     let fence = |what: String, e: Error| {
         // Not `poison()`: the overlay belongs to a write transaction that may be in flight; it
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
-        let mut d = lock(db);
-        log::emit(Level::Warn, "poisoned", &[
-            ("file", &d.path),
-            ("stream", &d.url),
-            ("fenced", &e.is_fenced()),
-            ("during", &what),
-            ("reason", &e),
-        ]);
-        d.poisoned = Some(e);
+        lock(db).set_poisoned(e, Some(&what));
     };
     match put_idempotent(
         &format!("{url}/snapshot/{offset}"),
