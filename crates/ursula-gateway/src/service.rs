@@ -33,16 +33,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let _observability = ursula_observability::init(init_options);
 
     let installed_access_control = access_control(&args)?;
-    let config = GatewayConfig {
-        listen: args.listen,
-        upstreams: args.upstream,
-        response_header_timeout: Duration::from_secs(args.response_header_timeout),
-        connect_timeout: Duration::from_secs(args.connect_timeout),
-        max_request_body_bytes: args.max_request_body_bytes,
-        raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
-        cors_allowed_origins: args.cors_allowed_origin.clone(),
-        usage_chunk_bytes: args.usage_chunk_bytes.map(NonZeroU64::get),
-    };
+    let config = gateway_config(&args);
 
     let mut gateway = match installed_access_control {
         Some(access_control) => Gateway::with_access_control(config.clone(), access_control),
@@ -139,6 +130,21 @@ fn access_control(args: &GatewayArgs) -> Result<Option<AccessControl>, Box<dyn s
     )))
 }
 
+fn gateway_config(args: &GatewayArgs) -> GatewayConfig {
+    GatewayConfig {
+        listen: args.listen,
+        upstreams: args.upstream.clone(),
+        response_header_timeout: Duration::from_secs(args.response_header_timeout),
+        connect_timeout: Duration::from_secs(args.connect_timeout),
+        upstream_tcp_user_timeout: (args.upstream_tcp_user_timeout > 0)
+            .then(|| Duration::from_secs(args.upstream_tcp_user_timeout)),
+        max_request_body_bytes: args.max_request_body_bytes,
+        raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
+        cors_allowed_origins: args.cors_allowed_origin.clone(),
+        usage_chunk_bytes: args.usage_chunk_bytes.map(NonZeroU64::get),
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct GatewayArgs {
     /// Address to bind the gateway server.
@@ -157,6 +163,14 @@ pub struct GatewayArgs {
     /// TCP connect timeout per upstream attempt in seconds.
     #[arg(long, default_value_t = 5)]
     connect_timeout: u64,
+
+    /// Seconds data sent to an upstream may stay unacknowledged before the
+    /// connection is closed and its request fails with 502 (Linux
+    /// `TCP_USER_TIMEOUT`). Bounds how long a request waits on a connection
+    /// to a node that vanished without closing it, such as a force-deleted
+    /// pod. 0 keeps the kernel default, about 15 minutes.
+    #[arg(long, default_value_t = 5)]
+    upstream_tcp_user_timeout: u64,
 
     /// Maximum request body bytes buffered for leader-redirect replay.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
@@ -230,8 +244,43 @@ mod tests {
     use std::time::Duration;
 
     use axum::Router;
+    use clap::Parser;
     use tokio::sync::oneshot;
     use ursula_observability::serve::serve_until_shutdown;
+
+    use super::GatewayArgs;
+    use super::gateway_config;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: GatewayArgs,
+    }
+
+    fn config_from(extra: &[&str]) -> crate::GatewayConfig {
+        let argv = ["ursulagw", "--upstream", "http://node:4437"]
+            .iter()
+            .chain(extra);
+        gateway_config(&Cli::try_parse_from(argv).unwrap().args)
+    }
+
+    // A request on a connection to a vanished upstream fails after 5 s
+    // unless configured otherwise (#495); 0 keeps the kernel's default.
+    #[test]
+    fn upstream_tcp_user_timeout_defaults_to_five_seconds_and_zero_disables_it() {
+        assert_eq!(
+            config_from(&[]).upstream_tcp_user_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            config_from(&["--upstream-tcp-user-timeout", "2"]).upstream_tcp_user_timeout,
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            config_from(&["--upstream-tcp-user-timeout", "0"]).upstream_tcp_user_timeout,
+            None
+        );
+    }
 
     #[tokio::test]
     async fn serve_with_shutdown_does_not_return_before_shutdown_signal() {

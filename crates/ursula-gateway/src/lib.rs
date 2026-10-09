@@ -111,6 +111,15 @@ pub struct GatewayConfig {
     /// Covers only response headers so SSE bodies stay open.
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
+    /// How long data sent to an upstream may stay unacknowledged before the
+    /// connection is closed and its request fails (Linux `TCP_USER_TIMEOUT`;
+    /// ignored elsewhere). An upstream that vanishes without closing its
+    /// connections, as a force-deleted pod's address does, otherwise holds a
+    /// request on a pooled connection until `response_header_timeout`. It
+    /// also bounds the keepalive probes of an idle connection, so a dead one
+    /// leaves the pool before it is reused. `None` keeps the kernel default
+    /// (retransmissions for about 15 minutes).
+    pub upstream_tcp_user_timeout: Option<Duration>,
     pub max_request_body_bytes: usize,
     /// Raft topology used to share one learned leader across every stream in
     /// the same group. `None` preserves per-stream affinity for standalone
@@ -162,11 +171,7 @@ impl Gateway {
         let shard_map = config
             .raft_group_count
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
-        let client = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("static gateway reqwest client config should be valid");
+        let client = upstream_client(&config);
         let response_header_timeout = config.response_header_timeout;
         let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
         Self {
@@ -692,6 +697,32 @@ impl Gateway {
             leader_cache_entries,
         }
     }
+}
+
+/// Idle time before an upstream connection is probed, and the time between
+/// probes.
+const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+/// Unanswered probes before an idle connection is dropped where
+/// `TCP_USER_TIMEOUT` does not bound them.
+const UPSTREAM_KEEPALIVE_RETRIES: u32 = 3;
+
+/// The client for every upstream request. Redirects are the gateway's to
+/// follow. A connection to an upstream that stopped answering fails within
+/// `upstream_tcp_user_timeout` while a request waits on it, and within the
+/// keepalive bounds while it idles in the pool.
+fn upstream_client(config: &GatewayConfig) -> reqwest::Client {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(config.connect_timeout)
+        .tcp_keepalive(UPSTREAM_KEEPALIVE_IDLE)
+        .tcp_keepalive_interval(UPSTREAM_KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(UPSTREAM_KEEPALIVE_RETRIES)
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(target_os = "linux")]
+    let builder = builder.tcp_user_timeout(config.upstream_tcp_user_timeout);
+    builder
+        .build()
+        .expect("static gateway reqwest client config should be valid")
 }
 
 /// The leader-cache key of a stream route: its Raft group when the topology
