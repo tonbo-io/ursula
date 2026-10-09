@@ -32,6 +32,9 @@ jobs:
     name: Authorize exact main release
     runs-on: ubuntu-24.04
     outputs:
+      chaos_image_latest: ${{ steps.latest.outputs.chaos_image_latest }}
+      image_latest: ${{ steps.latest.outputs.image_latest }}
+      is_highest: ${{ steps.latest.outputs.is_highest }}
       source_revision: ${{ steps.release.outputs.source_revision }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -100,6 +103,49 @@ jobs:
           echo "source_revision=$SOURCE_REVISION" >>"$GITHUB_OUTPUT"
           echo "version=$RELEASE_VERSION" >>"$GITHUB_OUTPUT"
 
+      # The latest image tag moves only to a stable version above every other
+      # stable release tag, so a patch to an older line or an X.Y.Z-patchN
+      # release leaves it alone. When it stays, finalize checks that it still
+      # points at the images recorded here.
+      - name: Decide whether latest moves
+        id: latest
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          is_highest=false
+          if [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            highest="$(git ls-remote --tags --refs origin 'refs/tags/v*' |
+              awk -v current="$RELEASE_VERSION" '
+                { tag = $2; sub(/^refs\/tags\/v/, "", tag) }
+                tag ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && tag != current { print tag }
+              ' |
+              sort -V | tail -n 1)"
+            if [ -z "$highest" ] ||
+              [ "$(printf '%s\n' "$highest" "$RELEASE_VERSION" | sort -V | tail -n 1)" = "$RELEASE_VERSION" ]; then
+              is_highest=true
+            fi
+          fi
+
+          image_latest=""
+          chaos_image_latest=""
+          if [ "$is_highest" = false ]; then
+            image_latest="$(docker buildx imagetools inspect "ghcr.io/$REPOSITORY:latest" \
+              --format '{{json .Manifest}}' | jq -r .digest)"
+            chaos_image_latest="$(docker buildx imagetools inspect "ghcr.io/$REPOSITORY-chaos-agent:latest" \
+              --format '{{json .Manifest}}' | jq -r .digest)"
+            [[ "$image_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$chaos_image_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          fi
+
+          echo "Latest moves to $RELEASE_VERSION: $is_highest" >>"$GITHUB_STEP_SUMMARY"
+          {
+            echo "is_highest=$is_highest"
+            echo "image_latest=$image_latest"
+            echo "chaos_image_latest=$chaos_image_latest"
+          } >>"$GITHUB_OUTPUT"
+
   crates_check:
     name: Validate crates.io packages
     needs: validate
@@ -133,6 +179,7 @@ jobs:
     needs: [validate, crates]
     uses: ./.github/workflows/docker-publish.yml
     with:
+      latest: ${{ needs.validate.outputs.is_highest == 'true' }}
       publish: true
       source_revision: ${{ needs.validate.outputs.source_revision }}
       version: ${{ needs.validate.outputs.version }}
@@ -142,6 +189,7 @@ jobs:
     needs: [validate, crates]
     uses: ./.github/workflows/chaos-docker-publish.yml
     with:
+      latest: ${{ needs.validate.outputs.is_highest == 'true' }}
       publish: true
       source_revision: ${{ needs.validate.outputs.source_revision }}
       version: ${{ needs.validate.outputs.version }}
@@ -183,8 +231,11 @@ jobs:
           CHAOS_CHART_DIGEST: ${{ needs.chaos_helm.outputs.digest }}
           CHAOS_IMAGE_DIGEST: ${{ needs.chaos_docker.outputs.digest }}
           CHART_DIGEST: ${{ needs.helm.outputs.digest }}
+          CHAOS_IMAGE_LATEST_BEFORE: ${{ needs.validate.outputs.chaos_image_latest }}
           GH_TOKEN: ${{ github.token }}
           IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+          IMAGE_LATEST_BEFORE: ${{ needs.validate.outputs.image_latest }}
+          IS_HIGHEST: ${{ needs.validate.outputs.is_highest }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_REVISION: ${{ needs.validate.outputs.source_revision }}
@@ -196,14 +247,30 @@ jobs:
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           done
 
+          # latest names this release only when it is the highest stable
+          # version. Otherwise it must still name what validate recorded.
+          if [ "$IS_HIGHEST" = true ]; then
+            image_latest="$IMAGE_DIGEST"
+            chaos_image_latest="$CHAOS_IMAGE_DIGEST"
+          else
+            test "$IS_HIGHEST" = false
+            image_latest="$IMAGE_LATEST_BEFORE"
+            chaos_image_latest="$CHAOS_IMAGE_LATEST_BEFORE"
+          fi
+
           # The release tag resolves to the published index, which holds
           # exactly the two platform images and no attestation manifests.
           # Provenance and the SBOM are GitHub artifact attestations on the
           # index digest, signed by the image's publish workflow on main at
           # the released commit.
           verify_image() {
-            local image="$1" digest="$2" workflow="$3"
-            local index config predicate_type
+            local image="$1" digest="$2" workflow="$3" expected_latest="$4"
+            local index config latest predicate_type
+            [[ "$expected_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            latest="$(docker buildx imagetools inspect "$image:latest" \
+              --format '{{json .Manifest}}' | jq -r .digest)"
+            test "$latest" = "$expected_latest"
+
             index="$(docker buildx imagetools inspect "$image:$RELEASE_VERSION" \
               --format '{{json .Manifest}}')"
             jq -e --arg digest "$digest" '
@@ -232,8 +299,9 @@ jobs:
             done
           }
 
-          verify_image "ghcr.io/$REPOSITORY" "$IMAGE_DIGEST" docker-publish.yml
-          verify_image "ghcr.io/$REPOSITORY-chaos-agent" "$CHAOS_IMAGE_DIGEST" chaos-docker-publish.yml
+          verify_image "ghcr.io/$REPOSITORY" "$IMAGE_DIGEST" docker-publish.yml "$image_latest"
+          verify_image "ghcr.io/$REPOSITORY-chaos-agent" "$CHAOS_IMAGE_DIGEST" chaos-docker-publish.yml \
+            "$chaos_image_latest"
 
           chart="$(helm show chart "oci://ghcr.io/${{ github.repository_owner }}/charts/ursula@$CHART_DIGEST")"
           test "$(yq -r .version <<<"$chart")" = "$RELEASE_VERSION"

@@ -10,6 +10,10 @@ on:
       - scripts/validate-release-version.sh
   workflow_call:
     inputs:
+      latest:
+        description: Point latest at this release, which is the highest stable version
+        required: true
+        type: boolean
       publish:
         required: true
         type: boolean
@@ -84,10 +88,14 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest comes only from the caller's decision, never from
+          # metadata-action, which cannot see the other release tags.
+          flavor: latest=false
           tags: |
             type=ref,event=pr
             type=raw,value=${{ inputs.version }},enable=${{ inputs.publish == true }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish == true && !contains(inputs.version, '-') }}
+            type=raw,value=latest,enable=${{ inputs.publish == true && inputs.latest == true && !contains(inputs.version, '-') }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ inputs.source_revision || github.sha }}
