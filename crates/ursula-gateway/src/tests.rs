@@ -357,7 +357,7 @@ async fn gateway_sends_one_probe_at_a_time() {
         Gateway::new(test_config(vec![silent.url.clone(), live.url.clone()]))
             .with_clock(clock.clone()),
     );
-    gateway.upstream_failed(None, &silent.url);
+    gateway.ejections.failed(&silent.url, clock.now());
     clock.advance(Duration::from_secs(10));
     assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
 
@@ -395,7 +395,7 @@ async fn gateway_restores_an_upstream_that_answers_its_probe() {
     let clock = Clock::manual();
     let gateway = Gateway::new(test_config(vec![live.url.clone(), other.url.clone()]))
         .with_clock(clock.clone());
-    gateway.upstream_failed(None, &live.url);
+    gateway.ejections.failed(&live.url, clock.now());
     clock.advance(Duration::from_secs(10));
 
     gateway.remember_leader("/bucket/stream".to_owned(), live.url.clone());
@@ -404,25 +404,6 @@ async fn gateway_restores_an_upstream_that_answers_its_probe() {
     assert_eq!(response.status(), StatusCode::OK);
     // Unanswered, the probe would keep it out for another base window.
     assert_eq!(gateway.metrics_snapshot().ejected_upstreams, 0);
-    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
-}
-
-/// An upstream that accepts a request and sends no response headers in time
-/// is ejected like one that refuses connections.
-#[tokio::test]
-async fn gateway_ejects_an_upstream_that_sends_no_response_headers() {
-    let silent = silent_upstream().await;
-    let live = answering_upstream().await;
-    let mut config = test_config(vec![silent.url.clone(), live.url.clone()]);
-    config.response_header_timeout = Duration::from_millis(200);
-    let gateway = Gateway::new(config);
-    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
-
-    let response = gateway.handle(get_stream()).await;
-
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
-    all_answered(&gateway, "s", 40).await;
 }
 
 /// The leader a follower redirects to is ejected when it fails, and the
@@ -477,6 +458,20 @@ async fn gateway_still_sends_when_every_upstream_is_ejected() {
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 1);
 }
 
+/// A request that could not be built never left the gateway, so its
+/// upstream stays in selection.
+#[tokio::test]
+async fn gateway_does_not_eject_an_upstream_for_a_request_it_could_not_build() {
+    let gateway = Gateway::new(test_config(vec!["not a url".to_owned()]));
+
+    let response = gateway.handle(get_stream()).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(metrics.upstream_ejections, 0);
+    assert_eq!(metrics.ejected_upstreams, 0);
+}
+
 /// A cached route to an ejected upstream is not followed: the request picks
 /// a live one.
 #[tokio::test]
@@ -497,7 +492,8 @@ async fn gateway_drops_a_cached_route_to_an_ejected_upstream() {
 
 /// A cached leader that accepts the request and never answers is dropped
 /// too. The request may have reached it, so the answer is a 504, not a
-/// retry invitation.
+/// retry invitation. The upstream stays in selection: one slow group on a
+/// live node looks the same.
 #[tokio::test]
 async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let silent = spawn_upstream(
@@ -513,6 +509,8 @@ async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.leader_cache_evictions, 1);
     assert_eq!(metrics.leader_cache_entries, 0);
+    assert_eq!(metrics.upstream_ejections, 0);
+    assert_eq!(metrics.ejected_upstreams, 0);
 }
 
 #[test]

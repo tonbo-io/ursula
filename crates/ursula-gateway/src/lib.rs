@@ -489,7 +489,7 @@ impl Gateway {
         let upstream_resp = self
             .send_request(upstream, &target_url, parts, body.clone())
             .await
-            .inspect_err(|_| self.upstream_failed(pin_key.as_deref(), upstream))?;
+            .inspect_err(|error| self.upstream_failed(pin_key.as_deref(), upstream, error))?;
         self.upstream_answered(upstream);
 
         // Raft leadership redirect: follow internally for all methods because
@@ -519,8 +519,8 @@ impl Gateway {
                 let leader_resp = self
                     .send_request(leader_upstream, &leader_target, parts, body)
                     .await
-                    .inspect_err(|_| {
-                        self.upstream_failed(pin_key.as_deref(), leader_upstream);
+                    .inspect_err(|error| {
+                        self.upstream_failed(pin_key.as_deref(), leader_upstream, error);
                     })?;
                 self.upstream_answered(leader_upstream);
                 self.metrics.leader_redirect_ns.fetch_add(
@@ -586,13 +586,16 @@ impl Gateway {
         })
     }
 
-    /// An upstream that failed at the transport (down, gone, or silent) loses
-    /// its cached route, so the next request learns the current leader instead
-    /// of failing on the same node, and leaves selection for a window, so that
-    /// request does not pick it again at random (#454).
-    fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str) {
+    /// An upstream whose request failed loses its cached route, so the next
+    /// request learns the current leader instead of failing on the same node.
+    /// One that failed at the transport (down or gone) also leaves selection
+    /// for a window, so that request does not pick it again at random (#454).
+    fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str, error: &GatewayError) {
         if let Some(key) = pin_key {
             self.forget_leader_if_matches(key, upstream);
+        }
+        if !error.ejects_upstream() {
+            return;
         }
         if let Failed::Ejected { window, failures } =
             self.ejections.failed(upstream, self.clock.now())
@@ -1198,6 +1201,20 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    /// Whether the upstream failed at the transport, so selection should
+    /// leave it out for a while (#454). A missing response within the header
+    /// timeout is not such a failure: one slow group on a live node causes it
+    /// too, and a node that vanished fails its connections within the
+    /// upstream TCP user timeout instead. Nor is a request that could not be
+    /// built, which never left the gateway.
+    fn ejects_upstream(&self) -> bool {
+        match self {
+            Self::UpstreamUnreachable { .. } => true,
+            Self::Upstream { source, .. } => !source.is_builder(),
+            Self::UpstreamTimeout { .. } | Self::ResponseBuild(_) => false,
+        }
+    }
+
     /// The client's answer. Only an unreachable upstream is safe to retry
     /// whatever the method (503 with `Retry-After`, as Ursula answers while
     /// a group has no reachable leader): the request was never sent. The
