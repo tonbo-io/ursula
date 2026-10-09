@@ -140,7 +140,8 @@ pub struct RaftGroupEngine {
     pub(crate) rejoin: std::sync::Mutex<Option<Arc<crate::GroupRejoin>>>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
     pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
-    pub(crate) metadata_serial: Arc<crate::rt::sync::Mutex<()>>,
+    pub(crate) metadata_serial:
+        Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
     pub(crate) recovery_tasks: crate::rejoin::RecoveryGate,
     pub(crate) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     pub(crate) placement: ShardPlacement,
