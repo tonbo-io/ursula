@@ -510,14 +510,14 @@ impl LeaderChannels {
         false
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(madsim)))]
     fn contains(&self, address: &str) -> bool {
         self.lock().by_address.contains_key(address)
     }
 }
 
 /// Whether this process holds a forwarding channel to `address`.
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn has_leader_channel(address: &str) -> bool {
     LEADER_CHANNELS.contains(address)
 }

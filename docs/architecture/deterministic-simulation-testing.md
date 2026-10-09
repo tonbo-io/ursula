@@ -52,9 +52,9 @@ The main friction points are:
 ## Raft unit-test boundaries
 
 CI runs both `cargo test -p ursula-raft --lib` and
-`RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib`. The latter runs the
-every test that compiles under `cfg(madsim)`, without a name filter. Native tests remain part of the regular
-workspace unit-test job.
+`RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib`. The latter runs
+every test that compiles under `cfg(madsim)`, without a name filter. Native
+tests remain part of the regular workspace unit-test job.
 
 | Fixture | Native coverage | Simulation coverage |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ simulated by merely starting a Tokio runtime. Simulator fixtures explicitly
 enter `MadsimOpenRaftRuntime::scope` and provision `SimDisk` paths. Do not gate
 pure tests with an entire mixed module, or remove native assertions to make the
 simulated suite pass. The existing ignored strict-replay diagnostic subprobes
-are unchanged; the full strict append/read replay runs by default.
+are unchanged. The full strict append/read replay runs by default.
 
 ## Approach
 

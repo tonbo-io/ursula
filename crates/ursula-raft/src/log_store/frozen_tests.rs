@@ -38,7 +38,6 @@ use super::sim_disk::SimDiskFault;
 use super::writer::WireCodec;
 use crate::codec::encode_wire;
 use crate::types::UrsulaRaftTypeConfig;
-use crate::types::entry_log_bytes;
 
 type Entry = EntryOf<UrsulaRaftTypeConfig>;
 type Id = LogIdOf<UrsulaRaftTypeConfig>;
