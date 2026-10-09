@@ -102,9 +102,11 @@ prevent re-acquiring leadership. It keeps Raft transport available while attempt
 to hand off each leadership to an eligible voter (see the handoff rule under
 [Recovering after a host crash](#recovering-after-a-host-crash)). It waits for
 observed leadership changes for up to five seconds, then closes Raft transport and
-drains HTTP listeners. It then stops its Raft groups, `fsync`s every journal and
-records a clean shutdown, so the next start reads the journals strictly and the
-node holds every entry it acknowledged. The whole shutdown has a deadline of
+drains HTTP listeners for up to ten seconds. A connection still open after
+that, such as one from a peer that lost power, is abandoned. It then stops its
+Raft groups, `fsync`s every journal and records a clean shutdown, so the next
+start reads the journals strictly and the node holds every entry it
+acknowledged. The whole shutdown has a deadline of
 twenty seconds from the first signal. If it has not finished by then, the
 process exits without recording a clean shutdown, and the next start treats the
 run as a crash. A second signal also exits at once without recording a clean

@@ -100,7 +100,7 @@ pub async fn serve_until_shutdown(
                     Err(_) => {
                         tracing::warn!(
                             drain_timeout_secs = timeout.as_secs(),
-                            "graceful shutdown timeout elapsed; exiting"
+                            "graceful drain timed out; abandoning the connections still open"
                         );
                         Ok(())
                     }

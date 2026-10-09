@@ -451,7 +451,7 @@ async fn serve(
         admin_listener,
         admin_app,
         notified(shutdown.clone()),
-        None,
+        Some(SHUTDOWN_DRAIN_GRACE),
     ));
 
     if let Some(cluster_addr) = cluster_listen {
@@ -472,13 +472,13 @@ async fn serve(
             client_listener,
             client_app,
             notified(shutdown.clone()),
-            None,
+            Some(SHUTDOWN_DRAIN_GRACE),
         ));
         let cluster_task = tokio::spawn(serve_until_shutdown(
             cluster_listener,
             cluster_app,
             notified(shutdown),
-            None,
+            Some(SHUTDOWN_DRAIN_GRACE),
         ));
         let (client_res, cluster_res, admin_res) =
             tokio::try_join!(client_task, cluster_task, admin_task)?;
@@ -500,13 +500,13 @@ async fn serve(
             listener,
             app,
             notified(shutdown),
-            None,
+            Some(SHUTDOWN_DRAIN_GRACE),
         ));
         let (serve_res, admin_res) = tokio::try_join!(serve_task, admin_task)?;
         serve_res?;
         admin_res?;
     }
-    tracing::info!("all listeners drained; stopping the Raft groups");
+    tracing::info!("listeners closed; stopping the Raft groups");
     let wal_shutdown = shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
     tracing::info!("exiting");
     Ok(wal_shutdown)
@@ -571,6 +571,12 @@ async fn notified(shutdown: Arc<Notify>) {
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// Leave most of the overall grace period for draining HTTP requests.
 const SHUTDOWN_HANDOFF_GRACE: Duration = Duration::from_secs(5);
+/// Bound on the listener drain, so stopping the groups and closing the WAL
+/// keep what is left of [`SHUTDOWN_GRACE`]. A connection from a peer that lost
+/// power never closes, even after transport shutdown ends its inbound append
+/// streams, so an unbounded drain waited for the forced exit and the run was
+/// recorded as a crash.
+const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Translate SIGTERM (systemd stop, Kubernetes pod termination) and Ctrl-C
 /// into a bounded leadership handoff followed by listener draining, after
@@ -631,6 +637,12 @@ mod tests {
     use std::io::Write;
 
     use super::parse_start_maintenance_drained;
+
+    #[test]
+    fn bounded_shutdown_phases_leave_time_to_close_the_wal() {
+        let phases = super::SHUTDOWN_HANDOFF_GRACE.saturating_add(super::SHUTDOWN_DRAIN_GRACE);
+        assert!(phases < super::SHUTDOWN_GRACE, "{phases:?}");
+    }
 
     #[test]
     fn startup_maintenance_drain_is_strict_and_opt_in() {
