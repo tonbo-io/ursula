@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -126,6 +127,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         upstreams,
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
+        upstream_tcp_user_timeout_secs: NonZeroU64::new(5).unwrap(),
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         raft_group_count: None,
         cors_allowed_origins: Vec::new(),
@@ -1656,5 +1658,59 @@ mod credential_deadline {
             "{\"record\":1}\n",
             "an already-expired credential must not rewrite a finite response"
         );
+    }
+}
+
+/// Keepalive derived from the upstream user timeout T (#495).
+mod upstream_keepalive {
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    use super::UpstreamKeepalive;
+
+    fn secs(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    fn for_user_timeout(secs: u64) -> UpstreamKeepalive {
+        UpstreamKeepalive::for_user_timeout(NonZeroU64::new(secs).unwrap())
+    }
+
+    fn keepalive(idle: u64, interval: u64) -> UpstreamKeepalive {
+        UpstreamKeepalive {
+            idle: secs(idle),
+            interval: secs(interval),
+            retries: 3,
+        }
+    }
+
+    // Below 5 s, both steps stay at the 1 s the kernel can express.
+    #[test]
+    fn one_second_floors_both_steps() {
+        assert_eq!(for_user_timeout(1), keepalive(1, 1));
+    }
+
+    // The default: probes after 2, 3 and 4 s of silence, closed at about 5 s.
+    #[test]
+    fn five_seconds_probes_three_times_before_closing() {
+        assert_eq!(for_user_timeout(5), keepalive(2, 1));
+    }
+
+    #[test]
+    fn thirty_seconds_scales_both_steps() {
+        assert_eq!(for_user_timeout(30), keepalive(12, 6));
+    }
+
+    // Linux closes an idle connection once T passes with a probe unanswered,
+    // so all three probes go out only if the third is sent before T. With
+    // steps of at least 1 s that needs T >= 4 s: at T = 3 s the third probe
+    // would fall at T.
+    #[test]
+    fn three_probes_go_out_before_the_user_timeout() {
+        for t in 4..=600 {
+            let k = for_user_timeout(t);
+            let third_probe = k.idle.saturating_add(k.interval.saturating_mul(2));
+            assert!(third_probe < secs(t), "T = {t} s: {k:?}");
+        }
     }
 }

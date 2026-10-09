@@ -899,6 +899,11 @@
           "minimum": 1,
           "description": "Timeout for upstream response headers in seconds."
         },
+        "upstreamTcpUserTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Seconds data sent to an upstream may stay unacknowledged before the connection closes (Linux TCP_USER_TIMEOUT)."
+        },
         "maxRequestBodyBytes": {
           "type": "integer",
           "minimum": 1,
@@ -1124,6 +1129,7 @@
         "rustLog",
         "connectTimeoutSeconds",
         "responseHeaderTimeoutSeconds",
+        "upstreamTcpUserTimeoutSeconds",
         "maxRequestBodyBytes",
         "gracefulShutdownTimeoutSeconds",
         "extraArgs",

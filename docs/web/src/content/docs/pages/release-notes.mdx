@@ -5,7 +5,11 @@ description: Changes that affect clients and operators, newest first.
 
 ## 0.7.1
 
-- **Rust library APIs changed.** The `ursula-control`, `ursula-raft` (`MetaRaftHandle` migration methods) and `ursula-proto` (`ProcessIncarnation::try_from` error type) Rust APIs changed, with no wire or on-disk change.
+- **Rust library APIs changed.** The `ursula-control`, `ursula-raft` (`MetaRaftHandle` migration methods), `ursula-proto` (`ProcessIncarnation::try_from` error type) and `ursula-gateway` Rust APIs changed, with no wire or on-disk change. `GatewayConfig` gains the public field `upstream_tcp_user_timeout_secs` (`NonZeroU64`), so code that builds it with a struct literal must set it.
+
+### Fixed
+
+- **The gateway gives up on a connection to a vanished node within seconds** ([#495](https://github.com/tonbo-io/ursula/issues/495)). A voter pod deleted with `--force`, or a host that loses power, leaves the gateway's pooled connections to it open without an answer. A request sent on one waited up to 30 s, reqwest's default `TCP_USER_TIMEOUT`, which is longer than the SQLite VFS's 10 s request timeout, so owners stalled for 10 to 22 s in failover tests. On Linux, upstream connections now give up after 5 s of unacknowledged data, set by the new `--upstream-tcp-user-timeout` flag (Helm `gateway.upstreamTcpUserTimeoutSeconds`). The request fails with `502`, and the client decides whether to retry it. TCP keepalive follows the flag: an idle connection is probed after 2/5 of it and then every 1/5, each at least 1 s. With the default, three probes go out at 2, 3 and 4 s and a dead connection closes at about 5 s, so one lost probe does not close a healthy long-poll or SSE read. The flag takes at least 1 s.
 
 ## 0.7.0
 

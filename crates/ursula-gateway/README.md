@@ -115,6 +115,13 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 --connect-timeout <SECONDS>
     TCP connect timeout per upstream request attempt. Defaults to 5.
 
+--upstream-tcp-user-timeout <SECONDS>
+    How long data sent to an upstream may stay unacknowledged before the
+    connection closes and its request fails with 502 (Linux TCP_USER_TIMEOUT).
+    Idle connections are probed three times within it: first after 2/5 of it,
+    then every 1/5, each at least 1 s. 0.7.0 effectively used reqwest's 30 s
+    default. Defaults to 5. At least 1.
+
 --max-request-body-bytes <BYTES>
     Maximum request body bytes buffered for leader-redirect replay.
     Larger requests return 413 before upstream forwarding. Defaults to 33554432.
@@ -126,6 +133,10 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 ## Operational Notes
 
 - Upstream URLs support `http` and `https`.
+- A node that vanishes without closing its connections, such as a
+  force-deleted pod or a powered-off host, fails the requests waiting on them
+  within `--upstream-tcp-user-timeout` with `502`. The request may have
+  reached the node, so the client decides whether to retry it.
 - Upstreams are selected randomly per request.
 - Request bodies are buffered up to `--max-request-body-bytes` because internal
   leader redirects require replaying the request to a different upstream.

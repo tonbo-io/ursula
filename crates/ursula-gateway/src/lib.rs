@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::error::Error as _;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -111,6 +112,14 @@ pub struct GatewayConfig {
     /// Covers only response headers so SSE bodies stay open.
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Seconds data sent to an upstream may stay unacknowledged before the
+    /// connection is closed and its request fails (Linux `TCP_USER_TIMEOUT`).
+    /// An upstream that vanishes without closing its connections, as a
+    /// force-deleted pod's address or a powered-off host does, otherwise
+    /// holds a request on a pooled connection until the kernel gives up,
+    /// after about 15 minutes. 0.7.0 used reqwest's default of 30 s. Idle
+    /// connections are probed three times within it (see `UpstreamKeepalive`).
+    pub upstream_tcp_user_timeout_secs: NonZeroU64,
     pub max_request_body_bytes: usize,
     /// Raft topology used to share one learned leader across every stream in
     /// the same group. `None` preserves per-stream affinity for standalone
@@ -162,11 +171,7 @@ impl Gateway {
         let shard_map = config
             .raft_group_count
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
-        let client = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("static gateway reqwest client config should be valid");
+        let client = upstream_client(&config);
         let response_header_timeout = config.response_header_timeout;
         let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
         Self {
@@ -692,6 +697,70 @@ impl Gateway {
             leader_cache_entries,
         }
     }
+}
+
+/// Keepalive probing of an idle upstream connection, derived from the
+/// upstream `TCP_USER_TIMEOUT` by [`UpstreamKeepalive::for_user_timeout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UpstreamKeepalive {
+    /// Idle time before the first probe.
+    idle: Duration,
+    /// Time between unanswered probes.
+    interval: Duration,
+    /// Unanswered probes before the connection is closed where
+    /// `TCP_USER_TIMEOUT` does not end probing first (not Linux).
+    retries: u32,
+}
+
+impl UpstreamKeepalive {
+    /// The shortest idle time and interval. Linux takes both in whole seconds,
+    /// rounding down, and refuses 0.
+    const MIN_STEP: Duration = Duration::from_secs(1);
+
+    /// Probing that fits several probes inside a user timeout of
+    /// `user_timeout_secs` (T): the first after 2T/5, then every T/5, each at
+    /// least 1 s, three in all.
+    ///
+    /// On Linux the user timeout also ends keepalive probing: a connection
+    /// that has received nothing for T while a probe is unanswered is closed,
+    /// whatever the retry count. A probe's acknowledgement counts as received.
+    /// With T = 5 s, probes go out after 2, 3 and 4 s of silence, and a
+    /// connection to a vanished upstream closes at about 5 s. One lost probe
+    /// or acknowledgement does not close a healthy idle connection, such as a
+    /// long-poll or an SSE read waiting for data. An idle time of T or more
+    /// would leave a single probe to decide. Elsewhere the three probes close
+    /// a dead connection after `idle + 3 * interval`, which is T for T >= 5 s.
+    fn for_user_timeout(user_timeout_secs: NonZeroU64) -> Self {
+        let fifth = Duration::from_secs(user_timeout_secs.get())
+            .checked_div(5)
+            .unwrap_or_default();
+        Self {
+            idle: fifth.saturating_mul(2).max(Self::MIN_STEP),
+            interval: fifth.max(Self::MIN_STEP),
+            retries: 3,
+        }
+    }
+}
+
+/// The client for every upstream request. Redirects are the gateway's to
+/// follow. A connection to an upstream that stopped answering fails within
+/// `upstream_tcp_user_timeout_secs`, whether a request waits on it or it is
+/// idle.
+fn upstream_client(config: &GatewayConfig) -> reqwest::Client {
+    let keepalive = UpstreamKeepalive::for_user_timeout(config.upstream_tcp_user_timeout_secs);
+    let builder = reqwest::Client::builder()
+        .connect_timeout(config.connect_timeout)
+        .tcp_keepalive(keepalive.idle)
+        .tcp_keepalive_interval(keepalive.interval)
+        .tcp_keepalive_retries(keepalive.retries)
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(target_os = "linux")]
+    let builder = builder.tcp_user_timeout(Duration::from_secs(
+        config.upstream_tcp_user_timeout_secs.get(),
+    ));
+    builder
+        .build()
+        .expect("static gateway reqwest client config should be valid")
 }
 
 /// The leader-cache key of a stream route: its Raft group when the topology
