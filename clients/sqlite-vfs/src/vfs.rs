@@ -44,14 +44,15 @@ use crate::host::OK;
 use crate::host::unix;
 use crate::local::sidecar_line;
 use crate::local::write_sidecar;
-use crate::wal::FIRST_PAGE;
 use crate::wal::FRAME;
 use crate::wal::FRAME_HDR;
 use crate::wal::FRAME_HDR_LEN;
 use crate::wal::FRAME_LEN;
+use crate::wal::PAGE_BYTES;
 use crate::wal::WAL_HDR;
 use crate::wal::WalClaim;
 use crate::wal::be32;
+use crate::wal::page_at;
 
 /// `WAL_WRITE_LOCK` and `WAL_CKPT_LOCK`: the shm lock slots SQLite takes for a write transaction and
 /// a checkpoint.
@@ -161,6 +162,17 @@ unsafe fn main_db(f: *mut ffi::sqlite3_file) -> Option<Arc<Mutex<Db>>> {
 }
 
 impl Db {
+    /// Records a write that reached the local WAL (see `wal_written`): the WAL header starts a new
+    /// generation, a page is remembered by its crc32c.
+    fn record_wal_write(&mut self, off: i64, data: &[u8]) {
+        if off == 0 {
+            self.wal_written.clear();
+        }
+        if data.len() == PAGE && page_at(off) {
+            self.wal_written.insert(off, crc32c::crc32c(data));
+        }
+    }
+
     /// Fsyncs the db file through the main db handle of the connection asking (the one holding the
     /// WAL write lock, or a closing one's EXCLUSIVE lock): before the local WAL starts a new
     /// generation or is truncated to nothing, so a disk image that shows the new WAL holds every
@@ -376,6 +388,25 @@ fn uncount_open(path: &str) {
     }
 }
 
+/// The first page of `buf` (read at `off`) whose bytes differ from what this process wrote there
+/// (`written`, by offset), outside the transaction in progress (`overlay`).
+fn lost_page(
+    written: &BTreeMap<i64, u32>,
+    overlay: &BTreeMap<i64, Vec<u8>>,
+    buf: &[u8],
+    off: i64,
+) -> Option<i64> {
+    let end = off.saturating_add(i64::try_from(buf.len()).unwrap_or(i64::MAX));
+    written
+        .range(off..end)
+        .filter(|&(&p, _)| p.saturating_add(PAGE_BYTES) <= end && !overlay.contains_key(&p))
+        .find_map(|(&p, &crc)| {
+            let at = usize::try_from(p.saturating_sub(off)).ok()?;
+            let page = buf.get(at..at.saturating_add(PAGE))?;
+            (crc32c::crc32c(page) != crc).then_some(p)
+        })
+}
+
 /// `[from, to)` as indexes (`None` for a negative bound).
 fn span(from: i64, to: i64) -> Option<std::ops::Range<usize>> {
     Some(usize::try_from(from).ok()?..usize::try_from(to).ok()?)
@@ -386,13 +417,25 @@ fn span(from: i64, to: i64) -> Option<std::ops::Range<usize>> {
 /// # Safety
 ///
 /// `file` is an open WAL file of this VFS.
-unsafe fn overlay_read(file: *mut ffi::sqlite3_file, db: &Db, buf: &mut [u8], off: i64) -> c_int {
+unsafe fn overlay_read(
+    file: *mut ffi::sqlite3_file,
+    db: &mut Db,
+    buf: &mut [u8],
+    off: i64,
+) -> c_int {
     let Ok(amt) = c_int::try_from(buf.len()) else {
         return ffi::SQLITE_IOERR_READ;
     };
     let rc = fwd!(file, xRead, buf.as_mut_ptr().cast::<c_void>(), amt, off);
     if rc != OK && rc != ffi::SQLITE_IOERR_SHORT_READ {
         return rc;
+    }
+    // A page this process wrote that reads back other bytes was lost on its way to the disk (a
+    // write-back error, after which the kernel dropped the dirty page): SQLite does not check WAL
+    // frames on a read, so commits built on it would append the damage to the stream.
+    if let Some(offset) = lost_page(&db.wal_written, &db.overlay, buf, off) {
+        db.poison(Error::LostWrite { offset });
+        return ffi::SQLITE_IOERR_READ;
     }
     if db.overlay.is_empty() {
         return rc;
@@ -443,7 +486,7 @@ unsafe extern "C" fn x_read(
     // SAFETY: SQLite passes `amt` writable bytes at `buf`.
     let buf = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
     // SAFETY: `file` is a WAL file of this VFS.
-    unsafe { overlay_read(file, &lock(&db), buf, off) }
+    unsafe { overlay_read(file, &mut lock(&db), buf, off) }
 }
 
 unsafe extern "C" fn x_write(
@@ -470,6 +513,13 @@ unsafe extern "C" fn x_write(
     if db.committed {
         // The rest of an acknowledged transaction (checksum rewrites, padding): the local WAL.
         let rc = fwd!(file, xWrite, buf, amt, off);
+        if rc == OK
+            && let Ok(len) = usize::try_from(amt)
+        {
+            // SAFETY: SQLite passes `amt` readable bytes at `buf`.
+            let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
+            db.record_wal_write(off, data);
+        }
         return db.post_ack("local WAL write", rc);
     }
     if db.writer == 0 {
@@ -488,14 +538,11 @@ unsafe extern "C" fn x_write(
     }
     db.overlay.insert(off, data.to_vec());
     // The commit point: the page data of a frame whose header carries "db size after commit".
-    if data.len() == PAGE
-        && off >= FIRST_PAGE
-        && off.saturating_sub(FIRST_PAGE).checked_rem(FRAME) == Some(0)
-    {
+    if data.len() == PAGE && page_at(off) {
         let mut h = [0u8; FRAME_HDR_LEN];
         let header = off.saturating_sub(FRAME_HDR);
         // SAFETY: `file` is a WAL file of this VFS.
-        let rc = unsafe { overlay_read(file, &db, &mut h, header) };
+        let rc = unsafe { overlay_read(file, &mut db, &mut h, header) };
         if rc != OK {
             return rc;
         }
@@ -543,7 +590,7 @@ unsafe extern "C" fn x_write(
 /// `file` is the open WAL file of `db`.
 unsafe fn final_pages(
     file: *mut ffi::sqlite3_file,
-    db: &Db,
+    db: &mut Db,
     size: u32,
     commit_frame: i64,
 ) -> Result<BTreeMap<u32, Vec<u8>>, c_int> {
@@ -551,7 +598,7 @@ unsafe fn final_pages(
     let frames = db.overlay.keys().copied().filter(|&o| {
         o >= WAL_HDR && o <= commit_frame && o.saturating_sub(WAL_HDR).checked_rem(FRAME) == Some(0)
     });
-    for o in frames {
+    for o in frames.collect::<Vec<_>>() {
         let (h, d) = (
             db.overlay.get(&o),
             db.overlay.get(&o.saturating_add(FRAME_HDR)),
@@ -720,6 +767,7 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
             db.poison(Error::LocalWalWrite(rc));
             return rc;
         }
+        db.record_wal_write(o, &d);
     }
     db.committed = true;
     if db.stats.len() < 1_000_000 {
@@ -767,6 +815,8 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
         }
     }
     db.overlay.retain(|&o, _| o < size);
+    db.wal_written
+        .retain(|&o, _| o.saturating_add(PAGE_BYTES) <= size);
     let rc = fwd!(file, xTruncate, size);
     db.post_ack("local WAL truncate", rc)
 }
@@ -1001,3 +1051,47 @@ static METHODS: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     xFetch: Some(x_fetch),
     xUnfetch: Some(x_unfetch),
 };
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::lost_page;
+    use crate::frame::PAGE;
+    use crate::wal::FIRST_PAGE;
+    use crate::wal::FRAME;
+
+    // A page read back is checked against what this process wrote at its offset, wherever it lies
+    // in the read (one page, or a whole frame with its header), unless the transaction in progress
+    // rewrote it (its overlay wins). Pages never written here are not checked.
+    #[test]
+    fn pages_read_back_are_checked_against_what_was_written() {
+        let (first, second) = (FIRST_PAGE, FIRST_PAGE + FRAME);
+        let written = BTreeMap::from([
+            (first, crc32c::crc32c(&[1u8; PAGE])),
+            (second, crc32c::crc32c(&[2u8; PAGE])),
+        ]);
+        let none = BTreeMap::new();
+        assert_eq!(lost_page(&written, &none, &[1u8; PAGE], first), None);
+        assert_eq!(lost_page(&written, &none, &[0u8; PAGE], first), Some(first));
+        // A frame read whole, header first: the page is checked at its offset.
+        let mut frame = vec![9u8; 24];
+        frame.extend([0u8; PAGE]);
+        assert_eq!(
+            lost_page(&written, &none, &frame, second - 24),
+            Some(second)
+        );
+        frame.truncate(24);
+        frame.extend([2u8; PAGE]);
+        assert_eq!(lost_page(&written, &none, &frame, second - 24), None);
+        // Rewritten by the transaction in progress, or never written here: not checked.
+        let overlay = BTreeMap::from([(first, vec![7u8; PAGE])]);
+        assert_eq!(lost_page(&written, &overlay, &[0u8; PAGE], first), None);
+        assert_eq!(
+            lost_page(&written, &none, &[0u8; PAGE], second + FRAME),
+            None
+        );
+        // A read that covers part of a page does not check it.
+        assert_eq!(lost_page(&written, &none, &[0u8; 100], first), None);
+    }
+}

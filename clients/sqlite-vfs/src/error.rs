@@ -216,6 +216,11 @@ pub(crate) enum Error {
     ProducerExpiredAgain,
     #[error("local WAL write: {0}")]
     LocalWalWrite(c_int),
+    #[error(
+        "the WAL page at offset {offset} reads back other bytes than this process wrote there (a \
+         write-back failed, or something else wrote the file)"
+    )]
+    LostWrite { offset: i64 },
 }
 
 /// The data asked for lies below the stream's retention (or a snapshot was superseded): a
