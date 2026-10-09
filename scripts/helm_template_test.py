@@ -377,6 +377,22 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertNotIn("trafficDistribution:", rendered)
 
+    def test_gateway_passes_the_upstream_tcp_user_timeout(self) -> None:
+        flag = '- --upstream-tcp-user-timeout\n            - "{}"'
+        self.assertIn(flag.format(5), render_chart("--set", "s3.bucket=bkt"))
+        # 0 leaves TCP_USER_TIMEOUT unset rather than being refused.
+        self.assertIn(
+            flag.format(0),
+            render_chart("--set", "s3.bucket=bkt", "--set", "gateway.upstreamTcpUserTimeoutSeconds=0"),
+        )
+        result = subprocess.run(
+            ["helm", "template", "test", "charts/ursula", "--set", "s3.bucket=bkt",
+             "--set", "gateway.upstreamTcpUserTimeoutSeconds=-1"],
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
     def test_admin_plane_defaults_to_loopback(self) -> None:
         config = render_config("--set", "s3.bucket=bkt")
 
