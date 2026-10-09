@@ -15,6 +15,8 @@
 //! - [`admission`]: opt-in per-tenant rate, live-read, and body-size limits.
 //! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
+//! - `ejection`: leaves upstreams that failed at the transport out of selection
+//!   for a backoff window, then lets one request at a time probe them (#454).
 
 use std::collections::HashMap;
 use std::error::Error as _;
@@ -42,7 +44,6 @@ use axum::http::header::WWW_AUTHENTICATE;
 use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
 use percent_encoding::percent_decode_str;
-use rand::prelude::IndexedRandom;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
@@ -52,6 +53,7 @@ use ursula_shard::StaticShardMap;
 pub mod admission;
 pub mod auth;
 pub mod cors;
+mod ejection;
 pub mod service;
 pub mod usage;
 
@@ -69,6 +71,8 @@ use crate::auth::AuthorizationDecision;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
+use crate::ejection::Ejections;
+use crate::ejection::Failed;
 use crate::usage::PrincipalRef;
 use crate::usage::UsageClass;
 use crate::usage::UsageCollector;
@@ -91,6 +95,7 @@ struct GatewayMetrics {
     leader_cache_evictions: AtomicU64,
     leader_redirects: AtomicU64,
     leader_redirect_ns: AtomicU64,
+    upstream_ejections: AtomicU64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -103,6 +108,11 @@ struct GatewayMetricsSnapshot {
     leader_redirects: u64,
     leader_redirect_ns: u64,
     leader_cache_entries: usize,
+    /// Times an upstream was left out of selection after a transport failure.
+    upstream_ejections: u64,
+    /// Upstreams left out of selection now: inside their window, or with a
+    /// probe outstanding.
+    upstream_ejected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +162,7 @@ pub struct Gateway {
     usage: Option<Arc<UsageCollector>>,
     shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
+    ejections: Arc<Ejections>,
     metrics: Arc<GatewayMetrics>,
     cors: Option<crate::cors::CorsPolicy>,
 }
@@ -173,6 +184,12 @@ impl Gateway {
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
         let client = upstream_client(&config);
         let response_header_timeout = config.response_header_timeout;
+        // The longest a request to a dead upstream takes to fail at the
+        // transport, so a probe that has neither answered nor failed by then
+        // is not waiting on a dead node.
+        let probe_deadline = config.connect_timeout.saturating_add(Duration::from_secs(
+            config.upstream_tcp_user_timeout_secs.get(),
+        ));
         let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
         Self {
             config,
@@ -184,6 +201,7 @@ impl Gateway {
             usage: None,
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
+            ejections: Arc::new(Ejections::new(probe_deadline)),
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
         }
@@ -417,25 +435,46 @@ impl Gateway {
         Ok(None)
     }
 
+    /// The cached leader route of the request's stream or group, unless its
+    /// upstream is ejected, else an upstream that is not ejected at random
+    /// (see `ejection`).
     fn pick_upstream(&self, uri: &Uri) -> Option<String> {
-        if let Some(key) = upstream_pin_key(uri, self.shard_map.as_ref())
-            && let Some(upstream) = self
-                .leader_affinity
+        let key = upstream_pin_key(uri, self.shard_map.as_ref());
+        // Its own statement: the cache's lock is released before the
+        // ejection lock is taken and before the cache may be taken again.
+        let cached = key.as_ref().and_then(|key| {
+            self.leader_affinity
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&key)
+                .get(key)
                 .cloned()
-        {
+        });
+        let pick = self.ejections.pick(
+            cached.as_deref(),
+            &self.config.upstreams,
+            Instant::now(),
+            &mut rand::rng(),
+        )?;
+        if pick.cached {
             self.metrics
                 .leader_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
-            return Some(upstream);
+        } else {
+            self.metrics
+                .leader_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            // A route to an upstream that is ejected or being probed.
+            if let (Some(key), Some(cached)) = (&key, &cached) {
+                self.forget_leader_if_matches(key, cached);
+            }
         }
-        self.metrics
-            .leader_cache_misses
-            .fetch_add(1, Ordering::Relaxed);
-        let mut rng = rand::rng();
-        self.config.upstreams.choose(&mut rng).cloned()
+        if pick.probe {
+            debug!(
+                upstream = pick.upstream,
+                "probing an upstream whose ejection window expired"
+            );
+        }
+        Some(pick.upstream.to_owned())
     }
 
     async fn forward(
@@ -457,7 +496,8 @@ impl Gateway {
         let upstream_resp = self
             .send_request(upstream, &target_url, parts, body.clone())
             .await
-            .inspect_err(|_| self.forget_failed_upstream(pin_key.as_deref(), upstream))?;
+            .inspect_err(|error| self.upstream_failed(pin_key.as_deref(), upstream, error))?;
+        self.upstream_answered(upstream);
 
         // Raft leadership redirect: follow internally for all methods because
         // the body has been buffered and the client cannot do better than
@@ -486,9 +526,10 @@ impl Gateway {
                 let leader_resp = self
                     .send_request(leader_upstream, &leader_target, parts, body)
                     .await
-                    .inspect_err(|_| {
-                        self.forget_failed_upstream(pin_key.as_deref(), leader_upstream);
+                    .inspect_err(|error| {
+                        self.upstream_failed(pin_key.as_deref(), leader_upstream, error);
                     })?;
+                self.upstream_answered(leader_upstream);
                 self.metrics.leader_redirect_ns.fetch_add(
                     u64::try_from(redirect_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
@@ -552,12 +593,36 @@ impl Gateway {
         })
     }
 
-    /// A cached route whose upstream failed at the transport (down, gone, or
-    /// silent) is dropped, so the next request picks an upstream afresh and
-    /// learns the current leader instead of failing on the same node.
-    fn forget_failed_upstream(&self, pin_key: Option<&str>, upstream: &str) {
+    /// An upstream whose request failed loses its cached route, so the next
+    /// request learns the current leader instead of failing on the same node.
+    /// One that failed at the transport (down or gone) also leaves selection
+    /// for a window, so that request does not pick it again at random (#454).
+    fn upstream_failed(&self, pin_key: Option<&str>, upstream: &str, error: &GatewayError) {
         if let Some(key) = pin_key {
             self.forget_leader_if_matches(key, upstream);
+        }
+        if !error.ejects_upstream() {
+            return;
+        }
+        if let Failed::Ejected { window, failures } =
+            self.ejections.failed(upstream, Instant::now())
+        {
+            self.metrics
+                .upstream_ejections
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                upstream,
+                window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                failures,
+                "upstream failed at the transport; leaving it out of selection"
+            );
+        }
+    }
+
+    /// Any response proves the upstream reachable again.
+    fn upstream_answered(&self, upstream: &str) {
+        if self.ejections.answered(upstream) {
+            tracing::info!(upstream, "upstream answers again; back in selection");
         }
     }
 
@@ -695,6 +760,8 @@ impl Gateway {
             leader_redirects: self.metrics.leader_redirects.load(Ordering::Relaxed),
             leader_redirect_ns: self.metrics.leader_redirect_ns.load(Ordering::Relaxed),
             leader_cache_entries,
+            upstream_ejections: self.metrics.upstream_ejections.load(Ordering::Relaxed),
+            upstream_ejected: self.ejections.active(Instant::now()),
         }
     }
 }
@@ -1141,6 +1208,20 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
+    /// Whether the upstream failed at the transport, so selection should
+    /// leave it out for a while (#454). A missing response within the header
+    /// timeout is not such a failure: one slow group on a live node causes it
+    /// too, and a node that vanished fails its connections within the
+    /// upstream TCP user timeout instead. Nor is a request that could not be
+    /// built, which never left the gateway.
+    fn ejects_upstream(&self) -> bool {
+        match self {
+            Self::UpstreamUnreachable { .. } => true,
+            Self::Upstream { source, .. } => !source.is_builder(),
+            Self::UpstreamTimeout { .. } | Self::ResponseBuild(_) => false,
+        }
+    }
+
     /// The client's answer. Only an unreachable upstream is safe to retry
     /// whatever the method (503 with `Retry-After`, as Ursula answers while
     /// a group has no reachable leader): the request was never sent. The
