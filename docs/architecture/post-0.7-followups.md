@@ -87,17 +87,21 @@ working with only `wal.path`, without configuring remote meta peers. Managed
 mode is explicit and durably recorded. Static mode uses the existing data
 memberships and exposes no new dynamic maintenance API. Managed mode uses meta
 exclusively for control intents. These are mutually exclusive persisted
-deployment modes, not an `enabled=false`
-fallback inside a managed group. Static and managed writers must never
-operate concurrently on the same group. The conversion protocol, storage epoch
-and any unsupported upgrade boundary must be reviewed before enabling it.
+deployment modes, not an `enabled=false` fallback inside a managed group. Static
+and managed writers must never operate concurrently on the same group. The
+conversion protocol, storage epoch and any unsupported upgrade boundary must be
+reviewed before enabling it.
 
 The persisted managed-mode record and the meta namespace in the per-core journal
-change the storage format. Under the same-minor compatibility policy, 0.7.x
-patches must interoperate and support in-place rolling upgrades. These format
-changes therefore require a minor release, 0.8 at the earliest, with a format-epoch
-bump and the upgrade boundary settled in design review. They must not ship in a
-0.7.x patch.
+change the storage format, and an older 0.7.x `ursulactl` cannot operate a
+managed cluster. Under the same-minor compatibility policy, 0.7.x patches must
+interoperate, support in-place rolling upgrades and allow rollback within the
+minor. Code toward managed mode may therefore merge, and ship in a 0.7.x patch,
+only while it is dormant: static mode stays byte-identical on disk and in
+behavior, writes no new record or file, and reads nothing that a 0.7.0-written
+WAL lacks. Enabling managed mode, including writing the managed-mode record or
+any meta journal record, requires a minor release, 0.8 at the earliest, with a
+format-epoch bump and the upgrade boundary settled in design review.
 
 The following table states the proposed acceptance contract, not the frozen
 implementation's current behavior.
@@ -287,10 +291,11 @@ After this design is reviewed, #416 proceeds in dependency order:
 
 1. One pure operation model, including recovery outcomes and transition tests.
 2. Append-only meta storage in the shared per-core WAL and authenticated
-   transport with explicit managed-mode startup, for 0.8 or a later minor release
-   with the reviewed format-epoch and upgrade boundary. Validate both fsync
-   policies through the native/SimDisk I/O seam. Keep it unenabled until the remaining
-   integration is complete.
+   transport with explicit managed-mode startup. It may merge dormant during
+   0.7.x. Enabling it waits for 0.8 or a later minor release with the reviewed
+   format-epoch and upgrade boundary. Validate both fsync policies through the
+   native/SimDisk I/O seam. Keep it unenabled until the remaining integration is
+   complete.
 3. Encapsulated request/response identity admission and simulated durable fences.
 4. Thin executor with participant restart and cancellation reconciliation.
 5. Complete live topology, join and decommission, followed by removal of the
