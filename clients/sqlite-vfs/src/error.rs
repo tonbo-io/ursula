@@ -70,6 +70,11 @@ pub(crate) enum Error {
         cached: String,
         wanted: String,
     },
+    #[error(
+        "{url} is missing and {path} holds data: refusing to create an empty stream over it \
+         (delete {path} to start over, or attach it under another URL)"
+    )]
+    StreamMissing { path: String, url: String },
     #[error("spawn the snapshot thread: {0}")]
     SpawnSnapshotThread(#[source] std::io::Error),
 

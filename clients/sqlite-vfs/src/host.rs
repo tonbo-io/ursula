@@ -75,7 +75,9 @@ pub(crate) fn full_pathname(path: &str) -> Result<String, Error> {
     let mut buf = vec![0u8; len];
     // SAFETY: `c` is NUL-terminated and `buf` holds the `n_out` writable bytes the method may fill.
     let rc = unsafe { full(u, c.as_ptr(), n_out, buf.as_mut_ptr().cast()) };
-    if rc != OK {
+    // SQLite reports a successful canonicalization through a symlink with an extended SQLITE_OK
+    // code (for example macOS /var -> /private/var).
+    if rc != OK && rc != ffi::SQLITE_OK_SYMLINK {
         return Err(Error::FullPathname {
             path: path.to_owned(),
             code: rc,

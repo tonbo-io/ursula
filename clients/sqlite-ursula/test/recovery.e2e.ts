@@ -1,6 +1,8 @@
 // Attach is the only writer of a file it recovers: one owner per file on a host (lock file), and no
 // other connection open while pages are rewritten.
 import { spawn } from "node:child_process";
+import { mkdirSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { expect, it } from "vitest";
 import { attach, loadUrsulaVfs, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -15,6 +17,20 @@ const xs = (file: string): string[] => {
 		db.close();
 	}
 };
+
+it("attach accepts SQLite's successful symlink canonicalization", () => {
+	const root = dirname(freshFile());
+	const actual = join(root, "symlink-target");
+	const alias = join(root, "symlink-alias");
+	mkdirSync(actual);
+	symlinkSync(actual, alias, "dir");
+	const file = join(alias, "db.sqlite");
+	attach(file, ursulaUrl() + streamPath());
+	const db = openPlain(file);
+	db.exec("CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('canonical')");
+	db.close();
+	expect(xs(join(actual, "db.sqlite"))).toEqual(["canonical"]);
+});
 
 it("a second process cannot attach a file another process has attached", async () => {
 	const file = freshFile();
@@ -72,9 +88,9 @@ it("a file with a sidecar opens only while attached here: not before an attach, 
 	const again = openPlain(file);
 	again.exec("INSERT INTO t VALUES ('r2')");
 	again.close();
-	// A failed re-attach of the bound path drops its binding. Nothing listens on port 1: creating
-	// the stream fails.
-	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/create/);
+	// A failed re-attach of the bound path drops its binding. Nothing listens on port 1: the HEAD
+	// fails.
+	expect(() => attach(file, `http://127.0.0.1:1${path}`)).toThrow(/head http:\/\/127\.0\.0\.1:1\//);
 	expect(() => openPlain(file)).toThrow(/unable to open/);
 	expect(() => status(file)).toThrow(/last attach failed/);
 	attach(file, url);
