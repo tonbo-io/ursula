@@ -14,6 +14,10 @@
 //!   attach of it has succeeded in this process: before that, after a failed attach, or in a
 //!   process that never attached it, opening it fails (SQLITE_CANTOPEN), so it is never written
 //!   unreplicated. A file without a sidecar passes through to "unix".
+//!   `SELECT ursula_attach(path, stream_url, 'read_only')` catches the file up the same way but
+//!   claims nothing and never writes the stream (no claim, commit, snapshot or retention move): it
+//!   fences no owner, works while a layer in front of the stream refuses writes, and every write to
+//!   the file fails with SQLITE_READONLY. An attach refused with 402 fails with SQLITE_AUTH.
 //! * Stream: `application/octet-stream`, one self-delimiting frame per append (see [`frame`]):
 //!   a commit carries the db size after it and the transaction's final page images; a claim carries
 //!   the owner's producer epoch. Appends use the idempotent producer (`Producer-Id`
@@ -22,7 +26,8 @@
 //!   whose outcome is unknown is retried with the same sequence until the server answers (a
 //!   duplicate is acknowledged without being applied twice);
 //!   a 403 with `Producer-Epoch` means another owner claimed the stream (an authorizer's 401 or
-//!   403 is a refused token, never a fence; see `auth`). Every request after attach's first
+//!   403 is a refused token, never a fence; see `auth`, and neither is a 402: a layer in front of
+//!   the stream refusing it, see below). Every request after attach's first
 //!   `HEAD` carries that `HEAD`'s `Stream-Incarnation` as a precondition, which the server checks
 //!   atomically with the request (a write at Raft apply): nothing of an owner reaches a stream
 //!   deleted and recreated at its path, and the server's 412 fences and poisons the owner (an
@@ -35,9 +40,14 @@
 //!   ends (the WAL write lock is released) the sidecar `<db>-ursula` (stream offset and epoch
 //!   reflected locally) advances. On a rejection or an exhausted retry budget the overlay is
 //!   dropped, the write fails with SQLITE_IOERR_WRITE (SQLite rolls the transaction back) and the
-//!   database is poisoned until it is re-attached. The overlay belongs to the write transaction: it
-//!   is cleared whenever the WAL write lock is taken or released, so a rolled-back transaction's
-//!   spilled frames never shadow a later one's.
+//!   database is poisoned until it is re-attached. A 402 from a layer in front of the stream (an
+//!   authorizer, a quota or billing service) fails the transaction alone with SQLITE_IOERR_AUTH:
+//!   nothing of it reached the stream, so the database is not poisoned, reads go on from the local
+//!   files, and the next commit is sent as usual (the epoch and the claim stay valid). Unless an
+//!   earlier attempt of the append may have reached the stream: its outcome is then unknown, and
+//!   the 402 is retried like one (see `client::append`). The overlay belongs to the write
+//!   transaction: it is cleared whenever the WAL write lock is taken or released, so a
+//!   rolled-back transaction's spilled frames never shadow a later one's.
 //! * Durability is the stream's acknowledgement alone: the local files (db, -wal, -shm, sidecar)
 //!   are a cache, not fsynced on the commit path (`xSync` of an attached database is a no-op,
 //!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's
@@ -58,16 +68,20 @@
 //!   db file's pages, fsyncs the WAL and the db file (a write-back error poisons the database, and
 //!   nothing is published), publishes the pages at the stream offset they reflect, reads the
 //!   snapshot back and only then advances the stream's retention to the *previous* snapshot's
-//!   offset. Attach installs the latest snapshot when the local file is missing or behind it, then
-//!   replays the tail.
+//!   offset. A publish or retention move refused with 402 waits for the next acknowledged commit.
+//!   Attach installs the latest snapshot when the local file is missing or behind it, then replays
+//!   the tail.
 //! * `SELECT ursula_status(path)` returns
-//!   `{"offset","epoch","poisoned","fenced","reason","snapshot","retained","local","installed",
-//!   "attach_ms","commits","append_retries","log_bytes","snapshot_due_bytes","snapshot_age_ms",
-//!   "snapshot_failures","snapshot_error"}` (offsets as strings; `reason`: the first poison's,
-//!   which a later one never replaces; `fenced`: a fence was seen since, first or later, never
-//!   reset; `local`: the stream offset of the local state attach started from, `-1` when it rebuilt
-//!   the file; `installed`: the offset of the snapshot attach installed, `-1` for none; `snapshot`,
-//!   `retained`: `-1` for none; the rest are the owner's health, see `status`);
+//!   `{"offset","epoch","poisoned","fenced","reason","read_only","payment_required",
+//!   "payment_reason","snapshot","retained","local","installed","attach_ms","commits",
+//!   "append_retries","log_bytes","snapshot_due_bytes","snapshot_age_ms","snapshot_failures",
+//!   "snapshot_error"}` (offsets as strings; `reason`: the first poison's, which a later one never
+//!   replaces; `fenced`: a fence was seen since, first or later, never reset; `payment_required`:
+//!   the latest write was refused with 402, until a commit is acknowledged, with the layer's
+//!   explanation in `payment_reason`; `local`: the stream offset of the local state attach started
+//!   from, `-1` when it rebuilt the file; `installed`: the offset of the snapshot attach installed,
+//!   `-1` for none; `snapshot`, `retained`: `-1` for none; the rest are the owner's health, see
+//!   `status`);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged

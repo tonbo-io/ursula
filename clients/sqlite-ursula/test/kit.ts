@@ -66,6 +66,12 @@ export type ChildLine = {
 	reason?: string | null;
 	offset?: string;
 	epoch?: number;
+	/** On `done`: whether the latest write was refused with 402 (and the layer's explanation), and whether the file is attached read-only. */
+	payment_required?: boolean;
+	payment_reason?: string | null;
+	read_only?: boolean;
+	/** On a `@status` step: `ursula_status`. */
+	status?: AttachStatus;
 	/** On `done`: snapshots published, the latest known snapshot and the retention this owner set. */
 	snapshots?: number;
 	snapshot?: string;
@@ -88,6 +94,7 @@ export interface Child {
 }
 
 const childScript = join(dirname(fileURLToPath(import.meta.url)), "child.mjs");
+const gateScript = join(dirname(fileURLToPath(import.meta.url)), "gate.mjs");
 
 /** Runs `child.mjs` with this build's extension, or with `ext`'s. */
 export function runChild(file: string, url: string, sqls: readonly string[], env: Record<string, string> = {}, ext = vfsPath()): Child {
@@ -204,5 +211,65 @@ export class StallProxy {
 	async close(): Promise<void> {
 		this.server.closeAllConnections();
 		await new Promise<void>((r) => this.server.close(() => r()));
+	}
+}
+
+/**
+ * An HTTP layer in front of the node that refuses writes with `402 Payment Required` on demand, the
+ * way an authorizer or a quota or billing service may (`gate.mjs`). It runs in a process of its own,
+ * so this process can attach and commit through it synchronously.
+ */
+export class Gate {
+	private readonly proc: ChildProcess;
+	readonly url: string;
+
+	private constructor(proc: ChildProcess, url: string) {
+		this.proc = proc;
+		this.url = url;
+	}
+
+	static async start(target: string): Promise<Gate> {
+		const proc = spawn(process.execPath, [gateScript, target], { stdio: ["ignore", "pipe", "inherit"] });
+		const port = await new Promise<number>((res, rej) => {
+			let buf = "";
+			proc.stdout?.on("data", (chunk: Buffer) => {
+				buf += chunk.toString();
+				const i = buf.indexOf("\n");
+				if (i >= 0) res((JSON.parse(buf.slice(0, i)) as { port: number }).port);
+			});
+			proc.once("exit", (code) => rej(new Error(`the gate exited (${code})`)));
+		});
+		return new Gate(proc, `http://127.0.0.1:${port}`);
+	}
+
+	/**
+	 * Answers writes `402` with `body` from now on, without forwarding them: `limit` of them at most,
+	 * and only those with one of `methods` (POST and PUT by default). `null` forwards them again.
+	 */
+	async refuse(body: string | null, options: { limit?: number; methods?: string[] } = {}): Promise<void> {
+		await this.control({ refuse: body, ...options });
+	}
+
+	/** Forwards the next POST but cuts its answer (its outcome stays unknown to the client), then refuses the next `limit` writes with `402` and `body`. */
+	async dropNextPostThenRefuse(body: string, limit: number): Promise<void> {
+		await this.control({ dropNextPost: { refuse: body, limit } });
+	}
+
+	/** Requests refused, forwarded and forwarded with their answer cut, so far. */
+	async counts(): Promise<{ refused: number; forwarded: number; dropped: number }> {
+		const r = await fetch(`${this.url}/__gate`);
+		return (await r.json()) as { refused: number; forwarded: number; dropped: number };
+	}
+
+	private async control(body: object): Promise<void> {
+		const r = await fetch(`${this.url}/__gate`, { method: "PUT", body: JSON.stringify(body) });
+		if (!r.ok) throw new Error(`gate control: ${r.status}`);
+	}
+
+	async close(): Promise<void> {
+		if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
+		const exited = new Promise((r) => this.proc.once("exit", r));
+		this.proc.kill();
+		await exited;
 	}
 }

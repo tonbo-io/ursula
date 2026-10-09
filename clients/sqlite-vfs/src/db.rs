@@ -33,8 +33,36 @@ pub(crate) struct CommitStat {
     pub(crate) vfs: Duration,
 }
 
+/// How `ursula_attach` binds a file to its stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Claims the stream, which fences every earlier owner, and replicates every commit.
+    Owner,
+    /// Claims nothing and never writes the stream (no claim, commit, snapshot or retention move),
+    /// so it fences no owner and a layer that refuses writes does not stop it: the file holds the
+    /// stream as of the attach, and every write fails with SQLITE_READONLY (`x_write`).
+    ReadOnly,
+}
+
+/// The mode argument of `ursula_attach`: `'owner'` (the default, also for an absent or NULL
+/// argument) or `'read_only'`.
+impl TryFrom<&str> for Mode {
+    type Error = Error;
+
+    fn try_from(mode: &str) -> Result<Mode, Error> {
+        match mode {
+            "" | "owner" => Ok(Mode::Owner),
+            "read_only" => Ok(Mode::ReadOnly),
+            other => Err(Error::AttachMode {
+                mode: other.to_owned(),
+            }),
+        }
+    }
+}
+
 pub(crate) struct Db {
     pub(crate) url: String,
+    pub(crate) mode: Mode,
     /// The stream's incarnation at attach (`Head::incarnation`): a re-claim or a snapshot checks
     /// the stream is still it.
     pub(crate) incarnation: String,
@@ -45,6 +73,7 @@ pub(crate) struct Db {
     /// `stamp`).
     pub(crate) stamp: String,
     pub(crate) path: String,
+    /// The owner's epoch; for a read-only attachment, the highest one claimed up to `offset`.
     pub(crate) epoch: u64,
     /// Producer sequence of the last acknowledged append (the claim is 0).
     pub(crate) seq: u64,
@@ -54,6 +83,9 @@ pub(crate) struct Db {
     pub(crate) log: u64,
     /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
     pub(crate) poisoned: Option<Poisoned>,
+    /// A layer in front of the stream refused the latest write with 402 Payment Required, with its
+    /// explanation (see `payment_refused`): cleared by the next acknowledged commit.
+    pub(crate) payment_required: Option<String>,
     /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
     /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
     /// offset + 24).
@@ -210,6 +242,43 @@ impl Db {
         }
     }
 
+    /// A layer in front of the stream refused the write transaction's commit with 402 Payment
+    /// Required, and nothing of it reached the stream (`Append::PaymentRequired`): the write fails
+    /// with SQLITE_IOERR_AUTH and SQLite rolls the transaction back, as on a poison, but the
+    /// database is not poisoned. Its epoch, producer sequence and offset still describe the
+    /// stream, so the next commit is sent as usual, and is acknowledged once the layer accepts
+    /// writes again: no attach is needed.
+    pub(crate) fn refuse(&mut self, body: String) -> c_int {
+        self.payment_refused(body, "commit");
+        self.overlay.clear();
+        self.committed = false;
+        ffi::SQLITE_IOERR_AUTH
+    }
+
+    /// Records a write refused with 402 Payment Required (`during`: which, for the log), logged
+    /// when no refusal is recorded yet.
+    pub(crate) fn payment_refused(&mut self, body: String, during: &str) {
+        if self.payment_required.is_none() {
+            log::emit(Level::Warn, "payment_required", &[
+                ("file", &self.path),
+                ("stream", &self.url),
+                ("during", &during),
+                ("reason", &body),
+            ]);
+        }
+        self.payment_required = Some(body);
+    }
+
+    /// A commit was acknowledged: a layer that refused writes with 402 accepts them again.
+    pub(crate) fn writes_accepted(&mut self) {
+        if self.payment_required.take().is_some() {
+            log::emit(Level::Info, "writes_resumed", &[
+                ("file", &self.path),
+                ("stream", &self.url),
+            ]);
+        }
+    }
+
     /// A local operation of an acknowledged transaction (the rest of its WAL writes, -shm growth)
     /// failed: SQLite rolls the transaction back locally, so the file no longer
     /// reflects the stream offset; poison it (re-attach replays the commit from the stream).
@@ -315,6 +384,7 @@ impl Db {
     pub(crate) fn for_tests() -> Db {
         Db {
             url: "http://h/b/s".into(),
+            mode: Mode::Owner,
             incarnation: "i1".into(),
             producer: "sqlite-ursula-vfs/i1".into(),
             sidecar: "/data/app.db-ursula".into(),
@@ -325,6 +395,7 @@ impl Db {
             offset: crate::client::START.into(),
             log: 0,
             poisoned: None,
+            payment_required: None,
             overlay: BTreeMap::new(),
             wal_written: BTreeMap::new(),
             committed: false,
@@ -357,9 +428,54 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    use libsqlite3_sys as ffi;
+
     use super::Db;
+    use super::Mode;
     use crate::error::Error;
     use crate::error::Fence;
+
+    // A commit refused with 402 fails its transaction alone: the overlay goes, as on a poison, but
+    // the database is not poisoned and keeps its epoch, sequence and offset, so the next commit
+    // goes out as usual. The refusal shows until a commit is acknowledged.
+    #[test]
+    fn a_refused_commit_fails_alone() {
+        let mut d = Db::for_tests();
+        d.seq = 4;
+        d.offset = "00000000000000000009".into();
+        d.overlay.insert(0, vec![1u8; 32]);
+        d.committed = true;
+        assert_eq!(d.refuse("quota exhausted".into()), ffi::SQLITE_IOERR_AUTH);
+        assert!(d.overlay.is_empty() && !d.committed);
+        assert!(d.poisoned.is_none() && !d.fenced());
+        assert_eq!(d.payment_required.as_deref(), Some("quota exhausted"));
+        assert_eq!(
+            (d.epoch, d.seq, d.offset.as_str()),
+            (2, 4, "00000000000000000009")
+        );
+        d.refuse(String::new());
+        assert_eq!(d.payment_required.as_deref(), Some(""));
+        d.writes_accepted();
+        assert!(d.payment_required.is_none());
+        // A fence after a refusal still poisons.
+        d.refuse("quota exhausted".into());
+        d.poison(Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: Some(3),
+        }));
+        assert!(d.fenced());
+    }
+
+    #[test]
+    fn attach_modes() {
+        assert_eq!(Mode::try_from("").unwrap(), Mode::Owner);
+        assert_eq!(Mode::try_from("owner").unwrap(), Mode::Owner);
+        assert_eq!(Mode::try_from("read_only").unwrap(), Mode::ReadOnly);
+        assert!(matches!(
+            Mode::try_from("readonly"),
+            Err(Error::AttachMode { mode }) if mode == "readonly"
+        ));
+    }
 
     // The first poison's reason stays, whatever fails after it (the rest of the transaction, a
     // lost page read again, the snapshot thread's own fence). A fence and a lost write stick

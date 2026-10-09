@@ -1,5 +1,6 @@
 //! `ursula_status` and `ursula_stats` as JSON.
 
+use crate::db::Mode;
 use crate::db::attached;
 use crate::db::lock;
 use crate::error::Error;
@@ -34,6 +35,18 @@ pub(crate) fn status(path: &str) -> Result<String, Error> {
             db.poisoned
                 .as_ref()
                 .map_or_else(null, |p| json_str(&p.first.to_string())),
+        ),
+        ("read_only", (db.mode == Mode::ReadOnly).to_string()),
+        (
+            "payment_required",
+            db.payment_required.is_some().to_string(),
+        ),
+        (
+            "payment_reason",
+            db.payment_required
+                .as_deref()
+                .filter(|reason| !reason.is_empty())
+                .map_or_else(null, json_str),
         ),
         ("snapshot", json_str(&db.snapshot)),
         ("retained", json_str(&db.retained)),

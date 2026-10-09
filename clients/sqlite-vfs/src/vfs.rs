@@ -32,6 +32,7 @@ use crate::client::stream_seq;
 use crate::config::abort_after_ack;
 use crate::db::CommitStat;
 use crate::db::Db;
+use crate::db::Mode;
 use crate::db::lock;
 use crate::db::lookup;
 use crate::db::refused;
@@ -510,6 +511,11 @@ unsafe extern "C" fn x_write(
         return fwd!(file, xWrite, buf, amt, off);
     };
     let mut db = lock(&db);
+    // A read-only attachment writes neither the stream nor its WAL: its write transactions fail at
+    // their first WAL write (a commit, or a spill), and SQLite rolls them back.
+    if db.mode == Mode::ReadOnly {
+        return ffi::SQLITE_READONLY;
+    }
     if db.poisoned.is_some() {
         return ffi::SQLITE_IOERR_WRITE;
     }
@@ -679,17 +685,21 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
     );
     // An unknown producer: the server expired it (`reclaim`).
     if let Append::ProducerExpired = outcome {
-        if let Err(e) = reclaim(db) {
-            return db.poison(e);
-        }
-        outcome = append(
-            &db.url,
-            &db.incarnation,
-            &db.producer,
-            &body,
-            db.epoch,
-            db.seq.saturating_add(1),
-        );
+        outcome = match reclaim(db) {
+            Ok(()) => append(
+                &db.url,
+                &db.incarnation,
+                &db.producer,
+                &body,
+                db.epoch,
+                db.seq.saturating_add(1),
+            ),
+            // Refused in front of the stream: nothing of the re-claim reached it.
+            Err(Error::PaymentRequired { body: reason, .. }) => {
+                Append::PaymentRequired { body: reason }
+            }
+            Err(e) => return db.poison(e),
+        };
     }
     let seq = db.seq.saturating_add(1);
     let append_time = t.elapsed();
@@ -738,8 +748,11 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         Append::ProducerExpired => {
             return db.poison(Error::ProducerExpiredAgain);
         }
+        // Nothing of the transaction reached the stream: it fails alone (see `Db::refuse`).
+        Append::PaymentRequired { body: reason } => return db.refuse(reason),
         Append::Failed(e) => return db.poison(e),
     };
+    db.writes_accepted();
     db.seq = seq;
     db.offset = next;
     db.log = db.log.saturating_add(body.len() as u64);

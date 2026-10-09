@@ -1,5 +1,6 @@
 //! `ursula_attach`: decide whether the local files can be trusted, bring them to the stream's
-//! tail (snapshot install and replay), claim the stream, and bind the attachment.
+//! tail (snapshot install and replay), claim the stream (unless read-only), and bind the
+//! attachment.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -21,6 +22,7 @@ use crate::client::read_from;
 use crate::client::recreated;
 use crate::config::abort_in_replay;
 use crate::db::Db;
+use crate::db::Mode;
 use crate::db::SnapshotThread;
 use crate::db::registry;
 use crate::error::Error;
@@ -280,12 +282,14 @@ fn catch_up(
 /// carries it as a precondition: a stream deleted and recreated meanwhile fails this round with
 /// [`Error::Recreated`], and `attach_files_rebuilding` rebuilds against the new one; a newer owner's
 /// claim replayed after ours fails the attach). Returns the epoch claimed and the latest
-/// snapshot's offset (`START` for none).
+/// snapshot's offset (`START` for none). Read-only (`mode`), it stops at the tail without a claim
+/// and returns the highest epoch claimed up to it.
 pub(crate) fn sync(
     url: &str,
     incarnation: &str,
     pos: &mut String,
     applier: &mut Applier,
+    mode: Mode,
 ) -> Result<(u64, String), Error> {
     let head = head(url, &|| false)?;
     if head.incarnation.as_deref() != Some(incarnation) {
@@ -319,6 +323,10 @@ pub(crate) fn sync(
     }
     // From the beginning (`START`), a stream trimmed with no snapshot visible answers 410: `Gone`.
     catch_up(url, incarnation, pos, None, applier)?;
+    let snapshot = head.snapshot.unwrap_or_else(|| START.into());
+    if mode == Mode::ReadOnly {
+        return Ok((applier.epoch, snapshot));
+    }
     // `pos` is now the tail as catch-up found it: the claim is checked from there.
     let producer = producer_id(incarnation);
     let (epoch, claimed) = claim(
@@ -339,10 +347,10 @@ pub(crate) fn sync(
             epoch: applier.epoch,
         }));
     }
-    Ok((epoch, head.snapshot.unwrap_or_else(|| START.into())))
+    Ok((epoch, snapshot))
 }
 
-pub(crate) fn attach(path: &str, url: &str) -> Result<String, Arc<Error>> {
+pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Error>> {
     let path = full_pathname(path)?;
     let url = url.trim_end_matches('/').to_owned();
     let previous = {
@@ -385,14 +393,16 @@ pub(crate) fn attach(path: &str, url: &str) -> Result<String, Arc<Error>> {
             log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
         }
     }
-    let outcome = attach_files_rebuilding(&path, &url);
+    let outcome = attach_files_rebuilding(&path, &url, mode);
     let mut reg = registry();
     reg.attaching.remove(&path);
     match outcome {
         Ok((offset, db, snapper)) => {
             reg.failed.remove(&path);
             reg.dbs.insert(path.clone(), db);
-            reg.snappers.insert(path, snapper);
+            if let Some(snapper) = snapper {
+                reg.snappers.insert(path, snapper);
+            }
             Ok(offset)
         }
         Err(e) => {
@@ -407,16 +417,17 @@ pub(crate) fn attach(path: &str, url: &str) -> Result<String, Arc<Error>> {
     }
 }
 
+/// A bound attachment: the offset its file reflects, its state, and its snapshot thread (none when
+/// read-only).
+type Attached = (String, Arc<Mutex<Db>>, Option<SnapshotThread>);
+
 /// `attach_files`, again when the stream was deleted and recreated during it (a 412): the files,
 /// stamped with the old incarnation, are then discarded and rebuilt from the new stream. Bounded,
 /// so a stream recreated over and over fails the attach instead of looping.
-fn attach_files_rebuilding(
-    path: &str,
-    url: &str,
-) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), Error> {
+fn attach_files_rebuilding(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     let mut tries: u64 = 0;
     loop {
-        match attach_files(path, url) {
+        match attach_files(path, url, mode) {
             Err(e) if e.is_recreated() && tries < 3 => {
                 tries = tries.saturating_add(1);
                 log::emit(Level::Warn, "attach_rebuilding", &[
@@ -431,8 +442,9 @@ fn attach_files_rebuilding(
 }
 
 /// Decides whether the local files can be trusted (or discards them), brings them to the stream's
-/// tail and claims it (`sync`), then builds the new attachment for `attach` to bind.
-fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, SnapshotThread), Error> {
+/// tail and claims it unless read-only (`sync`), then builds the new attachment for `attach` to
+/// bind. A read-only attachment gets no snapshot thread: it never writes the stream.
+fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     let started = Instant::now();
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
@@ -459,12 +471,18 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
     };
     let head = match head(url, &|| false) {
         Ok(head) => head,
-        // A missing stream is created for a file that holds no data. Behind one that does, the
-        // stream was deleted (by mistake, by TTL expiry, or by a fresh install that did not carry
-        // it over) and the files may be the only copy left: refused, and kept.
-        Err(Error::Status { status: 404, .. }) if found.is_none() => {
+        // A missing stream is created for a file that holds no data, unless the attach is
+        // read-only (it never writes the stream). Behind one that does, the stream was deleted (by
+        // mistake, by TTL expiry, or by a fresh install that did not carry it over) and the files
+        // may be the only copy left: refused, and kept.
+        Err(Error::Status { status: 404, .. }) if found.is_none() && mode == Mode::Owner => {
             create_stream(url)?;
             head(url, &|| false)?
+        }
+        Err(Error::Status { status: 404, .. }) if found.is_none() => {
+            return Err(Error::NoStream {
+                url: url.to_owned(),
+            });
         }
         Err(Error::Status { status: 404, .. }) => {
             return Err(Error::StreamMissing {
@@ -568,7 +586,7 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
     // `Gone`: retention moved past the file (or the snapshot read was superseded) under a HEAD
     // that did not show it yet; the next round installs the newer snapshot.
     let (epoch, snapshot) = loop {
-        match sync(url, &incarnation, &mut pos, &mut applier) {
+        match sync(url, &incarnation, &mut pos, &mut applier, mode) {
             Ok(r) => break r,
             Err(e) if e.is_gone() && tries < 10 => {
                 tries = tries.saturating_add(1);
@@ -612,6 +630,7 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
     let snapper = Arc::new(Snapper::default());
     let db = Arc::new(Mutex::new(Db {
         url: url.to_owned(),
+        mode,
         producer: producer_id(&incarnation),
         incarnation,
         sidecar,
@@ -622,6 +641,7 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
         offset: pos.clone(),
         log,
         poisoned: None,
+        payment_required: None,
         overlay: BTreeMap::new(),
         wal_written: BTreeMap::new(),
         committed: false,
@@ -649,12 +669,18 @@ fn attach_files(path: &str, url: &str) -> Result<(String, Arc<Mutex<Db>>, Snapsh
         attached_from: from,
         installed,
     }));
-    let thread = {
-        let (db, snapper) = (db.clone(), snapper.clone());
-        std::thread::Builder::new()
-            .name("ursula-snapshot".into())
-            .spawn(move || snapshot_loop(&db, &snapper))
-            .map_err(Error::SpawnSnapshotThread)?
+    let snapshots = match mode {
+        Mode::Owner => {
+            let thread = {
+                let (db, snapper) = (db.clone(), snapper.clone());
+                std::thread::Builder::new()
+                    .name("ursula-snapshot".into())
+                    .spawn(move || snapshot_loop(&db, &snapper))
+                    .map_err(Error::SpawnSnapshotThread)?
+            };
+            Some((snapper, thread))
+        }
+        Mode::ReadOnly => None,
     };
-    Ok((pos, db, (snapper, thread)))
+    Ok((pos, db, snapshots))
 }

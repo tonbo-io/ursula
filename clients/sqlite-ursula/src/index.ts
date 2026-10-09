@@ -23,6 +23,30 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
 	return db;
 }
 
+/** SQLITE_READONLY: a write to a file attached read-only. */
+const SQLITE_READONLY = 8;
+/** SQLITE_AUTH: `ursula_attach` refused with 402 in front of the stream. */
+const SQLITE_AUTH = 23;
+/** SQLITE_IOERR_AUTH: a commit refused with 402 in front of the stream. */
+const SQLITE_IOERR_AUTH = 7178;
+
+/** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
+function errcode(error: unknown): number | undefined {
+	const code = (error as { errcode?: unknown } | null | undefined)?.errcode;
+	return typeof code === "number" ? code : undefined;
+}
+
+export interface AttachOptions {
+	/**
+	 * Attach without claiming the stream. Nothing is ever appended (no claim, commit or snapshot), so
+	 * no owner is fenced, and a layer in front of the stream that refuses writes does not stop it.
+	 * Every write to the file fails with SQLITE_READONLY ("attempt to write a readonly database").
+	 * The file holds the stream as of the attach: attach again to catch up. A missing stream is an
+	 * error, never created.
+	 */
+	readonly readOnly?: boolean;
+}
+
 /**
  * Catches `file` up from the stream (installing the stream's latest snapshot first when the file is
  * missing or behind it), claims the stream for this process (fencing every earlier owner)
@@ -31,10 +55,20 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
  * written by its first attach) opens in this process only while attached here: not before an attach
  * of it succeeds, nor after one fails (unless refused up front for open connections, another thread
  * attaching it, or another process holding it, which leaves the file as it was).
+ *
+ * With `{ readOnly: true }` it claims nothing (see {@link AttachOptions.readOnly}). An attach that a
+ * layer in front of the stream refuses with `402 Payment Required` throws
+ * {@link UrsulaPaymentRequiredError}: a read-only attach can still read the database.
  */
-export function attach(file: string, streamUrl: string): StreamOffset {
-	const row = loadUrsulaVfs().prepare("SELECT ursula_attach(?, ?) AS n").get(file, streamUrl) as { n: string };
-	return row.n;
+export function attach(file: string, streamUrl: string, options: AttachOptions = {}): StreamOffset {
+	const sql = options.readOnly === true ? "SELECT ursula_attach(?, ?, 'read_only') AS n" : "SELECT ursula_attach(?, ?) AS n";
+	try {
+		const row = loadUrsulaVfs().prepare(sql).get(file, streamUrl) as { n: string };
+		return row.n;
+	} catch (error) {
+		if (errcode(error) === SQLITE_AUTH) throw new UrsulaPaymentRequiredError(error instanceof Error ? error.message : String(error), null, error);
+		throw error;
+	}
 }
 
 /**
@@ -61,7 +95,7 @@ export type StreamOffset = string;
 export interface AttachStatus {
 	/** Stream offset after the last acknowledged commit. */
 	readonly offset: StreamOffset;
-	/** This owner's producer epoch. */
+	/** This owner's producer epoch; read-only, the highest epoch claimed up to `offset`. */
 	readonly epoch: number;
 	/** Every later commit fails until the file is re-attached. */
 	readonly poisoned: boolean;
@@ -69,6 +103,12 @@ export interface AttachStatus {
 	readonly fenced: boolean;
 	/** Why it is poisoned: the first failure, which a later one never replaces. */
 	readonly reason: string | null;
+	/** Attached with `{ readOnly: true }`: nothing is ever appended, and every write fails with SQLITE_READONLY. */
+	readonly read_only: boolean;
+	/** A layer in front of the stream refused the latest write with `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). Not poisoned: cleared by the next acknowledged commit. */
+	readonly payment_required: boolean;
+	/** The layer's explanation: the `402` response's body, cut to 256 bytes (`null` when it was empty, or without a refusal). */
+	readonly payment_reason: string | null;
 	/** Offset of the latest snapshot known readable (published and read back, or found at attach); `"-1"` for none. */
 	readonly snapshot: StreamOffset;
 	/** Retention this owner advanced the stream to (`"-1"`: none yet). */
@@ -157,22 +197,60 @@ export class UrsulaReplicationError extends Error {
 }
 
 /**
+ * A write refused with `402 Payment Required` by a layer in front of the stream, such as an authorizer
+ * or a quota or billing service: nothing of it reached the stream. Unlike an
+ * {@link UrsulaReplicationError}, it leaves the file usable. A refused commit was rolled back, but the
+ * file is not poisoned: reads go on from the local file, and later commits are sent as usual and
+ * succeed once the layer accepts writes again, with no new attach. A refused attach claimed nothing:
+ * attach with `{ readOnly: true }` to read the database meanwhile.
+ *
+ * With plain node:sqlite, a refused commit throws SQLite's error with `errcode` 7178
+ * (SQLITE_IOERR_AUTH), and a refused `ursula_attach` one with `errcode` 23 (SQLITE_AUTH); `attach`
+ * turns the latter into this error.
+ */
+export class UrsulaPaymentRequiredError extends Error {
+	/** The layer's explanation, the `402` response's body cut to 256 bytes: for a refused commit (`null` when it was empty). Always `null` for a refused attach, whose message carries it. */
+	readonly reason: string | null;
+	constructor(message: string, reason: string | null, cause: unknown) {
+		super(message, { cause });
+		this.name = "UrsulaPaymentRequiredError";
+		this.reason = reason;
+	}
+}
+
+/** {@link openUrsulaPiStorage}'s options: Pi's node driver settings, and how to attach. */
+export type UrsulaPiStorageOptions = NodeSqliteStorageOptions & AttachOptions;
+
+/**
  * Pi Durable's official node SqliteStorage on a replicated file: attaches `file` to `streamUrl`, then
  * opens it with Pi's node driver, unmodified. A commit the VFS fails surfaces as an
  * `UrsulaReplicationError` (SQLite has already rolled the transaction back, so the driver's own
  * rollback attempt would otherwise turn it into an AggregateError). The storage is unusable for
  * writes after that; re-open it to take the stream over again (after a delete and recreate, re-opening
  * rebuilds the file from the new stream).
+ *
+ * A commit refused with `402 Payment Required` in front of the stream surfaces as an
+ * {@link UrsulaPaymentRequiredError} instead, and the storage stays usable: the next commit goes out as
+ * usual. With `{ readOnly: true }` the file is attached read-only: the storage opens on a database Pi
+ * has already written, its reads work, and every commit that changes it fails with SQLITE_READONLY.
  */
-export async function openUrsulaPiStorage(file: string, streamUrl: string, options: NodeSqliteStorageOptions = {}): Promise<SqliteStorage> {
-	attach(file, streamUrl);
-	const db = await openNodeSqliteDatabase(file, options);
+export async function openUrsulaPiStorage(file: string, streamUrl: string, options: UrsulaPiStorageOptions = {}): Promise<SqliteStorage> {
+	const { readOnly, ...sqlite } = options;
+	attach(file, streamUrl, readOnly === undefined ? {} : { readOnly });
+	const db = await openNodeSqliteDatabase(file, sqlite);
 	const transaction = db.transaction.bind(db);
 	db.transaction = <T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> =>
 		transaction(callback).catch((error: unknown) => {
+			const cause = error instanceof AggregateError ? error.errors[0] : error;
 			const s = status(file);
+			if (errcode(cause) === SQLITE_IOERR_AUTH) {
+				const why = s.payment_reason === null ? "" : `: ${s.payment_reason}`;
+				throw new UrsulaPaymentRequiredError(`commit refused with 402 Payment Required in front of the stream${why}`, s.payment_reason, cause);
+			}
+			// Read-only: SQLite has rolled the transaction back too.
+			if (s.read_only && errcode(cause) === SQLITE_READONLY) throw cause;
 			if (!s.poisoned) throw error;
-			throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, error instanceof AggregateError ? error.errors[0] : error);
+			throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, cause);
 		});
 	return SqliteStorage.open(db);
 }
@@ -203,8 +281,8 @@ export interface MeterLike {
  *   WAL write) and `sqlite_ursula.append.duration`, in ms;
  * - counters `sqlite_ursula.append.retries` and `sqlite_ursula.stream.bytes`;
  * - gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`
- *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned` and `sqlite_ursula.fenced`
- *   (0 or 1).
+ *   (ms), `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned`, `sqlite_ursula.fenced` and
+ *   `sqlite_ursula.payment_required` (0 or 1).
  *
  * Every measurement carries `sqlite.file` and `attributes`. The per-commit numbers come from
  * {@link drainStats} every `intervalMs` (10 s by default), so do not call `drainStats` on the same
@@ -237,6 +315,7 @@ export function instrument(file: string, meter: MeterLike, options: { intervalMs
 		["sqlite_ursula.snapshot.failures", undefined, (s) => s.snapshot_failures],
 		["sqlite_ursula.poisoned", undefined, (s) => (s.poisoned ? 1 : 0)],
 		["sqlite_ursula.fenced", undefined, (s) => (s.fenced ? 1 : 0)],
+		["sqlite_ursula.payment_required", undefined, (s) => (s.payment_required ? 1 : 0)],
 	];
 	const observed = gauges.map(([name, unit, value]) => {
 		const gauge = meter.createObservableGauge(name, unit === undefined ? {} : { unit });

@@ -12,6 +12,7 @@ use std::ffi::CString;
 use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ptr::null_mut;
+use std::sync::Arc;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 
@@ -19,6 +20,7 @@ use libsqlite3_sys as ffi;
 
 use crate::attach::attach;
 use crate::auth::set_token;
+use crate::db::Mode;
 use crate::error::Error;
 use crate::host::API;
 use crate::host::OK;
@@ -100,6 +102,22 @@ unsafe fn result<E: std::fmt::Display>(
     }
 }
 
+/// Sets the code a failed SQL function reports (`result` set its message; the code is
+/// SQLITE_ERROR otherwise).
+///
+/// # Safety
+///
+/// `ctx` is the context SQLite passed to the function, whose error `result` set.
+unsafe fn result_error_code(ctx: *mut ffi::sqlite3_context, code: c_int) {
+    if let Some(result_error_code) = api().and_then(|a| a.result_error_code) {
+        // SAFETY: `ctx` is the function's context (the caller's contract).
+        unsafe { result_error_code(ctx, code) };
+    }
+}
+
+/// `ursula_attach(path, url[, mode])`: the mode is `'owner'` (the default) or `'read_only'` (see
+/// `Mode`). An attach refused with 402 in front of the stream fails with SQLITE_AUTH, which
+/// callers tell from other failures (a read-only attach can read the database meanwhile).
 unsafe extern "C" fn fn_attach(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -109,8 +127,18 @@ unsafe extern "C" fn fn_attach(
     let path = unsafe { arg(argc, argv, 0) };
     // SAFETY: as above.
     let url = unsafe { arg(argc, argv, 1) };
+    // SAFETY: as above (empty without a third argument).
+    let mode = unsafe { arg(argc, argv, 2) };
+    let outcome = Mode::try_from(mode.as_str())
+        .map_err(Arc::new)
+        .and_then(|mode| attach(&path, &url, mode));
+    let refused = matches!(&outcome, Err(e) if e.is_payment_required());
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_attach", attach(&path, &url)) };
+    unsafe { result(ctx, "ursula_attach", outcome) };
+    if refused {
+        // SAFETY: as above; `result` set the error.
+        unsafe { result_error_code(ctx, ffi::SQLITE_AUTH) };
+    }
 }
 
 unsafe extern "C" fn fn_status(
@@ -178,8 +206,9 @@ pub unsafe extern "C" fn sqlite3_extension_init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 4] = [
+    let fns: [(&CStr, c_int, SqlFn); 5] = [
         (c"ursula_attach", 2, fn_attach),
+        (c"ursula_attach", 3, fn_attach),
         (c"ursula_status", 1, fn_status),
         (c"ursula_stats", 1, fn_stats),
         (c"ursula_set_token", 1, fn_set_token),

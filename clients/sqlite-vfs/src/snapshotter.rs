@@ -100,6 +100,10 @@ enum Outcome {
     /// Not possible right now (a reader pins WAL frames the checkpoint needs, or another
     /// checkpoint kept it busy): try again shortly.
     Busy,
+    /// A layer in front of the stream refused the publish or the retention move with 402 Payment
+    /// Required (`Db::payment_refused`): no snapshot is taken until a commit is acknowledged again,
+    /// which requests one if it is still due (nothing adds to the log meanwhile).
+    Refused,
 }
 
 /// The snapshot health `ursula_status` reports, after an attempt: a snapshot at its offset (one
@@ -111,7 +115,13 @@ fn record_attempt(d: &mut Db, attempt: &Result<Outcome, Error>) {
             d.snapshot_failures = 0;
             d.snapshot_error = None;
         }
-        Ok(Outcome::Skipped | Outcome::Fenced | Outcome::Damaged | Outcome::Busy) => {}
+        Ok(
+            Outcome::Skipped
+            | Outcome::Fenced
+            | Outcome::Damaged
+            | Outcome::Busy
+            | Outcome::Refused,
+        ) => {}
         Err(e) => {
             d.snapshot_failures = d.snapshot_failures.saturating_add(1);
             d.snapshot_error = Some(e.to_string());
@@ -135,7 +145,8 @@ pub(crate) fn snapshot_loop(db: &Mutex<Db>, snapper: &Snapper) {
                 | Outcome::Covered
                 | Outcome::Skipped
                 | Outcome::Fenced
-                | Outcome::Damaged,
+                | Outcome::Damaged
+                | Outcome::Refused,
             ) => {
                 (busy, failing) = (Duration::from_millis(10), Duration::from_millis(100));
                 continue;
@@ -185,7 +196,13 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
     let (url, incarnation, offset, epoch, pages, log) = {
         let mut d = lock(db);
         loop {
-            if !d.snapshot_due() || d.poisoned.is_some() || stopped() {
+            // While writes are refused with 402 (`Outcome::Refused`), a snapshot would be refused
+            // too: not taken until a commit is acknowledged again.
+            if !d.snapshot_due()
+                || d.poisoned.is_some()
+                || d.payment_required.is_some()
+                || stopped()
+            {
                 d.window_wanted = false;
                 snapper.window_cv.notify_all();
                 return Ok(Outcome::Skipped);
@@ -269,12 +286,24 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
         // clears it itself when it ends, and `x_write` refuses its commit (`poisoned`).
         lock(db).set_poisoned(e, Some(&what));
     };
-    match put_idempotent(
+    // A 402 in front of the stream: nothing was published or moved (`Outcome::Refused`).
+    let refused = |e: Error, during: &str| match e {
+        Error::PaymentRequired { body, .. } => {
+            lock(db).payment_refused(body, during);
+            Ok(Outcome::Refused)
+        }
+        e => Err(e),
+    };
+    let published = match put_idempotent(
         &format!("{url}/snapshot/{offset}"),
         &incarnation,
         &body,
         &stopped,
-    )? {
+    ) {
+        Ok(answer) => answer,
+        Err(e) => return refused(e, "snapshot publish"),
+    };
+    match published {
         (200..=299, _) => {}
         (412, _) => {
             fence(
@@ -358,12 +387,16 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper) -> Result<Outcome, Error> {
     // Retention trails one snapshot behind: a host that read the previous snapshot (or whose file
     // is past it) still finds the frames after it, and the newer snapshot has read back.
     if previous > retained && previous < offset {
-        match put_idempotent(
+        let moved = match put_idempotent(
             &format!("{url}/retention/{previous}"),
             &incarnation,
             &[],
             &stopped,
-        )? {
+        ) {
+            Ok(answer) => answer,
+            Err(e) => return refused(e, "retention move"),
+        };
+        match moved {
             (412, _) => {
                 fence(
                     format!("retention not moved to {previous}"),
@@ -415,6 +448,7 @@ mod tests {
             Outcome::Fenced,
             Outcome::Damaged,
             Outcome::Busy,
+            Outcome::Refused,
         ] {
             record_attempt(&mut d, &Ok(outcome));
             assert_eq!(d.snapshot_failures, 2, "{outcome:?}");
