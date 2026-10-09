@@ -70,10 +70,14 @@ pub(crate) enum Error {
         cached: String,
         wanted: String,
     },
+    /// The files attach to no other URL (`OtherStream`) and a copy of them has no sidecar
+    /// (`NoSidecar`), so the data is salvaged by reading a copy as a plain SQLite file.
     #[error(
         "{url} is missing (or hidden from this client's credentials) and {path} holds data: \
-         refusing to create an empty stream over it (delete {path} to start over, or attach it \
-         under another URL)"
+         refusing to create an empty stream over it, and keeping the files (to salvage the data, \
+         copy {path} and {path}-wal to a new name and export the copy's rows into a newly \
+         attached database; to start over, delete {path}, or attach a new file under another \
+         URL)"
     )]
     StreamMissing { path: String, url: String },
     #[error("spawn the snapshot thread: {0}")]
@@ -346,6 +350,13 @@ mod tests {
         assert!(gone.is_gone() && !gone.is_fenced() && !gone.is_recreated());
         let local = Error::LocalWalWrite(10);
         assert!(!local.is_fenced() && !local.is_gone() && !local.is_recreated());
+        let missing = Error::StreamMissing {
+            path: "/data/app.db".into(),
+            url: "http://h/b/s".into(),
+        }
+        .to_string();
+        assert!(missing.starts_with("http://h/b/s is missing") && missing.contains("holds data"));
+        assert!(missing.contains("attach a new file under another URL"));
         let lost = Error::LostData {
             url: "http://h/b/s".into(),
             offset: "9".into(),

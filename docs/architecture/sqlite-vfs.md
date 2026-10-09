@@ -410,8 +410,16 @@ What attach does in each case:
   has grown past it. A stream deleted (by mistake, by TTL expiry, or by a fresh install that did not
   carry it over) leaves the local files as possibly the only copy: attach creates a missing stream
   only for a file without content, refuses one with content and keeps its files. To start over
-  from an empty stream, delete `<db>`, or attach under another stream URL. A recreate during
-  attach fails that round, and attach rebuilds from the recreated stream (§3).
+  from an empty stream, delete `<db>` (attach then creates the stream), or attach a new file under
+  another stream URL: the files attach to no other URL (the sidecar names this one), and a copy of
+  them has no sidecar, so attach refuses it as never attached. To salvage the data, copy `<db>` and
+  `<db>-wal` to a new name before deleting anything (an attached file's WAL persists and may hold
+  commits not yet checkpointed), open the copy, which has no sidecar and so opens as a plain SQLite
+  file, and export its rows into a newly attached database. An empty file attached at the same URL
+  after the delete (another host, a fresh install) creates a new incarnation, and the original
+  owner's next attach then discards its files as the cache of a recreated stream: moving them aside
+  instead is a follow-up. A recreate during attach fails that round, and attach rebuilds from the
+  recreated stream (§3).
   While attached, every request of the owner carries its incarnation as the `Stream-Incarnation`
   precondition, which the server checks atomically with the request (an append when Raft applies
   it, so a commit proposed before a delete and recreate and applied after is refused too): the
