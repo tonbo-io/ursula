@@ -62,6 +62,7 @@ use crate::log_store::disk::JournalDisk;
 use crate::log_store::disk::JournalFile;
 use crate::log_store::disk::create_dir_all_durable;
 use crate::log_store::elapsed_ns;
+use crate::log_store::replace_file;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
 use crate::rt::time::Instant;
@@ -1255,19 +1256,9 @@ fn persist_snapshot_metadata(
         pointer_bytes: pointer_bytes.to_vec(),
     })
     .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
-    let temporary = path.with_extension("json.tmp");
-    if Disk::exists(&temporary) {
-        Disk::remove_file(&temporary)?;
-    }
-    {
-        let mut file = Disk::open_append(&temporary)?;
-        file.append(&encoded)?;
-        file.sync_data()?;
-    }
-    Disk::rename(&temporary, path)?;
-    if let Some(parent) = path.parent() {
-        Disk::sync_dir(parent)?;
-    }
+    // The WAL state files' publication protocol, with this record's own encoding.
+    replace_file(path, &path.with_extension("json.tmp"), &encoded)
+        .map_err(|err| io::Error::new(err.kind(), err))?;
     Ok(())
 }
 

@@ -22,6 +22,8 @@ use super::SnapshotMetaOf;
 use super::UrsulaRaftTypeConfig;
 use super::default_snapshot_store;
 use super::group_snapshot_frames;
+use crate::log_store::JournalError;
+use crate::log_store::JournalOp;
 use crate::log_store::SimDisk;
 use crate::log_store::SimDiskError;
 use crate::log_store::SimDiskFault;
@@ -30,6 +32,7 @@ use crate::log_store::SimDiskFault;
 enum PublicationFailure {
     Write,
     FileSync,
+    Rename,
     DirectorySync,
 }
 
@@ -102,12 +105,22 @@ fn snapshot_metadata_acknowledged_pointer_survives_power_loss() {
     }
 }
 
+/// The injected disk fault behind a failed publication, and the step it failed.
+fn injected_fault(error: &std::io::Error) -> Option<(JournalOp, &SimDiskError)> {
+    let JournalError::Io { op, source, .. } = error.get_ref()?.downcast_ref::<JournalError>()?
+    else {
+        return None;
+    };
+    Some((*op, source.get_ref()?.downcast_ref::<SimDiskError>()?))
+}
+
 #[test]
 fn snapshot_metadata_failed_publication_restores_a_complete_pointer() {
     for seed in [1, 7, 19, 42, 60, 64] {
         for phase in [
             PublicationFailure::Write,
             PublicationFailure::FileSync,
+            PublicationFailure::Rename,
             PublicationFailure::DirectorySync,
         ] {
             for host_crash in [false, true] {
@@ -117,22 +130,32 @@ fn snapshot_metadata_failed_publication_restores_a_complete_pointer() {
                         let path = root.join("group-7.snapshot.json");
                         let mut state = machine(&path);
                         install(&mut state, 1).await.unwrap();
-                        let (fault_path, fault) = match phase {
+                        let temporary = path.with_extension("json.tmp");
+                        let (fault_path, fault, op) = match phase {
                             PublicationFailure::Write => {
-                                (path.with_extension("json.tmp"), SimDiskFault::Write)
+                                (temporary, SimDiskFault::Write, JournalOp::Append)
                             }
                             PublicationFailure::FileSync => {
-                                (path.with_extension("json.tmp"), SimDiskFault::Sync)
+                                (temporary, SimDiskFault::Sync, JournalOp::Sync)
                             }
-                            PublicationFailure::DirectorySync => (root.clone(), SimDiskFault::Sync),
+                            // Rename faults match the destination.
+                            PublicationFailure::Rename => {
+                                (path.clone(), SimDiskFault::Rename, JournalOp::Rename)
+                            }
+                            PublicationFailure::DirectorySync => {
+                                (root.clone(), SimDiskFault::Sync, JournalOp::SyncDir)
+                            }
                         };
                         SimDisk::inject_fault(&fault_path, fault).unwrap();
                         let error = install(&mut state, 2).await.unwrap_err();
-                        assert!(matches!(
-                            error.get_ref().and_then(|source| source.downcast_ref::<SimDiskError>()),
-                            Some(SimDiskError::Injected { path, fault: actual })
-                                if path == &fault_path && *actual == fault
-                        ), "expected {phase:?} injection: {error}");
+                        assert!(
+                            matches!(
+                                injected_fault(&error),
+                                Some((actual_op, SimDiskError::Injected { path, fault: actual }))
+                                    if actual_op == op && path == &fault_path && *actual == fault
+                            ),
+                            "expected {phase:?} injection: {error}"
+                        );
                         drop(state);
                         if host_crash {
                             SimDisk::power_loss_losing_unsynced(&root).unwrap();
@@ -155,6 +178,18 @@ fn snapshot_metadata_failed_publication_restores_a_complete_pointer() {
                         assert_eq!(
                             restored.group_snapshot().await.unwrap().group_commit_index,
                             expected
+                        );
+                        // The next publication replaces whatever temporary file the
+                        // failure left, and is durable once acknowledged.
+                        install(&mut restored, 3).await.unwrap();
+                        drop(restored);
+                        SimDisk::power_loss_losing_unsynced(&root).unwrap();
+                        let mut republished = machine(&path);
+                        republished.restore_persisted_snapshot().await.unwrap();
+                        assert_eq!(
+                            republished.last_applied_log_id.unwrap().index,
+                            3,
+                            "seed {seed} phase {phase:?} host_crash {host_crash}"
                         );
                     },
                 );
