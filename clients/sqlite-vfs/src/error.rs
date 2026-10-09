@@ -71,8 +71,9 @@ pub(crate) enum Error {
         wanted: String,
     },
     #[error(
-        "{url} is missing and {path} holds data: refusing to create an empty stream over it \
-         (delete {path} to start over, or attach it under another URL)"
+        "{url} is missing (or hidden from this client's credentials) and {path} holds data: \
+         refusing to create an empty stream over it (delete {path} to start over, or attach it \
+         under another URL)"
     )]
     StreamMissing { path: String, url: String },
     #[error("spawn the snapshot thread: {0}")]
@@ -117,6 +118,15 @@ pub(crate) enum Error {
     AppendUnknown { attempts: u32, last: Attempt },
     #[error("put {url}: {last}")]
     PutUnknown { url: String, last: Attempt },
+    #[error(
+        "{op} {url}: {status}: the endpoint refused this client's credentials (see \
+         URSULA_VFS_TOKEN_FILE and ursula_set_token)"
+    )]
+    Unauthorized {
+        op: &'static str,
+        url: String,
+        status: u16,
+    },
     #[error("{url} reports no Stream-Incarnation (an older server?); refusing to attach")]
     NoIncarnation { url: String },
     #[error("{op} {url}: no Stream-Next-Offset")]

@@ -60,3 +60,21 @@ pub(crate) fn first_claim_epoch() -> Option<u64> {
             .and_then(|v| v.parse().ok())
     })
 }
+
+/// `URSULA_VFS_CA_FILE`: a PEM bundle of the certificate authorities trusted for `https://` stream
+/// URLs, instead of the bundled Mozilla roots.
+pub(crate) fn ca_file() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| non_empty("URSULA_VFS_CA_FILE")).as_deref()
+}
+
+/// `URSULA_VFS_TOKEN_FILE`: a file holding the bearer token every request carries (see `auth`).
+pub(crate) fn token_file() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| non_empty("URSULA_VFS_TOKEN_FILE"))
+        .as_deref()
+}
+
+fn non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}

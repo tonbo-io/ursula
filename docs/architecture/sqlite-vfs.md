@@ -59,9 +59,13 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   a commit that starts a new WAL generation, once per WAL wrap (§6).
 - **Outcome unknown** (timeout, connection loss, 5xx): retried with the same sequence until the
   server answers, for up to `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
-- **403** (a newer epoch claimed the stream), a definite rejection, or an exhausted budget: the
-  write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back, nothing of it reaches
-  the local WAL, and the database is poisoned until it is re-attached.
+- **401** (an authorizer in front of the stream, such as `ursula gateway --auth-*`, refused the
+  token): retried like an unknown outcome, with the token read again (§7). A **403 without
+  `Producer-Epoch`** is an authorizer's denial and final. Both fail the write as unauthorized,
+  never as fenced: only the server's 403 carries `Producer-Epoch`.
+- **403 with `Producer-Epoch`** (a newer epoch claimed the stream), a definite rejection, or an
+  exhausted budget: the write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back,
+  nothing of it reaches the local WAL, and the database is poisoned until it is re-attached.
 - **A 2xx is accepted only with a `Stream-Next-Offset` past the owner's offset**, which becomes the
   owner's offset; another poisons. The VFS does not check where its frame landed (that would need
   offset arithmetic). A duplicate answered without one (its receipt is beyond the server's
@@ -461,7 +465,9 @@ rebuild, delete `<db>`.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
   by the server at 1 GiB compressed (32 MiB inline or through the gateway).
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.
-- Plain HTTP only.
+- HTTP, or TLS for `https://` URLs with the bundled Mozilla roots, or only the certificate
+  authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
+  content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401.
 
 ## 8. Tests
 
