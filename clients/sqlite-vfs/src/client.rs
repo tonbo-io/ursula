@@ -227,6 +227,7 @@ pub(crate) fn append(
     epoch: u64,
     seq: u64,
 ) -> Append {
+    let started = Instant::now();
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
     let mut attempts: u32 = 0;
@@ -306,6 +307,13 @@ pub(crate) fn append(
             }
             Err(e) => Attempt::Transport(Box::new(e)),
         };
+        // A retried commit is a stall the application sees: say why, attempt by attempt.
+        log::emit(Level::Warn, "append_retry", &[
+            ("stream", &url),
+            ("attempt", &attempts),
+            ("elapsed_ms", &started.elapsed().as_millis()),
+            ("reason", &unknown),
+        ]);
         if !pause(retry_after, &mut backoff, deadline) {
             return Append::Failed(if refused {
                 unauthorized("append", url, 401)

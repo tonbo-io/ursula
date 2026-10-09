@@ -90,7 +90,7 @@ The token is process-wide. A request whose token is refused (`401`) is sent agai
 
 `instrument(file, meter)` reports the same as metrics on an OpenTelemetry `Meter` (any object with `createHistogram`, `createCounter` and `createObservableGauge`; the package does not depend on OpenTelemetry): `sqlite_ursula.commit.duration` and `sqlite_ursula.append.duration` (ms), `sqlite_ursula.append.retries`, `sqlite_ursula.stream.bytes`, and the gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`, `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned` and `sqlite_ursula.fenced`. It drains `drainStats` every 10 seconds, so do not drain the same file elsewhere. Call the function it returns to stop.
 
-The extension logs one line per event on stderr, in logfmt: `sqlite-ursula-vfs level=warn event=poisoned file=... stream=... fenced=true reason="..."`. The events: `poisoned`, `snapshot_failed`, `open_refused`, `journal_refused`, `local_files_discarded`, `attach_retrying`, `attach_rebuilding`, `token_file_unreadable`, `ca_file_unreadable`, `ca_file_without_certificates`.
+The extension logs one line per event on stderr, in logfmt: `sqlite-ursula-vfs level=warn event=poisoned file=... stream=... fenced=true reason="..."`. The events: `poisoned`, `append_retry` (a commit's append was retried, with the attempt, the time since the commit's first attempt and the reason), `snapshot_failed`, `open_refused`, `journal_refused`, `local_files_discarded`, `attach_retrying`, `attach_rebuilding`, `token_file_unreadable`, `ca_file_unreadable`, `ca_file_without_certificates`.
 
 Alerts worth setting:
 
