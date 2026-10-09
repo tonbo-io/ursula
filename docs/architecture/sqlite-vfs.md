@@ -480,11 +480,40 @@ rebuild, delete `<db>`.
   authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
   content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401.
 
+### Versions
+
+Extensions of different versions meet in a stream and in the local files. They must agree on:
+
+| what | where | now |
+| --- | --- | --- |
+| commit and claim frames | the stream | `USQ1` |
+| snapshot bodies | the snapshot store | `USS2` |
+| the sidecar | `<db>-ursula`, on each host | format 2 (`v=2`) |
+| the producer | every append | `Producer-Id: sqlite-ursula-vfs/<Stream-Incarnation>`, and `Stream-Seq` from the epoch and sequence |
+
+None of these changes within a minor (0.7.x). Any 0.7.x extension attaches a stream another 0.7.x
+wrote, installs its snapshots, resumes from its local files on the same host, and fences its owner,
+and is fenced by it in turn. So upgrading the extension one owner at a time is safe: the new
+owner's attach fences the old one. CI checks this on every change: `test/compat.e2e.ts` runs the
+previous published patch of the minor against the build, both ways (a new host taking over, the old
+owner's next commit failing, the old version reading the new one's frames, and the same host
+resuming from the other version's files). Until a minor has a second patch it runs the build
+against itself.
+
+A change to any of them waits for a minor and changes the identifier with it: a new frame or
+snapshot magic, a new sidecar format, a new `Producer-Id` prefix. An extension fails closed on what
+it cannot read. A frame or snapshot of another format stops attach with an error that names the
+magic it found (`frame magic "USQ2": this extension reads "USQ1" frames, ...`) instead of
+misreading it. A sidecar it cannot parse is not trusted, so attach rebuilds the files from the
+stream. Owners with different `Producer-Id`s do not fence each other, so a minor that changes it
+must say in its release notes to stop every owner of a stream before upgrading.
+
 ## 8. Tests
 
-- Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused), and the
-  claim lookup (a claim wins only as the frame ending at the answered offset, or anywhere in a
-  read-back that ran past it; a re-claim also only as the first frame after the owner's offset).
+- Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused, another
+  format refused by its magic, named in the error), and the claim lookup (a claim wins only as the
+  frame ending at the answered offset, or anywhere in a read-back that ran past it; a re-claim also
+  only as the first frame after the owner's offset).
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -513,6 +542,8 @@ rebuild, delete `<db>`.
   and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
   fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
   fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
+- Same-minor compatibility (`test/compat.e2e.ts`, §7): the previous published patch of the minor
+  and the build take over each other's streams on a new host and on the same one, both ways.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,
   MinIO locally and for fork PRs; the snapshot run's ~3.5 MB bodies go to the cold tier), plus a
   12 MiB snapshot body that exercises the multipart path, with a 64 KiB snapshot minimum so the

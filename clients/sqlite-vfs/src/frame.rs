@@ -37,8 +37,14 @@ pub enum Decoded {
 /// A frame that cannot be encoded or decoded.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("bad frame magic")]
-    Magic,
+    /// Not a frame this extension reads: a frame of another minor version's format (an
+    /// incompatible change bumps the magic), or not a frame at all.
+    #[error(
+        "frame magic \"{}\": this extension reads \"USQ1\" frames, so the stream was written by \
+         an extension of another minor version, or not by the extension",
+        .found.escape_ascii()
+    )]
+    Magic { found: Vec<u8> },
     #[error("frame checksum mismatch")]
     Checksum,
     #[error("zstd: {0}")]
@@ -122,11 +128,15 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, FrameError> {
         return if MAGIC.iter().zip(buf).all(|(m, b)| m == b) {
             Ok(Decoded::Partial)
         } else {
-            Err(FrameError::Magic)
+            Err(FrameError::Magic {
+                found: buf.to_vec(),
+            })
         };
     };
     if magic != MAGIC {
-        return Err(FrameError::Magic);
+        return Err(FrameError::Magic {
+            found: magic.to_vec(),
+        });
     }
     let Some((len, rest)) = take_u32(rest) else {
         return Ok(Decoded::Partial);
@@ -237,5 +247,20 @@ mod tests {
         });
         buf[first - 1] ^= 1;
         assert!(matches!(decode(&buf), Err(FrameError::Checksum)));
+    }
+
+    // A frame of another format fails closed and names what it found (§7, versions).
+    #[test]
+    fn another_format_is_refused_by_its_magic() {
+        let pages = BTreeMap::from([(1, vec![7u8; PAGE])]);
+        let (mut buf, _) = encode_commit(1, &pages).unwrap();
+        buf[3] = b'2';
+        let err = decode(&buf).unwrap_err();
+        assert!(matches!(&err, FrameError::Magic { found } if found == b"USQ2"));
+        assert!(
+            err.to_string()
+                .starts_with("frame magic \"USQ2\": this extension reads \"USQ1\"")
+        );
+        assert!(matches!(decode(b"UX"), Err(FrameError::Magic { found }) if found == b"UX"));
     }
 }

@@ -1,6 +1,8 @@
 // Child process for the crash, fencing and snapshot tests: loads the extension, attaches FILE to URL,
 // opens it with plain node:sqlite in WAL mode and runs each SQL argument as one exec (`@sleep:<ms>`
-// sleeps instead), printing a JSON line per step. Then stays alive until killed, unless CHILD_EXIT=1.
+// sleeps instead, `@wait:<path>` waits until the path exists, `@query:<sql>` prints the rows),
+// printing a JSON line per step. Then stays alive until killed, unless CHILD_EXIT=1.
+import { existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 const [ext, file, url, ...sqls] = process.argv.slice(2);
@@ -16,6 +18,15 @@ for (const [step, sql] of sqls.entries()) {
 	if (sql.startsWith("@sleep:")) {
 		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(sql.slice(7)));
 		say({ step, ok: true });
+		continue;
+	}
+	if (sql.startsWith("@wait:")) {
+		while (!existsSync(sql.slice(6))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+		say({ step, ok: true });
+		continue;
+	}
+	if (sql.startsWith("@query:")) {
+		say({ step, ok: true, rows: db.prepare(sql.slice(7)).all() });
 		continue;
 	}
 	try {
@@ -37,6 +48,8 @@ say({
 	snapshots: stats.snapshots.length,
 	snapshot: status.snapshot,
 	retained: status.retained,
+	installed: status.installed,
+	local: status.local,
 	health: { commits, append_retries, attach_ms, log_bytes, snapshot_due_bytes, snapshot_age_ms, snapshot_failures, snapshot_error },
 });
 if (process.env.CHILD_EXIT === "1") {
