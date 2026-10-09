@@ -15,8 +15,15 @@ pub enum NodeState {
     Removed,
 }
 
+/// Nodes that are not `Removed`, with their lifecycle state, as the
+/// operation kernel sees them.
+pub(crate) type NodeStates = BTreeMap<NodeId, NodeState>;
+
 impl NodeState {
-    pub fn is_migration_eligible(self) -> bool {
+    /// Whether the node may receive a new replica, as a seeded voter, a
+    /// learner or a promoted voter. A node being drained may be in any state
+    /// except `Removed`.
+    pub fn accepts_new_replicas(self) -> bool {
         matches!(self, Self::Active)
     }
 }

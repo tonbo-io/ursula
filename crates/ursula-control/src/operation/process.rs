@@ -15,6 +15,7 @@ use super::model::RetirementReason;
 use crate::NodeId;
 use crate::identity::ProcessIncarnation;
 use crate::identity::ReplicaIdentity;
+use crate::model::NodeStates;
 
 impl OperationState {
     pub(super) fn restart_process(
@@ -68,9 +69,9 @@ impl OperationState {
         node_id: NodeId,
         expected_epoch: u64,
         incarnation: ProcessIncarnation,
-        nodes: &BTreeSet<NodeId>,
+        nodes: &NodeStates,
     ) -> Result<OperationOutcome, OperationError> {
-        if !nodes.contains(&node_id) {
+        if !nodes.contains_key(&node_id) {
             return Err(OperationError::UnknownNode { node_id });
         }
         let current = self.processes.get(&node_id);
@@ -150,9 +151,9 @@ impl OperationState {
         node_id: NodeId,
         process: &ProcessIdentity,
         identity: ReplicaIdentity,
-        nodes: &BTreeSet<NodeId>,
+        nodes: &NodeStates,
     ) -> Result<OperationOutcome, OperationError> {
-        if !nodes.contains(&node_id) {
+        if !nodes.contains_key(&node_id) {
             return Err(OperationError::UnknownNode { node_id });
         }
         if !self.accepts_process(node_id, process) {

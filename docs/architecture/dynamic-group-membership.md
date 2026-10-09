@@ -29,8 +29,10 @@ This phase provides:
 
 - `ursula-control`, a pure control-plane state-machine crate.
 - A placement projection model for data Raft groups.
-- Node registration state, node lifecycle state, and migration eligibility
-  validation.
+- Node registration state, node lifecycle state, and hosting eligibility:
+  only `Active` nodes receive new replicas (seeded voters, learners and
+  promoted voters), while a source being drained may be in any state except
+  `Removed`.
 - One maintenance operation kernel for move, rebuild and decommission.
 - Process and replica identity pins, explicit action outcomes, and evidence-checked placement completion.
 - A meta Raft type config, state machine, and snapshot support, with an
@@ -71,8 +73,9 @@ completion changes existing voters or marks a node removed.
 current process identities. A rebuild covers every source-hosted group; a move
 names a nonempty subset; a decommission supplies replacements for the entire
 inventory. Every node that gains a replica (a move or decommission target, or
-a rebuild source) must already have an active registered replica, because
-replica registration is refused while an operation is active. The operation
+a rebuild source) must be `Active` and already have an active registered
+replica, because replica registration is refused while an operation is
+active. The source being drained may be in any state except `Removed`. The operation
 pins previous and desired voters. Executor takeover
 advances a generation and invalidates observations without erasing pending
 work or lowering the observed prefix floor.

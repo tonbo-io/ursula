@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 
 use ursula_shard::RaftGroupId;
 
-use crate::ClusterNode;
 use crate::GroupPlacementView;
 use crate::NodeState;
 use crate::PlacementNode;
@@ -70,21 +69,11 @@ fn placement_view_selects_active_non_draining_voter_for_redirect() {
 }
 
 #[test]
-fn cluster_node_active_state_is_migration_eligible() {
-    let node = ClusterNode {
-        node_id: 5,
-        client_url: "http://node5:4491".to_owned(),
-        cluster_url: "http://node5:4492".to_owned(),
-        state: NodeState::Active,
-        registered_at_ms: 10,
-        updated_at_ms: 10,
-        labels: BTreeMap::new(),
-    };
-
-    assert!(node.state.is_migration_eligible());
-    assert!(!NodeState::Draining.is_migration_eligible());
-    assert!(!NodeState::Disabled.is_migration_eligible());
-    assert!(!NodeState::Removed.is_migration_eligible());
+fn only_active_nodes_accept_new_replicas() {
+    assert!(NodeState::Active.accepts_new_replicas());
+    assert!(!NodeState::Draining.accepts_new_replicas());
+    assert!(!NodeState::Disabled.accepts_new_replicas());
+    assert!(!NodeState::Removed.accepts_new_replicas());
 }
 
 use crate::ControlCommand;
@@ -535,4 +524,153 @@ fn one_dispatcher_owns_membership_from_intent_through_placement() {
     );
     assert_eq!(state.placements[&RaftGroupId(0)].voters, set([2, 3, 4]));
     assert_eq!(state.placements[&RaftGroupId(0)].epoch, 1);
+}
+
+/// Registers nodes, seeds group 0 on voters 1-3, and claims a process and a
+/// generation-1 replica for every node.
+fn ready_cluster(nodes: &[u64]) -> ControlPlaneState {
+    use crate::OperationCommand;
+    use crate::OperationOutcome;
+    let mut state = ControlPlaneState::default();
+    register_active_nodes(&mut state, nodes.iter().copied());
+    assert_eq!(
+        state.apply(ControlCommand::SeedPlacement {
+            raft_group_id: RaftGroupId(0),
+            voters: set([1, 2, 3]),
+            now_ms: 10
+        }),
+        ControlResponse::Ok
+    );
+    for node_id in nodes {
+        let incarnation = crate::ProcessIncarnation::from_bits(u128::from(*node_id));
+        let ControlResponse::Operation(Ok(OperationOutcome::ProcessClaimed(process))) = state
+            .apply(ControlCommand::Operation {
+                command: OperationCommand::ClaimProcess {
+                    node_id: *node_id,
+                    expected_epoch: 0,
+                    incarnation: incarnation.clone(),
+                },
+                now_ms: 10,
+            })
+        else {
+            panic!("claim");
+        };
+        assert_eq!(
+            state.apply(ControlCommand::Operation {
+                command: OperationCommand::RegisterReplica {
+                    node_id: *node_id,
+                    process,
+                    identity: crate::ReplicaIdentity {
+                        generation: 1,
+                        incarnation,
+                    },
+                },
+                now_ms: 10,
+            }),
+            ControlResponse::Operation(Ok(OperationOutcome::ReplicaRegistered))
+        );
+    }
+    state
+}
+
+fn begin_operation(state: &mut ControlPlaneState, kind: crate::OperationKind) -> ControlResponse {
+    let participants = state
+        .operations
+        .processes
+        .iter()
+        .filter_map(|(node_id, process)| match process {
+            crate::ProcessState::Active(identity) => Some((*node_id, identity.clone())),
+            crate::ProcessState::Retired { .. } => None,
+        })
+        .filter(|(node_id, _)| *node_id <= 3 || kind_targets(&kind).contains(node_id))
+        .collect();
+    state.apply(ControlCommand::Operation {
+        command: crate::OperationCommand::Begin {
+            kind,
+            executor: crate::ProcessIncarnation::from_bits(100),
+            participants,
+            meta_voters: set([1, 2, 3]),
+        },
+        now_ms: 10,
+    })
+}
+
+fn kind_targets(kind: &crate::OperationKind) -> BTreeSet<u64> {
+    match kind {
+        crate::OperationKind::MoveReplicas { target, .. } => set([*target]),
+        crate::OperationKind::RebuildReplica { .. } => BTreeSet::new(),
+        crate::OperationKind::DecommissionNode { replacements, .. } => {
+            replacements.values().copied().collect()
+        }
+    }
+}
+
+#[test]
+fn new_replicas_need_active_nodes_while_any_unremoved_source_can_drain() {
+    let mut state = ready_cluster(&[1, 2, 3, 4]);
+    let set_state = |state: &mut ControlPlaneState, node_id, node_state| {
+        assert_eq!(
+            state.apply(ControlCommand::SetNodeState {
+                node_id,
+                state: node_state,
+                now_ms: 10,
+            }),
+            ControlResponse::Ok
+        );
+    };
+    let move_to_four = |source| crate::OperationKind::MoveReplicas {
+        source,
+        target: 4,
+        groups: BTreeSet::from([RaftGroupId(0)]),
+    };
+
+    // A disabled source can still be drained.
+    set_state(&mut state, 1, NodeState::Disabled);
+    let ControlResponse::Operation(Ok(crate::OperationOutcome::Acquired(token))) =
+        begin_operation(&mut state, move_to_four(1))
+    else {
+        panic!("a disabled source can be drained");
+    };
+    assert_eq!(
+        state.apply(ControlCommand::Operation {
+            command: crate::OperationCommand::Abort { token },
+            now_ms: 10,
+        }),
+        ControlResponse::Operation(Ok(crate::OperationOutcome::Aborted))
+    );
+
+    // New voters and learners need an active node.
+    for (node_state, kind) in [
+        (NodeState::Draining, move_to_four(2)),
+        (
+            NodeState::Disabled,
+            crate::OperationKind::DecommissionNode {
+                node_id: 2,
+                replacements: BTreeMap::from([(RaftGroupId(0), 4)]),
+            },
+        ),
+    ] {
+        set_state(&mut state, 4, node_state);
+        let before = state.clone();
+        assert_eq!(
+            begin_operation(&mut state, kind),
+            ControlResponse::Operation(Err(crate::OperationError::IneligibleNode {
+                node_id: 4,
+                state: node_state,
+            }))
+        );
+        assert_eq!(state, before);
+    }
+    // A rebuilt replica rejoins as a new voter.
+    let before = state.clone();
+    assert_eq!(
+        begin_operation(&mut state, crate::OperationKind::RebuildReplica {
+            node_id: 1
+        }),
+        ControlResponse::Operation(Err(crate::OperationError::IneligibleNode {
+            node_id: 1,
+            state: NodeState::Disabled,
+        }))
+    );
+    assert_eq!(state, before);
 }

@@ -16,6 +16,7 @@ use super::model::OperationToken;
 use super::model::PrefixEvidence;
 use super::model::ProcessIdentity;
 use crate::NodeId;
+use crate::NodeState;
 use crate::identity::ProcessIncarnation;
 use crate::identity::ReplicaIdentity;
 
@@ -138,6 +139,8 @@ pub enum OperationError {
     EpochExhausted,
     #[error("group {raft_group_id:?} lacks fresh quorum and apply evidence")]
     MissingEvidence { raft_group_id: RaftGroupId },
+    #[error("node {node_id} cannot receive a new replica while {state:?}")]
+    IneligibleNode { node_id: NodeId, state: NodeState },
     #[error("node {node_id} has no active registered replica")]
     InactiveReplica { node_id: NodeId },
     #[error("operation passed irreversible work ({phase:?}); reconcile forward")]

@@ -33,7 +33,6 @@ mod process;
 mod tests;
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 
 pub use command::OperationCommand;
 pub use command::OperationError;
@@ -59,6 +58,7 @@ use ursula_shard::RaftGroupId;
 use crate::DataGroupPlacement;
 use crate::NodeId;
 use crate::identity::ProcessIncarnation;
+use crate::model::NodeStates;
 
 impl OperationState {
     pub fn accepts_process(&self, node_id: NodeId, identity: &ProcessIdentity) -> bool {
@@ -69,7 +69,7 @@ impl OperationState {
         &mut self,
         command: OperationCommand,
         now_ms: u64,
-        nodes: &BTreeSet<NodeId>,
+        nodes: &NodeStates,
         placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
     ) -> Result<OperationOutcome, OperationError> {
         match command {

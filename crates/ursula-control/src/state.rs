@@ -76,7 +76,7 @@ impl ControlPlaneState {
             .nodes
             .iter()
             .filter(|(_, node)| node.state != NodeState::Removed)
-            .map(|(id, _)| *id)
+            .map(|(id, node)| (*id, node.state))
             .collect();
         let decommissioned = self
             .operations
@@ -211,7 +211,7 @@ impl ControlPlaneState {
             let Some(node) = self.nodes.get(node_id) else {
                 return reject(crate::ControlError::UnknownNode { node_id: *node_id });
             };
-            if node.state != NodeState::Active {
+            if !node.state.accepts_new_replicas() {
                 return reject(crate::ControlError::IneligibleNode {
                     node_id: *node_id,
                     state: node.state,

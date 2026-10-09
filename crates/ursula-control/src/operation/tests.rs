@@ -1,5 +1,9 @@
+use std::collections::BTreeSet;
+
 use super::*;
+use crate::NodeState;
 use crate::ReplicaIdentity;
+use crate::model::NodeStates;
 
 fn identity(epoch: u64, node: u64) -> ProcessIdentity {
     ProcessIdentity {
@@ -18,17 +22,17 @@ fn replica(node: u64) -> ReplicaIdentity {
 
 fn setup() -> (
     OperationState,
-    BTreeSet<NodeId>,
+    NodeStates,
     BTreeMap<RaftGroupId, DataGroupPlacement>,
 ) {
-    let nodes = BTreeSet::from([1, 2, 3, 4]);
+    let nodes: NodeStates = [1, 2, 3, 4].map(|id| (id, NodeState::Active)).into();
     let state = OperationState {
         processes: nodes
-            .iter()
+            .keys()
             .map(|id| (*id, ProcessState::Active(identity(1, *id))))
             .collect(),
         replicas: nodes
-            .iter()
+            .keys()
             .map(|id| {
                 (*id, ReplicaState::Active {
                     identity: replica(*id),
@@ -51,7 +55,7 @@ fn setup() -> (
 
 fn begin(
     state: &mut OperationState,
-    nodes: &BTreeSet<NodeId>,
+    nodes: &NodeStates,
     placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
     kind: OperationKind,
     ids: &[u64],
@@ -60,7 +64,7 @@ fn begin(
         kind,
         executor: ProcessIncarnation::from_bits(99),
         participants: ids.iter().map(|id| (*id, identity(1, *id))).collect(),
-        meta_voters: nodes.clone(),
+        meta_voters: nodes.keys().copied().collect(),
     };
     let OperationOutcome::Acquired(token) = state.apply(command, 10, nodes, placements).unwrap()
     else {
@@ -94,7 +98,7 @@ fn evidence(voters: &[u64], replicas: &[u64], index: u64) -> PrefixEvidence {
 #[test]
 fn replica_fence_requires_every_survivor_not_only_a_majority() {
     let (mut state, mut nodes, mut placements) = setup();
-    nodes.insert(5);
+    nodes.insert(5, NodeState::Active);
     state
         .processes
         .insert(5, ProcessState::Active(identity(1, 5)));
@@ -944,7 +948,7 @@ proptest::proptest! {
 
 fn dispatch_pending(
     state: &mut OperationState,
-    nodes: &BTreeSet<NodeId>,
+    nodes: &NodeStates,
     placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
 ) {
     let operation = state.active.as_ref().unwrap();
@@ -1090,7 +1094,7 @@ proptest::proptest! {
 
 fn install_admission(
     state: &mut OperationState,
-    nodes: &BTreeSet<NodeId>,
+    nodes: &NodeStates,
     placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
     token: &OperationToken,
     node_id: NodeId,
@@ -1245,7 +1249,7 @@ fn reassignment_applies_the_prepare_policy_to_the_new_leader() {
 
 fn move_one_to_four(
     state: &mut OperationState,
-    nodes: &BTreeSet<NodeId>,
+    nodes: &NodeStates,
     placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
 ) -> OperationToken {
     begin(
@@ -1263,7 +1267,7 @@ fn move_one_to_four(
 
 fn prepare(
     state: &mut OperationState,
-    nodes: &BTreeSet<NodeId>,
+    nodes: &NodeStates,
     placements: &mut BTreeMap<RaftGroupId, DataGroupPlacement>,
     token: &OperationToken,
     action: MembershipAction,
@@ -1310,7 +1314,7 @@ fn begin_requires_an_active_replica_on_every_joining_node() {
                     kind,
                     executor: ProcessIncarnation::from_bits(99),
                     participants: [1, 2, 3, 4].map(|id| (id, identity(1, id))).into(),
-                    meta_voters: nodes.clone(),
+                    meta_voters: nodes.keys().copied().collect(),
                 },
                 10,
                 &nodes,
@@ -1328,7 +1332,7 @@ fn begin_requires_an_active_replica_on_every_joining_node() {
                 kind: OperationKind::RebuildReplica { node_id: 1 },
                 executor: ProcessIncarnation::from_bits(99),
                 participants: [1, 2, 3].map(|id| (id, identity(1, id))).into(),
-                meta_voters: nodes.clone(),
+                meta_voters: nodes.keys().copied().collect(),
             },
             10,
             &nodes,

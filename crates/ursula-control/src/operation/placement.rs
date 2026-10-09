@@ -19,6 +19,7 @@ use super::model::RetirementReason;
 use crate::DataGroupPlacement;
 use crate::NodeId;
 use crate::identity::ProcessIncarnation;
+use crate::model::NodeStates;
 
 impl OperationState {
     pub(super) fn begin(
@@ -27,14 +28,14 @@ impl OperationState {
         executor: ProcessIncarnation,
         participants: BTreeMap<NodeId, ProcessIdentity>,
         meta_voters: BTreeSet<NodeId>,
-        nodes: &BTreeSet<NodeId>,
+        nodes: &NodeStates,
         placements: &BTreeMap<RaftGroupId, DataGroupPlacement>,
     ) -> Result<OperationOutcome, OperationError> {
         if self.active.is_some() {
             return Err(OperationError::Busy);
         }
         let source = kind.source();
-        if !nodes.contains(&source) {
+        if !nodes.contains_key(&source) {
             return Err(OperationError::UnknownNode { node_id: source });
         }
         let hosted = placements
@@ -46,7 +47,7 @@ impl OperationState {
             OperationKind::MoveReplicas { target, groups, .. } => {
                 if groups.is_empty()
                     || *target == source
-                    || !nodes.contains(target)
+                    || !nodes.contains_key(target)
                     || groups.iter().any(|group| !hosted.contains_key(group))
                 {
                     return Err(OperationError::InventoryMismatch);
@@ -79,7 +80,7 @@ impl OperationState {
                 }
             };
             if let Some(target) = target {
-                if !nodes.contains(&target) || voters.contains(&target) {
+                if !nodes.contains_key(&target) || voters.contains(&target) {
                     return Err(OperationError::InventoryMismatch);
                 }
                 voters.remove(&source);
@@ -95,13 +96,22 @@ impl OperationState {
                 replacements.values().copied().collect()
             }
         };
-        if let Some(node_id) = joining.into_iter().find(|node_id| {
-            !matches!(
-                self.replicas.get(node_id),
+        for node_id in joining {
+            // Sources may be in any state but `Removed`; new replicas go only to
+            // nodes that accept them.
+            let state = nodes
+                .get(&node_id)
+                .copied()
+                .ok_or(OperationError::UnknownNode { node_id })?;
+            if !state.accepts_new_replicas() {
+                return Err(OperationError::IneligibleNode { node_id, state });
+            }
+            if !matches!(
+                self.replicas.get(&node_id),
                 Some(ReplicaState::Active { .. })
-            )
-        }) {
-            return Err(OperationError::InactiveReplica { node_id });
+            ) {
+                return Err(OperationError::InactiveReplica { node_id });
+            }
         }
         let mut required = previous
             .values()
@@ -110,7 +120,11 @@ impl OperationState {
             .copied()
             .collect::<BTreeSet<_>>();
         required.insert(source);
-        if meta_voters.is_empty() || !meta_voters.is_subset(nodes) {
+        if meta_voters.is_empty()
+            || meta_voters
+                .iter()
+                .any(|node_id| !nodes.contains_key(node_id))
+        {
             return Err(OperationError::InventoryMismatch);
         }
         if participants.keys().copied().collect::<BTreeSet<_>>() != required {
