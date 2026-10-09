@@ -13,9 +13,10 @@ identifies the Raft leader.
 
 ## Behavior
 
-- Sends each incoming request to the cached leader of its stream, or else to
-  a configured upstream Ursula node picked at random, skipping upstreams that
-  recently failed at the transport.
+- Sends each incoming request to the leader it learned for the request's
+  stream, or else to a configured upstream Ursula node picked at random,
+  skipping upstreams that recently failed at the transport. See
+  [Upstream Selection](#upstream-selection).
 - Buffers request bodies up to `--max-request-body-bytes`; larger requests
   receive `413 Payload Too Large` before reaching an upstream.
 - Follows Ursula Raft leader redirects internally when the response includes
@@ -26,6 +27,40 @@ identifies the Raft leader.
 - Optionally classifies Durable Streams requests as an explicit
   `bucket/stream/action` resource before forwarding them to provider-neutral
   authentication and authorization hooks.
+
+## Upstream Selection
+
+- **Leader cache.** When an upstream answers with Ursula's internal `307` and
+  `x-ursula-raft-leader-id`, the gateway follows it to the leader and
+  remembers that leader for the stream, or for the stream's Raft group with
+  `--raft-group-count`. Later requests for the stream or group go to the
+  cached leader directly. A route is dropped when its leader answers with the
+  retryable `503` it sends while it does not know the leader, or when a
+  request to it fails. The cache holds up to 16384 routes and starts over
+  when full. Requests without a route go to a configured upstream picked at
+  random.
+- **Ejection.** An upstream that fails at the transport (it refuses or times
+  out the connection, or the exchange breaks) is ejected: requests skip it
+  for 10 s. Each failure after a window ejects it again for twice as long,
+  up to 60 s. Failures of requests that were already in flight do not
+  lengthen a window. An upstream that sends no response headers within
+  `--response-header-timeout` is not ejected, because one slow Raft group on
+  a live node does the same. A node that vanished fails within
+  `--upstream-tcp-user-timeout` instead.
+- **Probe.** When a window expires, the next request that selects the
+  upstream, along a cached route or at random, probes it. The other requests
+  keep skipping the upstream until the probe answers or fails, or for at most
+  `--connect-timeout` plus `--upstream-tcp-user-timeout`, after which the
+  next request that selects it probes it again. Any response from the
+  upstream, whatever its status, ends its ejection. That includes the
+  response to a request that follows a leader redirect to it.
+- **Fallback.** If every upstream is ejected or being probed, requests go
+  along their cached route, or else to any upstream, rather than to none.
+- **Metrics.** `/__ursula/gateway/metrics` reports `upstream_ejections`
+  (times an upstream was ejected) and `upstream_ejected` (upstreams skipped
+  now, inside a window or with a probe outstanding), next to the leader-cache
+  counters `leader_cache_hits`, `leader_cache_misses`, `leader_cache_updates`,
+  `leader_cache_evictions` and `leader_cache_entries`.
 
 ## Access Control and Logical Tenancy
 
@@ -141,15 +176,8 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
   force-deleted pod or a powered-off host, fails the requests waiting on them
   within `--upstream-tcp-user-timeout` with `502`. The request may have
   reached the node, so the client decides whether to retry it.
-- An upstream that fails at the transport (refuses or times out the
-  connection, drops the exchange, or sends no response headers in time) is
-  skipped for 10 s, doubling up to 60 s while it keeps failing. Once a window
-  expires, one request probes it, and the others keep skipping it until that
-  probe answers or fails. Any response puts it back. If every upstream is
-  skipped, requests go to all of them again rather than to none.
-- `/__ursula/gateway/metrics` reports `upstream_ejections` (times an upstream
-  was skipped after a failure) and `ejected_upstreams` (skipped now), next to
-  the leader-cache counters.
+- Upstreams that fail at the transport are skipped for a while. See
+  [Upstream Selection](#upstream-selection).
 - Request bodies are buffered up to `--max-request-body-bytes` because internal
   leader redirects require replaying the request to a different upstream.
 - The gateway keeps no durable state and does not maintain cluster membership.
