@@ -87,14 +87,16 @@ Over `http://` the token crosses the network in clear. Use `https://` for any en
 
 ## Writes refused with 402
 
-A layer in front of the stream, such as an authorizer or a quota or billing service, may refuse writes with `402 Payment Required`. Ursula itself never does. Nothing of a refused write reaches the stream, so the extension fails that transaction alone:
+A layer in front of the stream, such as an authorizer or a quota or billing service, may refuse writes with `402 Payment Required`. Ursula itself never does. The extension takes a `402` to mean that nothing of the write reached the stream, so it fails that transaction alone:
 
 - The commit fails with `SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`), and SQLite rolls the transaction back. The file is not poisoned, and the owner keeps its claim on the stream.
 - Reads keep working from the local file.
 - Later commits are sent as usual, and succeed once the layer accepts writes again. No new attach is needed.
-- `status(file)` reports `payment_required: true` until a commit succeeds, with the layer's explanation (its response body, up to 256 bytes) as `payment_reason`. Through `openUrsulaPiStorage`, the commit rejects with `UrsulaPaymentRequiredError`, whose `reason` is the same text.
+- `status(file)` reports `payment_required: true` until a commit succeeds or the file is poisoned, with the layer's explanation (its response body, up to 256 bytes) as `payment_reason`. Through `openUrsulaPiStorage`, the commit rejects with `UrsulaPaymentRequiredError`, whose `reason` is the same text.
 
 One case still poisons. When a commit's append got no answer or a `5xx` before the `402`, the append may already be in the stream, so the extension retries it like any append whose outcome is unknown. If the layer still refuses it when `URSULA_VFS_RETRY_MS` runs out, the commit fails and the file must be attached again.
+
+This is safe only if the layer follows one rule: answer `401`, `402` or `429` only to a request that the stream did not apply. A layer that passes an append on to the stream and then refuses it, for example with a `402` from metering that runs after the stream answered, breaks the rule. The extension then sends the next commit with the refused append's producer sequence, the stream acknowledges that commit as a duplicate of the refused append without appending it, and the file and the stream diverge without an error. Ursula's gateway and server follow the rule.
 
 An attach claims the stream, which is a write. When the layer refuses it, `attach` throws `UrsulaPaymentRequiredError` (`ursula_attach` fails with `SQLITE_AUTH`, `errcode` 23), and the file opens again only after an attach succeeds. A [read-only attach](#read-only-attach) can read the database meanwhile.
 
@@ -108,7 +110,8 @@ attach("/data/app.db", "https://ursula.example.com/my-bucket/app-db", { readOnly
 
 A read-only attach catches the file up like any attach but claims nothing, and it never writes the stream. It does not fence the owner, and it works while a layer in front of the stream refuses writes. Use it to export a database from another host, or to read one whose owner cannot claim it.
 
-- Every write fails with `SQLITE_READONLY` ("attempt to write a readonly database"), and SQLite rolls the transaction back. A transaction that changes nothing still commits.
+- Every write fails with `SQLITE_READONLY` ("attempt to write a readonly database"). A transaction that changes nothing still commits.
+- A failed `COMMIT`, or a failed statement outside an explicit transaction, leaves no transaction open. Inside an explicit transaction, a statement whose changes outgrow SQLite's page cache fails before `COMMIT`, and the transaction stays open. After an error, run `ROLLBACK` if the transaction is still open (`isTransaction` in `node:sqlite`). Until then, even reads on that connection fail with the same error. Pi's storage rolls back a failed transaction itself.
 - The file holds the stream as of the attach. Attach it again to catch up.
 - A missing stream is an error. A read-only attach never creates one.
 - `status(file)` reports `read_only: true`, and `epoch` is the highest epoch claimed up to `offset`.
@@ -123,7 +126,7 @@ A read-only attach catches the file up like any attach but claims nothing, and i
 - `log_bytes`, `snapshot_due_bytes`: the log since the latest snapshot, which a rebuild replays, and the size at which a snapshot is taken (the database's size, or `URSULA_VFS_SNAPSHOT_MIN_BYTES` if larger).
 - `snapshot_age_ms`, `snapshot_failures`, `snapshot_error`: milliseconds since this owner last saw a snapshot published (`null` for none since the attach), and the snapshot attempts that failed in a row with the last reason.
 - `attach_ms`: how long the attach took.
-- `payment_required`, `payment_reason`: a layer in front of the stream refused the latest write with `402`, and its explanation (see [Writes refused with 402](#writes-refused-with-402)).
+- `payment_required`, `payment_reason`: a layer in front of the stream refused the latest write with `402`, and its explanation (see [Writes refused with 402](#writes-refused-with-402)). `payment_required` is `false` while `poisoned` is `true`, since a poisoned file needs a new attach whatever the layer does.
 - `read_only`: the file is attached read-only.
 
 `instrument(file, meter)` reports the same as metrics on an OpenTelemetry `Meter`, which can be any object with `createHistogram`, `createCounter` and `createObservableGauge`. The package does not depend on OpenTelemetry. The metrics are `sqlite_ursula.commit.duration` and `sqlite_ursula.append.duration` (ms), `sqlite_ursula.append.retries`, `sqlite_ursula.stream.bytes`, and the gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`, `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned`, `sqlite_ursula.fenced` and `sqlite_ursula.payment_required`. It drains `drainStats` every 10 seconds, so do not drain the same file elsewhere. Call the function it returns to stop.

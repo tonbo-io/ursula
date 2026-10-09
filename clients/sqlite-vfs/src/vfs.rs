@@ -512,7 +512,10 @@ unsafe extern "C" fn x_write(
     };
     let mut db = lock(&db);
     // A read-only attachment writes neither the stream nor its WAL: its write transactions fail at
-    // their first WAL write (a commit, or a spill), and SQLite rolls them back.
+    // their first WAL write. SQLITE_READONLY is not an error on which SQLite rolls a transaction
+    // back by itself: a failed COMMIT (or autocommit statement) ends it, but a spill (a statement
+    // of an explicit transaction outgrowing the page cache) fails before COMMIT and leaves the
+    // transaction open until the application rolls it back.
     if db.mode == Mode::ReadOnly {
         return ffi::SQLITE_READONLY;
     }

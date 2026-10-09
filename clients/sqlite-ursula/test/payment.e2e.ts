@@ -92,6 +92,52 @@ it("a commit refused with 402 fails alone: reads go on, and the next commit succ
 	expect(xs(copy)).toEqual(["a1", "a5"]);
 });
 
+// A refused transaction that restarts the WAL (after a full backfill) and spills frames before its
+// COMMIT (a 5-page cache) fails alone too: SQLITE_IOERR_AUTH is an I/O error, so SQLite rolls the
+// whole transaction back, and no transaction stays open. The file stays intact and in step with the
+// stream: the next commit succeeds, a same-boot re-attach trusts the local files, and a rebuild from
+// the stream holds the same rows.
+it("a refused transaction that restarts the WAL and spills before COMMIT is rolled back whole", async () => {
+	const path = streamPath();
+	const file = freshFile();
+	const [refusing, accepting] = [`${file}.refusing`, `${file}.accepting`];
+	const big = "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) INSERT INTO t SELECT hex(randomblob(400)) FROM c";
+	const steps = [
+		"CREATE TABLE t(x TEXT)",
+		"INSERT INTO t VALUES ('b1')",
+		"PRAGMA wal_checkpoint(PASSIVE)",
+		"PRAGMA cache_size=5",
+		`@wait:${refusing}`,
+		`BEGIN; ${big}; COMMIT`,
+		`@wait:${accepting}`,
+		"INSERT INTO t VALUES ('b2')",
+		"@query:SELECT count(*) AS n FROM t",
+		"@query:PRAGMA integrity_check",
+	];
+	const child = runChild(file, gate.url + path, steps, { CHILD_EXIT: "1" });
+	await child.waitFor((l) => l.step === 4 && l.phase === "start");
+	await gate.refuse(REASON);
+	writeFileSync(refusing, "");
+	await child.waitFor((l) => l.step === 6 && l.phase === "start");
+	await gate.refuse(null);
+	writeFileSync(accepting, "");
+	const done = await child.waitFor((l) => l.done === true);
+	expect((await child.exited).code, child.stderr()).toBe(0);
+	expect(step(child, 5)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
+	expect(step(child, 7)?.ok).toBe(true);
+	expect(step(child, 8)?.rows).toEqual([{ n: 2 }]);
+	expect(step(child, 9)?.rows).toEqual([{ integrity_check: "ok" }]);
+	expect(done).toMatchObject({ poisoned: false, payment_required: false });
+	expect(child.stderr()).not.toMatch(/event=poisoned/);
+
+	attach(file, ursulaUrl() + path);
+	expect(status(file)).toMatchObject({ local: done.offset, installed: "-1" });
+	expect(xs(file)).toEqual(["b1", "b2"]);
+	const copy = freshFile();
+	attach(copy, ursulaUrl() + path);
+	expect(xs(copy)).toEqual(["b1", "b2"]);
+});
+
 // The commit's first attempt reaches the stream but its answer is lost, and the retries meet the 402:
 // the commit may be in the stream, so the refusal proves nothing. It is retried until an answer
 // settles it: once the layer forwards it again, the stream answers it as a duplicate of the first.
@@ -116,7 +162,8 @@ it("an append whose answer was lost and whose retries meet a 402 is retried unti
 });
 
 // The fence rules do not change: after a refusal, an owner that another one claimed over is fenced and
-// poisoned at its next commit, as ever.
+// poisoned at its next commit, as ever. It then reports the poison alone, not the refusal: it needs a
+// new attach whatever the layer does.
 it("an owner refused with 402 is still fenced by a newer owner's claim", async () => {
 	const path = streamPath();
 	const file = freshFile();
@@ -135,7 +182,7 @@ it("an owner refused with 402 is still fenced by a newer owner's claim", async (
 	expect((await child.exited).code, child.stderr()).toBe(0);
 	expect(step(child, 2)).toMatchObject({ ok: false, errcode: COMMIT_REFUSED });
 	expect(step(child, 4)).toMatchObject({ ok: false, errcode: POISONED });
-	expect(done).toMatchObject({ poisoned: true, fenced: true });
+	expect(done).toMatchObject({ poisoned: true, fenced: true, payment_required: false, payment_reason: null });
 	expect(done.reason).toMatch(/superseded.*\(403\)/);
 });
 

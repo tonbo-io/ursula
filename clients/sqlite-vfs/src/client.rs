@@ -299,7 +299,10 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// reached the stream. After an attempt whose outcome is unknown (no answer, or a 5xx), the
 /// append may be in the stream, and the next commit, sent with the same sequence, would be
 /// acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
-/// answer settles it or the budget runs out ([`Error::AppendUnknown`]).
+/// answer settles it or the budget runs out ([`Error::AppendUnknown`]). An attempt answered 401,
+/// 402 or 429 is taken to have applied nothing, which every layer in front of the stream must
+/// ensure (design doc §2): one that passed the append on and then answered so would have the next
+/// commit acknowledged as this one's duplicate, its pages never appended.
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -398,8 +401,9 @@ pub(crate) fn append(
             }
             Err(e) => Attempt::Transport(Box::new(e)),
         };
-        // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing; any
-        // other answer, or none, may come after the stream applied the append.
+        // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing (a
+        // requirement on every layer in front of it, see above); any other answer, or none, may
+        // come after the stream applied the append.
         if !matches!(unknown, Attempt::Status {
             status: 401 | 402 | 429,
             ..
@@ -954,6 +958,8 @@ mod tests {
             refused(),
             answer("429 Too Many Requests"),
             refused(),
+            answer("401 Unauthorized"),
+            refused(),
             // No answer at all: the attempt may have reached the stream.
             String::new(),
             refused(),
@@ -968,6 +974,8 @@ mod tests {
         assert!(matches!(&first, Append::PaymentRequired { body } if body == reason));
         let after_429 = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(after_429, Append::PaymentRequired { .. }));
+        let after_401 = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(after_401, Append::PaymentRequired { .. }));
         let settled = append(&url, "i1", "p", b"x", 1, 1);
         assert!(
             matches!(settled, Append::Acked { next: Some(ref n), attempts: 5 } if n == "9"),
@@ -988,7 +996,8 @@ mod tests {
             .map(|r| r.split(' ').next().unwrap())
             .collect();
         assert_eq!(methods, [
-            "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "PUT", "HEAD", "PUT"
+            "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "PUT",
+            "HEAD", "PUT"
         ]);
     }
 

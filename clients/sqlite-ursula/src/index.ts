@@ -41,6 +41,9 @@ export interface AttachOptions {
 	 * Attach without claiming the stream. Nothing is ever appended (no claim, commit or snapshot), so
 	 * no owner is fenced, and a layer in front of the stream that refuses writes does not stop it.
 	 * Every write to the file fails with SQLITE_READONLY ("attempt to write a readonly database").
+	 * A failed COMMIT leaves no transaction open, but a statement of an explicit transaction whose
+	 * changes outgrow the page cache fails before COMMIT, and SQLite leaves that transaction open:
+	 * run ROLLBACK after such an error (until then even reads on the connection fail).
 	 * The file holds the stream as of the attach: attach again to catch up. A missing stream is an
 	 * error, never created.
 	 */
@@ -105,7 +108,7 @@ export interface AttachStatus {
 	readonly reason: string | null;
 	/** Attached with `{ readOnly: true }`: nothing is ever appended, and every write fails with SQLITE_READONLY. */
 	readonly read_only: boolean;
-	/** A layer in front of the stream refused the latest write with `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). Not poisoned: cleared by the next acknowledged commit. */
+	/** A layer in front of the stream refused the latest write with `402 Payment Required` (a commit failed with {@link UrsulaPaymentRequiredError}, or a snapshot waits). It does not poison the file, and the next acknowledged commit clears it. Always `false` while `poisoned`, since a poisoned file needs a re-attach whatever the layer does. */
 	readonly payment_required: boolean;
 	/** The layer's explanation: the `402` response's body, cut to 256 bytes (`null` when it was empty, or without a refusal). */
 	readonly payment_reason: string | null;
@@ -247,7 +250,9 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 				const why = s.payment_reason === null ? "" : `: ${s.payment_reason}`;
 				throw new UrsulaPaymentRequiredError(`commit refused with 402 Payment Required in front of the stream${why}`, s.payment_reason, cause);
 			}
-			// Read-only: SQLite has rolled the transaction back too.
+			// Read-only: SQLite's own error, without the driver's failed ROLLBACK. The transaction is
+			// rolled back either way: by SQLite when COMMIT failed, by the driver's ROLLBACK when a
+			// statement failed before it.
 			if (s.read_only && errcode(cause) === SQLITE_READONLY) throw cause;
 			if (!s.poisoned) throw error;
 			throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, cause);
