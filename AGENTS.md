@@ -337,6 +337,12 @@ verifies them, and only then creates the Git tag and GitHub Release:
 - Docker image: `ghcr.io/tonbo-io/ursula`
 - Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula`
 
+GHCR holds only what tagged stable releases publish: the images, the charts,
+and nothing else. Image indexes carry no attestation manifests. Commit
+candidates come from the Commit Candidate Build workflow, which saves the image
+in the Depot Registry. A candidate's chart is installed from a checkout of the
+same commit.
+
 ## Security Considerations
 
 - `unsafe_code = "deny"` at the workspace level.
