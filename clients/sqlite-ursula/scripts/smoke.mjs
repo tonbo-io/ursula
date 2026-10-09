@@ -15,7 +15,7 @@ const functions = control
 	.prepare("SELECT DISTINCT name FROM pragma_function_list WHERE name LIKE 'ursula!_%' ESCAPE '!' ORDER BY name")
 	.all()
 	.map((row) => row.name);
-assert.deepEqual(functions, ["ursula_attach", "ursula_stats", "ursula_status"]);
+assert.deepEqual(functions, ["ursula_attach", "ursula_set_token", "ursula_stats", "ursula_status"]);
 
 // The extension made its VFS SQLite's default: an unattached database passes through it unchanged.
 const db = new DatabaseSync(join(mkdtempSync(join(tmpdir(), "smoke-")), "plain.db"));

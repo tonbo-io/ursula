@@ -150,7 +150,8 @@ unsafe extern "C" fn fn_set_token(
 }
 
 /// Registers the "ursula" VFS over "unix" as the default (once per process) and the SQL functions
-/// on `db`.
+/// on `db`, direct-only: a schema object of an untrusted database (a trigger, a view) cannot call
+/// them to attach a file or replace the process's token.
 ///
 /// # Safety
 ///
@@ -191,7 +192,7 @@ pub unsafe extern "C" fn sqlite3_extension_init(
                 db,
                 name.as_ptr(),
                 n,
-                ffi::SQLITE_UTF8,
+                ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY,
                 null_mut(),
                 Some(f),
                 None,

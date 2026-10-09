@@ -40,8 +40,12 @@ export function attach(file: string, streamUrl: string): StreamOffset {
 /**
  * Sets the bearer token every request of the extension carries from now on, process-wide (for an
  * endpoint behind `ursula gateway --auth-*`). `null` goes back to the file named by
- * `URSULA_VFS_TOKEN_FILE`, which is read again whenever it changes. A request whose token is
- * refused (401) is retried, with the token read again, within the retry budget.
+ * `URSULA_VFS_TOKEN_FILE`, which is read again whenever it changes and after a refused token (401).
+ *
+ * Call it with a fresh token before the current one expires. node:sqlite is synchronous, so a
+ * commit whose token is refused retries on the thread that would call `setToken`: it waits out the
+ * retry budget (`URSULA_VFS_RETRY_MS`, 30 s by default) and fails, and the file must be attached
+ * again. For tokens that expire on their own schedule, prefer the token file.
  */
 export function setToken(token: string | null): void {
 	loadUrsulaVfs().prepare("SELECT ursula_set_token(?)").get(token ?? "");

@@ -2,10 +2,14 @@
 //! snapshot and retention requests, and their retries.
 
 use std::fs;
+use std::net::IpAddr;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use ureq::http::Uri;
 use ureq::tls::Certificate;
 use ureq::tls::PemItem;
 use ureq::tls::RootCerts;
@@ -85,27 +89,64 @@ fn tls() -> TlsConfig {
     .clone()
 }
 
-/// `req` with the bearer token, when there is one; `refresh` reads the token file again.
+/// A token went out in clear (`authorized`), and the log said so.
+static IN_CLEAR_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// `req` with the bearer token, when there is one; `refresh` reads the token file again. A token
+/// sent over plain HTTP to another host crosses the network in clear: logged once per process.
 fn authorized<B>(req: ureq::RequestBuilder<B>, refresh: bool) -> ureq::RequestBuilder<B> {
-    match auth::token(refresh) {
-        Some(token) => req.header("authorization", format!("Bearer {token}")),
-        None => req,
+    let Some(token) = auth::token(refresh) else {
+        return req;
+    };
+    if let Some(uri) = req.uri_ref().filter(|uri| in_clear(uri))
+        && !IN_CLEAR_LOGGED.swap(true, Ordering::Relaxed)
+    {
+        log::emit(Level::Warn, "token_in_clear", &[("url", uri)]);
     }
+    req.header("authorization", format!("Bearer {token}"))
 }
 
-/// The endpoint refused the token: a 401. Retried with the token read again.
-fn token_refused(r: &ureq::http::Response<ureq::Body>) -> bool {
-    r.status().as_u16() == 401
+/// A plain `http://` URL whose host is not a loopback address (or `localhost`).
+fn in_clear(uri: &Uri) -> bool {
+    let loopback = |host: &str| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    uri.scheme_str() == Some("http") && !uri.host().is_some_and(loopback)
 }
 
-/// An authorizer in front of the stream refused the request: a 401, or a 403 that is not a fence
-/// (the server's fence carries the epoch that owns the stream, `Producer-Epoch`).
-fn auth_refused(r: &ureq::http::Response<ureq::Body>) -> bool {
+/// How an answer refuses a request before it reaches the stream, or fences its owner: the one
+/// place a fence is told from an authorizer's refusal.
+enum Refused {
+    /// A 401: an authorizer in front of the stream refused the token. Sent again, with the token
+    /// read again, within the retry budget.
+    Token,
+    /// A 403 without `Producer-Epoch`: an authorizer denied the request. Final, and never a fence.
+    Denied,
+    /// A 403 with `Producer-Epoch`: the server's fence, which names the epoch that owns the stream
+    /// (only an append can meet it).
+    Fenced { current: Option<u64> },
+}
+
+fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
     match r.status().as_u16() {
-        401 => true,
-        403 => !r.headers().contains_key("producer-epoch"),
-        _ => false,
+        401 => Some(Refused::Token),
+        403 if r.headers().contains_key("producer-epoch") => Some(Refused::Fenced {
+            current: header_u64(r, "producer-epoch"),
+        }),
+        403 => Some(Refused::Denied),
+        _ => None,
     }
+}
+
+/// An authorizer refused the request (a refused token, or a denial): the request fails as
+/// unauthorized, never as fenced.
+fn auth_refused(r: &ureq::http::Response<ureq::Body>) -> bool {
+    matches!(refused(r), Some(Refused::Token | Refused::Denied))
 }
 
 fn unauthorized(op: &'static str, url: &str, status: u16) -> Error {
@@ -159,13 +200,14 @@ fn retry_deadline() -> Instant {
     now.checked_add(retry_budget()).unwrap_or(now)
 }
 
-/// Sends a read, retrying 429 (rate limiting), 503 (overload, or a `consistency=leader` read, HEAD
-/// or snapshot read the leader could not confirm with a quorum in time) and 401 (the token was
-/// refused: sent again with the token read again) the way `append` does: no sooner than
-/// Retry-After (seconds), with backoff, within `retry_budget()`. Returns the first other answer,
-/// or the last retried one once the budget is spent or `stopped` (a re-attach is waiting for the
-/// snapshot thread). `send` takes whether to read the token again.
-fn read_retrying(
+/// Sends a request that is safe to repeat (a read, or a create), retrying 429 (rate limiting), 503
+/// (overload, or a `consistency=leader` read, HEAD or snapshot read the leader could not confirm
+/// with a quorum in time) and a refused token (`Refused::Token`: sent again with the token read
+/// again) the way `append` does: no sooner than Retry-After (seconds), with backoff, within
+/// `retry_budget()`. Returns the first other answer, or the last retried one once the budget is
+/// spent or `stopped` (a re-attach is waiting for the snapshot thread). `send` takes whether to
+/// read the token again.
+fn send_retrying(
     send: impl Fn(bool) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     stopped: &dyn Fn() -> bool,
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
@@ -174,7 +216,7 @@ fn read_retrying(
     let mut refresh = false;
     loop {
         let r = send(refresh)?;
-        refresh = token_refused(&r);
+        refresh = matches!(refused(&r), Some(Refused::Token));
         if !refresh && !matches!(r.status().as_u16(), 429 | 503) {
             return Ok(r);
         }
@@ -231,11 +273,11 @@ pub(crate) fn append(
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(20);
     let mut attempts: u32 = 0;
-    // The last answer was a 401: the next attempt reads the token again.
-    let mut refused = false;
+    // The last answer refused the token: the next attempt reads it again.
+    let mut token_refused = false;
     loop {
         attempts = attempts.saturating_add(1);
-        let mut req = authorized(agent().post(url), std::mem::take(&mut refused))
+        let mut req = authorized(agent().post(url), std::mem::take(&mut token_refused))
             .header("content-type", CONTENT_TYPE)
             .header("stream-incarnation", incarnation)
             .header("producer-id", producer)
@@ -252,56 +294,54 @@ pub(crate) fn append(
                 // Rate limiting (429, e.g. ursulagw) and overload (503) are transient: retried
                 // with the same producer sequence, no sooner than Retry-After (seconds).
                 retry_after = header_u64(&r, "retry-after").map(Duration::from_secs);
-                match status {
-                    200..=299 => {
-                        return Append::Acked {
-                            next: header_offset(&r, "stream-next-offset"),
-                            attempts,
-                        };
+                match refused(&r) {
+                    Some(Refused::Fenced { current }) => return Append::Fenced { current },
+                    Some(Refused::Denied) => {
+                        return Append::Failed(unauthorized("append", url, status));
                     }
-                    // The server's fence carries the epoch that owns the stream.
-                    403 if r.headers().contains_key("producer-epoch") => {
-                        return Append::Fenced {
-                            current: header_u64(&r, "producer-epoch"),
-                        };
-                    }
-                    // An authorizer in front of the stream: a refused token (401) is sent again with
-                    // the token read again; a denial (403) is final.
-                    401 => {
-                        refused = true;
+                    Some(Refused::Token) => {
+                        token_refused = true;
                         Attempt::Status {
                             status,
                             body: body_text(&mut r),
                         }
                     }
-                    403 => return Append::Failed(unauthorized("append", url, status)),
-                    // The stream was deleted and recreated: nothing was appended.
-                    412 => return Append::Recreated,
-                    409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
-                        return Append::ProducerExpired;
-                    }
-                    // Neither a producer sequence conflict nor a closed stream: the `Stream-Seq`.
-                    409 if seq > 0
-                        && !r.headers().contains_key("producer-expected-seq")
-                        && !r.headers().contains_key("stream-closed") =>
-                    {
-                        return Append::SeqConflict {
-                            body: body_text(&mut r),
-                        };
-                    }
-                    429 => Attempt::Status {
-                        status,
-                        body: body_text(&mut r),
-                    },
-                    400..=499 => {
-                        return Append::Failed(Error::AppendRejected {
+                    None => match status {
+                        200..=299 => {
+                            return Append::Acked {
+                                next: header_offset(&r, "stream-next-offset"),
+                                attempts,
+                            };
+                        }
+                        // The stream was deleted and recreated: nothing was appended.
+                        412 => return Append::Recreated,
+                        409 if seq > 0 && header_u64(&r, "producer-expected-seq") == Some(0) => {
+                            return Append::ProducerExpired;
+                        }
+                        // Neither a producer sequence conflict nor a closed stream: the
+                        // `Stream-Seq`.
+                        409 if seq > 0
+                            && !r.headers().contains_key("producer-expected-seq")
+                            && !r.headers().contains_key("stream-closed") =>
+                        {
+                            return Append::SeqConflict {
+                                body: body_text(&mut r),
+                            };
+                        }
+                        429 => Attempt::Status {
                             status,
                             body: body_text(&mut r),
-                        });
-                    }
-                    _ => Attempt::Status {
-                        status,
-                        body: body_text(&mut r),
+                        },
+                        400..=499 => {
+                            return Append::Failed(Error::AppendRejected {
+                                status,
+                                body: body_text(&mut r),
+                            });
+                        }
+                        _ => Attempt::Status {
+                            status,
+                            body: body_text(&mut r),
+                        },
                     },
                 }
             }
@@ -315,7 +355,7 @@ pub(crate) fn append(
             ("reason", &unknown),
         ]);
         if !pause(retry_after, &mut backoff, deadline) {
-            return Append::Failed(if refused {
+            return Append::Failed(if token_refused {
                 unauthorized("append", url, 401)
             } else {
                 Error::AppendUnknown {
@@ -327,11 +367,18 @@ pub(crate) fn append(
     }
 }
 
+/// Creates the stream at `url` (idempotent: an existing stream of the same content type answers
+/// 200).
 pub(crate) fn create_stream(url: &str) -> Result<(), Error> {
-    let mut r = authorized(agent().put(url), false)
-        .header("content-type", CONTENT_TYPE)
-        .send_empty()
-        .map_err(|e| http_error("create", url, e))?;
+    let mut r = send_retrying(
+        |refresh| {
+            authorized(agent().put(url), refresh)
+                .header("content-type", CONTENT_TYPE)
+                .send_empty()
+        },
+        &|| false,
+    )
+    .map_err(|e| http_error("create", url, e))?;
     let status = r.status().as_u16();
     if auth_refused(&r) {
         return Err(unauthorized("create", url, status));
@@ -373,7 +420,7 @@ pub(crate) fn read_from(
     offset: &str,
 ) -> Result<(Vec<u8>, String), Error> {
     let request = format!("{url}?offset={offset}&consistency=leader");
-    let mut r = read_retrying(
+    let mut r = send_retrying(
         |refresh| {
             authorized(agent().get(request.as_str()), refresh)
                 .header("stream-incarnation", incarnation)
@@ -459,9 +506,9 @@ pub(crate) struct Head {
     pub(crate) incarnation: Option<String>,
 }
 
-/// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
+/// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
 pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
-    let r = read_retrying(
+    let r = send_retrying(
         |refresh| authorized(agent().head(url), refresh).call(),
         stopped,
     )
@@ -492,7 +539,7 @@ pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error>
 }
 
 /// The snapshot at `offset`; `None` when it does not exist (superseded, or not yet visible here).
-/// `stopped` ends the retries of a 429/503 early (see `read_retrying`).
+/// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
 pub(crate) fn get_snapshot(
     url: &str,
     incarnation: &str,
@@ -500,7 +547,7 @@ pub(crate) fn get_snapshot(
     stopped: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<u8>>, Error> {
     let request = format!("{url}/snapshot/{offset}");
-    let mut r = read_retrying(
+    let mut r = send_retrying(
         |refresh| {
             authorized(bulk_agent().get(request.as_str()), refresh)
                 .header("stream-incarnation", incarnation)
@@ -545,26 +592,28 @@ pub(crate) fn put_idempotent(
 ) -> Result<(u16, ureq::http::Response<ureq::Body>), Error> {
     let deadline = retry_deadline();
     let mut backoff = Duration::from_millis(50);
-    // The last answer was a 401: the next attempt reads the token again.
-    let mut refused = false;
+    // The last answer refused the token: the next attempt reads it again.
+    let mut token_refused = false;
     loop {
-        let unknown = match authorized(bulk_agent().put(url), std::mem::take(&mut refused))
+        let unknown = match authorized(bulk_agent().put(url), std::mem::take(&mut token_refused))
             .header("content-type", CONTENT_TYPE)
             .header("stream-incarnation", incarnation)
             .send(body)
         {
-            Ok(r) if token_refused(&r) => {
-                refused = true;
-                Attempt::Status {
-                    status: 401,
-                    body: String::new(),
+            Ok(mut r) => match (refused(&r), r.status().as_u16()) {
+                (Some(Refused::Token), status) => {
+                    token_refused = true;
+                    Attempt::Status {
+                        status,
+                        body: body_text(&mut r),
+                    }
                 }
-            }
-            Ok(r) if auth_refused(&r) => return Err(unauthorized("put", url, r.status().as_u16())),
-            Ok(r) if r.status().as_u16() < 500 => return Ok((r.status().as_u16(), r)),
-            Ok(mut r) => Attempt::Status {
-                status: r.status().as_u16(),
-                body: body_text(&mut r),
+                (Some(Refused::Denied), status) => return Err(unauthorized("put", url, status)),
+                (_, status) if status < 500 => return Ok((status, r)),
+                (_, status) => Attempt::Status {
+                    status,
+                    body: body_text(&mut r),
+                },
             },
             Err(e) => Attempt::Transport(Box::new(e)),
         };
@@ -573,7 +622,7 @@ pub(crate) fn put_idempotent(
             .is_none_or(|end| end > deadline)
             || stopped()
         {
-            return Err(if refused {
+            return Err(if token_refused {
                 unauthorized("put", url, 401)
             } else {
                 Error::PutUnknown {
@@ -614,8 +663,10 @@ mod tests {
 
     use super::Append;
     use super::append;
+    use super::create_stream;
     use super::get_snapshot;
     use super::head;
+    use super::in_clear;
     use super::read_from;
     use crate::auth::set_token;
     use crate::error::Error;
@@ -721,9 +772,9 @@ mod tests {
     }
 
     // Every request carries the token. A 401 is an authorizer refusing it: the request is sent
-    // again (with the token read again) within the retry budget. A 403 is a fence only with the
-    // epoch that owns the stream (the server's); without it, an authorizer's final denial, never
-    // taken for a fence.
+    // again (with the token read again) within the retry budget, a create too. A 403 is a fence
+    // only with the epoch that owns the stream (the server's); without it, an authorizer's final
+    // denial, never taken for a fence.
     #[test]
     fn auth_refusals_are_retried_or_final_never_fences() {
         set_token(Some("t1"));
@@ -734,6 +785,8 @@ mod tests {
             answer("200 OK\r\nstream-incarnation: i1"),
             answer("403 Forbidden\r\nproducer-epoch: 4"),
             answer("403 Forbidden"),
+            answer("401 Unauthorized"),
+            answer("201 Created"),
         ]);
         let acked = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(acked, Append::Acked { attempts: 2, .. }));
@@ -748,9 +801,10 @@ mod tests {
             denied,
             Append::Failed(Error::Unauthorized { status: 403, .. })
         ));
+        create_stream(&url).unwrap();
         set_token(None);
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 8);
         for request in &requests {
             assert!(
                 request
@@ -759,5 +813,17 @@ mod tests {
                 "{request}"
             );
         }
+    }
+
+    // A token crosses the network in clear only over plain HTTP to a host other than this one.
+    #[test]
+    fn tokens_go_in_clear_over_http_to_other_hosts() {
+        let clear = |url: &str| in_clear(&url.parse().unwrap());
+        assert!(clear("http://ursula.example.com/b/s"));
+        assert!(clear("http://10.0.0.7:4437/b/s"));
+        assert!(!clear("https://ursula.example.com/b/s"));
+        assert!(!clear("http://127.0.0.1:4437/b/s"));
+        assert!(!clear("http://localhost:4437/b/s"));
+        assert!(!clear("http://[::1]:4437/b/s"));
     }
 }

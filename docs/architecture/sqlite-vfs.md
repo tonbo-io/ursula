@@ -60,9 +60,12 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
 - **Outcome unknown** (timeout, connection loss, 5xx): retried with the same sequence until the
   server answers, for up to `URSULA_VFS_RETRY_MS` (30 s). The server deduplicates.
 - **401** (an authorizer in front of the stream, such as `ursula gateway --auth-*`, refused the
-  token): retried like an unknown outcome, with the token read again (§7). A **403 without
-  `Producer-Epoch`** is an authorizer's denial and final. Both fail the write as unauthorized,
-  never as fenced: only the server's 403 carries `Producer-Epoch`.
+  token): retried like an unknown outcome, with the token read again (§7). On a synchronous host
+  (node:sqlite) a set token cannot change meanwhile, because the committing thread is the one that
+  would call `ursula_set_token`: one that expires fails the commit once the budget runs out, so
+  applications refresh it before it expires. A **403 without `Producer-Epoch`** is an authorizer's
+  denial and final. Both fail the write as unauthorized, never as fenced: only the server's 403
+  carries `Producer-Epoch` (one classifier, `refused`, tells them apart for every request).
 - **403 with `Producer-Epoch`** (a newer epoch claimed the stream), a definite rejection, or an
   exhausted budget: the write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back,
   nothing of it reaches the local WAL, and the database is poisoned until it is re-attached.
@@ -486,7 +489,11 @@ rebuild, delete `<db>`.
 - Producer expiry after 7 idle days; the owner reclaims only if nobody wrote meanwhile.
 - HTTP, or TLS for `https://` URLs with the bundled Mozilla roots, or only the certificate
   authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
-  content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401.
+  content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a 401. A read of
+  the file that finds no token (empty, half-written, missing) keeps the last one it held: sent
+  without one, a request is concealed as a missing stream (404), which poisons at once. A token
+  sent over `http://` to a host that is not loopback is logged once (`token_in_clear`). The SQL
+  functions are direct-only: a trigger or view of an untrusted database cannot call them.
 
 ### Versions
 

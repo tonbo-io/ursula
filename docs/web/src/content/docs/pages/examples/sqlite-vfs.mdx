@@ -57,7 +57,7 @@ console.log(status("/data/app.db"));
 // { offset, epoch, poisoned, fenced, reason, snapshot, retained, local, installed }
 ```
 
-From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path)`, `ursula_stats(path)` and `ursula_set_token(token)`. Offsets (`attach`'s result, and `offset`, `snapshot`, `retained`, `local` and `installed`) are the server's [opaque offset](/docs/concepts/offsets) strings: compare two of the same stream as strings, never as numbers. `"-1"` means none (no snapshot, no retention, a file rebuilt from nothing).
+From SQL, the same functions are `ursula_attach(path, url)`, `ursula_status(path)`, `ursula_stats(path)` and `ursula_set_token(token)`. They can be called from top-level SQL only, not from a trigger or a view. Offsets (`attach`'s result, and `offset`, `snapshot`, `retained`, `local` and `installed`) are the server's [opaque offset](/docs/concepts/offsets) strings: compare two of the same stream as strings, never as numbers. `"-1"` means none (no snapshot, no retention, a file rebuilt from nothing).
 
 ## TLS and credentials
 
@@ -79,6 +79,12 @@ setToken(accessToken);
 
 The token is process-wide. A request whose token is refused (`401`) is sent again, with the token read again, within the retry budget (`URSULA_VFS_RETRY_MS`). A commit still refused then fails, and the file must be attached again, as after any failed commit. A `403` from the gateway's authorizer fails the request at once. Neither marks the owner fenced. The gateway answers `404` for a private bucket to a client without a token, so attach then reports the stream as missing.
 
+`setToken` cannot rescue a commit that is already retrying. `node:sqlite` is synchronous, so the thread that runs the commit cannot call `setToken` until the commit returns. A commit whose set token has expired waits out the retry budget (30 s by default, and reads of the file in the process wait with it), then fails, and the file must be attached again. Call `setToken` with a fresh token before the current one expires, or use a token file, which is read again on every retry.
+
+When the token file holds no token as it is read (empty, half-written, or missing while it is replaced), the extension keeps the last token it read from it, and logs `token_file_unreadable` once until the file holds a token again.
+
+Over `http://` the token crosses the network in clear. Use `https://` for any endpoint on another host. The extension logs `token_in_clear` once when it sends a token over `http://` to a host that is not a loopback address.
+
 ## Health and alerts
 
 `status(file)` (`ursula_status`) reports the owner's health along with its offsets:
@@ -90,7 +96,7 @@ The token is process-wide. A request whose token is refused (`401`) is sent agai
 
 `instrument(file, meter)` reports the same as metrics on an OpenTelemetry `Meter` (any object with `createHistogram`, `createCounter` and `createObservableGauge`; the package does not depend on OpenTelemetry): `sqlite_ursula.commit.duration` and `sqlite_ursula.append.duration` (ms), `sqlite_ursula.append.retries`, `sqlite_ursula.stream.bytes`, and the gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`, `sqlite_ursula.snapshot.failures`, `sqlite_ursula.poisoned` and `sqlite_ursula.fenced`. It drains `drainStats` every 10 seconds, so do not drain the same file elsewhere. Call the function it returns to stop.
 
-The extension logs one line per event on stderr, in logfmt: `sqlite-ursula-vfs level=warn event=poisoned file=... stream=... fenced=true reason="..."`. The events: `poisoned`, `append_retry` (a commit's append was retried, with the attempt, the time since the commit's first attempt and the reason), `snapshot_failed`, `open_refused`, `journal_refused`, `local_files_discarded`, `attach_retrying`, `attach_rebuilding`, `token_file_unreadable`, `ca_file_unreadable`, `ca_file_without_certificates`.
+The extension logs one line per event on stderr, in logfmt: `sqlite-ursula-vfs level=warn event=poisoned file=... stream=... fenced=true reason="..."`. The events: `poisoned`, `append_retry` (a commit's append was retried, with the attempt, the time since the commit's first attempt and the reason), `snapshot_failed`, `open_refused`, `journal_refused`, `local_files_discarded`, `attach_retrying`, `attach_rebuilding`, `token_file_unreadable`, `token_in_clear`, `ca_file_unreadable`, `ca_file_without_certificates`.
 
 Alerts worth setting:
 
