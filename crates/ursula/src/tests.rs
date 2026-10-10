@@ -1259,6 +1259,7 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"raft_grpc_append_stream_response_frames\":"));
     assert!(body.contains("\"raft_grpc_append_stream_batch_frames\":"));
     assert!(body.contains("\"raft_grpc_append_stream_batch_items_max\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_frame_bytes_max\":"));
     assert!(body.contains("\"raft_grpc_append_stream_inflight\":"));
     assert!(body.contains("\"raft_grpc_append_stream_inflight_max\":"));
     assert!(body.contains("\"raft_grpc_append_heartbeat_requests\":"));

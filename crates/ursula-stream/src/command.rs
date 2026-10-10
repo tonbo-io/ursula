@@ -218,7 +218,9 @@ impl StreamCommand {
                 .saturating_add(1)
                 .saturating_mul(CHUNK_REF_LOG_BYTES),
             // Each stream's allowance, hot payload, inline snapshot body and
-            // chunk references: a restored group's import is one entry.
+            // chunk references: a restored group's import is one entry. The
+            // bodies are `Vec<u8>`, which MessagePack writes as an array of
+            // integers, two bytes for each byte from 0x80 up.
             Self::ImportSnapshot { snapshot } => snapshot
                 .streams
                 .iter()
@@ -227,9 +229,9 @@ impl StreamCommand {
                         .visible_snapshot
                         .as_ref()
                         .map_or(0, |visible| visible.payload.len());
+                    let bodies = len_u64(stream.payload.len()).saturating_add(len_u64(visible));
                     COMMAND_LOG_OVERHEAD_BYTES
-                        .saturating_add(len_u64(stream.payload.len()))
-                        .saturating_add(len_u64(visible))
+                        .saturating_add(bodies.saturating_mul(2))
                         .saturating_add(
                             len_u64(stream.cold_chunks.len()).saturating_mul(CHUNK_REF_LOG_BYTES),
                         )

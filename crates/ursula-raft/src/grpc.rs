@@ -132,7 +132,6 @@ static GRPC_APPEND_STREAM_RESPONSE_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_BATCH_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_BATCH_ITEMS_MAX: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_FRAME_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
-static GRPC_APPEND_STREAM_RETIRED_SESSIONS: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_INFLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -343,8 +342,6 @@ pub struct RaftGrpcMetricsSnapshot {
     /// Encoded bytes of the largest request frame sent, before compression. Bounded by
     /// `RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES` plus one call.
     pub raft_grpc_append_stream_frame_bytes_max: u64,
-    /// Sessions retired after a frame above `RAFT_GRPC_APPEND_STREAM_RETIRE_FRAME_BYTES`.
-    pub raft_grpc_append_stream_retired_sessions: u64,
     pub raft_grpc_append_stream_inflight: u64,
     pub raft_grpc_append_stream_inflight_max: u64,
     /// Leader side: bytes of Append calls queued for peers but not yet taken by the HTTP/2
@@ -400,8 +397,6 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
         raft_grpc_append_stream_batch_items_max: GRPC_APPEND_STREAM_BATCH_ITEMS_MAX
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_frame_bytes_max: GRPC_APPEND_STREAM_FRAME_BYTES_MAX
-            .load(Ordering::Relaxed),
-        raft_grpc_append_stream_retired_sessions: GRPC_APPEND_STREAM_RETIRED_SESSIONS
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_inflight: GRPC_APPEND_STREAM_INFLIGHT.load(Ordering::Relaxed),
         raft_grpc_append_stream_inflight_max: GRPC_APPEND_STREAM_INFLIGHT_MAX
@@ -502,14 +497,9 @@ const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
 /// the log reader bounds to 4 MiB of entries unless one entry alone is larger. tonic keeps each
 /// stream's encode, compression and decode buffers at the largest message the stream ever
 /// carried, and a session lives until its peer restarts: unbounded frames left every node holding
-/// GBs of idle buffers after one burst of large appends (#507).
+/// GBs of idle buffers after one burst of large appends (#507). An entry larger than a read's
+/// budget still travels alone and leaves its stream's buffers at its size (#518).
 const RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
-/// A session that sent a frame larger than this retires: it takes no new calls, sends and answers
-/// the ones it holds, then ends its stream, so both ends drop the codec buffers the frame grew.
-/// The next call opens a fresh session. Bounded frames never come near it; only an entry far
-/// larger than a log read's budget does, such as a request body of up to 32 MiB on a node
-/// without a cold store, or a restored group.
-const RAFT_GRPC_APPEND_STREAM_RETIRE_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 /// Leader side, per peer: bytes of Append calls queued (not yet taken by the HTTP/2 encoder).
 /// Beyond it a call fails fast as `Unavailable`, which OpenRaft treats as an unreachable peer and
 /// backs off on. Before this bound a lagging peer's queue grew without limit: every replication
@@ -1346,7 +1336,7 @@ impl GrpcRaftNetwork {
         let client = self
             .client()
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
-        let session = shared_append_session(&self.transport, &self.endpoint, client.clone())
+        let session = shared_append_session(&self.transport, &self.endpoint, client)
             .map_err(tonic::Status::unavailable)?;
         let charge = append_budget_charge(envelope.encoded_len(), self.transport.budget.bytes);
         // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
@@ -1385,20 +1375,14 @@ impl GrpcRaftNetwork {
             &GRPC_APPEND_STREAM_QUEUED_BYTES_MAX,
         );
         let (response_sender, response_receiver) = oneshot::channel();
-        let call = AppendStreamCall {
-            envelope,
-            response: response_sender,
-            queued,
-        };
-        // A session that retired after an oversized frame, or whose stream just ended, refuses
-        // the call: send it on the session that replaces it. Sessions share the queue budget.
-        if let Err(mpsc::error::SendError(call)) = session.sender.send(call) {
-            shared_append_session(&self.transport, &self.endpoint, client)
-                .map_err(tonic::Status::unavailable)?
-                .sender
-                .send(call)
-                .map_err(|_closed| tonic::Status::unavailable("raft append stream is closed"))?;
-        }
+        session
+            .sender
+            .send(AppendStreamCall {
+                envelope,
+                response: response_sender,
+                queued,
+            })
+            .map_err(|_closed| tonic::Status::unavailable("raft append stream is closed"))?;
         match tokio::time::timeout_at(deadline, response_receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(tonic::Status::unavailable(
@@ -1549,28 +1533,43 @@ fn shared_append_session(
 fn collect_append_stream_frame(
     first: AppendStreamCall,
     calls: &mut mpsc::UnboundedReceiver<AppendStreamCall>,
-) -> (Vec<AppendStreamCall>, bool) {
-    fn keep(call: AppendStreamCall, frame: &mut Vec<AppendStreamCall>, bytes: &mut usize) {
+) -> CollectedFrame {
+    fn keep(call: AppendStreamCall, frame: &mut CollectedFrame) {
         if call.response.is_closed() {
             GRPC_APPEND_STREAM_EXPIRED_UNSENT.fetch_add(1, Ordering::Relaxed);
         } else {
-            *bytes = bytes.saturating_add(call.envelope.encoded_len());
-            frame.push(call);
+            frame.bytes = frame.bytes.saturating_add(call.envelope.encoded_len());
+            frame.calls.push(call);
         }
     }
-    let mut frame = Vec::new();
-    let mut bytes = 0;
-    keep(first, &mut frame, &mut bytes);
-    while frame.len() < RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS
-        && bytes < RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES
+    let mut frame = CollectedFrame {
+        calls: Vec::new(),
+        bytes: 0,
+        receiver_open: true,
+    };
+    keep(first, &mut frame);
+    while frame.calls.len() < RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS
+        && frame.bytes < RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES
     {
         match calls.try_recv() {
-            Ok(call) => keep(call, &mut frame, &mut bytes),
-            Err(mpsc::error::TryRecvError::Empty) => return (frame, true),
-            Err(mpsc::error::TryRecvError::Disconnected) => return (frame, false),
+            Ok(call) => keep(call, &mut frame),
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                frame.receiver_open = false;
+                break;
+            }
         }
     }
-    (frame, true)
+    frame
+}
+
+/// The calls of one request frame, from [`collect_append_stream_frame`].
+struct CollectedFrame {
+    calls: Vec<AppendStreamCall>,
+    /// Encoded bytes of `calls`.
+    bytes: usize,
+    /// False once every sender is gone: no call follows these.
+    receiver_open: bool,
 }
 
 type PendingAppend = oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>;
@@ -1716,8 +1715,11 @@ async fn run_append_session(
                     wire_sender.take();
                     continue;
                 };
-                let (frame_calls, receiver_open) =
-                    collect_append_stream_frame(call, &mut calls);
+                let CollectedFrame {
+                    calls: frame_calls,
+                    bytes: frame_bytes,
+                    receiver_open,
+                } = collect_append_stream_frame(call, &mut calls);
                 if !receiver_open {
                     accepting = false;
                 }
@@ -1751,11 +1753,9 @@ async fn run_append_session(
 
                 let mut items = Vec::with_capacity(frame_calls.len());
                 let mut queued = Vec::with_capacity(frame_calls.len());
-                let mut frame_bytes = 0_u64;
                 for call in frame_calls {
                     let request_id = next_request_id;
                     next_request_id = next_request_id.saturating_add(1);
-                    frame_bytes = frame_bytes.saturating_add(call.envelope.encoded_len() as u64);
                     pending.insert(request_id, call.response);
                     queued.push(call.queued);
                     items.push(raft_internal_proto::RaftAppendStreamRequestItem {
@@ -1763,16 +1763,11 @@ async fn run_append_session(
                         envelope: Some(call.envelope),
                     });
                 }
-                GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(frame_bytes, Ordering::Relaxed);
-                GRPC_APPEND_STREAM_FRAME_BYTES_MAX.fetch_max(frame_bytes, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(frame_bytes as u64, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_FRAME_BYTES_MAX.fetch_max(frame_bytes as u64, Ordering::Relaxed);
                 // The slot was reserved above, so this cannot wait.
                 let _sender =
                     slot.send((raft_internal_proto::RaftAppendStreamRequest { items }, queued));
-                if frame_bytes > RAFT_GRPC_APPEND_STREAM_RETIRE_FRAME_BYTES && accepting {
-                    // New calls go to a fresh session; the ones already queued here still drain.
-                    GRPC_APPEND_STREAM_RETIRED_SESSIONS.fetch_add(1, Ordering::Relaxed);
-                    calls.close();
-                }
             }
         }
     }
@@ -2089,7 +2084,11 @@ mod reconnect_tests {
         sender.send(second).expect("queue second call");
         sender.send(third).expect("queue third call");
 
-        let (batch, receiver_open) = collect_append_stream_frame(first, &mut receiver);
+        let CollectedFrame {
+            calls: batch,
+            receiver_open,
+            ..
+        } = collect_append_stream_frame(first, &mut receiver);
         assert!(receiver_open);
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].envelope.raft_group_id, 1);
@@ -2108,7 +2107,11 @@ mod reconnect_tests {
         sender.send(second).expect("queue second call");
         sender.send(third).expect("queue third call");
 
-        let (batch, receiver_open) = collect_append_stream_frame(first, &mut receiver);
+        let CollectedFrame {
+            calls: batch,
+            receiver_open,
+            ..
+        } = collect_append_stream_frame(first, &mut receiver);
         assert!(receiver_open);
         assert_eq!(batch.len(), 1, "timed-out calls must not be sent");
         assert_eq!(batch[0].envelope.raft_group_id, 2);
@@ -2129,73 +2132,23 @@ mod reconnect_tests {
             waiters.push(waiter);
         }
 
-        let (frame, receiver_open) = collect_append_stream_frame(first, &mut receiver);
-        assert!(receiver_open);
+        let frame = collect_append_stream_frame(first, &mut receiver);
+        assert!(frame.receiver_open);
         let ids = frame
+            .calls
             .iter()
             .map(|call| call.envelope.raft_group_id)
             .collect::<Vec<_>>();
         assert_eq!(ids, [1, 2]);
+        let encoded = frame
+            .calls
+            .iter()
+            .map(|call| call.envelope.encoded_len())
+            .sum::<usize>();
+        assert_eq!(frame.bytes, encoded);
+        assert!(frame.bytes >= RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES);
         let next = receiver.try_recv().expect("the rest stay queued");
         assert_eq!(next.envelope.raft_group_id, 3);
-    }
-
-    fn current_session(transport: &CoreRaftTransport, endpoint: &str) -> SharedAppendSession {
-        transport
-            .sessions
-            .lock()
-            .expect("append session pool lock")
-            .get(endpoint)
-            .expect("an append session")
-            .clone()
-    }
-
-    /// #507: only an entry far above a log read's limit makes a frame past the retirement size
-    /// (a 32 MiB request body without a cold store, say). The session that sent it still answers
-    /// it, takes no new calls, and ends its stream, so both ends drop the buffers it grew; the
-    /// next call opens a fresh session.
-    #[tokio::test]
-    async fn append_session_retires_after_an_oversized_frame() {
-        let transport = Arc::new(CoreRaftTransport::default());
-        let (endpoint, _registry, server) = spawn_append_stream_server().await;
-        remove_shared_channel(&transport, &endpoint);
-        let network = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
-        let envelope = |bytes: usize| raft_internal_proto::RaftRpcEnvelopeV1 {
-            raft_group_id: 1,
-            node_id: 2,
-            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            payload: vec![7_u8; bytes].into(),
-        };
-        let option = RPCOption::new(Duration::from_secs(10));
-        // The test server hosts no group: an answer is a NotFound item.
-        let answered = |result: Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>| {
-            result.expect_err("no group here").code() == tonic::Code::NotFound
-        };
-        let retired_before = GRPC_APPEND_STREAM_RETIRED_SESSIONS.load(Ordering::Relaxed);
-
-        assert!(answered(
-            network
-                .try_append_stream(envelope(16), option.clone())
-                .await
-        ));
-        let first = current_session(&transport, &endpoint);
-        assert!(!first.sender.is_closed());
-        let oversized = usize::try_from(RAFT_GRPC_APPEND_STREAM_RETIRE_FRAME_BYTES).unwrap();
-        assert!(answered(
-            network
-                .try_append_stream(envelope(oversized), option.clone())
-                .await
-        ));
-        assert!(first.sender.is_closed(), "a retired session takes no calls");
-        assert!(GRPC_APPEND_STREAM_RETIRED_SESSIONS.load(Ordering::Relaxed) > retired_before);
-
-        assert!(answered(
-            network.try_append_stream(envelope(16), option).await
-        ));
-        let second = current_session(&transport, &endpoint);
-        assert!(!first.sender.same_channel(&second.sender));
-        assert!(!second.sender.is_closed());
-        server.abort();
     }
 
     /// The EKS OOM: a peer that does not keep up must not let the leader queue an unbounded
