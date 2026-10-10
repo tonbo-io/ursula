@@ -197,7 +197,9 @@ cached entries from the cache, and older entries from disk. A disk read runs
 on Tokio's blocking pool, never on the core's async tasks: it opens the
 segment, reads each frame at its recorded position, verifies it as replay
 would and checks every entry against the log id the index holds for it. A
-limited read, which replication uses, reads at most 8 MiB from disk at a time.
+limited read, which replication uses, returns the longest prefix of the range
+that weighs at most 4 MiB, cached, on disk or pending, and never less than one
+entry (#507).
 OpenRaft's key log ids come from the index without reading any entry.
 
 ### Metadata and run-state files

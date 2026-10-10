@@ -11,7 +11,7 @@ The recommended way to run it is **Kubernetes via the Helm chart**. Bring a Kube
 The chart and images are published to GHCR on every release. One command starts a three-voter cluster:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.1
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.2
 ```
 
 The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's `appVersion`. The default install runs three voters and 64 Raft groups, with durable per-pod Raft logs on PVCs, a headless peer Service, a client Service, and a quorum-protecting PodDisruptionBudget.
@@ -50,7 +50,7 @@ The chart's [`examples/production-eks.yaml`](https://github.com/tonbo-io/ursula/
 The [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#prerequisites) lists the details. Replace the bucket and the role ARNs in the example, then install it:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.1 \
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.2 \
   --namespace ursula --create-namespace -f production-eks.yaml
 helm test ursula --namespace ursula
 ```
