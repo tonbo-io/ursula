@@ -87,6 +87,8 @@ Over `http://` the token crosses the network in clear. Use `https://` for any en
 
 ## Writes refused with 402
 
+Requires 0.7.1 or later of `@tonbo/sqlite-ursula` and of the extension.
+
 A layer in front of the stream, such as an authorizer or a quota or billing service, may refuse writes with `402 Payment Required`. Ursula itself never does. The extension takes a `402` to mean that nothing of the write reached the stream, so it fails that transaction alone:
 
 - The commit fails with `SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`), and SQLite rolls the transaction back. The file is not poisoned, and the owner keeps its claim on the stream.
@@ -103,6 +105,8 @@ An attach claims the stream, which is a write. When the layer refuses it, `attac
 While writes are refused, the owner takes no snapshot. It publishes the next one after a commit succeeds, and a refused snapshot does not count in `snapshot_failures`.
 
 ## Read-only attach
+
+Requires 0.7.1 or later of `@tonbo/sqlite-ursula` and of the extension. Called from plain JavaScript, the 0.7.0 `attach` and `openUrsulaPiStorage` ignore `readOnly` and claim the stream, which fences its owner.
 
 ```ts
 attach("/data/app.db", "https://ursula.example.com/my-bucket/app-db", { readOnly: true });
