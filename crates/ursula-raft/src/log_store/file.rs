@@ -54,6 +54,7 @@ use super::writer::raft_group_log_record_count;
 use super::writer::raft_group_log_record_initializes;
 use super::writer::read_entries;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::entry_log_bytes;
 
 type Entry = EntryOf<UrsulaRaftTypeConfig>;
 
@@ -61,9 +62,13 @@ type Entry = EntryOf<UrsulaRaftTypeConfig>;
 /// freed it moved the entries, so a second plan finds them; more attempts
 /// cover reclaims racing again.
 const READ_ATTEMPTS: usize = 4;
-/// Bytes of entries a limited read takes from disk, as replication reads
-/// a bounded batch at a time.
-const LIMITED_READ_DISK_BYTES: u64 = 8 * 1024 * 1024;
+/// Read weight of the entries one limited read returns, cached, on disk or
+/// pending alike. OpenRaft sends what a limited read returns as one Append
+/// call, and tonic keeps the buffers of the AppendStream that carries it at
+/// the largest frame the stream ever carried, for the life of the session
+/// (#507). Well above the 1 MiB at which a payload moves to the cold store,
+/// so a follower catching up still gets several entries per round trip.
+pub(super) const LIMITED_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One raft group's durable OpenRaft log, stored in its core's shared journal.
 #[derive(Debug)]
@@ -368,11 +373,12 @@ impl RaftGroupFileLogStore {
     }
 
     /// Reads the entries of `range`: cached ones from memory, older ones
-    /// from disk, at most about `max_disk_bytes` of those when it is set.
+    /// from disk, then the pending ones. With `max_bytes`, a prefix of the
+    /// range weighing at most that much, and never less than one entry.
     async fn read_entries(
         &self,
         range: (Bound<u64>, Bound<u64>),
-        max_disk_bytes: Option<u64>,
+        max_bytes: Option<u64>,
     ) -> Result<Vec<Entry>, CoreJournalError> {
         let mut attempt = 0_usize;
         loop {
@@ -391,20 +397,21 @@ impl RaftGroupFileLogStore {
                 });
                 let plan = self
                     .lock_log()?
-                    .plan_read((range.0, durable_end), max_disk_bytes);
+                    .plan_read((range.0, durable_end), max_bytes);
                 let entries = entries
                     .into_iter()
                     .filter(|entry| range.contains(&entry.log_id.index))
                     .collect::<Vec<_>>();
                 (plan, entries)
             };
+            let room = max_bytes.map(|max| max.saturating_sub(plan.bytes));
             let mut sample = WalReadSample {
                 cache_hits: u64::try_from(plan.cached.len()).unwrap_or(u64::MAX),
                 ..WalReadSample::default()
             };
             if plan.disk.is_empty() {
                 self.metrics.record_wal_read(self.placement, sample);
-                return Ok(merge_pending(plan.cached, pending));
+                return Ok(merge_pending(plan.cached, pending, room));
             }
             let dir = self.core_writer.dir().to_owned();
             let group_id = self.placement.raft_group_id.0;
@@ -423,7 +430,7 @@ impl RaftGroupFileLogStore {
                     let mut entries = read.entries;
                     entries.extend(plan.cached);
                     entries.sort_by_key(|entry| entry.log_id.index);
-                    return Ok(merge_pending(entries, pending));
+                    return Ok(merge_pending(entries, pending, room));
                 }
                 Err(error) if segment_gone(&error) && attempt < READ_ATTEMPTS => {
                     tracing::debug!(
@@ -438,15 +445,30 @@ impl RaftGroupFileLogStore {
     }
 }
 
-// A limited disk read may stop before the pending suffix. Return only the
-// consecutive prefix in that case; the replication reader asks for the rest.
-fn merge_pending(mut durable: Vec<Entry>, pending: Vec<Entry>) -> Vec<Entry> {
+// A limited read may stop before the pending suffix. Return only the
+// consecutive prefix in that case, and only the pending entries that fit in
+// what is left of the limit (`room`), never leaving the read empty; the
+// replication reader asks for the rest.
+fn merge_pending(
+    mut durable: Vec<Entry>,
+    pending: Vec<Entry>,
+    mut room: Option<u64>,
+) -> Vec<Entry> {
     if let (Some(last), Some(first)) = (durable.last(), pending.first())
         && last.log_id.index.checked_add(1) != Some(first.log_id.index)
     {
         return durable;
     }
-    durable.extend(pending);
+    for entry in pending {
+        if let Some(left) = room {
+            let bytes = entry_log_bytes(&entry);
+            if bytes > left && !durable.is_empty() {
+                break;
+            }
+            room = Some(left.saturating_sub(bytes));
+        }
+        durable.push(entry);
+    }
     durable
 }
 
@@ -565,7 +587,7 @@ impl RaftLogReader<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
         let entries = self
             .read_entries(
                 (Bound::Included(start), Bound::Excluded(end)),
-                Some(LIMITED_READ_DISK_BYTES),
+                Some(LIMITED_READ_BYTES),
             )
             .await?;
         super::ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;

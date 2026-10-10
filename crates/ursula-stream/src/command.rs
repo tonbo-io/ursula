@@ -217,9 +217,24 @@ impl StreamCommand {
             Self::CompactCold { old_chunks, .. } => len_u64(old_chunks.len())
                 .saturating_add(1)
                 .saturating_mul(CHUNK_REF_LOG_BYTES),
-            Self::ImportSnapshot { snapshot } => {
-                len_u64(snapshot.streams.len()).saturating_mul(COMMAND_LOG_OVERHEAD_BYTES)
-            }
+            // Each stream's allowance, hot payload, inline snapshot body and
+            // chunk references: a restored group's import is one entry.
+            Self::ImportSnapshot { snapshot } => snapshot
+                .streams
+                .iter()
+                .map(|stream| {
+                    let visible = stream
+                        .visible_snapshot
+                        .as_ref()
+                        .map_or(0, |visible| visible.payload.len());
+                    COMMAND_LOG_OVERHEAD_BYTES
+                        .saturating_add(len_u64(stream.payload.len()))
+                        .saturating_add(len_u64(visible))
+                        .saturating_add(
+                            len_u64(stream.cold_chunks.len()).saturating_mul(CHUNK_REF_LOG_BYTES),
+                        )
+                })
+                .fold(0, u64::saturating_add),
             // The wrapped command plus the expected incarnation (a u64).
             Self::IfIncarnation { command, .. } => {
                 return command.log_bytes_estimate().saturating_add(8);

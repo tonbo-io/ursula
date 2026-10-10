@@ -3,6 +3,12 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.7.2
+
+### Fixed
+
+- **Server memory no longer grows with uptime** ([#507](https://github.com/tonbo-io/ursula/issues/507)). Each voter keeps one long-lived gRPC stream per peer and core for Raft replication, and the gRPC library keeps a stream's encode and decode buffers at the largest message the stream ever carried. A replication message could batch 32 calls of up to 300 entries each, so one burst of large writes, or one follower catching up, left every stream holding buffers of up to hundreds of MiB until a peer restarted. In the 0.7.0 soak, memory grew by about 0.2 GB per hour on nodes whose peers stayed up, and it stayed up after the load stopped. A replication read now returns at most 4 MiB of entries, and a message collects at most 4 MiB of calls. A stream that still carries a much larger message, which takes a single entry well over 4 MiB, such as a request body of up to 32 MiB on a node without a cold store, ends once it is answered and frees its buffers. After the same burst of large writes, memory fell from about 2.6 GB to 1.8 GB per node. `/__ursula/metrics` reports `raft_grpc_append_stream_frame_bytes_max` and `raft_grpc_append_stream_retired_sessions`.
+
 ## 0.7.1
 
 0.7.1 is a drop-in patch for 0.7.0: format epoch 3 is unchanged, with no storage, snapshot or Raft protocol change. Upgrade from 0.7.0 in place with an ordinary rolling restart (`helm upgrade`). No fresh install or data move is needed.
@@ -26,7 +32,7 @@ description: Changes that affect clients and operators, newest first.
 ### Known issues
 
 - [#411](https://github.com/tonbo-io/ursula/issues/411): residual risks from the adversarial review of recovery stay open. An acknowledgement that a replica sent before a crash still counts toward commit if it reaches the leader after the replica's post-restart barrier, which needs a network delay longer than a reboot. The ordering of directory operations on real filesystems has not been reviewed. Tests now show that a failed write of the `poisoned` status fails closed.
-- [#507](https://github.com/tonbo-io/ursula/issues/507): in a soak with a steady write load, server memory grew by about 0.2 GB per hour of uptime and stayed up after the load stopped, while a restarted node used less. Leave headroom in the servers' memory limit and watch their memory.
+- [#507](https://github.com/tonbo-io/ursula/issues/507): in a soak with a steady write load, server memory grew by about 0.2 GB per hour of uptime and stayed up after the load stopped, while a restarted node used less. Leave headroom in the servers' memory limit and watch their memory. Fixed in 0.7.2.
 
 ## 0.7.0
 
