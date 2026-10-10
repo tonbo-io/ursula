@@ -1,11 +1,12 @@
 //! The crate's error type: why an operation failed, or why an attached database is poisoned.
 //!
-//! Callers act on three classes, through methods rather than message text: [`Error::is_gone`]
+//! Callers act on four classes, through methods rather than message text: [`Error::is_gone`]
 //! (the data lies below the stream's retention: attach retries from a newer snapshot),
-//! [`Error::is_recreated`] (the stream is another incarnation: attach rebuilds) and
+//! [`Error::is_recreated`] (the stream is another incarnation: attach rebuilds),
 //! [`Error::is_fenced`] (another owner or writer holds the stream: `ursula_status` reports
-//! `fenced`). Every other variant fails the operation, or poisons the database until it is
-//! attached again.
+//! `fenced`) and [`Error::is_payment_required`] (a layer in front of the stream refused with 402:
+//! the operation fails alone, and `ursula_attach` reports it as SQLITE_AUTH). Every other variant
+//! fails the operation, or poisons the database until it is attached again.
 
 use std::ffi::CStr;
 use std::ffi::c_int;
@@ -80,6 +81,13 @@ pub(crate) enum Error {
          URL)"
     )]
     StreamMissing { path: String, url: String },
+    #[error(
+        "{url} is missing (or hidden from this client's credentials), and a read-only attach never \
+         creates a stream"
+    )]
+    NoStream { url: String },
+    #[error("unknown attach mode {mode:?}: expected 'owner' or 'read_only'")]
+    AttachMode { mode: String },
     #[error("spawn the snapshot thread: {0}")]
     SpawnSnapshotThread(#[source] std::io::Error),
 
@@ -130,6 +138,17 @@ pub(crate) enum Error {
         op: &'static str,
         url: String,
         status: u16,
+    },
+    /// `body` is the layer's explanation, as it sent it (cut short: `client::body_text`).
+    #[error(
+        "{op} {url}: 402 Payment Required{}: a layer in front of the stream refused it, and \
+         nothing of it reached the stream",
+        with_body(.body)
+    )]
+    PaymentRequired {
+        op: &'static str,
+        url: String,
+        body: String,
     },
     #[error("{url} reports no Stream-Incarnation (an older server?); refusing to attach")]
     NoIncarnation { url: String },
@@ -310,6 +329,13 @@ impl Error {
         matches!(self, Error::Fenced(_) | Error::Recreated { .. })
     }
 
+    /// A layer in front of the stream (an authorizer, a quota or billing service) refused the
+    /// request with 402 Payment Required, so nothing of it reached the stream: the operation fails
+    /// alone, and never poisons a database (see `Db::refuse`).
+    pub(crate) fn is_payment_required(&self) -> bool {
+        matches!(self, Error::PaymentRequired { .. })
+    }
+
     /// The local files may hold other pages than this process wrote (a write-back was lost, or
     /// something else wrote them): nothing read from them may reach the stream, not even in a
     /// snapshot.
@@ -390,5 +416,19 @@ mod tests {
             offset: "9".into(),
         };
         assert!(!lost.is_gone() && lost.to_string().contains("lost acknowledged data"));
+        // A 402 in front of the stream is its own class: never a fence, never gone, never damage.
+        let refused = Error::PaymentRequired {
+            op: "claim",
+            url: "http://h/b/s".into(),
+            body: "{\"detail\":\"quota exhausted\"}".into(),
+        };
+        assert!(refused.is_payment_required());
+        assert!(!refused.is_fenced() && !refused.is_gone() && !refused.is_local_damage());
+        assert_eq!(
+            refused.to_string(),
+            "claim http://h/b/s: 402 Payment Required {\"detail\":\"quota exhausted\"}: a layer in front \
+             of the stream refused it, and nothing of it reached the stream"
+        );
+        assert!(!superseded.is_payment_required() && !local.is_payment_required());
     }
 }

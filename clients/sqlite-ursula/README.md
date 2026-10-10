@@ -37,6 +37,10 @@ db.exec("PRAGMA journal_mode=WAL");
 
 The extension is loaded once per process and becomes SQLite's default VFS there. Files that were never attached are not affected.
 
+When a layer in front of the stream, such as an authorizer or a quota or billing service, refuses a commit with `402 Payment Required`, that commit fails alone. The file is not poisoned, reads keep working, and the next commit succeeds once the layer accepts writes again. Through `openUrsulaPiStorage` the refused commit rejects with `UrsulaPaymentRequiredError`.
+
+`attach(file, url, { readOnly: true })` reads a database without claiming its stream. It never writes the stream, so it does not fence the owner, and every write to the file fails.
+
 Read [SQLite on Ursula](https://ursula.tonbo.io/docs/examples/sqlite-vfs) before you rely on it. It covers what the cluster needs, the rules (WAL mode only, one process per file), and what fencing means for your writes.
 
 ## TLS and credentials

@@ -66,9 +66,35 @@ same path refuses everything of an owner of the deleted one with `412` (§6, wro
   applications refresh it before it expires. A **403 without `Producer-Epoch`** is an authorizer's
   denial and final. Both fail the write as unauthorized, never as fenced: only the server's 403
   carries `Producer-Epoch` (one classifier, `refused`, tells them apart for every request).
-- **403 with `Producer-Epoch`** (a newer epoch claimed the stream), a definite rejection, or an
-  exhausted budget: the write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the transaction back,
-  nothing of it reaches the local WAL, and the database is poisoned until it is re-attached.
+- **403 with `Producer-Epoch`** (a newer epoch claimed the stream), a definite rejection (any other
+  4xx but 402), or an exhausted budget: the write fails with `SQLITE_IOERR_WRITE`, SQLite rolls the
+  transaction back, nothing of it reaches the local WAL, and the database is poisoned until it is
+  re-attached.
+- **402 Payment Required** (a layer in front of the stream, such as an authorizer or a quota or
+  billing service, refuses writes until something is paid or settled): nothing of the transaction
+  reached the stream (given the requirement on the layer below), so it fails alone. The write fails
+  with `SQLITE_IOERR_AUTH` (an extended code SQLite reserves for extensions), SQLite rolls the
+  transaction back and nothing of it reaches the local WAL, as above, but the database is not
+  poisoned. Reads go on from the local files. The owner keeps its epoch, producer sequence and
+  offset, so the next commit is sent as usual, with the sequence the refused append never used, and
+  is acknowledged once the layer accepts writes again, without a new attach. `ursula_status`
+  reports `payment_required`, with the layer's explanation (its response body, cut to 256 bytes) as
+  `payment_reason`, until a commit is acknowledged or the database is poisoned (it then needs an
+  attach whatever the layer does). This holds only while no attempt of the append can have reached
+  the stream. After an attempt whose outcome is unknown (no answer, or a 5xx) the append may be in
+  the stream, and the next commit, sent with the same sequence, would be acknowledged as its
+  duplicate, its pages never sent. So a 402 there is retried like an unknown outcome, until an
+  answer settles it (the duplicate's receipt, once the layer forwards the append again) or the
+  budget runs out, which poisons. The VFS takes a 401, 402 or 429 to mean that the attempt applied
+  nothing, so these leave the outcome known. That is a requirement on every layer in front of the
+  stream, which the VFS cannot check: such a layer answers 401, 402 or 429 only to requests the
+  stream did not apply (it refuses them before passing them on, or relays the server's own
+  answer). A layer that passes an append on and then answers 402 (metering after the response,
+  say) or 429 breaks it. The next commit would be acknowledged as a duplicate of the refused
+  transaction, its pages never appended, and the stream would hold the refused transaction while
+  the local file holds the next one, with no error. Ursula meets the requirement: the gateway
+  answers 401 and 429 before it forwards a request, and the server never answers 401 or 402 and
+  answers 429 only to a new producer over the stream's producer limit, which applies nothing.
 - **A 2xx is accepted only with a `Stream-Next-Offset` past the owner's offset**, which becomes the
   owner's offset; another poisons. The VFS does not check where its frame landed (that would need
   offset arithmetic). A duplicate answered without one (its receipt is beyond the server's
@@ -167,7 +193,30 @@ old attachment's state and the stream's, and the stream may hold a newer claim. 
 db then fails with `SQLITE_CANTOPEN` while it has a sidecar (§1; the reason is logged, and
 `ursula_status` names it) until an attach succeeds; passing it through to the plain `unix` VFS
 would let its commits bypass replication. An attach refused at step 1 (connections open, or
-another thread attaching it) changes nothing: a bound path stays bound.
+another thread attaching it) changes nothing: a bound path stays bound. An attach whose claim or
+stream create a layer in front of the stream refuses with 402 fails the same way, and
+`ursula_attach` reports it with `SQLITE_AUTH` rather than `SQLITE_ERROR`, so callers can attach
+read-only instead.
+
+**Read-only attach.** `ursula_attach(path, stream_url, 'read_only')` runs steps 1 to 4, skips the
+claim (step 5) and the replay up to it, and ends as step 6 does: it fsyncs the db file if attach
+wrote it, writes the sidecar and binds the file. It never writes the stream: no claim, no commit,
+no snapshot and no retention move (it has no snapshot thread). So it fences no owner and works
+while a layer in front of the stream refuses writes. A missing stream is an error, never created.
+The file holds the stream as of the attach (attach again to catch up), and the sidecar records the
+highest epoch claimed up to its offset, which a later owner's attach claims above. Every WAL write
+of the database fails with `SQLITE_READONLY` before anything is appended or written to the WAL, and
+SQLite reports "attempt to write a readonly database". SQLite does not roll a transaction back on
+its own for that code, as it does for an I/O error such as an owner's `SQLITE_IOERR_AUTH`. A failed
+`COMMIT` or autocommit statement still leaves no transaction open. But in an explicit transaction,
+a statement whose changes outgrow the page cache fails before `COMMIT`, when SQLite spills them to
+the WAL. The transaction then stays open, and even reads on that connection fail with
+`SQLITE_READONLY` until the application rolls it back. Pi's transaction helper rolls back a failed
+transaction itself. A write transaction that changes nothing (`BEGIN IMMEDIATE` then `COMMIT`)
+writes no WAL frame and still succeeds, so a library that opens one at startup (Pi's migrations on
+an existing database) works. The local files are kept as for an owner: checkpoints, the WAL claim
+and the sidecar. The uses: exporting a database without fencing its owner, and reading a database
+whose owner cannot claim it because a layer refuses its writes.
 
 The new epoch fences every earlier owner at the server: their next append gets 403. Replay applies
 page images per read batch (last image per page, truncate to the batch's smallest size first), so
@@ -177,7 +226,8 @@ Producer expiry: the server forgets a producer idle for 7 days. The owner's next
 expecting seq 0; it takes the stream back only if the stream still ends at its own offset and its
 new claim (epoch + 1) is the first frame after it (read and decoded from that offset, as in step
 5), else it is fenced. Both requests carry the incarnation, so a recreated stream (which answers
-`412` before any producer check) fences the owner instead. Reads in
+`412` before any producer check) fences the owner instead. A new claim refused with 402 fails the
+commit alone, as a refused commit does (§2). Reads in
 recovery use `consistency=leader` (a follower may lag an acknowledged append). Catch-up reads,
 `HEAD` and snapshot `GET`s retry `429` and `503` (a leader that could not confirm its leadership in
 time) like appends: no sooner than `Retry-After`, with backoff, within `URSULA_VFS_RETRY_MS`; the
@@ -268,6 +318,12 @@ WAL (the old pages may predate the offset) and the files are rebuilt. A tail rea
 404, or a body cut short when its cold object is deleted after the grace), restarts attach from
 `HEAD`, up to ten times.
 
+A publish or retention move that a layer in front of the stream refuses with 402 publishes or moves
+nothing and is not counted as a snapshot failure. It records the refusal (`payment_required`), and
+the thread takes no snapshot until a commit is acknowledged again, which requests one if it is
+still due. While writes are refused no commit adds to the log, and each attempt would copy and
+compress the whole database for nothing.
+
 Any owner may publish a snapshot of its own offset, a fenced one included: its state at its offset
 is a true prefix of the incarnation it attached to. The snapshot and retention endpoints know no
 producer, so the snapshot `PUT`, its read-back `GET` and the retention `PUT` carry the
@@ -293,9 +349,10 @@ and the log keeps growing. A superseded cold body stays readable for 5 minutes.
   most of that window; §6 lists what remains. Local files rolled back while no process had them attached (a restored disk
   image) are caught by attach (§6).
 - Nothing the stream did not acknowledge becomes visible: no frame of a transaction reaches the
-  local WAL before its append is acknowledged, and a fenced or failed commit leaves no trace
-  locally or remotely (the server deduplicates retries). An append the server applied but whose
-  answer the client never saw is in the stream, and appears after the next attach.
+  local WAL before its append is acknowledged, and a fenced, refused or failed commit leaves no trace
+  locally or remotely (the server deduplicates retries, and a refused commit relies on §2's
+  requirement on layers in front of the stream). An append the server applied but whose answer the
+  client never saw is in the stream, and appears after the next attach.
 - Fencing: after a claim at epoch `e` is verified, appends below `e` fail. Snapshots carry the
   highest epoch, so this survives retention trimming the claims.
 - A snapshot reflects exactly the stream at its offset; retention advances only past a snapshot
@@ -446,6 +503,11 @@ What attach does in each case:
   that fails after step 1 leaves a file with a sidecar refusing opens until an attach succeeds
   (§1, §3); a file whose first attach failed before writing its sidecar (the server unreachable,
   for example) is still a plain file and passes through.
+- A layer in front of the stream that refuses writes with 402 (an exhausted quota, a suspended
+  account): commits fail alone with `SQLITE_IOERR_AUTH` and nothing of them reaches the stream,
+  reads go on, and the first commit after the layer accepts writes again succeeds, with no attach
+  (§2). A process that restarts meanwhile cannot attach as the owner, because its claim is refused.
+  It attaches read-only to read (§3).
 - Two owners: the later claim wins; the earlier one's next commit fails cleanly
   (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
 - A snapshot that cannot be taken (a long reader pins WAL frames) or published (body too large):
@@ -544,7 +606,12 @@ must say in its release notes to stop every owner of a stream before upgrading.
 - Units (`cargo test`): frame and snapshot encodings (whole frames only, damage refused, another
   format refused by its magic, named in the error), and the claim lookup (a claim wins only as the
   frame ending at the answered offset, or anywhere in a read-back that ran past it; a re-claim also
-  only as the first frame after the owner's offset).
+  only as the first frame after the owner's offset). A 402 fails a request alone with the layer's
+  explanation, and ends an append only while no attempt of it can have reached the stream: after a
+  401 or a 429 it does, after no answer or a 5xx it is retried until an answer settles the outcome,
+  and an outcome still unknown when the budget runs out fails as unknown. A refused commit leaves
+  the owner unpoisoned with its epoch, sequence and offset, a poison clears the refusal (and a
+  refusal after a poison is not recorded), and the attach mode parses.
 - Units also cover the sidecar: trusted only in this boot, for this stream incarnation and db file,
   and with its WAL claim met (a claim on frames the WAL does not hold or on another WAL generation,
   or no claim, is not); legacy, other-boot, other-incarnation and torn sidecars are not, nothing is
@@ -573,6 +640,19 @@ must say in its release notes to stop every owner of a stream before upgrading.
   and retention (a ~160 MB run; CI also runs it without a cold tier under the default hot limit;
   fresh and lagging hosts rebuild byte-identical from snapshot + tail; the takeover after the trim
   fences the old owner), Pi conformance in three modes, and a benchmark (sanity numbers only).
+- Writes refused with 402 (`test/payment.e2e.ts`), through `test/gate.mjs`, an HTTP layer in its
+  own process that answers 402 on demand (the server never does). Commits refused in autocommit
+  and in an explicit transaction fail with `SQLITE_IOERR_AUTH` while reads go on, the owner keeps
+  its epoch and offset, the next commit after the layer accepts writes succeeds without an attach,
+  and the stream holds the accepted commits alone. A refused transaction that restarts the WAL and
+  spills before `COMMIT` is rolled back whole, and the file stays in step with the stream. An
+  append whose answer was lost and whose retries meet a 402 is applied once. An owner refused with 402 is still fenced by a newer claim,
+  and then reports the poison alone. A refused attach throws `UrsulaPaymentRequiredError`, and a
+  read-only attach of the same file reads it, refuses writes, appends nothing, fences no owner and
+  catches up when attached again. A read-only attach never creates a missing stream. A snapshot
+  refused with 402 is no snapshot failure and is published after the next commit. Through Pi, a
+  refused commit rejects with `UrsulaPaymentRequiredError` and the storage commits again once the
+  layer accepts, and a read-only storage reads what an owner wrote and refuses its commits.
 - Same-minor compatibility (`test/compat.e2e.ts`, §7): the previous published patch of the minor
   and the build take over each other's streams on a new host and on the same one, both ways.
 - The same Pi conformance, snapshot and benchmark suites on 3 nodes + gateway + S3 (AWS S3 in CI,

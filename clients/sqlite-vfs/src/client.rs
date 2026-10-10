@@ -121,11 +121,15 @@ fn in_clear(uri: &Uri) -> bool {
 }
 
 /// How an answer refuses a request before it reaches the stream, or fences its owner: the one
-/// place a fence is told from an authorizer's refusal.
+/// place a fence is told from a refusal in front of the stream.
 enum Refused {
     /// A 401: an authorizer in front of the stream refused the token. Sent again, with the token
     /// read again, within the retry budget.
     Token,
+    /// A 402: a layer in front of the stream (an authorizer, a quota or billing service) refuses
+    /// the request until something is paid or settled. Final for the request, never a fence, and
+    /// nothing of it reached the stream (unless an earlier attempt of an append did: `append`).
+    PaymentRequired,
     /// A 403 without `Producer-Epoch`: an authorizer denied the request. Final, and never a fence.
     Denied,
     /// A 403 with `Producer-Epoch`: the server's fence, which names the epoch that owns the stream
@@ -136,6 +140,7 @@ enum Refused {
 fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
     match r.status().as_u16() {
         401 => Some(Refused::Token),
+        402 => Some(Refused::PaymentRequired),
         403 if r.headers().contains_key("producer-epoch") => Some(Refused::Fenced {
             current: header_u64(r, "producer-epoch"),
         }),
@@ -144,10 +149,15 @@ fn refused(r: &ureq::http::Response<ureq::Body>) -> Option<Refused> {
     }
 }
 
-/// An authorizer refused the request (a refused token, or a denial): the request fails as
-/// unauthorized, never as fenced.
-fn auth_refused(r: &ureq::http::Response<ureq::Body>) -> bool {
-    matches!(refused(r), Some(Refused::Token | Refused::Denied))
+/// The error of request `op` to `url` that a layer in front of the stream refused (a refused
+/// token, a denial, or a 402), never a fence; `None` for any other answer.
+fn refusal(op: &'static str, url: &str, r: &mut ureq::http::Response<ureq::Body>) -> Option<Error> {
+    let status = r.status().as_u16();
+    match refused(r)? {
+        Refused::Token | Refused::Denied => Some(unauthorized(op, url, status)),
+        Refused::PaymentRequired => Some(payment_required(op, url, body_text(r))),
+        Refused::Fenced { .. } => None,
+    }
 }
 
 fn unauthorized(op: &'static str, url: &str, status: u16) -> Error {
@@ -155,6 +165,14 @@ fn unauthorized(op: &'static str, url: &str, status: u16) -> Error {
         op,
         url: url.to_owned(),
         status,
+    }
+}
+
+fn payment_required(op: &'static str, url: &str, body: String) -> Error {
+    Error::PaymentRequired {
+        op,
+        url: url.to_owned(),
+        body,
     }
 }
 
@@ -252,6 +270,10 @@ pub(crate) enum Append {
     /// 409 refusing the commit's `Stream-Seq` (not above the stream's last one): another writer
     /// appended with a higher one (see `stream_seq`). `body` is the server's explanation.
     SeqConflict { body: String },
+    /// 402: a layer in front of the stream refused the append, and no attempt of it reached the
+    /// stream (each earlier one was refused in front of it too, or rate limited): nothing was
+    /// appended, and the producer sequence is still free. `body` is the layer's explanation.
+    PaymentRequired { body: String },
     /// A definite rejection, or no answer within the retry budget.
     Failed(Error),
 }
@@ -272,6 +294,15 @@ pub(crate) fn producer_id(incarnation: &str) -> String {
 /// verified claim (see `claim_once`), which makes this owner the only writer of its incarnation's
 /// producer at its epoch, so whatever holds (epoch, seq) there is ours. A claim's answer is
 /// verified separately. Commits also carry their `Stream-Seq` (see `stream_seq`).
+///
+/// A 402 ends the append as [`Append::PaymentRequired`] only while no attempt of it can have
+/// reached the stream. After an attempt whose outcome is unknown (no answer, or a 5xx), the
+/// append may be in the stream, and the next commit, sent with the same sequence, would be
+/// acknowledged as its duplicate: the 402 is then retried like an unknown outcome, until an
+/// answer settles it or the budget runs out ([`Error::AppendUnknown`]). An attempt answered 401,
+/// 402 or 429 is taken to have applied nothing, which every layer in front of the stream must
+/// ensure (design doc §2): one that passed the append on and then answered so would have the next
+/// commit acknowledged as this one's duplicate, its pages never appended.
 pub(crate) fn append(
     url: &str,
     incarnation: &str,
@@ -286,6 +317,8 @@ pub(crate) fn append(
     let mut attempts: u32 = 0;
     // The last answer refused the token: the next attempt reads it again.
     let mut token_refused = false;
+    // An earlier attempt may have reached the stream: its outcome is unknown.
+    let mut reached = false;
     loop {
         attempts = attempts.saturating_add(1);
         let mut req = authorized(agent().post(url), std::mem::take(&mut token_refused))
@@ -310,6 +343,16 @@ pub(crate) fn append(
                     Some(Refused::Denied) => {
                         return Append::Failed(unauthorized("append", url, status));
                     }
+                    Some(Refused::PaymentRequired) if !reached => {
+                        return Append::PaymentRequired {
+                            body: body_text(&mut r),
+                        };
+                    }
+                    // An earlier attempt may be in the stream: the outcome is still unknown.
+                    Some(Refused::PaymentRequired) => Attempt::Status {
+                        status,
+                        body: body_text(&mut r),
+                    },
                     Some(Refused::Token) => {
                         token_refused = true;
                         Attempt::Status {
@@ -358,6 +401,15 @@ pub(crate) fn append(
             }
             Err(e) => Attempt::Transport(Box::new(e)),
         };
+        // Refusals in front of the stream (401, 402) and rate limiting (429) apply nothing (a
+        // requirement on every layer in front of it, see above); any other answer, or none, may
+        // come after the stream applied the append.
+        if !matches!(unknown, Attempt::Status {
+            status: 401 | 402 | 429,
+            ..
+        }) {
+            reached = true;
+        }
         // A retried commit is a stall the application sees: say why, attempt by attempt, and
         // whether another attempt follows.
         let wait = next_wait(retry_after, backoff, deadline);
@@ -398,10 +450,10 @@ pub(crate) fn create_stream(url: &str) -> Result<(), Error> {
         &|| false,
     )
     .map_err(|e| http_error("create", url, e))?;
-    let status = r.status().as_u16();
-    if auth_refused(&r) {
-        return Err(unauthorized("create", url, status));
+    if let Some(e) = refusal("create", url, &mut r) {
+        return Err(e);
     }
+    let status = r.status().as_u16();
     let body = body_text(&mut r);
     if (200..300).contains(&status) {
         Ok(())
@@ -464,10 +516,10 @@ pub(crate) fn read_from(
         &|| false,
     )
     .map_err(|e| http_error("read", &request, e))?;
-    let status = r.status().as_u16();
-    if auth_refused(&r) {
-        return Err(unauthorized("read", &request, status));
+    if let Some(e) = refusal("read", &request, &mut r) {
+        return Err(e);
     }
+    let status = r.status().as_u16();
     if status == 412 {
         return Err(recreated(url, incarnation));
     }
@@ -543,15 +595,15 @@ pub(crate) struct Head {
 
 /// `stopped` ends the retries of a 429/503 early (see `send_retrying`).
 pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
-    let r = send_retrying(
+    let mut r = send_retrying(
         |refresh| authorized(agent().head(url), refresh).call(),
         stopped,
     )
     .map_err(|e| http_error("head", url, e))?;
-    let status = r.status().as_u16();
-    if auth_refused(&r) {
-        return Err(unauthorized("head", url, status));
+    if let Some(e) = refusal("head", url, &mut r) {
+        return Err(e);
     }
+    let status = r.status().as_u16();
     if status != 200 {
         return Err(Error::Status {
             op: "head",
@@ -591,10 +643,10 @@ pub(crate) fn get_snapshot(
         stopped,
     )
     .map_err(|e| http_error("get snapshot", &request, e))?;
-    let status = r.status().as_u16();
-    if auth_refused(&r) {
-        return Err(unauthorized("get snapshot", &request, status));
+    if let Some(e) = refusal("get snapshot", &request, &mut r) {
+        return Err(e);
     }
+    let status = r.status().as_u16();
     if status == 412 {
         return Err(recreated(url, incarnation));
     }
@@ -617,7 +669,8 @@ pub(crate) fn get_snapshot(
 
 /// `PUT` to stream incarnation `incarnation` (a 412 when it is not) with retries while the outcome
 /// is unknown (transport errors, 5xx): both publishing a snapshot and advancing retention are
-/// idempotent. Returns the status and response. Gives up once `stopped` (a re-attach is waiting
+/// idempotent, so a 402 fails the request alone ([`Error::PaymentRequired`]), whatever an earlier
+/// attempt did. Returns the status and response. Gives up once `stopped` (a re-attach is waiting
 /// for the snapshot thread).
 pub(crate) fn put_idempotent(
     url: &str,
@@ -644,6 +697,9 @@ pub(crate) fn put_idempotent(
                     }
                 }
                 (Some(Refused::Denied), status) => return Err(unauthorized("put", url, status)),
+                (Some(Refused::PaymentRequired), _) => {
+                    return Err(payment_required("put", url, body_text(&mut r)));
+                }
                 (_, status) if status < 500 => return Ok((status, r)),
                 (_, status) => Attempt::Status {
                     status,
@@ -702,8 +758,10 @@ mod tests {
     use super::get_snapshot;
     use super::head;
     use super::in_clear;
+    use super::put_idempotent;
     use super::read_from;
     use crate::auth::set_token;
+    use crate::error::Attempt;
     use crate::error::Error;
 
     // A leader read the server could not confirm with a quorum in time answers 503 (Retry-After),
@@ -878,5 +936,92 @@ mod tests {
         assert_eq!(status, 400);
         assert_eq!(body, format!("{}...", "x".repeat(256)));
         server.join().unwrap();
+    }
+
+    fn answer_with_body(head: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    // A 402 is a layer in front of the stream refusing the request: it fails that request alone,
+    // with the layer's explanation, and is never retried, except by an append one of whose earlier
+    // attempts may have reached the stream (no answer, or a 5xx): its outcome is still unknown, so
+    // it is sent again until an answer settles it. Refusals in front of the stream (401, 402) and
+    // rate limiting (429) leave the outcome known.
+    #[test]
+    fn payment_refusals_fail_the_request_alone() {
+        let reason = "{\"detail\":\"quota exhausted\"}";
+        let refused = || answer_with_body("402 Payment Required", reason);
+        let (url, server) = serve(vec![
+            refused(),
+            answer("429 Too Many Requests"),
+            refused(),
+            answer("401 Unauthorized"),
+            refused(),
+            // No answer at all: the attempt may have reached the stream.
+            String::new(),
+            refused(),
+            answer("503 Service Unavailable"),
+            refused(),
+            answer("200 OK\r\nstream-next-offset: 9"),
+            refused(),
+            refused(),
+            refused(),
+        ]);
+        let first = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(&first, Append::PaymentRequired { body } if body == reason));
+        let after_429 = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(after_429, Append::PaymentRequired { .. }));
+        let after_401 = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(matches!(after_401, Append::PaymentRequired { .. }));
+        let settled = append(&url, "i1", "p", b"x", 1, 1);
+        assert!(
+            matches!(settled, Append::Acked { next: Some(ref n), attempts: 5 } if n == "9"),
+            "a 402 after an unknown outcome is retried"
+        );
+        let create = create_stream(&url).unwrap_err();
+        assert!(matches!(
+            &create,
+            Error::PaymentRequired { op: "create", body, .. } if body == reason
+        ));
+        let head = head(&url, &|| false).err().unwrap();
+        assert!(matches!(head, Error::PaymentRequired { op: "head", .. }));
+        let put = put_idempotent(&url, "i1", b"", &|| false).err().unwrap();
+        assert!(matches!(put, Error::PaymentRequired { op: "put", .. }));
+        let requests = server.join().unwrap();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|r| r.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(methods, [
+            "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "POST", "PUT",
+            "HEAD", "PUT"
+        ]);
+    }
+
+    // An append whose outcome stays unknown to the end (a 402 after an attempt that may have
+    // reached the stream) fails as unknown, never as refused: the caller must not take the
+    // producer sequence for free.
+    #[test]
+    fn a_payment_refusal_after_an_unknown_outcome_stays_unknown() {
+        // The budget ends once a wait would pass it: a Retry-After too large to wait for.
+        let (url, server) = serve(vec![
+            answer("503 Service Unavailable"),
+            answer_with_body(
+                "402 Payment Required\r\nretry-after: 18446744073709551615",
+                "quota exhausted",
+            ),
+        ]);
+        let unknown = append(&url, "i1", "p", b"x", 1, 1);
+        let Append::Failed(Error::AppendUnknown { attempts, last }) = unknown else {
+            panic!("not unknown");
+        };
+        assert_eq!(attempts, 2);
+        assert!(
+            matches!(last, Attempt::Status { status: 402, ref body } if body == "quota exhausted")
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 }

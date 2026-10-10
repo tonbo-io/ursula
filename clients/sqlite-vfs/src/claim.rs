@@ -80,6 +80,14 @@ pub(crate) fn claim_once(
                 url: url.to_owned(),
             });
         }
+        // Refused in front of the stream: nothing was claimed.
+        Append::PaymentRequired { body } => {
+            return Err(Error::PaymentRequired {
+                op: "claim",
+                url: url.to_owned(),
+                body,
+            });
+        }
         Append::Failed(e) => return Err(e),
     };
     let (mut buf, mut at) = (Vec::new(), from.to_owned());
@@ -175,7 +183,8 @@ pub(crate) fn claim(
 /// owner's older epochs) must be ours (verified) and be the first frame after it. Otherwise
 /// another owner wrote or claimed, and this one is fenced ([`Error::is_fenced`]); so it is when the
 /// stream turns out to be another incarnation (every request here carries ours as a
-/// precondition).
+/// precondition). A layer in front of the stream that refuses with 402 fails it with
+/// [`Error::PaymentRequired`]: nothing was claimed, and the owner is as it was.
 pub(crate) fn reclaim(db: &mut Db) -> Result<(), Error> {
     let (bytes, _) = read_from(&db.url, &db.incarnation, &db.offset)?;
     if !bytes.is_empty() {
