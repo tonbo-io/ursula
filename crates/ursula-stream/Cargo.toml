@@ -25,6 +25,7 @@ dhat = { workspace = true }
 serde_json = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
+rmp-serde = { workspace = true }
 
 [[bench]]
 name = "plan_next_cold_flush"

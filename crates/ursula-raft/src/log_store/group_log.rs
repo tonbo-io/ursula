@@ -74,6 +74,8 @@ pub(crate) enum ApplyMode {
 pub(crate) struct ReadPlan {
     pub(crate) disk: Vec<DiskRead>,
     pub(crate) cached: Vec<Entry>,
+    /// Read weight of the entries planned, cached or not.
+    pub(crate) bytes: u64,
 }
 
 /// Entries to read from one frame.
@@ -481,13 +483,13 @@ impl GroupLog {
     }
 
     /// What reading `range` needs: the cached entries, and the frames of the
-    /// entries before the cache. With `max_disk_bytes`, the read stops at
-    /// the first entry past that many bytes to read from disk, so it covers
-    /// a prefix of the range, never less than one entry.
+    /// entries before the cache. With `max_bytes`, the read covers the
+    /// longest prefix of the range whose entries weigh at most that much,
+    /// cached or not, and never less than one entry.
     pub(crate) fn plan_read(
         &self,
         range: impl RangeBounds<u64>,
-        max_disk_bytes: Option<u64>,
+        max_bytes: Option<u64>,
     ) -> ReadPlan {
         let start = match range.start_bound() {
             Bound::Included(start) => Bound::Included(*start),
@@ -501,8 +503,14 @@ impl GroupLog {
         };
         let mut plan = ReadPlan::default();
         let cache_first = self.cache.first_index();
-        let mut disk_bytes = 0_u64;
+        let mut planned = false;
         for entry in self.index.range((start, end)) {
+            let bytes = plan.bytes.saturating_add(u64::from(entry.bytes));
+            if planned && max_bytes.is_some_and(|max| bytes > max) {
+                break;
+            }
+            planned = true;
+            plan.bytes = bytes;
             let index = entry.log_id.index;
             if cache_first.is_some_and(|first| index >= first)
                 && let Some(cached) = self.cache.get(index)
@@ -510,10 +518,6 @@ impl GroupLog {
                 plan.cached.push(cached.clone());
                 continue;
             }
-            if max_disk_bytes.is_some_and(|max| disk_bytes >= max) {
-                break;
-            }
-            disk_bytes = disk_bytes.saturating_add(u64::from(entry.bytes));
             match plan.disk.last_mut() {
                 Some(read) if read.frame == entry.frame => read.log_ids.push(entry.log_id),
                 _ => plan.disk.push(DiskRead {
@@ -1119,6 +1123,30 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+    }
+
+    /// #507: the limit weighs cached entries as well as the ones read from
+    /// disk; a cached tail used to come whole, however large.
+    #[test]
+    fn a_limited_read_weighs_cached_entries_too() {
+        let mut log = GroupLog::new(1 << 20);
+        append(
+            &mut log,
+            (1..=8).map(|i| entry(1, i, 100)).collect(),
+            at(1, 32),
+            ApplyMode::Live,
+        );
+        let plan = log.plan_read(1..=8, Some(3 * weight(100)));
+        assert!(plan.disk.is_empty());
+        assert_eq!(
+            plan.cached
+                .iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(plan.bytes, 3 * weight(100));
+        assert_eq!(log.plan_read(1..=8, None).cached.len(), 8);
     }
 
     #[test]

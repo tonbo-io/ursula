@@ -469,6 +469,30 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
     );
 }
 
+/// #507: restoring a group replicates its whole snapshot as one Raft entry,
+/// and a log read limits what it returns, one Append call to a follower, by
+/// this weight. So the import weighs at least what it encodes to, for bodies
+/// of high bytes too.
+#[test]
+fn an_import_weighs_at_least_its_encoded_size() {
+    let mut machine = machine();
+    for (id, byte) in [("import-low", 7_u8), ("import-high", 0xff)] {
+        assert_eq!(
+            machine.apply(create_cmd(stream(id), Create {
+                payload: vec![byte; 64 * 1024],
+                ..Create::default()
+            })),
+            created(stream(id), 64 * 1024)
+        );
+    }
+    let import = StreamCommand::ImportSnapshot {
+        snapshot: Box::new(machine.snapshot()),
+    };
+    let encoded = rmp_serde::to_vec_named(&import).expect("encode the import");
+    assert!(encoded.len() > 3 * 64 * 1024);
+    assert!(import.log_bytes_estimate() >= u64::try_from(encoded.len()).unwrap());
+}
+
 /// D12: the `Stream-Incarnation` precondition rides in the command and is
 /// checked at apply, so an append proposed against one incarnation and
 /// applied after a delete and recreate is refused and appends nothing.

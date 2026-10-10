@@ -46,6 +46,7 @@ use super::RunStatus;
 use super::core_meta::CoreMetadata;
 use super::core_meta::MarkRecoveringError;
 use super::core_meta::core_metadata_path;
+use super::file::LIMITED_READ_BYTES;
 use super::journal::FrameDefect;
 use super::journal::JournalWriter;
 use super::run_state::PreviousRun;
@@ -63,6 +64,7 @@ use super::writer::group_commit_wait;
 use super::writer::raft_group_log_record_initializes;
 use super::writer::raft_group_log_record_requires_sync;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::entry_log_bytes;
 
 type Entry = EntryOf<UrsulaRaftTypeConfig>;
 
@@ -816,6 +818,131 @@ async fn evicted_entries_read_back_from_disk_identical() {
         reader.try_get_log_entries(..).await.expect("read"),
         appended
     );
+}
+
+/// #507: a limited read is one Append call to a follower, and tonic keeps the
+/// AppendStream that carries it at its largest frame. So the limit weighs
+/// every entry the read returns, cached ones too, and a single entry above it
+/// comes alone.
+#[tokio::test]
+async fn a_limited_read_weighs_cached_entries_too() {
+    let core = Core::new(JournalTuning {
+        fsync: WalFsync::Never,
+        segment_bytes: 64 * 1024 * 1024,
+        group_cache_bytes: 64 * 1024 * 1024,
+    });
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    let mib = 1024 * 1024;
+    let appended = (1..=10)
+        .map(|index| payload_entry(index, mib))
+        .collect::<Vec<_>>();
+    append(&mut store, appended.clone()).await;
+    let before = core.metrics.snapshot();
+    let mut reader = store.clone();
+    let limited = reader
+        .limited_get_log_entries(1, 11)
+        .await
+        .expect("limited read");
+    let after = core.metrics.snapshot();
+    assert_eq!(
+        after.wal_cache_misses, before.wal_cache_misses,
+        "every entry comes from the cache"
+    );
+    let fits = usize::try_from(LIMITED_READ_BYTES / entry_log_bytes(&appended[0])).unwrap();
+    assert!(fits < appended.len());
+    assert_eq!(limited.as_slice(), appended.get(..fits).expect("prefix"));
+
+    let oversized = payload_entry(11, 2 * usize::try_from(LIMITED_READ_BYTES).unwrap());
+    append(&mut store, [oversized.clone(), payload_entry(12, 16)]).await;
+    let limited = reader
+        .limited_get_log_entries(11, 13)
+        .await
+        .expect("limited read");
+    assert_eq!(limited, vec![oversized]);
+}
+
+/// OpenRaft reads a caught-up follower's range from entries the writer has
+/// not flushed yet, so the limit weighs those pending entries too. A read
+/// stops inside the pending batch, and a durable prefix that stops early is
+/// never followed by pending entries past the gap, which the replication
+/// reader would refuse as a fatal storage error.
+#[tokio::test]
+async fn a_limited_read_weighs_pending_entries_and_keeps_them_consecutive() {
+    use openraft::type_config::TypeConfigExt;
+
+    use super::writer::CoreWriteOp;
+
+    let core = Core::new(JournalTuning {
+        fsync: WalFsync::Never,
+        segment_bytes: 64 * 1024 * 1024,
+        group_cache_bytes: 64 * 1024 * 1024,
+    });
+    let writer = core.writer();
+    let mib = 1024 * 1024;
+    let entries = |first: u64, last: u64, bytes: usize| {
+        (first..=last)
+            .map(|index| payload_entry(index, bytes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        LIMITED_READ_BYTES / entry_log_bytes(&payload_entry(1, mib)),
+        3
+    );
+    let mut only_pending = core.store(&writer, 1);
+    let mut after_durable = core.store(&writer, 2);
+    append(&mut after_durable, entries(1, 2, mib)).await;
+    let mut after_a_stop = core.store(&writer, 3);
+    append(&mut after_a_stop, entries(1, 6, mib)).await;
+
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    writer.submit(
+        CoreWriteOp::Vote {
+            group_id: 0,
+            vote: committed_vote(),
+        },
+        move |result| {
+            result.expect("initial vote");
+            entered.send(()).expect("test is waiting");
+            let _released = wait_release.recv();
+        },
+    );
+    wait_entered.await.expect("writer reached barrier");
+    let mut flushes = Vec::new();
+    for (store, pending) in [
+        (&mut only_pending, entries(1, 10, mib)),
+        (&mut after_durable, entries(3, 12, mib)),
+        // Small enough to fit in what the durable prefix leaves of the limit.
+        (&mut after_a_stop, entries(7, 12, 1024)),
+    ] {
+        let (flushed, result) = UrsulaRaftTypeConfig::oneshot();
+        store
+            .append(pending, IOFlushed::signal(flushed))
+            .await
+            .expect("submit append");
+        flushes.push(result);
+    }
+
+    for store in [&only_pending, &after_durable, &after_a_stop] {
+        let mut reader = store.clone();
+        let read = reader
+            .limited_get_log_entries(1, 13)
+            .await
+            .expect("limited read")
+            .into_iter()
+            .map(|entry| entry.log_id.index)
+            .collect::<Vec<_>>();
+        assert_eq!(read, [1, 2, 3]);
+    }
+    drop(release);
+    for flush in flushes {
+        flush
+            .await
+            .expect("callback delivered")
+            .expect("durable append");
+    }
+    writer.close().await.unwrap();
 }
 
 /// Recovery reads every segment in order and truncates an incomplete final
