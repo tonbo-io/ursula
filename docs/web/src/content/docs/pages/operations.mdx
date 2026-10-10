@@ -376,6 +376,8 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes#070).
 
+0.7.1 upgrades 0.7.0 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.7.1 release notes](/docs/release-notes#071).
+
 To install 0.7:
 
 1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again.
