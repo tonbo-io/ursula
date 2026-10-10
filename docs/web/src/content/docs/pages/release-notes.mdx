@@ -5,7 +5,9 @@ description: Changes that affect clients and operators, newest first.
 
 ## 0.7.2
 
-0.7.2 is a drop-in patch for 0.7.0 and 0.7.1: format epoch 3 is unchanged, with no storage, snapshot or Raft protocol change. Upgrade in place with an ordinary rolling restart (`helm upgrade`). No fresh install or data move is needed, and 0.7.x voters run side by side during the upgrade.
+0.7.2 is a drop-in patch for 0.7.0 and 0.7.1: format epoch 3 is unchanged, with no storage, snapshot or Raft protocol change. Upgrade in place with an ordinary rolling restart (`helm upgrade`). No fresh install or data move is needed.
+
+0.7.0, 0.7.1 and 0.7.2 voters run side by side during the upgrade.
 
 - **Rust library API changed.** `ursula_raft::RaftGrpcMetricsSnapshot` has a new field, `raft_grpc_append_stream_frame_bytes_max`.
 
@@ -30,7 +32,7 @@ description: Changes that affect clients and operators, newest first.
 ### Changed
 
 - **SQLite VFS: a `402` no longer poisons the file, and files can attach read-only.** A layer in front of the stream, such as an authorizer or a quota or billing service, may refuse writes with `402 Payment Required`. A commit it refuses now fails alone with `SQLITE_IOERR_AUTH` (`UrsulaPaymentRequiredError` through `openUrsulaPiStorage`). The file is not poisoned, reads keep working, and the next commit succeeds once the layer accepts writes again, without a new attach. `status(file)` reports `payment_required` and `payment_reason`. An attach it refuses fails with `SQLITE_AUTH` (`UrsulaPaymentRequiredError` from `attach`). `attach(file, url, { readOnly: true })` (`ursula_attach(path, url, 'read_only')`) catches a file up without claiming the stream. It never writes the stream and fences no owner, and every write to the file fails with `SQLITE_READONLY`. See [SQLite VFS](/docs/examples/sqlite-vfs#writes-refused-with-402).
-- **Release images carry their provenance and SBOM as GitHub attestations.** The `ursula` and `ursula-chaos-agent` image indexes on GHCR hold only their `linux/amd64` and `linux/arm64` images, with no attestation manifests. Build provenance and an SPDX 2.3 SBOM are published as GitHub artifact attestations instead. Verify them with `gh attestation verify oci://ghcr.io/tonbo-io/ursula:0.7.1 --repo tonbo-io/ursula`, and add `--predicate-type https://spdx.dev/Document/v2.3` for the SBOM. GHCR receives stable releases only, with no `0.0.0-*` candidate images or charts, and `latest` moves only to the highest stable release.
+- **Release images carry their provenance and SBOM as GitHub attestations.** The `ursula` and `ursula-chaos-agent` image indexes on GHCR hold only their `linux/amd64` and `linux/arm64` images, with no attestation manifests. Build provenance and an SPDX 2.3 SBOM are published as GitHub artifact attestations instead. Verify them with `gh attestation verify oci://ghcr.io/tonbo-io/ursula:<version> --repo tonbo-io/ursula`, and add `--predicate-type https://spdx.dev/Document/v2.3` for the SBOM. GHCR receives stable releases only, with no `0.0.0-*` candidate images or charts, and `latest` moves only to the highest stable release.
 
 ### Fixed
 
