@@ -16,6 +16,7 @@ use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::RaftNetworkFactory;
 use openraft::RaftNetworkV2;
+use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotOf;
 use openraft::alias::VoteOf;
@@ -66,6 +67,7 @@ use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
+use crate::types::entry_log_bytes;
 
 /// Reply to an append-stream caller that may have stopped waiting. A dropped
 /// receiver makes the reply moot.
@@ -131,6 +133,7 @@ static GRPC_APPEND_STREAM_REQUEST_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_RESPONSE_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_BATCH_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_BATCH_ITEMS_MAX: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_FRAME_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_INFLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static GRPC_APPEND_STREAM_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -171,6 +174,7 @@ static GRPC_APPEND_REPLICATION: CachePadded<AppendReplicationCounters> =
         entries: AtomicU64::new(0),
     });
 static GRPC_APPEND_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_PARTIAL_SENDS: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_VOTE_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -338,6 +342,9 @@ pub struct RaftGrpcMetricsSnapshot {
     pub raft_grpc_append_stream_response_frames: u64,
     pub raft_grpc_append_stream_batch_frames: u64,
     pub raft_grpc_append_stream_batch_items_max: u64,
+    /// Encoded bytes of the largest request frame sent, before compression. Bounded by
+    /// `RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES` plus one call.
+    pub raft_grpc_append_stream_frame_bytes_max: u64,
     pub raft_grpc_append_stream_inflight: u64,
     pub raft_grpc_append_stream_inflight_max: u64,
     /// Leader side: bytes of Append calls queued for peers but not yet taken by the HTTP/2
@@ -363,6 +370,9 @@ pub struct RaftGrpcMetricsSnapshot {
     pub raft_grpc_append_replication_request_bytes: u64,
     pub raft_grpc_append_replication_entries: u64,
     pub raft_grpc_append_response_bytes: u64,
+    /// Append calls cut to `RAFT_GRPC_APPEND_MAX_PAYLOAD_BYTES` of entries and answered as
+    /// `PartialSuccess`.
+    pub raft_grpc_append_partial_sends: u64,
     pub raft_grpc_vote_requests: u64,
     pub raft_grpc_vote_request_bytes: u64,
     pub raft_grpc_vote_response_bytes: u64,
@@ -391,6 +401,8 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
         raft_grpc_append_stream_batch_frames: GRPC_APPEND_STREAM_BATCH_FRAMES
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_batch_items_max: GRPC_APPEND_STREAM_BATCH_ITEMS_MAX
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_frame_bytes_max: GRPC_APPEND_STREAM_FRAME_BYTES_MAX
             .load(Ordering::Relaxed),
         raft_grpc_append_stream_inflight: GRPC_APPEND_STREAM_INFLIGHT.load(Ordering::Relaxed),
         raft_grpc_append_stream_inflight_max: GRPC_APPEND_STREAM_INFLIGHT_MAX
@@ -422,6 +434,7 @@ pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
             .entries
             .load(Ordering::Relaxed),
         raft_grpc_append_response_bytes: GRPC_APPEND_RESPONSE_BYTES.load(Ordering::Relaxed),
+        raft_grpc_append_partial_sends: GRPC_APPEND_PARTIAL_SENDS.load(Ordering::Relaxed),
         raft_grpc_vote_requests: GRPC_VOTE_REQUESTS.load(Ordering::Relaxed),
         raft_grpc_vote_request_bytes: GRPC_VOTE_REQUEST_BYTES.load(Ordering::Relaxed),
         raft_grpc_vote_response_bytes: GRPC_VOTE_RESPONSE_BYTES.load(Ordering::Relaxed),
@@ -486,6 +499,18 @@ pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
+/// Leader side: entry payload bytes one Append call carries, as etcd's `MaxSizePerMsg` and TiKV's
+/// `raft-max-size-per-msg` bound theirs. OpenRaft batches by entry count only (300 by default),
+/// and an entry may hold up to 1 MiB before its payload moves to the cold store (32 MiB without
+/// one). A larger call is cut to the prefix that fits, at least one entry, and answered as
+/// `PartialSuccess`; OpenRaft sends the rest right away.
+const RAFT_GRPC_APPEND_MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
+/// Encoded bytes of the Append calls an AppendStream frame collects, besides the call count. A
+/// frame stops taking calls once it holds this many, so it exceeds it by at most one call. tonic
+/// keeps each stream's encode, compression and decode buffers at the largest message the stream
+/// ever carried, and a session lives until its peer restarts: unbounded frames left every node
+/// holding GBs of idle buffers after one burst of large appends (#507).
+const RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// Leader side, per peer: bytes of Append calls queued (not yet taken by the HTTP/2 encoder).
 /// Beyond it a call fails fast as `Unavailable`, which OpenRaft treats as an unreachable peer and
 /// backs off on. Before this bound a lagging peer's queue grew without limit: every replication
@@ -1512,26 +1537,30 @@ fn shared_append_session(
     Ok(session)
 }
 
-/// Collect `first` and the calls already queued behind it (up to the frame limit) into one
-/// frame, dropping calls whose caller has already given up: their response would go nowhere, and
-/// sending them anyway is what turned a lagging peer into an ever-growing backlog (each OpenRaft
-/// retry re-queues the same entries).
+/// Collect `first` and the calls already queued behind it (up to the frame's call and byte
+/// limits) into one frame, dropping calls whose caller has already given up: their response would
+/// go nowhere, and sending them anyway is what turned a lagging peer into an ever-growing backlog
+/// (each OpenRaft retry re-queues the same entries).
 fn collect_append_stream_frame(
     first: AppendStreamCall,
     calls: &mut mpsc::UnboundedReceiver<AppendStreamCall>,
 ) -> (Vec<AppendStreamCall>, bool) {
-    fn keep(call: AppendStreamCall, frame: &mut Vec<AppendStreamCall>) {
+    fn keep(call: AppendStreamCall, frame: &mut Vec<AppendStreamCall>, bytes: &mut usize) {
         if call.response.is_closed() {
             GRPC_APPEND_STREAM_EXPIRED_UNSENT.fetch_add(1, Ordering::Relaxed);
         } else {
+            *bytes = bytes.saturating_add(call.envelope.encoded_len());
             frame.push(call);
         }
     }
     let mut frame = Vec::new();
-    keep(first, &mut frame);
-    while frame.len() < RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS {
+    let mut bytes = 0;
+    keep(first, &mut frame, &mut bytes);
+    while frame.len() < RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS
+        && bytes < RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES
+    {
         match calls.try_recv() {
-            Ok(call) => keep(call, &mut frame),
+            Ok(call) => keep(call, &mut frame, &mut bytes),
             Err(mpsc::error::TryRecvError::Empty) => return (frame, true),
             Err(mpsc::error::TryRecvError::Disconnected) => return (frame, false),
         }
@@ -1717,13 +1746,11 @@ async fn run_append_session(
 
                 let mut items = Vec::with_capacity(frame_calls.len());
                 let mut queued = Vec::with_capacity(frame_calls.len());
+                let mut frame_bytes = 0_u64;
                 for call in frame_calls {
                     let request_id = next_request_id;
                     next_request_id = next_request_id.saturating_add(1);
-                    GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(
-                        call.envelope.encoded_len() as u64,
-                        Ordering::Relaxed,
-                    );
+                    frame_bytes = frame_bytes.saturating_add(call.envelope.encoded_len() as u64);
                     pending.insert(request_id, call.response);
                     queued.push(call.queued);
                     items.push(raft_internal_proto::RaftAppendStreamRequestItem {
@@ -1731,6 +1758,8 @@ async fn run_append_session(
                         envelope: Some(call.envelope),
                     });
                 }
+                GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(frame_bytes, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_FRAME_BYTES_MAX.fetch_max(frame_bytes, Ordering::Relaxed);
                 // The slot was reserved above, so this cannot wait.
                 let _sender =
                     slot.send((raft_internal_proto::RaftAppendStreamRequest { items }, queued));
@@ -1763,12 +1792,45 @@ pub(crate) fn raft_rpc_network_error(message: impl ToString) -> RPCError<UrsulaR
     RPCError::Network(NetworkError::from_string(message))
 }
 
+/// Cuts `request` to its longest prefix of entries within `max_bytes` of payload, keeping at
+/// least one entry. Returns the log id of the last entry kept when it cut any.
+fn cut_append_to_payload_budget(
+    request: &mut UrsulaAppendEntriesRequest,
+    max_bytes: u64,
+) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+    let mut bytes = 0_u64;
+    let over = request.entries.iter().position(|entry| {
+        bytes = bytes.saturating_add(entry_log_bytes(entry));
+        bytes > max_bytes
+    })?;
+    request.entries.truncate(over.max(1));
+    request.entries.last().map(|entry| entry.log_id)
+}
+
+/// The answer to an Append call cut after `sent_last`: the peer's `Success` covers only the
+/// entries it was sent, so OpenRaft must send the rest.
+fn answer_for_sent_prefix(
+    response: UrsulaAppendEntriesResponse,
+    sent_last: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+) -> UrsulaAppendEntriesResponse {
+    match (response, sent_last) {
+        (UrsulaAppendEntriesResponse::Success, Some(sent_last)) => {
+            UrsulaAppendEntriesResponse::PartialSuccess(Some(sent_last))
+        }
+        (response, _) => response,
+    }
+}
+
 impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
     async fn append_entries(
         &mut self,
-        rpc: UrsulaAppendEntriesRequest,
+        mut rpc: UrsulaAppendEntriesRequest,
         option: RPCOption,
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
+        let cut_after = cut_append_to_payload_budget(&mut rpc, RAFT_GRPC_APPEND_MAX_PAYLOAD_BYTES);
+        if cut_after.is_some() {
+            GRPC_APPEND_PARTIAL_SENDS.fetch_add(1, Ordering::Relaxed);
+        }
         let envelope = self.append_envelope(&rpc);
         record_append_logical_sample(append_logical_sample(&rpc, envelope.encoded_len()));
         let ack = self.append_rpc(envelope, option).await?;
@@ -1788,7 +1850,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 self.target, self.endpoint
             )));
         }
-        Ok(response)
+        Ok(answer_for_sent_prefix(response, cut_after))
     }
 
     async fn vote(
@@ -2014,6 +2076,16 @@ mod reconnect_tests {
         AppendStreamCall,
         oneshot::Receiver<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
     ) {
+        queued_call_of(raft_group_id, 0)
+    }
+
+    fn queued_call_of(
+        raft_group_id: u32,
+        payload_bytes: usize,
+    ) -> (
+        AppendStreamCall,
+        oneshot::Receiver<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
+    ) {
         let (response, receiver) = oneshot::channel();
         let permit = Arc::new(Semaphore::new(1))
             .try_acquire_owned()
@@ -2023,7 +2095,7 @@ mod reconnect_tests {
                 raft_group_id,
                 node_id: 2,
                 protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-                payload: Vec::new().into(),
+                payload: vec![7_u8; payload_bytes].into(),
             },
             response,
             queued: QueuedAppendBytes::new(permit, 0, &TEST_QUEUED_BYTES, &TEST_QUEUED_BYTES_MAX),
@@ -2063,6 +2135,100 @@ mod reconnect_tests {
         assert!(receiver_open);
         assert_eq!(batch.len(), 1, "timed-out calls must not be sent");
         assert_eq!(batch[0].envelope.raft_group_id, 2);
+    }
+
+    /// #507: tonic keeps a stream's buffers at the largest frame it carried, so a frame stops
+    /// taking calls at its byte budget; the calls behind it wait for the next frame.
+    #[test]
+    fn append_stream_frame_stops_at_its_byte_budget() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let third = RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES / 3;
+        let (first, _first) = queued_call_of(1, third);
+        let mut waiters = Vec::new();
+        for raft_group_id in 2..=5 {
+            let (call, waiter) = queued_call_of(raft_group_id, third);
+            sender.send(call).expect("queue call");
+            waiters.push(waiter);
+        }
+
+        let (frame, receiver_open) = collect_append_stream_frame(first, &mut receiver);
+        assert!(receiver_open);
+        // Three calls carry a little more than the budget with their framing; two carry less.
+        let ids = frame
+            .iter()
+            .map(|call| call.envelope.raft_group_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [1, 2, 3]);
+        let next = receiver.try_recv().expect("the rest stay queued");
+        assert_eq!(next.envelope.raft_group_id, 4);
+    }
+
+    type TestLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+
+    fn append_request(payloads: &[usize]) -> UrsulaAppendEntriesRequest {
+        let entries = payloads
+            .iter()
+            .zip(1..)
+            .map(|(&payload, index)| {
+                Entry::new(
+                    LogId {
+                        leader_id: TestLeaderId::new(1, 1),
+                        index,
+                    },
+                    EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+                        stream_id: BucketStreamId::new("grpc", "budget"),
+                        content_type: None,
+                        payload: vec![7_u8; payload].into(),
+                        close_after: false,
+                        stream_seq: None,
+                        producer: None,
+                        now_ms: 0,
+                    })),
+                )
+            })
+            .collect();
+        UrsulaAppendEntriesRequest {
+            vote: openraft::Vote::new_committed(1, 1),
+            prev_log_id: None,
+            entries,
+            leader_commit: None,
+        }
+    }
+
+    /// #507: OpenRaft batches entries by count only. An Append call carries at most the payload
+    /// budget, but always one entry, and the peer's `Success` covers only that prefix.
+    #[test]
+    fn append_call_is_cut_to_its_payload_budget() {
+        let kib = 1024;
+        let budget = 1024 * kib as u64;
+        let mut fits = append_request(&[100 * kib; 4]);
+        assert_eq!(cut_append_to_payload_budget(&mut fits, budget), None);
+        assert_eq!(fits.entries.len(), 4);
+        let mut heartbeat = append_request(&[]);
+        assert_eq!(cut_append_to_payload_budget(&mut heartbeat, budget), None);
+
+        let mut over = append_request(&[400 * kib; 4]);
+        let cut = cut_append_to_payload_budget(&mut over, budget);
+        assert_eq!(over.entries.len(), 2);
+        assert_eq!(cut.map(|log_id| log_id.index), Some(2));
+
+        let mut oversized_entry = append_request(&[3 * 1024 * kib, 10]);
+        let cut = cut_append_to_payload_budget(&mut oversized_entry, budget);
+        assert_eq!(oversized_entry.entries.len(), 1, "an entry is never split");
+        assert_eq!(cut.map(|log_id| log_id.index), Some(1));
+
+        assert!(matches!(
+            answer_for_sent_prefix(UrsulaAppendEntriesResponse::Success, cut),
+            UrsulaAppendEntriesResponse::PartialSuccess(Some(log_id)) if log_id.index == 1
+        ));
+        assert!(matches!(
+            answer_for_sent_prefix(UrsulaAppendEntriesResponse::Success, None),
+            UrsulaAppendEntriesResponse::Success
+        ));
+        assert!(matches!(
+            answer_for_sent_prefix(UrsulaAppendEntriesResponse::Conflict, cut),
+            UrsulaAppendEntriesResponse::Conflict
+        ));
     }
 
     /// The EKS OOM: a peer that does not keep up must not let the leader queue an unbounded
