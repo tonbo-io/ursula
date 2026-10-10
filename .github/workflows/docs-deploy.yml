@@ -1,10 +1,12 @@
 name: Deploy docs
 
-# Frozen until the 0.7.1 release: main pins 0.7.1 in its install commands before the images and
-# charts exist, so pushes to main do not deploy. Dispatch by hand with the ref to publish (v0.7.1
-# once it is released). A follow-up after the release restores the push trigger.
-
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - docs/web/**
+      - .github/workflows/docs-deploy.yml
   workflow_dispatch:
     inputs:
       ref:
