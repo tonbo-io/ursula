@@ -5,18 +5,18 @@ Run with `python3 -m scripts.dst <subcommand> [args]`.
 Subcommand list (verb-first, flat namespace):
 
   Audits (each returns non-zero on violation; `all` runs every audit):
-    nondeterminism      DoD #1 — no silent fallback in sim-reachable code
-    pipeline-smoke      DoD #2 — corrupt_*_expectation only in pipeline-smoke families
-    layer2              DoD #4 — Layer 2 has failpoints or is doc-retired
-    ci-shape            DoD #6 — no multi-element strict-equality jq step matches
-    modularity          DoD #3 — ratcheting line budget on madsim_harness/mod.rs
-    seed-inventory      DoD #7 + family discipline + per-track seed budget
+    nondeterminism      no silent fallback in sim-reachable code
+    pipeline-smoke      corrupt_*_expectation only in pipeline-smoke families
+    layer2              no fail_point! macros in crates/
+    ci-shape            no multi-element strict-equality jq step matches
+    modularity          ratcheting line budget on madsim_harness/mod.rs
+    seed-inventory      family discipline and per-track seed budget
     failure-guards      every failure-smoke entry has fresh PR CI coverage
     sim-patches         vendored madsim patches match the crate graph
     all                 run every audit
 
   Reports (write target/ artifacts; CI uploads them):
-    coverage-report     DoD #8 — distinct stable trace event cardinality
+    coverage-report     distinct stable trace event cardinality
     seed-report         PR/nightly seed inventory snapshot
     result-summary      walk failure artifacts under target/
 

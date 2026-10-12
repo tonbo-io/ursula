@@ -50,7 +50,7 @@ pub struct W1Args {
     )]
     pub checkpoints: Vec<u64>,
     /// Drain every hot byte before each measurement, so residual growth
-    /// compares like with like (§7.2).
+    /// compares like with like.
     #[arg(long)]
     pub forced_flush: bool,
     /// Also report zstd-3 snapshot sizes.
@@ -196,7 +196,7 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         last = Some((measured, retained));
     }
 
-    // Residual growth between N and 4N (§7.2), when both were measured.
+    // Residual growth between N and 4N, when both were measured.
     if let Some(&(n_last, r_last)) = residuals.last()
         && let Some(&(_, r_quarter)) = residuals
             .iter()

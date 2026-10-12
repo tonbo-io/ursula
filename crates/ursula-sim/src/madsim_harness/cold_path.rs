@@ -1,5 +1,4 @@
-//! Cold-path scenarios extracted from `madsim_harness/mod.rs`
-//! (DoD #3 modularity refactor — workloads axis, cold-store-faceted scenarios).
+//! Cold-path scenarios: workloads that exercise the cold store.
 
 use ursula_runtime::AppendResponse;
 use ursula_runtime::ColdFlushCandidate;

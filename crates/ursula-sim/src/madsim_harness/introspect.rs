@@ -1,5 +1,4 @@
-//! Pure fault-plan / SimEvent introspection helpers extracted from
-//! `madsim_harness/mod.rs` (DoD #3 modularity refactor). These are tiny
+//! Pure fault-plan / SimEvent introspection helpers. These are tiny
 //! `has_*_in_fault_plan` / `*_from_fault_plan` predicates that the dispatch
 //! layer + minimize tool use to decide which scenario / invariant matches.
 

@@ -1,5 +1,4 @@
-//! `SimSchedule::generate_*` factory methods extracted from
-//! `madsim_harness/mod.rs` (DoD #3 modularity refactor — scenarios axis).
+//! `SimSchedule::generate_*` factory methods.
 //! Each method maps a u64 seed to a SimSchedule for a specific scenario.
 
 use super::BucketStreamId;

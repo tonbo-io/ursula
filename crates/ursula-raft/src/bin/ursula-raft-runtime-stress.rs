@@ -1,5 +1,5 @@
 // Stresses the production ThreadPerCore runtime; cfg(not(madsim))-only by
-// design (DoD #1). Under cfg(madsim) the bin is a no-op.
+// design. Under cfg(madsim) the bin is a no-op.
 
 #[cfg(madsim)]
 fn main() {}

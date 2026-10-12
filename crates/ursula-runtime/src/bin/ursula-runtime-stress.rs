@@ -1,5 +1,5 @@
 // The stress binary exercises the production ThreadPerCore runtime; that
-// variant is cfg(not(madsim))-only by design (DoD #1). Under cfg(madsim) the
+// variant is cfg(not(madsim))-only by design. Under cfg(madsim) the
 // bin is a no-op so workspace builds stay green.
 
 #[cfg(madsim)]

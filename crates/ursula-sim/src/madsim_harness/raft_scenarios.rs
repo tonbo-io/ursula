@@ -1,6 +1,5 @@
 //! Raft-level scenarios (no-fault baseline, partition/heal, snapshot,
-//! restart-follower, leader-failover) extracted from `madsim_harness/mod.rs`
-//! (DoD #3 modularity refactor — workloads axis).
+//! restart-follower, leader-failover).
 
 #[cfg(test)]
 use openraft::storage::RaftLogStorage;

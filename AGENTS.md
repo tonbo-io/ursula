@@ -49,12 +49,12 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 | `ursula-bench`         | HTTP/client benchmark harnesses for performance testing.                                                                                      |
 | `ursula-ctl`           | Operational CLI (`ursulactl`) for logical cluster management over the admin HTTP API: drain leaderships, wait for catch-up, readiness gates.                                 |
 | `ursula-sim`           | Deterministic simulation harnesses using madsim for fault injection and invariant checking.                                                   |
-| `ursula-state-probe`   | Bounded-state measurement harness (W1-W6, L2 engine probes, counting allocator) and the CI state-growth ratchet (`docs/architecture/bounded-stream-state.md` §7). |
+| `ursula-state-probe`   | Bounded-state measurement harness (W1-W6, L2 engine probes, counting allocator) and the CI state-growth ratchet (`docs/architecture/bounded-stream-state.md`, Verification). |
 
 ### Other Top-Level Directories
 
 - `docs/web/`: Documentation site content (Vite + React + MDX). Deployed to Cloudflare Pages.
-- `docs/architecture/`: Architecture design documents (DST, thread-per-core multi-Raft, runtime evaluation).
+- `docs/architecture/`: Architecture documents describing the design as implemented. `docs/architecture/README.md` indexes them.
 - `charts/ursula/`: Helm chart for Kubernetes deployment.
 - `scripts/`: Repository helper scripts including chaos testing (`ursula_chaos_agent.py`) and DST audit tools (`scripts/dst/`).
 - `target/`: Cargo build output.

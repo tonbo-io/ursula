@@ -1,5 +1,4 @@
-//! `ThreeNodeRaftSim::*` dispatch glue extracted from `madsim_harness/mod.rs`
-//! (DoD #3 modularity refactor). The dispatch layer routes a SimSchedule to
+//! `ThreeNodeRaftSim::*` dispatch glue. The dispatch layer routes a SimSchedule to
 //! the right `run_*_inner` scenario function and wraps the outcome into a
 //! `SimReport`.
 

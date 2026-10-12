@@ -10,8 +10,8 @@
 //! Each `--shape NAME` corresponds to a Rust function that uses `matches!`
 //! on `SimFaultAction` variants. Renaming a variant in
 //! `crates/ursula-sim/src/madsim_harness` therefore breaks the shape fn at
-//! compile time under `RUSTFLAGS="--cfg madsim" cargo build`, satisfying
-//! DoD #6 ("renaming step is a compile error, not a CI failure").
+//! compile time under `RUSTFLAGS="--cfg madsim" cargo build`: renaming a
+//! step is a compile error, not a CI failure.
 
 use std::error::Error;
 
@@ -153,7 +153,7 @@ mod madsim_shapes {
 
     /// Single source of truth for variant-name → matches!-predicate. The match
     /// arm covers every SimFaultAction variant; renaming/removing a variant
-    /// breaks compilation here, which is the DoD #6 guarantee.
+    /// breaks compilation here, not a CI run.
     fn parse_variant_predicate(name: &str) -> Result<Box<StepPredicate>, Box<dyn Error>> {
         // NOTE: keep this arm aligned with crates/ursula-sim/src/madsim_harness
         // `pub enum SimFaultAction`. Adding a variant there without adding it

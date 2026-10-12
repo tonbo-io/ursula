@@ -1,4 +1,4 @@
-//! Trace types extracted from madsim_harness/mod.rs (DoD #3 modularity refactor).
+//! Trace types.
 //! `SimTrace` and `SimEvent` are the stable observation surface used by every
 //! scenario, invariant helper, and replay/minimize tool.
 

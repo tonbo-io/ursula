@@ -23,11 +23,11 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 
 /// Staged external refs per stream above which the offload pass moves them
-/// into pages at once (T_ext in §5.6).
+/// into pages at once (T_ext in F5).
 pub const MAX_STAGED_EXTERNAL_REFS: usize = 16;
 
 /// Age after which a staged external ref is offloaded even below
-/// [`MAX_STAGED_EXTERNAL_REFS`] (§5.6: 10 s).
+/// [`MAX_STAGED_EXTERNAL_REFS`] (F5: 10 s).
 pub const STAGED_EXTERNAL_REF_MAX_AGE_MS: u64 = 10_000;
 
 /// A stream whose state-held external refs the offload pass should move into

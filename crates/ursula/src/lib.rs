@@ -1679,7 +1679,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
 const GROUP_STATE_GAUGES_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
-/// §7.5) for `/__ursula/metrics`: one object per Raft group with the group id,
+/// Gauges) for `/__ursula/metrics`: one object per Raft group with the group id,
 /// whether this node hosts it, and either the gauges or an error.
 async fn group_state_gauges_json(state: &HttpState) -> render::GroupGaugeCollection {
     use crate::render::GroupGaugeCollection;

@@ -1,7 +1,7 @@
-//! Leader-side `TidyStream` driver (bounded-stream-state).
+//! Leader-side `TidyStream` driver (bounded-stream-state F0).
 //!
-//! Idle streams keep their debt (dense record offsets below the seal point,
-//! receipts beyond the window, idle producers, producers over the cap) until
+//! Idle streams keep their debt (receipts beyond the window, idle producers,
+//! producers over the cap) until
 //! something normalizes them. Every [`TIDY_INTERVAL`], each group this node
 //! leads proposes `TidyStream` for at most [`TIDY_MAX_STREAMS_PER_GROUP`]
 //! streams with debt, and repeats on later passes until none remains. Each

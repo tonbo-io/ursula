@@ -1,9 +1,9 @@
-//! The §7.2 per-structure formula checks (`docs/architecture/bounded-stream-state.md`),
+//! The per-structure formula checks (`docs/architecture/bounded-stream-state.md`),
 //! evaluated per stream with the stream's own U, K and P at a checkpoint.
 //!
-//! Each check records whether today's code meets the design's target. Most do
-//! not yet; the gate's ratchet file records which, so a regression (a met
-//! target lost) fails and an improvement is reported for tightening.
+//! Each check records whether the code meets the design's target. The gate's
+//! ratchet file records which targets are met, so a regression (a met target
+//! lost) fails and an improvement is reported for tightening.
 
 use crate::out::Measured;
 use crate::out::Outcome;

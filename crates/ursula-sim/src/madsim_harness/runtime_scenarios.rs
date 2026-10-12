@@ -1,5 +1,4 @@
-//! Runtime-actor + runtime/Raft scenarios extracted from `madsim_harness/mod.rs`
-//! (DoD #3 modularity refactor — workloads axis).
+//! Runtime-actor and runtime/Raft scenarios.
 
 use super::AppendRequest;
 use super::Arc;

@@ -1,4 +1,4 @@
-//! Snapshot cadence (bounded-stream-state F12e, §7.3 from B6): drives
+//! Snapshot cadence (bounded-stream-state F12e): drives
 //! `--groups` real `StreamStateMachine`s with uniform round-robin JSON
 //! appends and the flush passes the cold worker would run, counts the Raft
 //! log bytes every applied command adds (`StreamCommand::log_bytes_estimate`,
@@ -28,7 +28,7 @@ use crate::out::round3;
 use crate::payload;
 use crate::smx;
 
-/// The F12e target: snapshot bytes per appended log byte (§8 B6 exit).
+/// The F12e target: snapshot bytes per appended log byte.
 pub const MAX_SNAPSHOT_BYTES_PER_LOG_BYTE: f64 = 0.6;
 
 #[derive(Debug, Clone, Args)]

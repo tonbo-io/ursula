@@ -1,7 +1,7 @@
-// Back-to-back large transactions (docs/architecture/sqlite-vfs.md §9): a 5 MB table, 2,000-row
-// updates (frames of about 1 MB), no pause. Reports commit latency, snapshots taken, and the
-// retained log (tail minus retention, from the stream's HEAD every 10 s; this tool reads the
-// server's offsets as numbers, which the VFS itself never does).
+// Back-to-back large transactions (stream sizing in docs/architecture/sqlite-vfs.md §9): a 5 MB
+// table, 2,000-row updates (frames of about 1 MB), no pause. Reports commit latency, snapshots
+// taken, and the retained log (tail minus retention, from the stream's HEAD every 10 s; this tool
+// reads the server's offsets as numbers, which the VFS itself never does).
 //
 //   node bench/bigtx.ts <base url> <label> <duration s> <out dir>
 import { mkdirSync, writeFileSync } from "node:fs";

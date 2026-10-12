@@ -12,7 +12,7 @@
 //! - [`snapshot`]: snapshot wire format and restoration errors.
 //! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group,
 //!   plus [`GroupStateGauges`], the per-group bounded-state gauges
-//!   (`docs/architecture/bounded-stream-state.md` §7.5), and the leader-side
+//!   (`docs/architecture/bounded-stream-state.md`, Gauges), and the leader-side
 //!   cold-reference queries: shared-ref compaction discovery
 //!   ([`SharedRefCandidate`], F2), orphan-sweep references (F14h) and
 //!   staged external-ref offload discovery ([`StagedExternalRefCandidate`],

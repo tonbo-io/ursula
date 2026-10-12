@@ -809,7 +809,7 @@ impl InMemoryGroupEngine {
         self.state_machine.bucket_usage_report()
     }
 
-    /// Bounded-state gauges of the applied state (§7.5 of
+    /// Bounded-state gauges of the applied state (Gauges in
     /// `bounded-stream-state.md`). Public so the Raft engine can serve them.
     pub fn state_gauges(&self) -> ursula_stream::GroupStateGauges {
         self.state_machine.state_gauges()

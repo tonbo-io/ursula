@@ -1,12 +1,12 @@
 //! Value types and pure helpers for the leader-side cold-reference drivers
 //! (`docs/architecture/bounded-stream-state.md`):
 //!
-//! - the shared pack-reference compaction driver (F2, §5.3), whose discovery
+//! - the shared pack-reference compaction driver (F2), whose discovery
 //!   is the state query [`ursula_stream::StreamStateMachine::shared_ref_candidates`];
-//! - the orphan sweep (F14h, §5.15), which deletes cold objects that
+//! - the orphan sweep (F14h), which deletes cold objects that
 //!   ambiguous publishes left behind once they are older than a grace period
 //!   and nothing references them;
-//! - the external-locator offload (F5, §5.6), which writes
+//! - the external-locator offload (F5), which writes
 //!   cold-index page entries for committed state-held external refs and then
 //!   removes them from state with `OffloadColdRefs`.
 //!

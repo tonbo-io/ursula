@@ -1,5 +1,4 @@
-//! The shared pack-reference compaction driver (bounded-stream-state F2,
-//! §5.3, step 2).
+//! The shared pack-reference compaction driver (bounded-stream-state F2).
 //!
 //! Every packed flush adds one shared ref per participating stream, and only
 //! retention or delete used to remove them. The driver runs on each group's

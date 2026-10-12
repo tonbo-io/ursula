@@ -3,10 +3,10 @@
 //!
 //! Epoch 1 is the format of Ursula 0.5.x and earlier, and of main builds
 //! before format epoch 2 landed. Epoch 2 is the format of Ursula 0.6. Epoch 3
-//! checksums each Raft WAL frame's length together with a per-file generation
-//! sequence (`docs/architecture/single-raft-wal.md`). A binary reads exactly
-//! one epoch: it refuses data, backups and peers from any other epoch loudly,
-//! before it writes anything, and it does not convert them.
+//! checksums each Raft WAL frame's length together with the sequence number of
+//! the journal segment that holds it (`docs/architecture/raft-wal.md`). A
+//! binary reads exactly one epoch: it refuses data, backups and peers from any
+//! other epoch loudly, before it writes anything, and it does not convert them.
 //!
 //! Every version number that an earlier binary checks is set equal to
 //! [`FORMAT_EPOCH`]: the Raft WAL journal header and state files, the Raft

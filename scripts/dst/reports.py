@@ -26,7 +26,7 @@ from scripts.dst.common import (
 
 
 # =============================================================================
-# coverage — DoD #8
+# coverage
 # =============================================================================
 
 def _event_names(events: Iterable[object]) -> Iterable[str]:
@@ -123,7 +123,7 @@ def _render_coverage_md(summary: dict[str, object]) -> str:
 
 
 def report_coverage(argv: list[str]) -> int:
-    """DoD #8: distinct trace-event cardinality across a seed sweep."""
+    """Distinct trace-event cardinality across a seed sweep."""
     parser = argparse.ArgumentParser(prog="dst coverage-report")
     parser.add_argument("--scan", action="append", default=[],
                         help="directory to scan (repeatable); default = target/ursula-sim-failures")

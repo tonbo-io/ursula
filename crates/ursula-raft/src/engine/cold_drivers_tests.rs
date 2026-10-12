@@ -1,5 +1,5 @@
 //! Raft-engine tests for the leader-side cold-reference drivers
-//! (bounded-stream-state B2): the shared pack-reference compaction driver
+//! (bounded-stream-state): the shared pack-reference compaction driver
 //! (F2) and the cold orphan sweep (F14h): one wiring test per driver. The
 //! drivers' contracts are pinned against the in-memory engine in
 //! `ursula-runtime`'s `cold_drivers_tests`.

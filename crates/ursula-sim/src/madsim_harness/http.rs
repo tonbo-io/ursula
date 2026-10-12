@@ -1,5 +1,4 @@
-//! HTTP protocol-surface scenarios extracted from `madsim_harness/mod.rs`
-//! (DoD #3 modularity refactor — workloads axis, HTTP/axum in-process scenarios).
+//! HTTP protocol-surface scenarios, run against axum in process.
 
 use axum::Router;
 use axum::body::Bytes;

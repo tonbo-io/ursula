@@ -4,9 +4,9 @@
 //! its own start offset, so the buffer carries no per-append header. A block
 //! ends where the next append is not contiguous (an external append above hot
 //! bytes leaves a gap, F18) or where it is full. The buffer keeps nothing per
-//! message; only streams with a record index have message boundaries, in
-//! their dense offsets (F4b). Reads binary-search blocks and a flush drops
-//! whole blocks and trims at most one. Snapshots emit one hot segment per block and restore
+//! message (F4b): JSON message boundaries are LF bytes in the payload.
+//! Reads binary-search blocks and a flush drops whole blocks and trims at
+//! most one. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
 //! the same history.
 

@@ -140,7 +140,7 @@ pub fn measure_sm(
     })
 }
 
-/// One §7.2 assertion evaluated against its target formula. `met` is whether
+/// One ratchet assertion evaluated against its target formula. `met` is whether
 /// today's code already meets the target; the gate compares it with the
 /// ratchet's expectation.
 #[derive(Debug, Clone, Serialize)]

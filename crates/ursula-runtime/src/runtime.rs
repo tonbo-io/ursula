@@ -899,7 +899,7 @@ impl ShardRuntime {
     }
 
     /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`
-    /// §7.5) of every Raft group as held by this node's applied replica state.
+    /// Gauges) of every Raft group as held by this node's applied replica state.
     /// Groups are asked concurrently; per-group results, so a group this
     /// node does not host reports its own error instead of hiding the others.
     pub async fn state_gauges_all_groups(

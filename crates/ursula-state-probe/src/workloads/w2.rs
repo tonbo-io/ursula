@@ -153,7 +153,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
     smx::create_bucket(&mut m, "bkt1")?;
-    // Distinct names: deterministic planner order (§7.1).
+    // Distinct names: deterministic planner order.
     let ids: Vec<BucketStreamId> = (0..args.streams)
         .map(|i| smx::sid("bkt1", &format!("h{i:05}"), &format!("log{i:05}")))
         .collect();

@@ -3,8 +3,8 @@
 //! The run-state file at the WAL root records the run that last opened the
 //! journals: the host's boot id at the time, the run's fsync policy, and how
 //! the run ended ([`RunStatus`]). A run reads it first, decides how to read
-//! the journals ([`WalOpening::decide`], the design's "Opening the journal"
-//! table), and durably records itself as [`RunStatus::Running`] before any
+//! the journals ([`WalOpening::decide`], the "Startup and replay"
+//! table in docs/architecture/raft-wal.md), and durably records itself as [`RunStatus::Running`] before any
 //! journal write. A graceful shutdown records [`RunStatus::Clean`] after every
 //! journal is `fsync`ed; an I/O failure that poisons a journal writer records
 //! [`RunStatus::Poisoned`] before the process stops.
@@ -272,7 +272,7 @@ impl PreviousRun {
 }
 
 impl WalOpening {
-    /// The "Opening the journal" decision for a run on `boot_id` with the
+    /// The "Startup and replay" decision for a run on `boot_id` with the
     /// policy `fsync`, after the run that left `previous` and the core
     /// `journals`.
     pub fn decide(
@@ -685,7 +685,7 @@ mod tests {
     const STRICT: JournalReplayMode = JournalReplayMode::Strict;
     const PREFIX: JournalReplayMode = JournalReplayMode::VerifiedPrefix;
 
-    /// Every row of the "Opening the journal" table, for both policies and
+    /// Every row of the "Startup and replay" table, for both policies and
     /// with the boot id known or not.
     #[test]
     fn opening_the_journal_follows_the_decision_table() {

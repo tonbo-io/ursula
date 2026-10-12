@@ -155,9 +155,9 @@ pub enum StreamCommand {
         snapshot: Box<StreamSnapshot>,
     },
     /// Bounded normalization of one stream's replicated state (bounded-state
-    /// `TidyStream`): seals record offsets below the seal point (F1),
-    /// expires idle producers and trims the receipt window (F3). Each command
-    /// does bounded work; a leader-side driver repeats it while debt remains.
+    /// F0): expires idle producers, evicts producers over the cap and trims
+    /// the receipt window (F3). Each command does bounded work; a
+    /// leader-side driver repeats it while debt remains.
     /// Idempotent.
     TidyStream {
         stream_id: BucketStreamId,

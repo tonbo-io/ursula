@@ -1,4 +1,4 @@
-//! Suites and the ratchet gate (§7.2, §7.3).
+//! Suites and the ratchet gate (bounded-stream-state CI ratchet).
 //!
 //! The `pr` suite runs reduced-scale W1 and W3 to W6, the reduced starvation
 //! reproduction, the planner probe, the L2 engine probes and the Raft WAL
@@ -9,7 +9,7 @@
 //! - every metric must stay at or below its recorded baseline plus the
 //!   tolerance (10%); one that drops below the baseline minus the tolerance is
 //!   reported so the ratchet can be tightened;
-//! - every formula check records whether its §7.2 target is met today; losing
+//! - every formula check records whether its target is met today; losing
 //!   a met target fails, and newly meeting one is reported for tightening;
 //! - metrics and checks missing from either side fail, so coverage cannot
 //!   silently shrink.
@@ -37,7 +37,7 @@ use crate::workloads::w4::W4Args;
 use crate::workloads::w5::W5Args;
 use crate::workloads::wal::WalArgs;
 
-/// Default ratchet tolerance (§7.2: today's value plus 10%).
+/// Default ratchet tolerance (the recorded value plus 10%).
 pub const DEFAULT_TOLERANCE: f64 = 0.10;
 
 fn parse<A: Args + FromArgMatches>(argv: &str) -> Result<A> {
@@ -161,7 +161,7 @@ pub fn pr_suite() -> Result<Vec<Job>> {
     ])
 }
 
-/// Full-scale nightly suite: the audit's measurement set (§7.3).
+/// Full-scale nightly suite: the audit's measurement set.
 pub fn nightly_suite() -> Result<Vec<Job>> {
     Ok(vec![
         job(

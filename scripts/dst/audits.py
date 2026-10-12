@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Iterable
 
 from scripts.dst.common import (
-    DST_DOC,
     FAILURE_CORPUS,
     HARNESS_ROOT,
     NIGHTLY_WORKFLOW,
@@ -31,13 +30,13 @@ from scripts.dst.common import (
 
 
 # =============================================================================
-# 1. nondeterminism — DoD #1
+# 1. nondeterminism
 # =============================================================================
 
 EXEMPT_PATH_PREFIXES = (
     "crates/ursula-bench/",
     "crates/ursula-sim/",
-    # Measurement harness (bounded-stream-state.md §7.1): times its own
+    # Measurement harness (bounded-stream-state.md, State-probe harness): times its own
     # workloads and spawns its own runtime; never built under cfg(madsim).
     "crates/ursula-state-probe/",
 )
@@ -216,7 +215,7 @@ def _render_nondet_markdown(findings: list[NondetFinding]) -> str:
 
 
 def audit_nondeterminism(argv: list[str]) -> int:
-    """DoD #1: sim-reachable code has no silent nondeterminism."""
+    """Sim-reachable code has no silent nondeterminism."""
     parser = argparse.ArgumentParser(prog="dst nondeterminism")
     parser.add_argument("--update-baseline", action="store_true",
                         help="overwrite the whitelist with current findings")
@@ -279,7 +278,7 @@ def audit_nondeterminism(argv: list[str]) -> int:
 
 
 # =============================================================================
-# 2. pipeline-smoke — DoD #2
+# 2. pipeline-smoke
 # =============================================================================
 
 PIPELINE_SMOKE_RANGES: dict[str, range] = {
@@ -310,7 +309,7 @@ def _family_for_seed(seed: int) -> str | None:
 
 
 def audit_pipeline_smoke(argv: list[str]) -> int:
-    """DoD #2: every `corrupt_*_expectation` field must live in a pipeline-smoke family."""
+    """Every `corrupt_*_expectation` field must live in a pipeline-smoke family."""
     argparse.ArgumentParser(prog="dst pipeline-smoke").parse_args(argv)
 
     violations: list[str] = []
@@ -357,52 +356,36 @@ def audit_pipeline_smoke(argv: list[str]) -> int:
 
 
 # =============================================================================
-# 3. layer2 — DoD #4
+# 3. layer2
 # =============================================================================
 
-MIN_FAILPOINTS = 8
-
-
 def audit_layer2(argv: list[str]) -> int:
-    """DoD #4: Layer 2 either has >= 8 failpoints OR is explicitly retired in the doc."""
+    """No `fail_point!` macros. Simulator faults replace directed failpoints."""
     argparse.ArgumentParser(prog="dst layer2").parse_args(argv)
 
     try:
         out = subprocess.check_output(
             ["grep", "-rn", "fail_point!", "crates/"], cwd=ROOT, text=True,
         )
-        failpoints = sum(1 for line in out.splitlines() if line.strip())
     except subprocess.CalledProcessError as exc:
-        if exc.returncode == 1:
-            failpoints = 0
-        else:
+        if exc.returncode != 1:
             raise
+        out = ""
+    hits = [line for line in out.splitlines() if line.strip()]
 
-    if failpoints >= MIN_FAILPOINTS:
-        print(f"OK: Layer 2 implemented — {failpoints} `fail_point!` macros found "
-              f"(>= {MIN_FAILPOINTS}).")
-        return 0
+    if hits:
+        print("ERROR: `fail_point!` macros found; inject the fault through the simulator instead:",
+              file=sys.stderr)
+        for line in hits:
+            print(f"  {line}", file=sys.stderr)
+        return 1
 
-    retired = (
-        DST_DOC.exists()
-        and re.search(r"^###\s+Layer\s+2.*\(retired", DST_DOC.read_text(), re.MULTILINE | re.IGNORECASE)
-    )
-    if retired:
-        print(f"OK: Layer 2 explicitly retired in {rel(DST_DOC)} (heading marked '(retired').")
-        if failpoints > 0:
-            print(f"WARN: {failpoints} `fail_point!` macros still exist despite the retirement note.")
-        return 0
-
-    print(
-        f"ERROR: Layer 2 is neither implemented ({failpoints} `fail_point!` found, "
-        f"need >= {MIN_FAILPOINTS}) nor explicitly retired in {rel(DST_DOC)}.",
-        file=sys.stderr,
-    )
-    return 1
+    print("OK: no `fail_point!` macros in crates/.")
+    return 0
 
 
 # =============================================================================
-# 4. ci-shape — DoD #6
+# 4. ci-shape
 # =============================================================================
 
 MULTI_ELEMENT_SHAPE_RE = re.compile(
@@ -413,7 +396,7 @@ MULTI_ELEMENT_SHAPE_RE = re.compile(
 
 
 def audit_ci_shape(argv: list[str]) -> int:
-    """DoD #6: CI workflows must not contain multi-element strict-equality
+    """CI workflows must not contain multi-element strict-equality
     jq assertions on SimFaultAction discriminants."""
     argparse.ArgumentParser(prog="dst ci-shape").parse_args(argv)
 
@@ -448,7 +431,7 @@ def audit_ci_shape(argv: list[str]) -> int:
 
 
 # =============================================================================
-# 5. modularity — DoD #3
+# 5. modularity
 # =============================================================================
 
 HARNESS_MOD = HARNESS_ROOT / "mod.rs"
@@ -467,17 +450,16 @@ HARNESS_MOD = HARNESS_ROOT / "mod.rs"
 #    2_500 — re-baseline (upward, one-time): nightly rustfmt imports_granularity="Item"
 #            split grouped `use` blocks one-per-line, inflating mod.rs 2367 -> 2445
 #            (+78 net lines, all imports, no logic). Aligned the ratchet with the
-#            DoD #3 target so a global formatting policy isn't mistaken for logic creep.
+#            target so a global formatting policy isn't mistaken for logic creep.
 LINE_BUDGET = 2_500
 TARGET_FINAL_BUDGET = 2_500
 
 
 def audit_modularity(argv: list[str]) -> int:
-    """DoD #3: ratcheting line budget on madsim_harness/mod.rs.
+    """Ratcheting line budget on madsim_harness/mod.rs.
 
-    The empty scenario/workload/invariant/fault trait scaffold was deleted in
-    the LOC-reduction pass (docs/architecture/loc-reduction-plan.md, stage 1);
-    the audit now only enforces the harness line-budget ratchet.
+    Scenario code lives in the sibling modules of madsim_harness/. This audit
+    keeps mod.rs from growing back into a monolith.
     """
     argparse.ArgumentParser(prog="dst modularity").parse_args(argv)
 
@@ -488,7 +470,7 @@ def audit_modularity(argv: list[str]) -> int:
         if actual_lines > LINE_BUDGET:
             errors.append(
                 f"{rel(HARNESS_MOD)} has {actual_lines} lines, exceeds LINE_BUDGET "
-                f"{LINE_BUDGET} (DoD #3 target {TARGET_FINAL_BUDGET}). Migrate code "
+                f"{LINE_BUDGET} (target {TARGET_FINAL_BUDGET}). Migrate code "
                 "into sub-mods or update LINE_BUDGET in audits.py downward."
             )
 
@@ -500,13 +482,13 @@ def audit_modularity(argv: list[str]) -> int:
 
     print(
         f"OK: madsim_harness/mod.rs at {actual_lines} lines "
-        f"(budget {LINE_BUDGET}, DoD #3 target {TARGET_FINAL_BUDGET})."
+        f"(budget {LINE_BUDGET}, target {TARGET_FINAL_BUDGET})."
     )
     return 0
 
 
 # =============================================================================
-# 6. seed-inventory — DoD #7 + family discipline
+# 6. seed-inventory: family discipline and seed budget
 # =============================================================================
 
 EXPECTED_PR_FAMILIES = {
@@ -541,9 +523,9 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199"}
 
-# DoD #7: PR ≤ 2 min, Nightly ≤ 30 min at ~70 seeds/min/core conservative
-# (bundled invocation amortises cargo startup). See `Seed Throughput Budget`
-# section in docs/architecture/deterministic-simulation-testing.md.
+# PR ≤ 2 min, Nightly ≤ 30 min at ~70 seeds/min/core conservative
+# (bundled invocation amortises cargo startup). See the `CI` section of
+# docs/architecture/deterministic-simulation-testing.md.
 PR_SEED_BUDGET = 200
 NIGHTLY_SEED_BUDGET = 1500
 
@@ -605,7 +587,7 @@ def _check_expected_families(
 
 
 def audit_seed_inventory(argv: list[str]) -> int:
-    """DoD #7 + family discipline: PR/nightly workflows have the expected
+    """Family discipline: PR/nightly workflows have the expected
     families/ranges, every named family resolves to a supported handler,
     and total seed count is within the per-track budget."""
     argparse.ArgumentParser(prog="dst seed-inventory").parse_args(argv)
@@ -631,12 +613,12 @@ def audit_seed_inventory(argv: list[str]) -> int:
     if pr_total > PR_SEED_BUDGET:
         errors.append(
             f"PR: total seed count {pr_total} exceeds budget {PR_SEED_BUDGET} "
-            "(DoD #7; re-run `dst throughput` if the runner got faster)"
+            "(re-run `dst throughput` if the runner got faster)"
         )
     if nightly_total > NIGHTLY_SEED_BUDGET:
         errors.append(
             f"nightly: total seed count {nightly_total} exceeds budget {NIGHTLY_SEED_BUDGET} "
-            "(DoD #7; re-run `dst throughput` if the runner got faster)"
+            "(re-run `dst throughput` if the runner got faster)"
         )
 
     if errors:
@@ -654,7 +636,7 @@ def audit_seed_inventory(argv: list[str]) -> int:
 
 
 # =============================================================================
-# 7. failure-guards — DoD: every failure corpus entry has fresh CI coverage
+# 7. failure-guards: every failure corpus entry has fresh CI coverage
 # =============================================================================
 
 def _expected_failure_corpus() -> list[tuple[int, str]]:

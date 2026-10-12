@@ -1,9 +1,9 @@
 //! Leader-side, read-only queries over a group's cold references.
 //!
-//! - Shared pack-reference compaction discovery (bounded-stream-state F2,
-//!   §5.3): which streams the leader's driver should compact next, and the
+//! - Shared pack-reference compaction discovery (bounded-stream-state F2):
+//!   which streams the leader's driver should compact next, and the
 //!   run of shared refs to compact for each.
-//! - Orphan-sweep references (F14h, §5.15): every object path the group's
+//! - Orphan-sweep references (F14h): every object path the group's
 //!   replicated state still references, so the sweep never deletes one.
 //!
 //! Nothing here mutates replicated state. The idle tracker is leader-local
@@ -19,11 +19,11 @@ use super::ColdChunkRef;
 use super::ColdGcTarget;
 use super::StreamStateMachine;
 
-/// Shared refs per stream at which the driver compacts it (T in §5.3).
+/// Shared refs per stream at which the driver compacts it (T in F2).
 pub const SHARED_REF_COMPACTION_THRESHOLD: usize = 64;
 
 /// How long a stream's tail must stay put before the driver compacts its
-/// shared refs even below the threshold (§5.3: one hour).
+/// shared refs even below the threshold (F2: one hour).
 pub const SHARED_REF_IDLE_MS: u64 = 60 * 60 * 1_000;
 
 /// One discovery pass of the shared-ref compaction driver.

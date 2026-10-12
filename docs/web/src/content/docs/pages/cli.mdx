@@ -248,11 +248,12 @@ Reservation stores have one schema, version 1, for Pod replacement, host recover
 produces a whole-ConfigMap CAS proposal without contacting Kubernetes.
 `reservation-acknowledge` takes the same inputs plus `--response response.json` and
 validates the exact successful update receipt. Conflicts stop without refreshing
-authority; missing stores do not initialize themselves.
+authority, and missing stores do not initialize themselves.
 
 The policy covers sticky, one-source planned Pod replacement, current-token fresh
 prefix admission and all-retired completion after the original Pod UID is gone.
-Its inputs are operational evidence, not authentication. Chart/Cloud consumers and
-physical host fencing still need integration and qualification; this offline
-interface alone grants no disruption authority. The full protocol is documented
-in `docs/architecture/maintenance-reservation.md`.
+Its inputs are operational evidence, not authentication. The chart's
+`maintenance-rollout.sh` Job drives planned Pod replacement through it. No
+component drives host recovery or calls a provider to terminate an instance, and
+this offline interface alone grants no disruption authority. The full protocol is
+documented in `docs/architecture/cluster-membership.md`.

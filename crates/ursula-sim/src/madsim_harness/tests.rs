@@ -1,5 +1,4 @@
-//! Extracted from madsim_harness.rs (DoD #3 modularity refactor).
-//! See crates/ursula-sim/src/madsim_harness/mod.rs for the rest.
+//! Simulator tests. The harness itself is in crates/ursula-sim/src/madsim_harness/mod.rs.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -1821,7 +1820,7 @@ fn smoke_corpus_replays() {
     }
 }
 
-/// Bounded-state Invariant 12 (§7.4): after the same log prefix every
+/// Bounded-state Invariant 12: after the same log prefix every
 /// replica holds the same producers, receipt windows and newest
 /// acknowledgements, whether it replayed the log or installed a snapshot.
 /// A learner installs a snapshot taken mid-stream (receipt window
@@ -2024,7 +2023,7 @@ fn seeds_from_env(var: &str, default: &[u64]) -> Vec<u64> {
         .unwrap_or_else(|| default.to_vec())
 }
 
-/// Seeds of the bounded-state F5 ambiguous-commit family (§7.4): each runs
+/// Seeds of the bounded-state F5 ambiguous-commit family (Invariant 11): each runs
 /// the variant `seed % 3` of [`external_locator_ambiguity`].
 const EXTERNAL_LOCATOR_AMBIGUITY_SEEDS: [u64; 9] = [3, 17, 41, 58, 77, 96, 112, 131, 150];
 
@@ -2338,7 +2337,7 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
     );
 }
 
-/// Bounded-state F5 ambiguous-commit seeds with Invariant 11 (§7.4, B5).
+/// Bounded-state F5 ambiguous-commit seeds with Invariant 11.
 #[test]
 fn external_locators_survive_ambiguous_commits() {
     let _guard = sim_test_guard();
@@ -2359,7 +2358,7 @@ fn external_locators_survive_ambiguous_commits() {
 /// group snapshot that holds staged external refs (not yet offloaded).
 const EXTERNAL_LOCATOR_SNAPSHOT_SEEDS: [u64; 2] = [5, 23];
 
-/// Bounded-state F5 follow-up (§7.4, Invariants 11 and 12): a learner that
+/// Bounded-state F5 follow-up (Invariants 11 and 12): a learner that
 /// installs a snapshot holding staged external refs reads the
 /// acknowledged bytes, holds the same refs as the voters, and converges with
 /// them after the offload commits.
@@ -2547,7 +2546,7 @@ async fn external_locator_snapshot_install(seed: u64) {
 /// whether the compaction commits.
 const AMBIGUOUS_COMPACTION_SEEDS: [u64; 2] = [8, 13];
 
-/// Bounded-state F5/F14 follow-up (§7.4, Invariant 11): a `CompactCold` whose
+/// Bounded-state F5/F14 follow-up (Invariant 11): a `CompactCold` whose
 /// outcome is ambiguous to its caller (the leader rewrote the page entries,
 /// then lost quorum) never changes readable bytes: every replica reads the
 /// acknowledged bytes, around an offloaded external ref, before and after a

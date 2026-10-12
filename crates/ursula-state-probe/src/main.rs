@@ -1,6 +1,6 @@
 //! `ursula-state-probe`: run one bounded-state workload, a whole suite, or the
 //! CI ratchet gate. See the crate docs and
-//! `docs/architecture/bounded-stream-state.md` §7.
+//! `docs/architecture/bounded-stream-state.md`, Verification.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

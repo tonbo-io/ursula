@@ -1,5 +1,4 @@
-//! Fault types extracted from `madsim_harness/mod.rs` (DoD #3 modularity
-//! refactor — faults axis). Re-exported from the parent module so callers
+//! Fault types. Re-exported from the parent module so callers
 //! that import via `crate::madsim_harness::*` or via lib.rs's
 //! `pub use madsim_harness::{SimFaultAction, ...}` continue to compile.
 

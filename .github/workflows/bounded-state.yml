@@ -1,9 +1,9 @@
 name: Bounded state
 
-# Bounded per-stream state measurement (docs/architecture/bounded-stream-state.md §7.2, §7.3).
+# Bounded per-stream state measurement (docs/architecture/bounded-stream-state.md, Verification).
 # - state-growth: per-push ratchet gate over reduced-scale workloads; deterministic
 #   counters, snapshot sizes and heap figures compared with
-#   crates/ursula-state-probe/ratchet.json, plus the §7.2 formula checks.
+#   crates/ursula-state-probe/ratchet.json, plus the formula checks.
 # - nightly: full-scale W1 to W6 and L2 runs, JSONL published as artifacts.
 # - write_ratchet (workflow_dispatch): runs the reduced-scale suite, rewrites ratchet.json from it
 #   instead of comparing, and uploads the new file as an artifact.

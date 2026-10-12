@@ -66,8 +66,8 @@ const READ_ATTEMPTS: usize = 4;
 /// Read weight of the entries one limited read returns, cached, on disk or
 /// pending alike. OpenRaft sends what a limited read returns as one Append
 /// call, and tonic keeps the buffers of the AppendStream that carries it at
-/// the largest frame the stream ever carried, for the life of the session
-/// (#507). Well above the 1 MiB at which a payload moves to the cold store,
+/// the largest frame the stream ever carried, for the life of the session.
+/// Well above the 1 MiB at which a payload moves to the cold store,
 /// so a follower catching up still gets several entries per round trip.
 pub(super) const LIMITED_READ_BYTES: u64 = 4 * 1024 * 1024;
 

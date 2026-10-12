@@ -59,7 +59,7 @@ pub fn decode(bytes: &[u8]) -> Result<GroupSnapshot> {
     ursula_raft::decode_group_snapshot(bytes).context("decode group snapshot")
 }
 
-/// Per-stream figures used by the §7.2 formula checks.
+/// Per-stream figures used by the formula checks.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct StreamFrameStats {
     pub name: String,

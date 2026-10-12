@@ -1,5 +1,5 @@
 //! Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
-//! §7.5): counts of every replicated structure that can grow with stream
+//! Gauges): counts of every replicated structure that can grow with stream
 //! history, plus the node-local TTL heap. Computed on demand by walking the
 //! group's streams (O(streams + producers)), so metric scrapes pay for it and
 //! apply does not.
@@ -16,7 +16,7 @@ use super::stream_expiry_at_ms;
 ///
 /// Counts are exact. Byte figures are length-based estimates (element counts
 /// times in-memory element sizes, without allocator slack), which is what the
-/// §7.2 formula checks compare against.
+/// CI ratchet formula checks compare against.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupStateGauges {
     /// Live streams in the group.
@@ -81,7 +81,7 @@ fn producer_state_bytes(producer_id: &str, state: &ProducerState) -> u64 {
 }
 
 impl StreamStateMachine {
-    /// Bounded-state gauges for this group (§7.5). Walks every stream once.
+    /// Bounded-state gauges for this group. Walks every stream once.
     pub fn state_gauges(&self) -> GroupStateGauges {
         let mut gauges = GroupStateGauges {
             live_packs: as_u64(self.shared_cold_object_refs.len()),

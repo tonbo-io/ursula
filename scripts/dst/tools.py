@@ -29,7 +29,7 @@ def _run_one_seed(family: str, seed: int, failure_dir: Path) -> None:
 def tool_throughput(argv: list[str]) -> int:
     """Measure seeds/min/core so the PR/nightly budget is data-driven.
 
-    DoD #7. Wall-clocks `ursula-sim smoke --seed N` for `--measure` seeds
+    Wall-clocks `ursula-sim smoke --seed N` for `--measure` seeds
     (after `--warmup` warmup seeds), divides total elapsed by seed count, and
     suggests PR (2 min) and nightly (30 min) seed budgets.
     """
@@ -72,9 +72,9 @@ def tool_throughput(argv: list[str]) -> int:
         "pr_seed_count_suggested": int(seeds_per_minute * pr_budget_min),
         "nightly_seed_count_suggested": int(seeds_per_minute * nightly_budget_min),
         "note": (
-            "Lock these numbers into the `Seed Throughput Budget` section of "
-            "docs/architecture/deterministic-simulation-testing.md and have "
-            "`dst seed-inventory` enforce the per-track seed budget."
+            "Update PR_SEED_BUDGET / NIGHTLY_SEED_BUDGET in scripts/dst/audits.py "
+            "(see the `CI` section of docs/architecture/deterministic-simulation-testing.md); "
+            "`dst seed-inventory` enforces the per-track seed budget."
         ),
     }
 

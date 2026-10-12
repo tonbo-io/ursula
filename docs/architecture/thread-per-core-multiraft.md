@@ -1,254 +1,123 @@
 # Thread-Per-Core Multi-Raft Architecture
 
-## Objective
+This document describes how one Ursula node divides streams among cores and Raft groups, how a request reaches the group that owns its stream, and how groups replicate and persist their logs. The public [architecture overview](../web/src/content/docs/pages/architecture/overview.mdx) covers the cluster topology, the write and read paths and the storage layout. This document covers the internals that page leaves out.
 
-Migrate Ursula from a single process-wide Raft runtime toward a sharded durable stream runtime where each core owns a set of stream partitions and Raft groups.
+## Workload fit and non-goals
 
-The goal is to make stream ownership explicit before moving protocol handlers, storage, and background workers. This avoids a direct port that preserves global locks and Tokio-oriented sharing patterns.
+The Durable Streams protocol requires strict ordering only within a stream. Independent streams can therefore live in independent Raft groups with no cross-stream transaction. The design optimizes for:
 
-## Workload Fit
+- many independent streams
+- small, append-heavy writes
+- low-latency tailing over long-poll and SSE
+- per-stream replay from retained offsets
 
-Durable streams are a strong fit for sharding because the protocol requires strict ordering only within a stream. Independent streams can be placed in independent Raft groups without cross-stream transactions.
+One stream maps to exactly one Raft group, so its append order is total and deterministic. A single hot stream is a serial bottleneck by design.
 
-This architecture optimizes for:
+Non-goals:
 
-- Many independent streams.
-- Small append-heavy writes.
-- Low-latency tailing via long-poll and SSE.
-- Per-stream replay from retained offsets.
-- Snapshot and bootstrap semantics at stream or shard boundaries.
-- CPU saturation under `perf_compare` write and mixed workloads.
+- A Raft group per stream. A group owns a hash bucket of many streams.
+- Cross-stream or cross-group transactions.
 
-It does not remove the serial bottleneck for a single hot stream. One stream still maps to one Raft group so append order remains total and deterministic.
+## Ownership and request flow
 
-## Ownership Model
-
-Each runtime thread owns:
-
-- A local event loop.
-- A set of shard actors.
-- The Raft groups assigned to those shards.
-- Hot stream metadata and live-tail watcher state for owned streams.
-- Per-core write admission and backpressure counters.
-
-No shard-owned state is accessed by other threads directly. Other threads interact by sending commands to the owning actor.
+Each owner core runs on one OS thread with a current-thread Tokio runtime. It owns the Raft groups placed on it, and through their group actors the hot stream state, producer state and live-tail watchers of those groups. No other thread reads or writes owned state. Other threads send a command to the owner and receive the result on a oneshot channel.
 
 ```text
-client request
-    -> ingress runtime
-    -> stream router(bucket_id, stream_id)
-    -> owning core mailbox
-    -> shard actor
-    -> Raft group propose/apply
-    -> response channel
+HTTP request (axum)
+  -> ShardRuntime: StaticShardMap::locate(bucket_id, stream_id)
+  -> core mailbox (CoreWorker on the owner core)
+  -> group mailbox (GroupActor)
+  -> GroupEngine (in-memory or OpenRaft)
+  -> oneshot response
 ```
 
-## Raft Group Placement
+The HTTP layer parses protocol input, routes to `ShardRuntime` and renders the response. It holds no stream state. It serves three routers: the client plane (the Durable Streams protocol), the cluster plane (the internal Raft gRPC service, served on `server.cluster_listen` when set and otherwise on the main listener) and the admin plane. axum and tonic both run on Tokio, so the owner cores use Tokio current-thread runtimes as well.
 
-A Raft group owns a hash bucket of streams, not a single stream. The current static placement is implemented by `StaticShardMap`:
+## Placement
+
+`StaticShardMap` (`crates/ursula-shard/src/lib.rs`) places every stream:
 
 ```text
-raft_group = fnv1a64(bucket_id + "/" + stream_id) % raft_group_count
-core       = raft_group % core_count
+raft_group = fnv1a64(bucket_id + "/" + stream_id) % raft.group_count
+core       = raft_group % runtime.core_count
 ```
 
-This is not rendezvous hashing or consistent hashing. It is intentionally simple for bootstrapping fixed-size test clusters, and it gives stable placement only while `raft_group_count` and `core_count` are unchanged. Changing `raft_group_count` remaps a large fraction of streams, so this layer should be treated as a static bootstrap map, not as the split/merge or online-resize mechanism.
+This is a plain modulo map, not consistent hashing. `raft.group_count` (default `16 * core_count`) is fixed for the life of a cluster and every node must use the same value, so a group ID names the same streams on every node. Changing it remaps most streams, which is why groups never split, merge or resize online. The core is a local choice that depends only on the node's own `runtime.core_count`.
 
-Dynamic split/merge should introduce an explicit routing layer above `StaticShardMap`, for example a persisted virtual-bucket table or routing table that maps stream-hash ranges to Raft groups. That layer needs to be replicated as cluster metadata and consulted before stream commands enter the owner-core mailbox. It should support:
+## Owner-core runtime
 
-- Hot group movement between cores.
-- Leader placement balancing between nodes.
-- Group split/merge for long-running hot partitions.
-- Stable placement metadata persisted through cluster membership changes.
+`ShardRuntime` holds one bounded mailbox per core (`mailbox_capacity`, 1024 commands). The `CoreWorker` on each core keeps a map of its groups. The first command for a group, or an explicit warm request, calls `GroupEngineFactory::create` on the owner core, installs the group's ReadIndex barrier and spawns a `GroupActor` with its own bounded mailbox. Each actor is a separate task on the core's runtime, so a group waiting on Raft does not stop the other groups on that core.
 
-## Runtime Boundary
+The factory is chosen once at startup:
 
-The architecture should be runtime-neutral at the durable stream core boundary.
+- `InMemoryGroupEngineFactory`: non-replicated groups over the pure `ursula-stream` state machine. Used by the zero-config development node and by tests.
+- `DurableRaftGroupEngineFactory`: single-node OpenRaft groups over the per-core journal.
+- `StaticGrpcRaftGroupEngineFactory`: OpenRaft groups over the per-core journal with a static peer map, optional per-group voter sets and the gRPC network.
 
-The recommended layering is:
+Threads:
 
-- `runtime-core`: shard actors, routing, command envelopes, Raft group ownership.
-- `stream-core`: pure Durable Streams state-machine semantics.
-- `protocol-http`: HTTP parsing/response adapters.
-- `raft-transport`: node-to-node Raft RPC transport.
-- `storage`: WAL, hot payload store, cold tier, snapshots.
+- `RuntimeThreading::ThreadPerCore` (the default) runs each core worker on a thread named `ursula-core-N`. `RuntimeThreading::HostedTokio` runs workers as tasks of an existing runtime and is the mode used under madsim.
+- `runtime.cpu_affinity` controls Linux pinning. Unset, owner threads pin only when the inherited allowed cpuset size equals `runtime.core_count`, because a CFS quota alone is not an exclusive cpuset. `false` disables pinning and `true` forces it, round-robin over the allowed CPUs when oversubscribed. Pinning failures are logged. Other platforms run one thread per owner without pinning.
+- Each active core journal has its own writer thread with a current-thread runtime. Disk reads of older log entries run on Tokio's blocking pool. The main Tokio runtime and its blocking pool are additional threads, so the process thread count is larger than `runtime.core_count`.
 
-Tokio can remain the first production runtime while the core ownership model is introduced. Monoio should be evaluated behind a separate runtime adapter only after the HTTP and Raft transport dependencies are proven viable.
+An actor handles one command at a time. When its engine supports batched appends (the Raft engine does), an append drains up to 32 already-queued appends and 1 MiB of payload. It stops at the first non-append command, which runs next, and adds no batching delay. A request larger than 1 MiB is submitted alone. The Raft engine checks cold-write admission for the batch with cumulative reservations, so each item is admitted against the bytes accepted before it, and then proposes the commands together. Responses keep mailbox order. Live readers are woken only after the writers have their replies.
 
-## Current Runtime Prototype
+## Raft integration
 
-`crates/ursula-runtime` is the first concrete runtime-core artifact. It can run core workers on per-core OS threads or inside a hosted Tokio runtime. It is not the final production runtime.
+The OpenRaft application data type is `GroupWriteCommand` (`crates/ursula-runtime/src/command.rs`), defined as `enum GroupWriteCommand { Stream(StreamCommand) }`. Commands, responses, forwarded reads and OpenRaft's own RPC and log types are encoded as named MessagePack straight from their serde derives (`crates/ursula-raft/src/codec.rs`). The format is self-describing because the wire types rely on `serde(default)` and `skip_serializing_if`. The gRPC messages (`crates/ursula-raft/proto/raft_internal.proto`) carry a protobuf preamble with the group ID, node ID and protocol version, and an opaque MessagePack `payload`, so routing and validation never decode the payload. The protocol version is the format epoch, and a node refuses peers of another epoch.
 
-It establishes these contracts:
+Only the owner core holds a raw `Raft` handle. `OwnerRaftHandle` (`crates/ursula-raft/src/owner.rs`) wraps it in a mailbox task on the owner's runtime. Remote callers keep a sender and the read-only metrics receivers, which may cross threads. Inbound protocol RPCs, forwarded reads and writes, admin triggers and ReadIndex confirmation all run as mailbox jobs. Jobs are polled concurrently, so a proposal waiting for quorum never blocks the vote or AppendEntries that lets it complete.
 
-- public callers submit append-shaped commands through `ShardRuntime`;
-- `BucketStreamId` is mapped through `StaticShardMap` to one `CoreId` and one `RaftGroupId`;
-- each core actor owns group placement and dispatches commands for local groups;
-- each touched Raft group is represented by a core-local `GroupEngine` driven by its own mailbox, so one group can wait on I/O without stopping other groups;
-- stream offsets advance only inside the owning actor;
-- runtime metrics expose accepted appends, successful state mutations, routed requests, mutation apply time, mailbox send wait, and mailbox-full events per core/group without a hot-path process-wide accepted counter.
+`RaftGroupHandleRegistry` publishes the hosted groups as an immutable `ArcSwap` snapshot of entries holding `OwnerRaftHandle`s. Inbound RPC routing reads that snapshot and takes no process-wide mutex.
 
-The default `InMemoryGroupEngine` is intentionally not durable. It wraps the pure `ursula-stream` state machine and exists to test routing, ownership, engine construction, stream command application, error propagation, and observability before Raft transport and storage are moved.
+A follower that receives a write turns OpenRaft's `ForwardToLeader` into a structured `GroupLeaderHint`. The HTTP layer answers `307` with a `Location` on the leader's configured peer URL and an `x-ursula-raft-leader-id` header. A node that does not host the group redirects to a voter that does. Client writes are never proxied, because admission checks must run on the leader before replication. The administrative bucket purge is the one write forwarded over the `GroupWrite` RPC. Reads that must run on the leader are forwarded over `GroupRead`.
 
-`WalGroupEngineFactory` is an optional durability prototype behind the same group-engine boundary. It keeps the default in-memory path unchanged, but can create one WAL-backed engine per touched Raft group. Each group writes command records under a core/group-specific path and replays them when the group is constructed again. This proves the recovery boundary can stay group-local. It is not a substitute for the production OpenRaft log, snapshots, or a production group-commit policy.
+With static peers, the server warms every hosted group at startup (up to 8 concurrent warms per core) so followers can answer Raft RPCs before any client touches a group. A group whose replay stops is logged and the other groups stay available.
 
-The optional diagnostic WAL engine remains part of the HTTP prototype for recovery smokes. User-facing disk storage now uses the production OpenRaft log path through the typed Ursula config file.
+Snapshots transfer as one `FullSnapshot` message (vote, metadata and payload, at most 256 MiB). Installs are serialized per group and limited node-wide by `raft.snapshot_install_max_concurrency` (default 1). Builds are limited by `raft.snapshot_build_max_concurrency` (default 2).
 
-`RuntimeConfig::new` defaults to `RuntimeThreading::ThreadPerCore`: each core worker runs on its own OS thread with a current-thread Tokio event loop. Tests also cover `RuntimeThreading::HostedTokio` so the runtime can still be embedded inside an existing Tokio process while the server migration is incomplete.
+## Raft transport
 
-This prototype does not yet prove CPU saturation. It only proves that the request path can be shaped so independent streams do not need to share a single global mutable state machine.
+Each owner core has its own `CoreRaftTransport` holding its peer channels and one long-lived bidirectional `AppendStream` session per peer. Groups on the same core share that session. Different cores use independent sessions, queues and encoders. The session task drains already-queued calls into one frame of at most 32 items and stops adding calls once the frame holds 4 MiB of encoded calls. It adds no batching delay. Each item carries a transport-local request ID and receives its own result, so no group inherits another group's ordering, commit index or acknowledgement. Stream requests are zstd-compressed, and unary requests are compressed from 1 KiB up. A session that has calls outstanding and no response for 15 seconds is closed, and the next call opens a new stream.
 
-Metrics on the mutation, append, and routing paths use padded per-core and per-group atomics. Snapshot reads derive total accepted appends, successful state mutations, mutation apply time, routed requests, and mailbox send wait from per-core counters. Mailbox-full events are also per-core. Some high-watermark and gRPC transport counters still update process-wide atomics on the append path; this is not a synchronization-free path.
+Two node-wide budgets, each sized by `raft.append_transport_budget_bytes` (default 128 MiB), bound queued append bytes in each direction regardless of the number of cores or peers:
 
-The WAL prototype uses the same metrics shape. `GroupEngineMetrics` lets a group engine record WAL batch count, record count, write time, and sync time on the owning core/group. In-memory engines leave these counters at zero. This is diagnostic only; production OpenRaft storage still needs real group-commit histograms and log replication metrics.
+- Send: a call takes budget in FIFO order before it is queued, and gives it back when the HTTP/2 encoder takes the frame. A call not admitted within its OpenRaft deadline fails as `Unavailable` (backlog full), which OpenRaft treats as an unreachable peer and backs off on. Queued calls whose caller has already timed out are dropped unsent.
+- Receive: a follower charges each decoded inbound frame against the budget before reading the next one, so a slow follower pushes back through HTTP/2 flow control. Each inbound stream processes up to 64 items concurrently.
 
-## OpenRaft Integration
+The budgets bound accounted frames, not total RSS or tonic and socket buffers.
 
-OpenRaft supports custom async runtimes, including monoio through `openraft-rt-monoio`. The important design consequence is that monoio mode requires OpenRaft's `single-threaded` feature. That means a `Raft` handle is not `Send` or `Sync`, which is compatible with shard-local actor ownership but incompatible with the current clone-and-share `AppState` shape.
+The other RPCs are unary: `Vote`, `FullSnapshot`, `TransferLeader`, `RejoinBarrier` (the recovery boundary a gated replica asks its leader for), `GroupWrite` and `GroupRead`. The server also answers the unary `Append` RPC through the same handler as stream items. The outbound network never calls it and sends every AppendEntries over `AppendStream`.
 
-The migration should therefore avoid sharing `Raft` handles across request handlers. Instead, request handlers should route commands to shard mailboxes and receive responses through one-shot channels.
+`crates/ursula-raft/src/grpc.rs` also counts logical bytes for cross-AZ cost analysis: `raft_grpc_append_heartbeat_*`, `raft_grpc_append_replication_*` (requests, bytes and entries), `raft_grpc_append_response_bytes`, and the vote and snapshot request, payload and response bytes. They count encoded protobuf bytes before zstd and HTTP/2 framing, so comparing them with cloud network counters separates application, transport and billing amplification. They are process-wide atomics, with heartbeat and replication counters on separate cache lines.
 
-The runtime crate's `GroupEngine` trait is the intended OpenRaft adapter boundary. A production adapter should own exactly one OpenRaft group instance inside the owning core worker and should translate append/read/admin commands into Raft proposals without exposing the Raft handle through shared application state.
+## Log submission
 
-Runtime writes are represented by `GroupWriteCommand`, a serializable group-level command envelope for create, append, close, and delete. `InMemoryGroupEngine::apply_committed_write` is the current committed apply boundary: the prototype engine applies the same command shape that a future OpenRaft state machine should receive after log commit. The WAL prototype records this envelope per group, but it is still a local diagnostic durability layer, not an OpenRaft log store.
+Groups on one core share a segmented journal under `<raft.wal.path>/raft-log/core-N`. [Raft WAL](raft-wal.md) describes the on-disk format, recovery and reclamation. This section covers how appends reach it.
 
-`crates/ursula-raft` contains the first OpenRaft-specific adapter boundary. Durable app-log schema is now defined in `crates/ursula-proto` instead of in the Raft transport protobuf. `ProducerRequestV1`, `ExternalPayloadRefV1`, and `ColdChunkRefV1` are reused directly by `ursula-stream` and `ursula-runtime`. `BucketStreamId` remains a local semantic key in `ursula-shard` because it is used for hashing, display, validation, and map keys, but `ursula-shard` owns the conversion to and from shared `BucketStreamIdV1` so Raft does not duplicate that schema mapping. `RaftGroupCommandV1` and `RaftGroupResponseV1` are the shared protobuf application schema for Raft log commands and responses. `ursula-raft` keeps thin local `RaftGroupCommand` / `RaftGroupResponse` wrapper types only because OpenRaft needs local Rust trait implementations such as `Display`. Focused tests cover prost roundtrips for those shared command/response schemas back into runtime domain types. In the generated proto crate, serde derives are kept only for the three shared runtime JSON/snapshot value types that still need them: `ProducerRequestV1`, `ExternalPayloadRefV1`, and `ColdChunkRefV1`. `UrsulaRaftTypeConfig` uses those wrappers as OpenRaft application data, and `RaftGroupFileLogStore` persists the vote, committed pointer, purge pointer, and log entries as length-prefixed protobuf records. Normal application log entries in those records embed the shared `RaftGroupCommandV1` prost message directly, not a second serde encoding or an opaque command byte blob. When used by `DurableRaftGroupEngineFactory`, groups on the same owner core now share a `CoreFileLogWriter` and a core-local `journal.bin`: the writer batches length-prefixed binary records from owned groups and syncs the core journal once per batch. That validates recovery semantics from a per-core durable journal and exposes write/sync timing through the durable-log metrics before adding indexing, compaction, production backpressure, and a real group-commit policy.
+The log store keeps at most one pending, readable append batch per group. `append` publishes the batch, queues it to the core's journal writer and returns before any disk I/O. The writer calls `IOFlushed` only after it has written the record, applied it to the group's durable log index and satisfied the configured sync policy. Later log mutations of the group (truncate, purge, vote, committed pointer) wait for that callback, which preserves journal order. A write error poisons the pending state and is reported to OpenRaft. Readers merge the pending suffix with the durable index. Replication of a new batch therefore overlaps local journal I/O without an unbounded pending-log cache.
 
-`RaftGroupStateMachine` applies committed OpenRaft entries through `InMemoryGroupEngine::apply_committed_write`. The adapter can build and install OpenRaft snapshots backed by `GroupSnapshot` bytes, and the unit tests now prove a single-node OpenRaft group can initialize, elect itself, apply create/append writes through `client_write`, and recover those writes after reopening the file log. `RaftGroupEngine` also has a constructor path that accepts an injected `RaftNetworkFactory`; the focused three-node in-process test uses that path to exercise real OpenRaft Vote and AppendEntries replication and then reads the replicated Durable Streams payload from all three state machines. `ShardRuntime::warm_group` can instantiate a group engine on the owning core without using a stream mutation as the trigger, and `RegisteredRaftGroupEngineFactory` can put the resulting runtime-owned `Raft` handle into a `RaftGroupHandleRegistry` keyed by `RaftGroupId`. That registry is the local dispatch boundary a cross-process Raft RPC layer needs before it can serve AppendEntries, Vote, or full-snapshot messages for groups that have not yet received client traffic on the follower node. `router_with_raft_registry` wires that registry into an internal tonic gRPC service mounted on the same Axum listener as the public HTTP API. Vote, AppendEntries, and full-snapshot transfer use typed `RaftInternal` protobuf messages for OpenRaft votes, log ids, log entries, membership, snapshot metadata, and responses. The durable application command schema itself is not a private Raft transport schema; it is the shared `ursula-proto` schema embedded inside those Raft protobuf records. `GrpcRaftNetworkFactory` and `GrpcRaftNetwork` implement the outbound OpenRaft network trait for those RPCs. `StaticGrpcRaftGroupEngineFactory` wires that network into runtime-owned group construction with a static peer map and carries the configured cold store into each group's state machine. The cross-router test starts three Ursula HTTP routers, warms four groups on each node, initializes node 1 with three voters for every group, writes streams placed on all four groups through node 1, and waits until the replicated payloads are readable from every runtime.
+On every non-clean restart, a committed vote for the node itself is rewritten as the same vote uncommitted before the group's Raft core starts. A crashed leader may have lost tail entries its followers hold, and the demotion stops it from reusing their log IDs.
 
-AppendEntries transport is multiplexed per owner core and peer. Groups on the same core share one long-lived bidirectional gRPC stream and HTTP/2 channel per peer; different cores use independent pools, queues and encoders. The sender drains calls that are already queued into a ZSTD-compressed frame of at most 32 items, and stops adding calls once the frame holds 4 MiB of encoded calls (#507). It adds no batching delay. Each item keeps a transport-local request id and receives an independent result, so one group does not inherit another group's ordering, commit index, or acknowledgement. Vote and snapshot traffic remain unary. The 0.4 client has one AppendStream path and carries no legacy single-item frame, capability probe, or unary fallback state. Its request and response item lists retain the 0.3.32 batch field numbers, which lets a new client use the same batched wire shape with an old server; the unary Append server method covers the reverse old-client-to-new-server direction during the graceful rollout.
+## Live tail watchers
 
-`ursula` now exposes this static cluster shape through the typed config file: `raft.node_id`, `[[raft.peers]]`, `raft.wal.path`, and `raft.init_membership` / `raft.init_membership_per_group`. It warms every group at startup so followers can receive Raft RPCs before client traffic touches those groups, and serves the registered Raft gRPC routes in the production binary. OpenRaft `ForwardToLeader` is preserved as a structured `GroupLeaderHint`, and public write requests that land on followers now return a `307` redirect to the known leader instead of having the follower proxy the body over node-to-node HTTP. Full snapshots use the same gRPC transport. A short EC2 smoke has also run the static cluster shape across three `c7g.4xlarge` nodes with a `c7gn.8xlarge` client and S3 cold storage enabled using the current gRPC internal Raft transport. The smoke verified follower leader redirects, a leader write that committed through gRPC quorum replication, background S3 flush, and S3-backed post-flush readback. The official Durable Streams conformance suite also passed against this EC2 static gRPC shape from the `c7gn.8xlarge` client. The next missing pieces are dynamic/reconfigurable membership and long-running `perf_compare` with S3 cold path enabled. A later EC2 smoke also covered the same static gRPC shape with independent durable OpenRaft log roots plus real S3 cold storage, then restarted all nodes without reinitializing membership and read the cold-backed stream through a restarted follower. Another EC2 smoke covered a restarted late learner: node 1 snapshotted and purged a two-voter durable-log/S3 cluster, node 3 started from an empty durable log root, node 1 added it as a learner, node 3 installed snapshot index 4 through gRPC full-snapshot transfer, and node 3 served the restored cold-backed stream. The local automatic snapshot path is now covered by `openraft_installs_snapshot_for_lagging_learner`, which forces a purged leader to catch up a newly added learner through `RaftNetworkV2::full_snapshot`. That test also fixed the state-machine snapshot retention bug that made leader-side snapshot transfer fail after a successful snapshot build. `static_grpc_raft_installs_snapshot_for_late_learner_over_tcp` extends that coverage to local TCP routers by writing through the leader HTTP API and reading the restored stream through the late learner's HTTP endpoint after gRPC snapshot installation.
+Long-poll and SSE reads at the tail of an open stream register a watcher in the owning group actor. The watcher map belongs to the actor and changes only during its turns, with no lock. After an append or close commits, the actor completes the matching watchers in the same turn and hands materialization to a spawned task. A dropped waiter sends a cancel command back to the owner's mailbox. `runtime.live_read_max_waiters_per_core` (default 65,536, `0` disables) caps waiters per core. No process-wide watch registry exists.
 
-`RaftGroupEngine` wraps the group behind the runtime `GroupEngine` trait, routing writes through OpenRaft and routing read/head/snapshot calls through OpenRaft's state-machine access API. `GroupEngineFactory` is now async so group creation can await OpenRaft initialization instead of blocking a core worker, and `RaftGroupEngineFactory` proves `ShardRuntime` can instantiate a runtime-owned local Raft group. This is not yet the production runtime topology: production work still needs an indexed/high-throughput OpenRaft log format, dynamic deployment membership management, and long-running EC2 conformance/performance validation of the multi-group static cluster path.
+## Scalability invariants
 
-In the typed Ursula config, every Raft node uses the durable OpenRaft group-engine factory, which adds group-local file-log persistence under `raft.wal.path = "..."` through the same shard-owned runtime boundary. An earlier `raft.wal.backend = "memory"` mode drove OpenRaft over an in-memory `RaftGroupLogStore` to isolate OpenRaft/runtime overhead from disk durability in benchmarks. It has been removed. The static gRPC cluster path uses the same durable log backend by combining disk WAL config with `raft.node_id`, `[[raft.peers]]`, and membership settings; the HTTP layer chooses the backend through `DurableRaftLogStoreFactory` instead of owning the core journal writer. The local `static_grpc_raft_runtime_recovers_from_core_journal_after_restart` test also covers the single-node production shape restarting from the same `journal.bin` and reading back an HTTP-committed payload without reinitializing membership. The local `static_grpc_raft_group_engine_replicates_with_core_journals` test covers the three-router static gRPC shape with independent durable log roots, replicated writes across two groups, non-zero durable-log metrics on every node, and a `journal.bin` per node. `static_grpc_raft_durable_cold_flush_replicates_manifest` adds the cold-path version of that shape: three static gRPC nodes with independent durable journals share a cold store, the leader writes and batch flushes cold metadata, and every node's Raft state machine reads the complete payload through the replicated cold manifest while retaining a non-empty core journal. The gated `cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart` test covers the same shape through real `ursula` processes with independent durable log roots and shared S3 cold storage: it replicates the cold manifest, stops all nodes, restarts without initial membership, reads the cold-backed stream through a restarted follower, and cleans up the unique S3 root after readback. The binary also exposes narrow Raft admin endpoints under `/__ursula/raft/{group}` for validation workflows: trigger snapshot, trigger purge, and add a learner. `cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner` uses only real `ursula` processes plus those endpoints to prove a late third node installs the leader snapshot after the leader has snapshotted and purged its log. The same late-learner snapshot TCP flow also runs in a durable variant, `static_grpc_raft_installs_snapshot_for_late_learner_with_core_journals`, which forces leader snapshot and purge, adds a previously absent learner over gRPC, waits for snapshot installation, reads the restored stream through the learner HTTP endpoint, and verifies non-empty core journals on leader, follower, and learner. The binary-level `cli_static_grpc_raft_log_dir_recovers_after_restart` test covers the same production `ursula` binary used in EC2 deployment: typed static cluster config with `raft.wal.path`, HTTP write, process restart without reinitializing membership, and HTTP readback from the recovered journal. `cli_static_grpc_raft_log_dir_replicates_between_nodes` extends that binary coverage to three real `ursula` processes with independent log dirs, leader write, follower readback, and non-empty `journal.bin` files for every node. This is correctness and durability scaffolding, not a throughput-optimized log layout. The same static durable-log/S3 shape now has a short multi-node EC2 restart smoke, but still needs longer soak and performance validation before it can be treated as a production storage layout.
+The write path has no process-wide serialization point:
 
-The same boundary now includes group snapshots. `ShardRuntime::snapshot_group` routes by `RaftGroupId` to the owning core, and `GroupEngine::snapshot` returns that group's placement, commit index, deterministic stream snapshot, and per-stream append counts. `ShardRuntime::install_group_snapshot` validates the recorded placement before routing and installs the snapshot through the owning core. This is still a prototype control-plane API, but it establishes the shape needed for an OpenRaft state-machine adapter without adding a global snapshot lock or shared state-machine handle.
+- no global append coalescer: each group actor batches its own appends
+- no single Raft group for all streams
+- no shared stream metadata lock: stream state lives in its group
+- no single WAL or fsync queue: each core has its own journal writer that batches across that core's groups
+- no global live-tail watch registry
+- no process-wide mutex on inbound AppendEntries routing
 
-## Stream Semantics
+Some counters still update process-wide atomics on the append path, namely the gRPC transport counters and a few high watermarks.
 
-`crates/ursula-stream` holds the first pure state-machine slice. It models bucket creation and purge, stream creation, append, catch-up read, close, delete, metadata lookup, content-type checks, stream sequence ordering, and the monotonic closed state without HTTP, storage, or runtime side effects. It also models the first idempotent producer path for single append/close operations: per-stream producer epoch/sequence state, duplicate retry deduplication, sequence-gap rejection, stale-epoch fencing, and duplicate final append success after stream close.
+## Observability and DST coverage
 
-The stream state machine also exposes a deterministic, serde-compatible snapshot format. Snapshot buckets and streams are sorted before export, and restore validates duplicate buckets, duplicate streams, missing buckets, and payload length versus tail offset. Producer state is included in the stream snapshot, so producer retry safety survives snapshot restore. Runtime group snapshots add the group-local commit index and stream append counts that are outside the pure stream state-machine payload but still needed for restored response continuity. This is the semantic snapshot core that an OpenRaft state-machine adapter should encode into Raft snapshots; OpenRaft snapshot transport, bootstrap orchestration, retention, and storage integration still need separate production work.
+`GET /__ursula/metrics` reports runtime counters kept in padded per-core and per-group atomics, with totals derived when the snapshot is read. It also reports one Raft progress record per registered group from OpenRaft's watched metrics: node ID, term, leader, last log, committed, applied, snapshot and purged log IDs, voters, learners, maintenance state and log applied since the last snapshot. The gRPC transport counters above are reported in the same response.
 
-This crate should become the semantic core used behind OpenRaft apply. Protocol handlers may parse headers and bodies, but they should not define hidden stream state transitions outside this command model.
-
-The runtime prototype already uses this crate in its default group engine: `ShardRuntime::create_stream`, `ShardRuntime::append`, `ShardRuntime::read_stream`, `ShardRuntime::close_stream`, and `ShardRuntime::head_stream` route to the owning core, then the group-local engine applies stream commands or reads metadata/payload from its local state-machine instance. This keeps benchmark-shaped runtime tests and protocol semantic tests on the same transition code.
-
-## HTTP Prototype
-
-`crates/ursula` is the first protocol adapter over the shard-owned runtime. It uses axum on Tokio and intentionally implements only the subset needed to put the runtime under a real HTTP workload:
-
-- `PUT /{bucket}` for benchmark bucket setup.
-- `PUT /{bucket}/{stream}` for stream creation.
-- `POST /{bucket}/{stream}` for append and close-only requests.
-- `GET /{bucket}/{stream}?offset=N&max_bytes=M` for catch-up reads.
-- `GET /{bucket}/{stream}?offset=N&live=long-poll` for live long-poll reads.
-- `GET /{bucket}/{stream}?offset=N&live=sse` for SSE live-tail reads.
-- `HEAD /{bucket}/{stream}` for metadata.
-- `DELETE /{bucket}/{stream}` for stream deletion.
-- `GET /__ursula/metrics` for append distribution across cores and Raft groups.
-
-The HTTP adapter does not own stream state. It parses protocol inputs, routes to `ShardRuntime`, and renders protocol-shaped status codes and headers. Each append goes through the runtime and owning group. This keeps HTTP out of the durable stream ownership boundary and avoids a global request-state registry on the measured write path. Current local validation separates protocol correctness from local disk latency. A three-process static gRPC cluster with 32 Raft groups on the since-removed `raft.wal.backend = "memory"` passed the official Durable Streams suite (`300 / 300`) both with the background cold worker disabled and with memory cold storage actively flushing 1024-byte chunks. The same local three-process shape with durable OpenRaft file logs is protocol-correct but can exceed the official property tests' default 5s wrapper on a MacBook: metrics point to file-log fsync/replication latency and, for 1-byte cold flush, cold-manifest write-amplification. That is why EC2 and in-memory Raft-log conformance were the gates for multi-node protocol behavior at the time, while local durable-log runs were treated as latency diagnostics. The `ursula` binary now runs every Raft node on the OpenRaft-backed file-log engine under `raft.wal.path`, and the zero-config development node on the non-replicated in-memory engine. Both keep protocol handling in the same HTTP adapter and differ only in the runtime's group-engine factory. The file-log engine uses a versioned, checksummed per-core WAL with cross-group fsync batching, exclusive ownership, committed-tail replay, and online generation checkpoints after OpenRaft purge; the detailed storage decision and benchmark evidence live in [Production Raft WAL with an in-memory state machine](raft-wal-production.md). Append and close-only requests parse `Producer-Id`, `Producer-Epoch`, and `Producer-Seq` together and route them into the state machine. Successful producer requests echo epoch/sequence headers, producer sequence conflicts return expected/received sequence headers, and stale epochs return the current epoch header. The metrics route snapshots runtime counters and mailbox depths. It derives totals from per-core counters rather than recording a process-wide append counter on every request.
-
-Live long-poll and SSE reads are driven by shard-owned one-shot read watchers. When a reader is at the tail of an open stream, the owning core stores the waiter next to the group state and completes it from the same actor after append or close. The HTTP layer only renders long-poll responses or SSE events from those owner-core reads. Dropped waiters send cancellation back to the owning mailbox so live-tail state does not depend on a process-wide watch registry.
-
-## Storage Policy
-
-Do not let every Raft group independently fsync small writes without coordination. The storage layer should evaluate:
-
-- Per-core WAL files with group-id tagged records.
-- Group commit across Raft groups owned by the same core.
-- Dedicated blocking/fsync workers for RocksDB or file-backed stores.
-- Direct I/O or io_uring storage only after correctness and recovery semantics are settled.
-
-The current WAL prototype intentionally uses one file per group to make the ownership and recovery boundary testable. Production storage may collapse this into per-core group commit, but it must not reintroduce a single process-wide fsync queue for all groups.
-
-## Migration Phases
-
-1. Establish routing primitives and static shard placement.
-2. Introduce shard-owned command actors inside the existing Tokio server.
-3. Move append preview/prepare/commit state behind shard mailboxes.
-4. Split the single Raft group into multiple groups with static placement.
-5. Move live-tail watcher state and stream metadata into owning shards.
-6. Add placement metadata, rebalance hooks, and leader balancing.
-7. Evaluate monoio for shard actors and Raft runtime after HTTP/transport feasibility is proven.
-
-## CPU Saturation Gate
-
-The migration target is not only lower latency. Ursula must be able to drive all available cores under the `perf_compare` Ursula write path. The existing plateau at roughly three to four busy cores is treated as a release blocker for this architecture.
-
-The design must therefore remove process-wide write bottlenecks before optimizing runtime choice:
-
-- no single global append coalescer for all streams;
-- no single Raft group for all stream commands;
-- no shared stream metadata lock on the measured append path;
-- no single WAL/fsync queue that serializes all Raft groups without batching;
-- no single live-tail watch registry lock for mixed workloads.
-
-The first acceptance target is linear CPU utilization growth as `perf_compare --concurrency` increases across independent streams, until either the host cores, disk, or network are saturated.
-
-## Raft Progress Observability
-
-`GET /__ursula/metrics` exposes one OpenRaft progress record per registered Raft group. Each record includes the node id, current term/leader, log frontier, committed/applied/snapshot/purged indexes and terms, voters, and learners. This is intentionally read-only and sourced from OpenRaft's watched metrics through the `RaftGroupHandleRegistry`.
-
-This matters for the migration because lagging-follower and restart-level tests must distinguish "the stream is readable" from "snapshot transfer and log purge actually happened." The local TCP late-learner snapshot test now checks those metrics after leader snapshot/purge and after the learner installs the snapshot; the same fields should be used as the EC2 evidence when exercising a stopped or late-starting follower.
-
-## Non-Goals For The First Milestone
-
-- No per-stream Raft group.
-- No cross-stream transactions.
-- No immediate monoio rewrite of axum/tonic code.
-- No migration of all current operational workers before ownership boundaries are stable.
-
-## Owner-core execution and WAL submission
-
-Production group construction runs on the owning current-thread runtime. The
-shared registry publishes immutable routing snapshots and `OwnerRaftHandle`
-mailboxes, not raw Raft handles. Protocol RPCs, forwarded reads/writes and admin
-triggers execute through these mailboxes. ReadIndex confirmation also runs on its
-owner. Read-only metric receivers may cross threads. Mailbox jobs run concurrently:
-a proposal waiting for quorum must not block an incoming vote or AppendEntries.
-Inbound append routing takes no process-wide registry mutex.
-
-Each core's transport pool owns its peer connections and append sessions. Send sessions share a node-wide semaphore budget, and inbound streams share a
-separate node-wide budget, each configured by `raft.append_transport_budget_bytes`
-(default 128 MiB). Adding cores or peers does not multiply these charged-byte limits.
-These bound accounted queued frames, not total RSS or tonic/socket buffers. Groups
-on the same core still share that peer's queue and flow control. No wire protocol change is required.
-
-Ordinary append actors drain up to 32 already-queued appends and 1 MiB of
-payload, stopping at the first non-append command and adding no batching delay.
-An individually larger request is submitted alone. The Raft engine checks
-admission with conservative reservations for the accepted burst and submits the
-commands together. Responses and non-append operations preserve mailbox order.
-Cold metadata mutations retain their serialized preparation/commit boundary.
-
-The log store exposes one pending, readable append batch per group and returns
-before its journal writer performs disk I/O. The writer invokes `IOFlushed` only
-after writing, applying the durable log index and satisfying the configured sync
-policy. Subsequent log mutations wait for that callback, and errors poison the
-pending state. Readers merge the pending suffix with the durable index. This
-allows replication of a new batch to overlap local WAL I/O without an unbounded
-pending-log cache. On every non-clean restart, a committed self-vote is presented
-uncommitted so a crashed leader cannot reuse log IDs held by its followers.
-Dropped writer callbacks fail pending state and notify OpenRaft; rejected submitted
-records poison the writer. `blocking_append` is used by durable WAL measurements.
-
-`runtime.cpu_affinity` controls Linux affinity. By default, owner threads pin only
-when the inherited allowed cpuset size equals `runtime.core_count`; a CFS quota
-alone is not an exclusive cpuset. `false` disables pinning and `true` forces it
-(round-robin if oversubscribed). Affinity failures are logged.
-Other platforms retain one OS thread per owner without physical CPU affinity.
-Each active core journal still uses a dedicated blocking writer. The main Tokio
-runtime and its blocking pool are additional threads; total process threads are
-not equal to runtime.core_count.
-
-DST routes AppendEntries and votes through the production registry and owner mailbox.
-It validates ordering and failure semantics with hosted tasks and simulated disk,
-including abrupt writer abort with a replicated pending leader tail.
-It cannot validate physical CPU placement, cache-line contention or multicore
-throughput. Real-thread owner dispatch tests and delayed-writer tests cover those
-execution boundaries locally; throughput scaling still requires a multicore
-cluster benchmark and per-thread profiles.
+Deterministic simulation routes AppendEntries and votes through the production registry and owner mailbox over an in-process network, with hosted tasks and a simulated disk. It covers ordering and failure semantics, including an abrupt writer abort while followers hold a replicated pending leader tail. It does not exercise the gRPC `AppendStream` transport, physical CPU placement, cache-line contention or multicore throughput, which depend on real threads and hardware.

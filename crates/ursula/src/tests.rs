@@ -6613,7 +6613,7 @@ mod snapshot_driver {
 
     #[test]
     fn metrics_export_log_bytes_since_snapshot_and_last_snapshot_size() {
-        // Bounded-state §7.5 soak gauges: unpurged log bytes and snapshot raw
+        // Bounded-state gauges: unpurged log bytes and snapshot raw
         // bytes per group, scraped from `/__ursula/metrics`.
         let mut snapshot = snap(3, Some(100), Some(40), GroupLogProgress {
             log_bytes: 5 * MIB,
@@ -9859,7 +9859,7 @@ async fn purge_erases_external_payloads_and_uncommitted_stage_orphans() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// Bounded-state §7.5: per-group state gauges exported in /__ursula/metrics.
+// Bounded-state gauges: per-group state gauges exported in /__ursula/metrics.
 #[tokio::test]
 async fn metrics_expose_per_group_state_gauges() {
     let app = test_router();

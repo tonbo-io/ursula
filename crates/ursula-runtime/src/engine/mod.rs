@@ -389,7 +389,7 @@ pub trait GroupEngine: Send + 'static {
     }
 
     /// Bounded-state gauges of this replica's applied state
-    /// (`docs/architecture/bounded-stream-state.md` §7.5). Served from local
+    /// (`docs/architecture/bounded-stream-state.md`, Gauges). Served from local
     /// state, leader or follower, like [`GroupEngine::bucket_usage`].
     /// Default unsupported.
     fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {

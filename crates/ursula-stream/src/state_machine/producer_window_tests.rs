@@ -1,5 +1,5 @@
-//! F3 producer bounds and `TidyStream` (`docs/architecture/bounded-stream-state.md` §5.1, §5.4,
-//! §5.5).
+//! F3 producer bounds and `TidyStream` (`docs/architecture/bounded-stream-state.md`
+//! F0, F3).
 
 use bytes::Bytes;
 
