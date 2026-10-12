@@ -6,7 +6,8 @@
 // the stream at all. The layer here is `gate.mjs`: the server never answers 402 itself.
 import { writeFileSync } from "node:fs";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { attach, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
+import { attach, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
 import { openHarness, textTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
 import { type Child, type ChildLine, Gate, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";

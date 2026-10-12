@@ -1,4 +1,19 @@
-// The errors the package throws, and how a refused commit maps to one.
+// The errors the package throws, the SQLite result codes they map from, and how a refused commit
+// maps to one. Shared by the root entry (index.ts) and the Pi adapter (pi.ts); only the error classes
+// and `WriteRefusedKind` are public.
+
+/** SQLITE_READONLY: a write to a file attached read-only. */
+export const SQLITE_READONLY = 8;
+/** SQLITE_AUTH: `ursula_attach` refused with 402 in front of the stream. */
+export const SQLITE_AUTH = 23;
+/** SQLITE_IOERR_AUTH: a commit, or the claim of an `ursula_attach`, refused before it reached the stream (an attach refused with 402 gets SQLITE_AUTH). */
+export const SQLITE_IOERR_AUTH = 7178;
+
+/** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
+export function errcode(error: unknown): number | undefined {
+	const code = (error as { errcode?: unknown } | null | undefined)?.errcode;
+	return typeof code === "number" ? code : undefined;
+}
 
 /**
  * A commit the VFS could not replicate: fenced (by a newer owner, because the stream was deleted and

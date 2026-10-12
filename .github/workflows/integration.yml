@@ -306,8 +306,9 @@ jobs:
           cd clients/sqlite-ursula
           URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/snapshot.e2e.ts
 
-      # package.json declares the @earendil-works/pi-durable versions the package supports as
-      # ">=oldest <first-unsupported", and the steps above test the version in the lockfile. This one
+      # package.json declares the @earendil-works/pi-durable versions the `/pi` entry supports as an
+      # optional peer dependency, ">=oldest <first-unsupported", and the steps above test the
+      # version in the lockfile (a devDependency). This one
       # installs the oldest without saving it, then runs the typecheck, Pi's storage conformance
       # (three modes), and the fencing, 402 and refusal suites: their Pi cases reach
       # openUrsulaPiStorage's mapping of the errors the node driver throws for a failed commit, which
@@ -316,7 +317,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd clients/sqlite-ursula
-          range=$(node -p 'require("./package.json").dependencies["@earendil-works/pi-durable"]')
+          range=$(node -p 'require("./package.json").peerDependencies["@earendil-works/pi-durable"]')
           oldest=$(node -e '
             const bounds = /^>=(\d+\.\d+\.\d+) <\d+\.\d+\.\d+$/.exec(process.argv[1]);
             if (bounds === null) throw new Error("pi-durable range is not >=oldest <first-unsupported: " + process.argv[1]);

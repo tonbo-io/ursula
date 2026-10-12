@@ -5,8 +5,9 @@ reference user) with an Ursula stream as the source of truth. A commit is durabl
 acknowledges it. The local files are a non-durable cache of the stream (§6).
 
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
-`clients/sqlite-ursula` (TypeScript: the loader, `attach`, the Pi helper `openUrsulaPiStorage`, the
-e2e suites and the benchmark tools). User docs: `docs/web/src/content/docs/pages/examples/sqlite-vfs.mdx`.
+`clients/sqlite-ursula` (TypeScript: the loader and `attach` in the root entry, which has no runtime
+dependencies, the Pi helper `openUrsulaPiStorage` in the `/pi` entry, whose
+`@earendil-works/pi-durable` is an optional peer dependency, the e2e suites and the benchmark tools). User docs: `docs/web/src/content/docs/pages/examples/sqlite-vfs.mdx`.
 
 ## 1. Shape
 
@@ -857,11 +858,12 @@ PRs).
 | e2e: snapshots | `snapshot.e2e.ts`, `snapshot-backoff.e2e.ts`, `cold-snapshot.e2e.ts` | a run far past the hot limit stays bounded, fresh and lagging hosts rebuild byte-identical, takeover after a trim fences, §4.4's backoff through `gate.mjs` and a real gateway, a 12 MiB body through S3 multipart (cluster only) |
 | e2e: deployment | `auth.e2e.ts`, `redirects.e2e.ts`, `health.e2e.ts` | TLS and gateway-checked tokens, leaderships moved under commits and snapshot read-backs with no `307` reaching the client, `ursula_status` and logs for operators |
 | e2e: panics | `panics.e2e.ts` | every SQL function and init fail with an error and the process goes on, a panic poisons one file alone |
+| e2e: package entries | `entries.e2e.ts` | the root entry, source and built, imports nothing outside Node.js, the `/pi` entry imports Pi Durable |
 | e2e: versions | `compat.e2e.ts` | same-minor compatibility (§7, versions) |
 | e2e: load | `bench.e2e.ts`, `soak.e2e.ts` | sanity numbers (bytes per turn, pages per commit), server memory under VFS-shaped load (soak, opt-in) |
 
 The suites run the Pi Durable version in the lockfile. The single-node job also installs the oldest
-version in `package.json`'s range and runs the typecheck, conformance, `fencing.e2e.ts`,
+version in `package.json`'s peer range and runs the typecheck, conformance, `fencing.e2e.ts`,
 `payment.e2e.ts` and `refused.e2e.ts` again, whose Pi cases reach `openUrsulaPiStorage`'s mapping of
 the errors the node driver throws for a failed commit.
 

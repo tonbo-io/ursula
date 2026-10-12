@@ -3,6 +3,14 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## Unreleased
+
+These changes are planned for 0.7.5.
+
+### SQLite VFS
+
+- **`openUrsulaPiStorage` moved to `@tonbo/sqlite-ursula/pi`, and the package has no runtime dependencies.** `@tonbo/sqlite-ursula` used to depend on `@earendil-works/pi-durable`, so an application that only attaches files for `node:sqlite` installed Pi Durable and the model SDKs it pulls in, over 100 MB. The root entry now imports nothing outside Node.js, and Pi Durable is an optional peer dependency in the range `>=1.0.0 <1.2.0`, which npm installs only when the application depends on it and reports as a mismatch when the application's version is outside it. This is a breaking change for Pi users: install `@earendil-works/pi-durable` next to the package, and import `openUrsulaPiStorage` and `UrsulaPiStorageOptions` from `@tonbo/sqlite-ursula/pi`. Every other export, the error classes included, stays in `@tonbo/sqlite-ursula`. See [Pi Durable](/docs/examples/sqlite-vfs#pi-durable).
+
 ## 0.7.4
 
 0.7.4 is a drop-in patch for 0.7.0, 0.7.1, 0.7.2 and 0.7.3: format epoch 3 is unchanged, with no storage, snapshot, WAL or Raft protocol change. Upgrade in place with an ordinary rolling restart (`helm upgrade`). No fresh install or data move is needed.

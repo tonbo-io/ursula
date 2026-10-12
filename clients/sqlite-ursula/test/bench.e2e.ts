@@ -8,7 +8,8 @@
 import { appendFileSync } from "node:fs";
 import type { Storage, StorageWrite } from "@earendil-works/pi-durable";
 import { it } from "vitest";
-import { attach, drainStats, openUrsulaPiStorage, status, type VfsCommitStat, type VfsSnapshotStat } from "../src/index.ts";
+import { attach, drainStats, status, type VfsCommitStat, type VfsSnapshotStat } from "../src/index.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
 import { openHarness, textTurn, toolTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
 import { streamPath, ursulaUrl } from "./kit.ts";

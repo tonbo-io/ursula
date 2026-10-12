@@ -2,10 +2,12 @@
 // (clients/sqlite-vfs). The extension registers the "ursula" VFS as SQLite's default; after
 // `attach(path, streamUrl)` every connection that opens `path` (plain node:sqlite, Pi's official node
 // driver) is replicated: each commit is appended to the stream before it reaches the local WAL.
+//
+// The package's root entry. It depends on nothing outside Node.js: Pi Durable's storage is the
+// `@tonbo/sqlite-ursula/pi` entry (pi.ts), whose `@earendil-works/pi-durable` is an optional peer
+// dependency. Nothing reachable from here may import it (test/entries.e2e.ts).
 import { DatabaseSync } from "node:sqlite";
-import { type SqliteExecutor, SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { type NodeSqliteStorageOptions, openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { refusedCommitError, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError, type WriteRefusedKind } from "./errors.ts";
+import { errcode, SQLITE_AUTH, SQLITE_IOERR_AUTH, UrsulaPaymentRequiredError, UrsulaWriteRefusedError, type WriteRefusedKind } from "./errors.ts";
 import { prebuiltExtension } from "./platform.ts";
 
 export { UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError, type WriteRefusedKind } from "./errors.ts";
@@ -24,19 +26,6 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
 	db.loadExtension(library);
 	control = db;
 	return db;
-}
-
-/** SQLITE_READONLY: a write to a file attached read-only. */
-const SQLITE_READONLY = 8;
-/** SQLITE_AUTH: `ursula_attach` refused with 402 in front of the stream. */
-const SQLITE_AUTH = 23;
-/** SQLITE_IOERR_AUTH: a commit, or the claim of an `ursula_attach`, refused before it reached the stream (an attach refused with 402 gets SQLITE_AUTH). */
-const SQLITE_IOERR_AUTH = 7178;
-
-/** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
-function errcode(error: unknown): number | undefined {
-	const code = (error as { errcode?: unknown } | null | undefined)?.errcode;
-	return typeof code === "number" ? code : undefined;
 }
 
 export interface AttachOptions {
@@ -221,45 +210,6 @@ export interface VfsStats {
 export function drainStats(file: string): VfsStats {
 	const row = loadUrsulaVfs().prepare("SELECT ursula_stats(?) AS s").get(file) as { s: string };
 	return JSON.parse(row.s) as VfsStats;
-}
-
-/** {@link openUrsulaPiStorage}'s options: Pi's node driver settings, and how to attach. */
-export type UrsulaPiStorageOptions = NodeSqliteStorageOptions & AttachOptions;
-
-/**
- * Pi Durable's official node SqliteStorage on a replicated file: attaches `file` to `streamUrl`, then
- * opens it with Pi's node driver, unmodified. A commit the VFS fails surfaces as an
- * `UrsulaReplicationError` (SQLite has already rolled the transaction back, so the driver's own
- * rollback attempt would otherwise turn it into an AggregateError). The storage is unusable for
- * writes after that; re-open it to take the stream over again (after a delete and recreate, re-opening
- * rebuilds the file from the new stream).
- *
- * A commit refused before it reached the stream surfaces as an {@link UrsulaWriteRefusedError} instead
- * ({@link UrsulaPaymentRequiredError} for a `402`), and the storage stays usable: the next commit goes
- * out as usual. With `{ readOnly: true }` the file is attached read-only: the storage opens on a
- * database Pi has already written, its reads work, and every commit that changes it fails with
- * SQLITE_READONLY.
- */
-export async function openUrsulaPiStorage(file: string, streamUrl: string, options: UrsulaPiStorageOptions = {}): Promise<SqliteStorage> {
-	const { readOnly, ...sqlite } = options;
-	attach(file, streamUrl, readOnly === undefined ? {} : { readOnly });
-	const db = await openNodeSqliteDatabase(file, sqlite);
-	const transaction = db.transaction.bind(db);
-	db.transaction = <T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> =>
-		transaction(callback).catch((error: unknown) => {
-			const cause = error instanceof AggregateError ? error.errors[0] : error;
-			const s = status(file);
-			// Read-only: SQLite's own error, without the driver's failed ROLLBACK. The transaction is
-			// rolled back either way: by SQLite when COMMIT failed, by the driver's ROLLBACK when a
-			// statement failed before it.
-			if (s.read_only && errcode(cause) === SQLITE_READONLY) throw cause;
-			// Poisoned (by this commit, or by the snapshot thread since a refusal): the storage needs a
-			// new attach whatever the error, a refusal's code included.
-			if (s.poisoned) throw new UrsulaReplicationError(`commit not replicated: ${s.reason ?? "unknown"}`, s.fenced, cause);
-			if (errcode(cause) === SQLITE_IOERR_AUTH) throw refusedCommitError(s, cause);
-			throw error;
-		});
-	return SqliteStorage.open(db);
 }
 
 /** Attributes on a measurement, as OpenTelemetry takes them. */

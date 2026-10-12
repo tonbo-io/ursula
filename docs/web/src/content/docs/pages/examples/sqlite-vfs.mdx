@@ -3,7 +3,7 @@ title: SQLite on Ursula
 sidebarTitle: SQLite (VFS)
 ---
 
-`sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula), published to npm as `@tonbo/sqlite-ursula` with the extension prebuilt.
+`sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula), published to npm as `@tonbo/sqlite-ursula` with the extension prebuilt. The package has no runtime dependencies, and its Pi Durable adapter is a separate entry, [`@tonbo/sqlite-ursula/pi`](#pi-durable).
 
 Within a minor release (0.7.x), the formats the extension writes to the stream and to the local files do not change. Any 0.7.x extension can attach a stream that another 0.7.x extension wrote, resume from the local files that extension left on the host, and fence the stream's owner, so you can upgrade owners one at a time. The API of the extension and of `@tonbo/sqlite-ursula` can still change in a patch release, as it did in 0.7.3, so upgrade the package together with the extension. A new minor release may also change the formats. Either way, the [release notes](/docs/release-notes) say how to upgrade (see also [Rules](#rules)). The design doc lists the [known limits](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md#7-limits).
 
@@ -37,7 +37,7 @@ cargo build --release   # target/release/libsqlite_ursula_vfs.so (.dylib on macO
 export SQLITE_URSULA_VFS=$PWD/target/release/libsqlite_ursula_vfs.so
 ```
 
-The extension calls whatever SQLite loads it, here `node:sqlite`. Load it once per process: it registers the `ursula` VFS as SQLite's default. `attach` and `openUrsulaPiStorage` load it if you have not.
+The extension calls whatever SQLite loads it, here `node:sqlite`. Load it once per process: it registers the `ursula` VFS as SQLite's default. `attach` (and `openUrsulaPiStorage`) load it if you have not.
 
 ```ts
 import { attach, loadUrsulaVfs, status } from "@tonbo/sqlite-ursula";
@@ -193,16 +193,23 @@ Alerts worth setting:
 
 ## Pi Durable
 
-`openUrsulaPiStorage` attaches the file and opens it with Pi's own node driver:
+Install Pi Durable next to the package:
+
+```bash
+npm install @tonbo/sqlite-ursula @earendil-works/pi-durable
+```
+
+`openUrsulaPiStorage`, from the `@tonbo/sqlite-ursula/pi` entry, attaches the file and opens it with Pi's own node driver. The error classes come from the root entry:
 
 ```ts
-import { openUrsulaPiStorage, UrsulaReplicationError } from "@tonbo/sqlite-ursula";
+import { UrsulaReplicationError } from "@tonbo/sqlite-ursula";
+import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
 
 const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.example.com/pi/harness-1");
 // hand `storage` to the Pi harness; storage.close(ctx) on shutdown
 ```
 
-`@tonbo/sqlite-ursula` supports `@earendil-works/pi-durable` 1.0 and 1.1, the range `>=1.0.0 <1.2.0` it declares as its dependency. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits. Keep your application's `@earendil-works/pi-durable` in the same range, so that npm installs one copy for both. With a version outside it, npm installs a second copy for `@tonbo/sqlite-ursula` without a warning, and `openUrsulaPiStorage` returns that copy's `SqliteStorage`. That `SqliteStorage` implements the `Storage` contract of its own version, so a harness from another version can get wrong results from it. `npm ls @earendil-works/pi-durable` lists the copies.
+`@tonbo/sqlite-ursula` declares `@earendil-works/pi-durable` as an optional peer dependency in the range `>=1.0.0 <1.2.0`, and npm reports a mismatch when your version is outside it. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits. Before 0.7.5, `openUrsulaPiStorage` came from `@tonbo/sqlite-ursula` itself.
 
 A commit the stream does not accept surfaces as `UrsulaReplicationError`; `fenced: true` means another host took the stream over, the stream was deleted and recreated (opening it again then rebuilds the file from the new stream; see Rules), or another writer appended to it with a higher `Stream-Seq`. The storage is then read-only for this process: open it again to take the stream back.
 

@@ -10,7 +10,8 @@
 // extension's frame limit, which the extension refuses itself without sending it.
 import { writeFileSync } from "node:fs";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
-import { attach, instrument, openUrsulaPiStorage, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
+import { attach, instrument, status, UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError } from "../src/index.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
 import { openHarness, textTurn } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
 import { type Child, type ChildLine, Gate, integrity, openPlain, recordingMeter, runChild, streamPath, ursulaUrl } from "./kit.ts";

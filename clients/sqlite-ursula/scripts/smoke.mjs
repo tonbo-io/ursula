@@ -2,6 +2,8 @@
 // where `npm install ./*.tgz` installed @tonbo/sqlite-ursula and this platform's extension package:
 // with SQLITE_URSULA_VFS unset, loadUrsulaVfs() loads the extension from that package, the extension
 // registers its SQL functions, and a plain database works through its VFS. No server is needed.
+// The install has no Pi Durable (an optional peer dependency): the root entry loads without it, and
+// only the `/pi` entry asks for it.
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,5 +24,8 @@ const db = new DatabaseSync(join(mkdtempSync(join(tmpdir(), "smoke-")), "plain.d
 db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (42)");
 assert.equal(db.prepare("SELECT x FROM t").get().x, 42);
 db.close();
+
+assert.throws(() => import.meta.resolve("@earendil-works/pi-durable"), { code: "ERR_MODULE_NOT_FOUND" });
+await assert.rejects(import("@tonbo/sqlite-ursula/pi"), (error) => error.code === "ERR_MODULE_NOT_FOUND" && error.message.includes("@earendil-works/pi-durable"));
 
 console.log(`ok: ${process.platform}-${process.arch}, Node ${process.version}, ${functions.join(", ")}`);

@@ -9,7 +9,8 @@
 // VFS's per-commit numbers, and the owner's status at the end.
 import { writeFileSync } from "node:fs";
 import type { Storage, StorageWrite } from "@earendil-works/pi-durable";
-import { drainStats, openUrsulaPiStorage, status, UrsulaReplicationError, type VfsCommitStat } from "../src/index.ts";
+import { drainStats, status, UrsulaReplicationError, type VfsCommitStat } from "../src/index.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
 import { openHarness, textTurn, toolTurn } from "../test/harness-kit.ts";
 import { ctx } from "../test/helpers.ts";
 

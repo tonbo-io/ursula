@@ -1,7 +1,8 @@
 // Producer fencing: a new owner's claim (a new producer epoch) fences every earlier owner.
 import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
-import { attach, openUrsulaPiStorage, status, UrsulaReplicationError } from "../src/index.ts";
+import { attach, status, UrsulaReplicationError } from "../src/index.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
 import { openHarness } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
 import { integrity, openPlain, runChild, streamPath, ursulaUrl } from "./kit.ts";

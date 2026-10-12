@@ -5,7 +5,8 @@
 import type { Storage } from "@earendil-works/pi-durable";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { describe, expect, it } from "vitest";
-import { loadUrsulaVfs, openUrsulaPiStorage } from "../src/index.ts";
+import { loadUrsulaVfs } from "../src/index.ts";
+import { openUrsulaPiStorage } from "../src/pi.ts";
 import { ctx, freshFile, ReopeningStorage } from "./helpers.ts";
 import { streamPath, ursulaUrl } from "./kit.ts";
 
