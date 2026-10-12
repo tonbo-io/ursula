@@ -7,7 +7,9 @@
 //! `fenced`) and [`Error::refusal`] (the request was refused before it reached the stream, which
 //! applied nothing of it, see [`WriteRefusal`]: the operation fails alone, and `ursula_attach`
 //! reports it as SQLITE_AUTH for a 402, SQLITE_IOERR_AUTH otherwise). Every other variant fails
-//! the operation, or poisons the database until it is attached again.
+//! the operation, or poisons the database until it is attached again. What callers outside the
+//! extension see is [`Error::kind`]: a stable token ([`ErrorKind`]) with what to do about it
+//! ([`Action`]), in every SQL function's error and in `ursula_status`.
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -56,11 +58,23 @@ pub(crate) enum Error {
     },
     #[error("{path} has open connections; close them before attaching")]
     OpenConnections { path: String },
+    /// The process holds the db file open on a descriptor of no connection of this VFS: a
+    /// connection opened before the extension was loaded, or through another VFS (`?vfs=unix`).
+    /// Its commits would never reach the stream (`local::open_in_process`).
+    #[error(
+        "{path} is open in this process outside the extension (descriptor {fd}: a connection opened \
+         before the extension was loaded, or through another VFS), and its commits would never \
+         reach the stream; close it before attaching"
+    )]
+    OpenOutsideVfs { path: String, fd: i32 },
     #[error("{path} is being attached by another thread")]
     AttachInProgress { path: String },
     #[error(
         "{path} is not attached{}",
-        .last_failure.as_ref().map_or_else(String::new, |e| format!(": its last attach failed ({e})"))
+        .last_failure.as_ref().map_or_else(
+            String::new,
+            |e| format!(": its last attach failed ({}: {e})", e.kind().as_str()),
+        )
     )]
     NotAttached {
         path: String,
@@ -152,13 +166,16 @@ pub(crate) enum Error {
     #[error("put {url}: {last}")]
     PutUnknown { url: String, last: Attempt },
     #[error(
-        "{op} {url}: {status}: the endpoint refused this client's credentials (see \
-         URSULA_VFS_TOKEN_FILE and ursula_set_token)"
+        "{op} {url}: {status}{}: the endpoint refused this client's credentials (see \
+         URSULA_VFS_TOKEN_FILE and ursula_set_token)",
+        with_body(.body)
     )]
     Unauthorized {
         op: &'static str,
         url: String,
         status: u16,
+        /// The refusing layer's explanation (`client::body_text`), empty when it sent none.
+        body: String,
     },
     /// Refused before it reached the stream, or never sent, so that the stream applied nothing of
     /// it (see [`WriteRefusal`]).
@@ -311,6 +328,156 @@ pub(crate) enum Error {
     LostWrite { offset: i64 },
     #[error("fsync of the {file} failed ({code}): a write-back to it may have been lost")]
     FileSync { file: &'static str, code: c_int },
+    /// The local WAL holds a commit that no connection of this VFS wrote: its wal-index header
+    /// moved from `seen`, where this process's connections left it, to `found` within the same
+    /// WAL generation (`vfs::WalSeen`). A connection outside the extension (opened before it was
+    /// loaded, through another VFS, or by a process without it) committed to the file, and the
+    /// stream never got that commit.
+    #[error(
+        "the local WAL holds a commit no connection of the extension wrote (its last commit frame \
+         moved from {seen} to {found}): a connection outside the extension (opened before it was \
+         loaded, through another VFS, or by a process without it) wrote the file, and the stream \
+         never got that write; close it and attach the file again"
+    )]
+    ForeignWrite { seen: u32, found: u32 },
+}
+
+/// What kind of failure an error is, as the SQL functions' messages (`<function>: <kind>: ...`)
+/// and `ursula_status` (`error.kind`) name it: a stable token callers branch on instead of the
+/// message's text (design doc §1, errors). One function, [`Error::kind`], maps every error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    /// An argument of a SQL function is unusable (an attach mode, a path with a NUL byte).
+    InvalidArgument,
+    /// The stream URL is unusable as given: it does not parse, names no usable scheme, or answers
+    /// with a redirect the extension does not follow.
+    InvalidUrl,
+    /// The server refused the stream URL's bucket or stream id (a `400` to its `HEAD` or create:
+    /// the message carries the server's explanation).
+    InvalidName,
+    /// No answer from the endpoint: it did not resolve, refused or dropped the connection, or
+    /// timed out, or every attempt of a write failed before it went out.
+    Unreachable,
+    /// The endpoint answered, but put the request off (a 5xx, a `408`, a `429` or a `307`) until
+    /// the retry budget ran out.
+    Unavailable,
+    /// The endpoint refused this client's credentials (a `401`, or a `403` that is no fence).
+    Unauthorized,
+    /// The stream does not exist (or is hidden from these credentials).
+    NotFound,
+    /// A write was refused before it reached the stream, which applied nothing of it
+    /// (`refused_kind` says by what).
+    Refused,
+    /// Another owner claimed the stream, it was deleted and recreated, or a writer outside the
+    /// protocol appended.
+    Fenced,
+    /// An append's outcome stayed unknown until the retry budget ran out (no answer, a 5xx
+    /// without a vouched marker, a `307`): the stream may or may not hold the commit.
+    OutcomeUnknown,
+    /// The file is in use: open connections, another thread or process attaching or holding it,
+    /// or a descriptor of this process outside the extension.
+    InUse,
+    /// The local files cannot be used as they are (no sidecar, another stream's cache, an I/O
+    /// error on them).
+    LocalState,
+    /// The local files hold pages this process did not write there (a lost write-back, a failed
+    /// fsync): nothing read from them may reach the stream.
+    LocalDamage,
+    /// A connection outside the extension wrote the local files (`Error::ForeignWrite`).
+    ForeignWrite,
+    /// The stream holds something the extension cannot follow (an undecodable frame, lost
+    /// acknowledged data, an unexpected answer).
+    StreamState,
+    /// The application did something the VFS does not support (left WAL mode, another page size,
+    /// `locking_mode=EXCLUSIVE`).
+    Unsupported,
+    /// The file was never attached in this process.
+    NotAttached,
+    /// The file's last attach in this process failed: it opens again once an attach succeeds.
+    AttachFailed,
+    /// A failure inside the extension or the host's SQLite (a panic, a missing routine).
+    Internal,
+}
+
+/// What a caller does about an error of a kind ([`ErrorKind::action`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Nothing reached the stream: the same handle works again later (commit or attach again
+    /// once the cause is gone).
+    Retry,
+    /// The file is poisoned (or its attach failed for a reason an attach may not meet again):
+    /// close every connection and attach it again, which replays what the stream holds.
+    Reattach,
+    /// Another owner holds the stream: stop writing. Attaching again takes it back from that
+    /// owner, which only a deliberate takeover does.
+    Stop,
+    /// The request cannot succeed as made: fix the URL, the name, the setup or the use, then
+    /// attach again.
+    Fix,
+}
+
+impl Action {
+    /// The stable token.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Action::Retry => "retry",
+            Action::Reattach => "reattach",
+            Action::Stop => "stop",
+            Action::Fix => "fix",
+        }
+    }
+}
+
+impl ErrorKind {
+    /// The stable token.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::InvalidArgument => "invalid_argument",
+            ErrorKind::InvalidUrl => "invalid_url",
+            ErrorKind::InvalidName => "invalid_name",
+            ErrorKind::Unreachable => "unreachable",
+            ErrorKind::Unavailable => "unavailable",
+            ErrorKind::Unauthorized => "unauthorized",
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::Refused => "refused",
+            ErrorKind::Fenced => "fenced",
+            ErrorKind::OutcomeUnknown => "outcome_unknown",
+            ErrorKind::InUse => "in_use",
+            ErrorKind::LocalState => "local_state",
+            ErrorKind::LocalDamage => "local_damage",
+            ErrorKind::ForeignWrite => "foreign_write",
+            ErrorKind::StreamState => "stream_state",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::NotAttached => "not_attached",
+            ErrorKind::AttachFailed => "attach_failed",
+            ErrorKind::Internal => "internal",
+        }
+    }
+
+    /// What a caller does about it.
+    pub(crate) fn action(self) -> Action {
+        match self {
+            ErrorKind::Unreachable
+            | ErrorKind::Unavailable
+            | ErrorKind::Unauthorized
+            | ErrorKind::Refused => Action::Retry,
+            ErrorKind::Fenced => Action::Stop,
+            ErrorKind::OutcomeUnknown
+            | ErrorKind::LocalDamage
+            | ErrorKind::ForeignWrite
+            | ErrorKind::StreamState
+            | ErrorKind::LocalState
+            | ErrorKind::AttachFailed
+            | ErrorKind::Internal => Action::Reattach,
+            ErrorKind::InvalidArgument
+            | ErrorKind::InvalidUrl
+            | ErrorKind::InvalidName
+            | ErrorKind::NotFound
+            | ErrorKind::InUse
+            | ErrorKind::Unsupported
+            | ErrorKind::NotAttached => Action::Fix,
+        }
+    }
 }
 
 /// The data asked for lies below the stream's retention (or a snapshot was superseded): a
@@ -567,8 +734,129 @@ impl Error {
     pub(crate) fn is_local_damage(&self) -> bool {
         matches!(
             self,
-            Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. }
+            Error::Fsync { .. }
+                | Error::LostWrite { .. }
+                | Error::FileSync { .. }
+                | Error::ForeignWrite { .. }
         )
+    }
+
+    /// The kind of this error as the reason a database is poisoned. A poison is never retried on
+    /// the same handle, so a kind that would be (an append answered with a `403` that is neither
+    /// the fence nor vouched, which a proxy may have sent in place of the stream's own answer) is
+    /// an unknown outcome there.
+    pub(crate) fn poison_kind(&self) -> ErrorKind {
+        match self.kind() {
+            kind if kind.action() == Action::Retry => ErrorKind::OutcomeUnknown,
+            kind => kind,
+        }
+    }
+
+    /// What kind of failure this is ([`ErrorKind`]).
+    pub(crate) fn kind(&self) -> ErrorKind {
+        if self.is_fenced() {
+            return ErrorKind::Fenced;
+        }
+        match self {
+            Error::AttachMode { .. } | Error::NulInPath { .. } => ErrorKind::InvalidArgument,
+            Error::Redirected { .. } => ErrorKind::InvalidUrl,
+            Error::Http { source, .. } => transport_kind(source),
+            Error::Status { op, status, .. } => status_kind(op, *status),
+            Error::Unauthorized { .. } => ErrorKind::Unauthorized,
+            Error::Refused {
+                refusal: WriteRefusal::Unreachable { .. },
+                ..
+            } => ErrorKind::Unreachable,
+            Error::Refused { .. } => ErrorKind::Refused,
+            Error::PutUnknown { last, .. } => match last {
+                Attempt::Transport(source) => transport_kind(source),
+                Attempt::Status { .. } | Attempt::Deferred { .. } => ErrorKind::Unavailable,
+            },
+            Error::AppendUnknown { .. } => ErrorKind::OutcomeUnknown,
+            Error::NoStream { .. } | Error::StreamMissing { .. } => ErrorKind::NotFound,
+            Error::OpenElsewhere { .. }
+            | Error::AttachedElsewhere { .. }
+            | Error::OpenConnections { .. }
+            | Error::OpenOutsideVfs { .. }
+            | Error::AttachInProgress { .. } => ErrorKind::InUse,
+            Error::NotAttached {
+                last_failure: None, ..
+            } => ErrorKind::NotAttached,
+            Error::NotAttached { .. } => ErrorKind::AttachFailed,
+            Error::NoSidecar { .. }
+            | Error::OtherStream { .. }
+            | Error::Io { .. }
+            | Error::FullPathname { .. }
+            | Error::PostAck { .. }
+            | Error::NotPublished { .. }
+            | Error::LocalWalWrite(_) => ErrorKind::LocalState,
+            Error::ForeignWrite { .. } => ErrorKind::ForeignWrite,
+            Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. } => {
+                ErrorKind::LocalDamage
+            }
+            Error::DbWriteOutsideCheckpoint
+            | Error::DbTruncateOutsideCheckpoint
+            | Error::WalWriteOutsideTransaction
+            | Error::PageSize(_)
+            | Error::LeavesWal => ErrorKind::Unsupported,
+            Error::NoIncarnation { .. }
+            | Error::NoNextOffset { .. }
+            | Error::OffsetNotAdvanced { .. }
+            | Error::StreamEnded { .. }
+            | Error::ClaimCut { .. }
+            | Error::ClaimScan { .. }
+            | Error::ClaimRaces { .. }
+            | Error::ClaimAnswer { .. }
+            | Error::Frame { .. }
+            | Error::Snapshot { .. }
+            | Error::SnapshotOffset { .. }
+            | Error::SnapshotNotReadBack { .. }
+            | Error::SnapshotTooLarge { .. }
+            | Error::SnapshotTimedOut { .. }
+            | Error::LostData { .. }
+            | Error::Gone(_)
+            | Error::AppendRejected { .. }
+            | Error::AckNotPast { .. }
+            | Error::RefusedCommitApplied { .. }
+            | Error::ProducerExpiredAgain
+            | Error::Recreated { .. }
+            | Error::Fenced(_) => ErrorKind::StreamState,
+            Error::Panicked { .. }
+            | Error::SpawnSnapshotThread(_)
+            | Error::SqliteOpen { .. }
+            | Error::SqliteQuery { .. }
+            | Error::NoResultRow { .. }
+            | Error::PersistWal(_)
+            | Error::FileHandle { .. }
+            | Error::ReadPages { .. }
+            | Error::MissingRoutine(_)
+            | Error::EncodeFrame(_) => ErrorKind::Internal,
+        }
+    }
+}
+
+/// The kind of a request that got no answer: a URL that cannot be sent at all is the caller's to
+/// fix, anything else is the endpoint's (or the network's).
+fn transport_kind(e: &ureq::Error) -> ErrorKind {
+    match e {
+        ureq::Error::BadUri(_)
+        | ureq::Error::Http(_)
+        | ureq::Error::RequireHttpsOnly(_)
+        | ureq::Error::InvalidProxyUrl => ErrorKind::InvalidUrl,
+        _ => ErrorKind::Unreachable,
+    }
+}
+
+/// The kind of a final answer `status` to request `op` that its error names no other way. A `400`
+/// to the stream's `HEAD` or create refuses its URL's bucket or stream id (any later request
+/// carries ids the server took already).
+fn status_kind(op: &str, status: u16) -> ErrorKind {
+    match status {
+        400 if matches!(op, "head" | "create") => ErrorKind::InvalidName,
+        401 | 403 => ErrorKind::Unauthorized,
+        404 => ErrorKind::NotFound,
+        307 | 408 | 429 | 500..=599 => ErrorKind::Unavailable,
+        _ => ErrorKind::StreamState,
     }
 }
 
@@ -615,6 +903,7 @@ fn with_token(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::Attempt;
     use super::Error;
     use super::Fence;
     use super::FrameLimit;
@@ -713,6 +1002,7 @@ mod tests {
             op: "head",
             url: "http://h/b/s".into(),
             status: 401,
+            body: String::new(),
         };
         assert_eq!(unauthorized.refusal(), None);
         let pressure = Error::Refused {
@@ -761,6 +1051,136 @@ mod tests {
             "head http://h/b/s: 301 redirect to https://h/b/s: the extension never follows \
              redirects (point the stream URL at the server or gateway itself)"
         );
+    }
+
+    // Every error has a stable kind, and every kind an action. A refusal is retried, an unknown
+    // outcome attached again, a fence stops; a URL or name the server refuses, or a file in use,
+    // needs a fix. The SQL functions show the kind after their name.
+    #[test]
+    fn errors_have_stable_kinds() {
+        let url = || "http://h/b/s".to_owned();
+        let status = |op, status| Error::Status {
+            op,
+            url: url(),
+            status,
+            body: String::new(),
+        };
+        let cases = [
+            (status("head", 400), "invalid_name", "fix"),
+            (status("create", 400), "invalid_name", "fix"),
+            (status("read", 400), "stream_state", "reattach"),
+            (status("head", 404), "not_found", "fix"),
+            (status("head", 503), "unavailable", "retry"),
+            (
+                Error::Http {
+                    op: "head",
+                    url: url(),
+                    source: Box::new(ureq::Error::ConnectionFailed),
+                },
+                "unreachable",
+                "retry",
+            ),
+            (
+                Error::Http {
+                    op: "head",
+                    url: url(),
+                    source: Box::new(ureq::Error::BadUri("no host".into())),
+                },
+                "invalid_url",
+                "fix",
+            ),
+            (
+                Error::Refused {
+                    op: "claim",
+                    url: url(),
+                    refusal: WriteRefusal::RateLimited {
+                        body: String::new(),
+                    },
+                },
+                "refused",
+                "retry",
+            ),
+            (
+                Error::Refused {
+                    op: "claim",
+                    url: url(),
+                    refusal: WriteRefusal::Unreachable {
+                        reason: "timeout: resolve".into(),
+                    },
+                },
+                "unreachable",
+                "retry",
+            ),
+            (
+                Error::AppendUnknown {
+                    attempts: 35,
+                    last: Attempt::Status {
+                        status: 503,
+                        body: String::new(),
+                    },
+                },
+                "outcome_unknown",
+                "reattach",
+            ),
+            (
+                Error::Fenced(Fence::Superseded {
+                    epoch: 1,
+                    current: Some(2),
+                }),
+                "fenced",
+                "stop",
+            ),
+            (
+                Error::Recreated {
+                    url: url(),
+                    incarnation: "i1".into(),
+                },
+                "fenced",
+                "stop",
+            ),
+            (
+                Error::OpenOutsideVfs {
+                    path: "/data/app.db".into(),
+                    fd: 7,
+                },
+                "in_use",
+                "fix",
+            ),
+            (
+                Error::ForeignWrite { seen: 2, found: 4 },
+                "foreign_write",
+                "reattach",
+            ),
+            (
+                Error::NotAttached {
+                    path: "/data/app.db".into(),
+                    last_failure: None,
+                },
+                "not_attached",
+                "fix",
+            ),
+            (Error::LeavesWal, "unsupported", "fix"),
+            (Error::Panicked { entry: "x_read" }, "internal", "reattach"),
+        ];
+        for (e, kind, action) in cases {
+            assert_eq!(
+                (e.kind().as_str(), e.kind().action().as_str()),
+                (kind, action),
+                "{e}"
+            );
+        }
+        let failed = Error::NotAttached {
+            path: "/data/app.db".into(),
+            last_failure: Some(std::sync::Arc::new(status("head", 400))),
+        };
+        assert_eq!(failed.kind().as_str(), "attach_failed");
+        assert_eq!(
+            failed.to_string(),
+            "/data/app.db is not attached: its last attach failed (invalid_name: head \
+             http://h/b/s: 400)"
+        );
+        // A foreign commit is local damage: no snapshot publishes it.
+        assert!(Error::ForeignWrite { seen: 2, found: 4 }.is_local_damage());
     }
 
     // `ursula_status` reports a refusal's kind (stable names) and its reason: the marker's token or

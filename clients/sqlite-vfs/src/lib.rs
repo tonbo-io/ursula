@@ -13,7 +13,11 @@
 //!   A db file with a sidecar (`<db>-ursula`: it is the cache of a stream) opens only while an
 //!   attach of it has succeeded in this process: before that, after a failed attach, or in a
 //!   process that never attached it, opening it fails (SQLITE_CANTOPEN), so it is never written
-//!   unreplicated. A file without a sidecar passes through to "unix".
+//!   unreplicated. A file without a sidecar passes through to "unix", unless its last attach in this
+//!   process failed. Attach also refuses while the process holds the db file open outside this VFS
+//!   (a connection opened before the extension was loaded), and a commit such a connection makes
+//!   later poisons the owner at its next write transaction (`ForeignWrite`). A fenced owner's reads
+//!   fail too (SQLITE_IOERR_READ).
 //!   `SELECT ursula_attach(path, stream_url, 'read_only')` catches the file up the same way but
 //!   claims nothing and never writes the stream (no claim, commit, snapshot or retention move): it
 //!   fences no owner, works while a layer in front of the stream refuses writes, and every write to
@@ -99,7 +103,7 @@
 //!   `{"offset","epoch","poisoned","fenced","reason","read_only","payment_required",
 //!   "payment_reason","writes_refused","refused_kind","refused_reason","snapshot","retained",
 //!   "local","installed","attach_ms","commits","append_retries","log_bytes","snapshot_due_bytes",
-//!   "snapshot_age_ms","snapshot_failures","snapshot_error","snapshot_bytes"}` (offsets as strings;
+//!   "snapshot_age_ms","snapshot_failures","snapshot_error","snapshot_bytes","error"}` (offsets as strings;
 //!   `reason`: the first poison's, which a later one never replaces; `fenced`: a fence was seen
 //!   since, first or later, never reset; `writes_refused`: the latest write was refused before it
 //!   reached the stream, until a commit is acknowledged (never while poisoned), with what refused
@@ -112,9 +116,13 @@
 //!   the local state attach started from, `-1` when it rebuilt the file; `installed`: the offset of
 //!   the snapshot attach installed, `-1` for none; `snapshot`, `retained`: `-1` for none;
 //!   `snapshot_bytes`: the compressed size of the latest snapshot body built, published or not;
+//!   `error`: why writes fail now, `{"kind","action","message"}` or null (see `error::ErrorKind`);
 //!   the rest are the owner's health, see `status`);
 //!   `SELECT ursula_stats(path)` drains per-commit, per-checkpoint and per-snapshot numbers (bench):
 //!   at most the newest 8,192 of each kind between drains, and `dropped` counts the rest.
+//!
+//! Every SQL function's error reads `<function>: <kind>: <message>`, the kind a stable token
+//! (`error::ErrorKind`).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds every retry

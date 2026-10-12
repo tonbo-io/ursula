@@ -240,6 +240,14 @@ impl Private {
         }
     }
 
+    /// The wal-index header, through the connection's own db file handle (see `file`), once the
+    /// connection has mapped the wal-index (it read or checkpointed).
+    pub(crate) fn wal_index_header(&self) -> Option<WalIndexHeader> {
+        let (f, _methods) = self.file(ffi::SQLITE_FCNTL_FILE_POINTER, "db file").ok()?;
+        // SAFETY: `f` is the connection's open db file, with its VFS's methods.
+        unsafe { wal_index_header(f) }
+    }
+
     /// Pages `1..=n` of the db file, read through the connection's own file handle (see `file`).
     pub(crate) fn read_pages(&self, n: u32) -> Result<Vec<u8>, Error> {
         /// The most read at once: 256 pages.
@@ -298,6 +306,43 @@ impl Drop for Private {
             unsafe { close(self.db) };
         }
     }
+}
+
+/// The size of a wal-index region (the first holds the header).
+const WAL_INDEX_REGION: c_int = 32 * 1024;
+
+/// What the wal-index header's first copy says about the WAL: its generation (the salts, the WAL
+/// header's bytes 16..24) and the frame number of its last commit (`mxFrame`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalIndexHeader {
+    pub(crate) mx_frame: u32,
+    pub(crate) salts: [u8; 8],
+}
+
+/// The wal-index header of the database `f` is the main db file of, read through `f`'s own
+/// `xShmMap` without creating the region: `None` when the wal-index is not mapped.
+///
+/// # Safety
+///
+/// `f` is an open main db file whose `pMethods` are those of the VFS that opened it.
+pub(crate) unsafe fn wal_index_header(f: *mut ffi::sqlite3_file) -> Option<WalIndexHeader> {
+    // SAFETY: the caller's contract: `f` is an open file.
+    let methods = unsafe { (*f).pMethods };
+    // SAFETY: an open file's methods are its VFS's io methods, a static table.
+    let shm_map = unsafe { methods.as_ref() }?.xShmMap?;
+    let mut p: *mut std::ffi::c_void = null_mut();
+    // SAFETY: `f` is open, and region 0 is only looked up (`extend` 0), written to `p`.
+    let rc = unsafe { shm_map(f, 0, WAL_INDEX_REGION, 0, &raw mut p) };
+    if rc != OK || p.is_null() {
+        return None;
+    }
+    let p = p.cast::<u8>();
+    // SAFETY: region 0 of the wal-index is mapped (32 KiB, page aligned): mxFrame, the native
+    // endian u32 at byte 16, lies in it, aligned.
+    let mx_frame = unsafe { p.wrapping_add(16).cast::<u32>().read_volatile() };
+    // SAFETY: as above, for the 8 bytes of salts at byte 32.
+    let salts = unsafe { p.wrapping_add(32).cast::<[u8; 8]>().read_volatile() };
+    Some(WalIndexHeader { mx_frame, salts })
 }
 
 /// Gives an empty file its WAL-format page 1 through a private "unix" connection, so no

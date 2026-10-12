@@ -24,6 +24,7 @@ use crate::config::abort_in_replay;
 use crate::db::Db;
 use crate::db::Mode;
 use crate::db::SnapshotThread;
+use crate::db::WalSeen;
 use crate::db::registry;
 use crate::error::Error;
 use crate::error::Fence;
@@ -35,10 +36,12 @@ use crate::frame::Record;
 use crate::guard::contain;
 use crate::host::full_pathname;
 use crate::host::init_wal_format;
+use crate::local::Fresh;
 use crate::local::SIDECAR_VERSION;
 use crate::local::boot_id;
 use crate::local::discard_local;
 use crate::local::lock_unused;
+use crate::local::open_in_process;
 use crate::local::read_sidecar;
 use crate::local::remove_if_exists;
 use crate::local::sidecar_line;
@@ -410,7 +413,18 @@ pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Er
                     log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
                 }
             }
-            attach_files_rebuilding(&path, &url, mode)
+            let fresh = Fresh::of(&path);
+            let outcome = attach_files_rebuilding(&path, &url, mode);
+            if outcome.is_err()
+                && let Some(fresh) = fresh
+                && let Err(e) = fresh.restore(&path)
+            {
+                log::emit(Level::Warn, "attach_restore_failed", &[
+                    ("file", &path),
+                    ("reason", &e),
+                ]);
+            }
+            outcome
         },
     );
     let mut reg = registry();
@@ -465,6 +479,15 @@ fn attach_files_rebuilding(path: &str, url: &str, mode: Mode) -> Result<Attached
 /// bind. A read-only attachment gets no snapshot thread: it never writes the stream.
 fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     let started = Instant::now();
+    // No connection of this VFS has the file open (`attach` checked), and the previous
+    // attachment's snapshot thread has closed its own: a descriptor still open on it belongs to a
+    // connection outside the extension, whose commits would never reach the stream.
+    if let Some(fd) = open_in_process(path) {
+        return Err(Error::OpenOutsideVfs {
+            path: path.to_owned(),
+            fd,
+        });
+    }
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
     let boot = boot.as_deref();
@@ -634,6 +657,13 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     }
     // The db file alone must be on disk before the sidecar says so (no connection is open, so
     // this descriptor's close drops no lock).
+    // A WAL attach kept holds frames no connection of this process wrote: nothing is known of it
+    // until a write transaction ends (`WalSeen`). Otherwise attach deleted it.
+    let wal_seen = if wal.is_some() {
+        WalSeen::Unknown
+    } else {
+        WalSeen::Empty
+    };
     let wal = match wal {
         Some(wal) => wal,
         None => {
@@ -670,6 +700,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         refused_at: None,
         overlay: BTreeMap::new(),
         wal_written: BTreeMap::new(),
+        wal_seen,
         committed: false,
         commit_frame_no: 0,
         wal_open: 0,

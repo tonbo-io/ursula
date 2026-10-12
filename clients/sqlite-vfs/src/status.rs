@@ -5,6 +5,7 @@ use crate::db::Mode;
 use crate::db::attached;
 use crate::db::lock;
 use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::error::WriteRefusal;
 use crate::host::full_pathname;
 use crate::stats::Drained;
@@ -104,12 +105,37 @@ fn status_json(db: &Db) -> String {
             db.snapshot_bytes
                 .map_or_else(null, |bytes| bytes.to_string()),
         ),
+        ("error", error_json(db).unwrap_or_else(null)),
     ];
     let body: Vec<String> = fields
         .iter()
         .map(|(key, value)| format!("\"{key}\":{value}"))
         .collect();
     format!("{{{}}}", body.join(","))
+}
+
+/// Why writes to the database fail now, as `ursula_status` reports it (`error`):
+/// `{"kind","action","message"}`, `None` while they do not. A poison's kind is `fenced` once a
+/// fence was seen (`Poisoned::fenced`), whatever the first reason was, and otherwise the first
+/// reason's (`Error::poison_kind`), whose text is the message (the `reason` field's). A write
+/// refused before it reached the stream is `unreachable` when no attempt of it went out, and
+/// `refused` otherwise (`refused_kind` says by what).
+fn error_json(db: &Db) -> Option<String> {
+    let (kind, message) = match (&db.poisoned, &db.refused) {
+        (Some(p), _) if p.fenced => (ErrorKind::Fenced, p.first.to_string()),
+        (Some(p), _) => (p.first.poison_kind(), p.first.to_string()),
+        (None, Some(refusal @ WriteRefusal::Unreachable { .. })) => {
+            (ErrorKind::Unreachable, refusal.to_string())
+        }
+        (None, Some(refusal)) => (ErrorKind::Refused, refusal.to_string()),
+        (None, None) => return None,
+    };
+    Some(format!(
+        "{{\"kind\":{},\"action\":{},\"message\":{}}}",
+        json_str(kind.as_str()),
+        json_str(kind.action().as_str()),
+        json_str(&message)
+    ))
 }
 
 /// `ursula_stats`: drains the attached database's measurements (see [`Stats`]).
@@ -186,6 +212,9 @@ mod tests {
     use super::stats_json;
     use super::status_json;
     use crate::db::Db;
+    use crate::error::Attempt;
+    use crate::error::Error;
+    use crate::error::Fence;
     use crate::error::WriteRefusal;
     use crate::stats::CommitStat;
     use crate::stats::KEPT;
@@ -214,6 +243,64 @@ mod tests {
             "{}",
             json.get(json.len().saturating_sub(120)..).unwrap_or(&json)
         );
+    }
+
+    // Why writes fail now, as one object with a stable kind and what to do about it. The three
+    // outcomes of a failed commit stay apart: refused before it reached the stream (retry on the
+    // same handle), unknown after the retry budget (poisoned, attach again) and fenced by a newer
+    // owner (stop). A fence seen after another poison makes the kind `fenced`.
+    #[test]
+    fn the_error_names_its_kind_and_what_to_do() {
+        let error = |d: &Db| {
+            let status = status_json(d);
+            let (_, error) = status.split_once(r#","error":"#).unwrap();
+            error.strip_suffix('}').unwrap().to_owned()
+        };
+        let mut d = Db::for_tests();
+        assert_eq!(error(&d), "null");
+        d.refuse(WriteRefusal::RateLimited {
+            body: "slow down".into(),
+        });
+        assert_eq!(
+            error(&d),
+            r#"{"kind":"refused","action":"retry","message":"429 slow down: rate limited until the retry budget ran out"}"#
+        );
+        d.refuse(WriteRefusal::Unreachable {
+            reason: "timeout: resolve".into(),
+        });
+        assert!(error(&d).starts_with(r#"{"kind":"unreachable","action":"retry","#));
+
+        let mut d = Db::for_tests();
+        d.poison(Error::AppendUnknown {
+            attempts: 35,
+            last: Attempt::Status {
+                status: 503,
+                body: String::new(),
+            },
+        });
+        assert_eq!(
+            error(&d),
+            r#"{"kind":"outcome_unknown","action":"reattach","message":"append: 503 (outcome unknown after 35 attempts)"}"#
+        );
+        // An append's 403 that is neither the fence nor vouched may stand in for the stream's
+        // answer: its poison is an unknown outcome too, never something to retry.
+        let mut d = Db::for_tests();
+        d.poison(Error::Unauthorized {
+            op: "append",
+            url: "http://h/b/s".into(),
+            status: 403,
+            body: String::new(),
+        });
+        assert!(error(&d).starts_with(r#"{"kind":"outcome_unknown","action":"reattach","#));
+        d.poison(Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: Some(3),
+        }));
+        assert!(error(&d).starts_with(r#"{"kind":"fenced","action":"stop","message":"append "#));
+
+        let mut d = Db::for_tests();
+        d.poison(Error::ForeignWrite { seen: 4, found: 6 });
+        assert!(error(&d).starts_with(r#"{"kind":"foreign_write","action":"reattach","#));
     }
 
     // A write refused before it reached the stream shows in `writes_refused`, with its kind and

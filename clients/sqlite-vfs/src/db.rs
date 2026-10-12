@@ -19,6 +19,7 @@ use crate::config::snapshot_min_bytes;
 use crate::error::Error;
 use crate::error::WriteRefusal;
 use crate::host::OK;
+use crate::host::WalIndexHeader;
 use crate::log;
 use crate::log::Level;
 use crate::snapshotter::Snapper;
@@ -102,6 +103,9 @@ pub(crate) struct Db {
     /// offset. A page read back with other bytes was lost on its way to the disk (see
     /// `overlay_read`).
     pub(crate) wal_written: BTreeMap<i64, u32>,
+    /// Where this process's connections left the local WAL (`WalSeen`): checked whenever one
+    /// takes the WAL write lock, and by the snapshot thread before it copies pages.
+    pub(crate) wal_seen: WalSeen,
     /// The transaction's commit is acknowledged: later writes go straight to the local WAL, and
     /// the sidecar advances once the transaction ends.
     pub(crate) committed: bool,
@@ -154,6 +158,39 @@ pub(crate) struct Db {
     /// have failed for its size, which a probe of the stream decides
     /// (`snapshotter::FailureKind::may_be_size`).
     pub(crate) snapshot_published_bytes: usize,
+}
+
+/// Where the connections of this VFS left the local WAL's wal-index header: recorded whenever
+/// one releases the WAL write lock, so a commit that moved the header since came from a connection
+/// outside the extension ([`WalSeen::foreign`]). The header changes only under the write lock,
+/// apart from a recovery, which rebuilds it from the WAL file as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalSeen {
+    /// Nothing known: the WAL attach kept (trusted local files), until a connection's write
+    /// transaction ends.
+    Unknown,
+    /// No WAL frames: attach deleted the WAL, or a connection of this VFS truncated it to nothing.
+    Empty,
+    /// The header as a connection of this VFS left it.
+    At(WalIndexHeader),
+}
+
+impl WalSeen {
+    /// The last commit frame this process left, when `header` shows a commit since that no
+    /// connection of this VFS wrote: a frame count that moved within the same WAL generation (the
+    /// same salts), or frames after an empty WAL. A new generation is not taken for one: SQLite
+    /// starts one only after every frame is in the db file, and a recovery from a WAL whose
+    /// restart never reached the file (it stays in the overlay until its commit) shows the old
+    /// generation again. So a foreign commit that a WAL restart followed goes unseen.
+    pub(crate) fn foreign(&self, header: WalIndexHeader) -> Option<u32> {
+        match *self {
+            WalSeen::Empty if header.mx_frame != 0 => Some(0),
+            WalSeen::At(seen) if seen.salts == header.salts && seen.mx_frame != header.mx_frame => {
+                Some(seen.mx_frame)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Why an attached database is poisoned: the first reason, and what any reason so far showed.
@@ -426,25 +463,26 @@ pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, Error> {
     })
 }
 
-/// Why `x_open` refuses the main db `path` that has no binding: a sidecar next to it makes it the
-/// cache of a stream, which passed through to "unix" would take commits that never reach the stream
-/// (in a process that never attached it, or after its attach failed: the files may hold anything
-/// between their old state and the stream's). A path without a sidecar passes through. No WAL open
-/// can follow a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
+/// Why `x_open` refuses the main db `path` that has no binding. After a failed attach of it in
+/// this process, always: the application meant it to be replicated, and passed through to "unix"
+/// its commits would never reach the stream (and its files may hold anything between their old
+/// state and the stream's). Otherwise a sidecar next to it makes it the cache of a stream (in a
+/// process that never attached it), and a path without one passes through. No WAL open can follow
+/// a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
 pub(crate) fn refused(reg: &Registry, path: &str) -> Option<Refusal> {
+    if let Some(why) = reg.failed.get(path) {
+        return Some(Refusal::AttachFailed(why.clone()));
+    }
     if !fs::exists(format!("{path}-ursula")).unwrap_or(true) {
         return None;
     }
-    Some(match reg.failed.get(path) {
-        Some(why) => Refusal::AttachFailed(why.clone()),
-        None => Refusal::NotAttached,
-    })
+    Some(Refusal::NotAttached)
 }
 
 /// Why `x_open` refuses a main db (`refused`), for its log line.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Refusal {
-    #[error("its last attach failed ({0}); attach it again")]
+    #[error("its last attach failed ({}: {0}); attach it again", .0.kind().as_str())]
     AttachFailed(Arc<Error>),
     #[error("it is the cache of an Ursula stream (it has a sidecar); attach it first")]
     NotAttached,
@@ -476,6 +514,7 @@ impl Db {
             refused_at: None,
             overlay: BTreeMap::new(),
             wal_written: BTreeMap::new(),
+            wal_seen: WalSeen::Empty,
             committed: false,
             commit_frame_no: 0,
             wal_open: 0,
@@ -505,14 +544,21 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use libsqlite3_sys as ffi;
 
     use super::Db;
     use super::Mode;
+    use super::Refusal;
+    use super::Registry;
+    use super::WalSeen;
+    use super::refused;
     use crate::error::Error;
     use crate::error::Fence;
     use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
+    use crate::host::WalIndexHeader;
 
     // A commit refused before it reached the stream (a 402, or any refusal that applied nothing)
     // fails its transaction alone: the overlay goes, as on a poison, but the database is not
@@ -652,6 +698,57 @@ mod tests {
         assert_eq!(d.refused, Some(too_large));
         assert!(d.layer_refused.is_none() && d.refused_at.is_none());
         assert!(d.snapshot_wanted());
+    }
+
+    // A commit no connection of this VFS wrote: the last frame moved within the generation they
+    // left, or frames appeared after an empty WAL. A new generation, or nothing known, is no
+    // evidence (SQLite restarts the WAL only after a full checkpoint, and a recovery can show the
+    // old generation again).
+    #[test]
+    fn a_foreign_commit_moves_the_frame_count_within_a_generation() {
+        let header = |mx_frame, salt| WalIndexHeader {
+            mx_frame,
+            salts: [salt; 8],
+        };
+        let seen = WalSeen::At(header(7, 1));
+        assert_eq!(seen.foreign(header(7, 1)), None);
+        assert_eq!(seen.foreign(header(9, 1)), Some(7));
+        assert_eq!(seen.foreign(header(3, 1)), Some(7));
+        assert_eq!(seen.foreign(header(9, 2)), None);
+        assert_eq!(WalSeen::Empty.foreign(header(0, 5)), None);
+        assert_eq!(WalSeen::Empty.foreign(header(2, 5)), Some(0));
+        assert_eq!(WalSeen::Unknown.foreign(header(2, 5)), None);
+    }
+
+    // After a failed attach, `x_open` refuses the path whether or not a sidecar exists (the
+    // attach may have failed before writing one), naming the failure's kind; a path never
+    // attached opens unless it has a sidecar.
+    #[test]
+    fn a_failed_attach_refuses_opens_without_a_sidecar_too() {
+        let dir = std::env::temp_dir().join(format!("ursula-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.db").to_string_lossy().into_owned();
+        let mut reg = Registry::default();
+        assert!(refused(&reg, &path).is_none());
+        reg.failed.insert(
+            path.clone(),
+            Arc::new(Error::Status {
+                op: "head",
+                url: "http://h/s2/kv1".into(),
+                status: 400,
+                body: "bucket_id must be 4 to 64 bytes, got 2 bytes".into(),
+            }),
+        );
+        let why = refused(&reg, &path).unwrap();
+        assert!(matches!(why, Refusal::AttachFailed(_)));
+        assert!(
+            why.to_string()
+                .starts_with("its last attach failed (invalid_name: head ")
+        );
+        reg.failed.clear();
+        std::fs::write(format!("{path}-ursula"), "x").unwrap();
+        assert!(matches!(refused(&reg, &path), Some(Refusal::NotAttached)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

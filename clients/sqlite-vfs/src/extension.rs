@@ -71,16 +71,14 @@ fn c_text(s: &str) -> CString {
     CString::new(s.replace('\0', " ")).unwrap_or_default()
 }
 
-/// Returns `outcome` from a SQL function: its text, or the error as `name: error`.
+/// Returns `outcome` from a SQL function: its text, or the error as `name: kind: error`, the
+/// kind ([`ErrorKind`]) a stable token in a fixed place, which callers branch on instead of the
+/// text.
 ///
 /// # Safety
 ///
 /// `ctx` is the context SQLite passed to the function.
-unsafe fn result<E: std::fmt::Display>(
-    ctx: *mut ffi::sqlite3_context,
-    name: &str,
-    outcome: Result<String, E>,
-) {
+unsafe fn result(ctx: *mut ffi::sqlite3_context, name: &str, outcome: Result<String, &Error>) {
     let Some(a) = api() else {
         return;
     };
@@ -94,7 +92,7 @@ unsafe fn result<E: std::fmt::Display>(
             }
         }
         Err(e) => {
-            let c = c_text(&format!("{name}: {e}"));
+            let c = c_text(&format!("{name}: {}: {e}", e.kind().as_str()));
             if let Some(result_error) = a.result_error {
                 // SAFETY: `ctx` is the function's context, and SQLite copies the NUL-terminated
                 // message.
@@ -146,7 +144,13 @@ unsafe fn fn_attach(
         .and_then(|mode| attach(&path, &url, mode));
     let refused = outcome.as_ref().err().and_then(|e| refused_code(e));
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_attach", outcome) };
+    unsafe {
+        result(
+            ctx,
+            "ursula_attach",
+            outcome.as_ref().cloned().map_err(|e| &**e),
+        )
+    };
     if let Some(code) = refused {
         // SAFETY: as above; `result` set the error.
         unsafe { result_error_code(ctx, code) };
@@ -161,7 +165,7 @@ unsafe fn fn_status(
     // SAFETY: SQLite calls the function with its arguments.
     let path = unsafe { arg(argc, argv, 0) };
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_status", status(&path)) };
+    unsafe { result(ctx, "ursula_status", status(&path).as_ref().cloned()) };
 }
 
 unsafe fn fn_stats(
@@ -172,7 +176,7 @@ unsafe fn fn_stats(
     // SAFETY: SQLite calls the function with its arguments.
     let path = unsafe { arg(argc, argv, 0) };
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_stats", stats(&path)) };
+    unsafe { result(ctx, "ursula_stats", stats(&path).as_ref().cloned()) };
 }
 
 /// `ursula_set_token(token)`: the bearer token every request carries from now on; NULL or `''` goes
@@ -186,7 +190,7 @@ unsafe fn fn_set_token(
     let token = unsafe { arg(argc, argv, 0) };
     set_token(Some(&token));
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_set_token", Ok::<_, Error>(String::new())) };
+    unsafe { result(ctx, "ursula_set_token", Ok(String::new())) };
 }
 
 /// A SQL function's C entry point: runs the function named without `c_` through [`contain`], so a
@@ -203,13 +207,7 @@ macro_rules! sql_entry {
                 $name,
                 || {
                     // SAFETY: SQLite calls the function with its context.
-                    unsafe {
-                        result(
-                            ctx,
-                            $name,
-                            Err::<String, _>(Error::Panicked { entry: $name }),
-                        )
-                    }
+                    unsafe { result(ctx, $name, Err(&Error::Panicked { entry: $name })) }
                 },
                 || {
                     // SAFETY: SQLite's call of the function, forwarded with its arguments.
@@ -412,6 +410,7 @@ mod tests {
             op: "head",
             url: url(),
             status: 403,
+            body: String::new(),
         };
         assert_eq!(refused_code(&denied_read), None);
         assert_eq!(refused_code(&Error::ClaimRaces { url: url() }), None);

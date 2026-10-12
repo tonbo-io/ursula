@@ -5,6 +5,7 @@
 // had; the damage a power loss or a restored disk image could do is applied by hand.
 import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -112,7 +113,10 @@ it("(d) a file with content but no sidecar is refused, not discarded", () => {
 	db.exec("CREATE TABLE mine(x)");
 	db.close();
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/no readable sidecar/);
-	const kept = openPlain(file);
+	// The path refuses opens through the extension after the failed attach, so its data is read
+	// outside it.
+	expect(() => openPlain(file)).toThrow(/unable to open database file/);
+	const kept = new DatabaseSync(`file:${file}?vfs=unix&mode=ro`);
 	expect(kept.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'mine'").get()).toEqual({ n: 1 });
 	kept.close();
 });

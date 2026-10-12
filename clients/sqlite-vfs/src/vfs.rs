@@ -33,6 +33,7 @@ use crate::config::abort_after_ack;
 use crate::config::max_frame_bytes;
 use crate::db::Db;
 use crate::db::Mode;
+use crate::db::WalSeen;
 use crate::db::lock;
 use crate::db::lookup;
 use crate::db::refused;
@@ -45,7 +46,9 @@ use crate::frame::FrameError;
 use crate::frame::PAGE;
 use crate::guard::contain;
 use crate::host::OK;
+use crate::host::WalIndexHeader;
 use crate::host::unix;
+use crate::host::wal_index_header;
 use crate::local::sidecar_line;
 use crate::local::write_sidecar;
 use crate::log;
@@ -66,8 +69,9 @@ use crate::wal::page_at;
 const WAL_WRITE_LOCK: c_int = 0;
 const WAL_CKPT_LOCK: c_int = 1;
 
-/// The size of a wal-index region (the first holds the header).
-const WAL_INDEX_REGION: c_int = 32 * 1024;
+/// `WAL_READ_LOCK(0)`: the first of the read-mark lock slots, one of which every read transaction
+/// takes shared.
+const WAL_READ_LOCK_0: c_int = 3;
 
 /// The longest a commit waits at its commit point for a due snapshot to open its window.
 const WINDOW_WAIT: Duration = Duration::from_secs(1);
@@ -169,7 +173,36 @@ unsafe fn main_db(f: *mut ffi::sqlite3_file) -> Option<Arc<Mutex<Db>>> {
         .and_then(|e| e.db.clone())
 }
 
+/// The wal-index header, read through the "unix" file inside the main db file `f` (not through
+/// this VFS's `xShmMap`, which takes the database's mutex on a failure).
+///
+/// # Safety
+///
+/// `f` is an open main db file of this VFS.
+unsafe fn header(f: *mut ffi::sqlite3_file) -> Option<WalIndexHeader> {
+    // SAFETY: the "unix" file inside an open file of this VFS is open, with "unix"'s methods.
+    unsafe { wal_index_header(inner(f)) }
+}
+
 impl Db {
+    /// A connection of this VFS took the WAL write lock: a commit the wal-index shows since one
+    /// released it last (`wal_seen`) came from a connection outside the extension, which the
+    /// stream never got. It poisons the database (local damage: no snapshot publishes the
+    /// foreign pages either), and the transaction's first WAL write fails.
+    pub(crate) fn check_foreign(&mut self, header: Option<WalIndexHeader>, during: &str) {
+        if let Some(found) = header
+            && let Some(seen) = self.wal_seen.foreign(found)
+        {
+            self.set_poisoned(
+                Error::ForeignWrite {
+                    seen,
+                    found: found.mx_frame,
+                },
+                Some(during),
+            );
+        }
+    }
+
     /// Records a write that reached the local WAL (see `wal_written`): the WAL header starts a new
     /// generation, a page is remembered by its crc32c.
     fn record_wal_write(&mut self, off: i64, data: &[u8]) {
@@ -223,20 +256,10 @@ impl Db {
         // A snapshot waiting for the acknowledged commit to be published (it runs once this
         // returns and the mutex is released, seeing the outcome).
         self.snapper.window_cv.notify_all();
-        // wal-index header (first copy): mxFrame is the u32 at byte 16, native endian; the salts
-        // at byte 32 are the WAL header's bytes 16..24.
-        let mut p: *mut c_void = null_mut();
-        let rc = fwd!(file, xShmMap, 0, WAL_INDEX_REGION, 0, &raw mut p);
-        let (mx_frame, salts) = if rc == OK && !p.is_null() {
-            let p = p.cast::<u8>();
-            // SAFETY: region 0 of the wal-index is mapped (32 KiB, page aligned): the u32 at
-            // byte 16 lies in it, aligned.
-            let mx_frame = unsafe { p.wrapping_add(16).cast::<u32>().read_volatile() };
-            // SAFETY: as above, for the 8 bytes at byte 32.
-            let salts = unsafe { p.wrapping_add(32).cast::<[u8; 8]>().read_volatile() };
-            (mx_frame, salts)
-        } else {
-            (0, [0; 8])
+        // SAFETY: `file` is an open main db file of this VFS (the caller's contract).
+        let (mx_frame, salts) = match unsafe { header(file) } {
+            Some(h) => (h.mx_frame, h.salts),
+            None => (0, [0; 8]),
         };
         if mx_frame < self.commit_frame_no {
             // Already poisoned when the snapshot thread's fence failed the rest of the
@@ -945,6 +968,8 @@ unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> 
     // started a new generation) cuts only the previous generation's tail, whose pages
     // `commit` already fsynced.
     if size == 0 {
+        // No frames left: any the wal-index shows later, a connection wrote (`WalSeen`).
+        db.wal_seen = WalSeen::Empty;
         let rc = db.sync_db("a WAL truncate");
         if rc != OK {
             return rc;
@@ -1082,6 +1107,17 @@ unsafe fn x_shm_map(
 /// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
 /// mutex may be held while releasing it, which never blocks.
 unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int {
+    // Every read transaction on a WAL database takes one of the read-mark locks shared, even one
+    // whose pages its connection has cached. A fenced database refuses it, so no connection keeps
+    // serving the state the newer owner moved past: reads fail like writes until the file is
+    // attached again (`ursula_status` says `fenced`).
+    if flags == ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_SHARED
+        && offset >= WAL_READ_LOCK_0
+        // SAFETY: the module contract.
+        && unsafe { main_db(file) }.is_some_and(|db| lock(&db).fenced())
+    {
+        return ffi::SQLITE_IOERR_READ;
+    }
     let tracked = flags & ffi::SQLITE_SHM_EXCLUSIVE != 0
         && n == 1
         && (offset == WAL_WRITE_LOCK || offset == WAL_CKPT_LOCK);
@@ -1104,6 +1140,10 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
         if offset == WAL_WRITE_LOCK {
             // SAFETY: `file` is the main db handle releasing the WAL write lock it holds.
             unsafe { db.end_write_transaction(file) };
+            // SAFETY: as above.
+            if let Some(h) = unsafe { header(file) } {
+                db.wal_seen = WalSeen::At(h);
+            }
             return fwd!(file, xShmLock, offset, n, flags);
         }
         if let Some(t) = db.checkpoint_started.take() {
@@ -1121,6 +1161,9 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
             db.writer = file.expose_provenance();
             db.committed = false;
             db.overlay.clear();
+            // SAFETY: `file` is the main db handle that now holds the WAL write lock.
+            let h = unsafe { header(file) };
+            db.check_foreign(h, "WAL write lock");
         }
         WAL_CKPT_LOCK if rc == OK => db.checkpoint_started = Some(Instant::now()),
         _ => {}

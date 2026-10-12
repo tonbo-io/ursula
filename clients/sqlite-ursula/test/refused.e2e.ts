@@ -256,7 +256,7 @@ it("a refusal marked without a gateway's vouch proves nothing: the commit poison
 	expect(error).not.toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(errcode(error)).toBe(SQLITE_ERROR);
 	// The claim was the request refused: its append failed as unauthorized, and it was the one write.
-	expect((error as Error).message).toMatch(/append \S+: 403: the endpoint refused this client's credentials/);
+	expect((error as Error).message).toMatch(/append \S+: 403( .*)?: the endpoint refused this client's credentials/);
 	expect((await gate.counts()).refused - before.refused).toBe(1);
 	// The gate refused every attempt of the commit: the stream holds the table alone.
 	attach(reader, gate.url + path, { readOnly: true });

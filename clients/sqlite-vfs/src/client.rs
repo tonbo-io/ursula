@@ -439,17 +439,18 @@ fn payment_refusal(r: &mut ureq::http::Response<ureq::Body>) -> WriteRefusal {
 fn refusal(op: &'static str, url: &str, r: &mut ureq::http::Response<ureq::Body>) -> Option<Error> {
     let status = r.status().as_u16();
     match refused(r)? {
-        Refused::Token | Refused::Denied => Some(unauthorized(op, url, status)),
+        Refused::Token | Refused::Denied => Some(unauthorized(op, url, status, body_text(r))),
         Refused::PaymentRequired => Some(refused_request(op, url, payment_refusal(r))),
         Refused::Fenced { .. } => None,
     }
 }
 
-fn unauthorized(op: &'static str, url: &str, status: u16) -> Error {
+fn unauthorized(op: &'static str, url: &str, status: u16, body: String) -> Error {
     Error::Unauthorized {
         op,
         url: url.to_owned(),
         status,
+        body,
     }
 }
 
@@ -768,7 +769,12 @@ fn append_on(
                             Some(proof) if !reached => {
                                 Append::Refused(proof.refusal(status, body_text(&mut r)))
                             }
-                            _ => Append::Failed(unauthorized("append", url, status)),
+                            _ => Append::Failed(unauthorized(
+                                "append",
+                                url,
+                                status,
+                                body_text(&mut r),
+                            )),
                         };
                     }
                     Some(Refused::PaymentRequired) => {
@@ -893,7 +899,9 @@ fn append_on(
             return match refusal {
                 // Every attempt was refused before it reached the stream: nothing was appended.
                 Some(refusal) if !reached => Append::Refused(refusal),
-                _ if resend.refresh => Append::Failed(unauthorized("append", url, 401)),
+                _ if resend.refresh => {
+                    Append::Failed(unauthorized("append", url, 401, String::new()))
+                }
                 _ => Append::Failed(Error::AppendUnknown {
                     attempts,
                     last: unknown,
@@ -1061,21 +1069,70 @@ pub(crate) struct Head {
     pub(crate) incarnation: Option<String>,
 }
 
+/// `e`, a `HEAD`'s refusal of `url`, with the explanation a `HEAD`'s answer cannot carry (it has
+/// no body): the body of one `GET` of the stream from its beginning, when that `GET` is refused
+/// with a 4xx too, such as the server's `400` that names the bucket or stream id it refuses. A
+/// `404` gets none: attach creates the stream then, or names the missing stream itself. Any other
+/// outcome of the `GET` leaves `e` as it was.
+fn with_reason(e: Error, url: &str) -> Error {
+    let missing = |status: u16| (400..500).contains(&status) && status != 404;
+    match e {
+        Error::Status {
+            op,
+            url: u,
+            status,
+            body,
+        } if body.is_empty() && missing(status) => Error::Status {
+            op,
+            url: u,
+            status,
+            body: reason_of(url),
+        },
+        Error::Unauthorized {
+            op,
+            url: u,
+            status,
+            body,
+        } if body.is_empty() => Error::Unauthorized {
+            op,
+            url: u,
+            status,
+            body: reason_of(url),
+        },
+        e => e,
+    }
+}
+
+/// The body of a `GET` of `url` from the stream's beginning, sent once, when it is refused with a
+/// 4xx (cut short: `body_text`); empty otherwise.
+fn reason_of(url: &str) -> String {
+    let request = format!("{url}?offset={START}");
+    match prepared(agent().get(request.as_str()), Resend::default()).call() {
+        Ok(mut r) if (400..500).contains(&r.status().as_u16()) => {
+            body_text(&mut r).trim().to_owned()
+        }
+        _ => String::new(),
+    }
+}
+
 /// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
 pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error> {
     let mut r = send_retrying(|resend| prepared(agent().head(url), resend).call(), stopped)
         .map_err(|e| http_error("head", url, e))?;
     if let Some(e) = refusal("head", url, &mut r).or_else(|| redirected("head", url, &r)) {
-        return Err(e);
+        return Err(with_reason(e, url));
     }
     let status = r.status().as_u16();
     if status != 200 {
-        return Err(Error::Status {
-            op: "head",
-            url: url.to_owned(),
-            status,
-            body: String::new(),
-        });
+        return Err(with_reason(
+            Error::Status {
+                op: "head",
+                url: url.to_owned(),
+                status,
+                body: String::new(),
+            },
+            url,
+        ));
     }
     Ok(Head {
         retained: header_offset(&r, "stream-retained-offset").unwrap_or_else(|| START.into()),
@@ -1189,7 +1246,7 @@ pub(crate) fn put_idempotent(
                         }
                     }
                     (Some(Refused::Denied), status) => {
-                        return Err(unauthorized("put", url, status));
+                        return Err(unauthorized("put", url, status, body_text(&mut r)));
                     }
                     (Some(Refused::PaymentRequired), _) => {
                         return Err(refused_request("put", url, payment_refusal(&mut r)));
@@ -1231,7 +1288,7 @@ pub(crate) fn put_idempotent(
             || !pause(retry_after, &mut backoff, deadline)
         {
             return Err(if resend.refresh {
-                unauthorized("put", url, 401)
+                unauthorized("put", url, 401, String::new())
             } else {
                 Error::PutUnknown {
                     url: url.to_owned(),
@@ -1437,6 +1494,7 @@ mod tests {
     use crate::auth::set_token;
     use crate::error::Attempt;
     use crate::error::Error;
+    use crate::error::ErrorKind as Kind;
     use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
     use crate::net;
@@ -3296,6 +3354,57 @@ mod tests {
             outcome(&unknown)
         );
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    // A HEAD's answer has no body, so a refused HEAD fetches the server's explanation with one GET
+    // of the stream, refused too: a 400 names the bucket or stream id it refuses (`invalid_name`),
+    // a 403 the denial. A 404 sends none (attach creates the stream then), and a GET that
+    // succeeds adds nothing.
+    #[test]
+    fn a_refused_head_carries_the_reason_a_get_gives() {
+        let reason = "bucket_id must be 4 to 64 bytes, got 2 bytes";
+        let (url, server) = serve(vec![
+            answer("400 Bad Request"),
+            answer_with_body("400 Bad Request", reason),
+        ]);
+        let refused = head(&url, &|| false).err().unwrap();
+        let requests = server.join().unwrap();
+        assert!(
+            requests[1].starts_with("GET /b/s?offset=-1 "),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            matches!(&refused, Error::Status { op: "head", status: 400, body, .. } if body == reason)
+        );
+        assert_eq!(refused.kind(), Kind::InvalidName);
+        assert!(refused.to_string().ends_with(&format!(": 400 {reason}")));
+
+        let (url, server) = serve(vec![
+            answer("403 Forbidden"),
+            answer_with_body("403 Forbidden", "no access to bucket sqlite-e2e"),
+        ]);
+        let refused = head(&url, &|| false).err().unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(&refused, Error::Unauthorized { status: 403, body, .. } if body == "no access to bucket sqlite-e2e")
+        );
+        assert_eq!(refused.kind(), Kind::Unauthorized);
+
+        let (url, server) = serve(vec![answer("404 Not Found")]);
+        let missing = head(&url, &|| false).err().unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(matches!(&missing, Error::Status { status: 404, body, .. } if body.is_empty()));
+
+        let (url, server) = serve(vec![
+            answer("403 Forbidden"),
+            answer_with_body("200 OK", "stream bytes"),
+        ]);
+        let refused = head(&url, &|| false).err().unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(&refused, Error::Unauthorized { status: 403, body, .. } if body.is_empty())
+        );
     }
 
     fn outcome(append: &Append) -> String {

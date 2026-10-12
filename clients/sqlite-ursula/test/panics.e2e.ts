@@ -47,7 +47,7 @@ it("a panic in a SQL function fails the call, and the process goes on", () => {
 			console.log(JSON.stringify(out));`,
 			{ URSULA_VFS_PANIC_IN: fn },
 		);
-		expect(r.out.call).toMatch(new RegExp(`${fn}: ${fn} panicked inside the extension`));
+		expect(r.out.call).toMatch(new RegExp(`${fn}: internal: ${fn} panicked inside the extension`));
 		expect(r.out.after).toBe(42);
 		expect(r.stderr).toMatch(panicked(fn));
 	}
@@ -140,7 +140,7 @@ it("a panic while attaching fails the attach and leaves no attach in progress", 
 	// refused as after any failed attach ("unable to open"), not answered SQLITE_BUSY ("database is
 	// locked"), and the next attach runs (and panics again here) instead of finding one in progress.
 	expect(r.out.open).toMatch(/unable to open database file/);
-	expect(r.out.status).toMatch(/last attach failed \(attach_files panicked inside the extension\)/);
+	expect(r.out.status).toMatch(/last attach failed \(internal: attach_files panicked inside the extension\)/);
 	expect(r.out.again).toMatch(/attach_files panicked inside the extension/);
 	expect(r.stderr).toMatch(panicked("attach_files"));
 	// Without the setting, the file attaches again, with its row.
