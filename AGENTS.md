@@ -13,6 +13,16 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 - **Language**: Rust (Edition 2024)
 - **Toolchain**: Nightly (`nightly-2026-06-01`)
 
+## Design Principles
+
+First-principles thinking and the elegance of the implementation come before compatibility.
+
+- Start from what a feature must guarantee and from the user's mental model, not from how the current release does it. When compatibility with the previous minor is what shapes a design, drop that constraint in the next minor instead of designing around it.
+- Prefer a design that removes a class of problems over one that detects and patches each case. A heuristic that keeps needing new exceptions means the model is wrong.
+- Only patch releases of one minor must interoperate: formats, protocol, and rolling upgrades of a cluster or of SQLite owners. A new minor may change formats, protocols and APIs. Make it a clean break with upgrade notes, without shims, dual code paths or fields kept until a later release.
+- Reuse an existing, exercised mechanism before adding a new one, and keep one mechanism per concern.
+- Do not reach into another component's internals (for example SQLite's WAL index) to save a step. Simple and explicit beats clever.
+
 ## Technology Stack
 
 - **Language**: Rust 2024 Edition, nightly toolchain
@@ -354,7 +364,7 @@ same commit.
 ## Development Tips
 
 - Use `just build`, `just test`, `just fmt-check`, `just clippy` for common tasks.
-- The project is pre-1.0 (`0.x`); breaking compatibility is acceptable when it improves correctness or simplicity.
+- The project is pre-1.0 (`0.x`). Breaking compatibility in a new minor is expected when it serves the [Design Principles](#design-principles).
 - For performance work, add/update a micro benchmark in `ursula-runtime/benches/`.
 - When modifying protobuf schemas, remember both `ursula-proto` and `ursula-raft` have build scripts that regenerate code.
 - The `tokio-console` feature can be enabled by building with `--no-default-features --features tokio-console` for async debugging.
