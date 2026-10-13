@@ -180,7 +180,7 @@ From SQL, the same functions are `ursula_attach(path, url)` (`ursula_attach(path
 
 - Room for one transaction per append: up to 32 MiB of compressed page images.
 - For databases whose snapshots exceed 1 MiB, a cold backend, so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
-- Snapshots above 32 MiB must go through a gateway whose `--max-request-body-bytes` is raised, or straight to a single-node server.
+- Snapshots above 32 MiB must go through a gateway whose `--max-request-body-bytes` is raised, or straight to a single-node server. With `--body-budget-bytes` unset, that gateway's body budget grows to hold one body at the limit beside its 32 MiB small-body headroom, so give it memory to match (about twice the budget), or set the budget explicitly.
 - A stream URL that reaches the stream's leader by itself: a gateway, or a single-node server (see [Rules](#rules)).
 
 ## Versions
@@ -318,7 +318,7 @@ Alerts worth setting:
 - `writes_refused` stays 1: writes are refused before they reach the stream, and `refused_kind` and `refused_reason` say what and why (see [Troubleshooting](/docs/troubleshooting#a-commit-or-attach-is-refused-with-error-code-7178)). For `not_applied`, look at the Ursula cluster or the gateway that refuses them. Commits fail until the refusals stop. Then they succeed without an attach. For `too_large` only that transaction fails, so split it: other commits succeed as usual, and the next one that does clears it.
 - `fenced` is 1 without a planned handoff: another process claimed the stream. Find the second owner before attaching again. After a refused commit, a refusal that was false can show as a fence too (see [Writes refused before they reach the stream](#writes-refused-before-they-reach-the-stream)).
 - `log_bytes` stays above a few times `snapshot_due_bytes`, or `snapshot_failures` keeps growing: snapshots are not being published, for example a body over the gateway's `--max-request-body-bytes` or a long reader pinning WAL frames. Every rebuild then replays the whole log.
-- `snapshot_bytes` approaches the gateway's `--max-request-body-bytes`: the next snapshots will be refused. With a cold backend, raise the limit (snapshots up to 1 GiB), and the gateway's `--body-budget-bytes` with it, to at least the limit and 32 MiB, with memory to match. Otherwise make the database smaller: delete rows, then `VACUUM`, which is one transaction and must itself compress below the commit limit (see [Rules](#rules)), or copy the rows into a new database in transactions below the limit.
+- `snapshot_bytes` approaches the gateway's `--max-request-body-bytes`: the next snapshots will be refused. With a cold backend, raise the limit (snapshots up to 1 GiB), and give the gateway memory for a body budget of at least the limit and 32 MiB (an unset `--body-budget-bytes` grows to that). Otherwise make the database smaller: delete rows, then `VACUUM`, which is one transaction and must itself compress below the commit limit (see [Rules](#rules)), or copy the rows into a new database in transactions below the limit.
 - The p99 of `sqlite_ursula.commit.duration` rises: look at the Ursula cluster first. A commit waits for its append.
 
 ## Pi Durable
