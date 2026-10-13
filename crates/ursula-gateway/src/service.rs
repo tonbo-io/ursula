@@ -42,6 +42,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let installed_access_control = access_control(&args)?;
     let config = gateway_config(&args)?;
+    warn_on_budget_over_memory(config.uploads.budget_bytes());
     if config.uploads.stall_timeout() <= SQLITE_COMMIT_TIMEOUT {
         tracing::warn!(
             stall_timeout_secs = config.uploads.stall_timeout().as_secs(),
@@ -166,12 +167,45 @@ fn body_budget_bytes(args: &GatewayArgs) -> u64 {
         .unwrap_or(u64::MAX)
         .saturating_add(args.small_body_headroom_bytes);
     if needed > default {
-        tracing::info!(
+        tracing::warn!(
             budget_bytes = needed,
-            "--body-budget-bytes is unset; the body budget grows to hold a body at --max-request-body-bytes"
+            "--body-budget-bytes is unset; the body budget grows to hold a body at --max-request-body-bytes. Set --body-budget-bytes to a size the process's memory can hold"
         );
     }
     default.max(needed)
+}
+
+/// Where a cgroup states the memory limit of the process: v2, then v1.
+const CGROUP_MEMORY_LIMITS: [&str; 2] = [
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+];
+
+/// A cgroup memory limit file's contents as bytes: `None` for `max` (v2) or
+/// an unset v1 limit, which the kernel reports as a value near `i64::MAX`.
+fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
+    let limit = contents.trim().parse::<u64>().ok()?;
+    (limit < 1 << 60).then_some(limit)
+}
+
+/// Warns when the body budget exceeds half of the process's cgroup memory
+/// limit, the first limit file that exists and states one. A budget that
+/// size leaves too little for everything else the gateway holds.
+fn warn_on_budget_over_memory(budget_bytes: u64) {
+    let Some(limit) = CGROUP_MEMORY_LIMITS
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .and_then(|contents| parse_cgroup_memory_limit(&contents))
+    else {
+        return;
+    };
+    if budget_bytes > limit / 2 {
+        tracing::warn!(
+            budget_bytes,
+            memory_limit_bytes = limit,
+            "the request body budget exceeds half of the cgroup memory limit; set --body-budget-bytes lower or give the gateway more memory"
+        );
+    }
 }
 
 fn gateway_config(args: &GatewayArgs) -> Result<GatewayConfig, UploadLimitsError> {
@@ -377,6 +411,7 @@ mod tests {
     use super::GatewayArgs;
     use super::access_control;
     use super::gateway_config;
+    use super::parse_cgroup_memory_limit;
     use crate::Gateway;
     use crate::uploads::UploadLimits;
     use crate::uploads::UploadLimitsError;
@@ -418,6 +453,14 @@ mod tests {
             refused.map(|_| ()).unwrap_err().kind(),
             clap::error::ErrorKind::ValueValidation
         ));
+    }
+
+    #[test]
+    fn a_cgroup_memory_limit_parses_and_an_unset_one_is_none() {
+        assert_eq!(parse_cgroup_memory_limit("536870912\n"), Some(512 << 20));
+        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+        assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
+        assert_eq!(parse_cgroup_memory_limit(""), None);
     }
 
     // The body budget's flags default to the library's limits, and limits
