@@ -41,17 +41,13 @@ use crate::db::refused;
 use crate::db::registry;
 use crate::error::Error;
 use crate::error::Fence;
-use crate::error::Foreign;
 use crate::error::WriteRefusal;
 use crate::frame;
 use crate::frame::FrameError;
 use crate::frame::PAGE;
 use crate::guard::contain;
 use crate::host::OK;
-use crate::host::WalIndexHeader;
 use crate::host::unix;
-use crate::host::wal_index_header;
-use crate::local::db_fingerprint;
 use crate::local::sidecar_line;
 use crate::local::write_sidecar;
 use crate::log;
@@ -63,7 +59,6 @@ use crate::wal::FRAME_HDR_LEN;
 use crate::wal::FRAME_LEN;
 use crate::wal::PAGE_BYTES;
 use crate::wal::WAL_HDR;
-use crate::wal::WAL_HDR_LEN;
 use crate::wal::WalClaim;
 use crate::wal::be32;
 use crate::wal::page_at;
@@ -72,6 +67,9 @@ use crate::wal::page_at;
 /// a checkpoint.
 const WAL_WRITE_LOCK: c_int = 0;
 const WAL_CKPT_LOCK: c_int = 1;
+
+/// The size of a wal-index region (the first holds the header).
+const WAL_INDEX_REGION: c_int = 32 * 1024;
 
 /// `WAL_READ_LOCK(0)`: the first of the read-mark lock slots, one of which every read transaction
 /// takes shared.
@@ -179,42 +177,7 @@ unsafe fn main_db(f: *mut ffi::sqlite3_file) -> Option<Arc<Mutex<Db>>> {
         .and_then(|e| e.db.clone())
 }
 
-/// The wal-index header, read through the "unix" file inside the main db file `f` (not through
-/// this VFS's `xShmMap`, which takes the database's mutex on a failure).
-///
-/// # Safety
-///
-/// `f` is an open main db file of this VFS.
-unsafe fn header(f: *mut ffi::sqlite3_file) -> Option<WalIndexHeader> {
-    // SAFETY: the "unix" file inside an open file of this VFS is open, with "unix"'s methods.
-    unsafe { wal_index_header(inner(f)) }
-}
-
 impl Db {
-    /// A commit the wal-index `header` shows that no connection of this VFS made (`WalSeen::foreign`),
-    /// or while no frame of the VFS exists a change of the db file (`Db::untouched`), came from a
-    /// connection outside the extension, which the stream never got. Checked when a connection of
-    /// this VFS takes the WAL write lock, when it releases one it committed nothing under (a
-    /// recovery rebuilt the header from the WAL file), before it truncates the WAL to nothing, and
-    /// before the snapshot thread copies pages (`during` says which). It poisons the database as
-    /// local damage: no snapshot publishes the foreign pages, the next WAL write fails, and every
-    /// later attach refuses the local files (`Db::distrust_local`).
-    pub(crate) fn check_foreign(&mut self, header: Option<WalIndexHeader>, during: &str) {
-        let foreign = match header.and_then(|found| Some((self.wal_seen.foreign(found)?, found))) {
-            Some((seen, found)) => Some(Foreign::Frames {
-                seen,
-                found: found.mx_frame,
-            }),
-            None => self
-                .untouched
-                .filter(|&fingerprint| db_fingerprint(&self.path) != Some(fingerprint))
-                .map(|_changed| Foreign::DbFile),
-        };
-        if let Some(foreign) = foreign {
-            self.set_poisoned(Error::ForeignWrite(foreign), Some(during));
-        }
-    }
-
     /// Records a write that reached the local WAL (see `wal_written`): the WAL header starts a new
     /// generation, a page is remembered by its crc32c.
     fn record_wal_write(&mut self, off: i64, data: &[u8]) {
@@ -250,8 +213,8 @@ impl Db {
     }
 
     /// The write transaction ended (WAL write lock released): drop what never committed; after an
-    /// acknowledged commit, check that SQLite published it (the sidecar claimed it at the commit
-    /// point, `commit`).
+    /// acknowledged commit that SQLite published, advance the sidecar (no fsync: see the crate
+    /// docs).
     ///
     /// Runs before the real lock is released (see `x_shm_lock`), on the main db handle `file`,
     /// whose wal-index header tells whether SQLite published the commit.
@@ -268,8 +231,21 @@ impl Db {
         // A snapshot waiting for the acknowledged commit to be published (it runs once this
         // returns and the mutex is released, seeing the outcome).
         self.snapper.window_cv.notify_all();
-        // SAFETY: `file` is an open main db file of this VFS (the caller's contract).
-        let mx_frame = unsafe { header(file) }.map_or(0, |h| h.mx_frame);
+        // wal-index header (first copy): mxFrame is the u32 at byte 16, native endian; the salts
+        // at byte 32 are the WAL header's bytes 16..24.
+        let mut p: *mut c_void = null_mut();
+        let rc = fwd!(file, xShmMap, 0, WAL_INDEX_REGION, 0, &raw mut p);
+        let (mx_frame, salts) = if rc == OK && !p.is_null() {
+            let p = p.cast::<u8>();
+            // SAFETY: region 0 of the wal-index is mapped (32 KiB, page aligned): the u32 at
+            // byte 16 lies in it, aligned.
+            let mx_frame = unsafe { p.wrapping_add(16).cast::<u32>().read_volatile() };
+            // SAFETY: as above, for the 8 bytes at byte 32.
+            let salts = unsafe { p.wrapping_add(32).cast::<[u8; 8]>().read_volatile() };
+            (mx_frame, salts)
+        } else {
+            (0, [0; 8])
+        };
         if mx_frame < self.commit_frame_no {
             // Already poisoned when the snapshot thread's fence failed the rest of the
             // transaction's WAL writes: that reason stays (`set_poisoned`).
@@ -277,6 +253,15 @@ impl Db {
                 mx_frame,
                 frame: self.commit_frame_no,
             });
+            return;
+        }
+        let wal = WalClaim {
+            salts: u64::from_be_bytes(salts),
+            frame: self.commit_frame_no,
+        };
+        let line = sidecar_line(&self.offset, self.epoch, self.log, &self.stamp, wal);
+        if let Err(e) = write_sidecar(&self.sidecar, &line) {
+            self.poison(e);
             return;
         }
         // After a snapshot outage, the stream takes writes again: the next attempt need not wait
@@ -925,25 +910,6 @@ unsafe fn commit(file: *mut ffi::sqlite3_file, db: &mut Db, size: u32, commit_fr
         .checked_div(FRAME)
         .and_then(|n| u32::try_from(n).ok())
         .map_or(u32::MAX, |n| n.saturating_add(1));
-    // The sidecar claims the commit before any of its frames reaches the local WAL: a crash in
-    // between leaves a WAL behind its claim, which only costs a rebuild, and a commit frame past a
-    // claim then never is this VFS's own (`WalClaim`). The generation is the WAL header's, the
-    // overlay's when this commit starts a new one.
-    let mut header = [0u8; WAL_HDR_LEN];
-    // SAFETY: the caller's contract.
-    let rc = unsafe { overlay_read(file, db, &mut header, 0) };
-    let salts = header.get(16..).and_then(|s| s.first_chunk::<8>());
-    let claim = match (rc, salts) {
-        (OK, Some(salts)) => WalClaim {
-            salts: u64::from_be_bytes(*salts),
-            frame: db.commit_frame_no,
-        },
-        _ => return db.poison(Error::LocalWalWrite(rc)),
-    };
-    let line = sidecar_line(&db.offset, db.epoch, db.log, &db.stamp, claim);
-    if let Err(e) = write_sidecar(&db.sidecar, &line) {
-        return db.poison(e);
-    }
     for (o, d) in std::mem::take(&mut db.overlay) {
         let rc = if db.fault() {
             ffi::SQLITE_IOERR_WRITE
@@ -986,51 +952,25 @@ unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> 
     // Truncated to nothing (only after a complete checkpoint, under the write lock or the
     // closing connection's EXCLUSIVE lock): the db file alone then holds the state at
     // `offset`, so it is fsynced and the sidecar says so before the WAL loses its frames
-    // (`WalClaim`), with the db file's fingerprint: no frame of this VFS exists after the
-    // truncate, so until the next commit the db file changes only by a checkpoint of a foreign
-    // commit (`Db::untouched`, `WalClaim::none_with`). A truncate to a non-zero size
-    // (`journal_size_limit`, in the commit that started a new generation) cuts only the previous
-    // generation's tail, whose pages `commit` already fsynced.
-    let mut fingerprint = None;
+    // (`WalClaim`). A truncate to a non-zero size (`journal_size_limit`, in the commit that
+    // started a new generation) cuts only the previous generation's tail, whose pages
+    // `commit` already fsynced.
     if size == 0 {
-        // A foreign commit the closing connection's checkpoint moved into the db file (it takes no
-        // WAL write lock, which checks): the truncate would leave no trace of it.
-        let asking = [db.writer, db.exclusive].into_iter().find(|&h| h != 0);
-        if let Some(h) = asking {
-            let main = std::ptr::with_exposed_provenance_mut::<ffi::sqlite3_file>(h);
-            // SAFETY: `writer` and `exclusive` name open main db files of this VFS (`sync_db`).
-            let found = unsafe { header(main) };
-            db.check_foreign(found, "a WAL truncate");
+        let rc = db.sync_db("a WAL truncate");
+        if rc != OK {
+            return rc;
         }
-        if db.poisoned.is_some() {
-            // Nothing is claimed for a poisoned attachment's files (`Db::mark_stale`). Should the
-            // sidecar not say so, the WAL stays as it is, the last claim checkable against it.
-            if let Err(e) = db.mark_stale() {
-                db.set_poisoned(e, Some("a WAL truncate"));
-                return ffi::SQLITE_IOERR_TRUNCATE;
-            }
-        } else {
-            let rc = db.sync_db("a WAL truncate");
-            if rc != OK {
-                return rc;
-            }
-            fingerprint = db_fingerprint(&db.path);
-            let claim = WalClaim::none_with(fingerprint.unwrap_or(0));
-            let line = sidecar_line(&db.offset, db.epoch, db.log, &db.stamp, claim);
-            if let Err(e) = write_sidecar(&db.sidecar, &line) {
-                return db.poison(e);
-            }
+        let line = sidecar_line(&db.offset, db.epoch, db.log, &db.stamp, WalClaim::NONE);
+        if db.poisoned.is_none()
+            && let Err(e) = write_sidecar(&db.sidecar, &line)
+        {
+            return db.poison(e);
         }
     }
     db.overlay.retain(|&o, _| o < size);
     db.wal_written
         .retain(|&o, _| o.saturating_add(PAGE_BYTES) <= size);
     let rc = fwd!(file, xTruncate, size);
-    if rc == OK && size == 0 {
-        // No frames left in the WAL file (`WalSeen`), only once it holds none.
-        db.wal_seen.truncated();
-        db.untouched = fingerprint;
-    }
     db.post_ack("local WAL truncate", rc)
 }
 
@@ -1147,10 +1087,11 @@ unsafe fn x_shm_map(
 
 /// Tracks the write transaction (WAL write lock) and checkpoints (checkpoint lock) of an attached
 /// database; SQLite takes both through the main db handle. The end of a write transaction
-/// (publication check, foreign commit check) runs under the database's mutex *before* the real
-/// lock is released: once it is released, another thread's connection may start its own write
-/// transaction, whose state the bookkeeping would otherwise see. Lock order: the real shm lock may
-/// be taken without the mutex, and the mutex may be held while releasing it, which never blocks.
+/// (publication check, sidecar) runs under the database's mutex *before* the real lock is released:
+/// once it is released, another thread's connection may start its own write transaction, whose
+/// state the bookkeeping would otherwise see (or whose commit the sidecar would cover before its
+/// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
+/// mutex may be held while releasing it, which never blocks.
 unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int {
     // Every read transaction on a WAL database takes one of the read-mark locks shared when it
     // starts, even one whose pages its connection has cached. A fenced database refuses it, so no
@@ -1187,22 +1128,8 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
         // `checkpoint_started`) this bookkeeping would then clear or misjudge.
         let mut db = lock(&db);
         if offset == WAL_WRITE_LOCK {
-            let committed = db.committed;
             // SAFETY: `file` is the main db handle releasing the WAL write lock it holds.
             unsafe { db.end_write_transaction(file) };
-            if committed {
-                // A frame of this VFS exists now, which a checkpoint writes into the db file.
-                db.untouched = None;
-            }
-            // SAFETY: as above.
-            if let Some(h) = unsafe { header(file) } {
-                // Without a commit of its own, the lock changed the header only by a recovery,
-                // which rebuilt it from the WAL file: a commit outside the extension there shows.
-                if !committed {
-                    db.check_foreign(Some(h), "WAL write lock release");
-                }
-                db.wal_seen.released(h, committed);
-            }
             return fwd!(file, xShmLock, offset, n, flags);
         }
         if let Some(t) = db.checkpoint_started.take() {
@@ -1220,9 +1147,6 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
             db.writer = file.expose_provenance();
             db.committed = false;
             db.overlay.clear();
-            // SAFETY: `file` is the main db handle that now holds the WAL write lock.
-            let h = unsafe { header(file) };
-            db.check_foreign(h, "WAL write lock");
         }
         WAL_CKPT_LOCK if rc == OK => db.checkpoint_started = Some(Instant::now()),
         _ => {}

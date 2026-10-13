@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { generateKeyPairSync, type KeyObject, randomUUID, sign } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -13,15 +13,6 @@ let counter = 0;
 /** A fresh stream URL on the spawned node (bucket created by the global setup). */
 export const streamPath = (): string => `/sqlite-e2e/vfs-${process.pid}-${Date.now().toString(36)}-${counter++}`;
 export const ursulaUrl = (): string => inject("ursulaUrl");
-
-/**
- * What a refusal that keeps the local files asks for before the path attaches again: the db file and
- * its -wal moved aside, as a pair that still opens as a plain SQLite file.
- */
-export function moveAside(file: string): void {
-	renameSync(file, `${file}.aside`);
-	if (existsSync(`${file}-wal`)) renameSync(`${file}-wal`, `${file}.aside-wal`);
-}
 
 /** The offset a sidecar's text records: its first token. */
 export const sidecarOffset = (sidecar: string): string => sidecar.split(" ")[0] ?? "";
@@ -180,8 +171,7 @@ export function runChild(file: string, url: string, sqls: readonly string[], env
  * HTTP proxy to the node. After `stallAfter` forwarded POSTs it holds every further POST unanswered and
  * unforwarded; after `dropAfter` forwarded POSTs it forwards the next one, waits for the node's answer
  * and then cuts the client connection instead of answering (an append with an unknown outcome); the
- * POST numbered `limitAt` is answered 429 with `Retry-After: 1` without being forwarded. Every POST it
- * forwards waits `delayMs` first.
+ * POST numbered `limitAt` is answered 429 with `Retry-After: 1` without being forwarded.
  */
 export class StallProxy {
 	private readonly server: Server;
@@ -189,12 +179,10 @@ export class StallProxy {
 	stallAfter = Number.POSITIVE_INFINITY;
 	dropAfter = Number.POSITIVE_INFINITY;
 	limitAt = Number.POSITIVE_INFINITY;
-	delayMs = 0;
 	/** POSTs whose answer was dropped. */
 	dropped = 0;
 	readonly stalled: Promise<void>;
 	private onStall!: () => void;
-	private onPost: (() => void)[] = [];
 	readonly url: string;
 
 	private constructor(server: Server, url: string) {
@@ -211,10 +199,7 @@ export class StallProxy {
 		const server = createServer((req, res) => {
 			const p = proxy as StallProxy;
 			let drop = false;
-			let delay = 0;
 			if (req.method === "POST") {
-				for (const resolve of p.onPost.splice(0)) resolve();
-				delay = p.delayMs;
 				const n = p.posts++;
 				if (n >= p.stallAfter) {
 					p.onStall();
@@ -227,22 +212,18 @@ export class StallProxy {
 					return;
 				}
 			}
-			const forward = (): void => {
-				const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (ur) => {
-					if (drop) {
-						p.dropped++;
-						ur.resume();
-						ur.on("end", () => res.socket?.destroy());
-						return;
-					}
-					res.writeHead(ur.statusCode ?? 502, ur.headers);
-					ur.pipe(res);
-				});
-				up.on("error", () => res.destroy());
-				req.pipe(up);
-			};
-			if (delay > 0) setTimeout(forward, delay);
-			else forward();
+			const up = request({ host: t.hostname, port: t.port, method: req.method, path: req.url, headers: req.headers }, (ur) => {
+				if (drop) {
+					p.dropped++;
+					ur.resume();
+					ur.on("end", () => res.socket?.destroy());
+					return;
+				}
+				res.writeHead(ur.statusCode ?? 502, ur.headers);
+				ur.pipe(res);
+			});
+			up.on("error", () => res.destroy());
+			req.pipe(up);
 		});
 		const port = await new Promise<number>((res) =>
 			server.listen(0, "127.0.0.1", () => {
@@ -259,12 +240,6 @@ export class StallProxy {
 		this.stallAfter = Number.POSITIVE_INFINITY;
 		this.dropAfter = Number.POSITIVE_INFINITY;
 		this.limitAt = Number.POSITIVE_INFINITY;
-		this.delayMs = 0;
-	}
-
-	/** Resolves when the proxy receives its next POST, before it forwards, holds or delays it. */
-	nextPost(): Promise<void> {
-		return new Promise((resolve) => this.onPost.push(resolve));
 	}
 
 	async close(): Promise<void> {

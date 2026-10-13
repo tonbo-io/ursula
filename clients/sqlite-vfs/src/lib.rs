@@ -16,11 +16,9 @@
 //!   unreplicated. A file without a sidecar passes through to "unix", unless its last attach in this
 //!   process failed. Attach also refuses, changing nothing, while the process holds the db file,
 //!   its -wal, -shm or -journal open outside this VFS (a SQLite connection opened before the
-//!   extension was loaded or through another VFS, read-only ones included), or another process
-//!   holds the db file. A commit of a connection outside the extension that the owner sees later (at
-//!   its next write transaction, WAL truncate or snapshot: `ForeignWrite`) poisons it, and every
-//!   later attach refuses the files, which may hold data in no stream (the design doc's §7 lists
-//!   what goes unseen). A fenced owner's new read transactions fail too (SQLITE_IOERR_READ).
+//!   extension was loaded or through another VFS, read-only ones included), whose commits would
+//!   never reach the stream. Writes outside the extension after an attach are not detected (the
+//!   design doc's §7). A fenced owner's new read transactions fail too (SQLITE_IOERR_READ).
 //!   `SELECT ursula_attach(path, stream_url, 'read_only')` catches the file up the same way but
 //!   claims nothing and never writes the stream (no claim, commit, snapshot or retention move): it
 //!   fences no owner, works while a layer in front of the stream refuses writes, and every write to
@@ -44,10 +42,10 @@
 //! * WAL writes of an attached database go to a per-database overlay (reads and the file size see
 //!   it). The write of the commit frame's page data (the frame whose header carries a non-zero
 //!   "db size after commit") is the commit point: the transaction's final page images become one
-//!   frame, appended. On an ack the sidecar `<db>-ursula` (the stream offset and epoch reflected
-//!   locally, and the claim on the local WAL: `WalClaim`) advances, then the overlay is written to
-//!   the local WAL, and every later write of that transaction (checksum rewrites, padding) goes
-//!   straight to it. On a rejection or an exhausted retry budget the overlay is
+//!   frame, appended. On an ack the overlay is written to the local WAL and every later write of
+//!   that transaction (checksum rewrites, padding) goes straight to it; when the write transaction
+//!   ends (the WAL write lock is released) the sidecar `<db>-ursula` (stream offset and epoch
+//!   reflected locally) advances. On a rejection or an exhausted retry budget the overlay is
 //!   dropped, the write fails with SQLITE_IOERR_WRITE (SQLite rolls the transaction back) and the
 //!   database is poisoned until it is re-attached. A commit refused before it reached the stream
 //!   fails the transaction alone with SQLITE_IOERR_AUTH: a 402 from a layer in front of the stream
@@ -77,15 +75,11 @@
 //!   whatever `PRAGMA synchronous` says). The sidecar records the kernel's boot id, the stream's
 //!   incarnation, the db file's inode and what it needs of the local WAL (`WalClaim`); attach
 //!   trusts the local files only when all four check out (written since this boot, from this
-//!   incarnation of the stream, into this file, and the files hold what the claim says: the WAL's
-//!   last commit is the claimed one, or for a claim of no frame the WAL holds no commit and the db
-//!   file is as the extension left it). Files it cannot check (written in another boot, for
-//!   another incarnation of the stream, in an older format) or whose WAL ends before its claim are
-//!   discarded and rebuilt from the latest snapshot and the tail; files that may hold data in no
-//!   stream (a commit past the claim, another WAL generation, a changed or replaced db file, files
-//!   a poison distrusted) are refused and kept (`local::Sidecar::verdict`). The db file alone is
-//!   fsynced, rarely, so a crash-consistent image of the files (a disk snapshot) is either
-//!   verifiably complete or not trusted: before the WAL starts a new generation or is truncated to
+//!   incarnation of the stream, into this file, and the WAL still holds the claimed frames) and
+//!   otherwise discards them and rebuilds from the latest snapshot and the tail (from a stream
+//!   deleted and recreated at the path, whatever its length). The db file alone is fsynced,
+//!   rarely, so a crash-consistent image of the files (a disk snapshot) is either
+//!   verifiably complete or rejected: before the WAL starts a new generation or is truncated to
 //!   nothing, and at attach before a sidecar that relies on it. Attach never opens local files
 //!   through SQLite before replaying onto them: it folds the WAL into the db file itself.
 //! * Snapshots and retention (see [`snapshot`]): once the log since the latest snapshot (frame
@@ -110,7 +104,8 @@
 //!   `{"offset","epoch","poisoned","fenced","reason","read_only","payment_required",
 //!   "payment_reason","writes_refused","refused_kind","refused_reason","snapshot","retained",
 //!   "local","installed","attach_ms","commits","append_retries","log_bytes","snapshot_due_bytes",
-//!   "snapshot_age_ms","snapshot_failures","snapshot_error","snapshot_bytes","error"}` (offsets as strings;
+//!   "snapshot_age_ms","snapshot_failures","snapshot_error","snapshot_bytes","error"}` (offsets as
+//!   strings;
 //!   `reason`: the first poison's, which a later one never replaces; `fenced`: a fence was seen
 //!   since, first or later, never reset; `writes_refused`: the latest write was refused before it
 //!   reached the stream, until a commit is acknowledged (never while poisoned), with what refused
@@ -155,17 +150,16 @@
 //! - `claim`: claiming a stream (fencing earlier owners) and re-claiming an expired producer.
 //! - `client`: the stream over blocking HTTP, with the retries.
 //! - `config`: settings and test hooks from the environment.
-//! - `db`: attached databases (their poison, fence flag and what they know of the local WAL:
-//!   `WalSeen`) and the process-wide registry.
+//! - `db`: attached databases (their poison and fence flag) and the process-wide registry.
+//! - `descriptors`: the scan for descriptors of this process on a database's files outside the
+//!   extension, which attach refuses.
 //! - `error`: the error type, the classes the code acts on (gone, recreated, fenced, refused,
 //!   local damage), and the kinds and actions callers outside the extension see (`ErrorKind`,
 //!   `Action`).
 //! - `extension`: the entry point and the SQL functions.
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
-//! - `host`: the host's SQLite API, the "unix" VFS, private connections, and the wal-index header
-//!   read (`wal_index_header`).
-//! - `local`: the sidecar and the trust verdict on it, the boot id, the db file locks, the scan for
-//!   descriptors of this process outside the extension, and what a failed attach undoes.
+//! - `host`: the host's SQLite API, the "unix" VFS and private connections.
+//! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
@@ -180,6 +174,7 @@ mod claim;
 mod client;
 mod config;
 mod db;
+mod descriptors;
 mod error;
 mod extension;
 pub mod frame;

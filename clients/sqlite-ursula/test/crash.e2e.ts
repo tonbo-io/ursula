@@ -113,10 +113,8 @@ it("(e) an append whose answer is lost is retried with the same producer sequenc
 });
 
 // Regression (#324 review, P2-1): SQLite can still fail an acknowledged transaction locally (here
-// the local WAL write of its frames) and roll it back. The sidecar claimed the commit before its
-// frames went to the WAL, so the WAL ends before the claim: every frame in it is the extension's
-// own, and re-attach rebuilds the file from the stream, which holds the commit.
-it("(f) a local failure after the ack poisons the file, and re-attach rebuilds it with the commit", async () => {
+// the local WAL write of its frames) and roll it back; the sidecar then must not cover it.
+it("(f) a local failure after the ack poisons the file, keeps the sidecar behind, and re-attach replays the commit", async () => {
 	const path = streamPath();
 	const file = freshFile();
 	const child = runChild(file, ursulaUrl() + path, SQL, { URSULA_VFS_FAIL_POST_ACK: "3", CHILD_EXIT: "1" });
@@ -124,10 +122,8 @@ it("(f) a local failure after the ack poisons the file, and re-attach rebuilds i
 	await child.exited;
 	expect(child.lines.find((l) => l.step === 2 && l.ok !== undefined)?.ok).toBe(false);
 	expect(done.poisoned).toBe(true);
-	expect(sidecarOffset(readFileSync(`${file}-ursula`, "utf8"))).toBe(done.offset);
-	expect(walContains(file, "M-two")).toBe(false);
+	expectPast(done.offset as string, sidecarOffset(readFileSync(`${file}-ursula`, "utf8")));
 	attach(file, ursulaUrl() + path);
-	expect(status(file).local).toBe("-1");
 	expect(rows(file)).toEqual(["M-one", "M-two"]);
 });
 

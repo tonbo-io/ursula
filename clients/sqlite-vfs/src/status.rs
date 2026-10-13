@@ -296,11 +296,8 @@ mod tests {
         assert!(error(&d).starts_with(r#"{"kind":"fenced","action":"stop","message":"append "#));
 
         let mut d = Db::for_tests();
-        d.poison(Error::ForeignWrite(crate::error::Foreign::Frames {
-            seen: 4,
-            found: 6,
-        }));
-        assert!(error(&d).starts_with(r#"{"kind":"foreign_write","action":"fix","#));
+        d.poison(Error::LostWrite { offset: 56 });
+        assert!(error(&d).starts_with(r#"{"kind":"local_damage","action":"reattach","#));
     }
 
     // A write refused before it reached the stream shows in `writes_refused`, with its kind and

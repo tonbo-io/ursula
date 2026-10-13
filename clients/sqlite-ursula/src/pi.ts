@@ -18,9 +18,7 @@ export type UrsulaPiStorageOptions = NodeSqliteStorageOptions & AttachOptions;
  * `UrsulaReplicationError` (SQLite has already rolled the transaction back, so the driver's own
  * rollback attempt would otherwise turn it into an AggregateError). The storage is unusable for
  * writes after that; re-open it to take the stream over again (after a delete and recreate, re-opening
- * rebuilds the file from the new stream). When the failure distrusted the local files (`status(file)`
- * names the action `fix`: a commit outside the extension, local damage), re-opening is refused until
- * the file and its `-wal` are moved aside. Once the file is known to be fenced (a newer owner claimed
+ * rebuilds the file from the new stream). Once the file is known to be fenced (a newer owner claimed
  * the stream, or it was deleted and recreated), its reads fail too, also with an
  * `UrsulaReplicationError` whose `fenced` is `true` and whose message says the read was refused: the
  * file no longer serves the state the new owner moved past.

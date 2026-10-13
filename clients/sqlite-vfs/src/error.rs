@@ -17,19 +17,10 @@ use std::ffi::c_int;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::descriptors::DbFile;
 use crate::frame::FrameError;
 use crate::frame::PAGE;
-use crate::local::DbFile;
-use crate::local::Untrusted;
 use crate::snapshot::SnapshotError;
-
-/// What a poison that distrusts the local files (`Error::is_local_damage`) tells the caller: every
-/// later attach refuses them (`local::Untrusted::Distrusted`), and only moving them aside lets the
-/// path attach again.
-const DISTRUSTED: &str = "; attach refuses the local files from now on (to keep their rows, copy \
-                          the db file and its -wal to a new name and export the copy's rows into a \
-                          newly attached database; to attach this path again, move the db file and \
-                          its -wal aside first, and the attach rebuilds it from the stream)";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -69,7 +60,7 @@ pub(crate) enum Error {
     #[error("{path} has open connections; close them before attaching")]
     OpenConnections { path: String },
     /// The process holds the db file, its `-wal`, `-shm` or `-journal` open on a descriptor no
-    /// connection of this VFS owns (`local::open_in_process`): a SQLite connection outside the
+    /// connection of this VFS owns (`descriptors::open_in_process`): a SQLite connection outside the
     /// extension (opened before the extension was loaded, or through another VFS, a read-only one
     /// included), whose commits would never reach the stream and which shares the file's
     /// wal-index with the attachment, or another open of the file. Refused up front: nothing
@@ -82,27 +73,6 @@ pub(crate) enum Error {
          open while such a connection holds a lock on the file)"
     )]
     OpenOutsideVfs { path: String, fd: i32, file: DbFile },
-    /// The db file was written outside the extension while the attach ran, before the attach took
-    /// the lock that keeps other processes off it (`attach::attach_files`): a path that held no
-    /// data got some, or trusted files changed against their sidecar. What the writer wrote may be
-    /// in no stream. The attach of a path that held no data removes the sidecar it wrote, so a
-    /// later attach refuses the data as never replicated (`NoSidecar`).
-    #[error(
-        "{path} was written by a writer outside the extension while it was being attached, which \
-         may be in no stream; refusing to attach over it, and keeping the files (to keep its rows, \
-         copy {path} and {path}-wal to a new name and export the copy's rows into a newly \
-         attached database; to attach this path anyway, move {path} and {path}-wal aside first)"
-    )]
-    WrittenDuringAttach { path: String },
-    /// Local files that may hold data in no stream (`local::Verdict::Refuse`): attach keeps them
-    /// and refuses, rather than discard or adopt data that may be the only copy.
-    #[error(
-        "{path} may hold data that is in no stream ({why}); refusing to attach over it, and \
-         keeping the files (to keep its rows, copy {path} and {path}-wal to a new name and export \
-         the copy's rows into a newly attached database; to attach this path anyway, move {path} \
-         and {path}-wal aside first, and the attach rebuilds it from the stream)"
-    )]
-    Untrusted { path: String, why: Untrusted },
     #[error("{path} is being attached by another thread")]
     AttachInProgress { path: String },
     /// The path is not attached in this process: never, or its last attach failed. The message of
@@ -336,7 +306,7 @@ pub(crate) enum Error {
     PageSize(u32),
     #[error("a commit leaves WAL format (journal_mode must stay WAL)")]
     LeavesWal,
-    #[error("fsync of the db file before {before} failed ({code}){DISTRUSTED}")]
+    #[error("fsync of the db file before {before} failed ({code})")]
     Fsync { before: &'static str, code: c_int },
     #[error("{what} failed ({code}) after the commit was acknowledged")]
     PostAck { what: &'static str, code: c_int },
@@ -372,39 +342,11 @@ pub(crate) enum Error {
     LocalWalWrite(c_int),
     #[error(
         "the WAL page at offset {offset} reads back other bytes than this process wrote there (a \
-         write-back failed, or something else wrote the file){DISTRUSTED}"
+         write-back failed, or something else wrote the file)"
     )]
     LostWrite { offset: i64 },
-    #[error(
-        "fsync of the {file} failed ({code}): a write-back to it may have been lost{DISTRUSTED}"
-    )]
+    #[error("fsync of the {file} failed ({code}): a write-back to it may have been lost")]
     FileSync { file: &'static str, code: c_int },
-    /// The local files hold a commit that no connection of this VFS made (see [`Foreign`]): a
-    /// connection outside the extension (opened before it was loaded, through another VFS, or by a
-    /// process without it) committed to the file, and the stream never got that commit, which may
-    /// exist nowhere else.
-    #[error(
-        "the local files hold a commit no connection of the extension made ({0}): a connection \
-         outside the extension (opened before it was loaded, through another VFS, or by a process \
-         without it) wrote the file, and the stream never got that write; close that \
-         connection{DISTRUSTED}"
-    )]
-    ForeignWrite(Foreign),
-}
-
-/// What showed a commit of a connection outside the extension ([`Error::ForeignWrite`]).
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Foreign {
-    /// The wal-index header shows a commit that no connection of this VFS left there: its last
-    /// commit frame moved from `seen` (`db::WalSeen::foreign`) to `found`.
-    #[error("the WAL's last commit frame moved from {seen} to {found}")]
-    Frames { seen: u32, found: u32 },
-    /// The db file changed while no frame of this VFS existed for a checkpoint to write into it
-    /// (after an attach that left no WAL frame, or a truncate of the WAL, until the next commit:
-    /// `db::Db::untouched`): a checkpoint moved a foreign commit into it, and whoever ran it emptied
-    /// or deleted the WAL.
-    #[error("the db file changed while the extension had no WAL frame to checkpoint into it")]
-    DbFile,
 }
 
 /// What kind of failure an error is, as the SQL functions' messages (`<function>: <kind>: ...`)
@@ -429,10 +371,9 @@ pub(crate) enum ErrorKind {
     /// holding it, or a descriptor of this process outside the extension on the db file, its -wal,
     /// -shm or -journal (a SQLite connection outside the extension, read-only ones included).
     InUse,
-    /// The db file holds data that may be in no stream: never replicated (no sidecar), written by a
-    /// connection outside the extension (before an attach, or during one), or left in a state the
-    /// files cannot tell from that (`Error::NoSidecar`, `Error::WrittenDuringAttach`,
-    /// `Error::Untrusted`). Attach keeps the files and never replays a stream over them.
+    /// The db file holds data but has no readable sidecar: it was never replicated, or its sidecar
+    /// was lost, so its pages may be in no stream (`Error::NoSidecar`). Attach keeps the files and
+    /// never replays a stream over them.
     UnreplicatedFile,
     /// The local files are the cache of another stream (`Error::OtherStream`).
     OtherStream,
@@ -464,11 +405,8 @@ pub(crate) enum ErrorKind {
     /// neither the fence nor vouched, a `401` after an attempt that may have reached the stream).
     /// The stream may or may not hold it.
     OutcomeUnknown,
-    /// A connection outside the extension committed to the local files (`Error::ForeignWrite`):
-    /// they may hold data that is in no stream, and attach refuses them from now on.
-    ForeignWrite,
     /// The local files may hold pages this process did not write there (a lost write-back, a failed
-    /// fsync): nothing read from them may reach the stream, and attach refuses them from now on.
+    /// fsync): nothing read from them may reach the stream.
     LocalDamage,
     /// A local operation failed (an I/O error on the local files).
     LocalState,
@@ -531,7 +469,6 @@ impl ErrorKind {
             ErrorKind::Unauthorized => "unauthorized",
             ErrorKind::Refused => "refused",
             ErrorKind::OutcomeUnknown => "outcome_unknown",
-            ErrorKind::ForeignWrite => "foreign_write",
             ErrorKind::LocalDamage => "local_damage",
             ErrorKind::LocalState => "local_state",
             ErrorKind::AttachFailed => "attach_failed",
@@ -554,16 +491,15 @@ impl ErrorKind {
             | ErrorKind::TooLarge
             | ErrorKind::Unsupported
             | ErrorKind::StreamState
-            | ErrorKind::NotAttached
-            | ErrorKind::ForeignWrite
-            | ErrorKind::LocalDamage => Action::Fix,
+            | ErrorKind::NotAttached => Action::Fix,
             ErrorKind::Unreachable
             | ErrorKind::Unavailable
             | ErrorKind::Unauthorized
             | ErrorKind::Refused => Action::Retry,
-            ErrorKind::OutcomeUnknown | ErrorKind::LocalState | ErrorKind::Internal => {
-                Action::Reattach
-            }
+            ErrorKind::OutcomeUnknown
+            | ErrorKind::LocalDamage
+            | ErrorKind::LocalState
+            | ErrorKind::Internal => Action::Reattach,
             ErrorKind::Fenced => Action::Stop,
             ErrorKind::AttachFailed => return None,
         })
@@ -839,17 +775,13 @@ impl Error {
         }
     }
 
-    /// The local files may hold other pages than this process wrote (a write-back was lost, or a
-    /// connection outside the extension wrote them): nothing read from them may reach the stream,
-    /// not even in a snapshot, and as a poison's reason it makes every later attach refuse them
-    /// (`Db::distrust_local`).
+    /// The local files may hold other pages than this process wrote (a write-back was lost, or
+    /// something else wrote them): nothing read from them may reach the stream, not even in a
+    /// snapshot.
     pub(crate) fn is_local_damage(&self) -> bool {
         matches!(
             self,
-            Error::Fsync { .. }
-                | Error::LostWrite { .. }
-                | Error::FileSync { .. }
-                | Error::ForeignWrite(_)
+            Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. }
         )
     }
 
@@ -900,16 +832,13 @@ impl Error {
                 last_failure: None, ..
             } => ErrorKind::NotAttached,
             Error::NotAttached { .. } => ErrorKind::AttachFailed,
-            Error::NoSidecar { .. }
-            | Error::WrittenDuringAttach { .. }
-            | Error::Untrusted { .. } => ErrorKind::UnreplicatedFile,
+            Error::NoSidecar { .. } => ErrorKind::UnreplicatedFile,
             Error::OtherStream { .. } => ErrorKind::OtherStream,
             Error::Io { .. }
             | Error::FullPathname { .. }
             | Error::PostAck { .. }
             | Error::NotPublished { .. }
             | Error::LocalWalWrite(_) => ErrorKind::LocalState,
-            Error::ForeignWrite(_) => ErrorKind::ForeignWrite,
             Error::Fsync { .. } | Error::LostWrite { .. } | Error::FileSync { .. } => {
                 ErrorKind::LocalDamage
             }
@@ -1021,12 +950,10 @@ mod tests {
     use super::Error;
     use super::ErrorKind;
     use super::Fence;
-    use super::Foreign;
     use super::FrameLimit;
     use super::Gone;
     use super::WriteRefusal;
-    use crate::local::DbFile;
-    use crate::local::Untrusted;
+    use crate::descriptors::DbFile;
 
     // Callers act on the class, never on the text: attach retries `Gone`, rebuilds on a recreated
     // stream, and `ursula_status` reports `fenced` for the fence classes only. The texts below are
@@ -1283,21 +1210,6 @@ mod tests {
                 Some("fix"),
             ),
             (
-                Error::WrittenDuringAttach {
-                    path: "/data/app.db".into(),
-                },
-                "unreplicated_file",
-                Some("fix"),
-            ),
-            (
-                Error::Untrusted {
-                    path: "/data/app.db".into(),
-                    why: Untrusted::PastClaim { claim: 3, last: 5 },
-                },
-                "unreplicated_file",
-                Some("fix"),
-            ),
-            (
                 Error::NoSidecar {
                     path: "/data/app.db".into(),
                     source: Box::new(Error::LeavesWal),
@@ -1323,11 +1235,10 @@ mod tests {
                 Some("fix"),
             ),
             (
-                Error::ForeignWrite(Foreign::Frames { seen: 2, found: 4 }),
-                "foreign_write",
-                Some("fix"),
+                Error::LostWrite { offset: 56 },
+                "local_damage",
+                Some("reattach"),
             ),
-            (Error::LostWrite { offset: 56 }, "local_damage", Some("fix")),
             (
                 Error::PostAck {
                     what: "local WAL write",
@@ -1374,10 +1285,8 @@ mod tests {
         // outcome there.
         assert_eq!(status("read", 503).poison_kind(), ErrorKind::OutcomeUnknown);
         assert_eq!(Error::LeavesWal.poison_kind(), ErrorKind::Unsupported);
-        // A foreign commit is local damage: no snapshot publishes it, and attach refuses the files.
-        assert!(Error::ForeignWrite(Foreign::Frames { seen: 2, found: 4 }).is_local_damage());
-        // Nothing tells the caller to delete or rebuild over files that may hold the only copy of
-        // data: each such refusal names the salvage path, and moving the file aside.
+        // Nothing tells the caller to delete files that may hold the only copy of data: each such
+        // refusal names the salvage path, or moving the files aside.
         let salvage = [
             Error::LostData {
                 url: url(),
@@ -1387,15 +1296,6 @@ mod tests {
                 path: "/data/app.db".into(),
                 url: url(),
             },
-            Error::WrittenDuringAttach {
-                path: "/data/app.db".into(),
-            },
-            Error::Untrusted {
-                path: "/data/app.db".into(),
-                why: Untrusted::Distrusted,
-            },
-            Error::ForeignWrite(Foreign::DbFile),
-            Error::LostWrite { offset: 56 },
         ];
         for e in salvage {
             let m = e.to_string();
@@ -1403,6 +1303,12 @@ mod tests {
             assert!(m.contains("aside"), "{m}");
             assert!(!m.contains("delete"), "{m}");
         }
+        let never_replicated = Error::NoSidecar {
+            path: "/data/app.db".into(),
+            source: Box::new(Error::LeavesWal),
+        }
+        .to_string();
+        assert!(never_replicated.contains("aside") && !never_replicated.contains("delete"));
     }
 
     // `ursula_status` reports a refusal's kind (stable names) and its reason: the marker's token or
