@@ -26,7 +26,6 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::LOCATION;
 use axum::response::Response;
 use tower::ServiceExt;
-use ursula_gateway::DEFAULT_MAX_REQUEST_BODY_BYTES;
 use ursula_gateway::Gateway;
 use ursula_gateway::GatewayConfig;
 use ursula_gateway::uploads::UploadLimits;
@@ -897,7 +896,6 @@ async fn a_gateway_keeps_a_leader_refusal_marked_behind_a_redirect_raised_before
             response_header_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(1),
             upstream_tcp_user_timeout_secs: NonZeroU64::new(5).expect("non-zero"),
-            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             uploads: UploadLimits::default(),
             raft_group_count: None,
             cors_allowed_origins: Vec::new(),

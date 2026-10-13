@@ -140,12 +140,21 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
         upstream_tcp_user_timeout_secs: NonZeroU64::new(5).unwrap(),
-        max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         uploads: crate::uploads::UploadLimits::default(),
         raft_group_count: None,
         cors_allowed_origins: Vec::new(),
         usage_chunk_bytes: None,
     }
+}
+
+/// Sets `config`'s per-request body limit to `bytes`, the rest of its upload
+/// limits unchanged.
+fn set_body_limit(config: &mut GatewayConfig, bytes: usize) {
+    config.uploads = crate::uploads::UploadLimits::try_from(crate::uploads::UploadLimitsSpec {
+        max_request_body_bytes: bytes,
+        ..config.uploads.spec().clone()
+    })
+    .expect("valid upload limits");
 }
 
 fn gateway_for_url(upstream_url: impl Into<String>) -> Arc<Gateway> {
@@ -1266,7 +1275,7 @@ async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
     .await;
 
     let mut config = test_config(vec![upstream.url.clone()]);
-    config.max_request_body_bytes = 4;
+    set_body_limit(&mut config, 4);
     let gateway = Gateway::new(config);
     let req = Request::builder()
         .method("POST")
@@ -2529,7 +2538,7 @@ async fn the_gateway_vouches_for_every_response() {
     .await;
     let (gone, _refusing) = refusing_upstream().await;
     let mut small_bodies = test_config(vec![node.url.clone()]);
-    small_bodies.max_request_body_bytes = 2;
+    set_body_limit(&mut small_bodies, 2);
     let mut cors = test_config(vec![node.url.clone()]);
     cors.cors_allowed_origins = vec!["https://app.example".to_owned()];
     let preflight = Request::builder()
@@ -3728,6 +3737,7 @@ mod refused_bodies {
     use super::RecordingAuthorizer;
     use super::TestUpstream;
     use super::answering_upstream;
+    use super::set_body_limit;
     use super::test_config;
     use crate::Gateway;
     use crate::GatewayConfig;
@@ -3739,6 +3749,8 @@ mod refused_bodies {
     use crate::auth::AuthorizationDecision;
     use crate::auth::AuthorizationError;
     use crate::service::router;
+    use crate::uploads::UploadLimits;
+    use crate::uploads::UploadLimitsSpec;
 
     /// The body the clients announce: 8 MiB, far more than a connection holds
     /// while nothing reads it ([`BUFFER`]). Answered with this body unread, a
@@ -3762,6 +3774,9 @@ mod refused_bodies {
         /// `transfer-encoding: chunked`. The client never sends the last
         /// chunk, so the body does not end.
         Chunked,
+        /// `transfer-encoding: chunked`, ended with the last chunk once the
+        /// client has sent the bytes it sends.
+        ChunkedWhole,
     }
 
     /// A gateway with access control and `config`: a bearer token other than
@@ -3827,16 +3842,39 @@ mod refused_bodies {
         let socket = TcpSocket::new_v4()?;
         socket.set_send_buffer_size(BUFFER)?;
         let mut connection = socket.connect(addr).await?;
+        write_request(&mut connection, bearer, announce, sent).await?;
+        let mut answer = Vec::new();
+        loop {
+            if let Some(end) = answer.windows(4).position(|window| window == b"\r\n\r\n") {
+                return Ok(parse_head(&answer[..end]));
+            }
+            let mut read = [0_u8; 1024];
+            let got = connection.read(&mut read).await?;
+            if got == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            answer.extend_from_slice(&read[..got]);
+        }
+    }
+
+    /// Writes a POST to `/owner-a/events` with `bearer` on `connection`, its
+    /// body announced as `announce`, and `sent` bytes of the body.
+    async fn write_request(
+        connection: &mut TcpStream,
+        bearer: &str,
+        announce: Announce,
+        sent: usize,
+    ) -> std::io::Result<()> {
         let framing = match announce {
             Announce::Length(len) => format!("content-length: {len}"),
-            Announce::Chunked => "transfer-encoding: chunked".to_owned(),
+            Announce::Chunked | Announce::ChunkedWhole => "transfer-encoding: chunked".to_owned(),
         };
         let head = format!(
             "POST /owner-a/events HTTP/1.1\r\nhost: gateway.test\r\nauthorization: Bearer \
              {bearer}\r\n{framing}\r\n\r\n"
         );
         connection.write_all(head.as_bytes()).await?;
-        let chunked = matches!(announce, Announce::Chunked);
+        let chunked = !matches!(announce, Announce::Length(_));
         let chunk = vec![0_u8; CHUNK];
         let mut left = sent;
         while left > 0 {
@@ -3852,18 +3890,17 @@ mod refused_bodies {
             }
             left = left.saturating_sub(now);
         }
-        let mut answer = Vec::new();
-        loop {
-            if let Some(end) = answer.windows(4).position(|window| window == b"\r\n\r\n") {
-                return Ok(parse_head(&answer[..end]));
-            }
-            let mut read = [0_u8; 1024];
-            let got = connection.read(&mut read).await?;
-            if got == 0 {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-            answer.extend_from_slice(&read[..got]);
+        if matches!(announce, Announce::ChunkedWhole) {
+            connection.write_all(b"0\r\n\r\n").await?;
         }
+        Ok(())
+    }
+
+    /// A new connection to `addr` that sends from [`BUFFER`].
+    async fn connect(addr: SocketAddr) -> TcpStream {
+        let socket = TcpSocket::new_v4().expect("a socket");
+        socket.set_send_buffer_size(BUFFER).expect("a send buffer");
+        socket.connect(addr).await.expect("connect")
     }
 
     /// A gateway with access control and `config` whose token issuer is
@@ -4197,12 +4234,12 @@ mod refused_bodies {
         let _frozen = FrozenClock::hold();
         let upstream = answering_upstream().await;
         let mut config = test_config(vec![upstream.url.clone()]);
-        config.max_request_body_bytes = LIMIT;
+        set_body_limit(&mut config, LIMIT);
         let cases = [
             (
                 "forwarded",
                 Gateway::new(config.clone()),
-                Announce::Length(LARGE_BODY),
+                Announce::Chunked,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "RequestBodyTooLarge",
                 (0_u64, 0_u64),
@@ -4259,7 +4296,7 @@ mod refused_bodies {
         let _frozen = FrozenClock::hold();
         let upstream = answering_upstream().await;
         let mut config = test_config(vec![upstream.url.clone()]);
-        config.max_request_body_bytes = LIMIT;
+        set_body_limit(&mut config, LIMIT);
         let gateway = Arc::new(guarded(config, Ok(AuthorizationDecision::Allow)));
         let (addr, _server) = serve(Arc::clone(&gateway)).await;
 
@@ -4327,16 +4364,234 @@ mod refused_bodies {
         let metrics = gateway.metrics_snapshot();
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
     }
+
+    /// The body a holder declares: 2 MiB, past the default small-body
+    /// threshold, so that it counts toward its bucket's upload limits.
+    const HELD_BODY: usize = 2 << 20;
+
+    /// Each refusal of a request the gateway would forward, but for its body
+    /// or the bodies under way beside it, reaches a client that sends a body
+    /// of 8 MiB before it reads the answer, vouched, after the gateway read
+    /// the whole body: a body over its bucket's own limit (declared, or
+    /// found as it arrives), past its bucket's upload count or bytes while
+    /// another of its large bodies is under way, or without its share of the
+    /// budget. The connection then carries the client's next request.
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_refusal_reaches_a_client_that_sends_its_whole_body_first() {
+        let _frozen = FrozenClock::hold();
+        let upstream = answering_upstream().await;
+        let config = || test_config(vec![upstream.url.clone()]);
+        let quotas =
+            |policy: &str| Arc::new(StaticQuotaProvider::from_toml_str(policy).expect("quotas"));
+        let allowed = || guarded(config(), Ok(AuthorizationDecision::Allow));
+        // 8 MiB per request and 9 MiB of budget, 1 MiB of it headroom: a
+        // held body leaves no room for another at the limit. No wait.
+        let mut spent = config();
+        spent.uploads = UploadLimits::try_from(UploadLimitsSpec {
+            max_request_body_bytes: 8 << 20,
+            budget_bytes: 9 << 20,
+            small_body_headroom_bytes: 1 << 20,
+            budget_wait: Duration::ZERO,
+            ..UploadLimitsSpec::default()
+        })
+        .expect("valid upload limits");
+        let cases = [
+            (
+                "bucket limit, declared",
+                allowed().with_quota_provider(quotas(
+                    "[[bucket]]\nid = \"owner-a\"\nmax_request_body_bytes = 1048576\n",
+                )),
+                Announce::Length(LARGE_BODY),
+                false,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "RequestBodyTooLarge",
+            ),
+            (
+                "bucket limit, chunked",
+                allowed().with_quota_provider(quotas(
+                    "[[bucket]]\nid = \"owner-a\"\nmax_request_body_bytes = 1048576\n",
+                )),
+                Announce::ChunkedWhole,
+                false,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "RequestBodyTooLarge",
+            ),
+            (
+                "bucket upload count",
+                allowed().with_quota_provider(quotas(
+                    "[[bucket]]\nid = \"owner-a\"\nmax_concurrent_uploads = 1\n",
+                )),
+                Announce::Length(LARGE_BODY),
+                true,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TenantUploads",
+            ),
+            (
+                "bucket upload bytes",
+                allowed().with_quota_provider(quotas(
+                    "[[bucket]]\nid = \"owner-a\"\nmax_upload_bytes = 4194304\n",
+                )),
+                Announce::Length(LARGE_BODY),
+                true,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TenantUploadBytes",
+            ),
+            (
+                "budget spent",
+                guarded(spent, Ok(AuthorizationDecision::Allow)),
+                Announce::Length(LARGE_BODY),
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UploadBudgetExhausted",
+            ),
+        ];
+        for (case, gateway, announce, held, status, token) in cases {
+            let gateway = Arc::new(gateway);
+            let (addr, _server) = serve(Arc::clone(&gateway)).await;
+            // A large body of the bucket under way, which never ends.
+            let mut holder = None;
+            if held {
+                let mut connection = connect(addr).await;
+                write_request(
+                    &mut connection,
+                    "valid-token",
+                    Announce::Length(HELD_BODY),
+                    CHUNK,
+                )
+                .await
+                .expect("send the held body's start");
+                assert!(
+                    until(|| gateway.metrics_snapshot().upload_reserved_bytes == HELD_BODY as u64)
+                        .await,
+                    "{case}: the held body is reserved"
+                );
+                holder = Some(connection);
+            }
+
+            let mut connection = connect(addr).await;
+            let client = tokio::spawn(async move {
+                let answered =
+                    match write_request(&mut connection, "valid-token", announce, LARGE_BODY).await
+                    {
+                        Ok(()) => Ok(read_answer(&mut connection).await),
+                        Err(error) => Err(error),
+                    };
+                (answered, connection)
+            });
+            assert!(until(|| client.is_finished()).await, "{case}: no answer");
+            let (answered, mut connection) = client.await.unwrap();
+            let (answered, headers) = answered.unwrap_or_else(|error| {
+                panic!("{case}: the connection broke before the answer: {error}")
+            });
+
+            assert_eq!(answered, status, "{case}");
+            assert_eq!(value(&headers, NOT_APPLIED_HEADER), Some(token), "{case}");
+            assert_eq!(
+                value(&headers, NOT_APPLIED_CHECKED_HEADER),
+                Some("1"),
+                "{case}"
+            );
+            assert_eq!(
+                headers.get_all(NOT_APPLIED_CHECKED_HEADER).iter().count(),
+                1,
+                "{case}: one vouch on the wire"
+            );
+            let metrics = gateway.metrics_snapshot();
+            assert_eq!(
+                (metrics.refusal_drains, metrics.refusal_drains_cut),
+                (1, 0),
+                "{case}"
+            );
+
+            let next = tokio::spawn(async move {
+                connection
+                    .write_all(
+                        b"POST /owner-a/events HTTP/1.1\r\nhost: gateway.test\r\nauthorization: \
+                          Bearer valid-token\r\ncontent-length: 0\r\n\r\n",
+                    )
+                    .await
+                    .expect("send the next request on the same connection");
+                read_answer(&mut connection).await
+            });
+            assert!(until(|| next.is_finished()).await, "{case}: no next answer");
+            let (next, _) = next.await.unwrap();
+            assert_eq!(next, StatusCode::OK, "{case}: the connection carries on");
+            drop(holder);
+        }
+    }
+
+    /// A forwarded body that stops arriving is cut once no byte of it
+    /// arrived for the stall timeout, to the timer's millisecond: its client
+    /// gets a vouched `408`, and the connection closes on the rest of the
+    /// body.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upload_gets_a_vouched_408_and_its_connection_closes() {
+        let _frozen = FrozenClock::hold();
+        let upstream = answering_upstream().await;
+        let gateway = Arc::new(guarded(
+            test_config(vec![upstream.url.clone()]),
+            Ok(AuthorizationDecision::Allow),
+        ));
+        let stall = gateway.config.uploads.stall_timeout();
+        let (addr, _server) = serve(Arc::clone(&gateway)).await;
+
+        let mut connection = connect(addr).await;
+        write_request(
+            &mut connection,
+            "valid-token",
+            Announce::Length(LARGE_BODY),
+            CHUNK,
+        )
+        .await
+        .expect("send the start of the body");
+        assert!(
+            until(|| gateway.metrics_snapshot().upload_reserved_bytes == LARGE_BODY as u64).await,
+            "the gateway reads the body"
+        );
+        let client = tokio::spawn(async move {
+            let answered = read_answer(&mut connection).await;
+            let mut rest = [0_u8; 16];
+            let closed = connection.read(&mut rest).await.map(|read| read == 0);
+            (answered, closed)
+        });
+        tokio::time::advance(stall.saturating_sub(Duration::from_millis(1))).await;
+        assert!(
+            !until(|| client.is_finished()).await,
+            "cut before the stall"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert!(
+            until(|| client.is_finished()).await,
+            "no answer once stalled"
+        );
+        let ((status, headers), closed) = client.await.unwrap();
+
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            value(&headers, NOT_APPLIED_HEADER),
+            Some("RequestBodyTooSlow")
+        );
+        assert_eq!(value(&headers, NOT_APPLIED_CHECKED_HEADER), Some("1"));
+        assert!(
+            closed.unwrap_or(true),
+            "the connection closes after the 408"
+        );
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.upload_refusals_too_slow, 1);
+        assert_eq!(metrics.upload_reserved_bytes, 0);
+    }
 }
 
-/// The body budget and the per-tenant caps ([`crate::uploads`]), with budgets
-/// of a few KiB, through [`Gateway::handle`].
+/// The body budget, the buckets' upload limits and the pace of a forwarded
+/// body ([`crate::uploads`]), with budgets of a few KiB, through
+/// [`Gateway::handle`].
 mod uploads {
     use std::convert::Infallible;
-    use std::num::NonZeroU32;
-    use std::num::NonZeroU64;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -4347,12 +4602,15 @@ mod uploads {
     use axum::http::header::RETRY_AFTER;
     use axum::response::Response as AxumResponse;
     use bytes::Bytes;
+    use http_body::Frame;
+    use http_body::SizeHint;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
     use tokio::time::Instant;
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::FixedPrincipalResolver;
+    use super::FrozenClock;
     use super::RecordingAuthorizer;
     use super::counting_fallback_upstream;
     use super::not_applied;
@@ -4361,34 +4619,53 @@ mod uploads {
     use super::vouch;
     use crate::Gateway;
     use crate::GatewayConfig;
+    use crate::admission::StaticQuotaProvider;
     use crate::auth::AccessControl;
     use crate::auth::AuthorizationDecision;
     use crate::uploads::UploadLimits;
-
-    /// The per-request limit: a body without a declared length reserves it.
-    const LIMIT: usize = 4 << 10;
+    use crate::uploads::UploadLimitsSpec;
 
     /// A budget of 8 KiB, of which 4 KiB is headroom for bodies of at most
-    /// 1 KiB: one body at [`LIMIT`] spends the rest. Tenants hold 64 KiB and
-    /// eight bodies, so that only the budget refuses. A request waits 20 ms
-    /// for the budget.
-    fn tiny_budget() -> UploadLimits {
-        UploadLimits {
-            budget_bytes: NonZeroU64::new(8 << 10).unwrap(),
+    /// 1 KiB, and a per-request limit of 4 KiB: one body at the limit spends
+    /// the rest. A request waits 20 ms for the budget.
+    fn tiny() -> UploadLimitsSpec {
+        UploadLimitsSpec {
+            max_request_body_bytes: 4 << 10,
+            budget_bytes: 8 << 10,
             small_body_headroom_bytes: 4 << 10,
             small_body_max_bytes: 1 << 10,
-            tenant_bytes: NonZeroU64::new(64 << 10).unwrap(),
-            tenant_uploads: NonZeroU32::new(8).unwrap(),
             budget_wait: Duration::from_millis(20),
-            ..UploadLimits::default()
+            ..UploadLimitsSpec::default()
         }
     }
 
-    fn config(upstream: &str, uploads: UploadLimits) -> GatewayConfig {
+    /// [`tiny`] with 64 KiB of budget, which no test here spends.
+    fn roomy() -> UploadLimitsSpec {
+        UploadLimitsSpec {
+            budget_bytes: 64 << 10,
+            ..tiny()
+        }
+    }
+
+    fn config(upstream: &str, uploads: UploadLimitsSpec) -> GatewayConfig {
         let mut config = test_config(vec![upstream.to_owned()]);
-        config.max_request_body_bytes = LIMIT;
-        config.uploads = uploads;
+        config.uploads = UploadLimits::try_from(uploads).expect("valid upload limits");
         config
+    }
+
+    /// A gateway with access control that allows every request with
+    /// `valid-token`, and the quota policy `quotas`.
+    fn guarded(config: GatewayConfig, quotas: &str) -> Gateway {
+        Gateway::with_access_control(
+            config,
+            AccessControl::new(
+                Arc::new(FixedPrincipalResolver::valid()),
+                Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow)),
+            ),
+        )
+        .with_quota_provider(Arc::new(
+            StaticQuotaProvider::from_toml_str(quotas).expect("quotas"),
+        ))
     }
 
     fn post(path: &str, body: Body) -> Request<Body> {
@@ -4401,7 +4678,7 @@ mod uploads {
     }
 
     /// A body without a declared length that sends `first` and then nothing
-    /// until the returned sender is dropped, when it ends.
+    /// until the returned sender sends more or is dropped, when it ends.
     fn open_body(first: &'static [u8]) -> (mpsc::Sender<Result<Bytes, Infallible>>, Body) {
         let (chunks, body) = mpsc::channel(1);
         chunks
@@ -4410,17 +4687,57 @@ mod uploads {
         (chunks, Body::from_stream(ReceiverStream::new(body)))
     }
 
+    /// A body that declares `len` bytes, as a `content-length` does, and
+    /// delivers what the returned sender sends, ending when it is dropped.
+    struct Declared {
+        len: u64,
+        chunks: mpsc::Receiver<Bytes>,
+    }
+
+    impl http_body::Body for Declared {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            self.chunks
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(|chunk| Ok(Frame::data(chunk))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.len)
+        }
+    }
+
+    /// A body declared as `len` bytes, of which none has arrived yet.
+    fn declared(len: u64) -> (mpsc::Sender<Bytes>, Body) {
+        let (chunks, receiver) = mpsc::channel(64);
+        (
+            chunks,
+            Body::new(Declared {
+                len,
+                chunks: receiver,
+            }),
+        )
+    }
+
     /// Sends `request` through `gateway` on a task of its own.
     fn send(gateway: &Arc<Gateway>, request: Request<Body>) -> JoinHandle<AxumResponse> {
         let gateway = Arc::clone(gateway);
         tokio::spawn(async move { gateway.handle(request).await })
     }
 
-    /// Lets the runtime run until `gateway` holds `bytes` of its budget, and
+    /// Lets the runtime run until `done` holds of `gateway`'s metrics, and
     /// says whether it does. It gives up after many turns.
-    async fn until_reserved(gateway: &Gateway, bytes: u64) -> bool {
+    async fn until(
+        gateway: &Gateway,
+        done: impl Fn(&crate::GatewayMetricsSnapshot) -> bool,
+    ) -> bool {
         for _ in 0..100_000 {
-            if gateway.metrics_snapshot().upload_reserved_bytes == bytes {
+            if done(&gateway.metrics_snapshot()) {
                 return true;
             }
             tokio::task::yield_now().await;
@@ -4428,127 +4745,229 @@ mod uploads {
         false
     }
 
-    /// Ends an open upload and returns its answer.
-    async fn finish(
-        chunks: mpsc::Sender<Result<Bytes, Infallible>>,
-        upload: JoinHandle<AxumResponse>,
-    ) -> AxumResponse {
-        drop(chunks);
+    /// Lets the runtime run until `gateway` holds `bytes` of its budget.
+    async fn until_reserved(gateway: &Gateway, bytes: u64) -> bool {
+        until(gateway, |metrics| metrics.upload_reserved_bytes == bytes).await
+    }
+
+    /// The answer to `upload`, which must come within 5 s.
+    async fn answer(upload: JoinHandle<AxumResponse>) -> AxumResponse {
         tokio::time::timeout(Duration::from_secs(5), upload)
             .await
-            .expect("the upload is answered once its body ends")
+            .expect("the upload is answered")
             .expect("the upload's task")
     }
 
-    fn retry_after(response: &AxumResponse) -> Option<&HeaderValue> {
-        response.headers().get(RETRY_AFTER)
+    /// Ends a declared upload with the rest of its bytes and returns its
+    /// answer.
+    async fn finish_declared(
+        chunks: mpsc::Sender<Bytes>,
+        rest: usize,
+        upload: JoinHandle<AxumResponse>,
+    ) -> AxumResponse {
+        chunks
+            .send(Bytes::from(vec![0_u8; rest]))
+            .await
+            .expect("the gateway reads the body");
+        drop(chunks);
+        answer(upload).await
     }
 
-    /// A body that would take its tenant past the tenant's bytes is refused
-    /// with a vouched `429` and `Retry-After`, after the gateway read it, and
-    /// nothing reaches the upstream. The tenant is the bucket and the
-    /// principal that access control found.
+    fn retry_after(response: &AxumResponse) -> Option<&[u8]> {
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .map(HeaderValue::as_bytes)
+    }
+
+    /// Asserts that `response` is the vouched refusal `status` with `token`.
+    fn assert_refused(response: &AxumResponse, status: StatusCode, token: &str) {
+        assert_eq!(response.status(), status);
+        assert_eq!(not_applied(response), Some(token));
+        assert_eq!(vouch(response), Some("1"));
+    }
+
+    /// A large body that would take its bucket's large bodies past
+    /// `max_upload_bytes` is refused with a vouched `429` and `Retry-After`,
+    /// after the gateway read it, and nothing reaches the upstream. A small
+    /// body of the same bucket goes through meanwhile: small bodies never
+    /// count toward the bucket's upload limits.
     #[tokio::test]
-    async fn a_body_past_the_tenant_bytes_gets_a_vouched_429() {
+    async fn a_body_past_the_bucket_upload_bytes_gets_a_vouched_429_while_small_ones_pass() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let uploads = UploadLimits {
-            tenant_bytes: NonZeroU64::new(6 << 10).unwrap(),
-            ..tiny_budget()
-        };
-        let gateway = Arc::new(Gateway::with_access_control(
-            config(&upstream.url, uploads),
-            AccessControl::new(
-                Arc::new(FixedPrincipalResolver::valid()),
-                Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow)),
-            ),
+        let gateway = Arc::new(guarded(
+            config(&upstream.url, roomy()),
+            "[[bucket]]\nid = \"tenant-a\"\nmax_upload_bytes = 3072\n",
         ));
-        // The tenant's first body reserves the limit, 4 KiB of its 6 KiB.
-        let (chunks, body) = open_body(b"first");
+        let (chunks, body) = declared(2 << 10);
         let first = send(&gateway, post("/tenant-a/orders", body));
-        assert!(until_reserved(&gateway, 4 << 10).await);
+        assert!(until(&gateway, |metrics| metrics.upload_tenants == 1).await);
 
         let refused = gateway
-            .handle(post("/tenant-a/orders", Body::from(vec![0_u8; 4 << 10])))
+            .handle(post("/tenant-a/orders", Body::from(vec![0_u8; 2 << 10])))
             .await;
-
-        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(not_applied(&refused), Some("TenantUploadBytes"));
-        assert_eq!(vouch(&refused), Some("1"));
-        assert_eq!(
-            retry_after(&refused).map(HeaderValue::as_bytes),
-            Some(&b"1"[..])
-        );
+        assert_refused(&refused, StatusCode::TOO_MANY_REQUESTS, "TenantUploadBytes");
+        assert_eq!(retry_after(&refused), Some(&b"1"[..]));
         assert_eq!(hits.load(Ordering::Relaxed), 0);
         let metrics = gateway.metrics_snapshot();
         assert_eq!(metrics.upload_refusals_tenant_bytes, 1);
-        // Read before the answer, as every refusal from the head is.
+        assert_eq!(metrics.upload_tenants, 1, "the refusal holds nothing");
+        // Read to its end before the answer.
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
 
-        assert_eq!(finish(chunks, first).await.status(), StatusCode::OK);
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        for small in [512, 1 << 10] {
+            let passed = gateway
+                .handle(post("/tenant-a/orders", Body::from(vec![0_u8; small])))
+                .await;
+            assert_eq!(passed.status(), StatusCode::OK, "{small} bytes");
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            finish_declared(chunks, 2 << 10, first).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(gateway.metrics_snapshot().upload_tenants, 0);
     }
 
-    /// A tenant with [`UploadLimits::tenant_uploads`] bodies under way is
-    /// refused another, while another tenant's body goes through. Without
-    /// access control the tenant is the path's bucket.
+    /// A bucket with `max_concurrent_uploads` large bodies being read is
+    /// refused another, with a vouched `429`, while another bucket's large
+    /// body goes through, and while more small bodies of the bucket than the
+    /// count, sent at once and still arriving, go through too.
     #[tokio::test]
-    async fn uploads_past_the_tenant_count_are_refused_while_other_tenants_proceed() {
+    async fn uploads_past_the_bucket_count_are_refused_while_small_bodies_and_other_buckets_proceed()
+     {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let uploads = UploadLimits {
-            budget_bytes: NonZeroU64::new(64 << 10).unwrap(),
-            tenant_uploads: NonZeroU32::new(1).unwrap(),
-            ..tiny_budget()
-        };
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, uploads)));
-        let (chunks, body) = open_body(b"first");
+        let gateway = Arc::new(guarded(
+            config(&upstream.url, roomy()),
+            "[default]\nmax_concurrent_uploads = 1\n",
+        ));
+        let (chunks, body) = declared(2 << 10);
         let first = send(&gateway, post("/tenant-a/orders", body));
-        assert!(until_reserved(&gateway, 4 << 10).await);
+        assert!(until(&gateway, |metrics| metrics.upload_tenants == 1).await);
 
         let refused = gateway
-            .handle(post("/tenant-a/other", Body::from("second")))
+            .handle(post("/tenant-a/other", Body::from(vec![0_u8; 2 << 10])))
             .await;
-        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(not_applied(&refused), Some("TenantUploads"));
-        assert_eq!(vouch(&refused), Some("1"));
-        assert_eq!(
-            retry_after(&refused).map(HeaderValue::as_bytes),
-            Some(&b"1"[..])
-        );
+        assert_refused(&refused, StatusCode::TOO_MANY_REQUESTS, "TenantUploads");
+        assert_eq!(retry_after(&refused), Some(&b"1"[..]));
         assert_eq!(hits.load(Ordering::Relaxed), 0);
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.upload_refusals_tenant_uploads, 1);
+        assert_eq!(metrics.upload_tenants, 1, "the refusal holds nothing");
+
+        // Sixteen small appends of the bucket at once, each still arriving.
+        let small: Vec<_> = (0..16)
+            .map(|_| {
+                let (chunks, body) = open_body(b"commit");
+                (chunks, send(&gateway, post("/tenant-a/orders", body)))
+            })
+            .collect();
+        assert!(until_reserved(&gateway, (2 << 10) + (16 << 10)).await);
+        for (chunks, upload) in small {
+            drop(chunks);
+            assert_eq!(answer(upload).await.status(), StatusCode::OK);
+        }
 
         let other = gateway
-            .handle(post("/tenant-b/orders", Body::from("other tenant")))
+            .handle(post("/tenant-b/orders", Body::from(vec![0_u8; 2 << 10])))
             .await;
         assert_eq!(other.status(), StatusCode::OK);
         assert_eq!(not_applied(&other), None);
-        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        assert_eq!(hits.load(Ordering::Relaxed), 17);
 
-        assert_eq!(finish(chunks, first).await.status(), StatusCode::OK);
-        assert_eq!(hits.load(Ordering::Relaxed), 2);
-        assert_eq!(gateway.metrics_snapshot().upload_refusals_tenant_uploads, 1);
+        assert_eq!(
+            finish_declared(chunks, 2 << 10, first).await.status(),
+            StatusCode::OK
+        );
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(
+            (metrics.upload_tenants, metrics.upload_reserved_bytes),
+            (0, 0)
+        );
+    }
+
+    /// A large body stops counting toward its bucket's upload limits once
+    /// the gateway has buffered it, while the upstream still works on it, and
+    /// a body without a declared length counts once it grows past the small
+    /// bodies.
+    #[tokio::test]
+    async fn the_upload_count_is_released_once_the_body_is_buffered() {
+        let (upstream, mut arrivals) = silent_upstream().await;
+        let gateway = Arc::new(guarded(
+            config(&upstream.url, roomy()),
+            "[default]\nmax_concurrent_uploads = 1\n",
+        ));
+        let (chunks, body) = open_body(b"abc");
+        let first = send(&gateway, post("/tenant-a/orders", body));
+        // Small so far: it reserves the small-body threshold and counts for
+        // no bucket.
+        assert!(until_reserved(&gateway, 1 << 10).await);
+        assert_eq!(gateway.metrics_snapshot().upload_tenants, 0);
+        chunks
+            .send(Ok(Bytes::from(vec![0_u8; 2 << 10])))
+            .await
+            .expect("the gateway reads the body");
+        assert!(until(&gateway, |metrics| metrics.upload_tenants == 1).await);
+        assert!(until_reserved(&gateway, 3 << 10).await);
+
+        drop(chunks);
+        arrivals.recv().await.expect("the first body is forwarded");
+        assert_eq!(gateway.metrics_snapshot().upload_tenants, 0);
+
+        let second = send(
+            &gateway,
+            post("/tenant-a/orders", Body::from(vec![0_u8; 2 << 10])),
+        );
+        arrivals.recv().await.expect("the second body is forwarded");
+        first.abort();
+        second.abort();
+        assert!(until_reserved(&gateway, 0).await);
+    }
+
+    /// Without a quota policy no bucket has upload limits: three large
+    /// bodies of one bucket are read at once, within the budget.
+    #[tokio::test]
+    async fn upload_limits_apply_only_under_a_quota_policy() {
+        let (upstream, hits) = counting_fallback_upstream().await;
+        let gateway = Arc::new(Gateway::new(config(&upstream.url, roomy())));
+        let open: Vec<_> = (0..3)
+            .map(|_| {
+                let (chunks, body) = declared(2 << 10);
+                (chunks, send(&gateway, post("/tenant-a/orders", body)))
+            })
+            .collect();
+        assert!(until_reserved(&gateway, 6 << 10).await);
+        assert_eq!(gateway.metrics_snapshot().upload_tenants, 0);
+        for (chunks, upload) in open {
+            assert_eq!(
+                finish_declared(chunks, 2 << 10, upload).await.status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 
     /// With the budget spent by one large upload, another large body waits
-    /// [`UploadLimits::budget_wait`] and gets a vouched `503` with
-    /// `Retry-After`, while a small body goes through on the headroom.
+    /// `budget_wait` and gets a vouched `503` with `Retry-After`, after the
+    /// gateway read it, while a small body goes through on the headroom.
     #[tokio::test]
     async fn a_spent_budget_refuses_a_large_body_while_a_small_one_uses_the_headroom() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny_budget())));
-        let (chunks, body) = open_body(b"large");
+        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny())));
+        let (chunks, body) = declared(4 << 10);
         let large = send(&gateway, post("/tenant-a/orders", body));
         assert!(until_reserved(&gateway, 4 << 10).await);
 
         let refused = gateway
             .handle(post("/tenant-b/orders", Body::from(vec![0_u8; 2 << 10])))
             .await;
-        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(not_applied(&refused), Some("UploadBudgetExhausted"));
-        assert_eq!(vouch(&refused), Some("1"));
-        assert_eq!(
-            retry_after(&refused).map(HeaderValue::as_bytes),
-            Some(&b"1"[..])
+        assert_refused(
+            &refused,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UploadBudgetExhausted",
         );
+        assert_eq!(retry_after(&refused), Some(&b"1"[..]));
         assert_eq!(hits.load(Ordering::Relaxed), 0);
 
         let small = gateway
@@ -4559,96 +4978,182 @@ mod uploads {
 
         let metrics = gateway.metrics_snapshot();
         assert_eq!(metrics.upload_refusals_budget, 1);
+        assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
         assert_eq!(metrics.upload_reserved_bytes, 4 << 10);
-        assert_eq!(finish(chunks, large).await.status(), StatusCode::OK);
+        assert_eq!(
+            finish_declared(chunks, 4 << 10, large).await.status(),
+            StatusCode::OK
+        );
         assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 0);
     }
 
-    /// A body that, after the grace, arrives slower than the least average
-    /// rate is cut and refused with a vouched `408`, and nothing reaches the
-    /// upstream: with 4 KiB read at 1 KiB/s it is cut 4 s after the reading
-    /// started, and with nothing read at the end of the 2 s grace.
-    #[tokio::test(start_paused = true)]
-    async fn a_body_slower_than_the_least_rate_is_refused_before_it_is_forwarded() {
+    /// A request that finds the budget spent gets it once the upload that
+    /// holds it ends within `budget_wait`.
+    #[tokio::test]
+    async fn a_request_that_gets_the_budget_within_the_wait_goes_through() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let uploads = UploadLimits {
-            read_grace: Duration::from_secs(2),
-            min_bytes_per_sec: NonZeroU64::new(1 << 10).unwrap(),
-            ..UploadLimits::default()
-        };
-        let mut config = config(&upstream.url, uploads);
-        config.max_request_body_bytes = 64 << 10;
-        let gateway = Gateway::new(config);
-        for (first, cut_after) in [
-            (&[0_u8; 4 << 10][..], Duration::from_secs(4)),
-            (&[][..], Duration::from_secs(2)),
-        ] {
-            let (chunks, body) = open_body(first);
+        let gateway = Arc::new(Gateway::new(config(&upstream.url, UploadLimitsSpec {
+            budget_wait: Duration::from_secs(5),
+            ..tiny()
+        })));
+        let (chunks, body) = declared(4 << 10);
+        let holder = send(&gateway, post("/tenant-a/orders", body));
+        assert!(until_reserved(&gateway, 4 << 10).await);
 
-            let started = Instant::now();
-            let refused = gateway.handle(post("/tenant-a/orders", body)).await;
-            let took = started.elapsed();
-            drop(chunks);
-
-            assert_eq!(refused.status(), StatusCode::REQUEST_TIMEOUT);
-            assert_eq!(not_applied(&refused), Some("RequestBodyTooSlow"));
-            assert_eq!(vouch(&refused), Some("1"));
-            assert!(
-                took >= cut_after && took < cut_after.saturating_add(Duration::from_millis(1)),
-                "cut after {took:?}"
-            );
+        let waiting = send(
+            &gateway,
+            post("/tenant-b/orders", Body::from(vec![0_u8; 4 << 10])),
+        );
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
         }
-        assert_eq!(hits.load(Ordering::Relaxed), 0);
+        assert!(!waiting.is_finished(), "the request waits for the budget");
+        assert_eq!(
+            finish_declared(chunks, 4 << 10, holder).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(answer(waiting).await.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        assert_eq!(gateway.metrics_snapshot().upload_refusals_budget, 0);
+    }
+
+    /// A request dropped while it waits for the budget gives back its count
+    /// of its bucket's uploads and whatever of the budget it was assigned.
+    #[tokio::test]
+    async fn a_request_dropped_while_it_waits_releases_its_claim() {
+        let (upstream, _hits) = counting_fallback_upstream().await;
+        let gateway = Arc::new(guarded(
+            config(&upstream.url, UploadLimitsSpec {
+                budget_wait: Duration::from_millis(300),
+                ..tiny()
+            }),
+            "[default]\nmax_concurrent_uploads = 2\n",
+        ));
+        let (chunks, body) = declared(3 << 10);
+        let holder = send(&gateway, post("/tenant-a/orders", body));
+        assert!(until_reserved(&gateway, 3 << 10).await);
+
+        // Counted toward the bucket's two, then waits for the budget.
+        let waiting = send(
+            &gateway,
+            post("/tenant-a/orders", Body::from(vec![0_u8; 4 << 10])),
+        );
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished(), "the request waits for the budget");
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+
+        // Had the dropped request kept its count, this one would get the
+        // bucket's `429`: it gets the budget's `503`.
+        let refused = gateway
+            .handle(post("/tenant-a/orders", Body::from(vec![0_u8; 4 << 10])))
+            .await;
+        assert_refused(
+            &refused,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UploadBudgetExhausted",
+        );
+        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 3 << 10);
+
+        assert_eq!(
+            finish_declared(chunks, 3 << 10, holder).await.status(),
+            StatusCode::OK
+        );
         let metrics = gateway.metrics_snapshot();
-        assert_eq!(metrics.upload_refusals_too_slow, 2);
         assert_eq!(
             (metrics.upload_reserved_bytes, metrics.upload_tenants),
             (0, 0)
         );
     }
 
+    /// A body declared over its bucket's own body limit is refused with a
+    /// vouched `413` before it reserves anything, once the gateway has read
+    /// it to its end. A body without a declared length that passes the
+    /// bucket's limit as it arrives is read to its end too, and gives back
+    /// what it reserved.
+    #[tokio::test]
+    async fn a_body_over_the_bucket_limit_reserves_nothing_and_is_read_to_its_end() {
+        let (upstream, hits) = counting_fallback_upstream().await;
+        let gateway = Arc::new(guarded(
+            config(&upstream.url, roomy()),
+            "[default]\nmax_request_body_bytes = 2048\n",
+        ));
+        let (chunks, body) = declared(3 << 10);
+        let over = send(&gateway, post("/tenant-a/orders", body));
+        assert!(until(&gateway, |metrics| metrics.refusal_drains == 1).await);
+        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 0);
+        let refused = finish_declared(chunks, 3 << 10, over).await;
+        assert_refused(
+            &refused,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RequestBodyTooLarge",
+        );
+
+        let (chunks, body) = open_body(&[0; 1 << 10]);
+        let growing = send(&gateway, post("/tenant-a/orders", body));
+        chunks
+            .send(Ok(Bytes::from(vec![0_u8; 2 << 10])))
+            .await
+            .expect("the gateway reads past the bucket's limit");
+        assert!(until(&gateway, |metrics| metrics.refusal_drains == 2).await);
+        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 0);
+        drop(chunks);
+        assert_refused(
+            &answer(growing).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RequestBodyTooLarge",
+        );
+
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (2, 0));
+    }
+
     /// A reservation ends with its request: after the upstream answered,
-    /// after a refusal while the body was read, and after the client went
-    /// away. Each time a body that needs the whole budget but the headroom
-    /// goes through next.
+    /// after the body passed the per-request limit, and after the client
+    /// went away. Each time a body that needs the whole budget but the
+    /// headroom goes through next.
     #[tokio::test]
     async fn the_budget_is_released_after_success_refusal_and_disconnect() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny_budget())));
-        let whole_budget = || post("/tenant-a/orders", Body::from(vec![0_u8; LIMIT]));
-        let released = |gateway: &Gateway| {
-            let metrics = gateway.metrics_snapshot();
-            (metrics.upload_reserved_bytes, metrics.upload_tenants)
-        };
+        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny())));
+        let whole_budget = || post("/tenant-a/orders", Body::from(vec![0_u8; 4 << 10]));
+        let released = |gateway: &Gateway| gateway.metrics_snapshot().upload_reserved_bytes;
 
         let answered = gateway.handle(whole_budget()).await;
         assert_eq!(answered.status(), StatusCode::OK);
-        assert_eq!(released(&gateway), (0, 0), "after success");
+        assert_eq!(released(&gateway), 0, "after success");
         assert_eq!(
             gateway.handle(whole_budget()).await.status(),
             StatusCode::OK
         );
 
-        // Undeclared, so it reserves the limit, and then goes past it.
+        // Undeclared, it grows past the limit.
         let over = Body::from_stream(tokio_stream::iter([
             Ok::<_, Infallible>(Bytes::from(vec![0_u8; 3 << 10])),
             Ok(Bytes::from(vec![0_u8; 3 << 10])),
         ]));
         let refused = gateway.handle(post("/tenant-a/orders", over)).await;
-        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(released(&gateway), (0, 0), "after refusal");
+        assert_refused(
+            &refused,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RequestBodyTooLarge",
+        );
+        assert_eq!(released(&gateway), 0, "after refusal");
         assert_eq!(
             gateway.handle(whole_budget()).await.status(),
             StatusCode::OK
         );
 
-        let (chunks, body) = open_body(b"abandoned");
+        let (chunks, body) = declared(4 << 10);
         let abandoned = send(&gateway, post("/tenant-a/orders", body));
         assert!(until_reserved(&gateway, 4 << 10).await);
         abandoned.abort();
         assert!(abandoned.await.unwrap_err().is_cancelled());
         drop(chunks);
-        assert_eq!(released(&gateway), (0, 0), "after disconnect");
+        assert_eq!(released(&gateway), 0, "after disconnect");
         assert_eq!(
             gateway.handle(whole_budget()).await.status(),
             StatusCode::OK
@@ -4656,49 +5161,131 @@ mod uploads {
         assert_eq!(hits.load(Ordering::Relaxed), 4);
     }
 
-    /// A body without a declared length reserves the limit while it is read,
-    /// and only its size, in whole KiB, once it is buffered and forwarded.
+    /// A body without a declared length reserves the small-body threshold
+    /// at first, grows its reservation as it arrives, and holds only its
+    /// size, in whole KiB, once it is buffered and forwarded.
     #[tokio::test]
-    async fn a_reservation_shrinks_to_the_buffered_body() {
+    async fn an_undeclared_reservation_grows_as_the_body_arrives_and_shrinks_once_buffered() {
         let (upstream, mut arrivals) = silent_upstream().await;
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny_budget())));
+        let gateway = Arc::new(Gateway::new(config(&upstream.url, tiny())));
         let (chunks, body) = open_body(b"abc");
         let upload = send(&gateway, post("/tenant-a/orders", body));
+        assert!(until_reserved(&gateway, 1 << 10).await);
+        chunks
+            .send(Ok(Bytes::from(vec![0_u8; 1 << 10])))
+            .await
+            .expect("the gateway reads the body");
+        assert!(until_reserved(&gateway, 2 << 10).await);
+        chunks
+            .send(Ok(Bytes::from(vec![0_u8; 1 << 10])))
+            .await
+            .expect("the gateway reads the body");
         assert!(until_reserved(&gateway, 4 << 10).await);
 
         drop(chunks);
         arrivals.recv().await.expect("the body is forwarded");
-        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 1 << 10);
+        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 3 << 10);
 
         upload.abort();
         assert!(upload.await.unwrap_err().is_cancelled());
         assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 0);
     }
 
-    /// The gateway tracks a tenant only while it has a body under way.
-    #[tokio::test]
-    async fn tenant_entries_are_removed_when_their_uploads_end() {
-        let (upstream, _hits) = counting_fallback_upstream().await;
-        let uploads = UploadLimits {
-            budget_bytes: NonZeroU64::new(64 << 10).unwrap(),
-            ..tiny_budget()
-        };
-        let gateway = Arc::new(Gateway::new(config(&upstream.url, uploads)));
-        let mut open = Vec::new();
-        for path in ["/tenant-a/x", "/tenant-a/y", "/tenant-b/x", "/tenant-c/x"] {
-            let (chunks, body) = open_body(b"open");
-            open.push((chunks, send(&gateway, post(path, body))));
+    /// A body that keeps arriving is never cut, however long it takes: 8 MiB
+    /// at 64 KiB/s takes 128 s, past the stall timeout and past the SQLite
+    /// extension's 120 s for a snapshot transfer, and is forwarded.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_live_body_is_never_cut() {
+        let _frozen = FrozenClock::hold();
+        // Reads each body whole, and answers with its length.
+        let upstream = super::spawn_upstream(axum::Router::new().fallback(axum::routing::any(
+            |body: Body| async move {
+                let read = http_body_util::BodyExt::collect(body)
+                    .await
+                    .expect("the forwarded body");
+                read.to_bytes().len().to_string()
+            },
+        )))
+        .await;
+        let gateway = Arc::new(Gateway::new(config(
+            &upstream.url,
+            UploadLimitsSpec::default(),
+        )));
+        let (chunks, body) = declared(8 << 20);
+        let upload = send(&gateway, post("/tenant-a/orders", body));
+        assert!(until_reserved(&gateway, 8 << 20).await);
+        for _ in 0..128 {
+            chunks
+                .send(Bytes::from(vec![0_u8; 64 << 10]))
+                .await
+                .expect("the gateway reads the body");
+            tokio::time::advance(Duration::from_secs(1)).await;
         }
-        assert!(until_reserved(&gateway, 16 << 10).await);
-        assert_eq!(gateway.metrics_snapshot().upload_tenants, 3);
+        drop(chunks);
 
-        for (chunks, upload) in open {
-            assert_eq!(finish(chunks, upload).await.status(), StatusCode::OK);
+        let answered = answer(upload).await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let forwarded = http_body_util::BodyExt::collect(answered.into_body())
+            .await
+            .expect("the upstream's answer")
+            .to_bytes();
+        assert_eq!(forwarded, (8_u32 << 20).to_string());
+        assert_eq!(gateway.metrics_snapshot().upload_refusals_too_slow, 0);
+    }
+
+    /// A body is cut, and refused with a vouched `408` before anything of it
+    /// is forwarded, when no byte of it arrives for the stall timeout
+    /// (30 s after its last chunk), and when one window of the stall timeout
+    /// gets fewer bytes than the floor (1 KiB every 10 s against 1 KiB/s:
+    /// cut when the first window ends, 30 s after the reading started).
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_body_is_cut_before_it_is_forwarded() {
+        let (upstream, hits) = counting_fallback_upstream().await;
+        for (case, min_bytes_per_sec, every, chunks_sent, cut_after) in [
+            (
+                "stalled",
+                0,
+                Duration::from_secs(20),
+                2,
+                Duration::from_secs(50),
+            ),
+            (
+                "below the floor",
+                1 << 10,
+                Duration::from_secs(10),
+                u32::MAX,
+                Duration::from_secs(30),
+            ),
+        ] {
+            let gateway = Gateway::new(config(&upstream.url, UploadLimitsSpec {
+                min_bytes_per_sec,
+                ..UploadLimitsSpec::default()
+            }));
+            let (chunks, body) = declared(4 << 20);
+            let sender = tokio::spawn(async move {
+                for _ in 0..chunks_sent {
+                    if chunks.send(Bytes::from(vec![0_u8; 1 << 10])).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(every).await;
+                }
+                std::future::pending::<()>().await;
+            });
+
+            let started = Instant::now();
+            let refused = gateway.handle(post("/tenant-a/orders", body)).await;
+            let took = started.elapsed();
+            sender.abort();
+
+            assert_refused(&refused, StatusCode::REQUEST_TIMEOUT, "RequestBodyTooSlow");
+            assert!(
+                took >= cut_after && took < cut_after.saturating_add(Duration::from_millis(1)),
+                "{case}: cut after {took:?}"
+            );
+            let metrics = gateway.metrics_snapshot();
+            assert_eq!(metrics.upload_refusals_too_slow, 1, "{case}");
+            assert_eq!(metrics.upload_reserved_bytes, 0, "{case}");
         }
-        let metrics = gateway.metrics_snapshot();
-        assert_eq!(
-            (metrics.upload_reserved_bytes, metrics.upload_tenants),
-            (0, 0)
-        );
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
     }
 }

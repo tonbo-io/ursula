@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -24,12 +23,17 @@ use crate::auth::jwt::JwtPrincipalResolver;
 use crate::auth::jwt::JwtValidationConfig;
 use crate::auth::policy::StaticPolicyAuthorizer;
 use crate::uploads::DEFAULT_BUDGET_WAIT;
-use crate::uploads::DEFAULT_READ_GRACE;
+use crate::uploads::DEFAULT_MIN_BYTES_PER_SEC;
+use crate::uploads::DEFAULT_STALL_TIMEOUT;
 use crate::uploads::UploadLimits;
+use crate::uploads::UploadLimitsError;
+use crate::uploads::UploadLimitsSpec;
 use crate::usage::JsonlUsageSink;
 use crate::usage::UsageCollector;
 
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 3600;
+/// The SQLite extension's timeout for a commit's request.
+const SQLITE_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut init_options = ursula_observability::InitOptions::new("ursula-gateway");
@@ -37,8 +41,15 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let _observability = ursula_observability::init(init_options);
 
     let installed_access_control = access_control(&args)?;
-    let config = gateway_config(&args);
-    config.uploads.check()?;
+    let config = gateway_config(&args)?;
+    if config.uploads.stall_timeout() <= SQLITE_COMMIT_TIMEOUT {
+        tracing::warn!(
+            stall_timeout_secs = config.uploads.stall_timeout().as_secs(),
+            "--body-stall-timeout is not above the SQLite extension's 10 s commit timeout: the \
+             gateway may cut a commit its client still waits for, which the client sees as an \
+             unknown outcome"
+        );
+    }
 
     let mut gateway = match installed_access_control {
         Some(access_control) => Gateway::with_access_control(config.clone(), access_control),
@@ -142,28 +153,26 @@ fn access_control(args: &GatewayArgs) -> Result<Option<AccessControl>, Box<dyn s
     ))
 }
 
-fn gateway_config(args: &GatewayArgs) -> GatewayConfig {
-    GatewayConfig {
+fn gateway_config(args: &GatewayArgs) -> Result<GatewayConfig, UploadLimitsError> {
+    Ok(GatewayConfig {
         listen: args.listen,
         upstreams: args.upstream.clone(),
         response_header_timeout: Duration::from_secs(args.response_header_timeout),
         connect_timeout: Duration::from_secs(args.connect_timeout),
         upstream_tcp_user_timeout_secs: args.upstream_tcp_user_timeout,
-        max_request_body_bytes: args.max_request_body_bytes,
-        uploads: UploadLimits {
+        uploads: UploadLimits::try_from(UploadLimitsSpec {
+            max_request_body_bytes: args.max_request_body_bytes,
             budget_bytes: args.body_budget_bytes,
             small_body_headroom_bytes: args.small_body_headroom_bytes,
             small_body_max_bytes: args.small_body_max_bytes,
-            tenant_bytes: args.tenant_upload_bytes,
-            tenant_uploads: args.tenant_uploads,
             budget_wait: Duration::from_millis(args.body_budget_wait_ms),
-            read_grace: Duration::from_secs(args.body_read_grace),
+            stall_timeout: Duration::from_secs(args.body_stall_timeout),
             min_bytes_per_sec: args.body_min_bytes_per_sec,
-        },
+        })?,
         raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
         cors_allowed_origins: args.cors_allowed_origin.clone(),
         usage_chunk_bytes: args.usage_chunk_bytes.map(NonZeroU64::get),
-    }
+    })
 }
 
 #[derive(Args, Debug)]
@@ -195,45 +204,36 @@ pub struct GatewayArgs {
     upstream_tcp_user_timeout: NonZeroU64,
 
     /// Maximum request body bytes buffered for leader-redirect replay. Also
-    /// the most the gateway reads of a body before it sends a refusal it
-    /// decided from the request's head alone.
+    /// the most the gateway reads of a body before it sends a refusal. Must
+    /// fit the part of `--body-budget-bytes` large bodies may take, the
+    /// budget less `--small-body-headroom-bytes`: raise the budget with it.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
     max_request_body_bytes: usize,
 
     /// Bytes of request bodies the gateway buffers at once, across requests,
     /// the small-body headroom included. Each body reserves its declared
-    /// length, or `--max-request-body-bytes` when it has none, before the
-    /// gateway reads it, and holds it until it was forwarded. The default,
+    /// length before the gateway reads it, and holds it until it was
+    /// forwarded. A body without a declared length reserves
+    /// `--small-body-max-bytes` at first and more as it arrives. The default,
     /// 256 MiB, is half of a 512 MiB pod: seven bodies at the default
-    /// per-request limit beside the headroom. Raise it with
-    /// `--max-request-body-bytes`, and keep it well below the memory limit.
-    #[arg(long, value_name = "BYTES", default_value_t = UploadLimits::default().budget_bytes)]
-    body_budget_bytes: NonZeroU64,
+    /// per-request limit beside the headroom. Keep it well below the memory
+    /// limit.
+    #[arg(long, value_name = "BYTES", default_value_t = UploadLimitsSpec::default().budget_bytes)]
+    body_budget_bytes: u64,
 
     /// Bytes of the body budget that only bodies of at most
     /// `--small-body-max-bytes` may take, so that small writes never queue
-    /// behind large uploads. Must be below `--body-budget-bytes`. The
-    /// default, 32 MiB, holds at least 32 small bodies.
-    #[arg(long, value_name = "BYTES", default_value_t = UploadLimits::default().small_body_headroom_bytes)]
+    /// behind large uploads. Must hold at least one small body. The default,
+    /// 32 MiB, holds at least 32 small bodies.
+    #[arg(long, value_name = "BYTES", default_value_t = UploadLimitsSpec::default().small_body_headroom_bytes)]
     small_body_headroom_bytes: u64,
 
-    /// The largest declared body length that may take the small-body
-    /// headroom. A body without a declared length counts as large.
-    #[arg(long, value_name = "BYTES", default_value_t = UploadLimits::default().small_body_max_bytes)]
+    /// The largest declared body length that counts as small: it may take
+    /// the small-body headroom, and it never counts toward a bucket's upload
+    /// limits. A body without a declared length counts as small until it
+    /// grows past it.
+    #[arg(long, value_name = "BYTES", default_value_t = UploadLimitsSpec::default().small_body_max_bytes)]
     small_body_max_bytes: u64,
-
-    /// Bytes of the body budget one tenant, a bucket and the principal that
-    /// authenticated the request, may hold at once. A tenant's first body
-    /// always passes. Past it the gateway answers 429. The default, 64 MiB,
-    /// is two bodies at the default per-request limit and a quarter of the
-    /// default budget, so that no tenant takes the budget alone.
-    #[arg(long, value_name = "BYTES", default_value_t = UploadLimits::default().tenant_bytes)]
-    tenant_upload_bytes: NonZeroU64,
-
-    /// Request bodies one tenant may have buffered or arriving at once. Past
-    /// it the gateway answers 429.
-    #[arg(long, value_name = "COUNT", default_value_t = UploadLimits::default().tenant_uploads)]
-    tenant_uploads: NonZeroU32,
 
     /// Milliseconds a request waits for the body budget before the gateway
     /// answers 503 with Retry-After. 0 refuses at once.
@@ -244,19 +244,25 @@ pub struct GatewayArgs {
     )]
     body_budget_wait_ms: u64,
 
-    /// Seconds a request body may take to arrive whatever its pace. The
-    /// default, 15, is past the SQLite extension's 10 s request timeout for
-    /// a commit.
-    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_READ_GRACE.as_secs())]
-    body_read_grace: u64,
+    /// Seconds a request body may go without a byte arriving before the
+    /// gateway cuts it and answers 408, with nothing of it forwarded, and
+    /// the length of the windows `--body-min-bytes-per-sec` is measured
+    /// over. At least 1. The default, 30, is past the SQLite extension's
+    /// 10 s timeout for a commit: only a body whose client went away without
+    /// closing the connection stalls this long. Keep it above 10 s, or the
+    /// gateway may cut a commit its client still waits for.
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_STALL_TIMEOUT.as_secs())]
+    body_stall_timeout: u64,
 
-    /// After `--body-read-grace`, the least average rate, since the reading
-    /// started, at which a request body must arrive. A slower body is cut
-    /// and answered 408 before anything of it is forwarded. The default,
-    /// 256 KiB/s, lets a 32 MiB body take 128 s, past the SQLite extension's
-    /// 120 s timeout for snapshot transfers.
-    #[arg(long, value_name = "BYTES", default_value_t = UploadLimits::default().min_bytes_per_sec)]
-    body_min_bytes_per_sec: NonZeroU64,
+    /// The least rate at which a request body must arrive, measured over
+    /// each window of `--body-stall-timeout` from the start of its reading,
+    /// not over the whole body: a body that delivers fewer bytes in one
+    /// window is cut and answered 408, with nothing of it forwarded. Nothing
+    /// bounds a body's reading in all, so a slow upload that keeps arriving
+    /// is never cut. 0 disables the floor. The default, 1024, cuts only
+    /// connections that trickle a byte now and then.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MIN_BYTES_PER_SEC)]
+    body_min_bytes_per_sec: u64,
 
     /// Number of Raft groups in the upstream Ursula cluster. When set, leader
     /// affinity is shared by every stream that hashes to the same group.
@@ -352,6 +358,7 @@ mod tests {
     use crate::Gateway;
     use crate::uploads::UploadLimits;
     use crate::uploads::UploadLimitsError;
+    use crate::uploads::UploadLimitsSpec;
 
     #[derive(Parser)]
     struct Cli {
@@ -363,7 +370,7 @@ mod tests {
         let argv = ["ursulagw", "--upstream", "http://node:4437"]
             .iter()
             .chain(extra);
-        gateway_config(&Cli::try_parse_from(argv).unwrap().args)
+        gateway_config(&Cli::try_parse_from(argv).unwrap().args).unwrap()
     }
 
     // A request on a connection to a vanished upstream fails after 5 s unless
@@ -391,29 +398,46 @@ mod tests {
         ));
     }
 
-    // The body budget's flags default to the library's limits, and a
-    // headroom that leaves nothing of the budget for large bodies is refused
-    // at startup.
+    // The body budget's flags default to the library's limits, and limits
+    // that leave a body at the limit no room are refused at startup.
     #[test]
-    fn upload_flags_default_to_the_library_limits_and_refuse_a_full_headroom() {
-        let defaults = config_from(&[]).uploads;
-        assert_eq!(defaults, UploadLimits::default());
-        defaults.check().unwrap();
-
-        let full = config_from(&[
-            "--body-budget-bytes",
-            "1048576",
-            "--small-body-headroom-bytes",
-            "1048576",
-        ])
-        .uploads;
-        assert!(matches!(
-            full.check(),
-            Err(UploadLimitsError::HeadroomNotBelowBudget {
-                headroom_bytes: 1_048_576,
-                ..
+    fn upload_flags_default_to_the_library_limits_and_refuse_a_limit_over_the_budget() {
+        assert_eq!(config_from(&[]).uploads, UploadLimits::default());
+        let parsed = |extra: &[&str]| {
+            let argv = ["ursulagw", "--upstream", "http://node:4437"]
+                .iter()
+                .chain(extra);
+            gateway_config(&Cli::try_parse_from(argv).unwrap().args).map(|config| config.uploads)
+        };
+        assert_eq!(
+            parsed(&["--max-request-body-bytes", "1073741824"]),
+            Err(UploadLimitsError::LimitAboveSharedBudget {
+                max_request_body_bytes: 1 << 30,
+                shared_bytes: 224 << 20,
             })
-        ));
+        );
+        let raised = parsed(&[
+            "--max-request-body-bytes",
+            "1073741824",
+            "--body-budget-bytes",
+            "1207959552",
+            "--body-stall-timeout",
+            "10",
+            "--body-min-bytes-per-sec",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(raised.spec(), &UploadLimitsSpec {
+            max_request_body_bytes: 1 << 30,
+            budget_bytes: 1_207_959_552,
+            stall_timeout: Duration::from_secs(10),
+            min_bytes_per_sec: 0,
+            ..UploadLimitsSpec::default()
+        });
+        assert_eq!(
+            parsed(&["--body-stall-timeout", "0"]),
+            Err(UploadLimitsError::ZeroStallTimeout)
+        );
     }
 
     // An access-controlled gateway answers its metrics path 404 unless
@@ -442,7 +466,7 @@ mod tests {
                 .chain(flag);
             let args = Cli::try_parse_from(argv).unwrap().args;
             let gateway = Gateway::with_access_control(
-                gateway_config(&args),
+                gateway_config(&args).unwrap(),
                 access_control(&args).unwrap().expect("access control"),
             );
             let request = Request::get("/__ursula/gateway/metrics")

@@ -73,6 +73,10 @@ spec:
             - {{ .Values.gateway.upstreamTcpUserTimeoutSeconds | quote }}
             - --max-request-body-bytes
             - {{ .Values.gateway.maxRequestBodyBytes | int64 | quote }}
+            {{- if not (eq .Values.gateway.bodyBudgetBytes nil) }}
+            - --body-budget-bytes
+            - {{ .Values.gateway.bodyBudgetBytes | int64 | quote }}
+            {{- end }}
             - --raft-group-count
             - {{ .Values.raft.groupCount | int | quote }}
             - --graceful-shutdown-timeout

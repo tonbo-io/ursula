@@ -7,6 +7,8 @@
 //
 // Overload must surface as pushback (503/429 + retry) on the client, never as server memory growth:
 // the owners back off on 429/503 and retry with the same producer sequence, as the extension does.
+// The gateway's own 429s (its tenant limits, which the soak's gateway does not set) are not
+// pushback from the nodes: the soak fails on any of them.
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync } from "node:fs";
@@ -31,6 +33,17 @@ const counts = new Map<string, number>();
 const bump = (key: string): void => {
 	counts.set(key, (counts.get(key) ?? 0) + 1);
 };
+// The `x-ursula-not-applied` tokens of the gateway's 429s.
+const gatewayLimits = new Set(["TenantRateLimited", "TenantLiveReadsExhausted", "TenantUploads", "TenantUploadBytes"]);
+const gatewayRefusals = new Map<string, number>();
+// Counts a 429 that the gateway answered itself.
+const noteGatewayRefusal = (r: Response): void => {
+	const token = r.headers.get("x-ursula-not-applied");
+	if (r.status === 429 && token !== null && gatewayLimits.has(token)) {
+		gatewayRefusals.set(token, (gatewayRefusals.get(token) ?? 0) + 1);
+		bump(`gateway 429 ${token}`);
+	}
+};
 
 async function put(url: string, body: Buffer | null, stop: () => boolean): Promise<number> {
 	let backoff = 20;
@@ -39,6 +52,7 @@ async function put(url: string, body: Buffer | null, stop: () => boolean): Promi
 		try {
 			const r = await fetch(url, { method: "PUT", headers: { "content-type": "application/octet-stream" }, body, signal: AbortSignal.timeout(30_000) });
 			status = r.status;
+			noteGatewayRefusal(r);
 			await r.arrayBuffer();
 		} catch {
 			status = -1;
@@ -73,6 +87,7 @@ async function owner(base: string, index: number, stop: () => boolean): Promise<
 				signal: AbortSignal.timeout(30_000),
 			});
 			status = r.status;
+			noteGatewayRefusal(r);
 			next = r.headers.get("stream-next-offset");
 			await r.arrayBuffer();
 		} catch {
@@ -167,6 +182,7 @@ it.skipIf(seconds <= 0)(
 		await sampler;
 		const failed = results.filter((r) => r.status === "rejected");
 		if (failed.length > 0) throw new Error(`${failed.length} owners failed: ${String((failed[0] as PromiseRejectedResult).reason)}`);
+		if (gatewayRefusals.size > 0) throw new Error(`the gateway refused requests with 429: ${JSON.stringify(Object.fromEntries(gatewayRefusals))}`);
 		if (aborted) console.log(`soak aborted early: node RSS ${Math.round(maxSeen)} MB past SOAK_ABORT_RSS_MB`);
 		if (maxRssMb > 0 && maxSeen > maxRssMb) throw new Error(`node RSS reached ${Math.round(maxSeen)} MB (limit ${maxRssMb} MB)`);
 	},

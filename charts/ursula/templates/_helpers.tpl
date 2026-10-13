@@ -397,6 +397,26 @@ Validate gateway values before manifests are accepted.
 {{- if lt $maxRequestBodyBytes 1 -}}
 {{- fail (printf "gateway.maxRequestBodyBytes must be at least 1; got %v" .Values.gateway.maxRequestBodyBytes) -}}
 {{- end -}}
+{{- /* The gateway exits at startup unless a body at the limit fits the part
+of the body budget large bodies may take: the budget less the small-body
+headroom (32 MiB unless extraArgs sets --small-body-headroom-bytes, which the
+gateway then checks alone). */ -}}
+{{- $headroomOverridden := false -}}
+{{- range .Values.gateway.extraArgs -}}
+{{- if hasPrefix "--small-body-headroom-bytes" (toString .) -}}
+{{- $headroomOverridden = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $headroomOverridden -}}
+{{- $budgetBytes := 268435456 -}}
+{{- if not (eq .Values.gateway.bodyBudgetBytes nil) -}}
+{{- $budgetBytes = .Values.gateway.bodyBudgetBytes | int64 -}}
+{{- end -}}
+{{- $sharedBytes := sub $budgetBytes 33554432 -}}
+{{- if gt $maxRequestBodyBytes $sharedBytes -}}
+{{- fail (printf "gateway.maxRequestBodyBytes (%d) must fit the gateway's body budget less its 32 MiB small-body headroom (%d): set gateway.bodyBudgetBytes to at least %d" $maxRequestBodyBytes $sharedBytes (add $maxRequestBodyBytes 33554432)) -}}
+{{- end -}}
+{{- end -}}
 {{- if lt $gracefulShutdownTimeoutSeconds 1 -}}
 {{- fail (printf "gateway.gracefulShutdownTimeoutSeconds must be at least 1; got %v" .Values.gateway.gracefulShutdownTimeoutSeconds) -}}
 {{- end -}}

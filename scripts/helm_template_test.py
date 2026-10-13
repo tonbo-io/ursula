@@ -393,6 +393,27 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
 
+    def test_gateway_body_budget_is_rendered_only_when_set_and_must_hold_the_limit(self) -> None:
+        # Unset, the flag is not rendered: a gateway before 0.7.5 exits on it.
+        self.assertNotIn("--body-budget-bytes", render_chart("--set", "s3.bucket=bkt"))
+        raised = ("--set", "s3.bucket=bkt", "--set", "gateway.maxRequestBodyBytes=1073741824")
+        self.assertIn(
+            '- --body-budget-bytes\n            - "1107296256"',
+            render_chart(*raised, "--set", "gateway.bodyBudgetBytes=1107296256"),
+        )
+        # The gateway exits at startup when a body at the limit does not fit
+        # the budget less its 32 MiB headroom, so the chart refuses it first.
+        for values in (raised, (*raised, "--set", "gateway.bodyBudgetBytes=1107296255")):
+            result = subprocess.run(
+                ["helm", "template", "test", "charts/ursula", *values],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("gateway.bodyBudgetBytes", result.stderr)
+        # The largest limit the default budget holds.
+        render_chart("--set", "s3.bucket=bkt", "--set", "gateway.maxRequestBodyBytes=234881024")
+
     def test_admin_plane_defaults_to_loopback(self) -> None:
         config = render_config("--set", "s3.bucket=bkt")
 

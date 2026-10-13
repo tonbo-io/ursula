@@ -552,7 +552,8 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `gateway.connectTimeoutSeconds` | `5` | TCP connect timeout per upstream attempt in seconds. |
 | `gateway.responseHeaderTimeoutSeconds` | `30` | Timeout for upstream response headers in seconds. |
 | `gateway.upstreamTcpUserTimeoutSeconds` | `5` | Seconds data sent to an upstream may stay unacknowledged before the connection closes and its request fails with `502` (Linux `TCP_USER_TIMEOUT`). Idle connections are probed three times within it. At least `1`. |
-| `gateway.maxRequestBodyBytes` | `33554432` | Maximum request body bytes the gateway buffers for leader-redirect replay before returning `413 Payload Too Large`. |
+| `gateway.maxRequestBodyBytes` | `33554432` | Maximum request body bytes the gateway buffers for leader-redirect replay before returning `413 Payload Too Large`. Must fit the body budget less its 32 MiB small-body headroom, 224 MiB (`234881024`) with the default budget. Raise `gateway.bodyBudgetBytes` with it. |
+| `gateway.bodyBudgetBytes` | `null` | Bytes of request bodies the gateway buffers at once, across requests. Renders `--body-budget-bytes` when set, which needs a gateway of 0.7.5 or later. Unset, the gateway keeps its default of 256 MiB. Set it to at least `gateway.maxRequestBodyBytes` plus 32 MiB, and give the pod memory to match. |
 | `gateway.gracefulShutdownTimeoutSeconds` | `3600` | Maximum graceful shutdown drain time after SIGTERM, in seconds. |
 | `gateway.extraArgs` | `[]` | Extra CLI args appended after generated gateway args. |
 | `gateway.extraEnv` | `[]` | Extra container environment entries for the gateway. |
