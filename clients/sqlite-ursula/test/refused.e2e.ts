@@ -255,6 +255,8 @@ it("a refusal marked without a gateway's vouch proves nothing: the commit poison
 	}
 	expect(error).not.toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(errcode(error)).toBe(SQLITE_ERROR);
+	// The claim may be in the stream, and may have fenced the owner: attach again.
+	expect(error).toMatchObject({ name: "UrsulaReattachError", kind: "outcome_unknown", action: "reattach" });
 	// The claim was the request refused: its append failed as unauthorized, and it was the one write.
 	expect((error as Error).message).toMatch(/append \S+: 403( .*)?: the endpoint refused this client's credentials/);
 	expect((await gate.counts()).refused - before.refused).toBe(1);
@@ -304,7 +306,8 @@ it("an authorizer's marked 403 fails a commit alone at once, and an attach it re
 	}
 	expect(error).toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(error).not.toBeInstanceOf(UrsulaPaymentRequiredError);
-	expect(error).toMatchObject({ name: "UrsulaWriteRefusedError", kind: null, reason: null });
+	// The extension names the attach's failure `refused`, and its message what refused it.
+	expect(error).toMatchObject({ name: "UrsulaWriteRefusedError", kind: "refused", action: "retry", reason: null });
 	expect((error as Error).message).toMatch(/claim \S+: 403 write access denied: an authorizer denied it/);
 	expect(errcode((error as Error).cause)).toBe(COMMIT_REFUSED);
 	expect(() => openPlain(reader)).toThrow(/unable to open database file/);
@@ -339,7 +342,7 @@ it("Pi: a commit an authorizer refuses with a marked 403 rejects with UrsulaWrit
 	expect(error).toBeInstanceOf(UrsulaWriteRefusedError);
 	expect(error).not.toBeInstanceOf(UrsulaPaymentRequiredError);
 	expect(error).not.toBeInstanceOf(UrsulaReplicationError);
-	expect(error).toMatchObject({ name: "UrsulaWriteRefusedError", kind: "forbidden", reason: "write access denied" });
+	expect(error).toMatchObject({ name: "UrsulaWriteRefusedError", kind: "forbidden", action: "retry", reason: "write access denied" });
 	const { harness, root } = await openHarness(storage);
 	await textTurn(root, 1);
 	expect(observe("sqlite_ursula.writes_refused")).toBe(0);

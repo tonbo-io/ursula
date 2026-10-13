@@ -5,8 +5,9 @@ reference user) with an Ursula stream as the source of truth. A commit is durabl
 acknowledges it. The local files are a non-durable cache of the stream (§6).
 
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
-`clients/sqlite-ursula` (TypeScript: the loader and `attach` in the root entry, which has no runtime
-dependencies, the Pi helper `openUrsulaPiStorage` in the `/pi` entry, whose
+`clients/sqlite-ursula` (TypeScript: the loader, `attach` and `open` in the root entry, which has no
+runtime dependencies, the error classes and the one mapping to them from a failure of the
+extension, the Pi helper `openUrsulaPiStorage` in the `/pi` entry, whose
 `@earendil-works/pi-durable` is an optional peer dependency, the e2e suites and the benchmark tools). User docs: `docs/web/src/content/docs/pages/examples/sqlite-vfs.mdx`.
 
 ## 1. Shape
@@ -121,6 +122,19 @@ put off) reports `outcome_unknown`. An append's `403` that is neither the fence 
 commit and for an attach's claim alike. An attach that fails after its claim, with a failure of a
 `retry` kind, reports `outcome_unknown` too, unless the claim was refused before it reached the
 stream: the claim may be in the stream, fencing every earlier owner.
+
+The TypeScript package maps these failures to error classes in one place (`classify` in
+`clients/sqlite-ursula/src/errors.ts`), which `open`'s database, `attach`, `status` and the Pi
+helper share. Every class is an `UrsulaError` carrying `kind` and `action`, with the failure's error
+as `cause`. A SQL function's error is mapped from the kind its message names. A statement's error
+is mapped only when it is an I/O error (`SQLITE_FULL` too, on a poisoned file), and only then does
+the mapping read `ursula_status`: a poisoned file maps to `UrsulaFencedError` (`stop`),
+`UrsulaReattachError` (`reattach`), or `UrsulaReplicationError` with `fix`, all of them
+`UrsulaReplicationError`s, and a commit that failed with 7178 maps to `UrsulaWriteRefusedError`,
+whose `kind` is `refused_kind`. Any other error, such as a constraint violation, stays the error it
+is. The database `open` returns is a subclass of `node:sqlite`'s `DatabaseSync` whose `exec`,
+`prepare` and `applyChangeset`, and whose statements' `run`, `get`, `all` and `iterate`, throw what
+the mapping makes of their errors.
 
 ## 2. Writes
 
@@ -815,7 +829,8 @@ What attach does in each case:
   commits the stream may hold, and after the next attach the database holds the refused
   transaction. §2 lists the cases the check misses.
 - **Two owners**: the later claim wins, and the earlier one's next commit fails cleanly
-  (`UrsulaReplicationError` with `fenced: true` through the Pi helper).
+  (`UrsulaFencedError`, an `UrsulaReplicationError` with `fenced: true`, through `open`'s database
+  and the Pi helper).
 - **A snapshot that cannot be taken** (a long reader pins WAL frames) or published (body too large):
   the log grows, nothing is lost, and retention does not advance. A body too large is sent again
   every 48 to 72 minutes once its failures run long (an hour, give or take a fifth), and at once
@@ -1021,6 +1036,7 @@ PRs).
 | e2e: deployment | `auth.e2e.ts`, `redirects.e2e.ts`, `health.e2e.ts` | TLS and gateway-checked tokens, leaderships moved under commits and snapshot read-backs with no `307` reaching the client, `ursula_status` and logs for operators |
 | e2e: panics | `panics.e2e.ts` | every SQL function and init fail with an error and the process goes on, a panic poisons one file alone |
 | e2e: package entries | `entries.e2e.ts` | the root entry, source and built, imports nothing outside Node.js, the `/pi` entry imports Pi Durable |
+| e2e: `open` | `open.e2e.ts` | `open` with a derived and an explicit path, a distinct and safe file name for every URL and one for every spelling of a URL, the default directory, WAL mode without a pragma, a typed error for a fence, an unknown outcome, a `402`, a `too_large` refusal, an unreachable endpoint and setup mistakes, and SQLite's own errors (a constraint violation while writes are refused included) passing through unchanged |
 | e2e: misuse | `misuse.e2e.ts` | any descriptor outside the extension refuses the attach (a connection opened before the extension was loaded, a read descriptor, a read-only connection that keeps closed connections' descriptors open) and keeps the binding, a failed attach names the server's reason, refuses opens, blocks no later attach, and removes the sidecar it created when it wrote nothing, an unreplicated file whose rows copy into a newly attached file in the same process, another process met after the attach changed the files fails it, an unreachable endpoint, a fenced owner's reads fail, a reader with cached pages is not held up by another thread's commit, and refused, unknown and fenced commits report kinds of their own |
 | e2e: versions | `compat.e2e.ts` | same-minor compatibility (§7, versions) |
 | e2e: load | `bench.e2e.ts`, `soak.e2e.ts` | sanity numbers (bytes per turn, pages per commit), server memory under VFS-shaped load (soak, opt-in) |

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { ConversationId, DocumentId } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
-import { attach, status, UrsulaReplicationError } from "../src/index.ts";
+import { attach, status, UrsulaFencedError, UrsulaReplicationError } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
 import { openHarness } from "./harness-kit.ts";
 import { ctx, freshFile } from "./helpers.ts";
@@ -122,6 +122,8 @@ it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 	);
 	expect(error).toBeInstanceOf(UrsulaReplicationError);
 	expect((error as UrsulaReplicationError).fenced).toBe(true);
+	expect(error).toBeInstanceOf(UrsulaFencedError);
+	expect(error).toMatchObject({ name: "UrsulaFencedError", kind: "fenced", action: "stop" });
 	// Fenced, the stale storage serves no reads either, and says so the same way, whether the read
 	// runs alone or inside a transaction (`document()`), which never starts: a read refused, not a
 	// commit lost.
@@ -136,7 +138,7 @@ it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 		),
 	];
 	for (const read of reads) {
-		expect(read).toBeInstanceOf(UrsulaReplicationError);
+		expect(read).toBeInstanceOf(UrsulaFencedError);
 		expect((read as UrsulaReplicationError).fenced).toBe(true);
 		expect((read as UrsulaReplicationError).message).toMatch(/^read refused, the file is fenced: /);
 	}

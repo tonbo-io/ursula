@@ -2,15 +2,44 @@
 // (clients/sqlite-vfs). The extension registers the "ursula" VFS as SQLite's default; after
 // `attach(path, streamUrl)` every connection that opens `path` (plain node:sqlite, Pi's official node
 // driver) is replicated: each commit is appended to the stream before it reaches the local WAL.
+// `open(streamUrl)` does it all in one call, and returns the database.
 //
 // The package's root entry. It depends on nothing outside Node.js: Pi Durable's storage is the
 // `@tonbo/sqlite-ursula/pi` entry (pi.ts), whose `@earendil-works/pi-durable` is an optional peer
 // dependency. Nothing reachable from here may import it (test/entries.e2e.ts).
-import { DatabaseSync } from "node:sqlite";
-import { errcode, SQLITE_AUTH, SQLITE_IOERR_AUTH, UrsulaPaymentRequiredError, UrsulaWriteRefusedError, type WriteRefusedKind } from "./errors.ts";
+//
+// Module map:
+//
+// - errors.ts: the error classes, and `classify`, the one mapping from a failure of the extension to
+//   them, which the root entry and the Pi adapter share.
+// - database.ts: the database `open` returns, a node:sqlite DatabaseSync whose statements classify
+//   their errors.
+// - local.ts: the local file `open` derives from a stream URL.
+// - platform.ts: the prebuilt extension of this platform.
+// - pi.ts: the `/pi` entry.
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync, type DatabaseSyncOptions } from "node:sqlite";
+import { UrsulaDatabase } from "./database.ts";
+import { classify, type UrsulaErrorAction, UrsulaSetupError, type WriteRefusedKind } from "./errors.ts";
+import { defaultDir, localName } from "./local.ts";
 import { prebuiltExtension } from "./platform.ts";
 
-export { UrsulaPaymentRequiredError, UrsulaReplicationError, UrsulaWriteRefusedError, type WriteRefusedKind } from "./errors.ts";
+export {
+	type ReattachKind,
+	type RefusedKind,
+	type SetupKind,
+	UrsulaError,
+	type UrsulaErrorAction,
+	type UrsulaErrorKind,
+	UrsulaFencedError,
+	UrsulaPaymentRequiredError,
+	UrsulaReattachError,
+	UrsulaReplicationError,
+	UrsulaSetupError,
+	UrsulaWriteRefusedError,
+	type WriteRefusedKind,
+} from "./errors.ts";
 
 let control: DatabaseSync | undefined;
 
@@ -26,6 +55,79 @@ export function loadUrsulaVfs(path = process.env.SQLITE_URSULA_VFS): DatabaseSyn
 	db.loadExtension(library);
 	control = db;
 	return db;
+}
+
+/** Runs one of the extension's SQL functions on the control connection: its error is an {@link UrsulaError}, which names its kind. */
+function call(sql: string, ...args: string[]): Record<string, unknown> {
+	try {
+		return loadUrsulaVfs().prepare(sql).get(...args) as Record<string, unknown>;
+	} catch (error) {
+		throw classify(error);
+	}
+}
+
+/** {@link open}'s options: where the local file is, how to attach it, and node:sqlite's own settings. */
+export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnly"> {
+	/**
+	 * The local file, the stream's cache on this host. Without it, the file is named after the stream
+	 * URL in `dir`: `<bucket>-<stream>-<hash>.db`, where `<hash>` is 128 bits of the SHA-256 of the
+	 * normalized URL, so two spellings of one URL share a file and two different URLs never do.
+	 */
+	readonly path?: string | undefined;
+	/**
+	 * The directory of the file named after the URL, created when missing (mode 0700). By default
+	 * `sqlite-ursula` in the user's cache directory: `$XDG_CACHE_HOME` when set, `~/Library/Caches` on
+	 * macOS, `~/.cache` elsewhere. Ignored with `path`.
+	 */
+	readonly dir?: string | undefined;
+	/**
+	 * Attach without claiming the stream ({@link AttachOptions.readOnly}), and open the file read-only:
+	 * reads see the stream as of the attach, and every write fails with SQLITE_READONLY.
+	 */
+	readonly readOnly?: boolean | undefined;
+}
+
+/**
+ * Opens the database a stream holds, replicated: loads the extension if needed, catches the local
+ * file up from the stream, claims the stream for this process (fencing every earlier owner) and opens
+ * the file. Returns a node:sqlite `DatabaseSync` (a subclass of it, so `instanceof DatabaseSync`),
+ * which any library that takes one takes. Each commit returns once the stream holds it.
+ *
+ * The database stays in WAL mode, as attach leaves it. Close it before opening the stream again in
+ * the process: attach refuses a file with open connections (`in_use`).
+ *
+ * Errors say what to do. A failure of the extension throws an {@link UrsulaError} whose `action` is
+ * `retry`, `reattach`, `stop` or `fix`, and whose `cause` is the error the failure surfaced as:
+ * {@link UrsulaWriteRefusedError} (`retry`: nothing reached the stream), {@link UrsulaReattachError}
+ * (`reattach`: close the database and open it again), {@link UrsulaFencedError} (`stop`: another
+ * owner took the stream over) or {@link UrsulaSetupError} (`fix`). The database's `exec`, `prepare`
+ * and `applyChangeset`, and its statements' `run`, `get`, `all` and `iterate`, throw them too. Every
+ * other error, such as a constraint violation or a syntax error, is node:sqlite's own, unchanged.
+ * Other methods throw node:sqlite's errors as they are, which {@link status} of `db.location()`
+ * explains.
+ */
+export function open(streamUrl: string, options: OpenOptions = {}): DatabaseSync {
+	const { path, dir, readOnly, ...sqlite } = options;
+	const file = path ?? derivedPath(streamUrl, dir ?? defaultDir());
+	attach(file, streamUrl, readOnly === true ? { readOnly } : {});
+	return new UrsulaDatabase(file, readOnly === true ? { ...sqlite, readOnly } : sqlite, (error) => classify(error, () => status(file)));
+}
+
+/** The local file of `streamUrl` in `dir`, which is created when missing. */
+function derivedPath(streamUrl: string, dir: string): string {
+	let name: string;
+	try {
+		name = localName(streamUrl);
+	} catch (error) {
+		throw new UrsulaSetupError(`open: invalid_url: the stream URL does not parse: ${streamUrl}`, "invalid_url", error);
+	}
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+	} catch (error) {
+		const why = error instanceof Error ? error.message : String(error);
+		throw new UrsulaSetupError(`open: local_setup: cannot create ${dir} for the database's local file (${why}): pass a writable directory on a local disk as \`dir\`, or a file as \`path\``, "local_setup", error);
+	}
+	return join(dir, name);
 }
 
 export interface AttachOptions {
@@ -61,29 +163,23 @@ export interface AttachOptions {
  * to it or holding it open, a descriptor outside the extension), `unreplicated_file` (data but no
  * sidecar: the file still opens, so its rows can be copied into a newly attached file) and
  * `other_stream`. Writes to the file outside the extension after the attach are not detected: never
- * make them.
+ * make them. The attached file is in WAL mode, and stays in it.
  *
- * A failed attach throws an error whose message starts with `ursula_attach: <kind>: `, a stable
- * name of what failed (such as `invalid_name`, `unreachable`, `in_use`,
- * `unreplicated_file`, `fenced`). The design doc lists the kinds and what to do about each.
+ * A failed attach throws an {@link UrsulaError} whose `kind` names what failed (such as
+ * `invalid_name`, `unreachable`, `in_use`, `unreplicated_file`, `fenced`) and whose `action` says
+ * what to do. Its message is the extension's, which starts with `ursula_attach: <kind>: `, and its
+ * `cause` is SQLite's error. The design doc lists the kinds.
  *
  * With `{ readOnly: true }` it claims nothing (see {@link AttachOptions.readOnly}). An attach that a
  * layer in front of the stream refuses with `402 Payment Required` throws
  * {@link UrsulaPaymentRequiredError}, and one whose claim is refused before it reaches the stream in
- * another way (see {@link WriteRefusedKind}) throws {@link UrsulaWriteRefusedError}. Either way nothing
- * was claimed: attach again later, and a read-only attach can still read the database meanwhile.
+ * another way (see {@link WriteRefusedKind}), or that fails before it sends its claim because the
+ * endpoint does not answer, throws {@link UrsulaWriteRefusedError}. Either way nothing was claimed:
+ * attach again later, and a read-only attach can still read the database meanwhile.
  */
 export function attach(file: string, streamUrl: string, options: AttachOptions = {}): StreamOffset {
 	const sql = options.readOnly === true ? "SELECT ursula_attach(?, ?, 'read_only') AS n" : "SELECT ursula_attach(?, ?) AS n";
-	try {
-		const row = loadUrsulaVfs().prepare(sql).get(file, streamUrl) as { n: string };
-		return row.n;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		if (errcode(error) === SQLITE_AUTH) throw new UrsulaPaymentRequiredError(message, null, error);
-		if (errcode(error) === SQLITE_IOERR_AUTH) throw new UrsulaWriteRefusedError(message, null, null, error);
-		throw error;
-	}
+	return call(sql, file, streamUrl).n as string;
 }
 
 /**
@@ -98,7 +194,7 @@ export function attach(file: string, streamUrl: string, options: AttachOptions =
  * tokens that expire on their own schedule, prefer the token file.
  */
 export function setToken(token: string | null): void {
-	loadUrsulaVfs().prepare("SELECT ursula_set_token(?)").get(token ?? "");
+	call("SELECT ursula_set_token(?)", token ?? "");
 }
 
 /**
@@ -163,12 +259,16 @@ export interface AttachStatus {
 	 * holds the stream) or `fix` (change the URL, the setup, the transaction or the files). `message`
 	 * is the reason (`reason`'s text while poisoned). Absent with an extension before 0.7.5.
 	 */
-	readonly error?: { readonly kind: string; readonly action: "retry" | "reattach" | "stop" | "fix"; readonly message: string } | null;
+	readonly error?: { readonly kind: string; readonly action: UrsulaErrorAction; readonly message: string } | null;
 }
 
+/**
+ * The attached file's status: its offsets, its owner's health, and why writes fail now (`error`).
+ * Throws an {@link UrsulaSetupError} (`not_attached`) for a file never attached in the process, and
+ * for a file whose last attach failed an {@link UrsulaError} of that failure's kind.
+ */
 export function status(file: string): AttachStatus {
-	const row = loadUrsulaVfs().prepare("SELECT ursula_status(?) AS s").get(file) as { s: string };
-	return JSON.parse(row.s) as AttachStatus;
+	return JSON.parse(call("SELECT ursula_status(?) AS s", file).s as string) as AttachStatus;
 }
 
 /** One replicated commit, as measured inside the VFS. */
@@ -232,8 +332,7 @@ export interface VfsStats {
  * rest.
  */
 export function drainStats(file: string): VfsStats {
-	const row = loadUrsulaVfs().prepare("SELECT ursula_stats(?) AS s").get(file) as { s: string };
-	return JSON.parse(row.s) as VfsStats;
+	return JSON.parse(call("SELECT ursula_stats(?) AS s", file).s as string) as VfsStats;
 }
 
 /** Attributes on a measurement, as OpenTelemetry takes them. */

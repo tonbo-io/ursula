@@ -354,7 +354,7 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 
 ### A commit or attach is refused with error code 7178
 
-`SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`, `UrsulaWriteRefusedError` from `attach` and `openUrsulaPiStorage`) means that a write was refused before it reached the stream, so nothing of it was applied. A refused commit was rolled back, but the file is not poisoned. Reads go on, and the next commit succeeds once the refusals stop, with no new attach. A refused attach claimed nothing. Attach again later, or attach read-only to read the database meanwhile. An attach whose claim a `402` refuses fails with `SQLITE_AUTH` (`errcode` 23) instead, and `attach` throws `UrsulaPaymentRequiredError`. For a refused commit, `status(file)` (`ursula_status`) reports `writes_refused: true` and names the refusal:
+`SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`, `UrsulaWriteRefusedError` from `open`, its database, `attach` and `openUrsulaPiStorage`) means that a write was refused before it reached the stream, so nothing of it was applied. A refused commit was rolled back, but the file is not poisoned. Reads go on, and the next commit succeeds once the refusals stop, with no new attach. A refused attach claimed nothing. Attach again later, or attach read-only to read the database meanwhile. An attach whose claim a `402` refuses fails with `SQLITE_AUTH` (`errcode` 23) instead, and `open` and `attach` throw `UrsulaPaymentRequiredError`. For a refused commit, `status(file)` (`ursula_status`) reports `writes_refused: true` and names the refusal:
 
 | `refused_kind` | Refusal | What to do |
 | -------------- | ------- | ---------- |
@@ -400,7 +400,7 @@ When the database holds the next transaction instead, a gateway sent that commit
 
 ### Reads of a fenced file fail with error code 266
 
-From 0.7.5, once an owner knows that another owner claimed its stream (its commit failed, and `status(file)` reports `poisoned: true` and `fenced: true`, or `error.kind` `fenced`), every new read transaction on the file fails with `SQLITE_IOERR_READ` (`errcode` 266 in `node:sqlite`, `disk I/O error`). `openUrsulaPiStorage` reports these reads, those inside a transaction included, as `UrsulaReplicationError` with `fenced: true` and a message that starts with `read refused`. The file no longer holds what the stream does, so it serves nothing. A read transaction already open when the fence landed keeps its snapshot until it ends. Find the other owner. Attaching the file again takes the stream back from it, so do that only for a deliberate takeover.
+From 0.7.5, once an owner knows that another owner claimed its stream (its commit failed, and `status(file)` reports `poisoned: true` and `fenced: true`, or `error.kind` `fenced`), every new read transaction on the file fails with `SQLITE_IOERR_READ` (`errcode` 266 in `node:sqlite`, `disk I/O error`). `open`'s database and `openUrsulaPiStorage` report these reads, those inside a transaction included, as `UrsulaFencedError` (an `UrsulaReplicationError` with `fenced: true`, whose `action` is `stop`) with a message that starts with `read refused`. The file no longer holds what the stream does, so it serves nothing. A read transaction already open when the fence landed keeps its snapshot until it ends. Find the other owner. Attaching the file again takes the stream back from it, so do that only for a deliberate takeover.
 
 ### A file opens with "unable to open database file" after a failed attach
 

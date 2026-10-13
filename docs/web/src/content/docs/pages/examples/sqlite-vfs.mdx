@@ -3,25 +3,116 @@ title: SQLite on Ursula
 sidebarTitle: SQLite (VFS)
 ---
 
+`@tonbo/sqlite-ursula` gives a Node.js application a SQLite database that an Ursula stream replicates. Start a single node, which keeps nothing across restarts, and install the package. It needs Node.js 22.19 or later.
+
+```bash
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.4
+npm install @tonbo/sqlite-ursula
+```
+
+```ts
+import { open } from "@tonbo/sqlite-ursula";
+
+const db = open("http://127.0.0.1:4437/demo/notes");
+db.exec("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)");
+db.prepare("INSERT INTO notes(body) VALUES (?)").run("hello"); // returns once the stream holds it
+console.log(db.prepare("SELECT id, body FROM notes").all());
+db.close();
+```
+
+`open` loads the `sqlite-ursula-vfs` extension into `node:sqlite`, catches a local copy of the database up from the stream, claims the stream for this process and returns the database. Every commit is appended to the stream before it reaches the local file, so any host can rebuild the database from the stream: the same code on another host opens the same database, and fences this one. The database is a `node:sqlite` `DatabaseSync`, so libraries that take one take it. The local copy is a cache, kept in a file named after the stream URL (see [Local files](#local-files)).
+
+## Errors
+
+A failure of the extension throws an `UrsulaError`. Its `action` says what to do, its `kind` names what failed, and its `cause` is the error the failure surfaced as, usually SQLite's `disk I/O error` or `SQL logic error`. Every other error, such as a constraint violation, a syntax error or a write to a read-only database, is `node:sqlite`'s own, unchanged. `open` throws these errors, and so do the database's `exec`, `prepare` and `applyChangeset`, its statements' `run`, `get`, `all` and `iterate`, and `attach` and `status`.
+
+| `action` | What it means for you |
+| --- | --- |
+| `retry` | Nothing reached the stream, and the database stays usable. Run the same statement again later, on the same database. No new `open` is needed. A layer in front of the stream that refuses writes, such as a quota service, or an endpoint that does not answer, fails this way. |
+| `reattach` | The local file may no longer match the stream, for example after a commit whose outcome is unknown. Close the database and call `open` again: the new attach replays the stream, and the database then holds what the stream holds. |
+| `stop` | Another owner took the stream over. Stop using the database: exit, and let your scheduler restart the process. Never reopen in a loop, since every `open` takes the stream back from the other owner, which only a deliberate takeover does. |
+| `fix` | The request cannot succeed as made: a stream URL the server refuses, a missing stream, a database the process has open already, a directory that refuses the local files, a transaction too large for one append. The message says what to change. |
+
+```ts
+import { UrsulaError } from "@tonbo/sqlite-ursula";
+
+try {
+  db.prepare("INSERT INTO notes(body) VALUES (?)").run("hello");
+} catch (error) {
+  if (!(error instanceof UrsulaError)) throw error; // SQLite's own error, such as a constraint violation
+  if (error.action === "stop") process.exit(1); // another owner took over: let the scheduler restart us
+  throw error; // retry: try again later. reattach: close and open again. fix: change the setup.
+}
+```
+
+Branch on `action`. The classes group the failures by what happened:
+
+| Class | `action` | `kind` |
+| --- | --- | --- |
+| `UrsulaWriteRefusedError` | `retry` | `unauthorized`, `forbidden`, `rate_limited`, `not_applied`, `unreachable`, `refused`, `unavailable` |
+| `UrsulaPaymentRequiredError`, a subclass | `retry` | `payment_required` |
+| `UrsulaWriteRefusedError` | `fix` | `too_large`: the same transaction never fits in one append, so split it |
+| `UrsulaReattachError` | `reattach` | `outcome_unknown`, `local_damage`, `local_state`, `internal` |
+| `UrsulaFencedError` | `stop` | `fenced` |
+| `UrsulaReplicationError` | `fix` | `unsupported`, `stream_state`, `local_setup`: a commit poisoned the file for a cause to fix before you open it again |
+| `UrsulaSetupError` | `fix` | `invalid_argument`, `invalid_url`, `invalid_name`, `not_found`, `in_use`, `unreplicated_file`, `other_stream`, `unsupported`, `stream_state`, `not_attached`, `local_setup` |
+
+`UrsulaWriteRefusedError` means that nothing reached the stream. For a refused commit its `kind` and `reason` are `status(file)`'s `refused_kind` and `refused_reason` (see [Writes refused before they reach the stream](#writes-refused-before-they-reach-the-stream)). For a failed attach its `kind` is the extension's, and its message says what refused it. `UrsulaFencedError` and `UrsulaReattachError` are subclasses of `UrsulaReplicationError`, the class of a commit the stream did not take, whose `fenced` is `true` for a fence. A fenced database's reads fail too, with a message that starts with `read refused`. The kinds are those of the extension, which the [design doc](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md#errors) lists, except that where the extension's kind of a refused commit is `refused`, the error's `kind` names what refused it.
+
+The message of a failed attach is the extension's, `ursula_attach: <kind>: <message>`, which says what failed and how to fix it. The message of a failed statement names the failure and what to do, such as `commit refused with 402 Payment Required in front of the stream: quota exhausted. Nothing of it reached the stream, and the database stays usable: run it again later.` When `cause` is SQLite's error, its `code`, `errcode` and `errstr` are copied to the `UrsulaError`, so code that reads them keeps working.
+
+A connection you open yourself (see [Attach a file yourself](#attach-a-file-yourself)) throws SQLite's errors as they are. A failed commit or read then names nothing by itself: `status(file).error` says what failed (`kind`) and what to do (`action`) while writes fail.
+
+## Rules
+
+- One owner per stream. `open` (and `attach`) claims the stream for the process with a new producer epoch, which fences every earlier owner, on this host or another. The fenced owner's next commit fails with `UrsulaFencedError`, and from then on so do its reads.
+- To move a database to another host or process, open it there. The new owner's claim takes the stream over, and the old owner must stop, as the `stop` action says. Opening it again takes the stream back, so only a deliberate takeover does that. A rolling deploy that starts the new process before it stops the old one hands the stream over this way.
+- With `open`, open a stream once per process and share the database. Opening it again while the database is open fails with `in_use`, and opening it at another `path` takes the stream over from the first database. Close it first to open the stream again, as the `reattach` action does.
+- One process owns a database file at a time (a lock file next to it enforces this on the host). Another process that opens the same file fails with `in_use` until the first exits. Use as many connections inside that process as you like (see [Attach a file yourself](#attach-a-file-yourself)).
+- WAL mode only, 4 KiB pages (SQLite's default). Attach leaves the file in WAL mode, so you set nothing: do not change `journal_mode` or the page size. `locking_mode=EXCLUSIVE` is not supported.
+- Treat the local file as a cache: do not copy it elsewhere and attach it to another stream. A commit is durable once Ursula acknowledges it. Commits do not fsync the local files (only the db file, once per WAL wrap), so `PRAGMA synchronous` does not matter.
+- After a reboot, a power loss, or on another host, attach discards the local files and rebuilds them from the latest snapshot and the stream's tail (a crashed process on the same boot resumes from its local files). A volume restored from a disk snapshot without a reboot is checked: attach uses it only if its WAL still holds what the sidecar `<db>-ursula` records, and rebuilds otherwise. Keep the file on a local disk, not a network filesystem, and do not copy it with `cp` or `rsync` while the process runs. Delete the file to force a rebuild.
+- A commit whose append gets no answer is retried with the same producer sequence for up to 30 s (`URSULA_VFS_RETRY_MS`), then fails, and the file must be attached again.
+- From 0.7.3 the extension keeps a connection for 90 s after its last request (`URSULA_VFS_IDLE_MS`, in milliseconds, 0 turns reuse off), so commits up to that far apart reuse it instead of opening a new TCP and TLS connection. A request that gets no answer (its connection was reset or closed, or it timed out) is sent again on a new connection: a commit with the same producer sequence, and a read within `URSULA_VFS_RETRY_MS`. A refused connection fails a read at once. On macOS a reset can show as `Invalid argument (os error 22)`: from 0.7.4 that counts as no answer too, so a read that meets it is sent again, as on Linux. A NAT, a load balancer or a firewall on the way that drops idle connections sooner than 90 s without telling either end makes the first request after such a pause wait out its timeout (10 s) before it is sent again. Behind such a device, set `URSULA_VFS_IDLE_MS` below its idle limit.
+- From 0.7.3 the extension never follows a redirect. A `307` (a gateway before 0.7.3 passing on a redirect to the stream's leader, which moved, or a node that the URL names and that does not lead the stream's group) is sent again to the same URL within `URSULA_VFS_RETRY_MS`, like a `503`. Any other redirect fails the request at once with the redirect's `Location` in the error: a commit then fails, and the file must be attached again. A URL that names one node of a multi-node cluster works only while that node leads the stream's group. A URL that a proxy redirects (from `http://` to `https://`, say, usually with a `308`) fails, so use the address the redirect points to.
+- A transaction must fit one request: up to 32 MiB of changed pages after compression by default (the server's request body limit), set by `URSULA_VFS_MAX_FRAME_BYTES` in bytes. That is about 8,000 pages of incompressible data, such as embeddings, media or encrypted bytes, and about three times as many of typical text. A larger transaction is never sent. It fails alone with `SQLITE_IOERR_AUTH` and `refused_kind` `too_large` (an `UrsulaWriteRefusedError` whose `action` is `fix`), and the file stays usable. Split bulk imports into smaller transactions. Statements that rewrite a whole table or index are one transaction too: `CREATE INDEX` on a large table, `REINDEX`, an `ALTER TABLE` that rebuilds the table, and `VACUUM`, which rewrites every page. On a database whose compressed size is above the limit, `VACUUM` fails the same way. Delete rows before it, so that what it writes compresses below the limit, or copy the rows into a new database in transactions below the limit.
+- Behind a gateway or proxy with a lower body limit, set `URSULA_VFS_MAX_FRAME_BYTES` at or below it. A larger commit sent there usually meets a closed connection rather than a readable `413` ([#540](https://github.com/tonbo-io/ursula/issues/540)), and then poisons the file once `URSULA_VFS_RETRY_MS` runs out. `URSULA_VFS_MAX_FRAME_BYTES` takes 64 KiB to 32 MiB: a value outside is taken to the nearer bound, and one that is not a number of bytes is ignored, both logged once as `setting_adjusted`.
+- A file that has been attached (it has a sidecar `<db>-ursula`) opens in a new process only after its attach there succeeds. From 0.7.5 a file whose attach failed in the process (the server is unreachable, or refused the stream's name, for example) opens only after an attach of it succeeds, with or without a sidecar. Opening it otherwise fails, so no commit can bypass the stream: SQLite reports "unable to open database file", and the log and `status(file)` name the failed attach's reason. An attach refused because of the file itself before it changed anything (`in_use`, `unreplicated_file`, `other_stream`) is no failed attach: the file opens as before. A failed attach may already have changed the local files, as any attach does: discarded the ones it did not trust, or folded their WAL into the file. One that fails before it wrote anything into a new file removes the sidecar it created, which never touches the file, its `-wal` or `-shm`. A file it replayed pages into keeps its sidecar: the next attach resumes it when the sidecar names the file, and rebuilds it otherwise.
+- From 0.7.5 attach refuses (`in_use`), changing nothing, while the process has the file, its `-wal`, `-shm` or `-journal` open outside the extension, read-only or not: a connection opened before the extension was loaded, or one opened through another VFS, such as `?vfs=unix`. Its commits would never reach the stream. While such a connection is open, SQLite also keeps the files of closed connections open. Close every such connection, then attach. The check reads the process's open files where it can: on Linux with `/proc` mounted, and on macOS. Without that, on other platforms, or when the file's directory cannot be resolved, attach does not check, and it never finds a file opened through another hard link or mount of it. A database that was never attached and holds data is refused, never replicated over, and opens as before: copy its rows into a newly attached file, in the same process if you like (with `ATTACH`, for example), or move it and its `-wal` aside to attach the path.
+- Never write an attached file outside the extension. A write after the attach, through a connection that bypasses the extension or from a process without it, is not detected, as in 0.7.4: it never reaches the stream, and the owner's later commits and snapshots carry pages built on it, so copies rebuilt from the stream can diverge from the file or be malformed.
+- A stream deleted and recreated at the same path is a new stream: attach never resumes the local file on it, and rebuilds it from the new stream, whatever its length. When the stream of a file that holds data is missing (deleted by mistake, expired, or not carried over by a fresh install), attach refuses and keeps the file, which may be the only copy left. Delete the file to start over from an empty stream, or attach a new file under another stream URL. Neither the file nor a copy of it attaches under another URL. To salvage its data, copy the file and its `-wal` to a new name before deleting anything. The copy has no sidecar, so it opens as a plain SQLite file: read its rows from there into a newly attached database. An owner of the deleted stream is normally fenced at its next commit, but stop every owner before deleting a stream you will recreate: a snapshot it is publishing, or an attach racing the recreate, can still put its data into the new stream (see the design doc).
+- Within a minor (0.7.x), extension versions take over each other's streams, so upgrade owners one at a time: the new owner's attach fences the old one. Across minors, follow the release notes. A minor that changes the extension's `Producer-Id` cannot fence owners of the other version, so both would commit and could corrupt the database: stop every owner of a stream before attaching it with the new version (and the reverse on a downgrade). A frame or snapshot of another minor's format stops attach with an error that names it.
+- An owner idle for 7 days loses its producer state on the server. Its next commit takes the stream back only if nobody else wrote meanwhile.
+- Every commit carries a `Stream-Seq` above all earlier ones. Do not append to the stream yourself: a write with a higher `Stream-Seq` fences the owner at its next commit, and one without breaks every rebuild that replays it, until the owner publishes a snapshot past it.
+- `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log between snapshots (default 8 MiB).
+
+## How it works
+
 `sqlite-ursula-vfs` is a SQLite loadable extension that replicates a database file to an Ursula stream. Your application keeps using SQLite unchanged, for example `node:sqlite` or Pi Durable's official `SqliteStorage`: every commit is appended to the stream before it reaches the local file, and any host can rebuild the database from the stream. The extension lives in [`clients/sqlite-vfs`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-vfs), and the TypeScript helpers in [`clients/sqlite-ursula`](https://github.com/tonbo-io/ursula/tree/main/clients/sqlite-ursula), published to npm as `@tonbo/sqlite-ursula` with the extension prebuilt. The package has no runtime dependencies, and its Pi Durable adapter is a separate entry, [`@tonbo/sqlite-ursula/pi`](#pi-durable).
 
-Within a minor release (0.7.x), the formats the extension writes to the stream and to the local files do not change. Any 0.7.x extension can attach a stream that another 0.7.x extension wrote, resume from the local files that extension left on the host, and fence the stream's owner, so you can upgrade owners one at a time. The API of the extension and of `@tonbo/sqlite-ursula` can still change in a patch release, as it did in 0.7.3, so upgrade the package together with the extension. A new minor release may also change the formats. Either way, the [release notes](/docs/release-notes) say how to upgrade (see also [Rules](#rules)). The design doc lists the [known limits](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md#7-limits).
-
-How it works:
-
 - One database is one binary stream (`application/octet-stream`). A commit is one append carrying the transaction's final page images, zstd-compressed.
-- The append happens at SQLite's commit point. `COMMIT` returns only after Ursula acknowledged it; if the append is rejected, SQLite rolls the transaction back and nothing of it stays local.
+- The append happens at SQLite's commit point. `COMMIT` returns only after Ursula acknowledged it. If the append is rejected, SQLite rolls the transaction back and nothing of it stays local.
 - Attaching a file claims the stream with a new producer epoch. Every earlier owner is fenced: its next commit fails, and from then on so do its reads.
 - The owner publishes a [snapshot](/docs/concepts/snapshots) of the database whenever the log since the last one outgrows the database (8 MiB at least), reads it back, and then advances the stream's retention to the snapshot before it. A new host starts from the latest snapshot and replays only the tail.
 
-## What the cluster needs
+## Local files
 
-- Room for one transaction per append: up to 32 MiB of compressed page images.
-- For databases whose snapshots exceed 1 MiB, a cold backend, so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
-- Snapshots above 32 MiB must go through a gateway whose `--max-request-body-bytes` is raised, or straight to a single-node server.
-- A stream URL that reaches the stream's leader by itself: a gateway, or a single-node server (see [Rules](#rules)).
+`open(streamUrl, options)` takes `node:sqlite`'s own options (`timeout`, `readBigInts` and the rest) and three of its own:
 
-## Install and load
+- `path`: the local file to keep the database in.
+- `dir`: the directory of a file named after the stream URL, used when `path` is not given. `open` creates it (mode `0700`) when it is missing. By default it is `sqlite-ursula` in your cache directory: `$XDG_CACHE_HOME` when that is set to an absolute path, `~/Library/Caches` on macOS and `~/.cache` elsewhere.
+- `readOnly`: attach the file [read-only](#read-only-attach) and open it read-only.
+
+The file named after the URL is `<label>-<hash>.db`:
+
+- `<hash>` is the first 32 hex digits (128 bits) of the SHA-256 of the URL as WHATWG URL parsing normalizes it, `new URL(url).href`: the scheme and host lowercased, the default port dropped, the path percent-encoded. So every spelling of one URL maps to the same file, and two different URLs never map to the same one, short of a SHA-256 collision on 128 bits.
+- `<label>` only makes the name readable: the last two segments of the URL's path (normally the bucket and stream ids) joined by `-`, lowercased, with every run of characters other than `a-z`, `0-9`, `_` and `-` replaced by `_`, as is a leading `-`, cut to 64 characters, and `stream` when the path has no segment.
+
+`http://127.0.0.1:4437/demo/notes` maps to `demo-notes-<hash>.db`. The name is at most 100 characters of `a-z`, `0-9`, `_`, `-` and `.db`, and never starts with `-` or `.`, so it is a safe file name for any bucket and stream id, on a case-sensitive file system or not. Next to it are SQLite's `-wal` and `-shm` and the extension's sidecar `-ursula` and lock `-ursula.lock`. Two URLs that reach one stream, such as a gateway's and a node's, map to two files: opening the second takes the stream over from the first.
+
+The local file is a cache of the stream, so its directory does not need a backup. After a reboot, or on another host, attach rebuilds the file from the latest snapshot and the stream's tail. A process that restarts on the same boot resumes from the file. Keep the directory on a local disk, and in a container point `dir` at a volume that outlives the container if a restart should not rebuild the database.
+
+## Install
 
 ```bash
 npm install @tonbo/sqlite-ursula
@@ -37,7 +128,9 @@ cargo build --release   # target/release/libsqlite_ursula_vfs.so (.dylib on macO
 export SQLITE_URSULA_VFS=$PWD/target/release/libsqlite_ursula_vfs.so
 ```
 
-The extension calls whatever SQLite loads it, here `node:sqlite`. Load it once per process: it registers the `ursula` VFS as SQLite's default. `attach` (and `openUrsulaPiStorage`) load it if you have not.
+## Attach a file yourself
+
+`open` is `attach` followed by `new DatabaseSync(path)`. Make the two steps yourself to open more than one connection to a database, or to hand the file to code that opens it. The extension calls whatever SQLite loads it, here `node:sqlite`. Load it once per process: it registers the `ursula` VFS as SQLite's default. `open`, `attach` and `openUrsulaPiStorage` load it if you have not.
 
 ```ts
 import { attach, loadUrsulaVfs, status } from "@tonbo/sqlite-ursula";
@@ -49,16 +142,28 @@ loadUrsulaVfs(); // the prebuilt extension, or the one SQLITE_URSULA_VFS names
 // and attach. No connection to the file may be open yet.
 attach("/data/app.db", "https://ursula.example.com/my-bucket/app-db");
 
-const db = new DatabaseSync("/data/app.db");
-db.exec("PRAGMA journal_mode=WAL");
+const db = new DatabaseSync("/data/app.db"); // in WAL mode already
 db.exec("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)");
 db.prepare("INSERT INTO notes(body) VALUES (?)").run("replicated"); // returns after Ursula has it
 
 console.log(status("/data/app.db"));
-// { offset, epoch, poisoned, fenced, reason, read_only, writes_refused, refused_kind, refused_reason, snapshot, ... }
+// { offset, epoch, poisoned, fenced, reason, read_only, writes_refused, refused_kind, refused_reason, snapshot, ..., error }
 ```
 
-From SQL, the same functions are `ursula_attach(path, url)` (`ursula_attach(path, url, 'read_only')` for a [read-only attach](#read-only-attach)), `ursula_status(path)`, `ursula_stats(path)` and `ursula_set_token(token)`. They can be called from top-level SQL only, not from a trigger or a view. Offsets (`attach`'s result, and `offset`, `snapshot`, `retained`, `local` and `installed`) are the server's [opaque offset](/docs/concepts/offsets) strings: compare two of the same stream as strings, never as numbers. `"-1"` means none (no snapshot, no retention, a file rebuilt from nothing).
+A connection you open this way throws SQLite's errors as they are, and `status(file).error` names a failure (see [Errors](#errors)). `attach` throws an `UrsulaError`, as `open` does.
+
+From SQL, the same functions are `ursula_attach(path, url)` (`ursula_attach(path, url, 'read_only')` for a [read-only attach](#read-only-attach)), `ursula_status(path)`, `ursula_stats(path)` and `ursula_set_token(token)`, on the connection that loaded the extension (`loadUrsulaVfs()` returns it). They can be called from top-level SQL only, not from a trigger or a view. Offsets (`attach`'s result, and `offset`, `snapshot`, `retained`, `local` and `installed`) are the server's [opaque offset](/docs/concepts/offsets) strings: compare two of the same stream as strings, never as numbers. `"-1"` means none (no snapshot, no retention, a file rebuilt from nothing).
+
+## What the cluster needs
+
+- Room for one transaction per append: up to 32 MiB of compressed page images.
+- For databases whose snapshots exceed 1 MiB, a cold backend, so snapshot bodies are stored in the cold tier (up to 1 GiB). Without it, snapshots are kept inline, up to 32 MiB.
+- Snapshots above 32 MiB must go through a gateway whose `--max-request-body-bytes` is raised, or straight to a single-node server.
+- A stream URL that reaches the stream's leader by itself: a gateway, or a single-node server (see [Rules](#rules)).
+
+## Versions
+
+Within a minor release (0.7.x), the formats the extension writes to the stream and to the local files do not change. Any 0.7.x extension can attach a stream that another 0.7.x extension wrote, resume from the local files that extension left on the host, and fence the stream's owner, so you can upgrade owners one at a time. The API of the extension and of `@tonbo/sqlite-ursula` can still change in a patch release, as it did in 0.7.3, so upgrade the package together with the extension. A new minor release may also change the formats. Either way, the [release notes](/docs/release-notes) say how to upgrade (see also [Rules](#rules)). The design doc lists the [known limits](https://github.com/tonbo-io/ursula/blob/main/docs/architecture/sqlite-vfs.md#7-limits).
 
 ## TLS and credentials
 
@@ -95,13 +200,13 @@ A layer in front of the stream, such as an authorizer or a quota or billing serv
 - The commit fails with `SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`), and SQLite rolls the transaction back. The file is not poisoned, and the owner keeps its claim on the stream.
 - Reads keep working from the local file.
 - Later commits are sent as usual, and succeed once the layer accepts writes again. No new attach is needed.
-- `status(file)` reports `payment_required: true` until a commit succeeds or the file is poisoned, with the layer's explanation as `payment_reason`: its response body, the first 256 bytes followed by `...` when it is longer. Through `openUrsulaPiStorage`, the commit rejects with `UrsulaPaymentRequiredError`, whose `reason` is the same text.
+- `status(file)` reports `payment_required: true` until a commit succeeds or the file is poisoned, with the layer's explanation as `payment_reason`: its response body, the first 256 bytes followed by `...` when it is longer. Through `open`'s database, and through `openUrsulaPiStorage`, the commit throws `UrsulaPaymentRequiredError` (`action` `retry`), whose `reason` is the same text.
 
 One case still poisons. When a commit's append got no answer, a `5xx`, or a `307` before the `402`, the append may already be in the stream, so the extension retries it like any append whose outcome is unknown. If the layer still refuses it when `URSULA_VFS_RETRY_MS` runs out, the commit fails and the file must be attached again.
 
 This is safe only if the layer follows the rule in [Writes refused before they reach the stream](#writes-refused-before-they-reach-the-stream).
 
-An attach claims the stream, which is a write. When the layer refuses it, `attach` throws `UrsulaPaymentRequiredError` (`ursula_attach` fails with `SQLITE_AUTH`, `errcode` 23), and the file opens again only after an attach succeeds. A [read-only attach](#read-only-attach) can read the database meanwhile.
+An attach claims the stream, which is a write. When the layer refuses it, `open` and `attach` throw `UrsulaPaymentRequiredError` (`ursula_attach` fails with `SQLITE_AUTH`, `errcode` 23), and the file opens again only after an attach succeeds. A [read-only attach](#read-only-attach) can read the database meanwhile.
 
 While writes are refused, the owner takes no snapshot. It publishes the next one after a commit succeeds, and a refused snapshot does not count in `snapshot_failures`. A transaction refused as `too_large` holds no snapshot back.
 
@@ -126,11 +231,11 @@ A `402` fails the commit at once, and so does a `4xx` with both headers, such as
 - Reads keep working from the local file.
 - Later commits are sent as usual, and succeed once the refusals stop. No new attach is needed.
 - `status(file)` reports `writes_refused: true` until a commit succeeds or the file is poisoned. `refused_kind` says what refused the write: `payment_required` (a `402`), `unauthorized` (a `401`), `forbidden` (a `403`), `rate_limited` (a `429`), `too_large` (a transaction too large for one request, or a `413` with both headers, see [Rules](#rules)), `not_applied` (any other refusal with both headers) or `unreachable` (the last attempt never went out). `refused_reason` says why: the refusing layer's response body (the first 256 bytes, followed by `...` when it is longer), or the value of `x-ursula-not-applied` when the body is empty, and always for `not_applied`. For `too_large` it gives the frame's size and the limit, or the header's value, and for `unreachable` the last attempt's failure. [Troubleshooting](/docs/troubleshooting#a-commit-or-attach-is-refused-with-error-code-7178) lists the reasons and what to do about each.
-- Through `openUrsulaPiStorage`, the commit rejects with `UrsulaWriteRefusedError`, whose `kind` and `reason` are the same. For a `402` it is an `UrsulaPaymentRequiredError`, a subclass.
+- Through `open`'s database, and through `openUrsulaPiStorage`, the commit throws `UrsulaWriteRefusedError`, whose `kind` and `reason` are the same. For a `402` it is an `UrsulaPaymentRequiredError`, a subclass. Its `action` is `retry`, and `fix` for `too_large`.
 
 When any attempt of a commit went out and got no answer, a `307`, or a `5xx` without both headers, the commit may already be in the stream. Refusals after that attempt prove nothing, so the commit fails and the file must be attached again, as before. Without a gateway of 0.7.3 or later, every `503` of the server is such an answer. Through a gateway with several upstreams this can happen while a single node refuses writes, because the gateway drops the mark when it reaches that node by following a leader redirect that carries none.
 
-An attach whose claim is refused this way throws `UrsulaWriteRefusedError` (`ursula_attach` fails with `SQLITE_IOERR_AUTH`, `errcode` 7178, or with `SQLITE_AUTH` for a `402`). Nothing was claimed. Attach again later, or attach [read-only](#read-only-attach) to read the database meanwhile. From SQL, call `ursula_attach` without a `FROM` clause, as in `SELECT ursula_attach(?, ?)`: 7178 is an I/O error code, and SQLite rolls back the calling connection's open transaction when a statement that reads a table fails with one.
+An attach whose claim is refused this way makes `open` and `attach` throw `UrsulaWriteRefusedError` (`ursula_attach` fails with `SQLITE_IOERR_AUTH`, `errcode` 7178, or with `SQLITE_AUTH` for a `402`). Nothing was claimed. Attach again later, or attach [read-only](#read-only-attach) to read the database meanwhile. From SQL, call `ursula_attach` without a `FROM` clause, as in `SELECT ursula_attach(?, ?)`: 7178 is an I/O error code, and SQLite rolls back the calling connection's open transaction when a statement that reads a table fails with one.
 
 This is safe only if every layer in front of the stream follows one rule: answer `401`, `402` or `429`, or send `x-ursula-not-applied` with `x-ursula-not-applied-checked`, only on a request that the stream did not apply. A layer that passes an append on to the stream and then refuses it, for example with a `402` from metering that runs after the stream answered, breaks the rule. So does a proxy or service mesh that sends a write upstream again, because it retries or follows a redirect, and relays the refusal of a later attempt: an earlier attempt may have been applied. Turn off retries and redirect following for writes in any proxy in front of Ursula. Some service meshes retry unless told not to. Before 1.24, Istio's default retry policy retries a `503` twice, POSTs included, and Istio 1.24 to 1.26 does the same when istiod runs with `EXCLUDE_UNSAFE_503_FROM_DEFAULT_RETRY=false`, which `compatibilityVersion=1.23` sets (see [redirects and retries](/docs/api/overview#redirects-and-retries)). Any version of Istio retries on a route whose `retryOn` includes `503`, `5xx`, `gateway-error` or `reset`. Envoy does the same when a retry policy is set. Set `retries: attempts: 0` on the routes that carry stream writes, to the gateway and from the gateway to the servers. No layer between `ursula gateway` and the servers may answer `401`, `402` or `429` at all: the gateway passes such an answer on after it follows a leader redirect, and the extension trusts these statuses without a mark. Ursula's own components never answer so there.
 
@@ -149,18 +254,20 @@ Ursula's gateway and server follow the rule whatever versions run together. A ga
 Requires 0.7.1 or later of `@tonbo/sqlite-ursula` and of the extension. Called from plain JavaScript, the 0.7.0 `attach` and `openUrsulaPiStorage` ignore `readOnly` and claim the stream, which fences its owner.
 
 ```ts
+const db = open("https://ursula.example.com/my-bucket/app-db", { readOnly: true });
+// or, for a file you open yourself
 attach("/data/app.db", "https://ursula.example.com/my-bucket/app-db", { readOnly: true });
 ```
 
-A read-only attach catches the file up like any attach but claims nothing, and it never writes the stream. It does not fence the owner, and it works while a layer in front of the stream refuses writes. Use it to export a database from another host, or to read one whose owner cannot claim it.
+A read-only attach catches the file up like any attach but claims nothing, and it never writes the stream. It does not fence the owner, and it works while a layer in front of the stream refuses writes. Use it to export a database from another host, or to read one whose owner cannot claim it. `open` with `readOnly` also opens the file read-only in `node:sqlite`, so SQLite refuses a write at its statement.
 
-- Every write fails with `SQLITE_READONLY` ("attempt to write a readonly database"). A transaction that changes nothing still commits.
+- Every write fails with `SQLITE_READONLY` ("attempt to write a readonly database"), SQLite's own error, not an `UrsulaError`. A transaction that changes nothing still commits.
 - A failed `COMMIT`, or a failed statement outside an explicit transaction, leaves no transaction open. Inside an explicit transaction, a statement whose changes outgrow SQLite's page cache fails before `COMMIT`, and the transaction stays open. After an error, run `ROLLBACK` if the transaction is still open (`isTransaction` in `node:sqlite`). Until then, even reads on that connection fail with the same error. Pi's storage rolls back a failed transaction itself.
 - The file holds the stream as of the attach. Attach it again to catch up.
 - A missing stream is an error. A read-only attach never creates one.
 - `status(file)` reports `read_only: true`, and `epoch` is the highest epoch claimed up to `offset`.
 - `openUrsulaPiStorage(file, url, { readOnly: true })` opens Pi's storage on a database that Pi has already written. Its reads work, and commits that change the database fail.
-- To write again, close the file's connections and attach it without `readOnly`.
+- To write again, close the file's connections and attach it without `readOnly`, or `open` it without `readOnly`.
 
 ## Health and alerts
 
@@ -174,7 +281,7 @@ A read-only attach catches the file up like any attach but claims nothing, and i
 - `writes_refused`, `refused_kind`, `refused_reason`: the latest write was refused before it reached the stream, what refused it and why (see [Writes refused before they reach the stream](#writes-refused-before-they-reach-the-stream)). `writes_refused` is `false` while `poisoned` is `true`, since a poisoned file needs a new attach whatever refused its writes.
 - `payment_required`, `payment_reason`: `true` when the latest refusal a layer answered is a `402`, with the layer's explanation (see [Writes refused with 402](#writes-refused-with-402)). A transaction refused as `too_large` does not change them.
 - `read_only`: the file is attached read-only.
-- `error` (from 0.7.5): why writes fail now, `null` while they go through. Its `kind` is a stable name, its `action` what to do: `retry` (nothing reached the stream, the file is usable), `reattach` (attach the file again), `stop` (another owner holds the stream) or `fix` (change the URL, the setup, the transaction or the files). The design doc lists the kinds.
+- `error` (from 0.7.5): why writes fail now, `null` while they go through. Its `kind` is a stable name, its `action` what to do: `retry` (nothing reached the stream, the file is usable), `reattach` (attach the file again), `stop` (another owner holds the stream) or `fix` (change the URL, the setup, the transaction or the files). See [Errors](#errors). The design doc lists the kinds.
 
 `instrument(file, meter)` reports the same as metrics on an OpenTelemetry `Meter`, which can be any object with `createHistogram`, `createCounter` and `createObservableGauge`. The package does not depend on OpenTelemetry. The metrics are `sqlite_ursula.commit.duration` and `sqlite_ursula.append.duration` (ms), `sqlite_ursula.append.retries`, `sqlite_ursula.stream.bytes`, `sqlite_ursula.commit.unmeasured`, and the gauges `sqlite_ursula.log.bytes`, `sqlite_ursula.snapshot.due_bytes`, `sqlite_ursula.snapshot.age`, `sqlite_ursula.snapshot.failures`, `sqlite_ursula.snapshot.bytes`, `sqlite_ursula.poisoned`, `sqlite_ursula.fenced`, `sqlite_ursula.payment_required` and `sqlite_ursula.writes_refused`. It drains `drainStats` every second, or every `intervalMs` milliseconds with `instrument(file, meter, { intervalMs })`, so do not drain the same file elsewhere. Call the function it returns to stop. Between drains the extension keeps the newest 8,192 measurements of each kind (512 KiB of commits), so a file nobody drains holds a bounded amount. `drainStats` reports what it dropped in `dropped`. `instrument` adds the dropped commits' bytes and retries to its counters, and counts the dropped commits in `sqlite_ursula.commit.unmeasured`: the duration histograms see at most 8,192 commits per drain, while `status(file).commits` counts every commit. At the default interval that is every commit up to about 8,000 commits a second. A file that commits faster needs a shorter `intervalMs`.
 
@@ -203,38 +310,18 @@ npm install @tonbo/sqlite-ursula @earendil-works/pi-durable
 `openUrsulaPiStorage`, from the `@tonbo/sqlite-ursula/pi` entry, attaches the file and opens it with Pi's own node driver. The error classes come from the root entry:
 
 ```ts
-import { UrsulaReplicationError } from "@tonbo/sqlite-ursula";
+import { UrsulaFencedError } from "@tonbo/sqlite-ursula";
 import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
 
 const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.example.com/pi/harness-1");
-// hand `storage` to the Pi harness; storage.close(ctx) on shutdown
+// hand `storage` to the Pi harness, and storage.close(ctx) on shutdown
 ```
 
 `@tonbo/sqlite-ursula` declares `@earendil-works/pi-durable` as an optional peer dependency in the range `>=1.0.0 <1.2.0`, and npm reports a mismatch when your version is outside it. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits. Before 0.7.5, `openUrsulaPiStorage` came from `@tonbo/sqlite-ursula` itself.
 
-A commit the stream does not accept surfaces as `UrsulaReplicationError`. `fenced: true` means another host took the stream over, the stream was deleted and recreated (opening it again then rebuilds the file from the new stream, see Rules), or another writer appended to it with a higher `Stream-Seq`. From 0.7.5 a fenced storage's reads fail too, with the same error and a message that starts with `read refused`, since the file no longer holds what the stream does. Open the storage again to take the stream back.
+The storage reports failures with the errors of [Errors](#errors), from the same mapping as `open`'s database. A commit the stream does not accept surfaces as `UrsulaReplicationError`, as before 0.7.5, and from 0.7.5 as one of its subclasses. `UrsulaFencedError` (`fenced: true`, `action` `stop`) means another host took the stream over, the stream was deleted and recreated (opening it again then rebuilds the file from the new stream, see [Rules](#rules)), or another writer appended to it with a higher `Stream-Seq`. From 0.7.5 a fenced storage's reads fail too, with the same error and a message that starts with `read refused`, since the file no longer holds what the stream does. Opening the storage again takes the stream back, so do that only for a deliberate takeover. `UrsulaReattachError` (`fenced: false`, `action` `reattach`) means the commit's outcome is unknown, or the local file failed: open the storage again. A poison whose cause must be fixed first stays a plain `UrsulaReplicationError`, whose `action` is `fix`.
 
-A commit refused before it reached the stream surfaces as `UrsulaWriteRefusedError` instead, and as its subclass `UrsulaPaymentRequiredError` for a `402`. The storage stays usable, and its next commit succeeds once the refusals stop (see [Writes refused before they reach the stream](#writes-refused-before-they-reach-the-stream)).
-
-## Rules
-
-- WAL mode only, 4 KiB pages (SQLite's default). `locking_mode=EXCLUSIVE` is not supported.
-- One process owns a database file at a time (a lock file next to it enforces this on the host). Use as many connections inside that process as you like.
-- Treat the local file as a cache: do not copy it elsewhere and attach it to another stream. A commit is durable once Ursula acknowledges it; commits do not fsync the local files (only the db file, once per WAL wrap), so `PRAGMA synchronous` does not matter.
-- After a reboot, a power loss, or on another host, attach discards the local files and rebuilds them from the latest snapshot and the stream's tail (a crashed process on the same boot resumes from its local files). A volume restored from a disk snapshot without a reboot is checked: attach uses it only if its WAL still holds what the sidecar `<db>-ursula` records, and rebuilds otherwise. Keep the file on a local disk, not a network filesystem, and do not copy it with `cp` or `rsync` while the process runs. Delete the file to force a rebuild.
-- A commit whose append gets no answer is retried with the same producer sequence for up to 30 s (`URSULA_VFS_RETRY_MS`), then fails, and the file must be attached again.
-- From 0.7.3 the extension keeps a connection for 90 s after its last request (`URSULA_VFS_IDLE_MS`, in milliseconds, 0 turns reuse off), so commits up to that far apart reuse it instead of opening a new TCP and TLS connection. A request that gets no answer (its connection was reset or closed, or it timed out) is sent again on a new connection: a commit with the same producer sequence, and a read within `URSULA_VFS_RETRY_MS`. A refused connection fails a read at once. On macOS a reset can show as `Invalid argument (os error 22)`: from 0.7.4 that counts as no answer too, so a read that meets it is sent again, as on Linux. A NAT, a load balancer or a firewall on the way that drops idle connections sooner than 90 s without telling either end makes the first request after such a pause wait out its timeout (10 s) before it is sent again. Behind such a device, set `URSULA_VFS_IDLE_MS` below its idle limit.
-- From 0.7.3 the extension never follows a redirect. A `307` (a gateway before 0.7.3 passing on a redirect to the stream's leader, which moved, or a node that the URL names and that does not lead the stream's group) is sent again to the same URL within `URSULA_VFS_RETRY_MS`, like a `503`. Any other redirect fails the request at once with the redirect's `Location` in the error: a commit then fails, and the file must be attached again. A URL that names one node of a multi-node cluster works only while that node leads the stream's group. A URL that a proxy redirects (from `http://` to `https://`, say, usually with a `308`) fails, so use the address the redirect points to.
-- A transaction must fit one request: up to 32 MiB of changed pages after compression by default (the server's request body limit), set by `URSULA_VFS_MAX_FRAME_BYTES` in bytes. That is about 8,000 pages of incompressible data, such as embeddings, media or encrypted bytes, and about three times as many of typical text. A larger transaction is never sent. It fails alone with `SQLITE_IOERR_AUTH` and `refused_kind` `too_large`, and the file stays usable. Split bulk imports into smaller transactions. Statements that rewrite a whole table or index are one transaction too: `CREATE INDEX` on a large table, `REINDEX`, an `ALTER TABLE` that rebuilds the table, and `VACUUM`, which rewrites every page. On a database whose compressed size is above the limit, `VACUUM` fails the same way. Delete rows before it, so that what it writes compresses below the limit, or copy the rows into a new database in transactions below the limit.
-- Behind a gateway or proxy with a lower body limit, set `URSULA_VFS_MAX_FRAME_BYTES` at or below it. A larger commit sent there usually meets a closed connection rather than a readable `413` ([#540](https://github.com/tonbo-io/ursula/issues/540)), and then poisons the file once `URSULA_VFS_RETRY_MS` runs out. `URSULA_VFS_MAX_FRAME_BYTES` takes 64 KiB to 32 MiB: a value outside is taken to the nearer bound, and one that is not a number of bytes is ignored, both logged once as `setting_adjusted`.
-- A file that has been attached (it has a sidecar `<db>-ursula`) opens in a new process only after its attach there succeeds. From 0.7.5 a file whose attach failed in the process (the server is unreachable, or refused the stream's name, for example) opens only after an attach of it succeeds, with or without a sidecar. Opening it otherwise fails, so no commit can bypass the stream: SQLite reports "unable to open database file", and the log and `status(file)` name the failed attach's reason. An attach refused because of the file itself before it changed anything (`in_use`, `unreplicated_file`, `other_stream`) is no failed attach: the file opens as before. A failed attach may already have changed the local files, as any attach does: discarded the ones it did not trust, or folded their WAL into the file. One that fails before it wrote anything into a new file removes the sidecar it created, which never touches the file, its `-wal` or `-shm`. A file it replayed pages into keeps its sidecar: the next attach resumes it when the sidecar names the file, and rebuilds it otherwise.
-- From 0.7.5 attach refuses (`in_use`), changing nothing, while the process has the file, its `-wal`, `-shm` or `-journal` open outside the extension, read-only or not: a connection opened before the extension was loaded, or one opened through another VFS, such as `?vfs=unix`. Its commits would never reach the stream. While such a connection is open, SQLite also keeps the files of closed connections open. Close every such connection, then attach. The check reads the process's open files where it can: on Linux with `/proc` mounted, and on macOS. Without that, on other platforms, or when the file's directory cannot be resolved, attach does not check, and it never finds a file opened through another hard link or mount of it. A database that was never attached and holds data is refused, never replicated over, and opens as before: copy its rows into a newly attached file, in the same process if you like (with `ATTACH`, for example), or move it and its `-wal` aside to attach the path.
-- Never write an attached file outside the extension. A write after the attach, through a connection that bypasses the extension or from a process without it, is not detected, as in 0.7.4: it never reaches the stream, and the owner's later commits and snapshots carry pages built on it, so copies rebuilt from the stream can diverge from the file or be malformed.
-- A stream deleted and recreated at the same path is a new stream: attach never resumes the local file on it, and rebuilds it from the new stream, whatever its length. When the stream of a file that holds data is missing (deleted by mistake, expired, or not carried over by a fresh install), attach refuses and keeps the file, which may be the only copy left. Delete the file to start over from an empty stream, or attach a new file under another stream URL. Neither the file nor a copy of it attaches under another URL. To salvage its data, copy the file and its `-wal` to a new name before deleting anything. The copy has no sidecar, so it opens as a plain SQLite file: read its rows from there into a newly attached database. An owner of the deleted stream is normally fenced at its next commit, but stop every owner before deleting a stream you will recreate: a snapshot it is publishing, or an attach racing the recreate, can still put its data into the new stream (see the design doc).
-- Within a minor (0.7.x), extension versions take over each other's streams, so upgrade owners one at a time: the new owner's attach fences the old one. Across minors, follow the release notes. A minor that changes the extension's `Producer-Id` cannot fence owners of the other version, so both would commit and could corrupt the database: stop every owner of a stream before attaching it with the new version (and the reverse on a downgrade). A frame or snapshot of another minor's format stops attach with an error that names it.
-- An owner idle for 7 days loses its producer state on the server; its next commit takes the stream back only if nobody else wrote meanwhile.
-- Every commit carries a `Stream-Seq` above all earlier ones. Do not append to the stream yourself: a write with a higher `Stream-Seq` fences the owner at its next commit, and one without breaks every rebuild that replays it, until the owner publishes a snapshot past it.
-- `URSULA_VFS_SNAPSHOT_MIN_BYTES` sets the smallest log between snapshots (default 8 MiB).
+A commit refused before it reached the stream surfaces as `UrsulaWriteRefusedError` instead, and as its subclass `UrsulaPaymentRequiredError` for a `402`. The storage stays usable, and its next commit succeeds once the refusals stop (see [Writes refused before they reach the stream](#writes-refused-before-they-reach-the-stream)). A failed attach throws an `UrsulaError`, as `open` and `attach` do.
 
 ## Related
 
