@@ -2,6 +2,8 @@
 // failure of the extension to them (`classify`). Shared by the root entry (index.ts, database.ts) and
 // the Pi adapter (pi.ts). The error classes and the types of their fields are public.
 
+/** SQLITE_ERROR: a SQL error, and every error of an Ursula SQL function other than a refused attach. */
+export const SQLITE_ERROR = 1;
 /** SQLITE_READONLY: a write to a file attached read-only. */
 export const SQLITE_READONLY = 8;
 /** SQLITE_FULL, a primary code: a local write that found no room, after the stream acknowledged its commit (the file is poisoned). */
@@ -24,10 +26,12 @@ export function errcode(error: unknown): number | undefined {
 /**
  * What to do about a failure (`UrsulaError.action`, and `action` in `status(file).error`):
  *
- * - `retry`: nothing reached the stream, and the file stays usable. Run the same statement, or the
- *   same attach, again later, on the same database.
- * - `reattach`: the local file may no longer match the stream. Close the database and open it again
- *   (attach it again), which replays the stream.
+ * - `retry`: nothing reached the stream, and the file stays usable. Run it again later on the same
+ *   database: the statement, or the whole transaction when it was an explicit transaction's COMMIT,
+ *   since SQLite rolled the transaction back. When `open` or `attach` failed, call it again later.
+ * - `reattach`: the local file may no longer match the stream. Close the database and call `open`
+ *   (or `attach`) again, which replays the stream. The database's own `close()` and `open()` methods
+ *   attach nothing.
  * - `stop`: another owner took the stream over. Stop using the database. Opening it again takes the
  *   stream back, which only a deliberate takeover does, so never reopen it in a loop.
  * - `fix`: the request cannot succeed as made. Fix the URL, the setup, the files or the transaction.
@@ -157,8 +161,9 @@ export class UrsulaError extends Error {
  * (`unavailable`) or refused the credentials (`unauthorized`), is one too.
  *
  * Unlike an {@link UrsulaReplicationError}, it leaves the file usable. A refused commit was rolled
- * back, but the file is not poisoned: reads go on from the local file, and later commits are sent as
- * usual and succeed once the refusals stop, with no new attach (`action` `retry`). The one exception
+ * back (an explicit transaction whole, so run the whole transaction again), but the file is not
+ * poisoned: reads go on from the local file, and later commits are sent as usual and succeed once the
+ * refusals stop, with no new attach (`action` `retry`). The one exception
  * is `too_large`, whose transaction never fits in one append, whatever the layer does: split it into
  * smaller ones (`action` `fix`). A refused attach claimed nothing: attach again later, or with
  * `{ readOnly: true }` to read the database meanwhile.
@@ -172,7 +177,9 @@ export class UrsulaWriteRefusedError extends UrsulaError {
 	 * What refused it: for a refused commit its `refused_kind`, for an attach refused with a `402`
 	 * `payment_required`, and for any other failed attach the extension's kind (`refused`,
 	 * `unreachable`, `unavailable` or `unauthorized`), whose message names what refused it. `refused`
-	 * also stands for a refusal that names nothing more, such as one from an extension before 0.7.3.
+	 * also stands for a refusal that names nothing more, such as one from an extension before 0.7.3,
+	 * and for `status(file)` of a path whose attach a `402` refused: only `attach` itself gets the
+	 * `402`'s code, so only it throws an {@link UrsulaPaymentRequiredError}.
 	 */
 	declare readonly kind: RefusedKind;
 	/** Why (`refused_reason`), for a refused commit: the layer's explanation, for `too_large` the frame's size and the limit, and for `unreachable` the last attempt's failure (such as `timeout: resolve`). `null` when the layer sent no explanation, and for a failed attach, whose message carries it. */
@@ -206,8 +213,9 @@ export class UrsulaPaymentRequiredError extends UrsulaWriteRefusedError {
  * `read refused`): the file no longer serves the state the new owner moved past.
  *
  * Its subclasses say what to do: {@link UrsulaFencedError} (`stop`) and {@link UrsulaReattachError}
- * (`reattach`). A poison whose cause must be fixed before the file is attached again (kind
- * `unsupported`, `stream_state` or `local_setup`) is an UrsulaReplicationError with `action` `fix`.
+ * (`reattach`). A poison whose cause must be fixed before the file is attached again, of any kind
+ * whose action is `fix` (such as `unsupported`, `stream_state`, `local_setup`, or `invalid_url` for a
+ * commit that met a redirect), is an UrsulaReplicationError with `action` `fix`.
  */
 export class UrsulaReplicationError extends UrsulaError {
 	declare readonly kind: "fenced" | ReattachKind | SetupKind;
@@ -224,8 +232,9 @@ export class UrsulaReplicationError extends UrsulaError {
  * Another owner took the stream over: a newer owner claimed it, it was deleted and recreated, or a
  * writer outside the protocol appended to it. Commits fail, and so do new reads, whose message starts
  * with `read refused`. Stop using the database (`action` `stop`). Opening it again takes the stream
- * back from that owner, which only a deliberate takeover does: exit and let the scheduler restart the
- * process, and never reopen in a loop.
+ * back from that owner, which only a deliberate takeover does: never reopen in a loop, and do not let
+ * a scheduler start this process on the stream again while the new owner runs (one that restarts an
+ * exited process in place would do exactly that).
  */
 export class UrsulaFencedError extends UrsulaReplicationError {
 	declare readonly kind: "fenced";
@@ -239,8 +248,9 @@ export class UrsulaFencedError extends UrsulaReplicationError {
  * The local file may no longer match the stream: a commit whose outcome is unknown (no answer within
  * the retry budget, or an answer that does not prove nothing was applied, so the stream may or may
  * not hold it), a local file damaged or failing, or a failure inside the extension. Close the database
- * and open it again (`action` `reattach`): the new attach replays what the stream holds. An attach
- * that failed after its claim, which may already have fenced the earlier owner, is one too.
+ * and call `open` (or `attach`) again (`action` `reattach`): the new attach replays what the stream
+ * holds. The database's own `close()` and `open()` methods attach nothing. An attach that failed after
+ * its claim, which may already have fenced the earlier owner, is one too.
  */
 export class UrsulaReattachError extends UrsulaReplicationError {
 	declare readonly kind: ReattachKind;
@@ -268,9 +278,9 @@ export class UrsulaSetupError extends UrsulaError {
 function advice(kind: string, action: UrsulaErrorAction): string {
 	switch (action) {
 		case "retry":
-			return "Nothing of it reached the stream, and the database stays usable: run it again later.";
+			return "Nothing of it reached the stream, and the database stays usable: run it again later, the whole transaction if it was one.";
 		case "reattach":
-			return "Close the database and open it again, which replays the stream.";
+			return "Close the database and attach it again (open() does), which replays the stream.";
 		case "stop":
 			return "Another owner took the stream over: stop using this database, and never reopen it in a loop.";
 		case "fix":
@@ -357,6 +367,8 @@ function functionError(error: unknown): UrsulaError | undefined {
  * which names it. A status that throws stands for a file not attached (any more): `error` itself.
  */
 export function classify(error: unknown, status?: () => FailureStatus): unknown {
+	// Already one, thrown again through SQLite (by a user-defined function that called `status`).
+	if (error instanceof UrsulaError) return error;
 	const named = functionError(error);
 	if (named !== undefined) return named;
 	const code = errcode(error);
@@ -373,5 +385,28 @@ export function classify(error: unknown, status?: () => FailureStatus): unknown 
 	// needs a new attach whatever the error, a refusal's code included.
 	if (s.poisoned) return poisonError(s, error);
 	if (code === SQLITE_IOERR_AUTH) return refusedCommitError(s, error);
+	return error;
+}
+
+/**
+ * {@link classify} for an error a library may have wrapped: `error` itself, the errors an
+ * AggregateError holds (a driver's failed ROLLBACK after a COMMIT that SQLite rolled back), and the
+ * errors they wrap (`cause`, such as Pi's StorageRejected around a read the VFS failed), in that
+ * order. The first that maps to an {@link UrsulaError} is the result, so a failure of the extension
+ * never passes for the wrapper's own kind of error (for Pi, a semantic rejection). `error` itself
+ * otherwise.
+ */
+export function classifyWrapped(error: unknown, status: () => FailureStatus): unknown {
+	const pending: unknown[] = [error];
+	const seen = new Set<unknown>();
+	while (pending.length > 0 && seen.size < 16) {
+		const next = pending.shift();
+		if (next === null || typeof next !== "object" || seen.has(next)) continue;
+		seen.add(next);
+		const classified = classify(next, status);
+		if (classified instanceof UrsulaError) return classified;
+		if (next instanceof AggregateError) pending.push(...(next.errors as unknown[]));
+		if ("cause" in next) pending.push(next.cause);
+	}
 	return error;
 }

@@ -17,12 +17,12 @@
 // - local.ts: the local file `open` derives from a stream URL.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { DatabaseSync, type DatabaseSyncOptions } from "node:sqlite";
 import { UrsulaDatabase } from "./database.ts";
 import { classify, type UrsulaErrorAction, UrsulaSetupError, type WriteRefusedKind } from "./errors.ts";
-import { defaultDir, localName } from "./local.ts";
+import { defaultDir, localFile, localName } from "./local.ts";
 import { prebuiltExtension } from "./platform.ts";
 
 export {
@@ -69,9 +69,11 @@ function call(sql: string, ...args: string[]): Record<string, unknown> {
 /** {@link open}'s options: where the local file is, how to attach it, and node:sqlite's own settings. */
 export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnly"> {
 	/**
-	 * The local file, the stream's cache on this host. Without it, the file is named after the stream
-	 * URL in `dir`: `<bucket>-<stream>-<hash>.db`, where `<hash>` is 128 bits of the SHA-256 of the
-	 * normalized URL, so two spellings of one URL share a file and two different URLs never do.
+	 * The local file, the stream's cache on this host: a plain file path, made absolute against the
+	 * current directory (not `:memory:`, `""` or a `file:` URI, which SQLite would not open as that
+	 * file). Without it, the file is named after the stream URL in `dir`:
+	 * `<bucket>-<stream>-<hash>.db`, where `<hash>` is 128 bits of the SHA-256 of the stream the URL
+	 * names, so two spellings of one stream URL share a file and two different stream URLs never do.
 	 */
 	readonly path?: string | undefined;
 	/**
@@ -82,10 +84,15 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	readonly dir?: string | undefined;
 	/**
 	 * Attach without claiming the stream ({@link AttachOptions.readOnly}), and open the file read-only:
-	 * reads see the stream as of the attach, and every write fails with SQLITE_READONLY.
+	 * reads see the stream as of the attach, and every write fails with SQLITE_READONLY. A read-only
+	 * open named after the URL gets a file of its own (`-ro1`, `-ro2` and so on, the first that no
+	 * other connection or process holds), so it never holds up the owner on its host, or another reader.
 	 */
 	readonly readOnly?: boolean | undefined;
 }
+
+/** How many read-only opens of one stream may hold their files at once on a host, in `dir`. */
+const READERS = 8;
 
 /**
  * Opens the database a stream holds, replicated: loads the extension if needed, catches the local
@@ -93,41 +100,87 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
  * the file. Returns a node:sqlite `DatabaseSync` (a subclass of it, so `instanceof DatabaseSync`),
  * which any library that takes one takes. Each commit returns once the stream holds it.
  *
- * The database stays in WAL mode, as attach leaves it. Close it before opening the stream again in
- * the process: attach refuses a file with open connections (`in_use`).
+ * The stream URL may not have a query or a fragment (`invalid_url`). node:sqlite's options are
+ * checked before anything is attached, so a wrong one claims nothing. The database stays in WAL mode,
+ * as attach leaves it. Close it before opening the stream again in the process: attach refuses a file
+ * with open connections (`in_use`). Its own `close()` and `open()` methods attach nothing.
  *
  * Errors say what to do. A failure of the extension throws an {@link UrsulaError} whose `action` is
  * `retry`, `reattach`, `stop` or `fix`, and whose `cause` is the error the failure surfaced as:
  * {@link UrsulaWriteRefusedError} (`retry`: nothing reached the stream), {@link UrsulaReattachError}
- * (`reattach`: close the database and open it again), {@link UrsulaFencedError} (`stop`: another
+ * (`reattach`: close the database and call `open` again), {@link UrsulaFencedError} (`stop`: another
  * owner took the stream over) or {@link UrsulaSetupError} (`fix`). The database's `exec`, `prepare`
- * and `applyChangeset`, and its statements' `run`, `get`, `all` and `iterate`, throw them too. Every
- * other error, such as a constraint violation or a syntax error, is node:sqlite's own, unchanged.
- * Other methods throw node:sqlite's errors as they are, which {@link status} of `db.location()`
- * explains.
+ * and `applyChangeset`, and its statements' `run`, `get`, `all` and `iterate`, throw them too, for the
+ * file `open` attached (not for another one used through SQL `ATTACH DATABASE`). Every other error,
+ * such as a constraint violation or a syntax error, is node:sqlite's own, unchanged. A ROLLBACK that a
+ * transaction helper runs after such a failure, which SQLite has rolled back already, does not hide
+ * it. Other methods (a tag store, a session, `backup()`) throw node:sqlite's errors as they are, which
+ * {@link status} of `db.location()` explains.
  */
 export function open(streamUrl: string, options: OpenOptions = {}): DatabaseSync {
 	const { path, dir, readOnly, ...sqlite } = options;
-	const file = path ?? derivedPath(streamUrl, dir ?? defaultDir());
-	attach(file, streamUrl, readOnly === true ? { readOnly } : {});
-	return new UrsulaDatabase(file, readOnly === true ? { ...sqlite, readOnly } : sqlite, (error) => classify(error, () => status(file)));
-}
-
-/** The local file of `streamUrl` in `dir`, which is created when missing. */
-function derivedPath(streamUrl: string, dir: string): string {
-	let name: string;
+	const url = streamUrlOf(streamUrl);
+	const settings: DatabaseSyncOptions = { ...sqlite, open: false, ...(readOnly === true ? { readOnly } : {}) };
+	if (path !== undefined) return attachAndOpen(localFile(path), streamUrl, settings);
+	const directory = resolve(dir ?? defaultDir());
 	try {
-		name = localName(streamUrl);
-	} catch (error) {
-		throw new UrsulaSetupError(`open: invalid_url: the stream URL does not parse: ${streamUrl}`, "invalid_url", error);
-	}
-	try {
-		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
 	} catch (error) {
 		const why = error instanceof Error ? error.message : String(error);
-		throw new UrsulaSetupError(`open: local_setup: cannot create ${dir} for the database's local file (${why}): pass a writable directory on a local disk as \`dir\`, or a file as \`path\``, "local_setup", error);
+		throw new UrsulaSetupError(`local_setup: cannot create ${directory} for the database's local file (${why}): pass a writable directory on a local disk as \`dir\`, or a file as \`path\``, "local_setup", error);
 	}
-	return join(dir, name);
+	if (readOnly !== true) return attachAndOpen(join(directory, localName(url)), streamUrl, settings);
+	for (let reader = 1; ; reader++) {
+		try {
+			return attachAndOpen(join(directory, localName(url, `-ro${reader}`)), streamUrl, settings);
+		} catch (error) {
+			if (reader < READERS && error instanceof UrsulaSetupError && error.kind === "in_use") continue;
+			throw error;
+		}
+	}
+}
+
+/**
+ * Attaches `file` and opens it with node:sqlite's `settings` (which do not open it yet), read-only
+ * when they say so. node:sqlite checks them first, so a wrong one attaches nothing. Then checks that
+ * SQLite opened the attached file: another database would take writes that never reach the stream.
+ */
+function attachAndOpen(file: string, streamUrl: string, settings: DatabaseSyncOptions): DatabaseSync {
+	const db = new UrsulaDatabase(file, settings, (error) => classify(error, () => status(file)));
+	attach(file, streamUrl, settings.readOnly === true ? { readOnly: true } : {});
+	db.open();
+	const opened = db.location();
+	if (opened !== realpathSync(file)) {
+		db.close();
+		throw new UrsulaSetupError(`invalid_argument: SQLite opened ${opened ?? "an in-memory database"}, not the attached file ${file}`, "invalid_argument", undefined);
+	}
+	return db;
+}
+
+/**
+ * `streamUrl` parsed: an UrsulaSetupError (`invalid_url`) for one that does not parse, or that has a
+ * query or a fragment, which the extension cannot take (it adds its own query to the stream URL).
+ */
+function streamUrlOf(streamUrl: string): URL {
+	let url: URL;
+	try {
+		url = new URL(streamUrl);
+	} catch (error) {
+		throw new UrsulaSetupError(`invalid_url: the stream URL does not parse: ${streamUrl}`, "invalid_url", error);
+	}
+	refuseQuery(streamUrl, url);
+	return url;
+}
+
+/** Refuses (`invalid_url`) a stream URL with a query or a fragment, before any request is sent. */
+function refuseQuery(streamUrl: string, url: URL): void {
+	if (/[?#]/.test(streamUrl)) {
+		throw new UrsulaSetupError(
+			`invalid_url: the stream URL ${url.origin}${url.pathname} has a query or a fragment: name the stream alone, since the extension adds its own query`,
+			"invalid_url",
+			undefined,
+		);
+	}
 }
 
 export interface AttachOptions {
@@ -178,6 +231,8 @@ export interface AttachOptions {
  * attach again later, and a read-only attach can still read the database meanwhile.
  */
 export function attach(file: string, streamUrl: string, options: AttachOptions = {}): StreamOffset {
+	// A URL that does not parse here is the extension's to report (`invalid_url`).
+	if (URL.canParse(streamUrl)) refuseQuery(streamUrl, new URL(streamUrl));
 	const sql = options.readOnly === true ? "SELECT ursula_attach(?, ?, 'read_only') AS n" : "SELECT ursula_attach(?, ?) AS n";
 	return call(sql, file, streamUrl).n as string;
 }

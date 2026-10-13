@@ -1,47 +1,115 @@
-// Where `open` keeps the local file of a stream when it is given no path: a file named after the
-// stream URL, in a directory of its own. The local files are a cache of the stream, rebuilt from it
-// whenever they are missing or cannot be trusted (another boot, another host).
+// Where the local file of a stream is: the file a caller names, checked and resolved to an absolute
+// path, or, when `open` is given none, a file named after the stream in a directory of its own. The
+// local files are a cache of the stream, rebuilt from it whenever they are missing or cannot be
+// trusted (another boot, another host).
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { homedir, userInfo } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+import { UrsulaSetupError } from "./errors.ts";
+
+/**
+ * `path` as an absolute path, which SQLite and the extension read the same way, whatever the
+ * current directory is then. Refuses (`invalid_argument`) what SQLite would not open as that file:
+ * `""` and `":memory:"` (a temporary or in-memory database) and a `file:` URI.
+ */
+export function localFile(path: string): string {
+	if (path === "" || path === ":memory:" || path.startsWith("file:")) {
+		const instead = path.startsWith("file:") ? "read it as a URI" : "open a temporary database";
+		throw new UrsulaSetupError(
+			`invalid_argument: ${JSON.stringify(path)} is not a file path: SQLite would ${instead}, not the attached file. Pass the path of a file on a local disk`,
+			"invalid_argument",
+			undefined,
+		);
+	}
+	return resolve(path);
+}
 
 /**
  * The directory `open` keeps derived files in unless it is given one: `sqlite-ursula` in the user's
  * cache directory, which is `$XDG_CACHE_HOME` when that is an absolute path, `~/Library/Caches` on
- * macOS and `~/.cache` elsewhere.
+ * macOS and `~/.cache` elsewhere. The home directory comes from `HOME`, or from the user database
+ * when `HOME` is not an absolute path, and without either, `open` needs `dir` or `path`.
  */
 export function defaultDir(): string {
 	const xdg = process.env.XDG_CACHE_HOME;
 	if (xdg !== undefined && isAbsolute(xdg)) return join(xdg, "sqlite-ursula");
-	return join(homedir(), ...(process.platform === "darwin" ? ["Library", "Caches"] : [".cache"]), "sqlite-ursula");
+	return join(home(), ...(process.platform === "darwin" ? ["Library", "Caches"] : [".cache"]), "sqlite-ursula");
+}
+
+/** The user's home directory, an absolute path. */
+function home(): string {
+	const fromEnv = homedir();
+	if (isAbsolute(fromEnv)) return fromEnv;
+	let fromUser: string | undefined;
+	try {
+		fromUser = userInfo().homedir;
+	} catch {
+		// No entry for this user (an arbitrary uid in a container).
+	}
+	if (fromUser !== undefined && isAbsolute(fromUser)) return fromUser;
+	throw new UrsulaSetupError(
+		"local_setup: no home directory to keep the local file in (HOME is not an absolute path, and the user has none): pass `dir`, a writable directory on a local disk, or `path`",
+		"local_setup",
+		undefined,
+	);
+}
+
+/** A path segment percent-decoded, or `undefined` when it does not decode. */
+function decoded(segment: string): string | undefined {
+	try {
+		return decodeURIComponent(segment);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
- * The name of the local file of `streamUrl`: `<label>-<hash>.db`.
- *
- * - `<hash>` is the first 32 hex digits (128 bits) of the SHA-256 of the URL as WHATWG URL parsing
- *   normalizes it (`new URL(streamUrl).href`: the scheme and host lowercased, the default port
- *   dropped, the path percent-encoded). Two spellings of the same URL share a file, and two different
- *   URLs never do, short of a SHA-256 collision on 128 bits.
- * - `<label>` only makes the name readable: the last two segments of the URL's path (the bucket and
- *   stream ids) joined by `-`, lowercased, with every run of characters other than `a-z`, `0-9`, `_`
- *   and `-` replaced by `_`, as is a leading `-`, cut to 64 characters, and `stream` when empty.
- *
- * So the name is at most 100 characters of `[a-z0-9_-]` and `.db`, never starts with `-` or `.`,
- * and does not depend on the file system's case sensitivity: a safe file name for any bucket and
- * stream id. SQLite's and the extension's files next to it add at most 12 characters
- * (`-ursula.lock`). Throws a `TypeError` (`ERR_INVALID_URL`) for a URL that does not parse.
+ * The stream a parsed stream URL names, which the file name's hash covers: the scheme, the host
+ * (lowercased by URL parsing), the port when it is not the scheme's default, and the path, with every
+ * segment percent-decoded and encoded again one fixed way (a segment that does not decode stays as it
+ * is) and trailing `/` dropped, as the extension drops them. Userinfo, a query and a fragment play no
+ * part: `open` refuses a URL with either of the last two.
  */
-export function localName(streamUrl: string): string {
-	const url = new URL(streamUrl);
-	const hash = createHash("sha256").update(url.href).digest("hex").slice(0, 32);
+export function streamIdentity(url: URL): string {
+	const segments = url.pathname
+		.replace(/\/+$/, "")
+		.split("/")
+		.map((segment) => {
+			const text = decoded(segment);
+			return text === undefined ? segment : encodeURIComponent(text);
+		});
+	return `${url.protocol}//${url.host}${segments.join("/")}`;
+}
+
+/**
+ * The name of the local file of a stream, from its parsed URL: `<label>-<hash><variant>.db`.
+ *
+ * - `<hash>` is the first 32 hex digits (128 bits) of the SHA-256 of {@link streamIdentity}. Every
+ *   spelling of one stream URL (case of the scheme and host, a default port, percent-encoding, a
+ *   trailing `/`, userinfo) maps to the same file, and two different stream URLs never do, short of
+ *   a SHA-256 collision on 128 bits.
+ * - `<label>` only makes the name readable: the last two segments of the URL's path (the bucket and
+ *   stream ids), percent-decoded, joined by `-`, lowercased, with every run of characters other than
+ *   `a-z`, `0-9`, `_` and `-` replaced by `_`, as is a leading `-`, cut to 64 characters, and
+ *   `stream` when empty.
+ * - `<variant>` is empty for an owner, and `-ro1`, `-ro2` and so on for read-only opens, which keep
+ *   files of their own: a reader on the owner's host, and two readers on one host, do not hold each
+ *   other's file.
+ *
+ * So the name is at most 104 characters of `[a-z0-9_-]` and `.db`, never starts with `-` or `.`, and
+ * does not depend on the file system's case sensitivity: a safe file name for any bucket and stream
+ * id. SQLite's and the extension's files next to it add at most 12 characters (`-ursula.lock`).
+ */
+export function localName(url: URL, variant = ""): string {
+	const hash = createHash("sha256").update(streamIdentity(url)).digest("hex").slice(0, 32);
 	const segments = url.pathname.split("/").filter((segment) => segment.length > 0);
 	const label = segments
 		.slice(-2)
+		.map((segment) => decoded(segment) ?? segment)
 		.join("-")
 		.toLowerCase()
 		.replace(/[^a-z0-9_-]+/g, "_")
 		.replace(/^-/, "_")
 		.slice(0, 64);
-	return `${label.length === 0 ? "stream" : label}-${hash}.db`;
+	return `${label.length === 0 ? "stream" : label}-${hash}${variant}.db`;
 }

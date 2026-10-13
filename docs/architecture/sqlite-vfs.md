@@ -132,9 +132,17 @@ the mapping read `ursula_status`: a poisoned file maps to `UrsulaFencedError` (`
 `UrsulaReattachError` (`reattach`), or `UrsulaReplicationError` with `fix`, all of them
 `UrsulaReplicationError`s, and a commit that failed with 7178 maps to `UrsulaWriteRefusedError`,
 whose `kind` is `refused_kind`. Any other error, such as a constraint violation, stays the error it
-is. The database `open` returns is a subclass of `node:sqlite`'s `DatabaseSync` whose `exec`,
-`prepare` and `applyChangeset`, and whose statements' `run`, `get`, `all` and `iterate`, throw what
-the mapping makes of their errors.
+is. The Pi helper also looks behind the errors Pi wraps (an AggregateError, a `cause`), so a
+failure of the extension inside Pi's `StorageRejected` maps too. The database `open` returns is a
+subclass of `node:sqlite`'s `DatabaseSync` whose `exec`, `prepare` and `applyChangeset`, and whose
+statements' `run`, `get`, `all` and `iterate`, throw what the mapping makes of their errors, for the
+file `open` attached. `open` resolves that file to an absolute path before it attaches it (and
+refuses `:memory:`, `""` and `file:` URIs, which SQLite would open as another database), and after
+opening it checks that `location()` is that file. An I/O error makes SQLite roll the whole
+transaction back, so the database remembers an `UrsulaError` after which no transaction is open,
+until a statement succeeds: a transaction helper's ROLLBACK that then finds no transaction does not
+replace it (a prepared ROLLBACK succeeds, and one through `exec`, or a ROLLBACK TO or RELEASE that
+finds no savepoint, throws the remembered error).
 
 ## 2. Writes
 
@@ -1036,7 +1044,7 @@ PRs).
 | e2e: deployment | `auth.e2e.ts`, `redirects.e2e.ts`, `health.e2e.ts` | TLS and gateway-checked tokens, leaderships moved under commits and snapshot read-backs with no `307` reaching the client, `ursula_status` and logs for operators |
 | e2e: panics | `panics.e2e.ts` | every SQL function and init fail with an error and the process goes on, a panic poisons one file alone |
 | e2e: package entries | `entries.e2e.ts` | the root entry, source and built, imports nothing outside Node.js, the `/pi` entry imports Pi Durable |
-| e2e: `open` | `open.e2e.ts` | `open` with a derived and an explicit path, a distinct and safe file name for every URL and one for every spelling of a URL, the default directory, WAL mode without a pragma, a typed error for a fence, an unknown outcome, a `402`, a `too_large` refusal, an unreachable endpoint and setup mistakes, and SQLite's own errors (a constraint violation while writes are refused included) passing through unchanged |
+| e2e: `open` | `open.e2e.ts`, `classify.e2e.ts` | `open` with a derived and an explicit path, a distinct and safe file name for every stream and one for every spelling of its URL, read-only opens on files of their own, the default directory, WAL mode without a pragma, a typed error for a fence, an unknown outcome, a `402`, a `too_large` refusal, an unreachable endpoint and setup mistakes, SQLite's own errors (a constraint violation while writes are refused included) passing through unchanged, a transaction helper's or drizzle's ROLLBACK after a failure keeping the error, `:memory:` and `file:` paths, a query or a fragment in the URL and wrong `node:sqlite` options refused before anything is attached, a relative path after a chdir, statement options passed on, a connection made through `db.constructor`, and a failure Pi wraps in its `StorageRejected` |
 | e2e: misuse | `misuse.e2e.ts` | any descriptor outside the extension refuses the attach (a connection opened before the extension was loaded, a read descriptor, a read-only connection that keeps closed connections' descriptors open) and keeps the binding, a failed attach names the server's reason, refuses opens, blocks no later attach, and removes the sidecar it created when it wrote nothing, an unreplicated file whose rows copy into a newly attached file in the same process, another process met after the attach changed the files fails it, an unreachable endpoint, a fenced owner's reads fail, a reader with cached pages is not held up by another thread's commit, and refused, unknown and fenced commits report kinds of their own |
 | e2e: versions | `compat.e2e.ts` | same-minor compatibility (§7, versions) |
 | e2e: load | `bench.e2e.ts`, `soak.e2e.ts` | sanity numbers (bytes per turn, pages per commit), server memory under VFS-shaped load (soak, opt-in) |

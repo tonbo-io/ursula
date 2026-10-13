@@ -51,6 +51,7 @@
     "@earendil-works/pi-ai": "1.1.0",
     "@earendil-works/pi-durable": "1.1.0",
     "@types/node": "22.20.5",
+    "drizzle-orm": "1.0.0-rc.4",
     "typescript": "7.0.2",
     "vitest": "5.0.3"
   }

@@ -3,8 +3,9 @@
 // application that uses the root entry alone never installs it.
 import { type SqliteExecutor, SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { type NodeSqliteStorageOptions, openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { classify, errcode, SQLITE_READONLY } from "./errors.ts";
+import { classifyWrapped, errcode, SQLITE_READONLY } from "./errors.ts";
 import { type AttachOptions, attach, status } from "./index.ts";
+import { localFile } from "./local.ts";
 
 /** A statement's parameters, as Pi's executor takes them. */
 type Params = SqliteExecutor["run"] extends (sql: string, ...params: infer P) => unknown ? P : never;
@@ -29,15 +30,19 @@ export type UrsulaPiStorageOptions = NodeSqliteStorageOptions & AttachOptions;
  *
  * A commit refused before it reached the stream surfaces as an `UrsulaWriteRefusedError` instead
  * (`UrsulaPaymentRequiredError` for a `402`, `action` `retry`), and the storage stays usable: the next
- * commit goes out as usual. A failed attach throws an `UrsulaError` as `attach` does. With
- * `{ readOnly: true }` the file is attached read-only: the storage opens on a database Pi has already
- * written, its reads work, and every commit that changes it fails with SQLITE_READONLY. The error
- * classes are exported by the root entry, `@tonbo/sqlite-ursula`.
+ * commit goes out as usual. A failure that Pi wraps in its own error, such as a StorageRejected
+ * around a read the VFS failed, surfaces as the Ursula error, never as Pi's semantic rejection. A
+ * failed attach throws an `UrsulaError` as `attach` does. With `{ readOnly: true }` the file is
+ * attached read-only: the storage opens on a database Pi has already written, its reads work, and
+ * every commit that changes it fails with SQLITE_READONLY. `file` is a plain file path, made absolute
+ * against the current directory (not `:memory:`, `""` or a `file:` URI). The error classes are
+ * exported by the root entry, `@tonbo/sqlite-ursula`.
  */
 export async function openUrsulaPiStorage(file: string, streamUrl: string, options: UrsulaPiStorageOptions = {}): Promise<SqliteStorage> {
 	const { readOnly, ...sqlite } = options;
-	attach(file, streamUrl, readOnly === undefined ? {} : { readOnly });
-	const db = await openNodeSqliteDatabase(file, sqlite);
+	const path = localFile(file);
+	attach(path, streamUrl, readOnly === undefined ? {} : { readOnly });
+	const db = await openNodeSqliteDatabase(path, sqlite);
 	const { transaction, run, exec, get, all } = {
 		transaction: db.transaction.bind(db),
 		run: db.run.bind(db),
@@ -46,7 +51,7 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 		all: db.all.bind(db),
 	};
 	const failed = (error: unknown): never => {
-		throw failure(file, error);
+		throw failure(path, error);
 	};
 	db.transaction = <T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> => transaction(callback).catch(failed);
 	// Statements outside a transaction: a write commits on its own, and any statement reads.
@@ -57,15 +62,19 @@ export async function openUrsulaPiStorage(file: string, streamUrl: string, optio
 	return SqliteStorage.open(db);
 }
 
-/** The error to throw for `error`, which a statement or a transaction of Pi's driver threw on `file`. */
+/**
+ * The error to throw for `error`, which a statement or a transaction of Pi's driver threw on `file`.
+ * A COMMIT that SQLite rolled back fails the driver's ROLLBACK after it, an AggregateError of both,
+ * and Pi wraps some failures in its own errors (`cause`): a failure of the extension anywhere in
+ * there is the error.
+ */
 function failure(file: string, error: unknown): unknown {
-	// A COMMIT that SQLite rolled back fails the driver's ROLLBACK after it: an AggregateError of both.
-	const cause = error instanceof AggregateError ? error.errors[0] : error;
-	const classified = classify(cause, () => status(file));
-	if (classified !== cause) return classified;
+	const classified = classifyWrapped(error, () => status(file));
+	if (classified !== error) return classified;
 	// Read-only: SQLite's own error, without the driver's failed ROLLBACK. The transaction is rolled
 	// back either way: by SQLite when COMMIT failed, by the driver's ROLLBACK when a statement failed
 	// before it.
+	const cause = error instanceof AggregateError ? error.errors[0] : error;
 	if (errcode(cause) === SQLITE_READONLY) return cause;
 	return error;
 }
