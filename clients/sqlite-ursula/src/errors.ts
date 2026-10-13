@@ -10,6 +10,8 @@ export const SQLITE_AUTH = 23;
 export const SQLITE_IOERR_AUTH = 7178;
 /** SQLITE_IOERR, the primary code (`errcode & 0xff`) of every I/O error: a read of a fenced file fails with one (SQLITE_IOERR_READ). */
 export const SQLITE_IOERR = 10;
+/** SQLITE_IOERR_READ: a read transaction refused on a fenced file, before it started. */
+export const SQLITE_IOERR_READ = 266;
 
 /** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
 export function errcode(error: unknown): number | undefined {
@@ -20,7 +22,8 @@ export function errcode(error: unknown): number | undefined {
 /**
  * A commit the VFS could not replicate: fenced (by a newer owner, because the stream was deleted and
  * recreated, or by another writer's append with a higher `Stream-Seq`), rejected, or with no answer in
- * time.
+ * time. Also a read the VFS refused once the file is fenced (`fenced` is `true`, and the message
+ * starts with `read refused`): the file no longer serves the state the new owner moved past.
  */
 export class UrsulaReplicationError extends Error {
 	readonly fenced: boolean;

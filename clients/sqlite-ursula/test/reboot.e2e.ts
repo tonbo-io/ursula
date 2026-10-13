@@ -1,15 +1,17 @@
 // The local files are a cache of the stream: attach trusts them only when the sidecar says they were
-// written in this boot, from this incarnation of the stream, into this db file and the local WAL
-// still holds the frames the sidecar counts on, and otherwise discards them and rebuilds from
-// snapshot + tail. A reboot is simulated by rewriting the sidecar's boot id to one this kernel never
-// had; the damage a power loss or a restored disk image could do is applied by hand.
+// written in this boot, from this incarnation of the stream, into this db file, and the local WAL
+// holds what the sidecar claims of it. Files it cannot check (another boot, another incarnation, an
+// older format) or whose WAL ends before the claim are discarded and rebuilt from snapshot + tail;
+// files that may hold data in no stream (a replaced db file, commits past the claim) are refused and
+// kept. A reboot is simulated by rewriting the sidecar's boot id to one this kernel never had; the
+// damage a power loss or a restored disk image could do is applied by hand.
 import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
-import { expectPast, integrity, openPlain, runChild, sidecarOffset, streamPath, ursulaUrl } from "./kit.ts";
+import { expectPast, integrity, moveAside, openPlain, runChild, sidecarOffset, streamPath, ursulaUrl } from "./kit.ts";
 
 // Row 2 is replaced 30 times with incompressible text, so the log outgrows the database and (with a
 // 1-byte minimum) snapshots are taken; row 3 lands after them.
@@ -69,8 +71,9 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	// SQLite cannot open it, so attach must discard it unread), the WAL cut mid-frame.
 	writeFileSync(file, Buffer.concat([Buffer.alloc(512), older.subarray(512)]));
 	truncateSync(`${file}-wal`, Math.floor(statSync(`${file}-wal`).size / 2));
-	// Never discarded under another process's feet.
-	expect(() => attach(file, url)).toThrow(/open by another process/);
+	// Never discarded under another process's feet: refused up front, so no failed attach is recorded.
+	expect(() => attach(file, url)).toThrow(/in_use: .* is open by another process/);
+	expect(() => status(file)).toThrow(/not_attached: [^:]* is not attached$/);
 	reader.kill("SIGKILL");
 	await new Promise((r) => reader.once("exit", r));
 	attach(file, url);
@@ -95,11 +98,15 @@ it("(b) in the same boot, a crashed owner's files are used as they are: no snaps
 });
 
 // Same boot, but the db file was replaced (here by an older image renamed over it): the WAL left
-// next to it belongs to the old file, so applying it would mix two databases.
-it("(c) a db file replaced behind the extension's back is discarded and rebuilt", async () => {
+// next to it belongs to the old file, so applying it would mix two databases, and the new file may
+// hold data that is in no stream. Refused and kept; moved aside, the path is rebuilt.
+it("(c) a db file replaced behind the extension's back is refused and kept", async () => {
 	const { url, file, older } = await crashedOwner();
 	writeFileSync(`${file}.restore`, older);
 	renameSync(`${file}.restore`, file);
+	expect(() => attach(file, url)).toThrow(/unreplicated_file: .* may hold data that is in no stream \(the db file is not the one the sidecar describes/);
+	expect(readFileSync(file).equals(older)).toBe(true);
+	moveAside(file);
 	attach(file, url);
 	expect(status(file).local).toBe("-1");
 	expect(rows(file)).toEqual(ACKED);
@@ -204,13 +211,16 @@ it("(f) a same-boot image whose WAL is behind its sidecar is rejected and rebuil
 });
 
 // The WAL frames reached the disk, the sidecar's last renames did not: the WAL holds commits past
-// the sidecar's claim. They cannot be told from commits of a connection outside the extension, which
-// are in no stream, so the files are rebuilt, from the stream that holds every acknowledged commit.
-it("(g) a same-boot image whose WAL is ahead of its sidecar is rebuilt from the stream", async () => {
+// the sidecar's claim. The sidecar advances before a commit's frames reach the WAL, so such commits
+// look like those of a connection outside the extension, which may be in no stream: refused and
+// kept. Moved aside, the path is rebuilt from the stream, which holds every acknowledged commit.
+it("(g) a same-boot image whose WAL is ahead of its sidecar is refused and kept", async () => {
 	const { url, file, sidecar } = await twoOwners();
 	writeFileSync(`${file}-ursula`, sidecar);
+	expect(() => attach(file, url)).toThrow(/unreplicated_file: .* may hold data that is in no stream \(its WAL holds commits past the sidecar's claim/);
+	moveAside(file);
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: "-1", installed: "-1" });
+	expect(status(file)).toMatchObject({ local: "-1" });
 	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
 });
 

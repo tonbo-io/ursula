@@ -524,15 +524,17 @@ fn snapshot_once(db: &Mutex<Db>, snapper: &Snapper, taken: &mut Taken) -> Result
     conn.query(c"SELECT count(*) FROM sqlite_schema")?;
     // The checkpoints above moved every WAL frame into the db file, a commit of a connection
     // outside the extension among them if there was one (`WalSeen`): the stream never got it, so
-    // its pages must not reach a snapshot.
+    // its pages must not reach a snapshot. A header that cannot be read (a writer keeps tearing
+    // it) shows nothing either way: no snapshot now.
     {
+        let header = conn.wal_index_header();
         let mut d = lock(db);
-        d.check_foreign(
-            conn.wal_index_header(),
-            &format!("snapshot at {offset} not published"),
-        );
+        d.check_foreign(header, &format!("snapshot at {offset} not published"));
         if d.damaged() {
             return Ok(Outcome::Damaged);
+        }
+        if header.is_none() {
+            return Ok(Outcome::Busy);
         }
     }
     drop(window);

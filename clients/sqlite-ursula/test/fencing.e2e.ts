@@ -1,7 +1,7 @@
 // Producer fencing: a new owner's claim (a new producer epoch) fences every earlier owner.
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import type { ConversationId } from "@earendil-works/pi-durable";
+import type { ConversationId, DocumentId } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
 import { attach, status, UrsulaReplicationError } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
@@ -122,13 +122,24 @@ it("Pi: a fenced commit rejects with UrsulaReplicationError", async () => {
 	);
 	expect(error).toBeInstanceOf(UrsulaReplicationError);
 	expect((error as UrsulaReplicationError).fenced).toBe(true);
-	// Fenced, the stale storage serves no reads either, and says so the same way.
-	const read = await stale.conversation(await stale.mintId<ConversationId>(), ctx).then(
-		() => undefined,
-		(e: unknown) => e,
-	);
-	expect(read).toBeInstanceOf(UrsulaReplicationError);
-	expect((read as UrsulaReplicationError).fenced).toBe(true);
+	// Fenced, the stale storage serves no reads either, and says so the same way, whether the read
+	// runs alone or inside a transaction (`document()`), which never starts: a read refused, not a
+	// commit lost.
+	const reads = [
+		await stale.conversation(await stale.mintId<ConversationId>(), ctx).then(
+			() => undefined,
+			(e: unknown) => e,
+		),
+		await stale.document(await stale.mintId<DocumentId>(), "current", ctx).then(
+			() => undefined,
+			(e: unknown) => e,
+		),
+	];
+	for (const read of reads) {
+		expect(read).toBeInstanceOf(UrsulaReplicationError);
+		expect((read as UrsulaReplicationError).fenced).toBe(true);
+		expect((read as UrsulaReplicationError).message).toMatch(/^read refused, the file is fenced: /);
+	}
 	const { harness } = await openHarness(owner); // the new owner commits
 	await harness.close(ctx);
 	await stale.close(ctx);

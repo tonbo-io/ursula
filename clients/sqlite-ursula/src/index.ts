@@ -45,15 +45,22 @@ export interface AttachOptions {
 /**
  * Catches `file` up from the stream (installing the stream's latest snapshot first when the file is
  * missing or behind it), claims the stream for this process (fencing every earlier owner)
- * and attaches the file. No connection to `file` may be open, and the process may hold no writable
- * descriptor on it outside the extension (such as a connection opened before the extension was
- * loaded), whose commits would never reach the stream. The process keeps a host lock on the file for
- * its lifetime. Returns the stream offset the file reflects (a {@link StreamOffset}). A file that has
- * a sidecar (`<file>-ursula`, written by its first attach) opens in a new process only once attached
- * there. After a failed attach, the file opens in this process only once an attach of it succeeds,
- * whether or not it has a sidecar. An attach refused up front (open connections, another thread
- * attaching it, another process holding it, a writable descriptor outside the extension) leaves the
- * file, and its binding, as they were.
+ * and attaches the file. No connection to `file` may be open, the process may hold no descriptor
+ * on it, its `-wal`, `-shm` or `-journal` outside the extension (such as a connection opened before
+ * the extension was loaded, a read-only one included), and no other process may have it open. The
+ * process keeps a host lock on the file for its lifetime. Returns the stream offset the file
+ * reflects (a {@link StreamOffset}). A file that has a sidecar (`<file>-ursula`, written by its first
+ * attach) opens in a new process only once attached there. After a failed attach, the file opens in
+ * this process only once an attach of it succeeds, whether or not it has a sidecar. An attach
+ * refused up front with `in_use` (open connections, another thread attaching it, another process
+ * attached to it or holding it open, a descriptor outside the extension) leaves the file, and its
+ * binding, as they were. A process that opens the file while the attach runs fails it instead.
+ *
+ * Local files that may hold data in no stream are refused and kept, never rebuilt over
+ * (`unreplicated_file`): a file never attached, one written by a connection outside the extension
+ * (before, during or after an attach, as far as the files show it), one replaced or changed behind
+ * the extension's back, or one a poison distrusted. The message names how to salvage the data, and
+ * moving the file and its `-wal` aside lets the path attach again.
  *
  * A failed attach throws an error whose message starts with `ursula_attach: <kind>: `, a stable
  * name of what failed (such as `invalid_name`, `unreachable`, `in_use`,
@@ -127,7 +134,7 @@ export interface AttachStatus {
 	readonly snapshot: StreamOffset;
 	/** Retention this owner advanced the stream to (`"-1"`: none yet). */
 	readonly retained: StreamOffset;
-	/** Stream offset of the local state attach started from; `"-1"` when it rebuilt the file from nothing (a fresh host, or local files it could not trust and discarded: another boot, a replaced file, a sidecar ahead of its WAL, another incarnation of the stream: deleted and recreated). */
+	/** Stream offset of the local state attach started from; `"-1"` when it rebuilt the file from nothing: a fresh host, or local files it discarded because it could not check them against the stream and they hold nothing the stream lacks (written in another boot, for another incarnation of the stream after it was deleted and recreated, by an older version, or a WAL that ends before the sidecar's claim, such as after a crash or a local failure right after a commit). Files that may hold data in no stream are refused instead (`unreplicated_file`), never discarded. */
 	readonly local: StreamOffset;
 	/** Offset of the snapshot attach installed (`"-1"`: none). */
 	readonly installed: StreamOffset;
@@ -152,8 +159,10 @@ export interface AttachStatus {
 	 * Why writes fail now, `null` while they go through. `kind` is a stable name of what failed (the
 	 * design doc lists them), `action` what to do: `retry` (nothing reached the stream, the file stays
 	 * usable), `reattach` (attach the file again, which replays the stream), `stop` (another owner
-	 * holds the stream) or `fix` (change the URL, the setup or the transaction). `message` is the
-	 * reason (`reason`'s text while poisoned). Absent with an extension before 0.7.5.
+	 * holds the stream) or `fix` (change the URL, the setup, the transaction or the files: after
+	 * `foreign_write` or `local_damage` every attach refuses the local files until they are moved
+	 * aside, and the message says how to salvage their data). `message` is the reason (`reason`'s text
+	 * while poisoned). Absent with an extension before 0.7.5.
 	 */
 	readonly error?: { readonly kind: string; readonly action: "retry" | "reattach" | "stop" | "fix"; readonly message: string } | null;
 }

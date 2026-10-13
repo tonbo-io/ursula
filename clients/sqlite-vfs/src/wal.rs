@@ -23,7 +23,7 @@ pub(crate) fn page_at(off: i64) -> bool {
 }
 
 /// The same sizes, as buffer lengths.
-const WAL_HDR_LEN: usize = 32;
+pub(crate) const WAL_HDR_LEN: usize = 32;
 pub(crate) const FRAME_HDR_LEN: usize = 24;
 pub(crate) const FRAME_LEN: usize = FRAME_HDR_LEN + PAGE;
 const FIRST_PAGE_AT: u64 = (WAL_HDR_LEN + FRAME_HDR_LEN) as u64;
@@ -53,7 +53,9 @@ pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
 /// What a sidecar needs of the local WAL, so attach can check it against the files instead of
 /// inferring it: the WAL's generation (the salts of its header, which SQLite changes at every
 /// restart) and the frame number of the last acknowledged commit frame. Frame 0: the WAL holds no
-/// commit; the db file alone holds the state, fsynced before the sidecar was written.
+/// commit, and the db file alone holds the state, fsynced before the sidecar was written. For a
+/// frame 0 claim the salts field holds the db file's fingerprint instead (`local::db_fingerprint`,
+/// 0 when none was recorded: a sidecar an attach in progress wrote, or an older extension's).
 ///
 /// Why that suffices for any crash-consistent image of the files (a process crash, or a disk
 /// snapshot restored without a reboot): SQLite starts a WAL generation only once every frame of
@@ -63,30 +65,75 @@ pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
 /// offset. Any page of the image that is newer (backfilled from a later commit) belongs to a
 /// commit after the offset, which attach replays.
 ///
-/// The claimed frame is the WAL's last commit frame exactly: the sidecar advances at the end of
-/// every write transaction of the VFS, and nothing else of the VFS writes WAL frames. A commit
-/// frame past it is a commit the sidecar never saw: one whose sidecar update a crash cut off (in
-/// the stream, past the sidecar's offset), or a commit of a connection outside the extension (in
-/// no stream, and a checkpoint may have moved its pages into the db file already). Which, the
-/// files cannot tell, so they are not trusted and attach rebuilds them.
-#[derive(Clone, Copy)]
+/// The sidecar advances at the commit point, before any frame of the commit reaches the local WAL
+/// (`vfs::commit`), and nothing else of the VFS writes WAL frames but the copies of a commit frame
+/// SQLite writes after it to pad a commit to a sector (`WalMatch::Covered`). So a commit frame past
+/// the claim is no commit of the VFS: it came from a connection outside the extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WalClaim {
     pub(crate) salts: u64,
     pub(crate) frame: u32,
 }
 
+/// What the local WAL holds, measured against a sidecar's claim ([`WalClaim::check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalMatch {
+    /// The claimed generation, its last commit at the claimed frame, or past it only by copies of
+    /// the claimed commit frame (same page, same database size, same bytes), which SQLite writes to
+    /// pad a commit to a sector when the volume does not promise power-safe overwrites; for a
+    /// frame 0 claim, no commit at all. `end` is the last commit frame.
+    Covered { end: u32 },
+    /// The claimed generation, ending before the claimed commit: frames the sidecar counted on never
+    /// reached the WAL (a crash between the sidecar and the commit's WAL writes, or a disk image
+    /// whose sidecar reached the disk first). Every frame it holds is this VFS's own.
+    Behind,
+    /// A commit frame past the claim that is no padding copy: another writer's.
+    PastClaim { last: u32 },
+    /// Another generation, or no WAL, under a claim of frames: the WAL was restarted, truncated or
+    /// deleted by something other than this VFS, which writes a frame 0 claim before it truncates.
+    OtherGeneration,
+    /// Commits under a frame 0 claim: written after the VFS last emptied the WAL.
+    CommitsUnderNone { last: u32 },
+}
+
 impl WalClaim {
     pub(crate) const NONE: WalClaim = WalClaim { salts: 0, frame: 0 };
 
-    /// The local WAL, as SQLite's recovery will read it, holds what the claim says: this
-    /// generation with its last commit at the claimed frame, or for `NONE` no commit at all (frames
-    /// left over from before the db file was synced would roll pages back).
-    pub(crate) fn covered(self, path: &str) -> bool {
-        let (salts, last) =
-            wal_recover(&format!("{path}-wal")).map_or((0, 0), |w| (w.salts, w.last));
-        match self.frame {
-            0 => last == 0,
-            frame => salts == self.salts && last == frame,
+    /// A frame 0 claim with the db file's `fingerprint` (`local::db_fingerprint`).
+    pub(crate) fn none_with(fingerprint: u64) -> WalClaim {
+        WalClaim {
+            salts: fingerprint,
+            frame: 0,
+        }
+    }
+
+    /// What the local WAL of the db file at `path`, read the way SQLite's recovery reads it, holds
+    /// against this claim.
+    pub(crate) fn check(self, path: &str) -> WalMatch {
+        let scan = wal_recover(&format!("{path}-wal"));
+        let last = scan.as_ref().map_or(0, |w| w.last);
+        if self.frame == 0 {
+            return if last == 0 {
+                WalMatch::Covered { end: 0 }
+            } else {
+                WalMatch::CommitsUnderNone { last }
+            };
+        }
+        let Some(scan) = scan.filter(|w| w.salts == self.salts) else {
+            return WalMatch::OtherGeneration;
+        };
+        if last < self.frame {
+            return WalMatch::Behind;
+        }
+        // Frames are numbered from 1: the claimed commit frame, and those after it to the last.
+        let claimed = scan.frames.get(self.frame.saturating_sub(1) as usize);
+        let past = scan
+            .frames
+            .get(self.frame as usize..last as usize)
+            .unwrap_or_default();
+        match claimed {
+            Some(commit) if past.iter().all(|f| f == commit) => WalMatch::Covered { end: last },
+            _ => WalMatch::PastClaim { last },
         }
     }
 }
@@ -102,6 +149,17 @@ struct WalScan {
     pub(crate) size: u32,
     /// The page number of each frame up to `last`, in order.
     pub(crate) pages: Vec<u32>,
+    /// What each frame up to `last` holds, in order: a padding copy of a commit frame holds the
+    /// same (`WalClaim::check`).
+    pub(crate) frames: Vec<FrameId>,
+}
+
+/// A WAL frame's content, as far as telling a padding copy of a commit frame from it goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameId {
+    pgno: u32,
+    commit_size: u32,
+    page_crc: u32,
 }
 
 /// A WAL frame's header.
@@ -157,7 +215,7 @@ fn wal_recover(path: &str) -> Option<WalScan> {
     if s != (be32(&hdr, 24)?, be32(&hdr, 28)?) {
         return None;
     }
-    let (mut last, mut size, mut pages) = (0, 0, Vec::new());
+    let (mut last, mut size, mut pages, mut frames) = (0, 0, Vec::new(), Vec::new());
     let mut f = vec![0u8; FRAME_LEN];
     while r.read_exact(&mut f).is_ok() {
         let Some((h, page)) = f.split_first_chunk::<FRAME_HDR_LEN>() else {
@@ -177,17 +235,24 @@ fn wal_recover(path: &str) -> Option<WalScan> {
             break;
         }
         pages.push(h.pgno);
+        frames.push(FrameId {
+            pgno: h.pgno,
+            commit_size: h.commit_size,
+            page_crc: crc32c::crc32c(page),
+        });
         if h.commit_size != 0 {
             last = u32::try_from(pages.len()).ok()?;
             size = h.commit_size;
         }
     }
     pages.truncate(last as usize);
+    frames.truncate(last as usize);
     Some(WalScan {
         salts: u64::from_be_bytes(*salts),
         last,
         size,
         pages,
+        frames,
     })
 }
 

@@ -300,7 +300,7 @@ mod tests {
             seen: 4,
             found: 6,
         }));
-        assert!(error(&d).starts_with(r#"{"kind":"foreign_write","action":"reattach","#));
+        assert!(error(&d).starts_with(r#"{"kind":"foreign_write","action":"fix","#));
     }
 
     // A write refused before it reached the stream shows in `writes_refused`, with its kind and
