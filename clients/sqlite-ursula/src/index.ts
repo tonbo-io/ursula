@@ -48,15 +48,20 @@ export interface AttachOptions {
  * and attaches the file. No connection to `file` may be open, and the process may hold no
  * descriptor on it, its `-wal`, `-shm` or `-journal` outside the extension (such as a connection
  * opened before the extension was loaded, a read-only one included), whose commits would never
- * reach the stream. The process keeps a host lock on the file for its lifetime. Returns the stream
- * offset the file reflects (a {@link StreamOffset}). A file that has a sidecar (`<file>-ursula`,
- * written by its first attach) opens in a new process only once attached there. After a failed
- * attach, the file opens in this process only once an attach of it succeeds, whether or not it has
- * a sidecar, and a failed attach that wrote nothing into the file removes the sidecar it created. An
- * attach that fails with `in_use` (open connections, another thread attaching it, another process
- * attached to it or holding it open, a descriptor outside the extension) leaves the file, and its
- * binding, as they were. Writes to the file outside the extension after the attach are not
- * detected: never make them.
+ * reach the stream. That check reads the process's open files on Linux with `/proc` mounted and on
+ * macOS: elsewhere, or when the file's directory cannot be resolved, it does not run, and it misses
+ * a descriptor opened through another hard link or mount of the file. The process keeps a host
+ * lock on the file for its lifetime. Returns the stream offset the file reflects (a
+ * {@link StreamOffset}). A file that has a sidecar (`<file>-ursula`, written by its first attach)
+ * opens in a new process only once attached there. After a failed attach, the file opens in this
+ * process only once an attach of it succeeds, whether or not it has a sidecar, and a failed attach
+ * that wrote nothing into the file removes the sidecar it created. An attach refused because of the
+ * file itself before it changed anything leaves the file, and its binding, as they were, and is no
+ * failed attach: `in_use` (open connections, another thread attaching it, another process attached
+ * to it or holding it open, a descriptor outside the extension), `unreplicated_file` (data but no
+ * sidecar: the file still opens, so its rows can be copied into a newly attached file) and
+ * `other_stream`. Writes to the file outside the extension after the attach are not detected: never
+ * make them.
  *
  * A failed attach throws an error whose message starts with `ursula_attach: <kind>: `, a stable
  * name of what failed (such as `invalid_name`, `unreachable`, `in_use`,

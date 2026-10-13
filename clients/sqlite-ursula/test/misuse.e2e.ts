@@ -2,7 +2,7 @@
 // stable kind (design doc §1, errors): `<function>: <kind>: <message>` for a SQL function's error,
 // and `error.kind` in `ursula_status`. These tests use node:sqlite and the extension directly.
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, openSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, statSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { freshFile } from "./helpers.ts";
@@ -199,8 +199,9 @@ it("a failed attach names the server's reason, refuses opens, and blocks no late
 
 // A failed attach that wrote nothing into the db file removes the sidecar it created, so nothing of
 // it vouches for data written to the path later: here the claim of a new stream is refused. One that
-// replayed pages into the file keeps it, and the next attach resumes from there (a refused attach is
-// tried again later). Neither touches the db file, its -wal or -shm.
+// replayed pages into the file keeps it, so the next attach takes the file for the stream's cache
+// instead of refusing it as never replicated. Removing the sidecar never touches the db file, its
+// -wal or -shm.
 it("a failed attach removes the sidecar it created when it wrote nothing", async () => {
 	const path = streamPath();
 	const file = freshFile();
@@ -220,17 +221,71 @@ it("a failed attach removes the sidecar it created when it wrote nothing", async
 	expect(tablesOf(ursulaUrl() + path)).toEqual(["t"]);
 });
 
-// A database that was never replicated is refused, never replicated over, and its kind says so.
-it("a file with data and no sidecar is an unreplicated file", () => {
+// A database that was never replicated is refused, never replicated over, and its kind says so. The
+// refusal changes nothing and records no failed attach, so the remedy the error names works in the
+// same process: the file still opens, and its rows go into a newly attached file.
+it("a file with data and no sidecar is an unreplicated file, whose rows copy into a newly attached one", () => {
 	const file = freshFile();
 	const plain = new DatabaseSync(file);
-	plain.exec("CREATE TABLE mine(x)");
+	plain.exec("CREATE TABLE mine(x); INSERT INTO mine VALUES (1), (2), (3)");
 	plain.close();
 	const e = failure(() => attach(file, ursulaUrl() + streamPath()));
 	expect(e.message).toMatch(/^ursula_attach: unreplicated_file: .* has data but no readable sidecar .*it was never replicated/);
-	const kept = new DatabaseSync(`file:${file}?vfs=unix&mode=ro`);
-	expect(tables(kept)).toEqual(["mine"]);
+	expect(failure(() => status(file)).message).toMatch(/^ursula_status: not_attached: [^:]* is not attached$/);
+	const url = ursulaUrl() + streamPath();
+	const copy = freshFile();
+	attach(copy, url);
+	const db = open(copy);
+	db.prepare("ATTACH DATABASE ? AS old").run(file);
+	db.exec("CREATE TABLE mine(x); INSERT INTO mine SELECT x FROM old.mine; DETACH DATABASE old");
+	db.close();
+	const kept = new DatabaseSync(file);
+	expect(kept.prepare("SELECT x FROM mine ORDER BY x").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
 	kept.close();
+	expect(existsSync(`${file}-ursula`)).toBe(false);
+	const replica = freshFile();
+	attach(replica, url);
+	const copied = open(replica);
+	expect(copied.prepare("SELECT x FROM mine ORDER BY x").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+	copied.close();
+});
+
+// Another process holding the file fails an attach at the lock attach takes before it rewrites the
+// file. Met before the attach changed anything, that changes nothing (reboot.e2e.ts). Met after it
+// changed the files (here the -wal, -shm and sidecar of an empty file are reset first), it is a
+// failed attach: the path refuses opens until an attach succeeds.
+it("another process met after the attach changed the files fails the attach", async () => {
+	const url = ursulaUrl() + streamPath();
+	const owner = freshFile();
+	attach(owner, url);
+	const db = open(owner);
+	db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+	db.close();
+	const file = freshFile();
+	writeFileSync(file, "");
+	// A plain connection in another process (no extension) holds a read transaction on it.
+	const holder = spawn(
+		process.execPath,
+		[
+			"-e",
+			`const { DatabaseSync } = require("node:sqlite"); const db = new DatabaseSync(${JSON.stringify(file)}); db.exec("BEGIN"); db.prepare("SELECT count(*) FROM sqlite_schema").get(); console.log("open"); setInterval(() => {}, 1000);`,
+		],
+		{ stdio: ["ignore", "pipe", "inherit"] },
+	);
+	try {
+		await new Promise<void>((res) => holder.stdout?.once("data", () => res()));
+		expect(failure(() => attach(file, url)).message).toMatch(/^ursula_attach: in_use: .* is open by another process/);
+		expect(failure(() => status(file)).message).toMatch(/^ursula_status: attach_failed: in_use: .* its last attach failed/);
+		expect(failure(() => new DatabaseSync(file)).message).toMatch(/unable to open database file/);
+		expect(existsSync(`${file}-ursula`)).toBe(false);
+	} finally {
+		holder.kill("SIGKILL");
+		await new Promise((r) => holder.once("exit", r));
+	}
+	attach(file, url);
+	const again = open(file);
+	expect(again.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
+	again.close();
 });
 
 it("an endpoint that does not answer is unreachable", () => {

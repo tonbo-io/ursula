@@ -14,7 +14,9 @@
 //!   attach of it has succeeded in this process: before that, after a failed attach, or in a
 //!   process that never attached it, opening it fails (SQLITE_CANTOPEN), so it is never written
 //!   unreplicated. A file without a sidecar passes through to "unix", unless its last attach in this
-//!   process failed. Attach also refuses, changing nothing, while the process holds the db file,
+//!   process failed (an attach refused for the file as it stands before it changed anything,
+//!   `in_use`, `unreplicated_file` or `other_stream`, is no failed attach). Attach also refuses,
+//!   changing nothing, while the process holds the db file,
 //!   its -wal, -shm or -journal open outside this VFS (a SQLite connection opened before the
 //!   extension was loaded or through another VFS, read-only ones included), whose commits would
 //!   never reach the stream. Writes outside the extension after an attach are not detected (the

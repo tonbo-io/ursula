@@ -5,7 +5,6 @@
 // had; the damage a power loss or a restored disk image could do is applied by hand.
 import { spawn } from "node:child_process";
 import { readFileSync, renameSync, statSync, truncateSync, writeFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import { expect, it } from "vitest";
 import { attach, status } from "../src/index.ts";
 import { freshFile } from "./helpers.ts";
@@ -71,7 +70,7 @@ it("(a) after a reboot, files a power loss damaged are discarded and rebuilt fro
 	truncateSync(`${file}-wal`, Math.floor(statSync(`${file}-wal`).size / 2));
 	// Never discarded under another process's feet.
 	expect(() => attach(file, url)).toThrow(/^ursula_attach: in_use: .* is open by another process/);
-	// An attach that fails with in_use changes nothing: no failed attach is recorded.
+	// Refused at the lock taken before the discard, the attach changed nothing: no failed attach.
 	expect(() => status(file)).toThrow(/not_attached: [^:]* is not attached$/);
 	reader.kill("SIGKILL");
 	await new Promise((r) => reader.once("exit", r));
@@ -115,10 +114,7 @@ it("(d) a file with content but no sidecar is refused, not discarded", () => {
 	db.exec("CREATE TABLE mine(x)");
 	db.close();
 	expect(() => attach(file, ursulaUrl() + streamPath())).toThrow(/no readable sidecar/);
-	// The path refuses opens through the extension after the failed attach, so its data is read
-	// outside it.
-	expect(() => openPlain(file)).toThrow(/unable to open database file/);
-	const kept = new DatabaseSync(`file:${file}?vfs=unix&mode=ro`);
+	const kept = openPlain(file);
 	expect(kept.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'mine'").get()).toEqual({ n: 1 });
 	kept.close();
 });

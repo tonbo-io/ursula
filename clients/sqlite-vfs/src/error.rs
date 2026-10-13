@@ -201,6 +201,17 @@ pub(crate) enum Error {
         url: String,
         refusal: WriteRefusal,
     },
+    /// An attach failed after its claim, which may be in the stream and fence every earlier owner,
+    /// with an error whose kind says that nothing reached the stream (`retry`): an unknown outcome
+    /// instead (`attach::Progress::failure`).
+    #[error(
+        "{source}, after the attach's claim, which may be in the stream and fence every earlier \
+         owner: attach again"
+    )]
+    AfterClaim {
+        #[source]
+        source: Box<Error>,
+    },
     #[error("{url} reports no Stream-Incarnation (an older server?); refusing to attach")]
     NoIncarnation { url: String },
     #[error("{op} {url}: no Stream-Next-Offset")]
@@ -388,6 +399,10 @@ pub(crate) enum ErrorKind {
     StreamState,
     /// The file was never attached in this process.
     NotAttached,
+    /// The local file system refuses an operation on the local files as it is set up: no
+    /// permission, a read-only file system, a missing or misnamed directory, no space left.
+    /// Attaching again fails the same way until the setup changes.
+    LocalSetup,
     /// No answer from the endpoint: it did not resolve, refused or dropped the connection, or
     /// timed out, or every attempt of a write failed before it went out.
     Unreachable,
@@ -403,12 +418,13 @@ pub(crate) enum ErrorKind {
     /// An append's outcome is unknown: no answer within the retry budget, or an answer that does
     /// not prove that nothing was applied (a 5xx without a vouched marker, a `307`, a `403` that is
     /// neither the fence nor vouched, a `401` after an attempt that may have reached the stream).
-    /// The stream may or may not hold it.
+    /// The stream may or may not hold it. So is an attach that failed after its claim
+    /// (`Error::AfterClaim`).
     OutcomeUnknown,
     /// The local files may hold pages this process did not write there (a lost write-back, a failed
     /// fsync): nothing read from them may reach the stream.
     LocalDamage,
-    /// A local operation failed (an I/O error on the local files).
+    /// A local operation failed (an I/O error on the local files that is not `LocalSetup`).
     LocalState,
     /// The path's last attach in this process failed: it opens again once an attach succeeds.
     AttachFailed,
@@ -464,6 +480,7 @@ impl ErrorKind {
             ErrorKind::Unsupported => "unsupported",
             ErrorKind::StreamState => "stream_state",
             ErrorKind::NotAttached => "not_attached",
+            ErrorKind::LocalSetup => "local_setup",
             ErrorKind::Unreachable => "unreachable",
             ErrorKind::Unavailable => "unavailable",
             ErrorKind::Unauthorized => "unauthorized",
@@ -491,7 +508,8 @@ impl ErrorKind {
             | ErrorKind::TooLarge
             | ErrorKind::Unsupported
             | ErrorKind::StreamState
-            | ErrorKind::NotAttached => Action::Fix,
+            | ErrorKind::NotAttached
+            | ErrorKind::LocalSetup => Action::Fix,
             ErrorKind::Unreachable
             | ErrorKind::Unavailable
             | ErrorKind::Unauthorized
@@ -503,6 +521,17 @@ impl ErrorKind {
             ErrorKind::Fenced => Action::Stop,
             ErrorKind::AttachFailed => return None,
         })
+    }
+
+    /// This kind for a failure after something may have reached the stream (the reason of a
+    /// poison, an attach past its claim): `retry` says that nothing did, so a kind with that action
+    /// is an unknown outcome there.
+    pub(crate) fn once_reached(self) -> ErrorKind {
+        if self.action() == Some(Action::Retry) {
+            ErrorKind::OutcomeUnknown
+        } else {
+            self
+        }
     }
 }
 
@@ -791,10 +820,7 @@ impl Error {
     /// read that the endpoint put off or never answered) is an unknown outcome here: the commit
     /// failed, and only an attach tells what the stream holds.
     pub(crate) fn poison_kind(&self) -> ErrorKind {
-        match self.kind() {
-            kind if kind.action() == Some(Action::Retry) => ErrorKind::OutcomeUnknown,
-            kind => kind,
-        }
+        self.kind().once_reached()
     }
 
     /// What kind of failure this is ([`ErrorKind`]).
@@ -812,6 +838,7 @@ impl Error {
             Error::Unauthorized { op: "append", .. } => ErrorKind::OutcomeUnknown,
             Error::Unauthorized { .. } => ErrorKind::Unauthorized,
             Error::Refused { refusal, .. } => refusal.error_kind(),
+            Error::AfterClaim { source } => source.kind().once_reached(),
             Error::PutUnknown { last, .. } => match last {
                 Attempt::Transport(source) => transport_kind(source),
                 Attempt::Status { .. } | Attempt::Deferred { .. } => ErrorKind::Unavailable,
@@ -834,8 +861,8 @@ impl Error {
             Error::NotAttached { .. } => ErrorKind::AttachFailed,
             Error::NoSidecar { .. } => ErrorKind::UnreplicatedFile,
             Error::OtherStream { .. } => ErrorKind::OtherStream,
-            Error::Io { .. }
-            | Error::FullPathname { .. }
+            Error::Io { source, .. } => io_kind(source),
+            Error::FullPathname { .. }
             | Error::PostAck { .. }
             | Error::NotPublished { .. }
             | Error::LocalWalWrite(_) => ErrorKind::LocalState,
@@ -874,6 +901,26 @@ impl Error {
             | Error::MissingRoutine(_)
             | Error::EncodeFrame(_) => ErrorKind::Internal,
         }
+    }
+}
+
+/// The kind of a failed operation on a local file: one the file system refuses as it is set up (no
+/// permission, a read-only file system, a missing or misnamed directory, no space left) fails the
+/// same way until the setup changes. Any other (an I/O error, an interrupted call) is
+/// `local_state`.
+fn io_kind(e: &std::io::Error) -> ErrorKind {
+    use std::io::ErrorKind as Io;
+    match e.kind() {
+        Io::PermissionDenied
+        | Io::ReadOnlyFilesystem
+        | Io::NotFound
+        | Io::NotADirectory
+        | Io::IsADirectory
+        | Io::InvalidFilename
+        | Io::StorageFull
+        | Io::QuotaExceeded
+        | Io::FileTooLarge => ErrorKind::LocalSetup,
+        _ => ErrorKind::LocalState,
     }
 }
 
@@ -1247,6 +1294,53 @@ mod tests {
                 "local_state",
                 Some("reattach"),
             ),
+            // A local file the setup refuses fails the same way until the setup changes; any other
+            // I/O error does not.
+            (
+                Error::Io {
+                    op: "open",
+                    path: "/ro/app.db-ursula.lock".into(),
+                    source: std::io::Error::from_raw_os_error(libc::EACCES),
+                },
+                "local_setup",
+                Some("fix"),
+            ),
+            (
+                Error::Io {
+                    op: "write sidecar",
+                    path: "/data/app.db-ursula".into(),
+                    source: std::io::Error::from_raw_os_error(libc::EROFS),
+                },
+                "local_setup",
+                Some("fix"),
+            ),
+            (
+                Error::Io {
+                    op: "write sidecar",
+                    path: "/data/app.db-ursula".into(),
+                    source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+                },
+                "local_setup",
+                Some("fix"),
+            ),
+            (
+                Error::Io {
+                    op: "fsync",
+                    path: "/data/app.db".into(),
+                    source: std::io::Error::from_raw_os_error(libc::EIO),
+                },
+                "local_state",
+                Some("reattach"),
+            ),
+            // Past the attach's claim, which may be in the stream, nothing promises that nothing
+            // reached it.
+            (
+                Error::AfterClaim {
+                    source: Box::new(status("read", 503)),
+                },
+                "outcome_unknown",
+                Some("reattach"),
+            ),
             (
                 Error::NotAttached {
                     path: "/data/app.db".into(),
@@ -1285,6 +1379,22 @@ mod tests {
         // outcome there.
         assert_eq!(status("read", 503).poison_kind(), ErrorKind::OutcomeUnknown);
         assert_eq!(Error::LeavesWal.poison_kind(), ErrorKind::Unsupported);
+        // An attach that failed past its claim says so, and is no refusal that applied nothing.
+        let after = Error::AfterClaim {
+            source: Box::new(Error::Refused {
+                op: "read",
+                url: url(),
+                refusal: WriteRefusal::PaymentRequired {
+                    body: String::new(),
+                },
+            }),
+        };
+        assert_eq!(after.kind(), ErrorKind::OutcomeUnknown);
+        assert_eq!(after.refusal(), None);
+        assert!(after.to_string().ends_with(
+            ", after the attach's claim, which may be in the stream and fence every earlier owner: \
+             attach again"
+        ));
         // Nothing tells the caller to delete files that may hold the only copy of data: each such
         // refusal names the salvage path, or moving the files aside.
         let salvage = [

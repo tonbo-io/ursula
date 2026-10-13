@@ -461,9 +461,10 @@ pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, Error> {
 /// Why `x_open` refuses the main db `path` that has no binding. After a failed attach of it in
 /// this process, always: the application meant it to be replicated, and passed through to "unix"
 /// its commits would never reach the stream (and its files may hold anything between their old
-/// state and the stream's). Otherwise a sidecar next to it makes it the cache of a stream (in a
-/// process that never attached it), and a path without one passes through. No WAL open can follow
-/// a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
+/// state and the stream's). An attach refused for the file as it stands records none
+/// (`attach::refuses_the_file`). Otherwise a sidecar next to it makes it the cache of a stream (in
+/// a process that never attached it), and a path without one passes through. No WAL open can
+/// follow a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
 pub(crate) fn refused(reg: &Registry, path: &str) -> Option<Refusal> {
     if let Some(why) = reg.failed.get(path) {
         return Some(Refusal::AttachFailed(why.clone()));
