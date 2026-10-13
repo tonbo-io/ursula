@@ -105,6 +105,18 @@ pub struct UploadLimitsSpec {
     pub min_bytes_per_sec: u64,
 }
 
+impl UploadLimitsSpec {
+    /// The smallest budget that holds a body at `max_request_body_bytes`
+    /// beside the headroom, both counted in the whole KiB the budget is
+    /// reserved in, as [`UploadLimits::try_from`] counts them.
+    pub fn smallest_budget_bytes(&self) -> u64 {
+        let limit = u64::try_from(self.max_request_body_bytes).unwrap_or(u64::MAX);
+        u64::from(units(limit))
+            .saturating_add(u64::from(units(self.small_body_headroom_bytes)))
+            .saturating_mul(UNIT_BYTES)
+    }
+}
+
 impl Default for UploadLimitsSpec {
     fn default() -> Self {
         Self {
@@ -411,8 +423,8 @@ impl BodyPermit {
         self.bytes
     }
 
-    /// Shrinks the permit to `bytes`, the size of the body as buffered, when
-    /// that is less than it covers.
+    /// Shrinks the permit to `bytes`, the memory the body holds once it is
+    /// buffered, when that is less than it covers.
     pub(crate) fn settle(&mut self, bytes: u64) {
         if bytes >= self.bytes {
             return;

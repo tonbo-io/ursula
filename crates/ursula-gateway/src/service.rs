@@ -42,7 +42,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let installed_access_control = access_control(&args)?;
     let config = gateway_config(&args)?;
-    warn_on_budget_over_memory(config.uploads.budget_bytes());
+    warn_on_budget_over_memory(&config.uploads);
     if config.uploads.stall_timeout() <= SQLITE_COMMIT_TIMEOUT {
         tracing::warn!(
             stall_timeout_secs = config.uploads.stall_timeout().as_secs(),
@@ -163,23 +163,66 @@ fn body_budget_bytes(args: &GatewayArgs) -> u64 {
         return budget;
     }
     let default = UploadLimitsSpec::default().budget_bytes;
-    let needed = u64::try_from(args.max_request_body_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(args.small_body_headroom_bytes);
+    let needed = UploadLimitsSpec {
+        max_request_body_bytes: args.max_request_body_bytes,
+        small_body_headroom_bytes: args.small_body_headroom_bytes,
+        ..UploadLimitsSpec::default()
+    }
+    .smallest_budget_bytes();
     if needed > default {
         tracing::warn!(
             budget_bytes = needed,
-            "--body-budget-bytes is unset; the body budget grows to hold a body at --max-request-body-bytes. Set --body-budget-bytes to a size the process's memory can hold"
+            "--body-budget-bytes is unset; the body budget grows to hold a body at \
+             --max-request-body-bytes beside --small-body-headroom-bytes, and the gateway needs \
+             about twice the budget in memory. No budget below that can be set: lower \
+             --max-request-body-bytes or give the gateway more memory"
         );
     }
     default.max(needed)
 }
 
-/// Where a cgroup states the memory limit of the process: v2, then v1.
-const CGROUP_MEMORY_LIMITS: [&str; 2] = [
-    "/sys/fs/cgroup/memory.max",
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-];
+/// The cgroup v2 and v1 hierarchies, where `/proc/self/cgroup` paths start.
+const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+const CGROUP_V1_MEMORY_ROOT: &str = "/sys/fs/cgroup/memory";
+
+/// The files that may state a memory limit of the process, from the
+/// contents of `/proc/self/cgroup`: those of its cgroup and of each of its
+/// ancestors, in v2 (`0::<path>`) and in the v1 memory controller
+/// (`<id>:memory:<path>`), the roots included. Inside a container without a
+/// cgroup namespace, the process's path does not exist under the container's
+/// mount, whose root then states the container's limit.
+fn cgroup_memory_limit_files(proc_self_cgroup: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for line in proc_self_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (root, file) = if controllers.is_empty() {
+            (CGROUP_V2_ROOT, "memory.max")
+        } else if controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+        {
+            (CGROUP_V1_MEMORY_ROOT, "memory.limit_in_bytes")
+        } else {
+            continue;
+        };
+        let mut dir = Some(std::path::Path::new(path));
+        while let Some(at) = dir {
+            let relative = at.strip_prefix("/").unwrap_or(at);
+            files.push(std::path::Path::new(root).join(relative).join(file));
+            dir = at.parent();
+        }
+    }
+    if files.is_empty() {
+        files.push(std::path::Path::new(CGROUP_V2_ROOT).join("memory.max"));
+        files.push(std::path::Path::new(CGROUP_V1_MEMORY_ROOT).join("memory.limit_in_bytes"));
+    }
+    files
+}
 
 /// A cgroup memory limit file's contents as bytes: `None` for `max` (v2) or
 /// an unset v1 limit, which the kernel reports as a value near `i64::MAX`.
@@ -188,22 +231,35 @@ fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
     (limit < 1 << 60).then_some(limit)
 }
 
-/// Warns when the body budget exceeds half of the process's cgroup memory
-/// limit, the first limit file that exists and states one. A budget that
-/// size leaves too little for everything else the gateway holds.
-fn warn_on_budget_over_memory(budget_bytes: u64) {
-    let Some(limit) = CGROUP_MEMORY_LIMITS
+/// The process's cgroup memory limit: the smallest that its cgroup or an
+/// ancestor states ([`cgroup_memory_limit_files`]), or `None` where none
+/// does or the files cannot be read.
+fn cgroup_memory_limit() -> Option<u64> {
+    let proc_self_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    cgroup_memory_limit_files(&proc_self_cgroup)
         .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .and_then(|contents| parse_cgroup_memory_limit(&contents))
-    else {
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .filter_map(|contents| parse_cgroup_memory_limit(&contents))
+        .min()
+}
+
+/// Warns when the body budget exceeds half of the process's cgroup memory
+/// limit. A budget that size leaves too little for everything else the
+/// gateway holds.
+fn warn_on_budget_over_memory(limits: &UploadLimits) {
+    let Some(limit) = cgroup_memory_limit() else {
         return;
     };
+    let budget_bytes = limits.budget_bytes();
     if budget_bytes > limit / 2 {
         tracing::warn!(
             budget_bytes,
             memory_limit_bytes = limit,
-            "the request body budget exceeds half of the cgroup memory limit; set --body-budget-bytes lower or give the gateway more memory"
+            max_request_body_bytes = limits.max_request_body_bytes(),
+            "the request body budget exceeds half of the cgroup memory limit. Give the gateway \
+             about twice the budget in memory, or lower the budget, and with it \
+             --max-request-body-bytes: the budget cannot go below the limit plus \
+             --small-body-headroom-bytes"
         );
     }
 }
@@ -410,6 +466,7 @@ mod tests {
 
     use super::GatewayArgs;
     use super::access_control;
+    use super::cgroup_memory_limit_files;
     use super::gateway_config;
     use super::parse_cgroup_memory_limit;
     use crate::Gateway;
@@ -455,6 +512,33 @@ mod tests {
         ));
     }
 
+    // The memory limit is looked up along the process's own cgroup path and
+    // its ancestors, v2 and the v1 memory controller, as a systemd unit's
+    // `MemoryMax=` sets it below the root.
+    #[test]
+    fn cgroup_memory_limit_files_follow_the_process_cgroup_path() {
+        let files = |contents: &str| -> Vec<String> {
+            cgroup_memory_limit_files(contents)
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect()
+        };
+        assert_eq!(files("0::/system.slice/ursulagw.service\n"), [
+            "/sys/fs/cgroup/system.slice/ursulagw.service/memory.max",
+            "/sys/fs/cgroup/system.slice/memory.max",
+            "/sys/fs/cgroup/memory.max",
+        ]);
+        assert_eq!(files("12:cpu,cpuacct:/pod\n4:memory:/pod/gw\n"), [
+            "/sys/fs/cgroup/memory/pod/gw/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/pod/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ]);
+        assert_eq!(files(""), [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ]);
+    }
+
     #[test]
     fn a_cgroup_memory_limit_parses_and_an_unset_one_is_none() {
         assert_eq!(parse_cgroup_memory_limit("536870912\n"), Some(512 << 20));
@@ -481,6 +565,20 @@ mod tests {
                 .spec()
                 .budget_bytes,
             (1 << 30) + (32 << 20)
+        );
+        // Grown in whole KiB, so a limit and a headroom that are not whole
+        // KiB still start.
+        assert_eq!(
+            parsed(&[
+                "--max-request-body-bytes",
+                "314572801",
+                "--small-body-headroom-bytes",
+                "33554433"
+            ])
+            .unwrap()
+            .spec()
+            .budget_bytes,
+            (307_201 + 32_769) * 1024
         );
         // A budget set too small for the limit is refused.
         assert_eq!(

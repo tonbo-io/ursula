@@ -40,8 +40,8 @@
 //! by count and bytes too ([`admission::TenantLimits`]). A request past a
 //! bucket's upload limits is refused at once (`429`), and one that finds the
 //! budget spent after a short wait (`503`). A body that stops arriving, or
-//! takes too long in all, is cut and refused (`408`) before anything of it is
-//! forwarded. Each of these refusals is marked `x-ursula-not-applied`. The
+//! falls below a floor of bytes over one window of the stall timeout, is cut
+//! and refused (`408`) before anything of it is forwarded. Each of these refusals is marked `x-ursula-not-applied`. The
 //! first two, and the `413` for a body over a bucket's own limit, read the
 //! body first, at the pace a forwarded body may keep, so that the client gets
 //! them on an intact connection.
@@ -236,7 +236,11 @@ struct GatewayMetricsSnapshot {
     /// [`UploadLimits::min_window_bytes`] of them arrived in one window of
     /// it.
     upload_refusals_too_slow: u64,
-    /// Bytes of the body budget reserved now, in whole KiB.
+    /// The body budget in effect, the small-body headroom included: an
+    /// unset `--body-budget-bytes` grows with `--max-request-body-bytes`.
+    upload_budget_bytes: u64,
+    /// Bytes of the body budget reserved now, each body's share rounded up
+    /// to whole KiB.
     upload_reserved_bytes: u64,
     /// Buckets with a large body being read under an upload limit now.
     upload_tenants: usize,
@@ -550,6 +554,9 @@ impl Gateway {
         let mut permit = match self.uploads.reserve(reserve).await {
             Ok(permit) => permit,
             Err(BudgetExhausted) => {
+                // The bucket's upload limits bound bodies the gateway may
+                // forward, not the reading of a refused one.
+                drop(claim);
                 return Err(self
                     .refuse_unread(self.budget_exhausted(), body, pace)
                     .await);
@@ -557,39 +564,42 @@ impl Gateway {
         };
 
         let mut reader = BodyReader::new(body, self.config.uploads.max_request_body_bytes(), pace);
-        let mut chunks = Vec::new();
-        let mut buffered: u64 = 0;
+        // Each chunk is copied as it arrives and dropped, so that the body
+        // holds no more than its share of the budget: a chunk can be a
+        // slice of a larger read buffer, which it would keep alive. A
+        // declared body gets all of its share at once, and one without a
+        // declared length grows within its share as it arrives.
+        let mut buffered = BodyBuffer::new(declared.map_or(0, |_| permit.bytes()));
         loop {
             let chunk = match reader.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(end) => return Err(self.cut_short(end, buffered)),
+                Err(end) => return Err(self.cut_short(end, buffered.len())),
             };
-            buffered = buffered.saturating_add(chunk.len() as u64);
-            if buffered > limit {
+            let len = buffered.len().saturating_add(chunk.len() as u64);
+            if len > limit {
                 // Past the bucket's own limit, within the gateway's: the
                 // rest is read and dropped, as for a refusal from the head.
-                drop((chunks, permit, claim));
+                drop((chunk, buffered, permit, claim));
                 return Err(self.refuse_rest(Refusal::BodyTooLarge, reader).await);
             }
-            if buffered > permit.bytes() {
-                let grown = permit.bytes().saturating_mul(2).max(buffered).min(limit);
+            if len > permit.bytes() {
+                let grown = permit.bytes().saturating_mul(2).max(len).min(limit);
                 if let Err(refusal) = self
                     .grow_upload(context, &mut claim, &mut permit, grown)
                     .await
                 {
-                    drop((chunks, permit, claim));
+                    drop((chunk, buffered, permit, claim));
                     return Err(self.refuse_rest(refusal, reader).await);
                 }
             }
-            chunks.push(chunk);
+            buffered.push(&chunk, permit.bytes());
         }
         // The bucket's upload limits bound bodies while they arrive: a
         // buffered body no longer counts, while it still holds its share of
         // the budget.
         drop(claim);
-        let body_bytes = concat(chunks, buffered);
-        permit.settle(body_bytes.len() as u64);
+        let body_bytes = buffered.finish(&mut permit);
         Ok((body_bytes, Some(permit)))
     }
 
@@ -1342,6 +1352,7 @@ impl Gateway {
                 .metrics
                 .upload_refusals_too_slow
                 .load(Ordering::Relaxed),
+            upload_budget_bytes: self.config.uploads.budget_bytes(),
             upload_reserved_bytes: self.uploads.reserved_bytes(),
             upload_tenants: self.admission.upload_buckets(),
         }
@@ -1883,17 +1894,49 @@ impl BodyReader {
     }
 }
 
-/// `chunks`, `len` bytes in all, as one buffer of exactly that size, so that
-/// the body's share of the budget covers all the memory it holds.
-fn concat(mut chunks: Vec<bytes::Bytes>, len: u64) -> bytes::Bytes {
-    if chunks.len() == 1 {
-        return chunks.pop().unwrap_or_default();
+/// The body of a request the gateway forwards whole, as it arrives
+/// ([`Gateway::buffer`]): one buffer that never holds more than the body's
+/// share of the budget.
+struct BodyBuffer {
+    bytes: Vec<u8>,
+}
+
+impl BodyBuffer {
+    /// A buffer of `capacity` bytes: a declared body's share of the budget,
+    /// or nothing for a body without a declared length.
+    fn new(capacity: u64) -> Self {
+        Self {
+            bytes: Vec::with_capacity(usize::try_from(capacity).unwrap_or(0)),
+        }
     }
-    let mut whole = bytes::BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
-    for chunk in chunks {
-        whole.extend_from_slice(&chunk);
+
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
     }
-    whole.freeze()
+
+    fn capacity(&self) -> u64 {
+        self.bytes.capacity() as u64
+    }
+
+    /// Copies `chunk` into the buffer, growing it, when it must grow, to
+    /// twice its size at most and never past `share`, the bytes the body's
+    /// share of the budget covers, which holds the chunk.
+    fn push(&mut self, chunk: &[u8], share: u64) {
+        let needed = self.len().saturating_add(chunk.len() as u64);
+        if needed > self.capacity() {
+            let grown = self.capacity().saturating_mul(2).max(needed).min(share);
+            let more = usize::try_from(grown.saturating_sub(self.len())).unwrap_or(usize::MAX);
+            self.bytes.reserve_exact(more);
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    /// The body, after `permit` has shrunk to the buffer's capacity, the
+    /// memory the body holds until it is forwarded.
+    fn finish(self, permit: &mut BodyPermit) -> bytes::Bytes {
+        permit.settle(self.capacity());
+        bytes::Bytes::from(self.bytes)
+    }
 }
 
 /// Rides the response body: counts egress bytes and, on drop, records the

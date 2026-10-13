@@ -4548,6 +4548,13 @@ mod refused_bodies {
             until(|| gateway.metrics_snapshot().upload_reserved_bytes == LARGE_BODY as u64).await,
             "the gateway reads the body"
         );
+        // The reservation comes before the first chunk is read, and the
+        // gateway may still be reading the bytes sent so far, each read
+        // restarting the stall timeout. Let it read them, in real time with
+        // the clock held still, before the clock moves.
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(200)))
+            .await
+            .expect("the wait");
         let client = tokio::spawn(async move {
             let answered = read_answer(&mut connection).await;
             let mut rest = [0_u8; 16];
@@ -4589,6 +4596,7 @@ mod uploads {
     use std::convert::Infallible;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
@@ -4980,10 +4988,115 @@ mod uploads {
         assert_eq!(metrics.upload_refusals_budget, 1);
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
         assert_eq!(metrics.upload_reserved_bytes, 4 << 10);
+        assert_eq!(metrics.upload_budget_bytes, 8 << 10);
         assert_eq!(
             finish_declared(chunks, 4 << 10, large).await.status(),
             StatusCode::OK
         );
+        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 0);
+    }
+
+    /// A large body refused for the budget leaves its bucket's upload count
+    /// while the gateway reads it to its end: once the budget frees up, the
+    /// bucket's next large body goes through instead of getting a `429`.
+    #[tokio::test]
+    async fn a_body_refused_for_the_budget_gives_back_its_bucket_upload_while_it_is_read() {
+        let (upstream, hits) = counting_fallback_upstream().await;
+        let gateway = Arc::new(guarded(
+            config(&upstream.url, tiny()),
+            "[[bucket]]\nid = \"tenant-b\"\nmax_concurrent_uploads = 1\n",
+        ));
+        let (holding, body) = declared(4 << 10);
+        let holder = send(&gateway, post("/tenant-a/orders", body));
+        assert!(until_reserved(&gateway, 4 << 10).await);
+
+        // Refused after the wait, and still arriving.
+        let (arriving, body) = declared(2 << 10);
+        let refused = send(&gateway, post("/tenant-b/orders", body));
+        assert!(
+            until(&gateway, |metrics| metrics.upload_refusals_budget == 1
+                && metrics.upload_tenants == 0)
+            .await
+        );
+
+        assert_eq!(
+            finish_declared(holding, 4 << 10, holder).await.status(),
+            StatusCode::OK
+        );
+        let next = gateway
+            .handle(post("/tenant-b/orders", Body::from(vec![0_u8; 2 << 10])))
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(gateway.metrics_snapshot().upload_refusals_tenant_uploads, 0);
+
+        assert_refused(
+            &finish_declared(arriving, 2 << 10, refused).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UploadBudgetExhausted",
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
+    /// A body declared as `parents.len()` bytes that sends the first byte of
+    /// each parent in turn, as a slice of it, the way hyper hands out slices
+    /// of a connection's read buffer. Each time it is polled, it counts in
+    /// `retained` whether the gateway still holds the slice it sent last.
+    struct Slices {
+        parents: Vec<Bytes>,
+        sent: usize,
+        retained: Arc<AtomicUsize>,
+    }
+
+    impl http_body::Body for Slices {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            let sent = self.sent;
+            if let Some(last) = sent.checked_sub(1).and_then(|last| self.parents.get(last))
+                && !last.is_unique()
+            {
+                self.retained.fetch_add(1, Ordering::Relaxed);
+            }
+            let Some(parent) = self.parents.get(sent) else {
+                return Poll::Ready(None);
+            };
+            let chunk = parent.slice(0..1);
+            self.sent = sent.saturating_add(1);
+            Poll::Ready(Some(Ok(Frame::data(chunk))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.parents.len() as u64)
+        }
+    }
+
+    /// A body that arrives as 1-byte slices of 8 KiB buffers holds none of
+    /// them: the gateway copies each chunk and drops it before it reads the
+    /// next, and the body it holds is exactly its share of the budget.
+    #[tokio::test]
+    async fn a_buffered_body_holds_no_chunk_and_only_its_share_of_the_budget() {
+        let (upstream, mut arrivals) = silent_upstream().await;
+        let gateway = Arc::new(Gateway::new(config(&upstream.url, roomy())));
+        let retained = Arc::new(AtomicUsize::new(0));
+        let body = Body::new(Slices {
+            parents: (0..2 << 10)
+                .map(|_| Bytes::from(vec![0_u8; 8 << 10]))
+                .collect(),
+            sent: 0,
+            retained: Arc::clone(&retained),
+        });
+        let upload = send(&gateway, post("/tenant-a/orders", body));
+
+        arrivals.recv().await.expect("the body is forwarded");
+        assert_eq!(retained.load(Ordering::Relaxed), 0);
+        assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 2 << 10);
+
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
         assert_eq!(gateway.metrics_snapshot().upload_reserved_bytes, 0);
     }
 
@@ -5237,14 +5350,17 @@ mod uploads {
     /// is forwarded, when no byte of it arrives for the stall timeout
     /// (30 s after its last chunk), and when one window of the stall timeout
     /// gets fewer bytes than the floor (1 KiB every 10 s against 1 KiB/s:
-    /// cut when the first window ends, 30 s after the reading started).
+    /// cut when the first window ends, 30 s after the reading started, or,
+    /// after a first chunk of 32 KiB that meets the first window's floor,
+    /// when the second window ends, 60 s after it started).
     #[tokio::test(start_paused = true)]
     async fn an_abandoned_body_is_cut_before_it_is_forwarded() {
         let (upstream, hits) = counting_fallback_upstream().await;
-        for (case, min_bytes_per_sec, every, chunks_sent, cut_after) in [
+        for (case, min_bytes_per_sec, first, every, chunks_sent, cut_after) in [
             (
                 "stalled",
                 0,
+                1 << 10,
                 Duration::from_secs(20),
                 2,
                 Duration::from_secs(50),
@@ -5252,9 +5368,18 @@ mod uploads {
             (
                 "below the floor",
                 1 << 10,
+                1 << 10,
                 Duration::from_secs(10),
                 u32::MAX,
                 Duration::from_secs(30),
+            ),
+            (
+                "below the floor in a later window",
+                1 << 10,
+                32 << 10,
+                Duration::from_secs(10),
+                u32::MAX,
+                Duration::from_secs(60),
             ),
         ] {
             let gateway = Gateway::new(config(&upstream.url, UploadLimitsSpec {
@@ -5263,8 +5388,9 @@ mod uploads {
             }));
             let (chunks, body) = declared(4 << 20);
             let sender = tokio::spawn(async move {
-                for _ in 0..chunks_sent {
-                    if chunks.send(Bytes::from(vec![0_u8; 1 << 10])).await.is_err() {
+                for sent in 0..chunks_sent {
+                    let size = if sent == 0 { first } else { 1 << 10 };
+                    if chunks.send(Bytes::from(vec![0_u8; size])).await.is_err() {
                         return;
                     }
                     tokio::time::sleep(every).await;
