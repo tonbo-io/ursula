@@ -340,12 +340,12 @@ nothing.
   threshold, and then leaves the headroom.
 - A request that finds the budget spent waits for it for
   `--body-budget-wait-ms`, and then gets `503` with `Retry-After: 1`.
-- `--max-request-body-bytes` must fit the part of the budget large bodies may
-  take, `--body-budget-bytes` less `--small-body-headroom-bytes`, and
-  `--small-body-max-bytes` must fit the headroom. The gateway exits at startup
-  otherwise. Raise `--body-budget-bytes` together with
-  `--max-request-body-bytes`: a 1 GiB limit needs a budget of at least 1 GiB
-  and 32 MiB, and memory to match.
+- With `--body-budget-bytes` unset, the budget is 256 MiB or
+  `--max-request-body-bytes` plus `--small-body-headroom-bytes`, whichever is
+  larger, so raising the limit alone grows the budget (give the process memory
+  to match). A budget set explicitly must hold a body at the limit beside the
+  headroom, and `--small-body-max-bytes` must fit the headroom. The gateway
+  exits at startup otherwise.
 
 A body declared over its bucket's own limit (`max_request_body_bytes` in the
 quota policy) gets its `413` before it reserves anything. A body declared

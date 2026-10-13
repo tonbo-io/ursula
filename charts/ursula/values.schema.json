@@ -912,7 +912,7 @@
         "bodyBudgetBytes": {
           "type": ["integer", "null"],
           "minimum": 1,
-          "description": "Bytes of request bodies the gateway buffers at once, across requests (--body-budget-bytes, 0.7.5 and later). Unset, the gateway keeps its default of 256 MiB."
+          "description": "Bytes of request bodies the gateway buffers at once, across requests (--body-budget-bytes, 0.7.6 and later). Unset, the gateway uses 256 MiB or maxRequestBodyBytes plus 32 MiB, whichever is larger."
         },
         "gracefulShutdownTimeoutSeconds": {
           "type": "integer",

@@ -153,6 +153,27 @@ fn access_control(args: &GatewayArgs) -> Result<Option<AccessControl>, Box<dyn s
     ))
 }
 
+/// The body budget: `--body-budget-bytes` when set, which the limits then
+/// check against `--max-request-body-bytes`. Unset, the default budget, grown
+/// to hold a body at the limit beside the headroom, so that raising the limit
+/// alone never stops a gateway from starting.
+fn body_budget_bytes(args: &GatewayArgs) -> u64 {
+    if let Some(budget) = args.body_budget_bytes {
+        return budget;
+    }
+    let default = UploadLimitsSpec::default().budget_bytes;
+    let needed = u64::try_from(args.max_request_body_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(args.small_body_headroom_bytes);
+    if needed > default {
+        tracing::info!(
+            budget_bytes = needed,
+            "--body-budget-bytes is unset; the body budget grows to hold a body at --max-request-body-bytes"
+        );
+    }
+    default.max(needed)
+}
+
 fn gateway_config(args: &GatewayArgs) -> Result<GatewayConfig, UploadLimitsError> {
     Ok(GatewayConfig {
         listen: args.listen,
@@ -162,7 +183,7 @@ fn gateway_config(args: &GatewayArgs) -> Result<GatewayConfig, UploadLimitsError
         upstream_tcp_user_timeout_secs: args.upstream_tcp_user_timeout,
         uploads: UploadLimits::try_from(UploadLimitsSpec {
             max_request_body_bytes: args.max_request_body_bytes,
-            budget_bytes: args.body_budget_bytes,
+            budget_bytes: body_budget_bytes(args),
             small_body_headroom_bytes: args.small_body_headroom_bytes,
             small_body_max_bytes: args.small_body_max_bytes,
             budget_wait: Duration::from_millis(args.body_budget_wait_ms),
@@ -217,9 +238,10 @@ pub struct GatewayArgs {
     /// `--small-body-max-bytes` at first and more as it arrives. The default,
     /// 256 MiB, is half of a 512 MiB pod: seven bodies at the default
     /// per-request limit beside the headroom. Keep it well below the memory
-    /// limit.
-    #[arg(long, value_name = "BYTES", default_value_t = UploadLimitsSpec::default().budget_bytes)]
-    body_budget_bytes: u64,
+    /// limit. Unset, it grows to hold a body at `--max-request-body-bytes`
+    /// beside the headroom when that limit is raised past the default budget.
+    #[arg(long, value_name = "BYTES")]
+    body_budget_bytes: Option<u64>,
 
     /// Bytes of the body budget that only bodies of at most
     /// `--small-body-max-bytes` may take, so that small writes never queue
@@ -401,7 +423,7 @@ mod tests {
     // The body budget's flags default to the library's limits, and limits
     // that leave a body at the limit no room are refused at startup.
     #[test]
-    fn upload_flags_default_to_the_library_limits_and_refuse_a_limit_over_the_budget() {
+    fn upload_flags_default_to_the_library_limits_and_grow_an_unset_budget_for_a_raised_limit() {
         assert_eq!(config_from(&[]).uploads, UploadLimits::default());
         let parsed = |extra: &[&str]| {
             let argv = ["ursulagw", "--upstream", "http://node:4437"]
@@ -409,8 +431,22 @@ mod tests {
                 .chain(extra);
             gateway_config(&Cli::try_parse_from(argv).unwrap().args).map(|config| config.uploads)
         };
+        // Raising the limit alone grows the budget to hold it.
         assert_eq!(
-            parsed(&["--max-request-body-bytes", "1073741824"]),
+            parsed(&["--max-request-body-bytes", "1073741824"])
+                .unwrap()
+                .spec()
+                .budget_bytes,
+            (1 << 30) + (32 << 20)
+        );
+        // A budget set too small for the limit is refused.
+        assert_eq!(
+            parsed(&[
+                "--max-request-body-bytes",
+                "1073741824",
+                "--body-budget-bytes",
+                "268435456"
+            ]),
             Err(UploadLimitsError::LimitAboveSharedBudget {
                 max_request_body_bytes: 1 << 30,
                 shared_bytes: 224 << 20,
