@@ -8,6 +8,8 @@ export const SQLITE_READONLY = 8;
 export const SQLITE_AUTH = 23;
 /** SQLITE_IOERR_AUTH: a commit, or the claim of an `ursula_attach`, refused before it reached the stream (an attach refused with 402 gets SQLITE_AUTH). */
 export const SQLITE_IOERR_AUTH = 7178;
+/** SQLITE_IOERR, the primary code (`errcode & 0xff`) of every I/O error: a read of a fenced file fails with one (SQLITE_IOERR_READ). */
+export const SQLITE_IOERR = 10;
 
 /** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
 export function errcode(error: unknown): number | undefined {

@@ -10,21 +10,30 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use libsqlite3_sys as ffi;
 
 use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
+use crate::error::Action;
 use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::error::WriteRefusal;
 use crate::host::OK;
 use crate::host::WalIndexHeader;
+use crate::local::DAMAGED_BOOT;
+use crate::local::sidecar_line;
+use crate::local::stamp;
+use crate::local::write_sidecar;
 use crate::log;
 use crate::log::Level;
 use crate::snapshotter::Snapper;
 use crate::snapshotter::SnapshotFailing;
 use crate::stats::Stats;
+use crate::wal::WalClaim;
 use crate::wal::db_len;
 
 /// How `ursula_attach` binds a file to its stream.
@@ -77,6 +86,11 @@ pub(crate) struct Db {
     pub(crate) log: u64,
     /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
     pub(crate) poisoned: Option<Poisoned>,
+    /// Set once a fence poisons the database (`Poisoned::fenced`), and never cleared: read without
+    /// the mutex by every read transaction's start (`vfs::x_shm_lock`), which must not wait for a
+    /// commit holding the mutex across its append. The registry hands it to each main db handle
+    /// (`Registry::fences`).
+    pub(crate) fence: Arc<AtomicBool>,
     /// Why the latest write was refused before it reached the stream, which applied nothing of it:
     /// by a layer in front of the stream (`writes_refused`), or by the extension itself, which
     /// never sent it (`refuse_unsent`). `ursula_status` reports it (`writes_refused`,
@@ -106,6 +120,11 @@ pub(crate) struct Db {
     /// Where this process's connections left the local WAL (`WalSeen`): checked whenever one
     /// takes the WAL write lock, and by the snapshot thread before it copies pages.
     pub(crate) wal_seen: WalSeen,
+    /// The db file as an attach that left no WAL wrote it last, until the first commit of this VFS:
+    /// meanwhile no WAL frame of the VFS exists, so no checkpoint of its own writes the file, and
+    /// a change is a checkpoint of a foreign commit (`check_foreign`). `None` after that first
+    /// commit, and after an attach that kept the WAL (a checkpoint of its frames writes the file).
+    pub(crate) untouched: Option<DbFileStamp>,
     /// The transaction's commit is acknowledged: later writes go straight to the local WAL, and
     /// the sidecar advances once the transaction ends.
     pub(crate) committed: bool,
@@ -160,36 +179,85 @@ pub(crate) struct Db {
     pub(crate) snapshot_published_bytes: usize,
 }
 
-/// Where the connections of this VFS left the local WAL's wal-index header: recorded whenever
-/// one releases the WAL write lock, so a commit that moved the header since came from a connection
-/// outside the extension ([`WalSeen::foreign`]). The header changes only under the write lock,
-/// apart from a recovery, which rebuilds it from the WAL file as it is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WalSeen {
-    /// Nothing known: the WAL attach kept (trusted local files), until a connection's write
-    /// transaction ends.
-    Unknown,
-    /// No WAL frames: attach deleted the WAL, or a connection of this VFS truncated it to nothing.
-    Empty,
-    /// The header as a connection of this VFS left it.
-    At(WalIndexHeader),
+/// What the connections of this VFS know of the local WAL's wal-index header, to tell a commit of a
+/// connection outside the extension from their own ([`WalSeen::foreign`]). A header with frames
+/// (`mxFrame` above 0) comes from a commit, or from a recovery, which rebuilds it from the WAL file
+/// as it is. The WAL file changes only at a commit of this VFS (its writes before the commit point
+/// stay in the overlay) or when a connection of this VFS truncates it. So a header with frames is
+/// this VFS's own when it is the one a connection of the VFS last left (`live`) or the one the WAL
+/// file holds as of the VFS's last commit (`file`), and any other comes from a commit outside the
+/// extension.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WalSeen {
+    /// The header as a connection of this VFS last released the WAL write lock on it (`None`
+    /// before the first release).
+    live: Option<WalIndexHeader>,
+    /// The header a recovery rebuilds from the WAL file as of this VFS's last commit, or as attach
+    /// kept it (the sidecar's claim, which the WAL's last commit frame meets exactly:
+    /// `WalClaim::covered`). `None` while the WAL file holds no commit.
+    file: Option<WalIndexHeader>,
 }
 
 impl WalSeen {
-    /// The last commit frame this process left, when `header` shows a commit since that no
-    /// connection of this VFS wrote: a frame count that moved within the same WAL generation (the
-    /// same salts), or frames after an empty WAL. A new generation is not taken for one: SQLite
-    /// starts one only after every frame is in the db file, and a recovery from a WAL whose
-    /// restart never reached the file (it stays in the overlay until its commit) shows the old
-    /// generation again. So a foreign commit that a WAL restart followed goes unseen.
-    pub(crate) fn foreign(&self, header: WalIndexHeader) -> Option<u32> {
-        match *self {
-            WalSeen::Empty if header.mx_frame != 0 => Some(0),
-            WalSeen::At(seen) if seen.salts == header.salts && seen.mx_frame != header.mx_frame => {
-                Some(seen.mx_frame)
-            }
-            _ => None,
+    /// What an attach leaves: no live header yet, and the WAL file as `claim` describes it (`None`
+    /// when attach deleted the WAL).
+    pub(crate) fn attached(claim: Option<WalClaim>) -> WalSeen {
+        WalSeen {
+            live: None,
+            file: claim.filter(|c| c.frame > 0).map(|c| WalIndexHeader {
+                mx_frame: c.frame,
+                salts: c.salts.to_be_bytes(),
+            }),
         }
+    }
+
+    /// A connection of this VFS released the WAL write lock and left `header`. When its write
+    /// transaction committed (`committed`), the WAL file holds that commit now.
+    pub(crate) fn released(&mut self, header: WalIndexHeader, committed: bool) {
+        self.live = Some(header);
+        if committed {
+            self.file = Some(header).filter(|h| h.mx_frame > 0);
+        }
+    }
+
+    /// A connection of this VFS truncated the WAL file to nothing.
+    pub(crate) fn truncated(&mut self) {
+        self.file = None;
+    }
+
+    /// The last commit frame this VFS knows of, when `header` shows a commit no connection of this
+    /// VFS made: a header with frames that is neither the one a connection of the VFS last left nor
+    /// the one the WAL file holds as of its last commit. A header without frames shows no commit:
+    /// a commit outside the extension that a WAL restart or truncate followed (a complete
+    /// checkpoint moved it into the db file) leaves nothing here, and goes unseen.
+    pub(crate) fn foreign(&self, header: WalIndexHeader) -> Option<u32> {
+        if header.mx_frame == 0 || Some(header) == self.live || Some(header) == self.file {
+            return None;
+        }
+        Some(self.live.or(self.file).map_or(0, |h| h.mx_frame))
+    }
+}
+
+/// What `stat` says of the db file (size, inode, modification time), to tell whether anything wrote
+/// it between two moments in which nothing of this VFS could (`Db::untouched`). Any write to the
+/// file sets its modification time, to the timestamp granularity of its filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DbFileStamp {
+    len: u64,
+    ino: u64,
+    mtime: (i64, i64),
+}
+
+impl DbFileStamp {
+    /// The db file at `path` as it is now (`None` when it cannot be stat'ed).
+    pub(crate) fn of(path: &str) -> Option<DbFileStamp> {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::metadata(path).ok()?;
+        Some(DbFileStamp {
+            len: m.len(),
+            ino: m.ino(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+        })
     }
 }
 
@@ -203,6 +271,23 @@ pub(crate) struct Poisoned {
     /// A reason so far says the local files may hold other pages than this process wrote
     /// ([`Error::is_local_damage`]): once set, it stays.
     pub(crate) damaged: bool,
+}
+
+impl Poisoned {
+    /// The kind `ursula_status` reports for the poison: `fenced` once a fence was seen, whatever
+    /// the first reason was, and otherwise the first reason's (`Error::poison_kind`).
+    pub(crate) fn kind(&self) -> ErrorKind {
+        if self.fenced {
+            ErrorKind::Fenced
+        } else {
+            self.first.poison_kind()
+        }
+    }
+
+    /// What a caller does about the poison: the kind's action (a poison's kind always has one).
+    pub(crate) fn action(&self) -> Action {
+        self.kind().action().unwrap_or(Action::Reattach)
+    }
 }
 
 impl Db {
@@ -283,6 +368,7 @@ impl Db {
             fields.push(("reason", &why));
             log::emit(Level::Warn, "poisoned", &fields);
         }
+        let newly_damaged = damaged && !self.damaged();
         match &mut self.poisoned {
             Some(p) => {
                 p.fenced |= fenced;
@@ -296,8 +382,37 @@ impl Db {
                 });
             }
         }
+        if fenced {
+            self.fence.store(true, Ordering::Release);
+        }
+        if newly_damaged {
+            self.distrust_local();
+        }
         self.refused = None;
         self.layer_refused = None;
+    }
+
+    /// Makes the local files untrusted for every later attach, in this process or after a restart:
+    /// the sidecar is rewritten with a boot id no kernel has (`local::DAMAGED_BOOT`), so the next
+    /// attach discards the files and rebuilds them from the stream. In this boot it would trust
+    /// them otherwise, pages that a checkpoint moved from a foreign commit or a lost write into the
+    /// db file included. Every later sidecar of this attachment carries that stamp too.
+    fn distrust_local(&mut self) {
+        self.stamp = stamp(&self.path, &self.url, Some(DAMAGED_BOOT), &self.incarnation);
+        let line = sidecar_line(
+            &self.offset,
+            self.epoch,
+            self.log,
+            &self.stamp,
+            WalClaim::NONE,
+        );
+        if let Err(e) = write_sidecar(&self.sidecar, &line) {
+            log::emit(Level::Error, "distrust_failed", &[
+                ("file", &self.path),
+                ("stream", &self.url),
+                ("reason", &e),
+            ]);
+        }
     }
 
     /// The write transaction's commit was refused before it reached the stream, and so was every
@@ -423,6 +538,9 @@ impl Db {
 #[derive(Default)]
 pub(crate) struct Registry {
     pub(crate) dbs: HashMap<String, Arc<Mutex<Db>>>,
+    /// The fence flag of each binding in `dbs` (`Db::fence`), bound and unbound with it, which
+    /// `x_open` hands to the main db handles it opens without taking the database's mutex.
+    pub(crate) fences: HashMap<String, Arc<AtomicBool>>,
     /// Open main-db handles per path (attached or not): attach requires none.
     pub(crate) open: HashMap<String, usize>,
     /// Paths being attached: `x_open` refuses their main db meanwhile (an open would read under
@@ -482,7 +600,10 @@ pub(crate) fn refused(reg: &Registry, path: &str) -> Option<Refusal> {
 /// Why `x_open` refuses a main db (`refused`), for its log line.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Refusal {
-    #[error("its last attach failed ({}: {0}); attach it again", .0.kind().as_str())]
+    #[error(
+        "its last attach failed ({}: {0}); it opens through the extension once an attach succeeds",
+        .0.kind().as_str()
+    )]
     AttachFailed(Arc<Error>),
     #[error("it is the cache of an Ursula stream (it has a sidecar); attach it first")]
     NotAttached,
@@ -509,12 +630,14 @@ impl Db {
             offset: crate::client::START.into(),
             log: 0,
             poisoned: None,
+            fence: Arc::new(AtomicBool::new(false)),
             refused: None,
             layer_refused: None,
             refused_at: None,
             overlay: BTreeMap::new(),
             wal_written: BTreeMap::new(),
-            wal_seen: WalSeen::Empty,
+            wal_seen: WalSeen::default(),
+            untouched: None,
             committed: false,
             commit_frame_no: 0,
             wal_open: 0,
@@ -559,6 +682,7 @@ mod tests {
     use crate::error::FrameLimit;
     use crate::error::WriteRefusal;
     use crate::host::WalIndexHeader;
+    use crate::wal::WalClaim;
 
     // A commit refused before it reached the stream (a 402, or any refusal that applied nothing)
     // fails its transaction alone: the overlay goes, as on a poison, but the database is not
@@ -700,24 +824,47 @@ mod tests {
         assert!(d.snapshot_wanted());
     }
 
-    // A commit no connection of this VFS wrote: the last frame moved within the generation they
-    // left, or frames appeared after an empty WAL. A new generation, or nothing known, is no
-    // evidence (SQLite restarts the WAL only after a full checkpoint, and a recovery can show the
-    // old generation again).
+    // A header with frames is this VFS's own only when it is the one a connection of the VFS last
+    // left or the one the WAL file holds as of its last commit (what a recovery rebuilds). Any
+    // other came from a commit outside the extension: a first commit into an empty WAL (new
+    // salts), a commit after the VFS's last one in the same generation, or one a recovery found
+    // in the WAL file. A header without frames shows no commit.
     #[test]
-    fn a_foreign_commit_moves_the_frame_count_within_a_generation() {
+    fn a_header_with_frames_the_vfs_never_left_is_a_foreign_commit() {
         let header = |mx_frame, salt| WalIndexHeader {
             mx_frame,
             salts: [salt; 8],
         };
-        let seen = WalSeen::At(header(7, 1));
-        assert_eq!(seen.foreign(header(7, 1)), None);
-        assert_eq!(seen.foreign(header(9, 1)), Some(7));
-        assert_eq!(seen.foreign(header(3, 1)), Some(7));
-        assert_eq!(seen.foreign(header(9, 2)), None);
-        assert_eq!(WalSeen::Empty.foreign(header(0, 5)), None);
-        assert_eq!(WalSeen::Empty.foreign(header(2, 5)), Some(0));
-        assert_eq!(WalSeen::Unknown.foreign(header(2, 5)), None);
+        // Attach deleted the WAL; the first read recovers an empty header (zero salts), and a
+        // connection outside the extension commits into it with new salts.
+        let mut seen = WalSeen::attached(None);
+        assert_eq!(seen.foreign(header(0, 0)), None);
+        seen.released(header(0, 0), false);
+        assert_eq!(seen.foreign(header(2, 9)), Some(0));
+        // The VFS's own commit, then a commit after it in the same generation.
+        seen.released(header(4, 1), true);
+        assert_eq!(seen.foreign(header(4, 1)), None);
+        assert_eq!(seen.foreign(header(6, 1)), Some(4));
+        // A restart the VFS rolled back (its WAL header never left the overlay): the header shows
+        // no frames under new salts, and a recovery later rebuilds the WAL file's (the last commit).
+        seen.released(header(0, 2), false);
+        assert_eq!(seen.foreign(header(0, 2)), None);
+        assert_eq!(seen.foreign(header(4, 1)), None);
+        assert_eq!(seen.foreign(header(5, 1)), Some(0));
+        // A connection of the VFS truncated the WAL file: a recovery finds no frames.
+        seen.truncated();
+        assert_eq!(seen.foreign(header(4, 1)), Some(0));
+        // A WAL attach kept: the claim is its last commit frame exactly.
+        let kept = WalSeen::attached(Some(WalClaim {
+            salts: u64::from_be_bytes([3; 8]),
+            frame: 7,
+        }));
+        assert_eq!(kept.foreign(header(7, 3)), None);
+        assert_eq!(kept.foreign(header(8, 3)), Some(7));
+        assert_eq!(
+            WalSeen::attached(Some(WalClaim::NONE)).foreign(header(1, 3)),
+            Some(0)
+        );
     }
 
     // After a failed attach, `x_open` refuses the path whether or not a sidecar exists (the
@@ -748,6 +895,40 @@ mod tests {
         reg.failed.clear();
         std::fs::write(format!("{path}-ursula"), "x").unwrap();
         assert!(matches!(refused(&reg, &path), Some(Refusal::NotAttached)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Local damage (a foreign commit, a lost write) makes the local files untrusted for every
+    // later attach: the sidecar is rewritten with a boot id no kernel has, which every later
+    // sidecar of the attachment carries too. A fence leaves the files trusted (they hold a prefix
+    // of the stream) but sets the flag reads check without the mutex.
+    #[test]
+    fn local_damage_distrusts_the_files_and_a_fence_raises_the_flag() {
+        let dir = std::env::temp_dir().join(format!("ursula-damage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.db").to_string_lossy().into_owned();
+        std::fs::write(&path, b"").unwrap();
+        let mut d = Db::for_tests();
+        d.path.clone_from(&path);
+        d.sidecar = format!("{path}-ursula");
+        d.stamp = crate::local::stamp(&path, &d.url, Some("boot-1"), &d.incarnation);
+        d.poison(Error::Fenced(Fence::Superseded {
+            epoch: 2,
+            current: Some(3),
+        }));
+        assert!(d.fence.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !std::fs::exists(&d.sidecar).unwrap(),
+            "a fence writes no sidecar"
+        );
+        d.poison(Error::ForeignWrite(crate::error::Foreign::Frames {
+            seen: 2,
+            found: 4,
+        }));
+        let s = crate::local::read_sidecar(&d.sidecar).unwrap().unwrap();
+        assert_eq!(s.boot.as_deref(), Some(crate::local::DAMAGED_BOOT));
+        assert!(!s.trusted(&path, Some("boot-1"), "i1"));
+        assert!(d.stamp.contains("boot=damaged"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

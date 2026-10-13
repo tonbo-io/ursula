@@ -19,6 +19,8 @@ use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -32,14 +34,15 @@ use crate::client::stream_seq;
 use crate::config::abort_after_ack;
 use crate::config::max_frame_bytes;
 use crate::db::Db;
+use crate::db::DbFileStamp;
 use crate::db::Mode;
-use crate::db::WalSeen;
 use crate::db::lock;
 use crate::db::lookup;
 use crate::db::refused;
 use crate::db::registry;
 use crate::error::Error;
 use crate::error::Fence;
+use crate::error::Foreign;
 use crate::error::WriteRefusal;
 use crate::frame;
 use crate::frame::FrameError;
@@ -90,6 +93,8 @@ pub(crate) struct File {
 struct Ext {
     path: Option<String>,
     db: Option<Arc<Mutex<Db>>>,
+    /// The fence flag of a main db handle's attachment (`Db::fence`), read without its mutex.
+    fence: Option<Arc<AtomicBool>>,
     wal: bool,
     /// This main db handle holds an EXCLUSIVE file lock.
     exclusive: Cell<bool>,
@@ -185,21 +190,26 @@ unsafe fn header(f: *mut ffi::sqlite3_file) -> Option<WalIndexHeader> {
 }
 
 impl Db {
-    /// A connection of this VFS took the WAL write lock: a commit the wal-index shows since one
-    /// released it last (`wal_seen`) came from a connection outside the extension, which the
-    /// stream never got. It poisons the database (local damage: no snapshot publishes the
-    /// foreign pages either), and the transaction's first WAL write fails.
+    /// A commit the wal-index `header` shows that no connection of this VFS made (`WalSeen::foreign`)
+    /// came from a connection outside the extension, which the stream never got. Checked when a
+    /// connection of this VFS takes the WAL write lock, when it releases one it committed nothing
+    /// under (a recovery rebuilt the header from the WAL file), and before the snapshot thread
+    /// copies pages (`during` says which). It poisons the database as local damage: no snapshot
+    /// publishes the foreign pages, the next WAL write fails, and the next attach rebuilds the
+    /// local files (`Db::distrust_local`).
     pub(crate) fn check_foreign(&mut self, header: Option<WalIndexHeader>, during: &str) {
-        if let Some(found) = header
-            && let Some(seen) = self.wal_seen.foreign(found)
-        {
-            self.set_poisoned(
-                Error::ForeignWrite {
-                    seen,
-                    found: found.mx_frame,
-                },
-                Some(during),
-            );
+        let foreign = match header.and_then(|found| Some((self.wal_seen.foreign(found)?, found))) {
+            Some((seen, found)) => Some(Foreign::Frames {
+                seen,
+                found: found.mx_frame,
+            }),
+            None => self
+                .untouched
+                .filter(|&stamp| DbFileStamp::of(&self.path) != Some(stamp))
+                .map(|_changed| Foreign::DbFile),
+        };
+        if let Some(foreign) = foreign {
+            self.set_poisoned(Error::ForeignWrite(foreign), Some(during));
         }
     }
 
@@ -448,8 +458,8 @@ unsafe fn x_open(
         return ffi::SQLITE_CANTOPEN;
     }
     // Counted before the open, so attach (which refuses while any is counted) and an open
-    // cannot pass each other; refused while `attach` runs on the path, and when it has a
-    // sidecar but no binding (`refused`).
+    // cannot pass each other; refused while `attach` runs on the path, and without a binding
+    // after its last attach failed or while it has a sidecar (`refused`).
     let main = match name {
         Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => {
             let mut reg = registry();
@@ -466,9 +476,10 @@ unsafe fn x_open(
                 ]);
                 return ffi::SQLITE_CANTOPEN;
             }
+            let fence = reg.fences.get(name).cloned();
             let open = reg.open.entry(name.to_owned()).or_default();
             *open = open.saturating_add(1);
-            Some(db)
+            Some((db, fence))
         }
         _ => None,
     };
@@ -487,9 +498,10 @@ unsafe fn x_open(
         return rc;
     }
     let ext = match (name, main) {
-        (Some(name), Some(db)) => Some(Ext {
+        (Some(name), Some((db, fence))) => Some(Ext {
             path: Some(name.to_owned()),
             db,
+            fence,
             wal: false,
             exclusive: Cell::new(false),
         }),
@@ -497,6 +509,7 @@ unsafe fn x_open(
             name.strip_suffix("-wal").and_then(lookup).map(|db| Ext {
                 path: None,
                 db: Some(db),
+                fence: None,
                 wal: true,
                 exclusive: Cell::new(false),
             })
@@ -968,8 +981,8 @@ unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> 
     // started a new generation) cuts only the previous generation's tail, whose pages
     // `commit` already fsynced.
     if size == 0 {
-        // No frames left: any the wal-index shows later, a connection wrote (`WalSeen`).
-        db.wal_seen = WalSeen::Empty;
+        // No frames left in the WAL file (`WalSeen`).
+        db.wal_seen.truncated();
         let rc = db.sync_db("a WAL truncate");
         if rc != OK {
             return rc;
@@ -1107,14 +1120,18 @@ unsafe fn x_shm_map(
 /// rewrites reach the WAL). Lock order: the real shm lock may be taken without the mutex, and the
 /// mutex may be held while releasing it, which never blocks.
 unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int {
-    // Every read transaction on a WAL database takes one of the read-mark locks shared, even one
-    // whose pages its connection has cached. A fenced database refuses it, so no connection keeps
-    // serving the state the newer owner moved past: reads fail like writes until the file is
-    // attached again (`ursula_status` says `fenced`).
+    // Every read transaction on a WAL database takes one of the read-mark locks shared when it
+    // starts, even one whose pages its connection has cached. A fenced database refuses it, so no
+    // new read transaction serves the state the newer owner moved past: reads fail like writes
+    // until the file is attached again (`ursula_status` says `fenced`). A read transaction open
+    // already keeps its snapshot until it ends. The flag is read without the database's mutex,
+    // which a commit holds across its append (`Db::fence`).
     if flags == ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_SHARED
         && offset >= WAL_READ_LOCK_0
         // SAFETY: the module contract.
-        && unsafe { main_db(file) }.is_some_and(|db| lock(&db).fenced())
+        && unsafe { ext(file) }
+            .and_then(|e| e.fence.as_deref())
+            .is_some_and(|fence| fence.load(Ordering::Acquire))
     {
         return ffi::SQLITE_IOERR_READ;
     }
@@ -1138,11 +1155,21 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
         // `checkpoint_started`) this bookkeeping would then clear or misjudge.
         let mut db = lock(&db);
         if offset == WAL_WRITE_LOCK {
+            let committed = db.committed;
             // SAFETY: `file` is the main db handle releasing the WAL write lock it holds.
             unsafe { db.end_write_transaction(file) };
+            if committed {
+                // A frame of this VFS exists now, which a checkpoint writes into the db file.
+                db.untouched = None;
+            }
             // SAFETY: as above.
             if let Some(h) = unsafe { header(file) } {
-                db.wal_seen = WalSeen::At(h);
+                // Without a commit of its own, the lock changed the header only by a recovery,
+                // which rebuilt it from the WAL file: a commit outside the extension there shows.
+                if !committed {
+                    db.check_foreign(Some(h), "WAL write lock release");
+                }
+                db.wal_seen.released(h, committed);
             }
             return fwd!(file, xShmLock, offset, n, flags);
         }
@@ -1993,6 +2020,7 @@ mod tests {
             ext: Box::into_raw(Box::new(Ext {
                 path: Some(path.clone()),
                 db: Some(db.clone()),
+                fence: None,
                 wal: false,
                 exclusive: Cell::new(true),
             })),
@@ -2146,6 +2174,7 @@ mod tests {
             ext: Box::into_raw(Box::new(Ext {
                 path: None,
                 db: Some(db.clone()),
+                fence: None,
                 wal: true,
                 exclusive: Cell::new(false),
             })),

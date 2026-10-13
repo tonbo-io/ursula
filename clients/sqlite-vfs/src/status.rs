@@ -5,7 +5,6 @@ use crate::db::Mode;
 use crate::db::attached;
 use crate::db::lock;
 use crate::error::Error;
-use crate::error::ErrorKind;
 use crate::error::WriteRefusal;
 use crate::host::full_pathname;
 use crate::stats::Drained;
@@ -115,25 +114,20 @@ fn status_json(db: &Db) -> String {
 }
 
 /// Why writes to the database fail now, as `ursula_status` reports it (`error`):
-/// `{"kind","action","message"}`, `None` while they do not. A poison's kind is `fenced` once a
-/// fence was seen (`Poisoned::fenced`), whatever the first reason was, and otherwise the first
-/// reason's (`Error::poison_kind`), whose text is the message (the `reason` field's). A write
-/// refused before it reached the stream is `unreachable` when no attempt of it went out, and
-/// `refused` otherwise (`refused_kind` says by what).
+/// `{"kind","action","message"}`, `None` while they do not. A poisoned database reports the
+/// poison's kind and action (`Poisoned::kind`, `Poisoned::action`) and its first reason's text as
+/// the message (the `reason` field's). A write refused before it reached the stream reports the
+/// refusal's (`WriteRefusal::error_kind`, `refused_kind` says by what).
 fn error_json(db: &Db) -> Option<String> {
-    let (kind, message) = match (&db.poisoned, &db.refused) {
-        (Some(p), _) if p.fenced => (ErrorKind::Fenced, p.first.to_string()),
-        (Some(p), _) => (p.first.poison_kind(), p.first.to_string()),
-        (None, Some(refusal @ WriteRefusal::Unreachable { .. })) => {
-            (ErrorKind::Unreachable, refusal.to_string())
-        }
-        (None, Some(refusal)) => (ErrorKind::Refused, refusal.to_string()),
+    let (kind, action, message) = match (&db.poisoned, &db.refused) {
+        (Some(p), _) => (p.kind(), p.action(), p.first.to_string()),
+        (None, Some(refusal)) => (refusal.error_kind(), refusal.action(), refusal.to_string()),
         (None, None) => return None,
     };
     Some(format!(
         "{{\"kind\":{},\"action\":{},\"message\":{}}}",
         json_str(kind.as_str()),
-        json_str(kind.action().as_str()),
+        json_str(action.as_str()),
         json_str(&message)
     ))
 }
@@ -269,6 +263,9 @@ mod tests {
             reason: "timeout: resolve".into(),
         });
         assert!(error(&d).starts_with(r#"{"kind":"unreachable","action":"retry","#));
+        // A transaction too large for one request fails the same way every time: split it.
+        d.refuse_unsent(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
+        assert!(error(&d).starts_with(r#"{"kind":"too_large","action":"fix","#));
 
         let mut d = Db::for_tests();
         d.poison(Error::AppendUnknown {
@@ -299,7 +296,10 @@ mod tests {
         assert!(error(&d).starts_with(r#"{"kind":"fenced","action":"stop","message":"append "#));
 
         let mut d = Db::for_tests();
-        d.poison(Error::ForeignWrite { seen: 4, found: 6 });
+        d.poison(Error::ForeignWrite(crate::error::Foreign::Frames {
+            seen: 4,
+            found: 6,
+        }));
         assert!(error(&d).starts_with(r#"{"kind":"foreign_write","action":"reattach","#));
     }
 

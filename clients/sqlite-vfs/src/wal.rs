@@ -60,8 +60,15 @@ pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
 /// the previous one is in the db file, and the db file is fsynced before the new generation's
 /// header can reach the disk (`commit`), so an image that shows the generation holds every page
 /// from before it; the frames up to the claimed one hold every later commit up to the sidecar's
-/// offset. Any page of the image that is newer (backfilled, or frames past the claim) belongs to a
+/// offset. Any page of the image that is newer (backfilled from a later commit) belongs to a
 /// commit after the offset, which attach replays.
+///
+/// The claimed frame is the WAL's last commit frame exactly: the sidecar advances at the end of
+/// every write transaction of the VFS, and nothing else of the VFS writes WAL frames. A commit
+/// frame past it is a commit the sidecar never saw: one whose sidecar update a crash cut off (in
+/// the stream, past the sidecar's offset), or a commit of a connection outside the extension (in
+/// no stream, and a checkpoint may have moved its pages into the db file already). Which, the
+/// files cannot tell, so they are not trusted and attach rebuilds them.
 #[derive(Clone, Copy)]
 pub(crate) struct WalClaim {
     pub(crate) salts: u64,
@@ -71,15 +78,15 @@ pub(crate) struct WalClaim {
 impl WalClaim {
     pub(crate) const NONE: WalClaim = WalClaim { salts: 0, frame: 0 };
 
-    /// The local WAL, as SQLite's recovery will read it, holds what the claim needs: this
-    /// generation with frames reaching the claimed one, or for `NONE` no commit at all (frames left
-    /// over from before the db file was synced would roll pages back).
+    /// The local WAL, as SQLite's recovery will read it, holds what the claim says: this
+    /// generation with its last commit at the claimed frame, or for `NONE` no commit at all (frames
+    /// left over from before the db file was synced would roll pages back).
     pub(crate) fn covered(self, path: &str) -> bool {
         let (salts, last) =
             wal_recover(&format!("{path}-wal")).map_or((0, 0), |w| (w.salts, w.last));
         match self.frame {
             0 => last == 0,
-            frame => salts == self.salts && last >= frame,
+            frame => salts == self.salts && last == frame,
         }
     }
 }

@@ -1,8 +1,8 @@
 // Mistakes an application can make with the extension fail loudly, and every failure names a
 // stable kind (design doc §1, errors): `<function>: <kind>: <message>` for a SQL function's error,
 // and `error.kind` in `ursula_status`. These tests use node:sqlite and the extension directly.
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, openSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { freshFile } from "./helpers.ts";
@@ -32,17 +32,56 @@ const failure = (f: () => unknown): { message: string; errcode?: number } => {
 	}
 	throw new Error("expected a failure");
 };
-/** The tables a fresh host attaching `url` sees. */
+const tables = (db: DatabaseSync): string[] =>
+	(db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+const integrity = (db: DatabaseSync): string => (db.prepare("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check;
+/** The tables a fresh host attaching `url` sees, after checking its rebuild is sound. */
 const tablesOf = (url: string): string[] => {
 	const file = freshFile();
 	attach(file, url);
 	const db = open(file);
 	try {
-		return (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+		expect(integrity(db)).toBe("ok");
+		return tables(db);
 	} finally {
 		db.close();
 	}
 };
+/**
+ * Runs an ES module script in a child process with `args`, within a minute: its stdout parsed as
+ * JSON. Asynchronous, so this process goes on serving the proxies the script may go through.
+ */
+const runScript = (script: string, args: readonly string[], env: Record<string, string> = {}): Promise<Record<string, unknown>> =>
+	new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, ["--input-type=module", "-e", script, ...args], {
+			env: { ...process.env, ...env },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let out = "";
+		let err = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			out += chunk.toString();
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			err += chunk.toString();
+		});
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			reject(new Error(`the script timed out; stderr ${err}`));
+		}, 60_000);
+		child.once("exit", (code, signal) => {
+			clearTimeout(timer);
+			if (code !== 0) {
+				reject(new Error(`the script exited ${code} ${signal}; stderr ${err}`));
+				return;
+			}
+			try {
+				resolve(JSON.parse(out) as Record<string, unknown>);
+			} catch {
+				reject(new Error(`the script printed ${out}; stderr ${err}`));
+			}
+		});
+	});
 
 let gate: Gate;
 let proxy: StallProxy;
@@ -56,11 +95,13 @@ afterAll(async () => {
 });
 
 // Regression: a connection opened before the extension was loaded uses the "unix" VFS, and its
-// commits never reached the stream, while attach succeeded and nothing failed.
-it("attach refuses a file a connection opened before the extension was loaded", () => {
+// commits never reached the stream, while attach succeeded and nothing failed. A descriptor that
+// only reads (a file watcher, a backup reading the file) does not refuse the attach.
+it("attach refuses a file a connection opened before the extension was loaded", async () => {
 	const file = freshFile();
 	const url = ursulaUrl() + streamPath();
 	const script = `
+		import { openSync, closeSync } from "node:fs";
 		import { DatabaseSync } from "node:sqlite";
 		const [ext, file, url] = process.argv.slice(1);
 		const early = new DatabaseSync(file);
@@ -70,23 +111,95 @@ it("attach refuses a file a connection opened before the extension was loaded", 
 		let refused;
 		try { attach(); } catch (e) { refused = e.message; }
 		early.close();
+		const reader = openSync(file, "r");
 		attach();
+		closeSync(reader);
 		const db = new DatabaseSync(file);
 		db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x)");
 		db.close();
 		console.log(JSON.stringify({ refused }));
 	`;
-	const run = spawnSync(process.execPath, ["--input-type=module", "-e", script, vfsPath(), file, url], { encoding: "utf8" });
-	expect(run.status, run.stderr).toBe(0);
-	const { refused } = JSON.parse(run.stdout) as { refused?: string };
-	expect(refused).toMatch(/^ursula_attach: in_use: .* is open in this process outside the extension/);
+	const { refused } = await runScript(script, [vfsPath(), file, url]);
+	expect(refused).toMatch(/^ursula_attach: in_use: .* is open for writing in this process outside the extension/);
 	expect(tablesOf(url)).toEqual(["t"]);
+});
+
+// A refused attach changes nothing: a bound path keeps its binding (and its replication) while a
+// writable descriptor outside the extension stays open, and attaches once it is closed.
+it("an attach refused for a writable descriptor keeps the binding", () => {
+	const file = freshFile();
+	const url = ursulaUrl() + streamPath();
+	attach(file, url);
+	const db = open(file);
+	db.exec("CREATE TABLE t(x)");
+	db.close();
+	const fd = openSync(file, "r+");
+	try {
+		expect(failure(() => attach(file, url)).message).toMatch(/^ursula_attach: in_use: /);
+		const again = open(file);
+		again.exec("INSERT INTO t VALUES (1)");
+		again.close();
+		expect(status(file)).toMatchObject({ poisoned: false, error: null });
+	} finally {
+		closeSync(fd);
+	}
+	attach(file, url);
+	const fresh = freshFile();
+	attach(fresh, url);
+	const replica = open(fresh);
+	expect(replica.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
+	replica.close();
 });
 
 // A connection that bypasses the VFS after attach (here `?vfs=unix`) writes the same WAL: the
 // owner's next write transaction finds the commit it did not make and poisons before anything else
-// is acknowledged. Nothing of the foreign commit reaches the stream.
-it("a commit through a connection outside the extension poisons the owner at its next write", () => {
+// is acknowledged. Nothing of the foreign commit reaches the stream, and attaching the file again,
+// the action `foreign_write` names, rebuilds it from the stream.
+it("a commit through a connection outside the extension poisons the owner, and a reattach rebuilds the file", () => {
+	const file = freshFile();
+	const url = ursulaUrl() + streamPath();
+	attach(file, url);
+	const owner = open(file);
+	owner.exec("CREATE TABLE t(x)");
+	const outside = new DatabaseSync(`file:${file}?vfs=unix`);
+	outside.exec("CREATE TABLE foreign_table(y); INSERT INTO foreign_table VALUES (randomblob(20000))");
+	outside.close();
+	const e = failure(() => owner.exec("INSERT INTO t VALUES (1)"));
+	expect(e.errcode).toBe(SQLITE_IOERR_WRITE);
+	expect(status(file)).toMatchObject({ poisoned: true, fenced: false, error: { kind: "foreign_write", action: "reattach" } });
+	owner.close();
+	expect(tablesOf(url)).toEqual(["t"]);
+	attach(file, url);
+	expect(status(file)).toMatchObject({ local: "-1", poisoned: false, error: null });
+	const again = open(file);
+	expect(tables(again)).toEqual(["t"]);
+	again.exec("CREATE TABLE u(z); INSERT INTO t VALUES (2)");
+	again.close();
+	expect(tablesOf(url)).toEqual(["t", "u"]);
+});
+
+// The commit outside the extension comes first: into the WAL attach left empty, before the owner
+// has committed anything (with new salts), whether the owner had read the file or not.
+it("a first commit outside the extension, before the owner's, poisons the owner", () => {
+	for (const ownerReadFirst of [true, false]) {
+		const file = freshFile();
+		const url = ursulaUrl() + streamPath();
+		attach(file, url);
+		const owner = ownerReadFirst ? open(file) : undefined;
+		const outside = new DatabaseSync(`file:${file}?vfs=unix`);
+		outside.exec("PRAGMA journal_mode=WAL; CREATE TABLE foreign_table(y)");
+		outside.close();
+		const writer = owner ?? new DatabaseSync(file);
+		expect(failure(() => writer.exec("CREATE TABLE t(x)")).errcode, `owner read first: ${ownerReadFirst}`).toBe(SQLITE_IOERR_WRITE);
+		expect(status(file)).toMatchObject({ poisoned: true, error: { kind: "foreign_write" } });
+		writer.close();
+		expect(tablesOf(url)).toEqual([]);
+	}
+});
+
+// The owner's connections all close after the commit outside the extension, so the next one
+// rebuilds the wal-index from the WAL file (a recovery): the foreign commit shows there too.
+it("a commit outside the extension shows after the owner reopens the file", () => {
 	const file = freshFile();
 	const url = ursulaUrl() + streamPath();
 	attach(file, url);
@@ -95,10 +208,11 @@ it("a commit through a connection outside the extension poisons the owner at its
 	const outside = new DatabaseSync(`file:${file}?vfs=unix`);
 	outside.exec("CREATE TABLE foreign_table(y)");
 	outside.close();
-	const e = failure(() => owner.exec("INSERT INTO t VALUES (1)"));
-	expect(e.errcode).toBe(SQLITE_IOERR_WRITE);
-	expect(status(file)).toMatchObject({ poisoned: true, fenced: false, error: { kind: "foreign_write", action: "reattach" } });
 	owner.close();
+	const reopened = new DatabaseSync(file);
+	expect(failure(() => reopened.exec("INSERT INTO t VALUES (1)")).errcode).toBe(SQLITE_IOERR_WRITE);
+	expect(status(file)).toMatchObject({ poisoned: true, error: { kind: "foreign_write" } });
+	reopened.close();
 	expect(tablesOf(url)).toEqual(["t"]);
 });
 
@@ -111,7 +225,7 @@ it("a failed attach names the server's reason, refuses opens, and blocks no late
 	const e = failure(() => attach(file, bad));
 	expect(e.message).toMatch(/^ursula_attach: invalid_name: head .*: 400 .*bucket_id must be 4 to 64 bytes, got 2 bytes/);
 	expect(failure(() => open(file)).message).toMatch(/unable to open database file/);
-	expect(failure(() => status(file)).message).toMatch(/^ursula_status: attach_failed: .* its last attach failed \(invalid_name: /);
+	expect(failure(() => status(file)).message).toMatch(/^ursula_status: attach_failed: invalid_name: .* is not attached: its last attach failed \(head /);
 	const url = ursulaUrl() + streamPath();
 	attach(file, url);
 	const db = open(file);
@@ -120,10 +234,10 @@ it("a failed attach names the server's reason, refuses opens, and blocks no late
 	expect(tablesOf(url)).toEqual(["t"]);
 });
 
-// A failed attach puts back the files of a path that held no data: here the claim is refused after
-// the attach replayed a stream with content into the file and wrote its sidecar, which would refuse
-// attaching the file to another stream ("a cache of stream ...").
-it("a failed attach of an empty file leaves no files that refuse a later attach elsewhere", async () => {
+// A failed attach empties the db file it wrote into while it held no data: here the claim is
+// refused after the attach replayed a stream with content into the file, which would refuse
+// attaching the file to another stream ("a cache of stream ..."). Its sidecar stays.
+it("a failed attach of an empty file leaves no data that refuses a later attach elsewhere", async () => {
 	const path = streamPath();
 	const writer = freshFile();
 	attach(writer, ursulaUrl() + path);
@@ -138,10 +252,23 @@ it("a failed attach of an empty file leaves no files that refuse a later attach 
 	} finally {
 		await gate.reset();
 	}
-	expect(existsSync(file) || existsSync(`${file}-ursula`)).toBe(false);
+	expect(statSync(file).size).toBe(0);
 	const other = ursulaUrl() + streamPath();
 	attach(file, other);
 	expect(tablesOf(other)).toEqual([]);
+});
+
+// A database that was never replicated is refused, never replicated over, and its kind says so.
+it("a file with data and no sidecar is an unreplicated file", () => {
+	const file = freshFile();
+	const plain = new DatabaseSync(file);
+	plain.exec("CREATE TABLE mine(x)");
+	plain.close();
+	const e = failure(() => attach(file, ursulaUrl() + streamPath()));
+	expect(e.message).toMatch(/^ursula_attach: unreplicated_file: .* has data but no readable sidecar .*it was never replicated/);
+	const kept = new DatabaseSync(`file:${file}?vfs=unix&mode=ro`);
+	expect(tables(kept)).toEqual(["mine"]);
+	kept.close();
 });
 
 it("an endpoint that does not answer is unreachable", () => {
@@ -150,7 +277,7 @@ it("an endpoint that does not answer is unreachable", () => {
 });
 
 // Regression: a fenced owner's commits failed, but its connections kept serving the state the new
-// owner moved past, indefinitely.
+// owner moved past, indefinitely. A read transaction already open keeps its snapshot until it ends.
 it("a fenced owner's reads fail too", async () => {
 	const url = ursulaUrl() + streamPath();
 	const file = freshFile();
@@ -173,6 +300,48 @@ it("a fenced owner's reads fail too", async () => {
 	const again = open(file);
 	expect(again.prepare("SELECT x FROM t ORDER BY x").all()).toEqual([{ x: 1 }, { x: 9 }]);
 	again.close();
+});
+
+// A read transaction's start checks the fence without the database's mutex, which a commit holds
+// across its append: a reader on another thread is not held up by a commit waiting for the stream.
+it("a reader is not held up by another thread's commit waiting for its append", async () => {
+	const file = freshFile();
+	proxy.reset();
+	// The claim, CREATE TABLE and the first INSERT go through; the worker's commit is held.
+	proxy.stallAfter = 3;
+	const script = `
+		import { DatabaseSync } from "node:sqlite";
+		import { Worker } from "node:worker_threads";
+		const [ext, file, url] = process.argv.slice(1);
+		const control = new DatabaseSync(":memory:", { allowExtension: true });
+		control.loadExtension(ext);
+		control.prepare("SELECT ursula_attach(?, ?)").get(file, url);
+		const db = new DatabaseSync(file);
+		db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+		const reader = new DatabaseSync(file);
+		const count = () => reader.prepare("SELECT count(*) AS n FROM t").get().n;
+		count();
+		const worker = new Worker(
+			'(async () => { const { DatabaseSync } = await import("node:sqlite");' +
+			'const { parentPort, workerData } = await import("node:worker_threads");' +
+			'const w = new DatabaseSync(workerData); parentPort.postMessage("committing");' +
+			'try { w.exec("INSERT INTO t VALUES (2)"); } catch {} })();',
+			{ eval: true, workerData: file },
+		);
+		await new Promise((res) => worker.on("message", res));
+		await new Promise((res) => setTimeout(res, 1000));
+		const started = performance.now();
+		const n = count();
+		console.log(JSON.stringify({ n, ms: performance.now() - started }));
+		process.exit(0);
+	`;
+	try {
+		const { n, ms } = await runScript(script, [vfsPath(), file, proxy.url + streamPath()], { URSULA_VFS_RETRY_MS: "1000" });
+		expect(n).toBe(1);
+		expect(ms).toBeLessThan(500);
+	} finally {
+		proxy.reset();
+	}
 });
 
 // The three ways a commit fails stay apart in `ursula_status`: refused before it reached the stream

@@ -45,11 +45,19 @@ export interface AttachOptions {
 /**
  * Catches `file` up from the stream (installing the stream's latest snapshot first when the file is
  * missing or behind it), claims the stream for this process (fencing every earlier owner)
- * and attaches the file. No connection to `file` may be open; the process keeps a host lock on the file
- * for its lifetime. Returns the stream offset the file reflects (a {@link StreamOffset}). A file that has a sidecar (`<file>-ursula`,
- * written by its first attach) opens in this process only while attached here: not before an attach
- * of it succeeds, nor after one fails (unless refused up front for open connections, another thread
- * attaching it, or another process holding it, which leaves the file as it was).
+ * and attaches the file. No connection to `file` may be open, and the process may hold no writable
+ * descriptor on it outside the extension (such as a connection opened before the extension was
+ * loaded), whose commits would never reach the stream. The process keeps a host lock on the file for
+ * its lifetime. Returns the stream offset the file reflects (a {@link StreamOffset}). A file that has
+ * a sidecar (`<file>-ursula`, written by its first attach) opens in a new process only once attached
+ * there. After a failed attach, the file opens in this process only once an attach of it succeeds,
+ * whether or not it has a sidecar. An attach refused up front (open connections, another thread
+ * attaching it, another process holding it, a writable descriptor outside the extension) leaves the
+ * file, and its binding, as they were.
+ *
+ * A failed attach throws an error whose message starts with `ursula_attach: <kind>: `, a stable
+ * name of what failed (such as `invalid_name`, `unreachable`, `in_use`,
+ * `unreplicated_file`, `fenced`). The design doc lists the kinds and what to do about each.
  *
  * With `{ readOnly: true }` it claims nothing (see {@link AttachOptions.readOnly}). An attach that a
  * layer in front of the stream refuses with `402 Payment Required` throws
@@ -140,6 +148,14 @@ export interface AttachStatus {
 	readonly snapshot_error: string | null;
 	/** Compressed size of the latest snapshot body this owner built, published or not (`null` for none since the attach). Ursula's gateway refuses a body above its `--max-request-body-bytes` (32 MiB by default) with `413`. Absent with an extension before 0.7.3. */
 	readonly snapshot_bytes?: number | null;
+	/**
+	 * Why writes fail now, `null` while they go through. `kind` is a stable name of what failed (the
+	 * design doc lists them), `action` what to do: `retry` (nothing reached the stream, the file stays
+	 * usable), `reattach` (attach the file again, which replays the stream), `stop` (another owner
+	 * holds the stream) or `fix` (change the URL, the setup or the transaction). `message` is the
+	 * reason (`reason`'s text while poisoned). Absent with an extension before 0.7.5.
+	 */
+	readonly error?: { readonly kind: string; readonly action: "retry" | "reattach" | "stop" | "fix"; readonly message: string } | null;
 }
 
 export function status(file: string): AttachStatus {

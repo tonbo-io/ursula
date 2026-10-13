@@ -72,7 +72,7 @@ fn c_text(s: &str) -> CString {
 }
 
 /// Returns `outcome` from a SQL function: its text, or the error as `name: kind: error`, the
-/// kind ([`ErrorKind`]) a stable token in a fixed place, which callers branch on instead of the
+/// kind ([`ErrorKind`](crate::error::ErrorKind)) a stable token in a fixed place, which callers branch on instead of the
 /// text.
 ///
 /// # Safety

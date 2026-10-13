@@ -203,13 +203,14 @@ it("(f) a same-boot image whose WAL is behind its sidecar is rejected and rebuil
 	expect(rows(fresh)).toEqual(["1:fir", "2:sec", "3:thi", "4:fou"]);
 });
 
-// The WAL frames reached the disk, the sidecar's last renames did not: the files hold more than the
-// sidecar says, and replaying from its offset is idempotent.
-it("(g) a same-boot image whose WAL is ahead of its sidecar is trusted", async () => {
+// The WAL frames reached the disk, the sidecar's last renames did not: the WAL holds commits past
+// the sidecar's claim. They cannot be told from commits of a connection outside the extension, which
+// are in no stream, so the files are rebuilt, from the stream that holds every acknowledged commit.
+it("(g) a same-boot image whose WAL is ahead of its sidecar is rebuilt from the stream", async () => {
 	const { url, file, sidecar } = await twoOwners();
 	writeFileSync(`${file}-ursula`, sidecar);
 	attach(file, url);
-	expect(status(file)).toMatchObject({ local: sidecarOffset(sidecar), installed: "-1" });
+	expect(status(file)).toMatchObject({ local: "-1", installed: "-1" });
 	expect(rows(file)).toEqual(["1:fir", "2:sec", "3:thi"]);
 });
 

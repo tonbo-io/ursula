@@ -1,5 +1,7 @@
-//! The local files of an attached database besides the WAL: the sidecar (`<db>-ursula`),
-//! the boot it was written in, and the locks that keep other processes off the db file.
+//! The local files of an attached database besides the WAL: the sidecar (`<db>-ursula`), the
+//! boot it was written in, the locks that keep other processes off the db file, the scan for
+//! descriptors of this process outside the extension (`open_in_process`), and what a failed
+//! attach undoes (`empty_again`).
 
 use std::fs::OpenOptions;
 use std::fs::{self};
@@ -14,47 +16,132 @@ const OPEN_FDS: &str = "/proc/self/fd";
 #[cfg(not(target_os = "linux"))]
 const OPEN_FDS: &str = "/dev/fd";
 
-/// A descriptor of this process open on the db file `path` (the same device and inode), if any.
-/// Attach calls it while no connection of this VFS has the file open and nothing of its own
-/// does, so such a descriptor belongs to a connection outside the extension: one opened before
-/// the extension was loaded (the default VFS was "unix" then) or through another VFS, which
-/// SQLite keeps open for the connection's lifetime. Its commits would bypass the stream, and the
-/// "unix" VFS shares its locks and wal-index with this VFS's connections in the process, so no
-/// lock tells it apart. `None` as well when the descriptors cannot be listed (no `/proc` or
-/// `/dev/fd`) or the file does not exist.
+/// A descriptor of this process open for writing on the db file `path`, if any. Attach calls it
+/// while no connection of this VFS has the file open and nothing of its own does, so such a
+/// descriptor is outside the extension: a connection opened before the extension was loaded (the
+/// default VFS was "unix" then), one opened through another VFS, or any other writer. The "unix"
+/// VFS shares its locks and wal-index with this VFS's connections in the process, so no lock tells
+/// such a connection apart, and its commits would never reach the stream.
+///
+/// Only a descriptor that can write counts (`writable`): SQLite opens a connection's file
+/// read-write unless the connection is read-only, and a read-only one can neither commit nor
+/// checkpoint. A file watcher, a backup reading the file, or a read-only connection does not. And
+/// only one whose name is the db file's (`fd_name`) is compared by device and inode, so no
+/// descriptor of an unrelated file is ever stat'ed (a stat on a hung network mount can block). So a
+/// descriptor opened through another hard link of the file is not found. `None` as well when the
+/// descriptors cannot be listed (no `/proc` or `/dev/fd`), or the file does not exist.
 pub(crate) fn open_in_process(path: &str) -> Option<i32> {
-    use std::os::unix::fs::MetadataExt;
-    let file = fs::metadata(path).ok()?;
+    let file = path_identity(path)?;
+    let name = std::path::Path::new(path).file_name()?.to_owned();
     fs::read_dir(OPEN_FDS)
         .ok()?
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
         .find(|&fd| {
-            // A descriptor closed since the listing (or the listing's own) fails or differs.
-            fd_file(fd).is_some_and(|(dev, ino)| dev == i128::from(file.dev()) && ino == file.ino())
+            // A descriptor closed since the listing (or the listing's own) fails one of these.
+            writable(fd)
+                && fd_name(fd).is_some_and(|n| same_name(&n, &name))
+                && fd_identity(fd) == Some(file)
         })
 }
 
+/// A file's device and inode, as `stat` and `fstat` report them (one type on both sides).
+type Identity = (libc::dev_t, libc::ino_t);
+
+/// The device and inode of the file at `path`, `None` when it cannot be stat'ed.
+#[expect(unsafe_code, reason = "stat into a libc struct has no safe std API")]
+fn path_identity(path: &str) -> Option<Identity> {
+    let c = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `stat` is a C struct of integers, for which all zeros is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated and `stat` writes the struct at the pointer.
+    if unsafe { libc::stat(c.as_ptr(), &raw mut st) } != 0 {
+        return None;
+    }
+    Some((st.st_dev, st.st_ino))
+}
+
 /// The device and inode of the file descriptor `fd` is open on, `None` when it is not open.
-/// Through `fstat`: a `stat` of `/dev/fd/<fd>` reports another device on macOS.
 #[expect(
     unsafe_code,
     reason = "fstat of a descriptor number this process lists has no safe std API"
 )]
-fn fd_file(fd: i32) -> Option<(i128, u64)> {
+fn fd_identity(fd: i32) -> Option<Identity> {
     // SAFETY: `stat` is a C struct of integers, for which all zeros is a valid value.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fstat` only reads the descriptor number (failing with EBADF when it is closed) and
-    // writes the `stat` at the pointer.
+    // writes the struct at the pointer.
     if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
         return None;
     }
-    // `dev_t` is signed on macOS and unsigned on Linux: both widen to i128.
-    Some((i128::from(st.st_dev), st.st_ino))
+    Some((st.st_dev, st.st_ino))
+}
+
+/// Whether descriptor `fd` is open for writing (its access mode is not read-only).
+#[expect(
+    unsafe_code,
+    reason = "fcntl(F_GETFL) of a descriptor number has no safe std API"
+)]
+fn writable(fd: i32) -> bool {
+    // SAFETY: F_GETFL only reads the descriptor's flags (failing with EBADF when it is closed).
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && flags & libc::O_ACCMODE != libc::O_RDONLY
+}
+
+/// The name of the file descriptor `fd` is open on, from the kernel's record of its path (no
+/// filesystem call): `/proc/self/fd/<fd>` on Linux, which reads ` (deleted)` after the name of a
+/// file since unlinked.
+#[cfg(target_os = "linux")]
+fn fd_name(fd: i32) -> Option<std::ffi::OsString> {
+    let target = fs::read_link(format!("{OPEN_FDS}/{fd}")).ok()?;
+    Some(target.file_name()?.to_owned())
+}
+
+/// As above, through `fcntl(F_GETPATH)` on macOS.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "fcntl(F_GETPATH) into a buffer has no safe std API"
+)]
+fn fd_name(fd: i32) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX bytes into `buf`.
+    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
+    Some(path.file_name()?.to_owned())
+}
+
+/// Elsewhere no descriptor's name is known, and none is found.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn fd_name(_fd: i32) -> Option<std::ffi::OsString> {
+    None
+}
+
+/// Whether a descriptor's file name is the db file's: equal, and on macOS equal but for ASCII case
+/// (its volumes are usually case-insensitive, and the kernel reports the name as stored). A name
+/// that only differs in case is compared by device and inode next, so it never matches another
+/// file.
+fn same_name(found: &std::ffi::OsStr, name: &std::ffi::OsStr) -> bool {
+    if cfg!(target_os = "macos") {
+        found
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(name.as_encoded_bytes())
+    } else {
+        found == name
+    }
 }
 
 /// The sidecar format (`sidecar_line`): 2 records offsets as the server's strings.
 pub(crate) const SIDECAR_VERSION: u32 = 2;
+
+/// The boot id of a sidecar whose local files must never be trusted again (`Db::distrust_local`):
+/// a poison found them damaged, or written by a connection outside the extension. No kernel has
+/// it, so every extension of the minor discards the files at the next attach (`Sidecar::trusted`).
+pub(crate) const DAMAGED_BOOT: &str = "damaged";
 
 /// This kernel's boot id; `None` when unknown, which never matches a recorded one. Within one boot
 /// every completed write stays visible (the page cache survives any process crash), so local files
@@ -345,76 +432,44 @@ pub(crate) fn lock_unused(path: &str, f: &fs::File) -> Result<(), Error> {
     })
 }
 
+/// Whether the db file at `path` holds data (an error reading its size counts as none, as attach's
+/// own check takes it: `attach_files`).
+pub(crate) fn holds_data(path: &str) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.len() > 0)
+}
+
+/// Whether the db file at `path` is known to hold no data: missing, or empty. Any other error
+/// reading its size is no such proof.
+pub(crate) fn holds_no_data(path: &str) -> bool {
+    match fs::metadata(path) {
+        Ok(m) => m.len() == 0,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Empties the db file of a path that held no data when an attach began, after that attach wrote
+/// into it and then failed (`attach`): back to no bytes, keeping its inode (`lock_unused`), its
+/// sidecar and every other file next to it. Only what the attach wrote is undone, and only while
+/// nothing else can have written the file since: under the lock that keeps other processes off it
+/// (`lock_unused`), and while no writable descriptor of this process outside the extension is
+/// open on it (`open_in_process`). Otherwise the files stay as they are, the sidecar naming the
+/// stream. A db file without data attaches to any stream later, and its sidecar keeps opens
+/// through the extension refused (in other processes, and under another spelling of the path).
+pub(crate) fn empty_again(path: &str) -> Result<(), Error> {
+    if let Some(fd) = open_in_process(path) {
+        return Err(Error::OpenOutsideVfs {
+            path: path.to_owned(),
+            fd,
+        });
+    }
+    open_locked(path)?.set_len(0).map_err(|source| Error::Io {
+        op: "truncate",
+        path: path.to_owned(),
+        source,
+    })
+}
+
 /// Opens the db file and locks it (`lock_unused`); the lock lasts while the descriptor is open.
-/// The local files of a path whose db file holds no data, as an attach found them: what a failed
-/// attach of it puts back ([`Fresh::restore`]). Such a file has nothing to lose, and the files the
-/// attach left (its sidecar, a db file it replayed into midway) would refuse a later attach to
-/// another URL (`Error::OtherStream`), or, once a connection outside the extension wrote the db
-/// file, any attach (`Error::NoSidecar`).
-pub(crate) struct Fresh {
-    db: bool,
-    wal: bool,
-    shm: bool,
-    sidecar: Option<Vec<u8>>,
-}
-
-impl Fresh {
-    /// The files of `path` when its db file holds no data (missing or empty); `None` otherwise.
-    pub(crate) fn of(path: &str) -> Option<Fresh> {
-        if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
-            return None;
-        }
-        let exists = |suffix: &str| fs::exists(format!("{path}{suffix}")).unwrap_or(true);
-        Some(Fresh {
-            db: exists(""),
-            wal: exists("-wal"),
-            shm: exists("-shm"),
-            sidecar: fs::read(format!("{path}-ursula")).ok(),
-        })
-    }
-
-    /// Puts the files of `path` back as found after a failed attach: the db file empty again (or
-    /// gone when the attach created it), under the lock that keeps other processes off it, then
-    /// the sidecar as it was, and no `-wal` or `-shm` the attach created. Never data that was
-    /// there before: the db file held none, and a WAL next to an empty db file holds nothing
-    /// committed. When another process holds the db file, everything stays: the sidecar keeps
-    /// naming the stream, so a later attach discards and rebuilds the files.
-    pub(crate) fn restore(&self, path: &str) -> Result<(), Error> {
-        let written = fs::metadata(path).is_ok_and(|m| m.len() > 0);
-        if written || (!self.db && fs::exists(path).unwrap_or(false)) {
-            let f = open_locked(path)?;
-            if self.db {
-                f.set_len(0).map_err(|source| Error::Io {
-                    op: "truncate",
-                    path: path.to_owned(),
-                    source,
-                })?;
-            } else {
-                remove_if_exists(path)?;
-            }
-        }
-        let sidecar = format!("{path}-ursula");
-        match &self.sidecar {
-            Some(before) => {
-                if fs::read(&sidecar).ok().as_ref() != Some(before) {
-                    fs::write(&sidecar, before).map_err(|source| Error::Io {
-                        op: "restore",
-                        path: sidecar.clone(),
-                        source,
-                    })?;
-                }
-            }
-            None => remove_if_exists(&sidecar)?,
-        }
-        for (existed, suffix) in [(self.wal, "-wal"), (self.shm, "-shm")] {
-            if !existed {
-                remove_if_exists(&format!("{path}{suffix}"))?;
-            }
-        }
-        Ok(())
-    }
-}
-
 fn open_locked(path: &str) -> Result<fs::File, Error> {
     let f = OpenOptions::new().read(true).write(true).open(path);
     let f = f.map_err(|source| Error::Io {
@@ -431,12 +486,15 @@ mod tests {
     use std::fs;
     use std::fs::OpenOptions;
 
-    use super::Fresh;
     use super::boot_id;
+    use super::empty_again;
+    use super::holds_data;
+    use super::holds_no_data;
     use super::open_in_process;
     use super::read_sidecar;
     use super::sidecar_line;
     use super::stamp;
+    use crate::error::Error;
     use crate::frame::PAGE;
     use crate::wal::WalClaim;
     use crate::wal::be32;
@@ -556,7 +614,13 @@ mod tests {
             wal.extend(page);
         }
         fs::write(format!("{db}-wal"), &wal).unwrap();
-        for (claim, trusted) in [("00000000000000aa:2", true), ("00000000000000bb:2", false)] {
+        // The claim is the WAL's last commit exactly: a commit past it (one whose sidecar update a
+        // crash cut off, or a commit of a connection outside the extension) is not trusted.
+        for (claim, trusted) in [
+            ("00000000000000aa:2", true),
+            ("00000000000000bb:2", false),
+            ("00000000000000aa:1", false),
+        ] {
             let line = format!("{mine} wal={claim}\n");
             assert_eq!(trust(line.as_bytes(), b1), Some(trusted), "{claim}");
         }
@@ -572,55 +636,71 @@ mod tests {
         assert!(boot_id().is_some(), "the kernel's boot id is unreadable");
     }
 
-    // A descriptor of this process on the db file is found by its inode, under any name, and
-    // none once it is closed.
+    // A writable descriptor of this process on the db file is found by its name and inode. A
+    // read-only one (a file watcher, a backup reading the file, a read-only connection) is not,
+    // nor one on another file of the same name, nor any once closed.
     #[test]
-    fn a_descriptor_on_the_db_file_is_found() {
+    fn a_writable_descriptor_on_the_db_file_is_found() {
         let dir = std::env::temp_dir().join(format!("ursula-fds-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("other");
+        fs::create_dir_all(&other).unwrap();
         let path = dir.join("app.db").to_string_lossy().into_owned();
         assert_eq!(open_in_process(&path), None, "no file");
         fs::write(&path, b"").unwrap();
         assert_eq!(open_in_process(&path), None);
-        let f = fs::File::open(&path).unwrap();
+        let reader = fs::File::open(&path).unwrap();
+        assert_eq!(open_in_process(&path), None, "read-only");
+        let same_name = other.join("app.db");
+        fs::write(&same_name, b"").unwrap();
+        let elsewhere = OpenOptions::new().write(true).open(&same_name).unwrap();
+        assert_eq!(
+            open_in_process(&path),
+            None,
+            "another file of the same name"
+        );
+        let writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         assert!(open_in_process(&path).is_some());
-        drop(f);
+        drop(writer);
         assert_eq!(open_in_process(&path), None);
+        drop((reader, elsewhere));
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // A failed attach of a path whose db file held no data puts its files back: the db file
-    // empty again, or gone when the attach created it, the sidecar as it was, and no `-wal` or
-    // `-shm` it created. One that held data is no `Fresh` path at all.
+    // A failed attach of a path whose db file held no data empties the db file it wrote into,
+    // and nothing else: the sidecar, the WAL and the shm stay. Never while a writable descriptor
+    // of this process outside the extension is open on the file, which may have written it.
     #[test]
-    fn a_fresh_path_is_put_back_after_a_failed_attach() {
+    fn a_failed_attach_empties_only_the_db_file_it_wrote() {
         let dir = std::env::temp_dir().join(format!("ursula-fresh-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("app.db").to_string_lossy().into_owned();
-        let sidecar = format!("{path}-ursula");
-
-        let fresh = Fresh::of(&path).unwrap();
-        fs::write(&path, vec![1u8; PAGE]).unwrap();
-        fs::write(&sidecar, "-1 0 v=2").unwrap();
-        fs::write(format!("{path}-wal"), b"wal").unwrap();
-        fresh.restore(&path).unwrap();
-        for file in [path.clone(), sidecar.clone(), format!("{path}-wal")] {
-            assert!(!fs::exists(&file).unwrap(), "{file}");
-        }
-
+        assert!(holds_no_data(&path), "missing");
         fs::write(&path, b"").unwrap();
-        fs::write(&sidecar, "before").unwrap();
-        fs::write(format!("{path}-shm"), b"shm").unwrap();
-        let fresh = Fresh::of(&path).unwrap();
+        assert!(holds_no_data(&path) && !holds_data(&path), "empty");
         fs::write(&path, vec![1u8; PAGE]).unwrap();
-        fs::write(&sidecar, "after").unwrap();
-        fresh.restore(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "before");
-        assert!(fs::exists(format!("{path}-shm")).unwrap());
-
-        fs::write(&path, vec![1u8; PAGE]).unwrap();
-        assert!(Fresh::of(&path).is_none());
+        assert!(!holds_no_data(&path) && holds_data(&path));
+        for suffix in ["-ursula", "-wal", "-shm"] {
+            fs::write(format!("{path}{suffix}"), suffix).unwrap();
+        }
+        let outside = OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(matches!(
+            empty_again(&path),
+            Err(Error::OpenOutsideVfs { .. })
+        ));
+        assert!(holds_data(&path));
+        drop(outside);
+        empty_again(&path).unwrap();
+        assert!(fs::exists(&path).unwrap() && holds_no_data(&path));
+        for suffix in ["-ursula", "-wal", "-shm"] {
+            assert_eq!(
+                fs::read_to_string(format!("{path}{suffix}")).unwrap(),
+                suffix
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }

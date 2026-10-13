@@ -34,69 +34,89 @@ WAL commit is appended to the stream *before* any of the transaction's frames re
   read without `Stream-Next-Offset` is an error. `ursula_attach`, `ursula_status`, `ursula_stats`
   and the TypeScript API return offsets as these strings.
 - One owner per file per host: attach takes `flock` on `<db>-ursula.lock` for the process
-  lifetime, and refuses while any connection to the file is open, a connection outside the
-  extension in this process included (§3, step 1).
+  lifetime, and refuses while any connection to the file is open, a writable descriptor of this
+  process outside the extension included (§3, step 1).
 - A db file with a sidecar is the cache of a stream. It opens through the VFS only while an attach
   of it has succeeded in this process. Before that (a process that never attached it, including a
   restarted one) opening it fails with `SQLITE_CANTOPEN`. Passed through to `unix`, its commits
   would never reach the stream. A file without a sidecar passes through, unless its last attach in
   this process failed: after a failed attach the path opens through the VFS only once an attach
-  succeeds, sidecar or not.
+  succeeds, sidecar or not. An attach refused up front (connections of the VFS open, another thread
+  attaching, another process holding the file, a writable descriptor outside the extension)
+  changes nothing, and is no failed attach.
 
 ### Errors
 
-Every failure has a kind, a stable token that callers branch on instead of the message's text.
-One function maps every error to its kind (`Error::kind`).
+Every failure has a kind, a stable token that callers branch on instead of the message's text, and
+each kind one action. `Error::kind` maps every error, `Error::poison_kind` the reason of a poison,
+and `WriteRefusal::error_kind` a write refused before it reached the stream, all in `error.rs`.
 
 - A SQL function's error message is `<function>: <kind>: <message>`, such as
   `ursula_attach: invalid_name: head http://h/s2/kv1: 400 ... bucket_id must be 4 to 64 bytes, got
   2 bytes`. The result codes are unchanged: `SQLITE_ERROR`, `SQLITE_AUTH` for an attach refused
   with `402`, `SQLITE_IOERR_AUTH` for one refused before it reached the stream in another way.
 - `ursula_status` of an attached file has `error`: `null` while writes go through, otherwise
-  `{"kind", "action", "message"}`. A poisoned file reports `fenced` once a fence was seen, and the
-  first reason's kind otherwise, with that reason as the message (the `reason` field's text). A
-  write refused before it reached the stream reports `refused` (`refused_kind` says by what), or
-  `unreachable` when its last attempt never went out.
-- `ursula_status` of a file that is not attached fails with kind `not_attached`, or `attach_failed`
-  when its last attach in this process failed, whose message ends with `its last attach failed
-  (<kind>: <message>)`.
+  `{"kind", "action", "message"}`. A poisoned file reports `fenced` and `stop` once a fence was
+  seen, and otherwise its first reason's kind and that kind's action, with the first reason as the
+  message (the `reason` field's text). A write refused before it reached the stream reports the
+  refusal's kind and action (`refused_kind` says what refused it).
+- `ursula_status` of a path that is not attached fails. Its kind is `not_attached` for a path
+  never attached in this process, and `attach_failed` for one whose last attach in this process
+  failed, followed by that failure's kind in a fixed place:
+  `ursula_status: attach_failed: <kind>: <path> is not attached: its last attach failed
+  (<message>)`. `attach_failed` has no action of its own: the wrapped kind's action applies.
 - A file method cannot choose SQLite's message, so a commit or read that fails names nothing by
   itself: the caller reads `ursula_status` right after it. A commit refused before it reached the
-  stream fails with `SQLITE_IOERR_AUTH` (7178). A poisoned commit fails with `SQLITE_IOERR_WRITE`
-  (778), and `error.kind` tells an unknown outcome from a fence. A read of a fenced file fails with
-  `SQLITE_IOERR_READ` (266, §3, fencing). An open refused because the path is not attached fails
-  with `SQLITE_CANTOPEN` (14).
+  stream fails with `SQLITE_IOERR_AUTH` (7178), and the file stays usable. A poisoned commit fails
+  with `SQLITE_IOERR_WRITE` (778), and `error.kind` tells an unknown outcome from a fence. A read
+  transaction of a fenced file fails with `SQLITE_IOERR_READ` (266, §3, fencing). An open refused
+  because the path is not attached fails with `SQLITE_CANTOPEN` (14).
 
 | kind | what failed | `action` |
 | --- | --- | --- |
 | `invalid_argument` | an argument of a SQL function (an attach mode, a NUL byte in a path) | `fix` |
-| `invalid_url` | the URL does not parse or answers with a redirect the extension does not follow | `fix` |
+| `invalid_url` | the URL does not parse, or answers with a redirect the extension does not follow | `fix` |
 | `invalid_name` | the server answered the stream's `HEAD` or create with `400`, refusing its bucket or stream id | `fix` |
 | `not_found` | the stream is missing (or hidden from the credentials) | `fix` |
-| `in_use` | connections open, another thread or process attaching or holding the file, or a descriptor outside the extension (§3) | `fix` |
+| `in_use` | connections of the VFS open, another thread or process attaching or holding the file, or a writable descriptor of this process outside the extension (§3, step 1) | `fix` |
+| `unreplicated_file` | the db file holds data but has no readable sidecar: it was never replicated (§3, step 2) | `fix` |
+| `other_stream` | the local files are the cache of another stream | `fix` |
+| `too_large` | a commit's frame is over the frame limit, or a vouched `413` refused it: the same transaction never goes through (§7) | `fix` |
 | `unsupported` | the application left WAL mode, changed the page size, or used `locking_mode=EXCLUSIVE` | `fix` |
-| `not_attached` | the file was never attached in this process | `fix` |
+| `stream_state` | the stream holds or answers something the extension cannot follow (an undecodable frame, lost acknowledged data, no incarnation) | `fix` |
+| `not_attached` | the path was never attached in this process | `fix` |
 | `unreachable` | no answer: no lookup, no connection, a timeout, or a write whose every attempt failed before it went out | `retry` |
 | `unavailable` | answered `429`, `408`, `307` or 5xx until the retry budget ran out | `retry` |
-| `unauthorized` | `401`, or a `403` that is no fence | `retry` |
+| `unauthorized` | `401`, or a `403` that is no fence, on a request that applies nothing | `retry` |
 | `refused` | a write refused before it reached the stream (§2) | `retry` |
-| `outcome_unknown` | an append whose outcome stayed unknown until the retry budget ran out: the stream may hold it | `reattach` |
-| `foreign_write` | a connection outside the extension committed to the local WAL (§3, step 1) | `reattach` |
+| `outcome_unknown` | an append whose outcome is unknown: no answer within the retry budget, or an answer that does not prove that nothing was applied (§2) | `reattach` |
+| `foreign_write` | a connection outside the extension committed to the local files (§3, step 1) | `reattach` |
 | `local_damage` | a page read back other bytes than written, or an fsync failed (§6) | `reattach` |
-| `local_state` | the local files cannot be used as they are (no sidecar, another stream's cache, an I/O error) | `reattach` |
-| `stream_state` | the stream holds something the extension cannot follow (an undecodable frame, lost data) | `reattach` |
-| `attach_failed` | the file's last attach in this process failed | `reattach` |
-| `internal` | a panic in the extension or a missing routine of the host's SQLite | `reattach` |
-| `fenced` | another owner claimed the stream, it was recreated, or a foreign writer appended | `stop` |
+| `local_state` | an I/O error on the local files | `reattach` |
+| `internal` | a panic in the extension, or a missing routine of the host's SQLite | `reattach` |
+| `fenced` | another owner claimed the stream, it was recreated, or a writer outside the protocol appended | `stop` |
+| `attach_failed` | the path's last attach in this process failed | the wrapped kind's |
 
-The actions: `retry` the same handle later, since nothing reached the stream (a refused commit
-leaves the file usable). `reattach`: close the file's connections and attach it again, which
-replays what the stream holds (for `local_state`, after removing what the message names). `stop`:
-another owner holds the stream, and attaching again takes it back from that owner, which only a
-deliberate takeover does. `fix` the request, the setup or the use, then attach again. A poison is
-never retried on the same handle, so a poison whose reason would be retried (an append's `403`
-that is neither the fence nor vouched, which a proxy may send in place of the stream's own answer)
-reports `outcome_unknown`.
+The actions:
+
+- `retry`: the same handle works again later, since nothing reached the stream. A refused commit
+  leaves the file usable, and the next commit is sent as usual.
+- `reattach`: close the file's connections and attach it again. The attach replays what the stream
+  holds, and rebuilds local files that a poison found damaged or written outside the extension
+  (§6, distrust).
+- `stop`: another owner holds the stream. Stop writing. Attaching again takes the stream back from
+  that owner, which only a deliberate takeover does.
+- `fix`: the request cannot succeed as made. Fix the URL, the name, the setup, the files or the
+  transaction, then try again. Nothing tells a caller to remove a file that may hold data: an
+  `unreplicated_file`'s message says how to copy its rows into a newly attached file.
+
+The three ways a commit fails: refused before it reached the stream (7178, `refused` or
+`unreachable` or `too_large`, file usable), an unknown outcome (778, `outcome_unknown`, poisoned,
+`fenced: false`), and fenced (778, `fenced`, poisoned, `fenced: true`). A poison is never retried on
+the same handle, so a poison whose reason is of a `retry` kind (a re-claim's read that the endpoint
+put off) reports `outcome_unknown`. An append's `403` that is neither the fence nor vouched, and a
+`401` after an attempt that may have reached the stream, are `outcome_unknown` themselves, for a
+commit and for an attach's claim alike.
 
 ## 2. Writes
 
@@ -308,34 +328,55 @@ leaving a stream whose rebuilt copies need a rollback journal to be written.
 
 1. Takes the host lock. Refuses if a connection to the file is open in this process. Once the
    previous attachment's snapshot thread has closed its connection, it also refuses (`in_use`) while
-   the process holds the db file open on any descriptor (`local::open_in_process`: it lists
-   `/proc/self/fd`, or `/dev/fd` elsewhere, and compares device and inode). No connection of the
-   VFS is open then, so the descriptor belongs to a connection outside the extension: one opened
-   before the extension was loaded, when `unix` was the default VFS, or through another VFS. The
-   `unix` VFS shares its locks and wal-index with the VFS's own connections in the process, so no
-   lock tells it apart, and its commits would never reach the stream. This refusal counts as a
-   failed attach.
-   One that opens later (`?vfs=unix`), or a process without the extension, writes the same WAL.
-   Whenever a connection of the VFS releases the WAL write lock, the database records the
-   wal-index header (`WalSeen`), and whenever one takes the lock, and before the snapshot thread
-   copies pages (§4.2, after step 4), the header is compared with it. A last commit frame that
-   moved within the same WAL generation, or frames after a WAL the VFS left empty, is a commit no
-   connection of the VFS wrote: the database is poisoned (`foreign_write`, local damage, so no
-   snapshot publishes it) before any other commit is acknowledged.
+   the process holds the db file open on a writable descriptor (`local::open_in_process`). It lists
+   `/proc/self/fd` (or `/dev/fd` on macOS), keeps the descriptors whose access mode can write
+   (`F_GETFL`), and of those the ones whose file name, as the kernel records it (`/proc/self/fd`
+   links, `F_GETPATH` on macOS, the case ignored there), is the db file's. Only those are compared
+   by device and inode, so no descriptor of an unrelated file is stat'ed, which on a hung network
+   mount could block. No connection of the VFS is open then, so such a descriptor is outside the
+   extension: a connection opened before the extension was loaded, when `unix` was the default VFS,
+   one opened through another VFS, or any other writer. SQLite opens a connection's file read-write
+   unless the connection is read-only, and a read-only one can neither commit nor checkpoint, so a
+   read-only descriptor (a file watcher, a backup reading the file, a `mode=ro` connection) does not
+   refuse the attach. The `unix` VFS shares its locks and wal-index with the VFS's own connections
+   in the process, so no lock tells such a connection apart, and its commits would never reach the
+   stream. The refusal changes nothing, like the other refusals of this step: a bound path keeps its
+   binding, whose snapshot thread runs again, and the path is no failed attach.
+
+   A connection outside the extension that opens later (`?vfs=unix`), or a process without the
+   extension, writes the same WAL, so a commit it makes is caught later (`WalSeen`). The local WAL
+   file changes only at a commit of the VFS (its writes before the commit point stay in the overlay)
+   or when a connection of the VFS truncates it. So the database records the wal-index header a
+   connection of the VFS leaves whenever it releases the WAL write lock, and the header the WAL file
+   holds as of the VFS's last commit (what a recovery rebuilds from it, and after an attach that
+   kept the WAL its claim, which the WAL's last commit frame meets exactly, §6). A header with
+   frames that is neither is a commit no connection of the VFS made. It is checked whenever a
+   connection of the VFS takes the WAL write lock, whenever it releases one it committed nothing
+   under (a recovery rebuilt the header from the WAL file meanwhile), and before the snapshot thread
+   copies pages (§4.2, after step 4). The header is read the way SQLite reads it without a lock:
+   both copies, equal and initialized. After an attach that left no WAL, until the VFS's first
+   commit, no checkpoint of the VFS writes the db file either, so the db file changing (its size,
+   inode or modification time, `DbFileStamp`) is a checkpoint of a foreign commit whose WAL its
+   writer deleted. Either poisons the database before any other commit is acknowledged, as local
+   damage (`foreign_write`): no snapshot publishes it, and the next attach rebuilds the local files
+   (§6, distrust).
 2. Reads the sidecar of a file with content, then `HEAD`s the stream for its `Stream-Incarnation`
    (an opaque token that changes when the stream is deleted and recreated at the same path, and a
    stream without one is refused), before anything opens the file through SQLite. A file with
-   content and no sidecar was never attached and is refused, since its pages may never have been
-   in the stream. A sidecar for another stream path is refused. A missing stream is created for a
-   file without content, and refused for one with content (§6, wrong stream), because the local
-   files may be the only copy left. The local files are trusted when the sidecar was written in
-   this boot, from this incarnation of the stream, for this db file, and the local WAL holds what
-   the sidecar claims of it (§6). Anything else (another or unknown boot id, another incarnation, a
-   sidecar of another format, a torn one, a replaced db file, a WAL behind its sidecar) means the
-   local files are discarded (§6) and the attach proceeds as on a fresh host. A sidecar of another
-   incarnation is always discarded, whatever the recreated stream's length (logged as a recreate).
-   For one of the same incarnation, a read at its offset first checks that the stream did not lose
-   acknowledged data (§6, wrong stream).
+   content and no sidecar was never attached and is refused (`unreplicated_file`), since its pages
+   may never have been in the stream: the message says to copy its rows into a newly attached file,
+   or to move it aside to attach the path. A sidecar for another stream path is refused
+   (`other_stream`). A refused `HEAD` carries the reason a `GET` of the stream gives (§3, reads). A
+   missing stream is created for a file without content, and refused for one with content (§6, wrong
+   stream), because the local files may be the only copy left. The local files are trusted when the
+   sidecar was written in this boot, from this incarnation of the stream, for this db file, and the
+   local WAL holds what the sidecar claims of it (§6). Anything else (another or unknown boot id,
+   another incarnation, a sidecar of another format, a torn one, a replaced db file, a WAL behind or
+   past its sidecar, a sidecar a poison distrusted) means the local files are discarded (§6) and the
+   attach proceeds as on a fresh host. A sidecar of another incarnation is always discarded,
+   whatever the recreated stream's length (logged as a recreate). For one of the same incarnation, a
+   read at its offset first checks that the stream did not lose acknowledged data (§6, wrong
+   stream).
 3. Recovery, when it rewrites pages, never opens the local files through SQLite before replaying
    onto them. Trust (§6) says every page holds the state at the sidecar's offset or a later
    commit's, not that SQLite can read the file (a disk image may hold a torn page 1 that replay
@@ -385,21 +426,36 @@ leaving a stream whose rebuilt copies need a rollback journal to be written.
 
 **A failed attach.** An attach that fails after step 1 leaves the path unbound, since its files may
 hold anything between the old attachment's state and the stream's, and the stream may hold a newer
-claim. Opening its main db then fails with `SQLITE_CANTOPEN` (§1, the reason is logged and
-`ursula_status` names it as `attach_failed`) until an attach succeeds, whether or not the attach
-wrote a sidecar. A path whose db file held no data when the attach began is put back as it was
-(`local::Fresh`): the db file empty again, or removed when the attach created it, under the lock
-that keeps other processes off it, then the sidecar as it was, and no `-wal` or `-shm` the attach
-created. So the files a failed attach leaves never refuse a later attach, to the same stream or
-another one. A db file that held data keeps its files. An attach refused at step 1 for connections
-of the VFS that are open, or another thread attaching it, changes nothing, and a bound path stays
-bound. An attach whose
-claim or stream create a layer in front refuses with `402` reports `SQLITE_AUTH` rather than
-`SQLITE_ERROR`, so callers can attach read-only instead. An attach whose claim is refused before it
-reached the stream in another way (§2) reports `SQLITE_IOERR_AUTH`, the code of a refused commit.
-Nothing was claimed either way, so the attach can be tried again later. SQLite rolls back the
-calling connection's open transaction when a statement that reads a table fails with an I/O error
-code, so call `ursula_attach` without a `FROM` clause, as in `SELECT ursula_attach(?, ?)`.
+claim. Opening its main db then fails with `SQLITE_CANTOPEN` (§1, the reason is logged, and
+`ursula_status` names it as `attach_failed` with the failure's kind) until an attach succeeds,
+whether or not the path has a sidecar. The refusal is keyed by the path as SQLite names it
+(`xFullPathname`, which resolves symbolic links): another spelling of it, such as another case on a
+case-insensitive volume, opens unless a sidecar refuses it, and a hard link of the db file has a
+sidecar path of its own.
+
+A failed attach undoes only what it wrote into a path whose db file held no data when it began
+(`local::empty_again`): when the attach opened the db file to replay into it (`Applier::fresh`,
+`Applier::wrote`) or gave it its WAL format, the db file is emptied again in place, keeping its
+inode, under the lock that keeps other processes off it, and only while no writable descriptor of
+this process outside the extension is open on it. Either may have written it since. Nothing else is
+removed: the sidecar stays (it names the stream, a db file without data attaches to any stream
+later, and it keeps opens through the VFS refused in other processes and under another case of the
+path), and so do `-wal` and `-shm`. The undo runs after a panic midway too. Data found in such a db
+file before the attach writes it came from a writer outside the extension: the attach fails
+(`in_use`), removes the sidecar it created, and leaves the data, which a later attach then refuses
+as an `unreplicated_file` rather than discarding it as a cache. When the undo cannot run (another
+process holds the file, an outside writable descriptor is open), the extension logs
+`attach_restore_failed` and the files stay as they are: an attach to the same stream discards and
+rebuilds them, and one to another stream is refused (`other_stream`) until they are moved aside. A
+db file that held data keeps its files.
+
+An attach refused at step 1 changes nothing, and a bound path stays bound. An attach whose claim or
+stream create a layer in front refuses with `402` reports `SQLITE_AUTH` rather than `SQLITE_ERROR`,
+so callers can attach read-only instead. An attach whose claim is refused before it reached the
+stream in another way (§2) reports `SQLITE_IOERR_AUTH`, the code of a refused commit. Nothing was
+claimed either way, so the attach can be tried again later. SQLite rolls back the calling
+connection's open transaction when a statement that reads a table fails with an I/O error code, so
+call `ursula_attach` without a `FROM` clause, as in `SELECT ursula_attach(?, ?)`.
 
 **Read-only attach.** `ursula_attach(path, stream_url, 'read_only')` runs steps 1 to 4, skips the
 claim and the replay up to it, and ends as step 6 does: it fsyncs the db file if attach wrote it,
@@ -420,11 +476,16 @@ writes.
 
 **Fencing.** The new epoch fences every earlier owner at the server: their next append gets `403`.
 Once an owner knows it is fenced (its own append, or its snapshot thread's request, met the fence),
-reads of the file fail too: every read transaction takes a read-mark lock of the wal-index shared,
-even one whose pages its connection holds in its cache, and the VFS refuses it with
-`SQLITE_IOERR_READ` while the database is fenced. So no connection goes on serving the state the
-new owner moved past, until the file is attached again. An owner that does not write never learns
-of the fence: its reads go on from the state as of its last commit.
+new read transactions on the file fail too: every read transaction takes a read-mark lock of the
+wal-index shared when it starts, even one whose pages its connection holds in its cache, and the
+VFS refuses it with `SQLITE_IOERR_READ` while the database is fenced. So from the next read
+transaction on, no connection serves the state the new owner moved past, until the file is
+attached again. A read transaction open already when the fence lands (an explicit `BEGIN`, a
+statement not stepped to its end) keeps its snapshot until it ends. The check reads a flag set with
+the fence (`Db::fence`), not the database's mutex, which a commit holds across its append: a read
+transaction never waits for a commit. An owner that does not write never learns of the fence: its
+reads go on from the state as of its last commit.
+
 Replay applies page images per read batch (last image per page, truncate to the batch's smallest
 size first), so replaying from an older offset than the file reflects is idempotent.
 
@@ -442,10 +503,11 @@ within `URSULA_VFS_RETRY_MS`. A read that got no answer (its connection reset or
 or a timeout) is sent again on a new connection (§7). A refused connection fails it at once. The
 snapshot thread's retries also end at its stop flag. A redirect that lasts the whole budget fails
 the read with its status, so attach never takes it for a missing stream or a superseded snapshot.
-A `HEAD` refused with a 4xx other than `404` carries no explanation (a `HEAD` has no body), so the
-client sends one `GET` of the stream from its beginning and takes that answer's body as the reason
-when it is refused with a 4xx too (`client::with_reason`): the server's `400` names the bucket or
-stream id it refuses.
+Attach's `HEAD` refused with a 4xx other than `404` carries no explanation (a `HEAD` has no body),
+so the client sends one `GET` of the stream from its beginning and takes that answer's body as the
+reason when it is refused with the same status (`client::head_explained`): the server's `400` names
+the bucket or stream id it refuses. A `HEAD` that only probes the stream (a re-claim's, the snapshot
+thread's) sends no `GET`, and none is sent under the database's mutex.
 
 ## 4. Snapshots and retention
 
@@ -484,7 +546,9 @@ backup API both rewrite pages, so neither qualifies. The thread:
    another connection's checkpoint keeps it busy (a passive checkpoint gets no busy handler).
    Unless every WAL frame was checkpointed (a reader pins older frames), it gives up for now and
    retries shortly (backoff from 10 ms up to 1 s, and a failed attempt waits longer, §4.4).
-4. `BEGIN` and a read: the read transaction starts at `W`. Closes the window.
+4. `BEGIN` and a read: the read transaction starts at `W`. Checks the wal-index header, and the db
+   file while nothing of the VFS can have written it, for a commit no connection of the VFS made
+   (§3, step 1): one poisons the database, and nothing is published. Closes the window.
 5. Copies pages `1..n` of the db file through the private connection's own file handle (a second
    descriptor's close would drop the process's POSIX locks). While the read transaction lasts no
    checkpoint can write newer frames into the db file (a reader at mark 0 blocks backfill, and at a
@@ -627,8 +691,18 @@ be written into the stream. Trust is therefore verified against the files, not i
 - **The check.** Attach trusts the files only when the boot id, the stream's incarnation and the db
   file's inode match and the WAL, read the way SQLite's recovery reads it (header checksum, then
   frames in order while their salts match and the cumulative checksum holds), is the claimed
-  generation with valid frames up to at least the claimed one. For `:0`, it must hold no commit
-  frame.
+  generation with its last commit at the claimed frame exactly. For `:0`, it must hold no commit
+  frame. A commit frame past the claim is a commit the sidecar never saw: one whose sidecar update a
+  crash cut off (in the stream, so the rebuild loses nothing), or a commit of a connection outside
+  the extension (in no stream, and a checkpoint may have moved its pages into the db file). The
+  files cannot tell which, so they are rebuilt.
+- **Distrust.** A poison that finds the local files damaged (a lost write-back, a failed fsync) or
+  written by a connection outside the extension (`foreign_write`) rewrites the sidecar with a boot
+  id no kernel has (`local::DAMAGED_BOOT`), and every later sidecar of that attachment carries it
+  (`Db::distrust_local`). So the next attach, in this process or after a restart, discards the
+  files and rebuilds them from the stream, pages a checkpoint already moved into the db file
+  included. The format stays version 2: every extension of the minor reads such a sidecar as one
+  of another boot.
 - **Three fsyncs of the db file**, none per commit, all through SQLite's own handle except at attach
   (when no connection is open):
   1. before a commit that starts a new WAL generation is appended (once per WAL wrap, since SQLite
@@ -649,8 +723,9 @@ be written into the stream. Trust is therefore verified against the files, not i
 
 **Why this holds** for any crash-consistent image of the files (every write that reached the disk
 before an fsync returned is in it, and any later one may be missing or torn). Take claim `(G, f)` at
-offset `X` and an image whose WAL recovers generation `G` with at least `f` valid frames. The image
-shows `G`'s header, so it holds the db file as of fsync (1), that is every page as of `G`'s start.
+offset `X` and an image whose WAL recovers generation `G` with its last commit at frame `f`. The
+image shows `G`'s header, so it holds the db file as of fsync (1), that is every page as of `G`'s
+start.
 A page in the recovered frames has its state at `X` or later, since every commit up to `X` since
 `G` started is a frame up to `f`. Any other page is unchanged since `G` started up to `X`, so the db
 file has it, unless a checkpoint wrote it from a frame past `f` (a commit after `X`). For `:0` the
@@ -669,16 +744,17 @@ What attach does in each case:
   after the WAL writes return). A killed write leaves a prefix. SQLite's salted, cumulative WAL
   checksums stop recovery at the last whole commit, `-shm` is rebuilt, and checkpoints are redone
   from the WAL. Attach trusts the files and replays from the sidecar's offset. A crash in the
-  middle of a WAL truncate (between the `:0` sidecar and the truncate), between the first WAL write
-  of a new generation and the sidecar update, or in a recovery between the `:0` sidecar and
-  deleting the folded WAL, leaves a claim the files do not meet, which only costs a rebuild.
+  middle of a WAL truncate (between the `:0` sidecar and the truncate), between a commit's WAL
+  writes and the sidecar update (a new generation's first, or any other), or in a recovery between
+  the `:0` sidecar and deleting the folded WAL, leaves a claim the files do not meet, which only
+  costs a rebuild.
 - **Same boot, files restored from a crash-consistent image**: a block-level snapshot of the volume
   (EBS, PD or Azure disk snapshots, a CSI VolumeSnapshot or PVC clone) restored or cloned onto a
   host that has not rebooted since, or a block volume force-detached and reattached. Boot id and
-  inode survive a block copy, so the WAL claim decides. An image whose WAL holds the claimed frames
-  (or more) is used. One whose sidecar ran ahead of its WAL (typical, since the sidecar's rename
-  reaches the disk before the WAL's in-place writes) or names another generation is discarded and
-  rebuilt.
+  inode survive a block copy, so the WAL claim decides. An image whose WAL ends at the claimed
+  commit is used. One whose sidecar ran ahead of its WAL (typical, since the sidecar's rename
+  reaches the disk before the WAL's in-place writes), or behind it, or names another generation is
+  discarded and rebuilt.
 - **Reboot, power loss, kexec, a volume moved to another host**: the kernel boot id differs (Linux
   `/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`, and unknown never matches), and
   a power loss may have left any prefix of any unsynced write in any file. Attach discards the local
@@ -833,14 +909,24 @@ The crate refuses to build with `panic = "abort"`.
 - One owner process per stream at a time. Connections in other processes that load the extension
   cannot open the file (§1), and processes without it are not replicated (and block recovery).
 - **Connections outside the extension.** Attach refuses while this process holds the db file open
-  outside the VFS, and a commit such a connection makes later poisons the owner at its next write
-  transaction or snapshot (§3, step 1). Two gaps remain. A commit of such a connection that a WAL
-  restart follows before the owner's next write transaction (it committed again after a complete
-  checkpoint, ran `wal_checkpoint(RESTART)` or `TRUNCATE`, or deleted the WAL as the last
-  connection to close) leaves no frame count to compare: it goes unseen, its pages in the db file
-  and never in the stream. And a connection outside the extension in this process that opens while
-  attach runs, after its check, is caught only once it commits. Where the process's descriptors
-  cannot be listed (no `/proc` or `/dev/fd`), attach does not check them.
+  for writing outside the VFS, and a commit such a connection makes later poisons the owner at its
+  next write transaction or snapshot, and rebuilds the files at the next attach (§3, step 1). What
+  stays unseen:
+  - A foreign commit that a complete checkpoint moved into the db file, followed by a WAL restart or
+    truncate (the writer committed again after the checkpoint, ran `wal_checkpoint(RESTART)` or
+    `TRUNCATE`, or deleted the WAL as the last connection to close), before the owner's next write
+    transaction, once the owner has committed since its attach or its attach kept the WAL. No frame
+    count is left to compare, and the owner's own checkpoints write the db file too. Its pages stay
+    in the db file and never reach the stream. Before the owner's first commit after an attach that
+    left no WAL, the db file's size, inode and modification time give such a commit away, unless it
+    lands within the filesystem's timestamp granularity of the attach's last write and keeps the
+    size.
+  - A connection outside the extension in this process that opens while attach runs, after its
+    check: it is caught once it commits. A read-only one never refuses the attach, and attach may
+    rewrite pages under it and drop its POSIX locks (its descriptor closes do).
+  - A descriptor opened through another hard link of the db file has another name, and is not
+    compared. Where the process's descriptors cannot be listed (no `/proc` or `/dev/fd`), or their
+    names cannot be read (other than Linux and macOS), attach does not check them.
 - The local files must be on a local filesystem (§6).
 - **A transaction must fit one request.** Its commit frame as sent, a 12-byte header and the
   transaction's changed pages compressed with zstd, is at most `URSULA_VFS_MAX_FRAME_BYTES`: 32 MiB
@@ -942,23 +1028,23 @@ PRs).
 | --- | --- | --- |
 | unit: encodings | `frame.rs`, `snapshot.rs` | whole frames only, damage refused, another format refused by its magic and named in the error |
 | unit: claims | `claim.rs` | a claim wins only as the frame ending at the answered offset, or anywhere in a read-back that ran past it, and a re-claim only as the first frame after the owner's offset |
-| unit: answers | `client.rs`, `error.rs` | a refused `HEAD` carries a `GET`'s reason, `applied_nothing` (status for 401, 402, 429, marker with vouch for other refusals, nothing for a redirect or a success), each answer's outcome and `refused_kind`, mixed attempts, `refused_reason` cut to 256 bytes, no request follows a redirect, a `307` resent with the same sequence, a large snapshot body sent twice at most, the snapshot size probe, idle times, resent requests on new connections, `EINVAL` a reset only on macOS, failures before sending fail alone as `unreachable` |
-| unit: owner state | `db.rs`, `vfs.rs`, `status.rs`, `extension.rs` | a refused commit fails alone with epoch, sequence and offset kept while an unknown one poisons, the next-commit check, an unsent `too_large` leaves `layer_refused` and the check, no snapshot while a layer refuses, WAL pages checked when read back, `ursula_status` fields and the error's kind and action, attach error codes and modes, foreign commits by the wal-index header, opens refused after a failed attach |
+| unit: answers | `client.rs`, `error.rs` | every error's kind and action, attach's refused `HEAD` carries the reason of a `GET` refused the same way, the last `401` keeps its body, `applied_nothing` (status for 401, 402, 429, marker with vouch for other refusals, nothing for a redirect or a success), each answer's outcome and `refused_kind`, mixed attempts, `refused_reason` cut to 256 bytes, no request follows a redirect, a `307` resent with the same sequence, a large snapshot body sent twice at most, the snapshot size probe, idle times, resent requests on new connections, `EINVAL` a reset only on macOS, failures before sending fail alone as `unreachable` |
+| unit: owner state | `db.rs`, `vfs.rs`, `status.rs`, `extension.rs` | a refused commit fails alone with epoch, sequence and offset kept while an unknown one poisons, the next-commit check, an unsent `too_large` leaves `layer_refused` and the check, no snapshot while a layer refuses, WAL pages checked when read back, `ursula_status` fields and the error's kind and action for poisons and refusals, attach error codes and modes, foreign commits by the wal-index header (a first commit into an empty WAL, one after the owner's, one a recovery found, a rolled-back restart), opens refused after a failed attach, local damage distrusts the files, a fence raises the read flag |
 | unit: snapshots | `snapshotter.rs` | backoff by kind (size, outage, other), doubling up to each kind's limit, spread by a fifth, `Retry-After` honoured, a shrink of a quarter releases the wait, one brought-forward attempt per run, only a snapshot at the offset ends a run |
 | unit: transport | `net.rs` | DNS freshness, one lookup at a time, the stale limit and retry, `NotSent` for failed lookups, connections and TLS handshakes |
-| unit: local files | `local.rs` | sidecar trust only in this boot, for this incarnation and db file, with its WAL claim met, folding a WAL keeps the last image and cuts the file, a failed attach puts a path without data back, a descriptor on the db file is found |
+| unit: local files | `local.rs` | sidecar trust only in this boot, for this incarnation and db file, with its WAL claim met exactly, folding a WAL keeps the last image and cuts the file, a failed attach empties only the db file it wrote, a writable descriptor on the db file is found and a read-only one or another file of the name is not |
 | unit: panics | `guard.rs`, `vfs.rs` | every file method's C entry point contains a panic and poisons, `xClose` and `xOpen` release the open count, the writer's overlay is kept |
 | unit: settings | `config.rs`, `auth.rs`, `log.rs`, `stats.rs` | frame limit bounds, a token file without a token keeps the last one, log format, bounded per-commit measurements |
 | e2e: transparency | `transparency.e2e.ts`, `conformance.e2e.ts` | any schema rebuilds byte-identical, the overlay's write-transaction scope, Pi conformance in three modes (direct, reopen, rebuild every commit) |
 | e2e: crash and recovery | `crash.e2e.ts`, `recovery.e2e.ts` | SIGKILL and abort around the commit point, the cache spill, an unknown append, one owner per host, no connection open while pages are rewritten |
 | e2e: local cache | `reboot.e2e.ts`, `writeback.e2e.ts` | trust only in the same boot with the WAL claim met, rebuild from snapshot and tail otherwise, a changed WAL page fails its read and poisons with the stream intact |
-| e2e: fencing | `fencing.e2e.ts` | a new claim fences every earlier owner, an owner of a deleted stream, a foreign higher `Stream-Seq` |
+| e2e: fencing | `fencing.e2e.ts` | a new claim fences every earlier owner, an owner of a deleted stream, a foreign higher `Stream-Seq`, a fenced owner's reads fail, through the Pi storage as `UrsulaReplicationError` |
 | e2e: refusals | `payment.e2e.ts`, `refused.e2e.ts`, `refusal-errors.e2e.ts`, `early-refusal.e2e.ts`, `unreachable.e2e.ts` | every fail-alone row of §2 through `gate.mjs`, read-only attach, the next-commit check and its first gap, `too_large`, a real gateway's head-decided `401` on an 8 MiB commit, refused connections, Pi error mapping |
 | e2e: snapshots | `snapshot.e2e.ts`, `snapshot-backoff.e2e.ts`, `cold-snapshot.e2e.ts` | a run far past the hot limit stays bounded, fresh and lagging hosts rebuild byte-identical, takeover after a trim fences, §4.4's backoff through `gate.mjs` and a real gateway, a 12 MiB body through S3 multipart (cluster only) |
 | e2e: deployment | `auth.e2e.ts`, `redirects.e2e.ts`, `health.e2e.ts` | TLS and gateway-checked tokens, leaderships moved under commits and snapshot read-backs with no `307` reaching the client, `ursula_status` and logs for operators |
 | e2e: panics | `panics.e2e.ts` | every SQL function and init fail with an error and the process goes on, a panic poisons one file alone |
 | e2e: package entries | `entries.e2e.ts` | the root entry, source and built, imports nothing outside Node.js, the `/pi` entry imports Pi Durable |
-| e2e: misuse | `misuse.e2e.ts` | a connection opened before the extension was loaded refuses the attach, a commit through `?vfs=unix` poisons the owner (`foreign_write`), a failed attach names the server's reason, refuses opens and leaves no files that refuse a later attach, a fenced owner's reads fail, and refused, unknown and fenced commits report kinds of their own |
+| e2e: misuse | `misuse.e2e.ts` | a connection opened before the extension was loaded refuses the attach and a read-only descriptor does not, a refused attach keeps the binding, a commit through `?vfs=unix` poisons the owner in either order and after a reopen, and a reattach rebuilds the file, a failed attach names the server's reason, refuses opens and leaves no data that refuses a later attach, an unreplicated file, a fenced owner's reads fail, a reader is not held up by another thread's commit, and refused, unknown and fenced commits report kinds of their own |
 | e2e: versions | `compat.e2e.ts` | same-minor compatibility (§7, versions) |
 | e2e: load | `bench.e2e.ts`, `soak.e2e.ts` | sanity numbers (bytes per turn, pages per commit), server memory under VFS-shaped load (soak, opt-in) |
 

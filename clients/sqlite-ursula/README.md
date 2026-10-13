@@ -27,7 +27,7 @@ const db = new DatabaseSync("/data/app.db");
 db.exec("PRAGMA journal_mode=WAL");
 ```
 
-The extension is loaded once per process and becomes SQLite's default VFS there. Files that were never attached are not affected.
+The extension is loaded once per process and becomes SQLite's default VFS there. Files that were never attached are not affected, unless an attach of them failed in the process: such a file opens only after an attach of it succeeds. Attach refuses while the process holds the file open for writing outside the extension, such as a connection opened before the extension was loaded.
 
 When a commit is refused before it reaches the stream, that commit fails alone. Examples are a `402 Payment Required` from a quota or billing service in front of the stream, and any refusal marked `x-ursula-not-applied` that `ursula gateway` 0.7.3 or later vouches for with `x-ursula-not-applied-checked`, such as a server that refuses writes for a while under sustained load or a gateway whose authorizer denies the write. Without such a gateway, the mark counts for nothing, and only a `401`, `402` or `429` fails a commit alone. The file is not poisoned, reads keep working, and the next commit succeeds once the refusals stop. With `node:sqlite` the commit throws SQLite's error with `errcode` 7178, and `status(file)` names the refusal. Through `openUrsulaPiStorage` the refused commit rejects with `UrsulaWriteRefusedError` (`UrsulaPaymentRequiredError` for a `402`).
 

@@ -8,6 +8,8 @@ use std::fs::{self};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -16,15 +18,17 @@ use crate::client::START;
 use crate::client::advanced;
 use crate::client::create_stream;
 use crate::client::get_snapshot;
-use crate::client::head;
+use crate::client::head_explained;
 use crate::client::producer_id;
 use crate::client::read_from;
 use crate::client::recreated;
 use crate::config::abort_in_replay;
 use crate::db::Db;
+use crate::db::DbFileStamp;
 use crate::db::Mode;
 use crate::db::SnapshotThread;
 use crate::db::WalSeen;
+use crate::db::lock;
 use crate::db::registry;
 use crate::error::Error;
 use crate::error::Fence;
@@ -36,10 +40,13 @@ use crate::frame::Record;
 use crate::guard::contain;
 use crate::host::full_pathname;
 use crate::host::init_wal_format;
-use crate::local::Fresh;
+use crate::local::DAMAGED_BOOT;
 use crate::local::SIDECAR_VERSION;
 use crate::local::boot_id;
 use crate::local::discard_local;
+use crate::local::empty_again;
+use crate::local::holds_data;
+use crate::local::holds_no_data;
 use crate::local::lock_unused;
 use crate::local::open_in_process;
 use crate::local::read_sidecar;
@@ -63,12 +70,13 @@ use crate::wal::pages_in;
 /// Applies records to the db file, deduplicating page writes per batch.
 ///
 /// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
-/// file open (or opens one) and has stopped the previous attachment's snapshot thread, and
-/// `lock_unused` keeps other processes off the file from its first write until the Applier drops.
-/// So its own descriptor on the db file cannot drop anyone else's POSIX locks when it closes.
-/// Outside `ursula_attach`, the extension touches the db file, -wal or -shm only through SQLite's
-/// handles (the private connections of `Private`).
-pub(crate) struct Applier {
+/// file open (or opens one), or a writable descriptor of this process outside the extension, and
+/// has stopped the previous attachment's snapshot thread, and `lock_unused` keeps other processes
+/// off the file from its first write until the Applier drops. So its own descriptor on the db file
+/// cannot drop a writer's POSIX locks when it closes. Outside `ursula_attach`, the extension
+/// touches the db file, -wal or -shm only through SQLite's handles (the private connections of
+/// `Private`).
+pub(crate) struct Applier<'a> {
     pub(crate) path: String,
     /// The sidecar, its stamp, and the offset, epoch and log the replay starts from: rewritten once
     /// the WAL is folded (`file`).
@@ -93,9 +101,15 @@ pub(crate) struct Applier {
     pub(crate) size: Option<u32>,
     /// Highest claimed epoch seen.
     pub(crate) epoch: u64,
+    /// The db file held no data when the attach began: data found in it when the Applier opens it
+    /// came from a writer outside the extension, and is never folded or replayed over.
+    pub(crate) fresh: bool,
+    /// Set once the Applier opened the db file to write it: what a failed attach of a fresh path
+    /// undoes (`attach`, `local::empty_again`).
+    pub(crate) wrote: &'a AtomicBool,
 }
 
-impl Applier {
+impl Applier<'_> {
     /// A failed operation on the db file.
     fn io(&self, op: &'static str, source: std::io::Error) -> Error {
         Error::Io {
@@ -121,7 +135,35 @@ impl Applier {
         }
     }
 
-    /// The db file, opened once and locked (`lock_unused`, held on `self.file` until the Applier
+    /// Opens the db file (creating it) and locks it against other processes (`lock_unused`, held
+    /// until the descriptor closes), and returns it with whether it holds data. A fresh path's
+    /// (`fresh`) must still hold none: data there came from a writer outside the extension since
+    /// the attach began, and is refused, not replayed over. From here on the attach writes the
+    /// file (`wrote`).
+    fn open_locked(&self) -> Result<(fs::File, bool), Error> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path);
+        let f = f.map_err(|source| self.io("open", source))?;
+        lock_unused(&self.path, &f)?;
+        let existing = f
+            .metadata()
+            .map_err(|source| self.io("stat", source))?
+            .len()
+            > 0;
+        if self.fresh && existing {
+            return Err(Error::WrittenDuringAttach {
+                path: self.path.clone(),
+            });
+        }
+        self.wrote.store(true, Ordering::Release);
+        Ok((f, existing))
+    }
+
+    /// The db file, opened once and locked (`open_locked`, held on `self.file` until the Applier
     /// drops; `discard_local` hands over its locked file). Before its first write, a file with
     /// content (trusted, never opened through SQLite here) gets its WAL folded in (`fold_wal`);
     /// then the db file is fsynced, the sidecar keeps its offset but claims no WAL frame, and the
@@ -135,15 +177,7 @@ impl Applier {
         if let Some(f) = self.file.take() {
             return Ok(self.file.insert(f));
         }
-        let existing = fs::metadata(&self.path).is_ok_and(|m| m.len() > 0);
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path);
-        let f = f.map_err(|source| self.io("open", source))?;
-        lock_unused(&self.path, &f)?;
+        let (f, existing) = self.open_locked()?;
         if existing {
             fold_wal(&self.path, &f)?;
             f.sync_all().map_err(|source| self.io("fsync", source))?;
@@ -205,17 +239,7 @@ impl Applier {
         };
         let f = match self.file.take() {
             Some(f) => f,
-            None => {
-                let f = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&self.path)
-                    .map_err(err)?;
-                lock_unused(&self.path, &f)?;
-                f
-            }
+            None => self.open_locked()?.0,
         };
         remove_if_exists(&format!("{}-wal", self.path))?;
         remove_if_exists(&format!("{}-shm", self.path))?;
@@ -299,7 +323,7 @@ pub(crate) fn sync(
     applier: &mut Applier,
     mode: Mode,
 ) -> Result<(u64, String), Error> {
-    let head = head(url, &|| false)?;
+    let head = head_explained(url)?;
     if head.incarnation.as_deref() != Some(incarnation) {
         return Err(recreated(url, incarnation));
     }
@@ -397,70 +421,151 @@ pub(crate) fn attach(path: &str, url: &str, mode: Mode) -> Result<String, Arc<Er
         reg.attaching.insert(path.clone());
         reg.snappers.remove(&path)
     };
+    // What a failure undoes: the db file of a path that held none when the attach began, once the
+    // attach wrote into it (`Applier::wrote`, `init_wal_format`).
+    let fresh = holds_no_data(&path);
+    let wrote = AtomicBool::new(false);
     let outcome = contain(
         "attach_files",
         || {
-            Err(Error::Panicked {
+            Err(Unbound::Failed(Error::Panicked {
                 entry: "attach_files",
-            })
+            }))
         },
         || {
             // The previous attachment's snapshot thread may hold a private connection on the
             // file.
-            if let Some((snapper, thread)) = previous {
+            let snapper = previous.map(|(snapper, thread)| {
                 snapper.stop();
                 if thread.join().is_err() {
                     log::emit(Level::Error, "snapshot_thread_panicked", &[("file", &path)]);
                 }
+                snapper
+            });
+            // Now nothing of the extension has the file open: a writable descriptor on it is
+            // outside the extension (`open_in_process`). Refused before anything changes, so the
+            // path keeps its binding, like the refusals above.
+            if let Some(fd) = open_in_process(&path) {
+                let e = Error::OpenOutsideVfs {
+                    path: path.clone(),
+                    fd,
+                };
+                return Err(Unbound::Refused(e, snapper));
             }
-            let fresh = Fresh::of(&path);
-            let outcome = attach_files_rebuilding(&path, &url, mode);
-            if outcome.is_err()
-                && let Some(fresh) = fresh
-                && let Err(e) = fresh.restore(&path)
-            {
-                log::emit(Level::Warn, "attach_restore_failed", &[
-                    ("file", &path),
-                    ("reason", &e),
-                ]);
-            }
-            outcome
+            attach_files_rebuilding(&path, &url, mode, &wrote).map_err(Unbound::Failed)
         },
     );
+    // Outside `contain`, so a panic midway still undoes what the attach wrote, and before the
+    // registry is locked (file I/O), while `attaching` keeps opens of the path refused.
+    if fresh
+        && wrote.load(Ordering::Acquire)
+        && matches!(outcome, Err(Unbound::Failed(_)))
+        && let Err(e) = empty_again(&path)
+    {
+        log::emit(Level::Warn, "attach_restore_failed", &[
+            ("file", &path),
+            ("reason", &e),
+        ]);
+    }
+    // A refused attach leaves the previous binding as it was: its snapshot thread runs again.
+    let resumed = match &outcome {
+        Err(Unbound::Refused(_, Some(snapper))) => {
+            let db = registry().dbs.get(&path).cloned();
+            db.map(|db| {
+                snapper.resume();
+                if lock(&db).snapshot_wanted() {
+                    snapper.request();
+                }
+                spawn_snapshots(&db, snapper)
+            })
+        }
+        _ => None,
+    };
     let mut reg = registry();
     reg.attaching.remove(&path);
     match outcome {
-        Ok((offset, db, snapper)) => {
+        Ok((offset, db, fence, snapper)) => {
             reg.failed.remove(&path);
             reg.dbs.insert(path.clone(), db);
+            reg.fences.insert(path.clone(), fence);
             if let Some(snapper) = snapper {
                 reg.snappers.insert(path, snapper);
             }
             Ok(offset)
         }
-        Err(e) => {
+        Err(Unbound::Refused(e, _)) => {
+            match resumed {
+                Some(Ok(thread)) => {
+                    reg.snappers.insert(path, thread);
+                }
+                Some(Err(spawn)) => {
+                    log::emit(Level::Error, "snapshot_thread_not_resumed", &[
+                        ("file", &path),
+                        ("reason", &spawn),
+                    ]);
+                }
+                None => {}
+            }
+            Err(Arc::new(e))
+        }
+        Err(Unbound::Failed(e)) => {
             // The binding no longer describes the files (they may hold anything between its state
             // and the stream's, the stream a newer claim): without it, `x_open` refuses the path
-            // while it has a sidecar (`refused`) until an attach succeeds.
+            // until an attach succeeds, whether or not it has a sidecar (`refused`).
             let e = Arc::new(e);
             reg.dbs.remove(&path);
+            reg.fences.remove(&path);
             reg.failed.insert(path, Arc::clone(&e));
             Err(e)
         }
     }
 }
 
-/// A bound attachment: the offset its file reflects, its state, and its snapshot thread (none when
-/// read-only).
-type Attached = (String, Arc<Mutex<Db>>, Option<SnapshotThread>);
+/// How an attach that got past its first checks ended without binding the path.
+enum Unbound {
+    /// Refused before it changed anything (a writable descriptor of this process outside the
+    /// extension): the path keeps its binding, if any, whose snapshot thread (stopped for the
+    /// check) runs again.
+    Refused(Error, Option<Arc<Snapper>>),
+    /// Failed: the path loses its binding, and opens through the extension only once an attach
+    /// succeeds (`Registry::failed`).
+    Failed(Error),
+}
+
+/// Starts the snapshot thread of the attachment `db`.
+fn spawn_snapshots(db: &Arc<Mutex<Db>>, snapper: &Arc<Snapper>) -> Result<SnapshotThread, Error> {
+    let (db, snapper) = (Arc::clone(db), Arc::clone(snapper));
+    let thread = {
+        let snapper = Arc::clone(&snapper);
+        std::thread::Builder::new()
+            .name("ursula-snapshot".into())
+            .spawn(move || snapshot_loop(&db, &snapper))
+            .map_err(Error::SpawnSnapshotThread)?
+    };
+    Ok((snapper, thread))
+}
+
+/// A bound attachment: the offset its file reflects, its state, its fence flag (`Db::fence`), and
+/// its snapshot thread (none when read-only).
+type Attached = (
+    String,
+    Arc<Mutex<Db>>,
+    Arc<AtomicBool>,
+    Option<SnapshotThread>,
+);
 
 /// `attach_files`, again when the stream was deleted and recreated during it (a 412): the files,
 /// stamped with the old incarnation, are then discarded and rebuilt from the new stream. Bounded,
 /// so a stream recreated over and over fails the attach instead of looping.
-fn attach_files_rebuilding(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
+fn attach_files_rebuilding(
+    path: &str,
+    url: &str,
+    mode: Mode,
+    wrote: &AtomicBool,
+) -> Result<Attached, Error> {
     let mut tries: u64 = 0;
     loop {
-        match attach_files(path, url, mode) {
+        match attach_files(path, url, mode, wrote) {
             Err(e) if e.is_recreated() && tries < 3 => {
                 tries = tries.saturating_add(1);
                 log::emit(Level::Warn, "attach_rebuilding", &[
@@ -477,22 +582,13 @@ fn attach_files_rebuilding(path: &str, url: &str, mode: Mode) -> Result<Attached
 /// Decides whether the local files can be trusted (or discards them), brings them to the stream's
 /// tail and claims it unless read-only (`sync`), then builds the new attachment for `attach` to
 /// bind. A read-only attachment gets no snapshot thread: it never writes the stream.
-fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
+fn attach_files(path: &str, url: &str, mode: Mode, wrote: &AtomicBool) -> Result<Attached, Error> {
     let started = Instant::now();
-    // No connection of this VFS has the file open (`attach` checked), and the previous
-    // attachment's snapshot thread has closed its own: a descriptor still open on it belongs to a
-    // connection outside the extension, whose commits would never reach the stream.
-    if let Some(fd) = open_in_process(path) {
-        return Err(Error::OpenOutsideVfs {
-            path: path.to_owned(),
-            fd,
-        });
-    }
     let sidecar = format!("{path}-ursula");
     let boot = boot_id();
     let boot = boot.as_deref();
     // The sidecar of a file that holds data (`None` without data; `Some(None)`: torn).
-    let found = if fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+    let found = if holds_data(path) {
         // A file with content but no sidecar was never attached: its pages are not in the stream.
         let s = read_sidecar(&sidecar).map_err(|e| Error::NoSidecar {
             path: path.to_owned(),
@@ -511,7 +607,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     } else {
         None
     };
-    let head = match head(url, &|| false) {
+    let head = match head_explained(url) {
         Ok(head) => head,
         // A missing stream is created for a file that holds no data, unless the attach is
         // read-only (it never writes the stream). Behind one that does, the stream was deleted (by
@@ -519,7 +615,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         // may be the only copy left: refused, and kept.
         Err(Error::Status { status: 404, .. }) if found.is_none() && mode == Mode::Owner => {
             create_stream(url)?;
-            head(url, &|| false)?
+            head_explained(url)?
         }
         Err(Error::Status { status: 404, .. }) if found.is_none() => {
             return Err(Error::NoStream {
@@ -537,6 +633,8 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     let incarnation = head.incarnation.ok_or_else(|| Error::NoIncarnation {
         url: url.to_owned(),
     })?;
+    // A path without data: anything found in the db file later came from outside (`Applier::fresh`).
+    let fresh = found.is_none();
     let (mut local, mut emptied) = (None, None);
     if let Some(s) = found {
         match s {
@@ -556,6 +654,11 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
                         "a cache of stream incarnation {old}, but {url} is now incarnation \
                          {incarnation}: deleted and recreated"
                     ),
+                    // A poison found the files damaged, or written by a connection outside the
+                    // extension (`Db::distrust_local`).
+                    _ if s.as_ref().and_then(|s| s.boot.as_deref()) == Some(DAMAGED_BOOT) => {
+                        "a poison found them damaged or written outside the extension".into()
+                    }
                     // The same incarnation, or an older version's sidecar (incarnation unknown:
                     // possibly the same stream), unless the stream lost acknowledged data: a
                     // sidecar offset never exceeds an acknowledged one, so a read there answering
@@ -593,6 +696,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     // roll it back, truncating whatever attach writes after it.
     remove_if_exists(&format!("{path}-journal"))?;
     let initial = stamp(path, url, boot, &incarnation);
+    let mut created_sidecar = false;
     let (from, epoch, log) = match &local {
         Some(s) => (s.offset.clone(), s.epoch, s.log),
         None => {
@@ -602,6 +706,7 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
             // otherwise discarded and rebuilt) instead of being refused as never attached.
             remove_if_exists(&format!("{path}-wal"))?;
             remove_if_exists(&format!("{path}-shm"))?;
+            created_sidecar = !fs::exists(&sidecar).unwrap_or(true);
             write_sidecar(
                 &sidecar,
                 &sidecar_line(START, 0, 0, &initial, WalClaim::NONE),
@@ -623,6 +728,8 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         min_size: None,
         size: None,
         epoch,
+        fresh,
+        wrote,
     };
     let mut pos = from.clone();
     let mut tries: u64 = 0;
@@ -640,6 +747,14 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
                 ]);
                 std::thread::sleep(Duration::from_millis(50_u64.saturating_mul(tries)));
             }
+            // Data a writer outside the extension put into a fresh path meanwhile (`Applier::fresh`):
+            // the sidecar this attach created would make the next attach discard it as a cache.
+            Err(e @ Error::WrittenDuringAttach { .. }) => {
+                if created_sidecar {
+                    remove_if_exists(&sidecar)?;
+                }
+                return Err(e);
+            }
             Err(e) => return Err(e),
         }
     };
@@ -652,18 +767,16 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     // `install`, or never there) and the db file alone holds the state.
     let wal = local.and_then(|s| s.wal.filter(|_| applier.file.is_none()));
     drop(applier);
-    if fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
+    if !holds_data(path) {
+        wrote.store(true, Ordering::Release);
         init_wal_format(path)?;
     }
     // The db file alone must be on disk before the sidecar says so (no connection is open, so
     // this descriptor's close drops no lock).
-    // A WAL attach kept holds frames no connection of this process wrote: nothing is known of it
-    // until a write transaction ends (`WalSeen`). Otherwise attach deleted it.
-    let wal_seen = if wal.is_some() {
-        WalSeen::Unknown
-    } else {
-        WalSeen::Empty
-    };
+    // A WAL attach kept holds exactly what its claim says (`WalClaim::covered`): the header a
+    // recovery rebuilds from it is this VFS's, any other a commit outside the extension's.
+    let wal_seen = WalSeen::attached(wal);
+    let kept_wal = wal.is_some();
     let wal = match wal {
         Some(wal) => wal,
         None => {
@@ -680,8 +793,16 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
     // Stamped again: the db file may not have existed before (`file_id`).
     let stamp = stamp(path, url, boot, &incarnation);
     write_sidecar(&sidecar, &sidecar_line(&pos, epoch, log, &stamp, wal))?;
+    // Without a WAL nothing of this VFS writes the db file before its first commit: a change before
+    // then is a checkpoint of a foreign commit (`Db::untouched`).
+    let untouched = if kept_wal {
+        None
+    } else {
+        DbFileStamp::of(path)
+    };
     let pages = pages_in(fs::metadata(path).map(|m| m.len()).unwrap_or(0));
     let snapper = Arc::new(Snapper::default());
+    let fence = Arc::new(AtomicBool::new(false));
     let db = Arc::new(Mutex::new(Db {
         url: url.to_owned(),
         mode,
@@ -695,12 +816,14 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         offset: pos.clone(),
         log,
         poisoned: None,
+        fence: Arc::clone(&fence),
         refused: None,
         layer_refused: None,
         refused_at: None,
         overlay: BTreeMap::new(),
         wal_written: BTreeMap::new(),
         wal_seen,
+        untouched,
         committed: false,
         commit_frame_no: 0,
         wal_open: 0,
@@ -726,17 +849,8 @@ fn attach_files(path: &str, url: &str, mode: Mode) -> Result<Attached, Error> {
         installed,
     }));
     let snapshots = match mode {
-        Mode::Owner => {
-            let thread = {
-                let (db, snapper) = (db.clone(), snapper.clone());
-                std::thread::Builder::new()
-                    .name("ursula-snapshot".into())
-                    .spawn(move || snapshot_loop(&db, &snapper))
-                    .map_err(Error::SpawnSnapshotThread)?
-            };
-            Some((snapper, thread))
-        }
+        Mode::Owner => Some(spawn_snapshots(&db, &snapper)?),
         Mode::ReadOnly => None,
     };
-    Ok((pos, db, snapshots))
+    Ok((pos, db, fence, snapshots))
 }

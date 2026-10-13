@@ -14,10 +14,11 @@
 //!   attach of it has succeeded in this process: before that, after a failed attach, or in a
 //!   process that never attached it, opening it fails (SQLITE_CANTOPEN), so it is never written
 //!   unreplicated. A file without a sidecar passes through to "unix", unless its last attach in this
-//!   process failed. Attach also refuses while the process holds the db file open outside this VFS
-//!   (a connection opened before the extension was loaded), and a commit such a connection makes
-//!   later poisons the owner at its next write transaction (`ForeignWrite`). A fenced owner's reads
-//!   fail too (SQLITE_IOERR_READ).
+//!   process failed. Attach also refuses, changing nothing, while the process holds the db file
+//!   open for writing outside this VFS (a connection opened before the extension was loaded), and a
+//!   commit such a connection makes later poisons the owner at its next write transaction or
+//!   snapshot (`ForeignWrite`), which also makes the next attach rebuild the local files. A fenced
+//!   owner's new read transactions fail too (SQLITE_IOERR_READ).
 //!   `SELECT ursula_attach(path, stream_url, 'read_only')` catches the file up the same way but
 //!   claims nothing and never writes the stream (no claim, commit, snapshot or retention move): it
 //!   fences no owner, works while a layer in front of the stream refuses writes, and every write to
@@ -122,7 +123,8 @@
 //!   at most the newest 8,192 of each kind between drains, and `dropped` counts the rest.
 //!
 //! Every SQL function's error reads `<function>: <kind>: <message>`, the kind a stable token
-//! (`error::ErrorKind`).
+//! (`error::ErrorKind`) with one action (`error::Action`); `attach_failed` names the failure it
+//! wraps next (`<function>: attach_failed: <kind>: <message>`).
 //!
 //! Test hook: `URSULA_VFS_ABORT_AFTER_ACK=<n>` aborts the process right after the n-th acknowledged
 //! commit of an attachment, before the local WAL write. `URSULA_VFS_RETRY_MS` bounds every retry
@@ -147,12 +149,17 @@
 //! - `claim`: claiming a stream (fencing earlier owners) and re-claiming an expired producer.
 //! - `client`: the stream over blocking HTTP, with the retries.
 //! - `config`: settings and test hooks from the environment.
-//! - `db`: attached databases and the process-wide registry.
-//! - `error`: the error type, and the classes callers act on (gone, recreated, fenced).
+//! - `db`: attached databases (their poison, fence flag and what they know of the local WAL:
+//!   `WalSeen`) and the process-wide registry.
+//! - `error`: the error type, the classes the code acts on (gone, recreated, fenced, refused,
+//!   local damage), and the kinds and actions callers outside the extension see (`ErrorKind`,
+//!   `Action`).
 //! - `extension`: the entry point and the SQL functions.
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
-//! - `host`: the host's SQLite API, the "unix" VFS and private connections.
-//! - `local`: the sidecar, the boot id, and the db file locks.
+//! - `host`: the host's SQLite API, the "unix" VFS, private connections, and the wal-index header
+//!   read (`wal_index_header`).
+//! - `local`: the sidecar, the boot id, the db file locks, the scan for writable descriptors of this
+//!   process outside the extension, and what a failed attach undoes.
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.

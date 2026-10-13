@@ -454,6 +454,17 @@ fn unauthorized(op: &'static str, url: &str, status: u16, body: String) -> Error
     }
 }
 
+/// The error of request `op` to `url` whose last attempt's token was refused (`Refused::Token`,
+/// recorded as `last`) when its retries ran out: that `401` with the layer's explanation.
+fn unauthorized_by(op: &'static str, url: &str, last: Attempt) -> Error {
+    match last {
+        Attempt::Status { status, body } | Attempt::Deferred { status, body, .. } => {
+            unauthorized(op, url, status, body)
+        }
+        Attempt::Transport(_) => unauthorized(op, url, 401, String::new()),
+    }
+}
+
 fn refused_request(op: &'static str, url: &str, refusal: WriteRefusal) -> Error {
     Error::Refused {
         op,
@@ -899,9 +910,8 @@ fn append_on(
             return match refusal {
                 // Every attempt was refused before it reached the stream: nothing was appended.
                 Some(refusal) if !reached => Append::Refused(refusal),
-                _ if resend.refresh => {
-                    Append::Failed(unauthorized("append", url, 401, String::new()))
-                }
+                // The last attempt's token was refused: its 401, with what the layer said.
+                _ if resend.refresh => Append::Failed(unauthorized_by("append", url, unknown)),
                 _ => Append::Failed(Error::AppendUnknown {
                     attempts,
                     last: unknown,
@@ -1071,22 +1081,22 @@ pub(crate) struct Head {
 
 /// `e`, a `HEAD`'s refusal of `url`, with the explanation a `HEAD`'s answer cannot carry (it has
 /// no body): the body of one `GET` of the stream from its beginning, when that `GET` is refused
-/// with a 4xx too, such as the server's `400` that names the bucket or stream id it refuses. A
-/// `404` gets none: attach creates the stream then, or names the missing stream itself. Any other
-/// outcome of the `GET` leaves `e` as it was.
+/// with the same status, such as the server's `400` that names the bucket or stream id it refuses.
+/// A `404` gets none: attach creates the stream then, or names the missing stream itself. Any other
+/// outcome of the `GET` leaves `e` as it was. Only attach asks (`head_explained`), with no lock
+/// held: a `HEAD` that only probes the stream (a re-claim's, the snapshot thread's) sends none.
 fn with_reason(e: Error, url: &str) -> Error {
-    let missing = |status: u16| (400..500).contains(&status) && status != 404;
     match e {
         Error::Status {
             op,
             url: u,
             status,
             body,
-        } if body.is_empty() && missing(status) => Error::Status {
+        } if body.is_empty() && (400..500).contains(&status) && status != 404 => Error::Status {
             op,
             url: u,
             status,
-            body: reason_of(url),
+            body: reason_of(url, status),
         },
         Error::Unauthorized {
             op,
@@ -1097,22 +1107,37 @@ fn with_reason(e: Error, url: &str) -> Error {
             op,
             url: u,
             status,
-            body: reason_of(url),
+            body: reason_of(url, status),
+        },
+        Error::Refused {
+            op,
+            url: u,
+            refusal: WriteRefusal::PaymentRequired { body },
+        } if body.is_empty() => Error::Refused {
+            op,
+            url: u,
+            refusal: WriteRefusal::PaymentRequired {
+                body: reason_of(url, 402),
+            },
         },
         e => e,
     }
 }
 
-/// The body of a `GET` of `url` from the stream's beginning, sent once, when it is refused with a
-/// 4xx (cut short: `body_text`); empty otherwise.
-fn reason_of(url: &str) -> String {
+/// The body of a `GET` of `url` from the stream's beginning, sent once, when it is answered
+/// `status` (cut short: `body_text`); empty otherwise.
+fn reason_of(url: &str, status: u16) -> String {
     let request = format!("{url}?offset={START}");
     match prepared(agent().get(request.as_str()), Resend::default()).call() {
-        Ok(mut r) if (400..500).contains(&r.status().as_u16()) => {
-            body_text(&mut r).trim().to_owned()
-        }
+        Ok(mut r) if r.status().as_u16() == status => body_text(&mut r).trim().to_owned(),
         _ => String::new(),
     }
+}
+
+/// `head`, for attach: a refusal carries the server's explanation, which a `HEAD`'s answer has no
+/// body for (`with_reason`).
+pub(crate) fn head_explained(url: &str) -> Result<Head, Error> {
+    head(url, &|| false).map_err(|e| with_reason(e, url))
 }
 
 /// `stopped` ends the retries early (`send_retrying` lists the answers it retries).
@@ -1120,19 +1145,16 @@ pub(crate) fn head(url: &str, stopped: &dyn Fn() -> bool) -> Result<Head, Error>
     let mut r = send_retrying(|resend| prepared(agent().head(url), resend).call(), stopped)
         .map_err(|e| http_error("head", url, e))?;
     if let Some(e) = refusal("head", url, &mut r).or_else(|| redirected("head", url, &r)) {
-        return Err(with_reason(e, url));
+        return Err(e);
     }
     let status = r.status().as_u16();
     if status != 200 {
-        return Err(with_reason(
-            Error::Status {
-                op: "head",
-                url: url.to_owned(),
-                status,
-                body: String::new(),
-            },
-            url,
-        ));
+        return Err(Error::Status {
+            op: "head",
+            url: url.to_owned(),
+            status,
+            body: String::new(),
+        });
     }
     Ok(Head {
         retained: header_offset(&r, "stream-retained-offset").unwrap_or_else(|| START.into()),
@@ -1288,7 +1310,7 @@ pub(crate) fn put_idempotent(
             || !pause(retry_after, &mut backoff, deadline)
         {
             return Err(if resend.refresh {
-                unauthorized("put", url, 401, String::new())
+                unauthorized_by("put", url, unknown)
             } else {
                 Error::PutUnknown {
                     url: url.to_owned(),
@@ -1475,6 +1497,7 @@ mod tests {
     use super::create_stream;
     use super::get_snapshot;
     use super::head;
+    use super::head_explained;
     use super::in_clear;
     use super::mock::LAST;
     use super::mock::VOUCH;
@@ -2211,7 +2234,7 @@ mod tests {
             answer(&format!("503 Service Unavailable\r\n{LAST}")),
             // An unmarked 503, then a refused token to the end.
             answer("503 Service Unavailable\r\nretry-after: 0"),
-            answer(&format!("401 Unauthorized\r\n{LAST}")),
+            answer_with_body(&format!("401 Unauthorized\r\n{LAST}"), "token revoked"),
             // An unmarked 503, then a marked final answer.
             answer("503 Service Unavailable\r\nretry-after: 0"),
             answer(&format!(
@@ -2232,11 +2255,14 @@ mod tests {
             unknown,
             Append::Failed(Error::AppendUnknown { attempts: 2, .. })
         ));
+        // The last 401 keeps what the layer said, and an earlier attempt may have reached the
+        // stream: its outcome is unknown, never a retry.
         let unauthorized = append(&url, "i1", "p", b"x", 1, 1);
-        assert!(matches!(
-            unauthorized,
-            Append::Failed(Error::Unauthorized { status: 401, .. })
-        ));
+        let Append::Failed(e @ Error::Unauthorized { status: 401, .. }) = unauthorized else {
+            panic!("{}", outcome(&unauthorized));
+        };
+        assert!(e.to_string().contains("401 token revoked"), "{e}");
+        assert_eq!(e.kind(), Kind::OutcomeUnknown);
         let rejected = append(&url, "i1", "p", b"x", 1, 1);
         assert!(matches!(
             rejected,
@@ -3356,10 +3382,11 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
-    // A HEAD's answer has no body, so a refused HEAD fetches the server's explanation with one GET
-    // of the stream, refused too: a 400 names the bucket or stream id it refuses (`invalid_name`),
-    // a 403 the denial. A 404 sends none (attach creates the stream then), and a GET that
-    // succeeds adds nothing.
+    // A HEAD's answer has no body, so attach's refused HEAD fetches the server's explanation with
+    // one GET of the stream, answered with the same status: a 400 names the bucket or stream id it
+    // refuses (`invalid_name`), a 403 the denial, a 402 the layer's reason. A 404 sends none
+    // (attach creates the stream then), and a GET answered otherwise adds nothing. A HEAD that only
+    // probes the stream (`head`) sends no GET.
     #[test]
     fn a_refused_head_carries_the_reason_a_get_gives() {
         let reason = "bucket_id must be 4 to 64 bytes, got 2 bytes";
@@ -3367,7 +3394,7 @@ mod tests {
             answer("400 Bad Request"),
             answer_with_body("400 Bad Request", reason),
         ]);
-        let refused = head(&url, &|| false).err().unwrap();
+        let refused = head_explained(&url).err().unwrap();
         let requests = server.join().unwrap();
         assert!(
             requests[1].starts_with("GET /b/s?offset=-1 "),
@@ -3384,27 +3411,49 @@ mod tests {
             answer("403 Forbidden"),
             answer_with_body("403 Forbidden", "no access to bucket sqlite-e2e"),
         ]);
-        let refused = head(&url, &|| false).err().unwrap();
+        let refused = head_explained(&url).err().unwrap();
         server.join().unwrap();
         assert!(
             matches!(&refused, Error::Unauthorized { status: 403, body, .. } if body == "no access to bucket sqlite-e2e")
         );
         assert_eq!(refused.kind(), Kind::Unauthorized);
 
+        let (url, server) = serve(vec![
+            answer("402 Payment Required"),
+            answer_with_body("402 Payment Required", "account suspended"),
+        ]);
+        let refused = head_explained(&url).err().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            refused.refusal(),
+            Some(&WriteRefusal::PaymentRequired {
+                body: "account suspended".into()
+            })
+        );
+
         let (url, server) = serve(vec![answer("404 Not Found")]);
-        let missing = head(&url, &|| false).err().unwrap();
+        let missing = head_explained(&url).err().unwrap();
         assert_eq!(server.join().unwrap().len(), 1);
         assert!(matches!(&missing, Error::Status { status: 404, body, .. } if body.is_empty()));
 
-        let (url, server) = serve(vec![
-            answer("403 Forbidden"),
+        // Another status, or a success, says nothing about the HEAD's refusal.
+        for other in [
+            answer_with_body("404 Not Found", "stream not found"),
             answer_with_body("200 OK", "stream bytes"),
-        ]);
-        let refused = head(&url, &|| false).err().unwrap();
-        server.join().unwrap();
-        assert!(
-            matches!(&refused, Error::Unauthorized { status: 403, body, .. } if body.is_empty())
-        );
+        ] {
+            let (url, server) = serve(vec![answer("405 Method Not Allowed"), other]);
+            let refused = head_explained(&url).err().unwrap();
+            server.join().unwrap();
+            assert!(
+                matches!(&refused, Error::Status { status: 405, body, .. } if body.is_empty()),
+                "{refused}"
+            );
+        }
+
+        let (url, server) = serve(vec![answer("400 Bad Request")]);
+        let probed = head(&url, &|| false).err().unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(matches!(&probed, Error::Status { status: 400, body, .. } if body.is_empty()));
     }
 
     fn outcome(append: &Append) -> String {

@@ -66,6 +66,12 @@ impl Snapper {
         self.cv.notify_one();
     }
 
+    /// Undoes `stop`, for a new thread on the same attachment: an attach refused before it changed
+    /// anything leaves the previous binding as it was (`attach::Unbound::Refused`).
+    pub(crate) fn resume(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = false;
+    }
+
     /// Waits for a request (true) or the stop (false).
     pub(crate) fn wait(&self) -> bool {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
