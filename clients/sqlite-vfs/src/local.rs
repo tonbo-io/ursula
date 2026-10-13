@@ -814,7 +814,9 @@ mod tests {
         let fingerprint = db_fingerprint(&db).unwrap();
         let sealed = line(WalClaim::none_with(fingerprint));
         assert_eq!(verdict(&sealed, b1), trusted(0));
-        fs::write(&db, b"y").unwrap();
+        // Another size: a write within the filesystem's timestamp granularity that keeps the size
+        // goes unseen (Linux updates the modification time at a coarse clock's granularity).
+        fs::write(&db, b"yy").unwrap();
         assert_ne!(db_fingerprint(&db), Some(fingerprint));
         assert_eq!(verdict(&sealed, b1), refused(Untrusted::DbFileChanged));
         // The stream deleted and recreated (another incarnation), a sidecar from before the claim
@@ -970,7 +972,7 @@ mod tests {
         assert_eq!(s.verdict(&db, Some("b1"), "i1"), Verdict::Trust {
             wal_end: 0
         });
-        fs::write(&db, vec![2u8; PAGE]).unwrap();
+        fs::write(&db, vec![2u8; 2 * PAGE]).unwrap();
         assert_eq!(
             s.verdict(&db, Some("b1"), "i1"),
             Verdict::Refuse(Untrusted::DbFileChanged)
