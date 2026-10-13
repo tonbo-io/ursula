@@ -88,7 +88,7 @@ export class UrsulaDatabase extends DatabaseSync {
 	}
 
 	// Preparing runs nothing, so it neither clears nor remembers an error. Every argument goes on
-	// (node:sqlite 24 takes the statement's options).
+	// (node:sqlite from 24.14 takes the statement's options).
 	override prepare(...args: Parameters<DatabaseSync["prepare"]>): StatementSync {
 		let statement: StatementSync;
 		try {

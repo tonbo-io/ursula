@@ -25,6 +25,7 @@ These changes are planned for 0.7.5.
   - An attach that fails before it sends its claim because the endpoint cannot be reached, puts it off or refuses the credentials throws `UrsulaWriteRefusedError` (`unreachable`, `unavailable` or `unauthorized`) where it threw SQLite's error.
   - `attach` and `openUrsulaPiStorage` refuse a stream URL with a query or a fragment (`invalid_url`) before sending anything, where the attach created the stream, appended a claim and failed. `openUrsulaPiStorage` refuses `:memory:`, `""` and `file:` URIs as its file (`invalid_argument`), and makes a relative one absolute.
   - The errors `openUrsulaPiStorage` builds for a failed commit or read have messages that end with one sentence that says what to do, after `commit not replicated: <reason>`, `read refused, the file is fenced: <reason>` and `commit refused ...`.
+  - Those errors for a fenced commit or read, and for an unknown outcome, have the `name` `UrsulaFencedError` or `UrsulaReattachError`, where it was `UrsulaReplicationError`, which shows in `String(error)`, the stack and loggers that print the class. `instanceof UrsulaReplicationError` holds as before: match with it.
   - A statement of Pi's storage on a poisoned file that fails with an error that is not an I/O error, such as a constraint violation, rejects with that error where it rejected with `UrsulaReplicationError`. A failure of the extension that Pi wraps in its `StorageRejected` still rejects with the Ursula error.
 
 ## 0.7.4

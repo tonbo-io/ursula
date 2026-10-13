@@ -38,17 +38,17 @@ export function defaultDir(): string {
 
 /** The user's home directory, an absolute path. */
 function home(): string {
-	const fromEnv = homedir();
-	if (isAbsolute(fromEnv)) return fromEnv;
-	let fromUser: string | undefined;
-	try {
-		fromUser = userInfo().homedir;
-	} catch {
-		// No entry for this user (an arbitrary uid in a container).
+	for (const lookup of [homedir, () => userInfo().homedir]) {
+		let found: string | undefined;
+		try {
+			found = lookup();
+		} catch {
+			// No HOME, and no entry for this user in the user database (an arbitrary uid).
+		}
+		if (found !== undefined && isAbsolute(found)) return found;
 	}
-	if (fromUser !== undefined && isAbsolute(fromUser)) return fromUser;
 	throw new UrsulaSetupError(
-		"local_setup: no home directory to keep the local file in (HOME is not an absolute path, and the user has none): pass `dir`, a writable directory on a local disk, or `path`",
+		"local_setup: no home directory to keep the local file in (HOME is unset or not an absolute path, and the user database has none): pass `dir`, a writable directory on a local disk, or `path`",
 		"local_setup",
 		undefined,
 	);
@@ -64,21 +64,40 @@ function decoded(segment: string): string | undefined {
 }
 
 /**
- * The stream a parsed stream URL names, which the file name's hash covers: the scheme, the host
- * (lowercased by URL parsing), the port when it is not the scheme's default, and the path, with every
- * segment percent-decoded and encoded again one fixed way (a segment that does not decode stays as it
- * is) and trailing `/` dropped, as the extension drops them. Userinfo, a query and a fragment play no
- * part: `open` refuses a URL with either of the last two.
+ * The path of a parsed stream URL, spelled one way: every segment percent-decoded and encoded again
+ * one fixed way (a segment that does not decode stays as it is), and trailing `/` dropped, as the
+ * extension drops them. URL parsing has resolved `.` and `..` segments already.
  */
-export function streamIdentity(url: URL): string {
-	const segments = url.pathname
+function canonicalPath(url: URL): string {
+	return url.pathname
 		.replace(/\/+$/, "")
 		.split("/")
 		.map((segment) => {
 			const text = decoded(segment);
 			return text === undefined ? segment : encodeURIComponent(text);
-		});
-	return `${url.protocol}//${url.host}${segments.join("/")}`;
+		})
+		.join("/");
+}
+
+/**
+ * The stream a parsed stream URL names, which the file name's hash covers: the scheme, the host
+ * (lowercased by URL parsing), the port when it is not the scheme's default, and the
+ * {@link canonicalPath}. Userinfo, a query and a fragment play no part: `open` refuses a URL with
+ * either of the last two.
+ */
+export function streamIdentity(url: URL): string {
+	return `${url.protocol}//${url.host}${canonicalPath(url)}`;
+}
+
+/**
+ * The stream URL `open` attaches a file named after the URL with: the URL with its path spelled one
+ * way ({@link canonicalPath}), its userinfo kept. The server reads every spelling as the same stream,
+ * and the extension records this one in the file's sidecar, so every spelling the file name merges
+ * attaches the file.
+ */
+export function canonicalUrl(url: URL): string {
+	const userinfo = url.username === "" && url.password === "" ? "" : `${url.username}${url.password === "" ? "" : `:${url.password}`}@`;
+	return `${url.protocol}//${userinfo}${url.host}${canonicalPath(url)}`;
 }
 
 /**

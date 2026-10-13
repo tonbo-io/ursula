@@ -131,14 +131,18 @@ is mapped only when it is an I/O error (`SQLITE_FULL` too, on a poisoned file), 
 the mapping read `ursula_status`: a poisoned file maps to `UrsulaFencedError` (`stop`),
 `UrsulaReattachError` (`reattach`), or `UrsulaReplicationError` with `fix`, all of them
 `UrsulaReplicationError`s, and a commit that failed with 7178 maps to `UrsulaWriteRefusedError`,
-whose `kind` is `refused_kind`. Any other error, such as a constraint violation, stays the error it
-is. The Pi helper also looks behind the errors Pi wraps (an AggregateError, a `cause`), so a
+whose `kind` is `refused_kind`, when the file's status names a refusal of its own (a refused commit
+of another file used through SQL `ATTACH DATABASE` fails with the same code and stays SQLite's
+error). Any other error, such as a constraint violation, stays the error it is. The Pi helper also looks behind the errors Pi wraps (an AggregateError, a `cause`), so a
 failure of the extension inside Pi's `StorageRejected` maps too. The database `open` returns is a
 subclass of `node:sqlite`'s `DatabaseSync` whose `exec`, `prepare` and `applyChangeset`, and whose
 statements' `run`, `get`, `all` and `iterate`, throw what the mapping makes of their errors, for the
 file `open` attached. `open` resolves that file to an absolute path before it attaches it (and
 refuses `:memory:`, `""` and `file:` URIs, which SQLite would open as another database), and after
-opening it checks that `location()` is that file. An I/O error makes SQLite roll the whole
+opening it checks that `location()` is that file, by device and inode. A file named after the URL
+is attached with one spelling of the stream URL (its path percent-decoded and encoded again, `.`
+segments resolved, no trailing `/`), since the sidecar records the URL and refuses another spelling
+as `other_stream`. An I/O error makes SQLite roll the whole
 transaction back, so the database remembers an `UrsulaError` after which no transaction is open,
 until a statement succeeds: a transaction helper's ROLLBACK that then finds no transaction does not
 replace it (a prepared ROLLBACK succeeds, and one through `exec`, or a ROLLBACK TO or RELEASE that

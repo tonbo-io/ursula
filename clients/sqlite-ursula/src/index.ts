@@ -17,12 +17,12 @@
 // - local.ts: the local file `open` derives from a stream URL.
 // - platform.ts: the prebuilt extension of this platform.
 // - pi.ts: the `/pi` entry.
-import { mkdirSync, realpathSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync, type DatabaseSyncOptions } from "node:sqlite";
 import { UrsulaDatabase } from "./database.ts";
-import { classify, type UrsulaErrorAction, UrsulaSetupError, type WriteRefusedKind } from "./errors.ts";
-import { defaultDir, localFile, localName } from "./local.ts";
+import { classify, UrsulaError, type UrsulaErrorAction, UrsulaSetupError, type WriteRefusedKind } from "./errors.ts";
+import { canonicalUrl, defaultDir, localFile, localName } from "./local.ts";
 import { prebuiltExtension } from "./platform.ts";
 
 export {
@@ -85,8 +85,9 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	/**
 	 * Attach without claiming the stream ({@link AttachOptions.readOnly}), and open the file read-only:
 	 * reads see the stream as of the attach, and every write fails with SQLITE_READONLY. A read-only
-	 * open named after the URL gets a file of its own (`-ro1`, `-ro2` and so on, the first that no
-	 * other connection or process holds), so it never holds up the owner on its host, or another reader.
+	 * open named after the URL (without `path`) gets a file of its own, the first of `-ro1` to `-ro8`
+	 * that no other connection or process holds, so it never holds up the owner on its host, or another
+	 * reader. A process holds the files it attached until it exits.
 	 */
 	readonly readOnly?: boolean | undefined;
 }
@@ -129,13 +130,20 @@ export function open(streamUrl: string, options: OpenOptions = {}): DatabaseSync
 		const why = error instanceof Error ? error.message : String(error);
 		throw new UrsulaSetupError(`local_setup: cannot create ${directory} for the database's local file (${why}): pass a writable directory on a local disk as \`dir\`, or a file as \`path\``, "local_setup", error);
 	}
-	if (readOnly !== true) return attachAndOpen(join(directory, localName(url)), streamUrl, settings);
+	// One spelling of the stream for a file named after it, so every spelling the name merges attaches it.
+	const canonical = canonicalUrl(url);
+	if (readOnly !== true) return attachAndOpen(join(directory, localName(url)), canonical, settings);
 	for (let reader = 1; ; reader++) {
 		try {
-			return attachAndOpen(join(directory, localName(url, `-ro${reader}`)), streamUrl, settings);
+			return attachAndOpen(join(directory, localName(url, `-ro${reader}`)), canonical, settings);
 		} catch (error) {
-			if (reader < READERS && error instanceof UrsulaSetupError && error.kind === "in_use") continue;
-			throw error;
+			if (!(error instanceof UrsulaSetupError) || (error.kind !== "in_use" && error.kind !== "other_stream")) throw error;
+			if (reader < READERS) continue;
+			throw new UrsulaSetupError(
+				`in_use: none of the ${READERS} read-only files of this stream in ${directory} is free (a process holds the files it attached until it exits): pass \`dir\` or \`path\` to give this reader a file of its own`,
+				"in_use",
+				error,
+			);
 		}
 	}
 }
@@ -144,17 +152,33 @@ export function open(streamUrl: string, options: OpenOptions = {}): DatabaseSync
  * Attaches `file` and opens it with node:sqlite's `settings` (which do not open it yet), read-only
  * when they say so. node:sqlite checks them first, so a wrong one attaches nothing. Then checks that
  * SQLite opened the attached file: another database would take writes that never reach the stream.
+ * The attach claimed the stream: whatever fails after it closes the database and throws an
+ * UrsulaError.
  */
 function attachAndOpen(file: string, streamUrl: string, settings: DatabaseSyncOptions): DatabaseSync {
 	const db = new UrsulaDatabase(file, settings, (error) => classify(error, () => status(file)));
 	attach(file, streamUrl, settings.readOnly === true ? { readOnly: true } : {});
-	db.open();
-	const opened = db.location();
-	if (opened !== realpathSync(file)) {
-		db.close();
-		throw new UrsulaSetupError(`invalid_argument: SQLite opened ${opened ?? "an in-memory database"}, not the attached file ${file}`, "invalid_argument", undefined);
+	try {
+		db.open();
+		const opened = db.location();
+		if (opened === null || !sameFile(opened, file)) {
+			throw new UrsulaSetupError(`invalid_argument: SQLite opened ${opened ?? "an in-memory database"}, not the attached file ${file}`, "invalid_argument", undefined);
+		}
+		return db;
+	} catch (error) {
+		if (db.isOpen) db.close();
+		const classified = classify(error, () => status(file));
+		if (classified instanceof UrsulaError) throw classified;
+		const why = error instanceof Error ? error.message : String(error);
+		throw new UrsulaSetupError(`local_setup: attached ${file}, then could not open it (${why}): check the file and its directory, then open it again`, "local_setup", error);
 	}
-	return db;
+}
+
+/** Whether two paths name one file, by device and inode, whatever links and spellings lead to it. */
+function sameFile(a: string, b: string): boolean {
+	const first = statSync(a);
+	const second = statSync(b);
+	return first.dev === second.dev && first.ino === second.ino;
 }
 
 /**

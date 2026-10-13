@@ -280,7 +280,7 @@ function advice(kind: string, action: UrsulaErrorAction): string {
 		case "retry":
 			return "Nothing of it reached the stream, and the database stays usable: run it again later, the whole transaction if it was one.";
 		case "reattach":
-			return "Close the database and attach it again (open() does), which replays the stream.";
+			return "Close the database and attach it again, which replays the stream: the package's open() does, the database's own open() does not.";
 		case "stop":
 			return "Another owner took the stream over: stop using this database, and never reopen it in a loop.";
 		case "fix":
@@ -301,9 +301,18 @@ export interface FailureStatus extends CommitRefusalStatus {
 	readonly poisoned: boolean;
 	readonly fenced: boolean;
 	readonly reason: string | null;
+	/** Absent with an extension before 0.7.3. */
+	readonly writes_refused?: boolean;
 	/** Absent with an extension before 0.7.5. */
 	readonly error?: { readonly kind: string; readonly action: UrsulaErrorAction; readonly message: string } | null;
 }
+
+/**
+ * Whether `s` names a refusal of its own file's latest write. A refused commit of another file, one
+ * used through SQL `ATTACH DATABASE` on the connection, fails with the same code but leaves nothing
+ * there. An extension before 0.7.3 reports a `402` alone.
+ */
+const refusedHere = (s: FailureStatus): boolean => s.writes_refused === true || (s.refused_kind ?? null) !== null || (s.writes_refused === undefined && s.payment_required);
 
 /**
  * The error for a commit that failed with SQLITE_IOERR_AUTH, from `status(file)` right after it.
@@ -384,7 +393,7 @@ export function classify(error: unknown, status?: () => FailureStatus): unknown 
 	// Poisoned (by this commit, by an earlier one, or by the snapshot thread since a refusal): the file
 	// needs a new attach whatever the error, a refusal's code included.
 	if (s.poisoned) return poisonError(s, error);
-	if (code === SQLITE_IOERR_AUTH) return refusedCommitError(s, error);
+	if (code === SQLITE_IOERR_AUTH && refusedHere(s)) return refusedCommitError(s, error);
 	return error;
 }
 

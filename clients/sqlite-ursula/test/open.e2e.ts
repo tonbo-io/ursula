@@ -3,8 +3,9 @@
 // UrsulaError, which says what to do (`action`), for a failure of the extension, and every other error
 // unchanged. The errors of `attach` and `status`, and of Pi's storage, come from the same mapping.
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import os, { tmpdir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { DatabaseSync, StatementSync } from "node:sqlite";
 import { sql } from "drizzle-orm";
@@ -314,7 +315,9 @@ it("a commit whose outcome is unknown throws UrsulaReattachError (reattach), and
 	const { error, tables: after } = await runScript(script, [proxy.url + path, ursulaUrl() + path, file], { URSULA_VFS_RETRY_MS: "500" });
 	expect(error).toMatchObject({ name: "UrsulaReattachError", kind: "outcome_unknown", action: "reattach", fenced: false, errcode: POISONED, cause: POISONED });
 	expect(error).toMatchObject({ ursula: true, replication: true, reattach: true });
-	expect((error as { message: string }).message).toMatch(/^commit not replicated: .*\. Close the database and attach it again \(open\(\) does\), which replays the stream\.$/);
+	expect((error as { message: string }).message).toMatch(
+		/^commit not replicated: .*\. Close the database and attach it again, which replays the stream: the package's open\(\) does, the database's own open\(\) does not\.$/,
+	);
 	// The held append never reached the stream.
 	expect(after).toEqual([]);
 	const copy = open(ursulaUrl() + path, { path: freshFile() });
@@ -502,7 +505,7 @@ it("refuses a stream URL with a query or a fragment before sending anything", as
 // Regression (review of #579): the file was named after the URL's spelling, so another spelling of the
 // same stream (a trailing `/`, which the extension drops) got a file of its own and took the stream
 // over from the first database in the same process.
-it("opens one file for every spelling of a stream's URL: a second spelling is in use, not a takeover", () => {
+it("opens one file for every spelling of a stream's URL: in use while it is open, not a takeover, and attached under any spelling", () => {
 	const url = ursulaUrl() + streamPath();
 	const db = open(url, { dir });
 	db.exec("CREATE TABLE t(x)");
@@ -513,10 +516,18 @@ it("opens one file for every spelling of a stream's URL: a second spelling is in
 	expect(again.location()).toBe(realpathSync(derived(url)));
 	expect(again.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
 	again.close();
-	// Another percent-encoding of the name is the same file too, which recorded the first spelling.
-	const encoded = url.replace(/\/vfs-/, "/%76fs-");
-	expect(derived(encoded)).toBe(derived(url));
-	expect(failure(() => open(encoded, { dir }))).toMatchObject({ name: "UrsulaSetupError", kind: "other_stream", action: "fix" });
+	// Another percent-encoding of the name, or a dot segment, is the same file too: open attaches it
+	// with one spelling of the stream, whichever the caller used.
+	for (const spelled of [url.replace(/\/vfs-/, "/%76fs-"), url.replace(/\/vfs-/, "/./vfs-")]) {
+		expect(derived(spelled), spelled).toBe(derived(url));
+		const other = open(spelled, { dir });
+		expect(other.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
+		other.close();
+		// Readers too.
+		const reader = open(spelled, { dir, readOnly: true });
+		expect(reader.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
+		reader.close();
+	}
 });
 
 // Regression (review of #579): a read-only open derived the owner's file, so a reader on the owner's
@@ -627,7 +638,7 @@ it("a transaction helper's ROLLBACK after an unknown outcome keeps the UrsulaRea
 });
 
 // Regression (review of #579): prepare dropped its second argument, the statement's options that
-// node:sqlite 24 takes.
+// node:sqlite takes from 24.14.
 it("passes every argument of prepare on to node:sqlite", () => {
 	const db = open(ursulaUrl() + streamPath(), { dir });
 	const original = DatabaseSync.prototype.prepare;
@@ -645,7 +656,20 @@ it("passes every argument of prepare on to node:sqlite", () => {
 	db.close();
 });
 
-it.runIf(Number(process.versions.node.split(".")[0]) >= 24)("applies node:sqlite 24's statement options", () => {
+/** Whether this node:sqlite takes a statement's options in `prepare` (from 24.14, and late 25.x). */
+const statementOptions = ((): boolean => {
+	const probe = new DatabaseSync(":memory:");
+	try {
+		const prepare = probe.prepare as (...a: unknown[]) => StatementSync;
+		return typeof prepare.call(probe, "SELECT 9007199254740993 AS x", { readBigInts: true }).get()?.x === "bigint";
+	} catch {
+		return false;
+	} finally {
+		probe.close();
+	}
+})();
+
+it.runIf(statementOptions)("applies the statement options of node:sqlite from 24.14", () => {
 	const db = open(ursulaUrl() + streamPath(), { dir });
 	const prepare = db.prepare as (...a: unknown[]) => StatementSync;
 	expect(prepare.call(db, "SELECT 9007199254740993 AS x", { readBigInts: true }).get()).toEqual({ x: 9007199254740993n });
@@ -682,4 +706,78 @@ it("checks node:sqlite's options before attaching: a wrong one claims nothing", 
 	db.exec("INSERT INTO t VALUES (1)");
 	expect(failure(() => status(other))).toMatchObject({ name: "UrsulaSetupError", kind: "not_attached" });
 	db.close();
+});
+
+// Regression (re-review of #579): a refused commit of a second replicated file used through SQL
+// ATTACH DATABASE was classified by the main file's status, which names no refusal: a too_large
+// refusal came back as `retry`. It is SQLite's own error, as the docs say.
+it("a refused commit of a file used through SQL ATTACH DATABASE is SQLite's own error", async () => {
+	const main = open(ursulaUrl() + streamPath(), { dir });
+	const path = streamPath();
+	const second = freshFile();
+	attach(second, gate.url + path);
+	main.prepare("ATTACH DATABASE ? AS b").run(second);
+	main.exec("CREATE TABLE b.t(x BLOB)");
+	await gate.refuse("", { status: 413, headers: { "x-ursula-not-applied": "PayloadTooLarge", ...VOUCH }, methods: ["POST"], over: 65_536, path });
+	const refused = failure(() => main.exec("INSERT INTO b.t VALUES (randomblob(200000))"));
+	expect(refused).not.toBeInstanceOf(UrsulaError);
+	expect(refused).toMatchObject({ code: "ERR_SQLITE_ERROR", errcode: COMMIT_REFUSED });
+	expect(status(second).error).toMatchObject({ kind: "too_large", action: "fix" });
+	expect(status(main.location() as string).error).toBeNull();
+	main.close();
+});
+
+// Regression (re-review of #579): the ninth read-only open of a stream on a host failed with a raw
+// in_use naming `-ro8`.
+it("says so when every reader file of a stream is held", () => {
+	const url = ursulaUrl() + streamPath();
+	const owner = open(url, { dir: freshFile() });
+	owner.exec("CREATE TABLE t(x)");
+	owner.close();
+	const readers = Array.from({ length: 8 }, () => open(url, { dir, readOnly: true }));
+	expect(readers.at(-1)?.location()).toBe(realpathSync(derived(url, "-ro8")));
+	const ninth = failure(() => open(url, { dir, readOnly: true }));
+	expect(ninth).toMatchObject({ name: "UrsulaSetupError", kind: "in_use", action: "fix" });
+	expect(ninth.message).toMatch(/none of the 8 read-only files of this stream in .* is free \(a process holds the files it attached until it exits\): pass `dir` or `path`/);
+	for (const reader of readers) reader.close();
+});
+
+// Regression (re-review of #579): Node's own realpathSync reads a link's target `x/../y` without
+// following `x` first, unlike the kernel and SQLite, so the check after the attach failed with a raw
+// ENOENT and left the database open.
+it("opens through a directory link whose target goes through another link and `..`", () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "sqlite-ursula-links-")));
+	for (const d of ["a", "z/w", "z/y"]) mkdirSync(join(root, d), { recursive: true });
+	symlinkSync(join(root, "z", "w"), join(root, "a", "x"));
+	symlinkSync("x/../y", join(root, "a", "l1"));
+	const url = ursulaUrl() + streamPath();
+	const db = open(url, { dir: join(root, "a", "l1") });
+	expect(db.location()).toBe(join(root, "z", "y", localName(new URL(url))));
+	db.exec("CREATE TABLE t(x)");
+	db.close();
+	// Nothing was left open: the stream opens again.
+	open(url, { dir: join(root, "a", "l1") }).close();
+});
+
+// Regression (re-review of #579): os.homedir() throws when HOME is unset and the user database has no
+// entry, which escaped as a raw SystemError.
+it("needs dir or path when there is no home directory", () => {
+	const saved = { homedir: os.homedir, userInfo: os.userInfo, xdg: process.env.XDG_CACHE_HOME };
+	const missing = (): never => {
+		throw Object.assign(new Error("A system error occurred: uv_os_homedir returned ENOENT"), { code: "ERR_SYSTEM_ERROR" });
+	};
+	delete process.env.XDG_CACHE_HOME;
+	os.homedir = missing;
+	os.userInfo = missing;
+	syncBuiltinESMExports();
+	try {
+		const e = failure(() => open(ursulaUrl() + streamPath()));
+		expect(e).toMatchObject({ name: "UrsulaSetupError", kind: "local_setup", action: "fix" });
+		expect(e.message).toMatch(/no home directory .*: pass `dir`/);
+	} finally {
+		os.homedir = saved.homedir;
+		os.userInfo = saved.userInfo;
+		syncBuiltinESMExports();
+		if (saved.xdg !== undefined) process.env.XDG_CACHE_HOME = saved.xdg;
+	}
 });
