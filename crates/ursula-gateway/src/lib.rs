@@ -41,7 +41,8 @@
 //! bucket's upload limits is refused at once (`429`), and one that finds the
 //! budget spent after a short wait (`503`). A body that stops arriving, or
 //! falls below a floor of bytes over one window of the stall timeout, is cut
-//! and refused (`408`) before anything of it is forwarded. Each of these refusals is marked `x-ursula-not-applied`. The
+//! and refused (`408`) before anything of it is forwarded. Each of these
+//! refusals is marked `x-ursula-not-applied`. The
 //! first two, and the `413` for a body over a bucket's own limit, read the
 //! body first, at the pace a forwarded body may keep, so that the client gets
 //! them on an intact connection.

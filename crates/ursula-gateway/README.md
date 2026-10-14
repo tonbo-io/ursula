@@ -327,13 +327,13 @@ that concurrent large or slow uploads cannot exhaust the gateway's memory.
 Before it reads any byte of a body, a request reserves the body's
 `Content-Length` from `--body-budget-bytes`. A body without a declared length
 reserves `--small-body-max-bytes` at first, and its reservation grows as the
-body arrives. The gateway copies each piece of a body into one buffer as it arrives
-and drops the piece, so the memory a body holds stays within its reservation
-however small the pieces it arrives in: a declared body gets a buffer of its
-`Content-Length`, and one without a declared length grows its buffer within
-its reservation. The reservation shrinks to the buffer's size once the
-gateway has the body whole, and ends when the gateway is done forwarding it, when it refuses
-the request, or when the client goes away. A request without a body reserves
+body arrives. The gateway copies each piece of a body into one buffer as it
+arrives and drops the piece, however small the pieces: a declared body gets a
+buffer of its `Content-Length`, and one without a declared length grows its
+buffer within its reservation, briefly holding up to twice its share while
+the buffer reallocates. The reservation shrinks to the buffer's size once the
+gateway has the body whole, and ends when the gateway is done forwarding it,
+when it refuses the request, or when the client goes away. A request without a body reserves
 nothing.
 
 - `--small-body-headroom-bytes` of the budget only bodies of at most
