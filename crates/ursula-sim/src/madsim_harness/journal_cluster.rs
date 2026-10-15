@@ -654,7 +654,15 @@ pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u
         },
         committed: replica.local_committed.map(|committed| committed.index),
         gate: gate(cluster, group, node_id),
-        plan_leader: history.plan().map(|plan| plan.leader),
+        plan: history
+            .plan()
+            .map(|plan| ursula_proto::admin::RaftGroupRecovery {
+                leader: plan.leader,
+                point: plan.point,
+                leader_term: plan.leader_term,
+                cut_pending: matches!(plan.cut, ursula_raft::PlanCut::Pending { .. }),
+            }),
+        leads_live: ursula_raft::leads_live(&replica),
         history_event_index: history.applied().map(|event| event.event_index),
         current_leader: replica.current_leader,
         voter_ids: replica.membership_config.membership().voter_ids().collect(),
@@ -689,7 +697,7 @@ impl SimPlanTransport<'_> {
                         message: error.to_string(),
                     },
                 },
-                None => SendError::Transport {
+                None => SendError::Failed {
                     node_id,
                     source: Box::new(error),
                 },

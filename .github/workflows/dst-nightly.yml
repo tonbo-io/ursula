@@ -37,7 +37,7 @@ jobs:
           python3 -m scripts.dst seed-report
 
       - name: Run DST negative controls
-        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib negative_control
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- negative_control either_defence
 
       - name: Run nightly madsim seed sweep
         run: |

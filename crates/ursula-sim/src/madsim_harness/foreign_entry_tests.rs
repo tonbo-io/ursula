@@ -60,6 +60,12 @@ const FOREIGN: &[u8] = b"foreign-uncommitted;";
 struct Outcome {
     /// Groups whose plan elected P, so X reached the plan's leader.
     shaped: usize,
+    /// Of those, groups where X extended P's log above the point at or
+    /// below the plan term: the replication fence did not stop it.
+    extended: usize,
+    /// Of those, groups whose plan was satisfied: the log guard did not
+    /// stop P.
+    shaped_satisfied: usize,
     /// Groups whose plan was satisfied on every reached replica.
     satisfied: usize,
     /// A reached replica applied X's write.
@@ -71,6 +77,8 @@ struct Outcome {
 struct XReachesTheLeader<'a> {
     inner: SimPlanTransport<'a>,
     leader: u64,
+    /// X extended P's log above the point at or below the plan term.
+    extended: bool,
 }
 
 impl XReachesTheLeader<'_> {
@@ -86,6 +94,17 @@ impl XReachesTheLeader<'_> {
             self.inner.cluster.policy.heal_bidirectional(X, P);
             madsim::time::sleep(Duration::from_secs(3)).await;
             self.inner.cluster.policy.partition_bidirectional(X, P);
+            if let Ok(report) = &answer {
+                let held = member_view(self.inner.cluster, self.inner.group, P)
+                    .await
+                    .log;
+                self.extended = held
+                    .last_log_index
+                    .is_some_and(|index| index > request.point)
+                    && held
+                        .last_log_term
+                        .is_some_and(|term| term <= report.leader_term);
+            }
         }
         answer
     }
@@ -206,15 +225,19 @@ fn run(seed: u64, controls: Controls) -> Outcome {
                     group,
                 },
                 leader: plan.leader,
+                extended: false,
             };
             let sent = send_plan(&mut transport, plan, &members)
                 .await
                 .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
+            let extended = transport.extended;
             for error in &sent.refused {
                 tracing::info!(%error, "{context}: group {group}: a member refused the plan");
             }
-            if plan.leader == P {
+            let shaped = plan.leader == P;
+            if shaped {
                 outcome.shaped = outcome.shaped.saturating_add(1);
+                outcome.extended = outcome.extended.saturating_add(usize::from(extended));
             }
             let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
             loop {
@@ -231,6 +254,8 @@ fn run(seed: u64, controls: Controls) -> Outcome {
                 });
                 if satisfied {
                     outcome.satisfied = outcome.satisfied.saturating_add(1);
+                    outcome.shaped_satisfied =
+                        outcome.shaped_satisfied.saturating_add(usize::from(shaped));
                     // The event landed: nothing below it changes any more.
                     madsim::time::sleep(Duration::from_millis(300)).await;
                     outcome.foreign_applied |= foreign_applied(&cluster, group).await;
@@ -265,19 +290,46 @@ fn a_leader_before_the_plan_never_extends_the_plans_leader() {
     assert!(shaped > 0, "no seed elected P: the scenario never ran");
 }
 
-/// Either defence alone keeps X's write from being applied.
+/// Either defence alone keeps X's write from being applied, and each run
+/// shows that the remaining one fired: without the log guard, the fence
+/// keeps X's entry out of P's log and the plan is satisfied; without the
+/// fence, X extends P's log and the guard keeps P from being elected.
 #[test]
 fn either_defence_against_a_foreign_entry_alone_suffices() {
     let _guard = sim_test_guard();
-    for controls in [Controls::NO_LOG_GUARD, Controls::NO_REPLICATION_FENCE] {
-        for seed in JOURNAL_POWER_LOSS_SEEDS {
-            let outcome = run(seed, controls);
-            assert!(
-                !outcome.foreign_applied,
-                "seed {seed} {controls:?}: {outcome:?}"
-            );
-        }
+    let (mut fenced, mut guarded) = (0_usize, 0_usize);
+    for seed in JOURNAL_POWER_LOSS_SEEDS {
+        let outcome = run(seed, Controls::NO_LOG_GUARD);
+        assert!(
+            !outcome.foreign_applied,
+            "seed {seed} fence only: {outcome:?}"
+        );
+        assert_eq!(outcome.extended, 0, "seed {seed} fence only: {outcome:?}");
+        assert_eq!(
+            outcome.shaped_satisfied, outcome.shaped,
+            "seed {seed} fence only: {outcome:?}"
+        );
+        fenced = fenced.saturating_add(outcome.shaped);
+
+        let outcome = run(seed, Controls::NO_REPLICATION_FENCE);
+        assert!(
+            !outcome.foreign_applied,
+            "seed {seed} guard only: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.extended, outcome.shaped,
+            "seed {seed} guard only: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.shaped_satisfied, 0,
+            "seed {seed} guard only: {outcome:?}"
+        );
+        guarded = guarded.saturating_add(outcome.shaped);
     }
+    assert!(
+        fenced > 0 && guarded > 0,
+        "no seed elected P: {fenced} {guarded}"
+    );
 }
 
 /// M1 of the third #581 review, with both defences off: X extends P's log

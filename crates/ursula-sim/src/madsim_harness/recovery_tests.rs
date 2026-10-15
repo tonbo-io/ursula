@@ -1607,3 +1607,110 @@ fn a_five_voter_group_that_lost_three_voters_recovers_through_a_plan() {
         });
     }
 }
+
+/// M2 of the third #581 review: the plan's leader takes `lead` while it is
+/// a stale leader (it lost its quorum but stays in OpenRaft's leader state)
+/// or a candidate. It restarts its group before it answers, so it drops that
+/// leadership or campaign: its durable vote for itself is uncommitted, it is
+/// elected only above the plan term, and the plan is satisfied. The plan is
+/// sent by hand, as the runbook does, over each replica's admin entry point.
+#[test]
+fn a_stale_leader_or_candidate_that_takes_a_plan_restarts_first() {
+    let _guard = sim_test_guard();
+    for (seed, stale_leader) in [(1_u64, true), (2, false), (3, true), (5, false)] {
+        run_with_madsim(seed, async move {
+            const P: u64 = 3;
+            let context = format!("seed {seed} stale leader {stale_leader}");
+            let mut cluster =
+                JournalCluster::start_with_fsync("demote-on-plan", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 3).await;
+            }
+            cluster.verify_reads().await;
+            lead_every_group(&cluster, if stale_leader { P } else { 1 }, &context).await;
+            for node_id in [1, 2] {
+                cluster.policy.partition_bidirectional(P, node_id);
+            }
+            if !stale_leader {
+                // P campaigns alone while the others still lead.
+                madsim::time::sleep(Duration::from_secs(1)).await;
+            }
+            for node_id in [1, 2] {
+                cluster.stop_node(node_id).await;
+            }
+            for node_id in [1, 2] {
+                cluster.wals[&node_id].power_loss().await;
+            }
+            for node_id in [1, 2] {
+                cluster.start_node(node_id).await;
+            }
+            // The others stall, and P's quorum acknowledgement grows old.
+            madsim::time::sleep(RECOVERY_STALL_AFTER * 2 + Duration::from_secs(4)).await;
+            cluster.votes.clear();
+            let mut sent_plans = Vec::new();
+            for group in JOURNAL_GROUPS {
+                let state = metrics(&cluster, group, P).state;
+                let expected = if stale_leader {
+                    openraft::ServerState::Leader
+                } else {
+                    openraft::ServerState::Candidate
+                };
+                assert_eq!(state, expected, "{context}: group {group}");
+                let mut members = Vec::new();
+                for node_id in NODES {
+                    members.push(member_view(&cluster, group, node_id).await);
+                }
+                let plan = ursula_ctl::recovery::plan_group(&members)
+                    .unwrap_or_else(|error| panic!("{context}: group {group}: {error}"));
+                assert_eq!(plan.leader, P, "{context}: group {group}: {plan:?}");
+                cluster.plan_leaders.insert(P);
+                let before = cluster.rejoins[&(group, P)].clone();
+                let sent = ursula_ctl::recovery::send_plan(
+                    &mut crate::madsim_harness::journal_cluster::SimPlanTransport {
+                        cluster: &mut cluster,
+                        group,
+                    },
+                    plan,
+                    &members,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{context}: group {group}: {error}"));
+                assert!(sent.refused.is_empty(), "{context}: {:?}", sent.refused);
+                // It restarted: a new replica, a follower, its vote for
+                // itself uncommitted.
+                assert!(
+                    !std::sync::Arc::ptr_eq(&before, &cluster.rejoins[&(group, P)]),
+                    "{context}: group {group}: P answered without restarting"
+                );
+                assert_ne!(
+                    metrics(&cluster, group, P).state,
+                    openraft::ServerState::Leader,
+                    "{context}: group {group}"
+                );
+                let vote = cluster.wals[&P]
+                    .store(RaftGroupId(group))
+                    .expect("a running replica holds its store")
+                    .read_vote()
+                    .await
+                    .expect("vote")
+                    .expect("a vote");
+                assert!(!vote.is_committed(), "{context}: group {group}: {vote:?}");
+                sent_plans.push((group, plan, sent.leader_term));
+            }
+            for node_id in [1, 2] {
+                cluster.policy.heal_bidirectional(P, node_id);
+            }
+            for (group, plan, leader_term) in sent_plans {
+                wait_plan_satisfied(&cluster, group, &NODES, plan.point, &context).await;
+                let leader = wait_leader(&cluster, group, &context).await;
+                assert_eq!(leader, P, "{context}: group {group}");
+                let term = metrics(&cluster, group, P).current_term;
+                assert!(
+                    term > leader_term,
+                    "{context}: group {group}: elected at {term}, plan term {leader_term}"
+                );
+            }
+            assert_no_vote_while_gated(&cluster, &context);
+        });
+    }
+}

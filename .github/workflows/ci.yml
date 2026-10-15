@@ -137,7 +137,7 @@ jobs:
       # Each negative control switches off exactly one defence and asserts
       # that its scenario then fails the invariant the defence keeps.
       - name: Run DST negative controls
-        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib negative_control
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- negative_control either_defence
 
       - name: Run madsim smoke corpus and PR seed set
         run: |
