@@ -2,8 +2,10 @@
 //!
 //! Routes client HTTP requests to upstream Ursula nodes.
 //!
-//! Raft leadership redirects (marked by `x-ursula-raft-leader-id`) are followed
-//! internally by the gateway after buffering the request body, so a client
+//! Ursula's routing redirects (a `307` that names the leader in
+//! `x-ursula-raft-leader-id`, or the group alone in `x-ursula-raft-group` from
+//! a node that hosts no replica of it) are followed internally by the gateway
+//! after buffering the request body, so a client
 //! never gets one: up to three hops after the first, none starting later than
 //! 5 s after the first redirect. A redirect to an address that is not one of
 //! the upstreams, or to an upstream the request already went to, sends the
@@ -623,12 +625,11 @@ impl Gateway {
     ///   limits, the client gets a retryable `503`
     ///   ([`GatewayError::LeaderNotFound`]).
     ///
-    /// Each hop sends the request again. Every stream write but a plain append
-    /// tolerates that, as the README's Redirects section explains. A plain
-    /// append, without a producer or `Stream-Seq`, can apply once for each
-    /// node that proposed it and then redirected: at-least-once delivery, as
-    /// on any retry of it, and as through a gateway before 0.7.3, which
-    /// followed one redirect.
+    /// Each hop sends the request again. A node routes a write with a body
+    /// before it reads the body, so it never redirects one it proposed. Only
+    /// a bodiless write (a delete or a retention move) can be redirected after
+    /// OpenRaft took it, and both tolerate a repeat, as the README's Redirects
+    /// section explains.
     async fn forward(
         &self,
         upstream: &str,

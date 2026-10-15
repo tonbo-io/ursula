@@ -115,9 +115,11 @@ with or without access control.
 
 ## Redirects
 
-The gateway follows Ursula `307 Temporary Redirect` responses marked as Raft
-leader redirects with `x-ursula-raft-leader-id` itself, so a client never gets
-one:
+The gateway follows Ursula's routing redirects itself, so a client never gets
+one: a `307 Temporary Redirect` to the leader, with `x-ursula-raft-leader-id`,
+`x-ursula-raft-group` and `x-ursula-raft-term`, and a `307` from a node that
+hosts no replica of the stream's group to one that does, which names the group
+alone in `x-ursula-raft-group`:
 
 - It sends the request to the upstream that the redirect's `Location` names,
   unless the request already went to that upstream.
@@ -131,8 +133,7 @@ one:
 - At most three hops follow redirects, search hops included, and none starts
   later than 5 s after the request's first redirect. A hop under way runs to
   its answer, so a long-poll or a large upload that reached the leader is not
-  cut short. Nor does a slow first hop use the 5 s up: a follower can store a
-  large body in object storage before it redirects.
+  cut short.
 - When no upstream answers without redirecting within these limits, the
   client gets `503` with `Retry-After: 1`, as from a node whose group has no
   known leader.
@@ -140,30 +141,19 @@ one:
 Gateways before 0.7.3 followed one redirect, to a configured upstream only,
 and passed any other on to the client with a path-only `Location`.
 
-Each hop sends the request again. Only stream requests are redirected. Two
-hops of one request are at most 5 s and the earlier hop's own time apart.
-When a node proposed a write before it redirected, so that the write may
-already apply, the next hop's copy fares as follows:
+Each hop sends the request again. Only stream requests are redirected. A
+node routes a create, an append or close, and a snapshot publish before it
+reads the body, so it never redirects one of them after it proposed it: a
+node that loses the leadership while it reads the body answers `503` with
+`Retry-After`, which the gateway passes on. A bodiless write, a delete or a
+retention move, can still be redirected after OpenRaft took it, so the next
+hop's copy may meet a write that already applied:
 
-- A producer append or close is deduplicated by its `Producer-Id`,
-  `Producer-Epoch` and `Producer-Seq`.
-- A create answers `200` for a stream that already exists as it asks. If
-  another client deleted the stream between the two hops, it creates the
-  stream again.
-- A close without a body answers as the first close did.
-- A snapshot publish or a retention move makes the same change again.
 - A delete answers `404`: the stream is gone. An unconditional delete also
   deletes a stream that another client recreated between the two hops. With
   `Stream-Incarnation`, it answers `412` and deletes nothing instead, so send
   it.
-- An append with `Stream-Seq`, or one that also closes the stream, is refused
-  with `409`, which its client cannot tell apart from a conflict with another
-  writer.
-- A plain append, without a producer or `Stream-Seq`, applies again: once for
-  each node that proposed it and then redirected. Its client gets
-  at-least-once delivery, as on any retry of it, and as through gateways
-  before 0.7.3, which followed one redirect. Use a producer for exactly-once
-  writes.
+- A retention move makes the same change again.
 
 Other `307` responses remain visible to the client. Their `Location` header is
 reduced to the path and query so redirect-following clients such as `curl -L`

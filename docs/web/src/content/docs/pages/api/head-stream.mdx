@@ -40,8 +40,8 @@ Response headers include:
 | `Stream-Incarnation` | An opaque token for this incarnation of the stream. It changes when the stream is deleted and recreated at the same URL; compare it only for equality. |
 | `Ursula-Protocol` | `2`. Present on every answer to a `HEAD`, `404`, `307` and `503` included. See [Server metadata](/docs/specs/extensions#10-server-metadata). |
 | `Ursula-Cluster-Id` | The deployment that served the request, as `server.cluster_id` names it. Present on every answer to a `HEAD`. A different id means another deployment, not a new history of the stream. |
-| `Ursula-Max-Request-Bytes` | The largest request body any request to the stream may carry: 33554432 (32 MiB) from a node, lowered by a gateway with a smaller limit. A larger request answers `413`. See [Server metadata](/docs/specs/extensions#10-server-metadata). |
-| `Ursula-Max-Snapshot-Bytes` | The largest snapshot the node accepts: 1073741824 (1 GiB). Present only on a node with a cold backend. |
+| `Ursula-Max-Request-Bytes` | The largest request body any request to the stream may carry: 33554432 (32 MiB) from a node, lowered by a gateway with a smaller limit. A larger request answers `413`. Until snapshots go up in parts, a snapshot publish on a node with a cold backend is the exception: it may carry up to `Ursula-Max-Snapshot-Bytes` in one request. See [Server metadata](/docs/specs/extensions#10-server-metadata). |
+| `Ursula-Max-Snapshot-Bytes` | The largest snapshot the node accepts: 1073741824 (1 GiB). Present only on a node with a cold backend. A gateway passes it unchanged, so until snapshots go up in parts a snapshot above the gateway's own body limit is refused by the gateway although `HEAD` advertises more. |
 | `Stream-TTL` | The configured TTL in seconds (if a TTL was set). This is the sliding window length, not the time remaining. `HEAD` does not renew it. |
 | `Stream-Expires-At` | Expiration timestamp (if set). |
 | `Cache-Control` | `no-store`. |
