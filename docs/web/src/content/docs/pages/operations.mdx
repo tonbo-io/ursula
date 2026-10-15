@@ -328,6 +328,26 @@ aws s3 rm "s3://my-ursula-bucket/ursula-test-20260518T000000Z" --recursive
 
 There is no automatic retention policy. Application checkpoints and explicit stream-retention advances control which cold objects become eligible for GC. After a retention advance, each group's leader deletes the stream's cold objects that lie wholly below the retained offset (chunks and offloaded external payloads, in whole 64 MiB cold-index pages, so up to one page just below the retained offset can remain until retention moves past it) once a 5-minute grace has passed, so reads planned before the advance still complete; its cold-index cursor visits 16 streams per group per minute, so on groups with many streams collection can lag further. The grace restarts after a leader change. Retention is a storage-cost tool only: replica memory does not depend on it (see [Memory without retention](#memory-without-retention)).
 
+### Incomplete multipart uploads
+
+Ursula writes large cold objects with S3 multipart uploads. A crash or shutdown in the middle of a cold write leaves an incomplete upload behind. Ursula never aborts these uploads, and S3 bills for their uploaded parts until they are aborted. Snapshot commits from parts make long cold writes more common, so these leftovers show up more often.
+
+Add an `AbortIncompleteMultipartUpload` lifecycle rule to every cold bucket, for example after 1 day:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket my-ursula-bucket \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "abort-incomplete-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": {},
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+    }]
+  }'
+```
+
+This call replaces the bucket's whole lifecycle configuration. If the bucket has other rules, add this rule to them. MinIO and other S3-compatible stores need their own equivalent rule. Check the store's lifecycle documentation for how to expire incomplete multipart uploads.
+
 ## Backup and disaster recovery
 
 `ursulactl` provides a verifiable whole-cluster backup and restore workflow:
