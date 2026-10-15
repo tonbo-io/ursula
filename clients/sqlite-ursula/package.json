@@ -50,6 +50,7 @@
     "@earendil-works/chord": "1.1.0",
     "@earendil-works/pi-ai": "1.1.0",
     "@earendil-works/pi-durable": "1.1.0",
+    "@noble/hashes": "2.4.0",
     "@types/node": "22.20.5",
     "drizzle-orm": "1.0.0-rc.4",
     "kysely": "0.29.6",

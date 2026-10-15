@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { Child, freshDir, killChildren, stream } from "./kit.ts";
 
@@ -151,6 +152,29 @@ describe("SQLite outside the extension", () => {
 		await owner.exec("INSERT INTO t VALUES (1)");
 		expect(await owner.send({ synced: 10_000 })).toMatchObject({ ok: true, synced: { synced: true } });
 		expect(await owner.rows("SELECT x FROM t")).toEqual([{ x: 1 }]);
+		await owner.stop();
+	});
+
+	// Golden (frozen for 0.8.x): `marker::empty_page_one` against SQLite's own new WAL database,
+	// byte for byte past the marker (0..16) and the library version (96..100), which it leaves 0.
+	it("publishes a new cache's page 1 as SQLite writes a new WAL database's", async () => {
+		const s = stream("outsiders-page-one");
+		const owner = new Child(s.url, freshDir());
+		const { path } = await owner.opened();
+		const ours = readFileSync(path);
+		const plain = join(freshDir(), "plain.db");
+		const db = new DatabaseSync(plain);
+		db.exec("PRAGMA page_size=4096; PRAGMA journal_mode=WAL");
+		db.close();
+		const theirs = readFileSync(plain);
+		expect(ours.length).toBe(4096);
+		expect(theirs.length).toBe(4096);
+		expect(ours.subarray(16, 96).toString("hex")).toBe(theirs.subarray(16, 96).toString("hex"));
+		expect(ours.subarray(96, 100).toString("hex")).toBe("00000000");
+		expect(ours.subarray(100).toString("hex")).toBe(theirs.subarray(100).toString("hex"));
+		// SQLite in the extension finds it a sound empty database before the first commit.
+		expect(await owner.rows("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+		expect(await owner.rows("SELECT count(*) AS n FROM sqlite_schema")).toEqual([{ n: 0 }]);
 		await owner.stop();
 	});
 

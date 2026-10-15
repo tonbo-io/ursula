@@ -572,6 +572,7 @@ impl Log {
             if !removed.is_empty() {
                 sync_dir(dir).map_err(io("fsync", dir))?;
             }
+            abort_at(Step::CutRemoved);
             if file.metadata().map_err(io("stat", &last.path))?.len() > len {
                 file.set_len(len).map_err(io("cut", &last.path))?;
                 file.sync_data().map_err(io("fdatasync", &last.path))?;
@@ -860,6 +861,7 @@ impl Log {
                 )));
             }
             sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
+            abort_at(Step::TrimUnlinked);
             self.segments.remove(0);
         }
         Ok(removable)
