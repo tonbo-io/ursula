@@ -9,6 +9,7 @@ use std::sync::Weak;
 
 use futures_util::future::join_all;
 use ursula_config::WalFsync;
+use ursula_headers::ClusterId;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_shard::CoreId;
 use ursula_shard::ShardPlacement;
@@ -72,14 +73,33 @@ impl RaftWal {
         Self::start_with(root, JournalTuning::new(fsync), topology)
     }
 
-    /// Starts a run of the Raft WAL under `root` with `tuning`.
+    /// Starts a run of the Raft WAL under `root` with `tuning`, keeping the
+    /// cluster id the root holds or generating one for a new root.
     pub fn start_with(
         root: impl Into<PathBuf>,
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
     ) -> Result<Self, RaftWalError> {
+        Self::start_in_cluster(root, tuning, topology, None)
+    }
+
+    /// Starts a run of the Raft WAL under `root` with `tuning` for the
+    /// configured `cluster_id`. A new root records it, or a generated id when
+    /// `None`. An existing root must hold the same id
+    /// ([`RaftWalError::ClusterIdMismatch`]).
+    pub fn start_in_cluster(
+        root: impl Into<PathBuf>,
+        tuning: JournalTuning,
+        topology: &ursula_shard::StaticShardMap,
+        cluster_id: Option<&ClusterId>,
+    ) -> Result<Self, RaftWalError> {
         Ok(Self {
-            node: Arc::new(NodeWal::start(root.into(), tuning.fsync, topology)?),
+            node: Arc::new(NodeWal::start(
+                root.into(),
+                tuning.fsync,
+                topology,
+                cluster_id,
+            )?),
             tuning,
             lagging: Arc::new(LaggingGroups::default()),
             core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
@@ -88,6 +108,11 @@ impl RaftWal {
 
     pub fn root(&self) -> &Path {
         self.node.root()
+    }
+
+    /// The cluster id bound to this WAL root.
+    pub fn cluster_id(&self) -> &ClusterId {
+        self.node.cluster_id()
     }
 
     pub fn fsync(&self) -> WalFsync {

@@ -1108,7 +1108,7 @@ async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
     let core = Core::small(WalFsync::Always);
     let root = core._root.path();
     let topology = ursula_shard::StaticShardMap::new(1, 2).unwrap();
-    drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+    drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology, None).unwrap());
     let writer = core.writer();
     let mut store = core.store(&writer, 1);
     for index in 1..=40 {
@@ -1137,7 +1137,7 @@ async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
         .map(|id| (*id, fs::read(core.segment(*id)).unwrap()))
         .collect::<Vec<_>>();
     for _ in 0..2 {
-        let node = NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap();
+        let node = NodeWal::start(root.to_owned(), WalFsync::Always, &topology, None).unwrap();
         let opening = node.opening();
         assert_eq!(opening.recovery_epoch, 0);
         let mut options = core.options(opening.recovery_epoch, opening.recovery);
@@ -1198,7 +1198,7 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
         let core = Core::small(WalFsync::Always);
         let root = core._root.path();
         let topology = ursula_shard::StaticShardMap::new(1, 3).unwrap();
-        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology, None).unwrap());
         let writer = core.writer();
         let mut sibling = core.store(&writer, 2);
         append(&mut sibling, [blank_entry(1)]).await;
@@ -1222,7 +1222,7 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
         .record(RunStatus::Running, "host crash")
         .unwrap();
         // Startup records Running but crashes before lazy core replay.
-        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology).unwrap());
+        drop(NodeWal::start(root.to_owned(), WalFsync::Always, &topology, None).unwrap());
         if gate_already_persisted {
             // Also exercise a crash after the durable repair gate, before truncate.
             assert!(
@@ -1230,7 +1230,7 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
             );
         }
         for _ in 0..2 {
-            let node = NodeWal::start(root.to_owned(), WalFsync::Never, &topology).unwrap();
+            let node = NodeWal::start(root.to_owned(), WalFsync::Never, &topology, None).unwrap();
             let opening = node.opening();
             let mut options = core.options(opening.recovery_epoch, opening.recovery);
             options.tuning.fsync = WalFsync::Never;

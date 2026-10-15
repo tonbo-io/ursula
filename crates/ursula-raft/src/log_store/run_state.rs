@@ -347,6 +347,14 @@ pub enum RaftWalError {
     },
     #[error("WAL topology is missing at '{}' but prior WAL state exists. Refusing to infer core_count and group_count from the current configuration. For replica rebuild or single-node migration, see https://ursula.tonbo.io/docs/operations#wal-routing-configuration", .root.display())]
     MissingTopology { root: PathBuf },
+    #[error("the WAL at '{}' belongs to cluster '{stored}', but server.cluster_id is '{configured}'. A disk does not move between clusters: set server.cluster_id to '{stored}', or start this node on an empty WAL", .root.display())]
+    ClusterIdMismatch {
+        root: PathBuf,
+        stored: String,
+        configured: ursula_headers::ClusterId,
+    },
+    #[error("the WAL topology at '{}' holds an invalid cluster id '{stored}'", .root.display())]
+    InvalidStoredClusterId { root: PathBuf, stored: String },
     #[error("read the Raft WAL topology: {0}")]
     ReadTopology(#[source] StateFileError),
     #[error("record the Raft WAL topology: {0}")]
@@ -447,6 +455,7 @@ impl RunStateFile {
 #[derive(Debug)]
 pub(crate) struct NodeWal {
     root: PathBuf,
+    cluster_id: ursula_headers::ClusterId,
     opening: WalOpening,
     run_state: Arc<RunStateFile>,
     /// Keeps a second process off the root, so two runs never interleave
@@ -463,6 +472,7 @@ impl NodeWal {
         root: PathBuf,
         fsync: WalFsync,
         topology: &ursula_shard::StaticShardMap,
+        cluster_id: Option<&ursula_headers::ClusterId>,
     ) -> Result<Self, RaftWalError> {
         create_dir_all_durable(&root).map_err(|source| RaftWalError::CreateDir {
             path: root.clone(),
@@ -486,7 +496,12 @@ impl NodeWal {
             .map_err(RaftWalError::ReadRunState)?;
         let cores = core_dirs(&root)?;
         // Even metadata-only cores are prior state: votes must not be forgotten.
-        super::topology::check_or_create(&root, topology, previous.is_some() || !cores.is_empty())?;
+        let cluster_id = super::topology::check_or_create(
+            &root,
+            topology,
+            cluster_id,
+            previous.is_some() || !cores.is_empty(),
+        )?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
         let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync)?;
@@ -521,6 +536,7 @@ impl NodeWal {
             .map_err(RaftWalError::RecordRunState)?;
         Ok(Self {
             root,
+            cluster_id,
             opening,
             run_state: Arc::new(run_state),
             lock: Mutex::new(Some(lock)),
@@ -529,6 +545,10 @@ impl NodeWal {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn cluster_id(&self) -> &ursula_headers::ClusterId {
+        &self.cluster_id
     }
 
     pub(crate) fn fsync(&self) -> WalFsync {

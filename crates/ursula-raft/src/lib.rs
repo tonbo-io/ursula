@@ -134,6 +134,7 @@ pub use log_store::RaftWal;
 pub use log_store::RaftWalError;
 pub use log_store::RecoveryState;
 pub use log_store::WalOpening;
+pub use log_store::generate_cluster_id;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;

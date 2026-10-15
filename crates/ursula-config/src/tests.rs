@@ -445,7 +445,47 @@ url = "http://127.0.0.1:4438"
             ".toml",
             &format!("[raft.wal]\npath = \"/tmp/ursula-wal\"\n{peers}"),
         );
-        load_config(Some(tmp.path()), None, Some(1)).expect("a static cluster with a WAL path");
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(crate::validate::ValidationError::ClusterIdRequired)
+            ),
+            "{err}"
+        );
+
+        let tmp = temp_config(
+            ".toml",
+            &format!(
+                "[server]\ncluster_id = \"prod-eu-1\"\n[raft.wal]\npath = \"/tmp/ursula-wal\"\n{peers}"
+            ),
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1))
+            .expect("a static cluster with a WAL path and a cluster id");
+        assert_eq!(
+            config.server.cluster_id.as_ref().map(|id| id.as_str()),
+            Some("prod-eu-1")
+        );
+    }
+
+    #[test]
+    fn a_cluster_id_outside_the_grammar_fails_the_load() {
+        for id in ["", "a/b", "a b", &"x".repeat(65)] {
+            let tmp = temp_config(".toml", &format!("[server]\ncluster_id = \"{id}\"\n"));
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(&err, crate::ConfigError::TomlParse(parse)
+                    if parse.message().contains("ursula-cluster-id")),
+                "{id}: {err}"
+            );
+        }
+        let tmp = temp_config(".toml", "[server]\ncluster_id = \"u0123.dev_A-1\"\n");
+        let config = load_config(Some(tmp.path()), None, Some(1)).expect("a valid id");
+        let rendered = toml::to_string(&config).expect("serialize");
+        assert!(
+            rendered.contains("cluster_id = \"u0123.dev_A-1\""),
+            "{rendered}"
+        );
     }
 
     /// The memory WAL is gone: its settings are unknown keys, which fail the
@@ -608,6 +648,9 @@ max_size = "128MiB"
         let tmp = temp_config(
             ".toml",
             r#"
+[server]
+cluster_id = "test"
+
 [raft.wal]
 path = "/tmp/ursula-wal"
 
