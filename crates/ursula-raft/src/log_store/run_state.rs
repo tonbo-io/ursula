@@ -353,6 +353,8 @@ pub enum RaftWalError {
         stored: String,
         configured: ursula_headers::ClusterId,
     },
+    #[error("the WAL topology at '{}' has no cluster id: an earlier 0.8 development build wrote it. Start this node on an empty WAL", .root.display())]
+    TopologyWithoutClusterId { root: PathBuf },
     #[error("the WAL topology at '{}' holds an invalid cluster id '{stored}'", .root.display())]
     InvalidStoredClusterId { root: PathBuf, stored: String },
     #[error("read the Raft WAL topology: {0}")]

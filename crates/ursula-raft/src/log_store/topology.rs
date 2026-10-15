@@ -15,6 +15,7 @@ use ursula_shard::StaticShardMap;
 
 use super::RaftWalError;
 use super::state_file;
+use super::state_file::StateFileError;
 use super::state_file::StateFileKind;
 
 const TOPOLOGY_FILE: &str = "topology.bin";
@@ -104,8 +105,20 @@ pub(super) fn check_or_create(
 ) -> Result<ClusterId, RaftWalError> {
     let configured = WalTopology::from(map);
     let path = root.join(TOPOLOGY_FILE);
-    let stored = state_file::read::<StoredTopology>(StateFileKind::Topology, &path)
-        .map_err(RaftWalError::ReadTopology)?;
+    let stored = match state_file::read::<StoredTopology>(StateFileKind::Topology, &path) {
+        Ok(stored) => stored,
+        // A topology an earlier 0.8 development build wrote, before the
+        // cluster id: incompatible, not corrupt.
+        Err(StateFileError::Undecodable { .. })
+            if state_file::read::<WalTopology>(StateFileKind::Topology, &path)
+                .is_ok_and(|legacy| legacy.is_some()) =>
+        {
+            return Err(RaftWalError::TopologyWithoutClusterId {
+                root: root.to_owned(),
+            });
+        }
+        Err(error) => return Err(RaftWalError::ReadTopology(error)),
+    };
     match TopologyDecision::decide(
         stored.as_ref(),
         configured,
@@ -406,5 +419,23 @@ mod tests {
         let wal = RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
         assert_eq!(wal.cluster_id(), &prod);
         wal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_topology_without_a_cluster_id_is_incompatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology = StaticShardMap::new(2, 4).unwrap();
+        let path = dir.path().join(TOPOLOGY_FILE);
+        state_file::write(
+            StateFileKind::Topology,
+            &path,
+            &path.with_extension("tmp"),
+            &WalTopology::from(&topology),
+        )
+        .unwrap();
+        assert!(matches!(
+            RaftWal::start(dir.path(), WalFsync::Never, &topology),
+            Err(RaftWalError::TopologyWithoutClusterId { .. })
+        ));
     }
 }

@@ -35,6 +35,7 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         | RaftWalError::MissingTopology { .. }
         | RaftWalError::ClusterIdMismatch { .. } => WalOpenFailureKind::InvalidConfiguration,
         RaftWalError::InvalidStoredClusterId { .. } => WalOpenFailureKind::Corrupt,
+        RaftWalError::TopologyWithoutClusterId { .. } => WalOpenFailureKind::IncompatibleFormat,
         RaftWalError::ReadTopology(source)
         | RaftWalError::ReadRunState(source)
         | RaftWalError::ReadCoreMetadata(source) => state_failure(source),
