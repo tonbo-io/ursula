@@ -74,6 +74,7 @@ use ursula_shard::BucketStreamId;
 use crate::HttpState;
 use crate::PublishTarget;
 use crate::SnapshotPath;
+use crate::admission::AdmissionPermit;
 use crate::admission::BodyBudget;
 use crate::admission::PendingAdmission;
 use crate::admission::retry_after_json;
@@ -105,9 +106,6 @@ const MIN_PIECES_IN_FLIGHT: u64 = 1;
 /// Part sizes a commit checks at once.
 const STATS_IN_FLIGHT: usize = 16;
 
-/// Parts a commit deletes at once, after its answer.
-const DELETES_IN_FLIGHT: usize = 16;
-
 /// What a copy holds besides the pieces it reads ahead: the piece it
 /// writes and the writer's upload parts in flight.
 const COPY_FIXED_PIECES: u64 = 1 + COLD_OBJECT_WRITE_CONCURRENCY as u64;
@@ -124,14 +122,16 @@ const _: () = assert!(
     "the smallest budget configuration admits must hold a request and a copy"
 );
 
-/// The copies a node runs at once take at most half its budget: each takes
-/// a share of `budget / (2 * SNAPSHOT_ASSEMBLIES)`.
+/// A copy reads ahead from a share of `budget / (2 * SNAPSHOT_ASSEMBLIES)`.
 const COPIES_SHARE_DIVISOR: u64 = 2 * SNAPSHOT_ASSEMBLIES as u64;
 
 /// How a copy runs on a node whose in-flight body budget is `capacity`:
-/// the pieces it reads ahead and what it charges the budget. Both copies a
-/// node runs at once take at most half the budget together, and never less
-/// than [`MIN_COPY_BYTES`].
+/// the pieces it reads ahead and what it charges the budget. Its read-ahead
+/// comes from a share of `capacity / (2 * SNAPSHOT_ASSEMBLIES)`, and its
+/// charge is never less than [`MIN_COPY_BYTES`], so on a small budget the
+/// share does not bound it. What bounds the copies is their reservation: a
+/// copy starts only while one request's worth of the budget stays free
+/// beside it ([`BodyBudget::reserve_leaving`]).
 fn copy_plan(capacity: u64) -> (usize, u64) {
     let share = capacity.checked_div(COPIES_SHARE_DIVISOR).unwrap_or(0);
     let pieces = share
@@ -437,6 +437,7 @@ pub(crate) async fn commit(
     commit: PartsCommit,
     incarnation: u64,
     budget: Option<BodyBudget>,
+    manifest_permit: Option<AdmissionPermit>,
     body: Body,
 ) -> Response {
     let sent_token = target.if_incarnation.is_some();
@@ -454,6 +455,8 @@ pub(crate) async fn commit(
             .into_response();
         }
     };
+    // The manifest is read: its share of the budget goes back.
+    drop(manifest_permit);
     let manifest = match PartsManifest::parse(commit.parts, &manifest) {
         Ok(manifest) => manifest,
         Err(err) => return PartsRefusal::from(err).into_response(),
@@ -547,12 +550,29 @@ async fn run_commit(
     };
     let parts = match resolve(cold_store, owner, manifest, MAX_COLD_SNAPSHOT_BYTES).await {
         Ok(parts) => parts,
+        // A part is gone: a commit of the same key may have published the
+        // snapshot and deleted its parts after this one's key check.
+        Err(PartsRefusal::UnknownPart { part }) => {
+            return (recheck_key(target, commit, sent_token, part).await, None);
+        }
         Err(refusal) => return (refusal.into_response(), None),
     };
     let (pieces, charge) = copy_plan(budget.map_or(u64::MAX, BodyBudget::capacity));
-    let charged = match budget.map(|budget| budget.reserve(charge)).transpose() {
+    // A copy never takes the room of the node's next request: on the 64 MiB
+    // floor one copy runs at a time, beside a request of the full limit.
+    let charged = match budget
+        .map(|budget| budget.reserve_leaving(charge, limits::MAX_REQUEST_BYTES))
+        .transpose()
+    {
         Ok(charged) => charged,
-        Err(refusal) => return (refusal.into_response(), None),
+        Err(_no_room) => {
+            target
+                .state
+                .http_metrics
+                .snapshot_commits_busy
+                .fetch_add(1, Ordering::Relaxed);
+            return (PartsRefusal::Busy.into_response(), None);
+        }
     };
     let assembled = assemble(cold_store, target, &parts, commit, pieces).await;
     drop(charged);
@@ -561,34 +581,48 @@ async fn run_commit(
         // A part went away during the copy: a concurrent identical commit
         // may have published the snapshot and deleted it.
         Err(PartsRefusal::UnknownPart { part }) => {
-            return (
-                match key_check(target, commit).await {
-                    KeyCheck::Answered(answer) => answer,
-                    KeyCheck::Open { .. } => PartsRefusal::UnknownPart { part }.into_response(),
-                },
-                None,
-            );
+            return (recheck_key(target, commit, sent_token, part).await, None);
         }
         Err(refusal @ PartsRefusal::DigestMismatch { .. }) => {
             return (refusal.into_response(), Some(parts));
         }
         Err(refusal) => return (refusal.into_response(), None),
     };
-    let mut response = target.publish(SnapshotUpload::Cold(assembled)).await;
-    // The stream was recreated during the copy. A client that named no
-    // token gets the answer a commit arriving after the recreate gets: its
-    // parts belong to no live stream.
-    if response.status() == StatusCode::PRECONDITION_FAILED
-        && !sent_token
-        && let Some(part) = parts.first()
-    {
-        response = PartsRefusal::UnknownPart {
-            part: part.id.clone(),
-        }
-        .into_response();
-    }
+    let response = target.publish(SnapshotUpload::Cold(assembled)).await;
+    let response = match parts.first() {
+        Some(part) => untokened(response, sent_token, &part.id),
+        None => response,
+    };
     let spent = final_for_key(response.status()).then_some(parts);
     (response, spent)
+}
+
+/// The answer to a commit one of whose parts is gone, from its key again:
+/// `204` when a commit of the same key published the snapshot, `409` or
+/// `410` when another one decides it, `400` for the unknown `part`
+/// otherwise.
+async fn recheck_key(
+    target: &PublishTarget,
+    commit: &PartsCommit,
+    sent_token: bool,
+    part: PartId,
+) -> Response {
+    match key_check(target, commit).await {
+        KeyCheck::Answered(answer) => untokened(answer, sent_token, &part),
+        KeyCheck::Open { .. } => PartsRefusal::UnknownPart { part }.into_response(),
+    }
+}
+
+/// A `412` for the token a commit was forced to (the incarnation its parts
+/// were staged for), when its client named no token: the stream was
+/// recreated meanwhile, and the client gets what a commit arriving after
+/// the recreate gets, a `400` for an unknown part. A client that named the
+/// token keeps its `412`.
+fn untokened(response: Response, sent_token: bool, part: &PartId) -> Response {
+    if response.status() == StatusCode::PRECONDITION_FAILED && !sent_token {
+        return PartsRefusal::UnknownPart { part: part.clone() }.into_response();
+    }
+    response
 }
 
 /// The incarnation of a stream that parts are staged for.
@@ -739,11 +773,16 @@ async fn assemble(
 /// Deletes the parts a commit spent, a few at once, best effort: a part
 /// left behind is swept as an orphan.
 async fn delete_parts(cold_store: &ColdStoreHandle, parts: &[ResolvedPart]) {
-    stream::iter(parts)
-        .for_each_concurrent(DELETES_IN_FLIGHT, |part| {
-            delete_object(cold_store, &part.path)
-        })
-        .await;
+    let paths = parts
+        .iter()
+        .map(|part| part.path.clone())
+        .collect::<Vec<_>>();
+    if let Err(err) = cold_store.delete_objects(paths).await {
+        tracing::warn!(
+            error = %err,
+            "failed to delete the parts of a snapshot commit; the orphan sweep reclaims them"
+        );
+    }
 }
 
 async fn delete_object(cold_store: &ColdStoreHandle, path: &str) {

@@ -950,12 +950,15 @@ async fn a_third_concurrent_commit_is_busy() {
     }
 }
 
-/// MA of the step 4 re-review: on a 64 MiB budget (the tiny and small
-/// presets) a commit's copy is charged 32 MiB once it holds its slot, so a
-/// request of up to 32 MiB still fits beside it; and a manifest without
-/// `Content-Length` is charged its own bound, not the request limit.
+/// MA of the step 4 re-review and M2 of the #618 review: on a 64 MiB
+/// budget (the tiny and small presets) a copy is charged 32 MiB once it
+/// holds its slot, and only while a request's worth stays free beside it.
+/// So a second commit answers `503 SnapshotCommitsBusy` instead of taking
+/// that room, and a request of the full 32 MiB limit still fits while the
+/// first copy runs. A manifest without `Content-Length` is charged its own
+/// bound, not the request limit, and gives it back once read.
 #[tokio::test]
-async fn a_commit_fits_beside_a_large_write_on_the_smallest_budget() {
+async fn one_copy_and_one_full_request_fit_the_smallest_budget() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         RuntimeConfig::new(1, 1),
@@ -969,20 +972,34 @@ async fn a_commit_fits_beside_a_large_write_on_the_smallest_budget() {
     };
     let app = client_router_with_admission(HttpState::new(runtime), IngressAdmission::new(&server));
     create(&app, "/parts/s").await;
-    let part = stage(&app, "/parts/s", b"part".to_vec()).await;
+    create(&app, "/parts/t").await;
+    let first = stage(&app, "/parts/s", b"part".to_vec()).await;
+    let second = stage(&app, "/parts/t", b"part".to_vec()).await;
     let gate = Gate::on_part_reads(&cold_store);
-    let mut request = commit_request("/parts/s", &[part], digest_of(b"part"));
+    let mut request = commit_request("/parts/s", &[first], digest_of(b"part"));
     // A manifest without `Content-Length`.
     let manifest = std::mem::replace(request.body_mut(), Body::empty());
     *request.body_mut() = Body::from_stream(manifest.into_data_stream());
     let pending = tokio::spawn(app.clone().oneshot(request));
     gate.reached(1).await;
+
+    let response = send(
+        &app,
+        commit_request("/parts/t", &[second], digest_of(b"part")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_of(response).await,
+        br#"{"error":"SnapshotCommitsBusy"}"#
+    );
+
     let response = send(
         &app,
         Request::post("/parts/s")
             .header(CONTENT_TYPE, OCTET)
-            .header(CONTENT_LENGTH, 30 * MIB)
-            .body(Body::from(vec![7_u8; 30 * MIB]))
+            .header(CONTENT_LENGTH, MAX_HTTP_BODY_BYTES)
+            .body(Body::from(vec![7_u8; MAX_HTTP_BODY_BYTES]))
             .unwrap(),
     )
     .await;
@@ -992,6 +1009,52 @@ async fn a_commit_fits_beside_a_large_write_on_the_smallest_budget() {
         pending.await.unwrap().unwrap().status(),
         StatusCode::NO_CONTENT
     );
+}
+
+/// M1 of the #618 review: a repeat whose key check ran while the original
+/// still copied, and whose parts the original deleted after it published,
+/// answers `204` from its key again, not `400` for an unknown part.
+#[tokio::test]
+async fn a_repeat_that_raced_the_original_answers_from_the_key() {
+    let (app, cold_store) = cold_app();
+    create(&app, "/parts/s").await;
+    let parts = vec![stage(&app, "/parts/s", b"part".to_vec()).await];
+    let digest = digest_of(b"part");
+    let gate = Gate::on_part_reads(&cold_store);
+    let original = tokio::spawn(
+        app.clone()
+            .oneshot(commit_request("/parts/s", &parts, digest)),
+    );
+    gate.reached(1).await;
+
+    // The repeat passes its key check now, then waits for its manifest.
+    let mut repeat = commit_request("/parts/s", &parts, digest);
+    let manifest = std::mem::replace(repeat.body_mut(), Body::empty());
+    let manifest = to_bytes(manifest, usize::MAX).await.unwrap();
+    let (send_manifest, manifest_sent) = tokio::sync::oneshot::channel::<Bytes>();
+    *repeat.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(manifest_sent.await.unwrap_or_default())
+    }));
+    let repeat = tokio::spawn(app.clone().oneshot(repeat));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    gate.open();
+    assert_eq!(
+        original.await.unwrap().unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    while !part_names(&cold_store).await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // The original's task ends right after its deletions.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    send_manifest.send(manifest).unwrap();
+    let response = repeat.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(matches!(
+        SnapshotPublishAnswer::parse(204, pairs(&response)),
+        Ok(Some(SnapshotPublishAnswer::Published { .. }))
+    ));
 }
 
 /// m4: a part that goes away during the copy re-checks the key: a later

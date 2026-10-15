@@ -3700,13 +3700,13 @@ pub(crate) async fn publish_snapshot(
     let admission = admission
         .0
         .map(|admission| admission.capped(manifest_bytes));
-    let _permit = match front_door::admit(admission) {
+    let manifest_permit = match front_door::admit(admission) {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
         HeadDecision::Read(permit) => permit,
     };
-    snapshot_parts::commit(snapshot, commit, incarnation, budget, body).await
+    snapshot_parts::commit(snapshot, commit, incarnation, budget, manifest_permit, body).await
 }
 
 /// The bare `{stream}/snapshot` path (the removed latest-snapshot redirect

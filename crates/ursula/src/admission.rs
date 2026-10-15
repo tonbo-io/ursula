@@ -209,6 +209,22 @@ impl BodyBudget {
         self.capacity
     }
 
+    /// `bytes` of the budget, held until the permit drops, only while
+    /// `free` more bytes stay free beside them: the check and the
+    /// reservation are one acquisition.
+    pub(crate) fn reserve_leaving(
+        &self,
+        bytes: u64,
+        free: u64,
+    ) -> Result<AdmissionPermit, AdmissionRefusal> {
+        let mut held = self.reserve(bytes.saturating_add(free))?;
+        let free = usize::try_from(free).unwrap_or(usize::MAX);
+        if let Some(permit) = held._held.as_mut() {
+            drop(permit.split(free));
+        }
+        Ok(held)
+    }
+
     /// `bytes` of the budget, held until the permit drops.
     pub(crate) fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionRefusal> {
         if bytes == 0 {
