@@ -23,7 +23,9 @@
 //! 10. the bytes between an owner's consecutive acknowledged offsets are its own frames, frames
 //!     it caught up, or (in a takeover's reconcile) foreign claims, unless it rebuilt;
 //! 11. after `Heal`, every ticket of an owner that ends acknowledged resolved or was abandoned;
-//! 12. no append carries a frame the owner caught up.
+//! 12. no append carries a frame the owner caught up;
+//! 13. an owner resets `fenced` or `stale` only when another writer, owner or clone was on the
+//!     stream.
 //!
 //! Two negative controls must fail them: the model with digest comparison off (requests reach it
 //! without `Producer-Digest`), and a replicator that re-seals its in-flight batch on resend.
@@ -36,7 +38,9 @@ use proptest::prelude::Just;
 use proptest::prelude::Strategy;
 use proptest::prop_oneof;
 use proptest::test_runner::Config;
+use proptest::test_runner::RngAlgorithm;
 use proptest::test_runner::TestCaseError;
+use proptest::test_runner::TestRng;
 use proptest::test_runner::TestRunner;
 use ursula_headers::BodyDigest;
 use ursula_headers::Delivery;
@@ -225,6 +229,8 @@ struct Instance {
     discards: Vec<Position>,
     /// A rebuild read the stream up to the next acknowledged offset.
     rebuilt: bool,
+    /// The world's expiry count when this owner's latest continuation claim went out.
+    claim_expiries: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +275,12 @@ struct World {
     /// The frame acknowledged at every commit id.
     acked_frames: HashMap<CommitId, Arc<[u8]>>,
     violations: Vec<String>,
+    /// Another writer (a foreign append or claim) wrote on the stream.
+    others: bool,
+    /// How often the clock passed idle expiry.
+    expiries: u64,
+    /// The event being processed met a continuation claim that expired while outstanding.
+    expired_claim: bool,
 }
 
 fn decode_all(bytes: &[u8]) -> Vec<(usize, usize, Option<Frame>)> {
@@ -314,6 +326,9 @@ impl World {
             keys: HashMap::new(),
             acked_frames: HashMap::new(),
             violations: Vec::new(),
+            others: false,
+            expiries: 0,
+            expired_claim: false,
         };
         world.takeover(false);
         world
@@ -359,6 +374,7 @@ impl World {
             calls: BTreeMap::new(),
             discards: Vec::new(),
             rebuilt: false,
+            claim_expiries: 0,
         };
         (inst, actions)
     }
@@ -544,6 +560,13 @@ impl World {
             kind: ClaimKind::Takeover { .. },
             ..
         });
+        // A continuation whose own claim expired while outstanding loses by design (the floor
+        // rose past it): that fence is not false.
+        let expired_claim = matches!(self.owners[index].inst.replicator, Replicator::Activating {
+            kind: ClaimKind::Continuation { .. },
+            ..
+        }) && self.expiries > self.owners[index].inst.claim_expiries;
+        self.expired_claim = expired_claim;
         let now = self.now();
         let actions = self.owners[index].inst.replicator.on(event, now);
         self.process_in(index, actions, before, takeover);
@@ -569,7 +592,8 @@ impl World {
         let fenced = actions.contains(&Action::Reset(ResetKind::Fenced));
         let discarded = actions.iter().any(|a| {
             matches!(a, Action::Rebuild {
-                discard_from: Some(_)
+                discard_from: Some(_),
+                ..
             })
         });
         if fenced && discarded {
@@ -578,25 +602,19 @@ impl World {
         for action in actions {
             match action {
                 Action::Send { id, request, .. } => self.sent(index, id, request, streaming_epoch),
-                Action::Persist(record) => {
+                Action::PersistClaim { epoch, activation } => {
+                    self.owners[index].log.claims.push((epoch, activation));
+                }
+                Action::PersistAck {
+                    acked,
+                    acked_offset,
+                    log_bytes,
+                } => {
                     let log = &mut self.owners[index].log;
-                    match record {
-                        crate::codec::segment::RecordBody::Claim { epoch, activation } => {
-                            log.claims.push((epoch, activation));
-                        }
-                        crate::codec::segment::RecordBody::Ack {
-                            acked,
-                            acked_offset,
-                            log_bytes,
-                        } => {
-                            log.acks.push((acked, acked_offset, log_bytes));
-                            if log.catching_up {
-                                log.catching_up = false;
-                                log.durable_acks = log.acks.len();
-                            }
-                        }
-                        crate::codec::segment::RecordBody::Commit { .. }
-                        | crate::codec::segment::RecordBody::Base { .. } => {}
+                    log.acks.push((acked, acked_offset, log_bytes));
+                    if log.catching_up {
+                        log.catching_up = false;
+                        log.durable_acks = log.acks.len();
                     }
                 }
                 Action::Wake { acked, offset } => self.woken(index, acked, offset, takeover),
@@ -615,24 +633,21 @@ impl World {
                         self.violation("property 6: a catch-up outside a takeover".to_owned());
                     }
                     let log = &mut self.owners[index].log;
-                    for frame in frames {
-                        let id = match frame::decode(&frame.frame, u64::MAX) {
-                            Ok(Decoded::Frame {
-                                frame: Frame::Commit { id, .. },
-                                ..
-                            }) => id,
-                            _ => panic!("a catch-up applies COMMIT frames"),
+                    for foreign in frames {
+                        let Frame::Commit { id, .. } = foreign.frame else {
+                            panic!("a catch-up applies COMMIT frames");
                         };
+                        let bytes: Arc<[u8]> = Arc::from(frame::encode(&foreign.frame).unwrap());
                         log.commits.insert(log.next_position, Pending {
                             id,
-                            frame: Arc::clone(&frame.frame),
+                            frame: Arc::clone(&bytes),
                         });
                         log.next_position += 1;
-                        log.applied.push(frame.frame);
+                        log.applied.push(bytes);
                     }
                     caught_up = true;
                 }
-                Action::Rebuild { discard_from } => {
+                Action::Rebuild { discard_from, .. } => {
                     if !takeover {
                         self.violation("property 6: a rebuild outside a takeover".to_owned());
                     }
@@ -649,14 +664,21 @@ impl World {
                     self.next_uid += 1;
                     caught_up = true;
                 }
-                Action::Reset(_) | Action::Refuse(_) => {}
+                Action::Reset(kind @ (ResetKind::Fenced | ResetKind::Stale))
+                    if !self.others && self.owners.len() == 1 && !self.expired_claim =>
+                {
+                    self.violation(format!(
+                        "property 13: a {kind:?} reset with no other writer on the stream"
+                    ));
+                }
+                Action::Bound { .. } | Action::Reset(_) | Action::Refuse(_) => {}
             }
         }
         if caught_up {
             let log = &mut self.owners[index].log;
             log.catching_up = true;
             let last = log.last_logged();
-            self.event(index, Event::CaughtUp { last });
+            self.event(index, Event::CaughtUp { last, log_bytes: 0 });
         }
     }
 
@@ -678,6 +700,9 @@ impl World {
                     .any(|f| request.body.windows(f.len()).any(|w| w == &f[..]))
             {
                 self.violation("property 12: an append carries a caught-up frame".to_owned());
+            }
+            if write.seq == Seq::ZERO && streaming.is_some() {
+                self.owners[index].inst.claim_expiries = self.expiries;
             }
             if write.seq == Seq::ZERO
                 && let Some(own) = streaming
@@ -1046,7 +1071,10 @@ impl World {
                 ..self.server.limits()
             }),
             Op::Advance(ms) => self.server.advance(u64::from(ms)),
-            Op::ExpireIdle => self.server.advance(IDLE_RETIREMENT_MS + 1),
+            Op::ExpireIdle => {
+                self.expiries += 1;
+                self.server.advance(IDLE_RETIREMENT_MS + 1);
+            }
             Op::Tick(o) => {
                 let i = self.owner(o);
                 self.tick(i);
@@ -1083,6 +1111,7 @@ impl World {
                 self.checkpoints.push((id, self.max_claimed));
             }
             Op::ForeignAppend(kind) => {
+                self.others = true;
                 let bytes = match kind {
                     0 => b"garbage, not a frame".to_vec(),
                     1 => frame::encode(&Frame::Commit {
@@ -1101,6 +1130,7 @@ impl World {
                 drop(self.server.foreign_append(PATH, &bytes));
             }
             Op::ForeignClaim(above) => {
+                self.others = true;
                 let epoch = if above {
                     self.max_epoch + 1
                 } else {
@@ -1240,12 +1270,22 @@ fn cases() -> u32 {
         .unwrap_or(CASES)
 }
 
-fn check(knobs: Knobs, cases: u32) -> Result<(), proptest::test_runner::TestError<(u64, Vec<Op>)>> {
-    let mut runner = TestRunner::new(Config {
+/// Runs `cases` random scripts, from a fixed seed when `deterministic`.
+fn check(
+    knobs: Knobs,
+    cases: u32,
+    deterministic: bool,
+) -> Result<(), proptest::test_runner::TestError<(u64, Vec<Op>)>> {
+    let config = Config {
         cases,
         failure_persistence: None,
         ..Config::default()
-    });
+    };
+    let mut runner = if deterministic {
+        TestRunner::new_with_rng(config, TestRng::deterministic_rng(RngAlgorithm::ChaCha))
+    } else {
+        TestRunner::new(config)
+    };
     let strategy = (
         proptest::num::u64::ANY,
         proptest::collection::vec(op(), 20..160),
@@ -1262,7 +1302,7 @@ fn check(knobs: Knobs, cases: u32) -> Result<(), proptest::test_runner::TestErro
 
 #[test]
 fn the_replicator_keeps_its_properties_against_the_model() {
-    if let Err(failure) = check(Knobs::default(), cases()) {
+    if let Err(failure) = check(Knobs::default(), cases(), false) {
         panic!("{failure}");
     }
 }
@@ -1348,7 +1388,9 @@ fn negative_controls_fail_the_proptest_too() {
             ..Knobs::default()
         },
     ] {
-        assert!(check(knobs, 256).is_err(), "{knobs:?} passed");
+        // A fixed seed: the fixed scripts above always trip, and this search is a bonus that
+        // must not flake.
+        assert!(check(knobs, 512, true).is_err(), "{knobs:?} passed");
     }
 }
 

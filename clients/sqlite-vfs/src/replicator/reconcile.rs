@@ -17,7 +17,6 @@ use ursula_headers::Receipt;
 use super::Ctx;
 use super::ForeignFrame;
 use super::MAX_BATCH_BYTES;
-use super::Refusal;
 use super::RequestId;
 use super::ResetKind;
 use crate::codec::frame;
@@ -58,7 +57,6 @@ pub(crate) enum RowDecision {
     /// Takeover: discard the remaining pending records and catch the stream up.
     Diverge,
     Reset(ResetKind),
-    Refuse(Refusal),
 }
 
 /// The table of design §4.9 (M1: no `410` snapshot rule).
@@ -72,8 +70,8 @@ pub(crate) fn decide_frame(mode: Mode, class: FrameClass) -> RowDecision {
         (FrameClass::ForeignCommit | FrameClass::Gone, Mode::Continuation) => {
             RowDecision::Reset(ResetKind::Stale)
         }
-        (FrameClass::Undecodable, Mode::Takeover) => RowDecision::Refuse(Refusal::StreamState),
-        (FrameClass::Undecodable, Mode::Continuation) => RowDecision::Reset(ResetKind::StreamState),
+        // The design refuses a takeover's open with `stream_state`: the same kind, one path.
+        (FrameClass::Undecodable, _) => RowDecision::Reset(ResetKind::StreamState),
     }
 }
 
@@ -84,7 +82,6 @@ pub(crate) enum Fed {
     More,
     Done,
     Reset(ResetKind),
-    Refuse(Refusal),
 }
 
 /// A complete reconcile.
@@ -175,7 +172,6 @@ impl Reconcile {
         match decide_frame(self.mode, FrameClass::Gone) {
             RowDecision::Diverge => self.rebuild(ctx),
             RowDecision::Reset(kind) => Fed::Reset(kind),
-            RowDecision::Refuse(refusal) => Fed::Refuse(refusal),
             RowDecision::Skip | RowDecision::Acknowledge => Fed::Reset(ResetKind::Internal),
         }
     }
@@ -256,18 +252,13 @@ impl Reconcile {
                 } else {
                     FrameClass::ForeignCommit
                 };
-                self.row(class, Some((bytes, end)), ctx)
+                self.row(class, Some((frame, end)), ctx)
             }
             Frame::Part { .. } => Fed::More,
         }
     }
 
-    fn row(
-        &mut self,
-        class: FrameClass,
-        commit: Option<(Arc<[u8]>, Offset)>,
-        ctx: &mut Ctx,
-    ) -> Fed {
+    fn row(&mut self, class: FrameClass, commit: Option<(Frame, Offset)>, ctx: &mut Ctx) -> Fed {
         match decide_frame(self.mode, class) {
             RowDecision::Skip => Fed::More,
             RowDecision::Acknowledge => {
@@ -290,16 +281,21 @@ impl Reconcile {
                 };
                 match &mut self.catch_up {
                     CatchUp::Nothing => {
-                        self.catch_up = CatchUp::Apply(vec![ForeignFrame { end, frame }]);
+                        self.catch_up = CatchUp::Apply(vec![ForeignFrame {
+                            frame,
+                            end_offset: end,
+                        }]);
                     }
-                    CatchUp::Apply(frames) => frames.push(ForeignFrame { end, frame }),
+                    CatchUp::Apply(frames) => frames.push(ForeignFrame {
+                        frame,
+                        end_offset: end,
+                    }),
                     CatchUp::Rebuild { .. } => {}
                 }
                 Fed::More
             }
             RowDecision::Diverge => self.rebuild(ctx),
             RowDecision::Reset(kind) => Fed::Reset(kind),
-            RowDecision::Refuse(refusal) => Fed::Refuse(refusal),
         }
     }
 

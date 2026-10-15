@@ -2,13 +2,12 @@
 //! and a continuation claim, driven through the replicator with the claim's answer and the read
 //! as they travel.
 
-use std::sync::Arc;
-
 use ursula_headers::Delivery;
 
 use super::ACTIVATION;
 use super::Harness;
 use super::LINEAGE;
+use super::cluster;
 use super::commit;
 use super::epoch;
 use super::local;
@@ -18,6 +17,7 @@ use super::read;
 use super::receipt;
 use super::reset_of;
 use super::sends;
+use super::token;
 use crate::codec::frame;
 use crate::codec::frame::Frame;
 use crate::ids::Activation;
@@ -27,7 +27,6 @@ use crate::replicator::Action;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
 use crate::replicator::ForeignFrame;
-use crate::replicator::Refusal;
 use crate::replicator::Replicator;
 use crate::replicator::ResetKind;
 use crate::replicator::reconcile::FrameClass;
@@ -184,16 +183,18 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
         let (mut h, actions) = reconcile(KINDS[0], &stream, None);
         // A discarded tail always rebuilds, and nothing is applied in place.
         assert!(
-            actions.contains(&Action::Rebuild {
-                discard_from: Some(discard_from)
-            }),
+            actions.contains(&rebuild(Some(discard_from), stream.len() + 37)),
             "{actions:?}"
         );
         assert!(!actions.iter().any(|a| matches!(a, Action::Apply(_))));
         assert!(sends(&actions).is_empty(), "{actions:?}");
         // The replicator binds once the driver caught up.
         assert!(!streaming(&h));
-        let actions = h.on(Event::CaughtUp { last: Position(7) });
+        let actions = h.on(Event::CaughtUp {
+            last: Position(7),
+            log_bytes: 900,
+        });
+        assert!(actions.contains(&Action::Bound { epoch: epoch(1) }));
         assert!(streaming(&h));
         assert_eq!(acked(&actions), Some(Position(7)));
         assert!(sends(&actions).is_empty(), "{actions:?}");
@@ -223,12 +224,20 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
     let actions = h.answer(&read(&foreign.frame, end));
     assert!(!actions.iter().any(|a| matches!(a, Action::Rebuild { .. })));
     assert_eq!(actions, vec![Action::Apply(vec![ForeignFrame {
-        end: off(end),
-        frame: Arc::clone(&foreign.frame),
+        frame: decoded(&foreign.frame),
+        end_offset: off(end),
     }])]);
     // The caught-up frame took position 1, acknowledged: the ticket (called after the claim went
     // out) needs only a probe, not a commit.
-    let actions = h.on(Event::CaughtUp { last: Position(1) });
+    let actions = h.on(Event::CaughtUp {
+        last: Position(1),
+        log_bytes: 77,
+    });
+    assert!(actions.contains(&Action::PersistAck {
+        acked: Position(1),
+        acked_offset: off(end + 37),
+        log_bytes: 77,
+    }));
     assert_eq!(acked(&actions), Some(Position(1)));
     assert_eq!(sends(&actions).len(), 1, "{actions:?}");
     let actions = h.answer(&read(&[], end + 37));
@@ -242,17 +251,17 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
 }
 
 #[test]
-fn row_5_undecodable_bytes_refuse_a_takeover_and_reset_a_continuation() {
+fn row_5_undecodable_bytes_end_a_takeover_and_a_continuation_with_stream_state() {
     let garbage = b"not a frame at all".to_vec();
     assert_eq!(
         decide_frame(Mode::Takeover, FrameClass::Undecodable),
-        RowDecision::Refuse(Refusal::StreamState)
+        RowDecision::Reset(ResetKind::StreamState)
     );
     let (h, actions) = reconcile(KINDS[0], &garbage, None);
-    assert!(actions.contains(&Action::Refuse(Refusal::StreamState)));
+    assert_eq!(reset_of(&actions), Some(ResetKind::StreamState));
     assert!(matches!(
         h.replicator,
-        Replicator::Refused(Refusal::StreamState)
+        Replicator::Reset(ResetKind::StreamState)
     ));
     assert_eq!(
         decide_frame(Mode::Continuation, FrameClass::Undecodable),
@@ -272,9 +281,7 @@ fn row_6_a_410_at_the_start_rebuilds_a_takeover_and_resets_a_continuation_stale(
     let (h, actions) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
     assert!(!streaming(&h));
     assert!(
-        actions.contains(&Action::Rebuild {
-            discard_from: Some(Position(1))
-        }),
+        actions.contains(&rebuild(Some(Position(1)), p1.frame.len() + 37)),
         "{actions:?}"
     );
     assert_eq!(
@@ -290,8 +297,11 @@ fn row_6_a_410_with_nothing_pending_still_rebuilds() {
     let (mut h, _) = Harness::activate(KINDS[0], local(Vec::new(), 0));
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 500, 537, None)));
     let actions = h.answer(&RawAnswer::new(410));
-    assert_eq!(actions, vec![Action::Rebuild { discard_from: None }]);
-    let actions = h.on(Event::CaughtUp { last: Position(4) });
+    assert_eq!(actions, vec![rebuild(None, 537)]);
+    let actions = h.on(Event::CaughtUp {
+        last: Position(4),
+        log_bytes: 0,
+    });
     assert!(streaming(&h));
     assert!(actions.contains(&Action::Wake {
         acked: Position(4),
@@ -316,12 +326,32 @@ fn a_410_after_frames_were_collected_rebuilds_and_drops_them() {
     let actions = h.answer(&read(&foreign.frame, len));
     assert_eq!(sends(&actions).len(), 1);
     let actions = h.answer(&RawAnswer::new(410));
-    assert_eq!(actions, vec![Action::Rebuild { discard_from: None }]);
+    let len = usize::try_from(len).unwrap();
+    assert_eq!(actions, vec![rebuild(None, 2 * len + 37)]);
 }
 
 fn mode(kind: ClaimKind) -> Mode {
     match kind {
         ClaimKind::Takeover { .. } => Mode::Takeover,
         ClaimKind::Continuation { .. } => Mode::Continuation,
+    }
+}
+
+/// The rebuild of a takeover that claimed epoch 1, up to the claim's end `to`.
+fn rebuild(discard_from: Option<Position>, to: usize) -> Action {
+    Action::Rebuild {
+        discard_from,
+        to: off(u64::try_from(to).unwrap()),
+        epoch: epoch(1),
+        activation: ACTIVATION,
+        incarnation: token(),
+        cluster_id: cluster(),
+    }
+}
+
+fn decoded(bytes: &[u8]) -> Frame {
+    match frame::decode(bytes, 1 << 20).unwrap() {
+        frame::Decoded::Frame { frame, .. } => frame,
+        frame::Decoded::Partial => unreachable!(),
     }
 }

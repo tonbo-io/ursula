@@ -25,7 +25,6 @@ use super::sends;
 use super::timer_of;
 use super::token;
 use crate::codec::frame;
-use crate::codec::segment::RecordBody;
 use crate::ids::Activation;
 use crate::ids::Position;
 use crate::replicator::Action;
@@ -53,10 +52,7 @@ use crate::wire::RawAnswer;
 fn streaming(n: u64) -> Harness {
     let pending = (1..=n).map(|p| commit(LINEAGE, p, 1)).collect();
     let (mut h, actions) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(pending, 0));
-    assert!(matches!(
-        actions.first(),
-        Some(Action::Persist(RecordBody::Claim { .. }))
-    ));
+    assert!(matches!(actions.first(), Some(Action::PersistClaim { .. })));
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, 37, None)));
     assert!(matches!(h.replicator, Replicator::Streaming { .. }));
     h
@@ -286,10 +282,10 @@ fn producer_expired_claims_exactly_own_plus_one_after_persisting_it() {
     }));
     assert_eq!(
         actions.first(),
-        Some(&Action::Persist(RecordBody::Claim {
+        Some(&Action::PersistClaim {
             epoch: epoch(2),
             activation: ACTIVATION,
-        }))
+        })
     );
     let claim = h.last_request().keys.producer.clone().unwrap();
     assert_eq!((claim.epoch, claim.seq), (epoch(2), super::seq(0)));
@@ -308,10 +304,10 @@ fn a_takeover_retries_above_every_epoch_seen_then_gives_up() {
     let actions = h.answer(&producer(&ProducerAnswer::ProducerExpired {
         epoch: epoch(40),
     }));
-    assert!(actions.contains(&Action::Persist(RecordBody::Claim {
+    assert!(actions.contains(&Action::PersistClaim {
         epoch: epoch(41),
         activation: ACTIVATION,
-    })));
+    }));
     for round in 2..TAKEOVER_ROUNDS {
         let e = 41 + u64::from(round) - 2;
         h.answer(&producer(&ProducerAnswer::KeyConflict { epoch: epoch(e) }));
@@ -506,4 +502,82 @@ fn stop_retires_the_binding() {
     assert!(h.on(Event::Stop).is_empty());
     assert!(matches!(h.replicator, Replicator::Stopped));
     assert!(h.on(Event::Logged(commit(LINEAGE, 2, 1))).is_empty());
+}
+
+#[test]
+fn a_stale_probe_never_reads_our_own_acknowledged_batch_as_foreign() {
+    let mut h = streaming(0);
+    h.on(Event::Sync {
+        ticket: 5,
+        target: Position(1),
+    });
+    // An idle probe P from offset 37 gets a 503.
+    let mut raw = RawAnswer::new(503);
+    raw.header(RETRY_AFTER, "1");
+    let actions = h.answer(&raw);
+    let (at, jitter) = timer_of(&actions).unwrap();
+    // Record 1's append A goes out from 37.
+    h.on(Event::Logged(commit(LINEAGE, 1, 1)));
+    let (append_id, append) = h.last.clone().unwrap();
+    assert_eq!(append.method, Method::Post);
+    // P is resent, then A lands and is acknowledged.
+    h.tick_at(at + jitter);
+    let (probe_id, probe) = h.last.clone().unwrap();
+    assert_eq!(probe.method, Method::Get);
+    let len = u64::try_from(append.body.len()).unwrap();
+    let ack = producer(&receipt(Delivery::Applied, 1, 1, 37, 37 + len, None)).parse(&append);
+    let actions = h.on(Event::Answer {
+        id: append_id,
+        exchange: Exchange::Answered(Box::new(ack)),
+    });
+    assert!(
+        actions.contains(&Action::Synced { ticket: 5 }),
+        "{actions:?}"
+    );
+    // P's answer reads A's bytes: it is stale, and fences nothing.
+    let late = read(&append.body, 37 + len).parse(&probe);
+    let actions = h.on(Event::Answer {
+        id: probe_id,
+        exchange: Exchange::Answered(Box::new(late)),
+    });
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert!(matches!(h.replicator, Replicator::Streaming { .. }));
+}
+
+#[test]
+fn a_ticket_on_a_claim_or_ack_position_waits_only_for_the_commits_below_it() {
+    // Records 1 and 3 are commits; position 4 is, say, the ACK after them.
+    let pending = vec![commit(LINEAGE, 1, 1), commit(LINEAGE, 3, 1)];
+    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(pending, 0));
+    h.on(Event::Sync {
+        ticket: 2,
+        target: Position(2),
+    });
+    h.on(Event::Sync {
+        ticket: 4,
+        target: Position(4),
+    });
+    h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, 37, None)));
+    let len = u64::try_from(h.last_request().body.len()).unwrap();
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        1,
+        1,
+        37,
+        37 + len,
+        None,
+    )));
+    // Every commit at or below 2 and at or below 4 is acknowledged: both resolve.
+    assert!(
+        actions.contains(&Action::Synced { ticket: 2 }),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&Action::Synced { ticket: 4 }),
+        "{actions:?}"
+    );
+    assert!(actions.contains(&Action::Wake {
+        acked: Position(3),
+        offset: off(37 + len),
+    }));
 }

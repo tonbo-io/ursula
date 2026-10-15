@@ -43,11 +43,13 @@ impl Tickets {
         self.proof.is_some_and(|proof| proof >= ticket.after)
     }
 
-    /// Resolves every ticket that both conditions hold for.
-    pub(crate) fn settle(&mut self, acked: Position, actions: &mut Vec<Action>) {
+    /// Resolves every ticket that both conditions hold for. `first_pending` is the first
+    /// position not acknowledged: a ticket is covered when no commit at or below its target
+    /// waits, whatever record (a commit, a CLAIM, an ACK, a BASE) sits at the target.
+    pub(crate) fn settle(&mut self, first_pending: Option<Position>, actions: &mut Vec<Action>) {
         let proof = self.proof;
         self.waiting.retain(|t| {
-            let done = acked >= t.target && proof.is_some_and(|proof| proof >= t.after);
+            let done = covered(first_pending, t.target) && proof.is_some_and(|p| p >= t.after);
             if done {
                 actions.push(Action::Synced { ticket: t.ticket });
             }
@@ -55,11 +57,11 @@ impl Tickets {
         });
     }
 
-    /// Whether a probe is needed: a ticket whose target is acknowledged waits for a round trip.
-    pub(crate) fn wants_probe(&self, acked: Position) -> bool {
+    /// Whether a probe is needed: a covered ticket waits for a round trip.
+    pub(crate) fn wants_probe(&self, first_pending: Option<Position>) -> bool {
         self.waiting
             .iter()
-            .any(|t| acked >= t.target && !self.proven(t))
+            .any(|t| covered(first_pending, t.target) && !self.proven(t))
     }
 
     /// A takeover discarded every record from `from` on: tickets that wait for one never resolve.
@@ -72,4 +74,9 @@ impl Tickets {
             !lost
         });
     }
+}
+
+/// Every commit at or below `target` is acknowledged.
+fn covered(first_pending: Option<Position>, target: Position) -> bool {
+    first_pending.is_none_or(|first| first > target)
 }

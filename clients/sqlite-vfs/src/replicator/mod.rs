@@ -69,10 +69,10 @@ use self::sync::Tickets;
 use crate::codec::digest::producer_digest;
 use crate::codec::frame;
 use crate::codec::frame::CONTENT_TYPE;
-use crate::codec::segment::RecordBody;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Position;
+pub(crate) use crate::materialize::ForeignFrame;
 use crate::transport::Attempt;
 use crate::wire::Exchange;
 use crate::wire::Method;
@@ -98,14 +98,6 @@ pub(crate) struct RequestId(pub(crate) u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pending {
     pub(crate) id: CommitId,
-    pub(crate) frame: Arc<[u8]>,
-}
-
-/// A stream frame a takeover's reconcile found that changes pages and is not ours: a COMMIT, or
-/// the COMMIT a complete PART run makes. `end` is the stream offset just after it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForeignFrame {
-    pub(crate) end: Offset,
     pub(crate) frame: Arc<[u8]>,
 }
 
@@ -140,24 +132,25 @@ pub(crate) enum Condition {
     Blocked(BlockedReason),
 }
 
-/// The resets of design §8.3.
+/// The resets of design §8.3, one enum for the replicator and the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResetKind {
     Fenced,
     Stale,
     Rewound,
     Deleted,
+    /// Raised by the driver (a failed fsync, a lost WAL page, an uncuttable log write).
+    #[cfg_attr(test, expect(dead_code, reason = "the driver (PR5) raises it"))]
+    LocalDamage,
     StreamState,
     Internal,
 }
 
-/// What ends a takeover at open without binding (design §8.4 setup kinds).
+/// What ends a takeover at open without binding, and is no reset (design §8.4 setup kinds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// [`TAKEOVER_ROUNDS`] claims lost to racing claimants.
     ClaimRaces,
-    /// The reconcile read bytes that are not `USQ2` frames.
-    StreamState,
 }
 
 /// What the driver tells the replicator.
@@ -171,11 +164,15 @@ pub(crate) enum Event {
     Tick,
     /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11).
     Boundary(Position),
-    /// `synced()` with ticket `ticket`: `target` is the last logged position at the call.
+    /// `synced()` with ticket `ticket`: `target` is the last logged position at the call. The
+    /// ticket waits for every commit at or below `target`, whatever record sits at `target`.
     Sync { ticket: u64, target: Position },
-    /// Takeover: the driver logged every frame an [`Action::Apply`] or [`Action::Rebuild`]
-    /// brought in, the last at `last`, wrote an ACK covering them and fsynced.
-    CaughtUp { last: Position },
+    /// Takeover: the driver carried out an [`Action::Apply`] or [`Action::Rebuild`]. Every record
+    /// it logged is at or below `last`, and `last` is at or above the last position logged
+    /// before (a rebuilt generation's positions continue above the old ones). `log_bytes` is the
+    /// log's frame byte count after it (the ACK's `log_bytes`). The ACK covering `last` is
+    /// written and fsynced.
+    CaughtUp { last: Position, log_bytes: u64 },
     /// The binding retires.
     Stop,
 }
@@ -188,8 +185,18 @@ pub(crate) enum Action {
         request: Request,
         attempt: Attempt,
     },
-    /// Append a record to the log. A CLAIM is fsynced before any later action.
-    Persist(RecordBody),
+    /// Append a CLAIM record and fsync it before carrying out any later action: a claim frame
+    /// whose activation is in the log is then always ours.
+    PersistClaim {
+        epoch: Epoch,
+        activation: Activation,
+    },
+    /// Append an ACK record; no fsync needed.
+    PersistAck {
+        acked: Position,
+        acked_offset: Offset,
+        log_bytes: u64,
+    },
     /// Every record up to `acked` is acknowledged; the next write of this owner starts at
     /// `offset`.
     Wake {
@@ -213,10 +220,22 @@ pub(crate) enum Action {
     /// with [`Event::CaughtUp`].
     Apply(Vec<ForeignFrame>),
     /// Takeover only: drop every record from `discard_from` on, if any, and rebuild the
-    /// generation from the stream up to the claim (design §5.6: a divergence, or a `410`), then
-    /// answer with [`Event::CaughtUp`].
+    /// generation from the stream (its latest snapshot and tail) up to `to`, the claim's end
+    /// (design §5.6: a divergence, or a `410`). The rebuilt generation's first segment names
+    /// `incarnation` and `cluster_id`, its positions continue above the last one logged, and
+    /// it holds the CLAIM record of `(epoch, activation)`. Then answer with
+    /// [`Event::CaughtUp`].
     Rebuild {
         discard_from: Option<Position>,
+        to: Offset,
+        epoch: Epoch,
+        activation: Activation,
+        incarnation: Incarnation,
+        cluster_id: ClusterId,
+    },
+    /// A claim of `epoch` applied and its reconcile completed: the replicator streams.
+    Bound {
+        epoch: Epoch,
     },
     Reset(ResetKind),
     Refuse(Refusal),
@@ -427,6 +446,16 @@ impl Ctx {
         }
     }
 
+    /// The first position not acknowledged: tickets at or above it wait.
+    pub(crate) fn first_pending(&self) -> Option<Position> {
+        self.pending.front().map(|p| p.id.position)
+    }
+
+    pub(crate) fn settle(&mut self, actions: &mut Vec<Action>) {
+        let first = self.first_pending();
+        self.tickets.settle(first, actions);
+    }
+
     /// Records acknowledged through `last`, the next write at `offset`.
     fn acknowledge(&mut self, last: Position, offset: Offset) {
         while let Some(front) = self.pending.front() {
@@ -446,11 +475,11 @@ impl Ctx {
     }
 
     fn ack_actions(&self, actions: &mut Vec<Action>) {
-        actions.push(Action::Persist(RecordBody::Ack {
+        actions.push(Action::PersistAck {
             acked: self.acked,
             acked_offset: self.acked_offset,
             log_bytes: self.log_bytes,
-        }));
+        });
         actions.push(Action::Wake {
             acked: self.acked,
             offset: self.acked_offset,
@@ -615,7 +644,7 @@ impl Replicator {
 fn claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
     let activation = ctx.activation;
     ctx.claims.push((epoch, activation));
-    actions.push(Action::Persist(RecordBody::Claim { epoch, activation }));
+    actions.push(Action::PersistClaim { epoch, activation });
     let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, activation));
     let request = ctx.write_request(epoch, Seq::ZERO, body);
     Link::send(request, ctx, actions)
@@ -668,7 +697,7 @@ fn common_event(
         Event::Sync { ticket, target } => {
             let after = ctx.upcoming_id();
             ctx.tickets.add(ticket, target, after);
-            ctx.tickets.settle(ctx.acked, actions);
+            ctx.settle(actions);
             Ok(None)
         }
         Event::Stop => Err(Terminal::Stopped),
@@ -790,11 +819,15 @@ fn activating(
             },
         },
         Step::CatchingUp(done) => match event {
-            Event::CaughtUp { last } => {
+            Event::CaughtUp { last, log_bytes } => {
+                if last < ctx.logged {
+                    return reset(ResetKind::Internal, actions);
+                }
                 // The caught-up frames hold positions up to `last`, acknowledged.
-                ctx.logged = ctx.logged.max(last);
+                ctx.logged = last;
                 let offset = ctx.acked_offset;
                 ctx.acknowledge(last, offset);
+                ctx.log_bytes = log_bytes;
                 bind(*done, ctx, now_ms, actions)
             }
             Event::Tick
@@ -914,10 +947,6 @@ fn reconciled(
 ) -> Replicator {
     match fed {
         Fed::Reset(kind) => reset(kind, actions),
-        Fed::Refuse(refusal) => {
-            actions.push(Action::Refuse(refusal));
-            Replicator::Refused(refusal)
-        }
         Fed::Done => finish(kind, *reconcile, ctx, now_ms, actions),
         Fed::More => {
             let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
@@ -956,6 +985,11 @@ fn finish(
             }
             actions.push(Action::Rebuild {
                 discard_from: *discard_from,
+                to: done.after_claim,
+                epoch: done.epoch,
+                activation: ctx.activation,
+                incarnation: ctx.incarnation,
+                cluster_id: ctx.cluster_id.clone(),
             });
             Replicator::Activating {
                 kind,
@@ -968,13 +1002,14 @@ fn finish(
 
 /// Streams under the claimed epoch: the ACK, the tickets, then the first batch.
 fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
+    actions.push(Action::Bound { epoch: done.epoch });
     ctx.acked_offset = done.after_claim;
     ctx.ack_actions(actions);
     ctx.sent.clear();
     if let Some(claim) = done.claim {
         ctx.tickets.prove(claim);
     }
-    ctx.tickets.settle(ctx.acked, actions);
+    ctx.settle(actions);
     let mut stream = Stream {
         epoch: done.epoch,
         seq: Seq::ZERO,
@@ -1072,7 +1107,7 @@ impl Stream {
             Work::Append { link, probed, .. } => link.in_flight() || *probed,
             Work::Idle | Work::Oversized { .. } => false,
         };
-        if self.probe.is_none() && !append_answers && ctx.tickets.wants_probe(ctx.acked) {
+        if self.probe.is_none() && !append_answers && ctx.tickets.wants_probe(ctx.first_pending()) {
             let from = ctx.acked_offset;
             let link = Box::new(Link::send(ctx.read_request(from), ctx, actions));
             self.probe = Some(Probe { from, link });
@@ -1167,8 +1202,16 @@ impl Stream {
                 if delivery == Delivery::Applied {
                     ctx.tickets.prove(id);
                 }
-                ctx.tickets.settle(ctx.acked, actions);
+                ctx.settle(actions);
                 self.seq = sealed.seq;
+                // A probe from before this batch would read the batch as foreign bytes.
+                if self
+                    .probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.from != self.ctx.acked_offset)
+                {
+                    self.probe = None;
+                }
                 self.kick(now_ms, actions);
                 self.into()
             }
@@ -1211,6 +1254,11 @@ impl Stream {
         let Some(Probe { from, mut link }) = self.probe.take() else {
             return self.into();
         };
+        if from != self.ctx.acked_offset {
+            // Stale: our own acknowledged bytes now follow `from`.
+            self.kick(now_ms, actions);
+            return self.into();
+        }
         let ctx = &mut self.ctx;
         if link.hit(id) == Hit::Head {
             if let Err(kind) = link.head_answer(exchange, now_ms, ctx, actions) {
@@ -1226,8 +1274,12 @@ impl Stream {
                     Exchange::NoAnswer(_) => &[],
                 };
                 if body.is_empty() && next == from {
+                    // The append slot keeps its own condition (a blocked append stays blocked).
+                    if matches!(self.work, Work::Idle) {
+                        ctx.set_condition(None, actions);
+                    }
                     ctx.tickets.prove(id);
-                    ctx.tickets.settle(ctx.acked, actions);
+                    ctx.settle(actions);
                 } else if let Work::Append { sealed, probed, .. } = &mut self.work
                     && sealed.expected_start == from
                     && (sealed.body.starts_with(body) || body.starts_with(&sealed.body))
@@ -1241,7 +1293,8 @@ impl Stream {
                 self.kick(now_ms, actions);
                 self.into()
             }
-            ReadDecision::Gone => reset(ResetKind::StreamState, actions),
+            // Retention passed our acknowledged tail: another owner moved the stream on.
+            ReadDecision::Gone => reset(ResetKind::Fenced, actions),
             ReadDecision::Common(common) => {
                 if let Err(kind) = link.common(common, retry_after(exchange), now_ms, ctx, actions)
                 {
