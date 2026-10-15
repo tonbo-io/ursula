@@ -46,6 +46,7 @@ use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
 use crate::ids::Position;
+use crate::materialize::LocalError;
 use crate::model::Delivered;
 use crate::model::HistoryEvent;
 use crate::model::ModelServer;
@@ -1714,15 +1715,62 @@ fn a_replaced_db_file_is_refused_and_kept() {
     assert!(
         matches!(
             &*e,
-            OpenError::LocalSetup(crate::open::LocalSetup::Replaced { found, .. })
-                if found[..] == SQLITE_MAGIC
+            OpenError::LocalSetup(crate::open::LocalSetup::Local(LocalError::Unmarked { .. }))
         ),
         "{e}"
     );
+    assert!(e.to_string().contains("before the 0.8 cache format"), "{e}");
     assert_eq!(
         std::fs::read(generation.join("db")).unwrap()[..16],
         SQLITE_MAGIC
     );
+}
+
+// A generation built from a snapshot holds no COMMIT record, only the ACK naming the snapshot.
+// Its db file emptied is refused, never taken for a new database (whose pages the next commits
+// would ship on top of the snapshot), and stays as it was found.
+#[test]
+fn an_emptied_db_of_a_snapshot_built_generation_is_refused() {
+    let dir_a = TempDir::new("driver-emptied-a");
+    let dir_b = TempDir::new("driver-emptied-b");
+    let mut w = World::new();
+    let a = w.core();
+    let bound = w.open(a, spec(dir_a.path(), 1));
+    commit_pages(&mut w, a, &bound, 2, &[1, 2], 1);
+    w.run_for(1_000);
+    w.retire(a, &bound);
+    drop(bound);
+    snapshot_and_retain(&mut w.server);
+    let b = w.core();
+    let built = w.open(b, spec(dir_b.path(), 2));
+    let generation = built.handle.generation.clone();
+    assert!(
+        !log_records(&generation.dir)
+            .iter()
+            .any(|r| matches!(r, RecordBody::Commit { .. })),
+        "built from the snapshot alone"
+    );
+    w.retire(b, &built);
+    drop(built);
+    std::fs::File::options()
+        .write(true)
+        .open(generation.db())
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let c = w.core();
+    let e = kind(w.open_result(c, spec(dir_b.path(), 3)));
+    assert!(
+        matches!(
+            &*e,
+            OpenError::LocalSetup(crate::open::LocalSetup::Local(LocalError::Replaced {
+                found,
+                ..
+            })) if found.is_empty()
+        ),
+        "{e}"
+    );
+    assert_eq!(std::fs::metadata(generation.db()).unwrap().len(), 0);
 }
 
 #[test]

@@ -8,12 +8,14 @@
 //! one by one.
 //!
 //! Page 1 is written stamped with the generation's marker ([`marker::stamp`]), as is the page 1 a
-//! snapshot install or an empty db's initialization writes ([`stamp_page_one`]): no db file of a
-//! generation holds SQLite's magic on disk.
+//! snapshot install writes ([`stamp_page_one`]): no db file of a generation holds SQLite's magic on
+//! disk. A page 1 from the stream without SQLite's magic is refused ([`ApplyError::PageOne`]).
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::capture::db_len;
 use crate::capture::page_offset;
@@ -28,10 +30,25 @@ pub(crate) type Image = Box<[u8; PAGE]>;
 /// Why a batch, or a page-1 stamp, could not be written.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplyError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    PageOne(#[from] MarkerError),
+    #[error("{op} {}: {source}", .path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A page 1 the stream holds (a commit's or a snapshot's) that is not a SQLite database's.
+    #[error("{}: page 1 from the stream: {source}", .path.display())]
+    PageOne {
+        path: PathBuf,
+        #[source]
+        source: MarkerError,
+    },
+}
+
+fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ApplyError {
+    let path = path.to_owned();
+    move |source| ApplyError::Io { op, path, source }
 }
 
 /// One batch of commits.
@@ -82,6 +99,7 @@ impl PageBatch {
     pub(crate) fn flush(
         &mut self,
         f: &File,
+        path: &Path,
         lineage: Lineage,
         mut written: impl FnMut() -> Result<(), std::io::Error>,
     ) -> Result<(), ApplyError> {
@@ -90,29 +108,34 @@ impl PageBatch {
         };
         let mut pages = std::mem::take(&mut self.pages);
         if let Some(page) = pages.get_mut(&1) {
-            marker::stamp(page.as_mut_slice(), lineage)?;
+            marker::stamp(page.as_mut_slice(), lineage).map_err(|source| ApplyError::PageOne {
+                path: path.to_owned(),
+                source,
+            })?;
         }
-        if f.metadata()?.len() > db_len(min) {
-            f.set_len(db_len(min))?;
+        if f.metadata().map_err(io("stat", path))?.len() > db_len(min) {
+            f.set_len(db_len(min)).map_err(io("truncate", path))?;
         }
         for (pgno, data) in pages {
-            f.write_all_at(data.as_slice(), page_offset(pgno))?;
-            written()?;
+            f.write_all_at(data.as_slice(), page_offset(pgno))
+                .and_then(|()| written())
+                .map_err(io("replay into", path))?;
         }
-        f.set_len(db_len(size))?;
-        Ok(())
+        f.set_len(db_len(size)).map_err(io("resize", path))
     }
 }
 
-/// Stamps page 1 of the db file `f` of a generation of `lineage`, written outside the applier with
-/// SQLite's magic (a snapshot's image, an empty db SQLite initialized): the marker replaces the
-/// magic in place. Anything else there is refused, nothing written.
-pub(crate) fn stamp_page_one(f: &File, lineage: Lineage) -> Result<(), ApplyError> {
+/// Stamps page 1 of the db file `f` (at `path`) of a generation of `lineage`, a snapshot's image
+/// written outside the applier with SQLite's magic: the marker replaces the magic in place.
+/// Anything else there is refused, nothing written.
+pub(crate) fn stamp_page_one(f: &File, path: &Path, lineage: Lineage) -> Result<(), ApplyError> {
     let mut head = [0u8; marker::LEN];
-    f.read_exact_at(&mut head, 0)?;
-    marker::stamp(&mut head, lineage)?;
-    f.write_all_at(&head, 0)?;
-    Ok(())
+    f.read_exact_at(&mut head, 0).map_err(io("read", path))?;
+    marker::stamp(&mut head, lineage).map_err(|source| ApplyError::PageOne {
+        path: path.to_owned(),
+        source,
+    })?;
+    f.write_all_at(&head, 0).map_err(io("stamp", path))
 }
 
 #[cfg(test)]
@@ -168,7 +191,7 @@ mod tests {
         assert_eq!(batch.len(), 2);
         let mut n = 0;
         batch
-            .flush(&f, LINEAGE, || {
+            .flush(&f, &dir.path().join("db"), LINEAGE, || {
                 n += 1;
                 Ok(())
             })
@@ -183,7 +206,7 @@ mod tests {
         assert!(bytes[2 * PAGE..].iter().all(|&b| b == 0));
         // An empty batch writes nothing.
         batch
-            .flush(&f, LINEAGE, || {
+            .flush(&f, &dir.path().join("db"), LINEAGE, || {
                 n += 1;
                 Ok(())
             })
@@ -205,15 +228,18 @@ mod tests {
         f.write_all_at(&[9u8; 2 * PAGE], 0).unwrap();
         let mut batch = PageBatch::default();
         batch.commit(1, vec![(1, Box::new([1u8; PAGE]))]);
-        let refused = batch.flush(&f, LINEAGE, || Ok(()));
+        let refused = batch.flush(&f, &dir.path().join("db"), LINEAGE, || Ok(()));
         assert!(matches!(
             refused,
-            Err(ApplyError::PageOne(MarkerError::NotSqlite { .. }))
+            Err(ApplyError::PageOne {
+                source: MarkerError::NotSqlite { .. },
+                ..
+            })
         ));
         assert_eq!(read(&f), vec![9u8; 2 * PAGE]);
     }
 
-    // A page 1 SQLite wrote in place is stamped; a foreign one is refused, unchanged.
+    // A snapshot's page 1 written in place is stamped; a foreign one is refused, unchanged.
     #[test]
     fn page_one_written_outside_the_applier_is_stamped() {
         let dir = TempDir::new("applier-stamp");
@@ -225,13 +251,16 @@ mod tests {
             .open(dir.path().join("db"))
             .unwrap();
         f.write_all_at(page(1, 5).as_slice(), 0).unwrap();
-        stamp_page_one(&f, LINEAGE).unwrap();
+        stamp_page_one(&f, &dir.path().join("db"), LINEAGE).unwrap();
         let bytes = read(&f);
         assert_eq!(bytes[..16], mark(LINEAGE));
         assert!(bytes[16..].iter().all(|&b| b == 5));
         assert!(matches!(
-            stamp_page_one(&f, LINEAGE),
-            Err(ApplyError::PageOne(MarkerError::NotSqlite { .. }))
+            stamp_page_one(&f, &dir.path().join("db"), LINEAGE),
+            Err(ApplyError::PageOne {
+                source: MarkerError::NotSqlite { .. },
+                ..
+            })
         ));
         assert_eq!(read(&f), bytes);
     }

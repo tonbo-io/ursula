@@ -1,10 +1,10 @@
 //! Materialize and catch up (design §5.6): bring a trusted generation's db file to the end of its
 //! log before any connection opens it.
 //!
-//! [`materialize`] runs at every open of a trusted generation: open the log (its torn tail cut),
-//! fsync it, check page 1 ([`page_one`]: a db file that is not this generation's is refused before
-//! anything is written), delete the WAL and `-shm` unread (and a `db-wal` or `db-journal` SQLite
-//! outside the extension may have left), re-apply the COMMIT records after the latest BASE
+//! [`materialize`] runs at every open of a trusted generation: check page 1 (a db file that is not
+//! this generation's, an empty one included, is refused before anything is written), open the log
+//! (its torn tail cut), fsync it, delete the WAL and `-shm` unread (and a `db-wal` or `db-journal`
+//! SQLite outside the extension may have left), re-apply the COMMIT records after the latest BASE
 //! (final images per batch, cutting first, so a crash midway replays again), fsync the db, append
 //! a BASE. By L3 the db holds every commit up to the BASE and otherwise only pages from records
 //! after it, so the result is exactly the state at the end of the valid log; the WAL plays no part.
@@ -30,9 +30,7 @@ use crate::codec::frame::RecordReader;
 use crate::codec::frame::decode;
 use crate::codec::frame::encode;
 use crate::codec::marker;
-use crate::codec::marker::MarkerError;
-use crate::codec::marker::PageOne;
-use crate::codec::marker::page_one;
+use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::segment::RecordBody;
 use crate::generation::Generation;
 use crate::ids::Lineage;
@@ -96,20 +94,34 @@ pub(crate) enum LocalError {
     OwnPending { first: Position },
     #[error("encoding a frame to catch up: {0}")]
     Encode(#[source] FrameError),
-    #[error("{}: {source}", .db.display())]
-    PageOne {
-        db: PathBuf,
-        #[source]
-        source: MarkerError,
-    },
-    /// Page 1 of the db file is not this generation's: the file was replaced (a copy, or SQLite
-    /// outside the extension), or cut short.
+    #[error(transparent)]
+    Apply(#[from] ApplyError),
+    /// Page 1 of the db file is not this generation's marker: the file was replaced (a copy, or
+    /// another generation's), emptied or cut short.
     #[error(
-        "{}: page 1 holds \"{}\", not this generation's marker: the db file was replaced",
+        "{}: page 1 holds \"{}\", not this generation's marker: the db file was replaced, \
+         emptied or cut short",
         .db.display(),
         .found.escape_ascii()
     )]
     Replaced { db: PathBuf, found: Vec<u8> },
+    /// Page 1 holds SQLite's own magic: a cache written before 0.8 marked page 1, or a file
+    /// SQLite wrote outside the extension.
+    #[error(
+        "{}: page 1 holds SQLite's own header, not the page-1 marker: a cache written before the \
+         0.8 cache format marked page 1 (an earlier 0.8 build), or a file SQLite wrote outside the \
+         extension, which this version does not open",
+        .db.display()
+    )]
+    Unmarked { db: PathBuf },
+}
+
+impl LocalError {
+    /// The stream's content is at fault, not the local files: a commit or a snapshot whose page 1
+    /// is not a SQLite database's.
+    pub(crate) fn is_stream_content(&self) -> bool {
+        matches!(self, LocalError::Apply(ApplyError::PageOne { .. }))
+    }
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> LocalError {
@@ -118,25 +130,25 @@ fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> LocalErro
 }
 
 /// Checks page 1 of the db file `db` of a generation of `lineage`, before anything writes it: the
-/// generation's marker, or an empty file whose log holds no commit the db should hold already
-/// (`holds_commit`). Anything else is [`LocalError::Replaced`].
-fn check_page_one(
-    db: &File,
-    db_path: &Path,
-    lineage: Lineage,
-    holds_commit: bool,
-) -> Result<(), LocalError> {
+/// generation's marker. Every generation is published with page 1 written, so an empty file is
+/// refused like any other.
+fn check_page_one(db: &File, db_path: &Path, lineage: Lineage) -> Result<(), LocalError> {
     let len = db.metadata().map_err(io("stat", db_path))?.len();
     let mut head = [0u8; marker::LEN];
     let n = usize::try_from(len.min(marker::LEN as u64)).unwrap_or(marker::LEN);
     let read = head.get_mut(..n).unwrap_or_default();
     db.read_exact_at(read, 0).map_err(io("read", db_path))?;
-    match page_one(read, len, lineage, holds_commit) {
-        PageOne::Marked | PageOne::Uninitialized => Ok(()),
-        PageOne::Foreign { found } => Err(LocalError::Replaced {
+    if marker::is_marked(read, lineage) {
+        Ok(())
+    } else if read == SQLITE_MAGIC {
+        Err(LocalError::Unmarked {
             db: db_path.to_owned(),
-            found,
-        }),
+        })
+    } else {
+        Err(LocalError::Replaced {
+            db: db_path.to_owned(),
+            found: read.to_vec(),
+        })
     }
 }
 
@@ -160,22 +172,16 @@ pub(crate) struct ForeignFrame {
 
 /// Brings `g`'s db file to the end of its valid log.
 pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
-    let (mut log, recovered) = Log::open(&g.log_dir())?;
-    log.sync()?;
+    // Page 1 first, so a refused generation is left exactly as it was found.
     let db_path = g.db();
     let db = File::options()
         .read(true)
         .write(true)
         .open(&db_path)
         .map_err(io("open", &db_path))?;
-    // A BASE record is written only once the db file holds a commit, and the latest one is never
-    // trimmed (its position is above the base it names). A commit after it is applied below.
-    let holds_commit = recovered.records.iter().any(|r| match r.body {
-        RecordBody::Base { .. } => true,
-        RecordBody::Commit { .. } => r.position <= recovered.base,
-        RecordBody::Claim { .. } | RecordBody::Ack { .. } => false,
-    });
-    check_page_one(&db, &db_path, g.lineage, holds_commit)?;
+    check_page_one(&db, &db_path, g.lineage)?;
+    let (mut log, recovered) = Log::open(&g.log_dir())?;
+    log.sync()?;
     let mut removed = false;
     let [stray_wal, journal] = g.strays();
     for path in [g.wal(), g.shm(), stray_wal, journal] {
@@ -368,13 +374,7 @@ fn flush(
     db_path: &Path,
     lineage: Lineage,
 ) -> Result<(), LocalError> {
-    batch.flush(db, lineage, page_written).map_err(|e| match e {
-        ApplyError::Io(source) => io("replay into", db_path)(source),
-        ApplyError::PageOne(source) => LocalError::PageOne {
-            db: db_path.to_owned(),
-            source,
-        },
-    })
+    Ok(batch.flush(db, db_path, lineage, page_written)?)
 }
 
 #[cfg(test)]

@@ -525,9 +525,9 @@ fn log_commit(g: &Generation, fill: u8) {
     log.append(&RecordBody::Commit { frame }).unwrap();
 }
 
-// A db file whose page 1 is not this generation's marker (plain SQLite copied over it, another
-// generation's db, a file cut short) is refused before anything is written: no replay, no WAL
-// deleted, no BASE.
+// A db file whose page 1 is not this generation's marker (plain SQLite copied over it, or a cache
+// from before the marker, another generation's db, a file cut short) is refused before anything is
+// written: no replay, no WAL deleted, no BASE, and the log's torn tail is not cut.
 #[test]
 fn a_foreign_page_one_is_refused_before_anything_is_written() {
     let other = Lineage([4; 16]);
@@ -541,42 +541,49 @@ fn a_foreign_page_one_is_refused_before_anything_is_written() {
         log_commit(&g, 5);
         fs::write(g.db(), &db).unwrap();
         fs::write(g.wal(), b"wal").unwrap();
-        let segment = fs::read(g.log_dir().join("00000000000000000001.usl")).unwrap();
-        assert!(matches!(
-            materialize(&g),
-            Err(super::LocalError::Replaced { found, .. }) if found == db[..db.len().min(16)]
-        ));
+        let path = g.log_dir().join("00000000000000000001.usl");
+        let mut segment = fs::read(&path).unwrap();
+        segment.extend_from_slice(b"torn");
+        fs::write(&path, &segment).unwrap();
+        let refused = materialize(&g);
+        if db.starts_with(&SQLITE_MAGIC) {
+            assert!(
+                matches!(refused, Err(super::LocalError::Unmarked { .. })),
+                "{refused:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    refused,
+                    Err(super::LocalError::Replaced { ref found, .. })
+                        if *found == db[..db.len().min(16)]
+                ),
+                "{refused:?}"
+            );
+        }
         assert_eq!(read(&g.db()), db);
         assert_eq!(read(&g.wal()), b"wal");
-        assert_eq!(
-            fs::read(g.log_dir().join("00000000000000000001.usl")).unwrap(),
-            segment
-        );
+        assert_eq!(fs::read(&path).unwrap(), segment);
     }
 }
 
-// An empty db file is one a bind initializes, unless the log holds a commit the db should hold
-// already (after a BASE): then it was emptied, and is refused.
+// An empty db file is refused, with commits in the log or not: every generation is published with
+// page 1 written, so an empty one was emptied.
 #[test]
-fn an_empty_db_is_new_only_without_a_based_commit() {
+fn an_empty_db_is_refused() {
     let dir = TempDir::new("materialize-empty");
     let (_root, g) = generation(&dir);
-    fs::write(g.db(), b"").unwrap();
-    let m = materialize(&g).unwrap();
-    assert_eq!(m.db.metadata().unwrap().len(), 0);
-    drop(m);
-    // A commit after the BASE is replayed onto the empty db, page 1 marked.
-    log_commit(&g, 6);
-    let m = materialize(&g).unwrap();
-    assert_eq!(read(&g.db())[..16], mark(LINEAGE));
-    assert_eq!(m.recovered.base, Position(0));
-    drop(m);
-    // Its replay appended a BASE: emptied now, the db lost what the BASE says it holds.
     fs::write(g.db(), b"").unwrap();
     assert!(matches!(
         materialize(&g),
         Err(super::LocalError::Replaced { found, .. }) if found.is_empty()
     ));
+    log_commit(&g, 6);
+    assert!(matches!(
+        materialize(&g),
+        Err(super::LocalError::Replaced { found, .. }) if found.is_empty()
+    ));
+    assert_eq!(read(&g.db()), b"");
 }
 
 // The WAL and `-shm` go unread, and so do a `db-wal` and a `db-journal` SQLite outside the

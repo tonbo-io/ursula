@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::FileExt;
 
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
@@ -8,6 +9,7 @@ use super::PathError;
 use super::Root;
 use super::canonical_path;
 use super::root_name;
+use crate::codec::marker::empty_page_one;
 use crate::codec::segment::SegmentHeader;
 use crate::ids::Lineage;
 use crate::ids::Position;
@@ -265,21 +267,21 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
     ));
 }
 
-// An empty db's initialization that a crash cut short (`db.init` and its SQLite files) is deleted
-// with the other leftovers; the db it would have replaced stays.
+// A generation nothing was applied to is published with the page 1 of an empty database, marked
+// (design D7): no published db file is empty or unmarked. One a commit or a snapshot wrote keeps
+// its pages.
 #[test]
-fn an_unfinished_init_is_a_leftover() {
-    let dir = TempDir::new("gen-init");
+fn a_generation_is_published_with_page_one_written() {
+    let dir = TempDir::new("gen-empty");
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
     let g = root.build(header(1)).unwrap().publish().unwrap();
-    for name in ["db.init", "db.init-wal", "db.init-shm"] {
-        fs::write(g.dir.join(name), b"x").unwrap();
-    }
-    root.finish_leftovers().unwrap();
-    for name in ["db.init", "db.init-wal", "db.init-shm"] {
-        assert!(!g.dir.join(name).exists(), "{name}");
-    }
-    assert!(g.db().exists());
-    assert_eq!(g.db_init(), g.dir.join("db.init"));
+    assert_eq!(
+        fs::read(g.db()).unwrap(),
+        empty_page_one(g.lineage).to_vec()
+    );
+    let building = root.build(header(2)).unwrap();
+    building.db.write_all_at(&[7u8; 8192], 0).unwrap();
+    let g2 = building.publish().unwrap();
+    assert_eq!(fs::read(g2.db()).unwrap(), vec![7u8; 8192]);
 }

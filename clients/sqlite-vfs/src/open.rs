@@ -37,7 +37,6 @@ use ursula_headers::Offset;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 
-use crate::applier::ApplyError;
 use crate::applier::stamp_page_one;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::Frame;
@@ -188,6 +187,8 @@ pub(crate) enum StreamState {
     },
     /// The stream changed history while the open read it.
     HistoryChanged,
+    /// A commit or snapshot whose page 1 is not a SQLite database's.
+    NotSqlite,
 }
 
 /// Why the stream's content is not this format.
@@ -213,13 +214,6 @@ pub(crate) enum LocalSetup {
     Log(#[from] LogError),
     #[error("the generation is of stream {found:?}, not {expected:?}")]
     OtherStream { found: String, expected: String },
-    /// Page 1 of the generation's db file is not its marker: refused until salvage keeps it.
-    #[error(
-        "{}: page 1 holds \"{}\", not the generation's marker: the db file was replaced",
-        .db.display(),
-        .found.escape_ascii()
-    )]
-    Replaced { db: PathBuf, found: Vec<u8> },
 }
 
 /// Why an open failed (design §8.4: `UrsulaSetupError` and `UrsulaUnavailableError`).
@@ -261,18 +255,21 @@ pub(crate) enum OpenError {
 }
 
 /// A local failure: a gap or malformed record under valid checksums is the extension's own bug
-/// (`internal`), anything else `local_setup`.
+/// (`internal`), a commit or snapshot from the stream whose page 1 is not a SQLite database's is
+/// the stream's (`stream_state`), anything else `local_setup`.
 pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
     let e = e.into();
+    if let LocalSetup::Local(l) = &e
+        && l.is_stream_content()
+    {
+        return OpenError::StreamState(StreamState::NotSqlite);
+    }
     let bug = |log: &LogError| matches!(log, LogError::Gap { .. } | LogError::Malformed { .. });
     let internal = match &e {
         LocalSetup::Local(LocalError::Log(log))
         | LocalSetup::Log(log)
         | LocalSetup::Generation(GenerationError::Log(log)) => bug(log),
-        LocalSetup::Local(_)
-        | LocalSetup::Generation(_)
-        | LocalSetup::OtherStream { .. }
-        | LocalSetup::Replaced { .. } => false,
+        LocalSetup::Local(_) | LocalSetup::Generation(_) | LocalSetup::OtherStream { .. } => false,
     };
     if internal {
         OpenError::Internal(e)
@@ -681,17 +678,8 @@ impl Build {
             })
         })?;
         drop(out);
-        stamp_page_one(&self.building.db, self.header.lineage).map_err(|e| match e {
-            ApplyError::Io(source) => local(LocalError::Io {
-                op: "stamp",
-                path: db_path,
-                source,
-            }),
-            ApplyError::PageOne(source) => local(LocalError::PageOne {
-                db: db_path,
-                source,
-            }),
-        })?;
+        stamp_page_one(&self.building.db, &db_path, self.header.lineage)
+            .map_err(|e| local(LocalError::from(e)))?;
         self.building
             .log
             .append(&RecordBody::Ack {
@@ -856,13 +844,9 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
     let local_generation = match root.current().map_err(local)? {
         None => None,
         Some(generation) => {
-            // A replaced db file is refused for now: salvage keeps it in a later version.
-            let m = materialize::materialize(&generation).map_err(|e| match e {
-                LocalError::Replaced { db, found } => {
-                    OpenError::LocalSetup(LocalSetup::Replaced { db, found })
-                }
-                e => local(e),
-            })?;
+            // A replaced db file is refused for now (`local_setup`, nothing changed): salvage keeps
+            // it in a later version.
+            let m = materialize::materialize(&generation).map_err(local)?;
             let found = &m.recovered.header.stream_path;
             if found != name.as_str() {
                 return Err(OpenError::LocalSetup(LocalSetup::OtherStream {

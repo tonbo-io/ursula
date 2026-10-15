@@ -11,21 +11,14 @@
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::c_int;
-use std::path::Path;
-use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 
 use libsqlite3_sys as ffi;
 
-use crate::applier::ApplyError;
-use crate::applier::stamp_page_one;
 use crate::codec::PAGE;
-use crate::codec::marker::MarkerError;
 use crate::error::ErrorKind;
-use crate::generation::Generation;
-use crate::replog::sync_dir;
 
 pub(crate) const OK: c_int = ffi::SQLITE_OK;
 
@@ -79,19 +72,6 @@ pub(crate) enum HostError {
     Copy(#[source] std::io::Error),
     #[error("fsync of the db file: SQLite error {code}")]
     FileSync { code: c_int },
-    #[error("initializing the empty db {}: {op}: {source}", .path.display())]
-    Init {
-        op: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("initializing the empty db {}: {source}", .path.display())]
-    InitPageOne {
-        path: PathBuf,
-        #[source]
-        source: MarkerError,
-    },
 }
 
 impl HostError {
@@ -106,9 +86,7 @@ impl HostError {
             | HostError::FileHandle { .. }
             | HostError::ReadPages { .. }
             | HostError::Copy(_)
-            | HostError::FileSync { .. }
-            | HostError::Init { .. }
-            | HostError::InitPageOne { .. } => ErrorKind::LocalSetup,
+            | HostError::FileSync { .. } => ErrorKind::LocalSetup,
             HostError::MissingRoutine(_) => ErrorKind::Internal,
         }
     }
@@ -174,7 +152,7 @@ pub(crate) enum Checkpoint {
 /// A private connection of the extension's own, in the extension's process. [`Private::open`]
 /// goes through the "ursula" VFS, so its checkpoints take F1 (design §4.3) and it counts as a
 /// connection of the binding: the snapshot thread's checkpoint, read transaction, page copy and
-/// db fsync. [`init_empty`] alone goes through "unix", before the database is bound.
+/// db fsync.
 pub(crate) struct Private {
     /// From `sqlite3_open_v2` (possibly a failed open's handle, which still needs closing).
     db: *mut ffi::sqlite3,
@@ -366,43 +344,4 @@ impl Drop for Private {
             unsafe { close(self.db) };
         }
     }
-}
-
-/// Initializes the empty db file of generation `g` (design D7): a private "unix" connection gives
-/// `db.init` its WAL-format page 1, so no connection ever commits through a rollback journal, which
-/// the VFS refuses; page 1 is stamped with the generation's marker and fsynced, and `db.init` is
-/// renamed over `db`, so the VFS never serves an unmarked page 1. The connection's WAL and `-shm`
-/// go when it closes, and a crash before the rename leaves `db.init*` for `finish_leftovers`. Not a
-/// commit: the first commit writes page 1 again (every schema change does), so the stream holds
-/// it. It runs before the database is bound and writes no page from the log, so it needs neither
-/// the "ursula" VFS nor F1, which would refuse its db write.
-pub(crate) fn init_empty(g: &Generation) -> Result<(), HostError> {
-    let init = g.db_init();
-    let db = g.db();
-    let failed = |op: &'static str, path: &Path| {
-        let path = path.to_owned();
-        move |source| HostError::Init { op, path, source }
-    };
-    match std::fs::remove_file(&init) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(failed("remove", &init)(e)),
-    }
-    Private::open_on(&init.to_string_lossy(), true, c"unix")?.exec(c"PRAGMA journal_mode=WAL")?;
-    let f = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .open(&init)
-        .map_err(failed("open", &init))?;
-    stamp_page_one(&f, g.lineage).map_err(|e| match e {
-        ApplyError::Io(source) => failed("stamp", &init)(source),
-        ApplyError::PageOne(source) => HostError::InitPageOne {
-            path: init.clone(),
-            source,
-        },
-    })?;
-    f.sync_all().map_err(failed("fsync", &init))?;
-    drop(f);
-    std::fs::rename(&init, &db).map_err(failed("rename", &init))?;
-    sync_dir(&g.dir).map_err(failed("fsync", &g.dir))
 }

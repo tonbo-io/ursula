@@ -1,5 +1,9 @@
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -14,10 +18,14 @@ use super::File;
 use super::METHODS;
 use super::Role;
 use super::WalName;
+use super::c_access;
+use super::c_delete;
 use super::c_open;
 use super::failed_open;
 use super::lost_page;
 use super::uwal;
+use super::x_access;
+use super::x_delete;
 use crate::capture::FIRST_PAGE;
 use crate::capture::FRAME;
 use crate::codec::PAGE;
@@ -26,6 +34,7 @@ use crate::codec::marker::mark;
 use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
 use crate::db::for_tests;
+use crate::db::registered_for_tests;
 use crate::publication::HandleState;
 use crate::replicator::ResetKind;
 use crate::testdir::TempDir;
@@ -545,6 +554,94 @@ fn the_wal_of_a_bound_db_is_db_uwal() {
     // SAFETY: `as_ptr` points at the NUL-terminated name inside `name`.
     let c = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
     assert_eq!(c.to_str().unwrap(), "/c/gen-1/db-uwal");
+}
+
+thread_local! {
+    /// The names the stand-in "unix" VFS's `xAccess` and `xDelete` got, in order.
+    static NAMES: RefCell<Vec<(&'static str, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn named(call: &'static str, zname: *const c_char) {
+    // SAFETY: the VFS methods under test pass a NUL-terminated name.
+    let name = unsafe { CStr::from_ptr(zname) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    NAMES.with_borrow_mut(|n| n.push((call, name)));
+}
+
+unsafe extern "C" fn stand_in_access(
+    _vfs: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    _flags: c_int,
+    out: *mut c_int,
+) -> c_int {
+    named("access", zname);
+    // SAFETY: the method under test passes its caller's writable `out`.
+    unsafe { *out = 1 };
+    ffi::SQLITE_OK
+}
+
+unsafe extern "C" fn stand_in_delete(
+    _vfs: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    _sync_dir: c_int,
+) -> c_int {
+    named("delete", zname);
+    ffi::SQLITE_OK
+}
+
+// The VFS's own `xAccess` and `xDelete` give "unix" `db-uwal` for SQLite's `db-wal` of a db in the
+// registry, and every other name as it is: another db's WAL, the db itself, and the same WAL once
+// its db left the registry. Without a "unix" VFS they answer their I/O error codes.
+#[test]
+fn access_and_delete_map_the_wal_of_a_registered_db_only() {
+    let dir = TempDir::new("vfs-access");
+    let b = for_tests(dir.path());
+    // SAFETY: every field of `sqlite3_vfs` is an integer, a raw pointer or an `Option` of a
+    // function pointer, for which all zero bytes are a valid value.
+    let mut unix: ffi::sqlite3_vfs = unsafe { std::mem::zeroed() };
+    unix.xAccess = Some(stand_in_access);
+    unix.xDelete = Some(stand_in_delete);
+    let u = &raw mut unix;
+    let probe = |name: &str| {
+        let c = CString::new(name).unwrap();
+        let mut out: c_int = 0;
+        // SAFETY: `c` is NUL-terminated, `out` writable, and `u` outlives the calls.
+        let access = unsafe { x_access(u, c.as_ptr(), ffi::SQLITE_ACCESS_EXISTS, &raw mut out) };
+        // SAFETY: as above.
+        let delete = unsafe { x_delete(u, c.as_ptr(), 0) };
+        assert_eq!(
+            (access, delete, out),
+            (ffi::SQLITE_OK, ffi::SQLITE_OK, 1),
+            "{name}"
+        );
+    };
+    let wal = format!("{}-wal", b.path);
+    let uwal_name = format!("{}-uwal", b.path);
+    let other = dir.path().join("other").join("db-wal");
+    let other = other.to_str().unwrap();
+    let registered = registered_for_tests(&b);
+    for name in [wal.as_str(), other, b.path.as_str()] {
+        probe(name);
+    }
+    drop(registered);
+    probe(&wal);
+    let names = NAMES.with_borrow_mut(std::mem::take);
+    let expected: Vec<(&str, String)> = [&uwal_name, other, &b.path, &wal]
+        .into_iter()
+        .flat_map(|n| [("access", n.to_owned()), ("delete", n.to_owned())])
+        .collect();
+    assert_eq!(names, expected);
+    // The registered entry points read the process's "unix" VFS, which no test registers.
+    let c = CString::new(wal).unwrap();
+    let mut out: c_int = 0;
+    // SAFETY: the entry points' contracts: a NUL-terminated name and a writable `out`.
+    let access = unsafe { c_access(null_mut(), c.as_ptr(), 0, &raw mut out) };
+    // SAFETY: as above.
+    let delete = unsafe { c_delete(null_mut(), c.as_ptr(), 0) };
+    assert_eq!(access, ffi::SQLITE_IOERR_ACCESS);
+    assert_eq!(delete, ffi::SQLITE_IOERR_DELETE);
 }
 
 /// `xShmLock` of an open file of this VFS over the stand-in.

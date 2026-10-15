@@ -31,7 +31,6 @@ use crate::error::Error;
 use crate::error::WriteRefusal;
 use crate::generation::canonical_path;
 use crate::host::full_pathname;
-use crate::host::init_empty;
 use crate::ids::Activation;
 use crate::ids::Position;
 use crate::log;
@@ -393,8 +392,8 @@ fn take(name: &str, open: OpenId, timeout_ms: u64) -> Result<Option<Opened>, Err
     register(bound, url).map(|b| Some(Opened::Bound(b)))
 }
 
-/// A database the driver bound: its empty db file is initialized (WAL format, page 1 marked), and
-/// it joins the registry.
+/// A database the driver bound joins the registry. Its db file was published with page 1 written
+/// and marked (WAL format), so no connection ever commits through a rollback journal.
 fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     let Bound { binding, handle } = bound;
     let refuse = |e: Error| {
@@ -406,9 +405,6 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     };
     let db = handle.generation.db();
     let path = full_pathname(&db.to_string_lossy()).map_err(|e| refuse(e.into()))?;
-    if std::fs::metadata(&db).map_or(0, |m| m.len()) == 0 {
-        init_empty(&handle.generation).map_err(|e| refuse(e.into()))?;
-    }
     let at_bind = match handle.log() {
         Ok(log) => Position(log.next_position().0.saturating_sub(1)),
         Err(_poisoned) => return Err(refuse(Error::Reset(ResetKind::Internal))),
@@ -560,6 +556,20 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
         wal_written: Mutex::new(BTreeMap::new()),
         decided: Condvar::new(),
     })
+}
+
+/// Puts `b` in the registry under its path, for tests of the VFS methods that look a db up, until
+/// the guard drops.
+#[cfg(test)]
+pub(crate) fn registered_for_tests(b: &Arc<Binding>) -> impl Drop {
+    struct Registered(String);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            registry().paths.remove(&self.0);
+        }
+    }
+    registry().paths.insert(b.path.clone(), Arc::clone(b));
+    Registered(b.path.clone())
 }
 
 #[cfg(test)]

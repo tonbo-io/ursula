@@ -1119,6 +1119,15 @@ impl Core {
             }
             DiskDone::CaughtUp {
                 outcome: Err(e), ..
+            } if e.is_stream_content() => {
+                log::emit(Level::Error, "stream_content", &[
+                    ("binding", &binding.0),
+                    ("error", &e),
+                ]);
+                self.reset(binding, ResetKind::StreamState, now_ms);
+            }
+            DiskDone::CaughtUp {
+                outcome: Err(e), ..
             } => {
                 self.local_damage(binding, &LocalFailure::Local(e), now_ms);
             }

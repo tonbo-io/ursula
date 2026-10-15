@@ -11,9 +11,10 @@
 //! and fails with `SQLITE_NOTADB` before it reads or writes anything else. The marker names the
 //! generation's lineage, so a db file copied in from another generation is not taken for this one.
 //!
-//! Every function here is pure: the VFS, the applier and the snapshot install call them on the
-//! bytes they move.
+//! Every function here is pure: the VFS, the applier, the snapshot install and a generation's
+//! publish call them on the bytes they move.
 
+use super::PAGE;
 use crate::ids::Lineage;
 
 /// The marker's first 8 bytes.
@@ -30,12 +31,9 @@ pub fn mark(lineage: Lineage) -> [u8; LEN] {
     let mut out = [0u8; LEN];
     let (head, tail) = out.split_at_mut(MARKER.len());
     head.copy_from_slice(&MARKER);
-    tail.copy_from_slice(
-        lineage
-            .0
-            .get(..LEN.saturating_sub(MARKER.len()))
-            .unwrap_or_default(),
-    );
+    if let Some(prefix) = lineage.0.first_chunk::<8>() {
+        tail.copy_from_slice(prefix);
+    }
     out
 }
 
@@ -115,31 +113,39 @@ pub fn stamp(page: &mut [u8], lineage: Lineage) -> Result<(), MarkerError> {
         .map_err(|(at, found)| MarkerError::NotSqlite { at, found })
 }
 
-/// What page 1 of a generation's db file holds, checked before anything opens or replays it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageOne {
-    /// This generation's marker.
-    Marked,
-    /// An empty db file in a generation whose log holds no commit the db should hold already: it
-    /// is initialized before it binds.
-    Uninitialized,
-    /// Anything else: a file SQLite outside the extension wrote, another generation's, or one cut
-    /// short. `found` holds its first bytes, at most 16.
-    Foreign { found: Vec<u8> },
+/// Whether `head`, the first bytes of a generation's db file, is the marker of `lineage`. An
+/// empty or shorter file is not: every generation is published with page 1 written.
+pub fn is_marked(head: &[u8], lineage: Lineage) -> bool {
+    head == mark(lineage)
 }
 
-/// Page 1 of a db file of `db_len` bytes whose first bytes are `head` (at most 16), in a generation
-/// of `lineage` whose log holds a commit the db should hold already (`holds_commit`) or none.
-pub fn page_one(head: &[u8], db_len: u64, lineage: Lineage, holds_commit: bool) -> PageOne {
-    if db_len == 0 && !holds_commit {
-        return PageOne::Uninitialized;
-    }
-    if head == mark(lineage) {
-        return PageOne::Marked;
-    }
-    PageOne::Foreign {
-        found: head.get(..LEN.min(head.len())).unwrap_or_default().to_vec(),
-    }
+/// Page 1 of an empty database in WAL mode, marked for a generation of `lineage`: what a
+/// generation's db file holds when it is published without a commit (design D7), so no published
+/// db file is ever empty or unmarked.
+///
+/// The bytes are those SQLite writes for a new database (`sqlite3BtreeNewDb`), then WAL mode: a
+/// 4096-byte page, file format versions 2 and 2 (WAL), the default payload fractions, one page,
+/// change counter 1, schema format 0 and text encoding 0 (SQLite sets both at the first `CREATE`),
+/// and an empty table b-tree leaf for `sqlite_schema` at byte 100. It is not a commit: the first
+/// commit writes page 1 again (every schema change does), so the stream holds it.
+pub fn empty_page_one(lineage: Lineage) -> Box<[u8; PAGE]> {
+    let mut page = Box::new([0u8; PAGE]);
+    let mut put = |at: usize, bytes: &[u8]| {
+        if let Some(to) = page.get_mut(at..at.saturating_add(bytes.len())) {
+            to.copy_from_slice(bytes);
+        }
+    };
+    put(0, &mark(lineage));
+    // Page size, write and read versions (2: WAL), reserved bytes, payload fractions.
+    put(16, &[0x10, 0x00, 2, 2, 0, 64, 32, 32]);
+    // File change counter, and the size in pages it validates (bytes 92..96).
+    put(24, &1u32.to_be_bytes());
+    put(28, &1u32.to_be_bytes());
+    put(92, &1u32.to_be_bytes());
+    // The empty `sqlite_schema` b-tree: a table leaf (13), no freeblock, no cell, its content
+    // area starting at the end of the page, no fragmented bytes.
+    put(100, &[13, 0, 0, 0, 0, 0x10, 0x00, 0]);
+    page
 }
 
 #[cfg(test)]

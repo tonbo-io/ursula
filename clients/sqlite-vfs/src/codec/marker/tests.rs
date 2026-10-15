@@ -11,12 +11,12 @@ use proptest::proptest;
 
 use super::LEN;
 use super::MarkerError;
-use super::PageOne;
 use super::SQLITE_MAGIC;
+use super::empty_page_one;
+use super::is_marked;
 use super::mark;
 use super::on_read;
 use super::on_write;
-use super::page_one;
 use super::stamp;
 use crate::ids::Lineage;
 
@@ -134,27 +134,29 @@ fn a_stamped_page_is_marked() {
 }
 
 #[test]
-fn page_one_is_marked_uninitialized_or_foreign() {
+fn only_the_marker_of_the_lineage_is_marked() {
     let m = mark(LINEAGE);
-    assert_eq!(page_one(&m, 4096, LINEAGE, true), PageOne::Marked);
-    assert_eq!(page_one(&[], 0, LINEAGE, false), PageOne::Uninitialized);
-    // An empty db in a generation whose log holds a commit the db should hold is not new.
-    assert_eq!(page_one(&[], 0, LINEAGE, true), PageOne::Foreign {
-        found: Vec::new()
-    });
-    assert_eq!(
-        page_one(&SQLITE_MAGIC, 4096, LINEAGE, false),
-        PageOne::Foreign {
-            found: SQLITE_MAGIC.to_vec()
-        }
-    );
-    assert_eq!(page_one(&m[..8], 8, LINEAGE, false), PageOne::Foreign {
-        found: m[..8].to_vec()
-    });
-    assert_eq!(
-        page_one(&mark(Lineage([1; 16])), 4096, LINEAGE, false),
-        PageOne::Foreign {
-            found: mark(Lineage([1; 16])).to_vec()
-        }
-    );
+    assert!(is_marked(&m, LINEAGE));
+    // An empty or cut db file is never marked: a generation is published with page 1 written.
+    assert!(!is_marked(&[], LINEAGE));
+    assert!(!is_marked(&m[..8], LINEAGE));
+    assert!(!is_marked(&SQLITE_MAGIC, LINEAGE));
+    assert!(!is_marked(&mark(Lineage([1; 16])), LINEAGE));
+}
+
+// The page 1 a generation is published with, without a commit: marked, and through the VFS the
+// header of an empty WAL-mode database with 4096-byte pages and one page.
+#[test]
+fn an_empty_page_one_is_a_marked_empty_wal_database() {
+    let page = empty_page_one(LINEAGE);
+    assert_eq!(page[..LEN], mark(LINEAGE));
+    let mut read = page[..LEN].to_vec();
+    on_read(&mut read, 0, LINEAGE).unwrap();
+    assert_eq!(read, SQLITE_MAGIC);
+    assert_eq!(page[16..24], [0x10, 0x00, 2, 2, 0, 64, 32, 32]);
+    assert_eq!(page[24..32], [0, 0, 0, 1, 0, 0, 0, 1]);
+    assert_eq!(page[92..96], page[24..28], "the size in pages is valid");
+    assert_eq!(page[100..108], [13, 0, 0, 0, 0, 0x10, 0x00, 0]);
+    assert!(page[32..92].iter().all(|&b| b == 0));
+    assert!(page[108..].iter().all(|&b| b == 0));
 }

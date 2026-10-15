@@ -24,13 +24,15 @@
 //! generation or a WAL truncate to nothing the db file is fsynced, then a BASE record names the
 //! last confirmed commit. A failed fsync resets `local_damage`.
 //!
-//! Page 1 (design §5.1): on disk bytes 0..16 of a bound db file hold the generation's marker
+//! Page 1 (design §5.3): on disk bytes 0..16 of a bound db file hold the generation's marker
 //! ([`marker`]). `xRead` gives SQLite its magic in their place, `xWrite` stores the marker in place
 //! of the magic, and `xFetch` maps nothing over them, so SQLite reads them through `xRead`. A read
 //! that finds anything but the marker resets `local_damage` (`SQLITE_IOERR_READ`). The WAL of a
 //! bound db is `db-uwal`: `xOpen` opens it in place of `db-wal`, and the VFS's own `xAccess` and
-//! `xDelete` map SQLite's probes and deletes of `db-wal` to it. Unbound, a generation's db file
-//! reads as no database (`SQLITE_NOTADB`), through this VFS or any other.
+//! `xDelete` map SQLite's probes and deletes of `db-wal` to it. A generation is published with
+//! page 1 written and marked (the page 1 of an empty database when it holds no commit), so its db
+//! file is never empty or unmarked: unbound, it reads as no database (`SQLITE_NOTADB`), through
+//! this VFS or any other, and SQLite outside the extension never takes it for a new one.
 //!
 //! After a reset, a new read transaction fails at its read-mark lock (`SQLITE_IOERR_READ`) and
 //! every write fails (`SQLITE_IOERR_WRITE`), db-file writes included, so no checkpoint moves pages
@@ -1374,14 +1376,20 @@ unsafe fn mapped_name(zname: *const c_char) -> Option<CString> {
     uwal(name, |db| lookup(db).is_some()).and_then(|n| CString::new(n).ok())
 }
 
-/// `xAccess` of the "ursula" VFS: SQLite's probe of a bound db's `db-wal` looks at its `db-uwal`.
+/// `xAccess` of the "ursula" VFS over the "unix" VFS `u`: SQLite's probe of a bound db's `db-wal`
+/// looks at its `db-uwal`.
 ///
 /// # Safety
 ///
-/// SQLite's `xAccess` contract: `zname` is NUL-terminated and `out` writable.
-unsafe fn x_access(zname: *const c_char, flags: c_int, out: *mut c_int) -> c_int {
-    let u = unix();
-    // SAFETY: `UNIX` is null or SQLite's "unix" VFS, which lives for the process.
+/// SQLite's `xAccess` contract: `zname` is NUL-terminated and `out` writable. `u` is null or a VFS
+/// that outlives the call.
+unsafe fn x_access(
+    u: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    flags: c_int,
+    out: *mut c_int,
+) -> c_int {
+    // SAFETY: the caller's contract.
     let Some(access) = unsafe { u.as_ref() }.and_then(|u| u.xAccess) else {
         return ffi::SQLITE_IOERR_ACCESS;
     };
@@ -1392,14 +1400,15 @@ unsafe fn x_access(zname: *const c_char, flags: c_int, out: *mut c_int) -> c_int
     unsafe { access(u, name, flags, out) }
 }
 
-/// `xDelete` of the "ursula" VFS: SQLite's delete of a bound db's `db-wal` deletes its `db-uwal`.
+/// `xDelete` of the "ursula" VFS over the "unix" VFS `u`: SQLite's delete of a bound db's `db-wal`
+/// deletes its `db-uwal`.
 ///
 /// # Safety
 ///
-/// SQLite's `xDelete` contract: `zname` is NUL-terminated.
-unsafe fn x_delete(zname: *const c_char, sync_dir: c_int) -> c_int {
-    let u = unix();
-    // SAFETY: `UNIX` is null or SQLite's "unix" VFS, which lives for the process.
+/// SQLite's `xDelete` contract: `zname` is NUL-terminated. `u` is null or a VFS that outlives the
+/// call.
+unsafe fn x_delete(u: *mut ffi::sqlite3_vfs, zname: *const c_char, sync_dir: c_int) -> c_int {
+    // SAFETY: the caller's contract.
     let Some(delete) = unsafe { u.as_ref() }.and_then(|u| u.xDelete) else {
         return ffi::SQLITE_IOERR_DELETE;
     };
@@ -1421,8 +1430,9 @@ pub(crate) unsafe extern "C" fn c_access(
         "x_access",
         || ffi::SQLITE_IOERR_ACCESS,
         || {
-            // SAFETY: SQLite's call of `xAccess`, forwarded with its arguments.
-            unsafe { x_access(zname, flags, out) }
+            // SAFETY: SQLite's call of `xAccess`, forwarded with its arguments over `UNIX`, null or
+            // SQLite's "unix" VFS, which lives for the process.
+            unsafe { x_access(unix(), zname, flags, out) }
         },
     )
 }
@@ -1437,8 +1447,9 @@ pub(crate) unsafe extern "C" fn c_delete(
         "x_delete",
         || ffi::SQLITE_IOERR_DELETE,
         || {
-            // SAFETY: SQLite's call of `xDelete`, forwarded with its arguments.
-            unsafe { x_delete(zname, sync_dir) }
+            // SAFETY: SQLite's call of `xDelete`, forwarded with its arguments over `UNIX`, null or
+            // SQLite's "unix" VFS, which lives for the process.
+            unsafe { x_delete(unix(), zname, sync_dir) }
         },
     )
 }

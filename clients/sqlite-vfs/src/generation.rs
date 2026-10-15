@@ -4,8 +4,7 @@
 //! ```text
 //! <dir>/<label>-<hash32>/     the root: BLAKE3 of the canonical stream path, first 32 hex digits
 //!   lock                      flock, held with the binding
-//!   gen-<id32>/               the current generation: db, db-uwal, db-shm, log/, and db.init
-//!                             while an empty db is initialized
+//!   gen-<id32>/               the current generation: db, db-uwal, db-shm, log/
 //!   gen-<id32>.tmp/           a generation being built
 //!   gen-<id32>.trash/         a superseded generation being deleted
 //! ```
@@ -20,13 +19,18 @@
 //! `gen-<id32>.tmp`, fsynced, and published by one rename, and its first log segment names the
 //! generation directory it supersedes by id, so a crash that leaves two is finished at the next
 //! open ([`Root::finish_leftovers`]). A superseded generation is renamed to `gen-<id32>.trash`
-//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory.
+//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory. A
+//! generation is published with page 1 written and marked, the page 1 of an empty database when
+//! nothing was applied ([`marker::empty_page_one`]), so no published db file is ever empty or
+//! unmarked.
 
 use std::fs::File;
 use std::fs::{self};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::codec::marker;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
 use crate::codec::segment::scan;
@@ -41,9 +45,6 @@ const LOCK: &str = "lock";
 const GEN: &str = "gen-";
 const TMP: &str = ".tmp";
 const TRASH: &str = ".trash";
-/// The prefix of an empty db being initialized and its SQLite files (`db.init`, `db.init-wal`,
-/// `db.init-shm`, `db.init-journal`).
-const INIT: &str = "db.init";
 
 /// A stream URL's path spelled one way: every segment percent-decoded and encoded again one
 /// fixed way (a segment that does not decode to UTF-8 stays as it is), `.` and `..` resolved, no
@@ -193,7 +194,11 @@ pub(crate) enum GenerationError {
     },
     #[error("generation {}: no log segment", .dir.display())]
     NoSegment { dir: PathBuf },
-    #[error("{}: generations {ids:?}, none superseding the others", .root.display())]
+    #[error(
+        "{}: generations {}, none superseding the others",
+        .root.display(),
+        .ids.iter().map(GenId::hex).collect::<Vec<_>>().join(", ")
+    )]
     Ambiguous { root: PathBuf, ids: Vec<GenId> },
     #[error("{}: a generation of this id exists", .path.display())]
     Exists { path: PathBuf },
@@ -233,11 +238,6 @@ impl Generation {
     /// a WAL under SQLite's own name and a rollback journal.
     pub(crate) fn strays(&self) -> [PathBuf; 2] {
         [self.dir.join("db-wal"), self.dir.join("db-journal")]
-    }
-
-    /// Where an empty db is initialized before it is renamed over `db` (`host::init_empty`).
-    pub(crate) fn db_init(&self) -> PathBuf {
-        self.dir.join(INIT)
     }
 
     pub(crate) fn shm(&self) -> PathBuf {
@@ -362,8 +362,8 @@ impl Root {
         &self.dir
     }
 
-    /// Finishes what a crash left: deletes every `gen-*.tmp`, every generation another one's
-    /// first segment says it supersedes, and an empty db's initialization in the ones left.
+    /// Finishes what a crash left: deletes every `gen-*.tmp` and every generation another one's
+    /// first segment says it supersedes.
     pub(crate) fn finish_leftovers(&self) -> Result<(), GenerationError> {
         let mut removed = false;
         for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
@@ -402,9 +402,6 @@ impl Root {
             for g in gens.iter().filter(|g| superseded.contains(&g.id)) {
                 self.discard(g)?;
             }
-        }
-        for g in self.generations()? {
-            remove_init(&g.path)?;
         }
         Ok(())
     }
@@ -501,7 +498,8 @@ pub(crate) struct Building {
 }
 
 impl Building {
-    /// Publishes the generation: fsyncs the db, the log and the directory, renames it into place,
+    /// Publishes the generation: writes the page 1 of an empty database into a db file nothing was
+    /// applied to (design D7), fsyncs the db, the log and the directory, renames it into place,
     /// fsyncs the root, deletes the generation it supersedes and fsyncs the root again.
     pub(crate) fn publish(self) -> Result<Generation, GenerationError> {
         self.publish_steps(usize::MAX)
@@ -538,6 +536,13 @@ impl Building {
             match step {
                 Step::FsyncDb => {
                     let db_path = self.db_path();
+                    let len = self.db.metadata().map_err(io("stat", &db_path))?.len();
+                    if len == 0 {
+                        let page = marker::empty_page_one(self.lineage);
+                        self.db
+                            .write_all_at(page.as_slice(), 0)
+                            .map_err(io("write", &db_path))?;
+                    }
                     self.db.sync_all().map_err(io("fsync", &db_path))?;
                 }
                 Step::FsyncLog => self.log.sync()?,
@@ -587,29 +592,6 @@ impl Building {
     pub(crate) fn db_path(&self) -> PathBuf {
         self.tmp.join("db")
     }
-}
-
-/// Deletes what an empty db's initialization left in the generation directory `dir` (`db.init`
-/// and its SQLite files): a crash before its rename leaves the db empty, and the next bind
-/// initializes it again.
-fn remove_init(dir: &Path) -> Result<(), GenerationError> {
-    let mut removed = false;
-    for entry in fs::read_dir(dir).map_err(io("list", dir))? {
-        let entry = entry.map_err(io("list", dir))?;
-        let init = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(INIT));
-        if init {
-            let path = entry.path();
-            fs::remove_file(&path).map_err(io("remove", &path))?;
-            removed = true;
-        }
-    }
-    if removed {
-        sync_dir(dir).map_err(io("fsync", dir))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

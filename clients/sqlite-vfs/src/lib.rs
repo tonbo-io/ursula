@@ -15,10 +15,11 @@
 //!   host reopens through `ursula_open`, which takes a retiring binding back: a plain open of the
 //!   path is refused once the binding retired.
 //! * Outside the extension a database file is not a database: on disk its bytes 0..16 hold a
-//!   marker in place of SQLite's magic (the VFS translates them for a bound file), and its WAL is
-//!   `db-uwal`, a name SQLite never probes. SQLite in another process, a connection opened before
-//!   the extension loaded, `?vfs=unix` and the `sqlite3` shell fail with `SQLITE_NOTADB`, and
-//!   change no file.
+//!   marker in place of SQLite's magic (the VFS translates them for a bound file), from the moment
+//!   its generation is published, since a generation without a commit is published with the page
+//!   1 of an empty database. Its WAL is `db-uwal`, a name SQLite never probes. SQLite in another
+//!   process, a connection opened before the extension loaded, `?vfs=unix` and the `sqlite3` shell
+//!   fail with `SQLITE_NOTADB`, reads and writes alike, and change no file.
 //! * `SELECT ursula_synced(path, timeout_ms)` resolves once every commit logged before the call is
 //!   acknowledged and a round trip that started after it found this owner still the owner.
 //! * `SELECT ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions, resets.
