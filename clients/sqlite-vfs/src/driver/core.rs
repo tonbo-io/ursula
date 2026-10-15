@@ -1405,7 +1405,13 @@ impl Core {
             return;
         };
         drop(b.replicator.on(Event::Stop, now_ms));
-        if let Err(e) = b.write_ack(now_ms) {
+        // A clean retire leaves an ACK at the exact acknowledged position, fsynced: a cleanly
+        // closed log then holds no commit after its latest ACK but ones never acknowledged, so a
+        // history event that loses nothing re-keys it at the next open instead of salvaging.
+        let exact = b
+            .write_ack(now_ms)
+            .and_then(|()| b.with_log(|log| log.sync()));
+        if let Err(e) = exact {
             log::emit(Level::Warn, "ack_lost", &[
                 ("binding", &binding.0),
                 ("error", &e),
