@@ -86,6 +86,8 @@ use crate::db::Commit;
 use crate::db::LogRefused;
 use crate::db::Window;
 use crate::db::lookup;
+use crate::driver::Connected;
+use crate::driver::Holder;
 use crate::driver::runtime::driver;
 use crate::error::WriteRefusal;
 use crate::guard::contain;
@@ -191,9 +193,10 @@ fn uwal(name: &str, bound: impl FnOnce(&str) -> bool) -> Option<String> {
 }
 
 enum Role {
-    /// A main db handle: where its connection's commit stands, and whether it holds an EXCLUSIVE
-    /// file lock.
+    /// A main db handle: whose connection it is, where its commit stands, and whether it holds an
+    /// EXCLUSIVE file lock.
     Main {
+        holder: Holder,
         state: Cell<HandleState>,
         exclusive: Cell<bool>,
     },
@@ -347,24 +350,31 @@ unsafe fn x_open(
         log::emit(Level::Warn, "journal_refused", &[("file", &db)]);
         return ffi::SQLITE_CANTOPEN;
     }
+    let mut connected = None;
     let ext = match name {
         Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => match lookup(name) {
             Some(binding) => {
-                let connected = if PRIVATE.get() {
-                    binding.connect_private()
+                let holder = if PRIVATE.get() {
+                    Holder::Private
                 } else {
-                    binding.connect()
+                    Holder::Host
                 };
-                if !connected {
-                    log::emit(Level::Warn, "open_refused", &[
-                        ("file", &name),
-                        ("reason", &"its binding retired: ursula_open it again"),
-                    ]);
+                connected = binding.connect(holder);
+                if connected.is_none() {
+                    // The private connection is refused beside no connection of the host: the
+                    // snapshot attempt skips, nothing to report.
+                    if holder == Holder::Host {
+                        log::emit(Level::Warn, "open_refused", &[
+                            ("file", &name),
+                            ("reason", &"its binding retired: ursula_open it again"),
+                        ]);
+                    }
                     return ffi::SQLITE_CANTOPEN;
                 }
                 Some(Ext {
                     binding,
                     role: Role::Main {
+                        holder,
                         state: Cell::new(HandleState::Idle),
                         exclusive: Cell::new(false),
                     },
@@ -382,7 +392,11 @@ unsafe fn x_open(
         _ => None,
     };
     // Released when the open fails below, also when a panic unwinds through it.
-    let mut counted = Counted(ext.as_ref().map(|e| (Arc::clone(&e.binding), e.is_main())));
+    let mut counted = Counted(
+        ext.as_ref()
+            .zip(connected)
+            .map(|(e, connected)| (Arc::clone(&e.binding), connected)),
+    );
     // A bound db's WAL opens as `db-uwal`, under a name the file owns until it closes ("unix"
     // keeps it as its path). Without URI parameters: the WAL takes none of its own.
     let (zname, flags) = match (&ext, name) {
@@ -442,14 +456,15 @@ impl Ext {
     }
 }
 
-/// A main db handle counted by [`Binding::connect`] while `x_open` runs, uncounted when dropped
-/// before the open succeeded (a failed open, or a panic unwinding through it).
-struct Counted(Option<(Arc<Binding>, bool)>);
+/// A main db handle counted by [`Binding::connect`] while `x_open` runs, undone when dropped
+/// before the open succeeded (a failed open, or a panic unwinding through it): the binding goes
+/// back to where it stood, a hand-out the handle took up waiting again.
+struct Counted(Option<(Arc<Binding>, Connected)>);
 
 impl Drop for Counted {
     fn drop(&mut self) {
-        if let Some((binding, true)) = self.0.take() {
-            binding.disconnect();
+        if let Some((binding, connected)) = self.0.take() {
+            binding.unconnect(connected);
         }
     }
 }
@@ -518,7 +533,11 @@ unsafe fn take_ext(file: *mut ffi::sqlite3_file) -> Option<Box<Ext>> {
 fn closing(ext: &Ext, addr: usize) {
     let b = &ext.binding;
     match &ext.role {
-        Role::Main { state, exclusive } => {
+        Role::Main {
+            holder,
+            state,
+            exclusive,
+        } => {
             {
                 let mut c = b.lock();
                 let mut after = state.get();
@@ -533,7 +552,7 @@ fn closing(ext: &Ext, addr: usize) {
                     c.txn = None;
                 }
             }
-            b.disconnect();
+            b.disconnect(*holder);
         }
         Role::Wal => {
             let mut c = b.lock();

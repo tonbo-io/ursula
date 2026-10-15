@@ -41,7 +41,10 @@ export {
 
 /** {@link open}'s options: where the cache is, how to reach the stream, and node:sqlite's own settings. */
 export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnly"> {
-	/** The cache root, created when missing. By default `<user cache>/sqlite-ursula/0.8`. */
+	/**
+	 * The cache root, created when missing. By default (`undefined`) `<user cache>/sqlite-ursula/0.8`,
+	 * also when the stream is open in this process under another root.
+	 */
 	readonly dir?: string | undefined;
 	/** The bearer token requests carry. One per process in this release: the last open's applies. */
 	readonly token?: string | undefined;
@@ -79,6 +82,12 @@ const byAbort = new WeakSet<object>();
  * network. Concurrent opens share one bind and its outcome. Worker threads call `open` too. After a
  * reset, an open binds anew at once, beside the reset database's connections: it works on a copy of
  * their local cache, and only another process gets `in_use`.
+ *
+ * A stream is open under one cache root at a time in the process, and a missing `dir` names the
+ * default root, not the one it is open under. An open under another root waits for the database
+ * there to retire once its connections closed, and fails `bound_elsewhere` (`fix`) while it has
+ * connections open or an open of it that has not connected yet: close it first, or pass its
+ * `dir`.
  *
  * Returns a node:sqlite `DatabaseSync` (a subclass, {@link UrsulaDatabase}), which any library that
  * takes one takes. Statements are local: commit, then `await db.synced()` before anything outside the

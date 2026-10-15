@@ -23,12 +23,15 @@ use super::Bound;
 use super::DiskIo;
 use super::DriverEvent;
 use super::EventLog;
+use super::Holder;
 use super::Io;
+use super::Kept;
 use super::Life;
 use super::OpenId;
 use super::SyncError;
 use super::Ticket;
 use super::UNCONNECTED_MS;
+use super::Undone;
 use super::core::Core;
 use super::disk::DiskDone;
 use super::disk::DiskJob;
@@ -371,7 +374,7 @@ impl World {
     /// An open's binding, with a connection open on it as the VFS opens one.
     fn open(&mut self, core: usize, spec: OpenSpec) -> Bound {
         let bound = self.open_result(core, spec).unwrap();
-        assert!(bound.handle.connect());
+        assert!(bound.handle.connect(Holder::Host).is_some());
         bound
     }
 
@@ -458,7 +461,7 @@ impl World {
     /// The binding's connection closes: it drains, then retires.
     fn retire(&mut self, core: usize, bound: &Bound) {
         let now = self.now;
-        assert!(bound.handle.disconnect(), "the last connection");
+        assert!(bound.handle.disconnect(Holder::Host), "the last connection");
         let ios = self.c(core).retire(bound.binding, now);
         self.queue_ios(core, ios);
         self.run_for(1_000);
@@ -824,7 +827,7 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     w.commit(a, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    assert!(bound.handle.disconnect());
+    assert!(bound.handle.disconnect(Holder::Host));
     let ios = w.c(a).retire(bound.binding, now);
     w.queue_ios(a, ios);
     w.run_for(1_000);
@@ -851,7 +854,7 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     assert_eq!(w.stream_commits().last(), Some(&e1));
     // Its ACKs name the caught-up records, so the next open trusts the log again.
     let now = w.now;
-    assert!(bound.handle.disconnect());
+    assert!(bound.handle.disconnect(Holder::Host));
     let ios = w.c(a2).retire(bound.binding, now);
     w.queue_ios(a2, ios);
     w.run_for(1_000);
@@ -1895,7 +1898,7 @@ fn reopen_after(
     w.commit(c, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    assert!(bound.handle.disconnect());
+    assert!(bound.handle.disconnect(Holder::Host));
     let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
@@ -2410,7 +2413,7 @@ fn a_reopen_while_old_handles_live_builds_from_a_copy() {
         "the copy's last commit is the one carried"
     );
     // The old connection closes: its root and hold go, and the new binding still holds the root.
-    assert!(!reopened.handle.disconnect());
+    assert!(!reopened.handle.disconnect(Holder::Host));
     assert!(!reopened.handle.holds_root());
     let e = kind(w.open_result(c3, spec(dir.path(), 3)));
     assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
@@ -2500,18 +2503,21 @@ fn a_binding_taken_back_before_its_retire_stays_live() {
     let bound = w.open(c, spec(dir.path(), 1));
     let now = w.now;
     // Closed, then handed out again by an open before the retire arrives.
-    assert!(bound.handle.disconnect());
+    assert!(bound.handle.disconnect(Holder::Host));
     assert_eq!(bound.handle.life(), Life::Retiring);
     assert!(bound.handle.revive());
     let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
-    assert_eq!(bound.handle.life(), Life::Live);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
     assert!(bound.handle.holds_root());
     // Closed, then opened again by a connection before the retire arrives: the same.
-    assert!(bound.handle.connect());
-    assert!(bound.handle.disconnect(), "the last connection");
-    assert!(bound.handle.connect(), "a retiring binding is taken back");
+    assert!(bound.handle.connect(Holder::Host).is_some());
+    assert!(bound.handle.disconnect(Holder::Host), "the last connection");
+    assert!(
+        bound.handle.connect(Holder::Host).is_some(),
+        "a retiring binding is taken back"
+    );
     let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
@@ -2528,7 +2534,7 @@ fn a_binding_taken_back_before_its_retire_stays_live() {
     assert_eq!(bound.handle.life(), Life::Retired);
     assert!(!bound.handle.holds_root());
     assert!(
-        !bound.handle.connect(),
+        !bound.handle.connect(Holder::Host).is_some(),
         "a retired binding opens no connection"
     );
 }
@@ -2547,7 +2553,7 @@ fn a_binding_no_connection_opens_retires() {
     let now = w.now;
     w.c(c).unconnected(bound.binding, now);
     w.run_for(UNCONNECTED_MS / 2 + 1_000);
-    assert_eq!(bound.handle.life(), Life::Live);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 2 });
     w.run_for(UNCONNECTED_MS / 2);
     assert_eq!(bound.handle.life(), Life::Retired);
     assert!(!bound.handle.holds_root());
@@ -2556,6 +2562,281 @@ fn a_binding_no_connection_opens_retires() {
     let other = w.open(c2, spec(dir.path(), 2));
     w.run_for(2 * UNCONNECTED_MS);
     assert_eq!(other.handle.life(), Life::Live);
+}
+
+/// The driver hears that the binding's last connection closed, and runs a while.
+fn retire_asked(w: &mut World, c: usize, bound: &Bound) {
+    let now = w.now;
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+}
+
+// The host closes its last connection while a snapshot attempt holds the private one, and
+// `ursula_open` hands the binding out again before the attempt ends. The private connection's close
+// must not retire it: the path handed out stays openable until a connection opens it, or until it
+// waited `UNCONNECTED_MS` for one.
+#[test]
+fn a_hand_out_outlives_the_close_of_the_private_connection() {
+    for connects in [true, false] {
+        let dir = TempDir::new("driver-handout-private");
+        let mut w = World::new();
+        let c = w.core();
+        let bound = w.open(c, spec(dir.path(), 1));
+        assert!(bound.handle.connect(Holder::Private).is_some());
+        // The host's close: retiring, though the private connection keeps it from retiring.
+        assert!(bound.handle.disconnect(Holder::Host));
+        retire_asked(&mut w, c, &bound);
+        assert_eq!(bound.handle.life(), Life::Retiring);
+        // `ursula_open` hands it out again.
+        assert!(bound.handle.revive());
+        let now = w.now;
+        w.c(c).unconnected(bound.binding, now);
+        // The attempt ends.
+        assert!(!bound.handle.disconnect(Holder::Private));
+        retire_asked(&mut w, c, &bound);
+        assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
+        assert!(bound.handle.holds_root());
+        if connects {
+            assert!(
+                bound.handle.connect(Holder::Host).is_some(),
+                "the path handed out opens"
+            );
+            w.run_for(2 * UNCONNECTED_MS);
+            assert_eq!(bound.handle.life(), Life::Live);
+            w.retire(c, &bound);
+        } else {
+            w.run_for(UNCONNECTED_MS + 1_000);
+        }
+        assert_eq!(bound.handle.life(), Life::Retired);
+        assert!(!bound.handle.holds_root());
+    }
+}
+
+// A hand-out beside a connection of the host still open: that connection's close leaves the
+// binding to the hand-out's wait, after which the connections left keep it live.
+#[test]
+fn a_hand_out_beside_an_open_connection_waits_for_its_own() {
+    let dir = TempDir::new("driver-handout-beside");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    assert!(bound.handle.connect(Holder::Host).is_some());
+    assert!(bound.handle.revive());
+    let now = w.now;
+    w.c(c).unconnected(bound.binding, now);
+    assert!(!bound.handle.disconnect(Holder::Host));
+    w.run_for(UNCONNECTED_MS + 1_000);
+    assert_eq!(
+        (bound.handle.life(), bound.handle.connections()),
+        (Life::Live, 1)
+    );
+    w.retire(c, &bound);
+    assert_eq!(bound.handle.life(), Life::Retired);
+}
+
+// An open under another cache root gives a binding up only when nothing of the host holds it: no
+// connection of the host, no hand-out waiting for one, no commit unacknowledged. Given up, nothing
+// takes it back, and it retires once its private connection closed.
+#[test]
+fn a_binding_is_given_up_only_when_the_host_holds_none_of_it() {
+    let dir = TempDir::new("driver-give-up");
+    let mut w = World::new();
+    let c = w.core();
+    // Handed out, no connection yet.
+    let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
+    assert_eq!(bound.handle.give_up(), Err(Kept::HandedOut));
+    // A connection of the host open, and a private one.
+    assert!(bound.handle.connect(Holder::Host).is_some());
+    assert!(bound.handle.connect(Holder::Private).is_some());
+    assert_eq!(bound.handle.give_up(), Err(Kept::Connections(1)));
+    // A commit not acknowledged yet.
+    let pending = World::append(&bound, Box::new([1; 4096])).unwrap();
+    assert!(bound.handle.disconnect(Holder::Host));
+    let bytes = bound.handle.pending_bytes();
+    assert_eq!(bound.handle.give_up(), Err(Kept::Pending { bytes }));
+    w.logged(c, &bound, pending);
+    w.run_for(1_000);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    // Held by the private connection only: given up, and nothing takes it back.
+    assert_eq!(bound.handle.give_up(), Ok(()));
+    assert_eq!(bound.handle.life(), Life::GivenUp);
+    assert!(!bound.handle.revive());
+    assert!(bound.handle.connect(Holder::Host).is_none());
+    assert!(bound.handle.connect(Holder::Private).is_none());
+    retire_asked(&mut w, c, &bound);
+    assert_eq!(bound.handle.life(), Life::GivenUp);
+    assert!(bound.handle.disconnect(Holder::Private));
+    retire_asked(&mut w, c, &bound);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert!(!bound.handle.holds_root());
+    assert_eq!(
+        bound.handle.give_up(),
+        Ok(()),
+        "a retired binding is no hold"
+    );
+}
+
+/// Starts an open, leaving it to resolve.
+fn start_open(w: &mut World, c: usize, spec: OpenSpec) -> OpenId {
+    let now = w.now;
+    let open = OpenId(w.id());
+    let ios = w.c(c).open(open, spec, now);
+    w.queue_ios(c, ios);
+    open
+}
+
+// The open a binding was given up for waits, without blocking anyone, until the binding's
+// private connection closed and it retired, then binds under its own cache root.
+#[test]
+fn an_open_after_a_given_up_binding_starts_once_it_retired() {
+    let first = TempDir::new("driver-after-first");
+    let second = TempDir::new("driver-after-second");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(first.path(), 1));
+    assert!(bound.handle.connect(Holder::Private).is_some());
+    assert!(bound.handle.disconnect(Holder::Host));
+    assert_eq!(bound.handle.give_up(), Ok(()));
+    let open = start_open(&mut w, c, spec(second.path(), 1));
+    w.run_for(5_000);
+    assert!(
+        w.c(c).take_opened(open).is_none(),
+        "it waits for the binding"
+    );
+    assert!(bound.handle.disconnect(Holder::Private));
+    retire_asked(&mut w, c, &bound);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    let mut opened = None;
+    for _ in 0..100 {
+        opened = w.c(c).take_opened(open);
+        if opened.is_some() {
+            break;
+        }
+        w.run_for(100);
+    }
+    let again = opened.expect("the open never resolved").unwrap();
+    assert!(again.handle.generation.dir.starts_with(second.path()));
+    assert_eq!(again.handle.dir, second.path());
+    assert_eq!(again.handle.life(), Life::HandedOut { awaiting: 1 });
+}
+
+// One whose binding does not retire before its deadline fails `in_use`, naming both roots, and a
+// cancelled one fails `cancelled`; the binding stays given up either way.
+#[test]
+fn an_open_after_a_given_up_binding_ends_at_its_deadline_or_cancel() {
+    let first = TempDir::new("driver-after-late-first");
+    let second = TempDir::new("driver-after-late-second");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(first.path(), 1));
+    assert!(bound.handle.connect(Holder::Private).is_some());
+    assert!(bound.handle.disconnect(Holder::Host));
+    assert_eq!(bound.handle.give_up(), Ok(()));
+    let late = OpenSpec {
+        timeout_ms: 2_000,
+        ..spec(second.path(), 1)
+    };
+    let open = start_open(&mut w, c, late);
+    w.run_for(3_000);
+    let e = kind(w.c(c).take_opened(open).expect("resolved at its deadline"));
+    match &*e {
+        OpenError::BoundElsewhere {
+            bound: b,
+            requested,
+            kept: Kept::Draining,
+        } => {
+            assert_eq!(b, first.path());
+            assert_eq!(requested, second.path());
+        }
+        other => panic!("{other}"),
+    }
+    let open = start_open(&mut w, c, spec(second.path(), 1));
+    let now = w.now;
+    let ios = w.c(c).cancel(open, now);
+    w.queue_ios(c, ios);
+    let e = kind(w.c(c).take_opened(open).expect("resolved at its cancel"));
+    assert!(matches!(*e, OpenError::Cancelled), "{e}");
+    assert_eq!(bound.handle.life(), Life::GivenUp);
+    // A retry, under any root, waits for the binding too: never two bindings of the stream.
+    let third = TempDir::new("driver-after-late-third");
+    let retry = start_open(&mut w, c, spec(third.path(), 1));
+    w.run_for(5_000);
+    assert!(w.c(c).take_opened(retry).is_none(), "the retry waits");
+    assert!(bound.handle.disconnect(Holder::Private));
+    retire_asked(&mut w, c, &bound);
+    let mut opened = None;
+    for _ in 0..100 {
+        opened = w.c(c).take_opened(retry);
+        if opened.is_some() {
+            break;
+        }
+        w.run_for(100);
+    }
+    let again = opened.expect("the retry never resolved").unwrap();
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert_eq!(again.handle.dir, third.path());
+}
+
+// Two hand-outs before any connection: the first caller's connection opening and closing leaves
+// the second's path openable.
+#[test]
+fn every_hand_out_waits_for_its_own_connection() {
+    let dir = TempDir::new("driver-two-handouts");
+    let mut w = World::new();
+    let c = w.core();
+    // A's hand-out (the open's result), then B's.
+    let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
+    assert!(bound.handle.revive());
+    let now = w.now;
+    w.c(c).unconnected(bound.binding, now);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 2 });
+    // A connects and closes.
+    assert!(bound.handle.connect(Holder::Host).is_some());
+    assert!(!bound.handle.disconnect(Holder::Host));
+    retire_asked(&mut w, c, &bound);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
+    // B connects.
+    assert!(
+        bound.handle.connect(Holder::Host).is_some(),
+        "B's path opens"
+    );
+    assert_eq!(bound.handle.life(), Life::Live);
+    w.retire(c, &bound);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    // Hand-outs never taken up lapse with the wait.
+    let other = w.open_result(c, spec(dir.path(), 2)).unwrap();
+    assert!(other.handle.revive());
+    let now = w.now;
+    w.c(c).unconnected(other.binding, now);
+    w.run_for(UNCONNECTED_MS + 1_000);
+    assert_eq!(other.handle.life(), Life::Retired);
+}
+
+// An open of a main db handle that fails after its connection counted undoes it exactly: a
+// hand-out it took up waits again, and a binding it took back from retiring retires again.
+#[test]
+fn a_failed_open_undoes_its_connection() {
+    let dir = TempDir::new("driver-unconnect");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
+    let connected = bound.handle.connect(Holder::Host).unwrap();
+    assert_eq!(bound.handle.unconnect(connected), Undone::WaitsAgain);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
+    retire_asked(&mut w, c, &bound);
+    assert!(
+        bound.handle.connect(Holder::Host).is_some(),
+        "the hand-out still opens"
+    );
+    // Closed, retiring, then a connection whose open fails: retiring again, and it retires.
+    assert!(bound.handle.disconnect(Holder::Host));
+    let connected = bound.handle.connect(Holder::Host).unwrap();
+    assert_eq!(bound.handle.life(), Life::Live);
+    assert_eq!(bound.handle.unconnect(connected), Undone::Retires);
+    assert_eq!(bound.handle.life(), Life::Retiring);
+    retire_asked(&mut w, c, &bound);
+    assert_eq!(bound.handle.life(), Life::Retired);
 }
 
 // The runtime: an open cancelled after its result arrived, untaken, retires and unlocks its root,
@@ -2594,8 +2875,8 @@ fn a_cancelled_or_timed_out_open_whose_result_arrived_retires() {
         };
         // A result the wait took is the caller's: it closes its (only) connection.
         if let Some(Ok(bound)) = taken {
-            assert!(bound.handle.connect());
-            assert!(bound.handle.disconnect());
+            assert!(bound.handle.connect(Holder::Host).is_some());
+            assert!(bound.handle.disconnect(Holder::Host));
             driver.retire(bound.binding).unwrap();
         }
         // Whatever happened, the root comes free for the next open.
@@ -2614,8 +2895,8 @@ fn a_cancelled_or_timed_out_open_whose_result_arrived_retires() {
             }
         }
         let bound = next.unwrap_or_else(|| panic!("{wait:?}: the root stayed locked"));
-        assert!(bound.handle.connect());
-        assert!(bound.handle.disconnect());
+        assert!(bound.handle.connect(Holder::Host).is_some());
+        assert!(bound.handle.disconnect(Holder::Host));
         driver.retire(bound.binding).unwrap();
         drop(bound);
         // Wait for that one to unlock too before the next round.
@@ -2633,8 +2914,8 @@ fn bound_is_free(driver: &Driver, dir: &Path) -> bool {
     let open = driver.open(spec(dir, 3)).unwrap();
     match driver.wait_open(open, Duration::from_secs(10)) {
         Some(Ok(bound)) => {
-            assert!(bound.handle.connect());
-            assert!(bound.handle.disconnect());
+            assert!(bound.handle.connect(Holder::Host).is_some());
+            assert!(bound.handle.disconnect(Holder::Host));
             driver.retire(bound.binding).unwrap();
             let handle = bound.handle;
             for _ in 0..100 {
@@ -3058,7 +3339,7 @@ fn caught_up_after_the_ack(
     w.commit(c, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    assert!(bound.handle.disconnect());
+    assert!(bound.handle.disconnect(Holder::Host));
     let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
@@ -4093,7 +4374,7 @@ fn a_reset_provisional_binding_is_reopened_beside_its_connection_from_a_copy() {
         let stream = w.stream_commits();
         assert!(offline.iter().all(|f| !stream.contains(f)), "{kind:?}");
         drop(connection);
-        assert!(!bound.handle.disconnect());
+        assert!(!bound.handle.disconnect(Holder::Host));
         assert!(!bound.handle.holds_root());
     }
 }
@@ -4131,4 +4412,27 @@ fn a_reopen_beside_a_reset_provisional_binding_while_unreachable_is_provisional_
     let next = Epoch::try_from(own.get() + 1).unwrap();
     assert_eq!(claimed(&w, c), vec![own, next]);
     assert_eq!(w.stream_commits(), vec![first, x]);
+}
+
+// A hand-out a failed open gave back waits again from the start: the driver may have ended the
+// first wait in the moment the binding was live, and the binding still retires if nobody connects.
+#[test]
+fn a_hand_out_given_back_by_a_failed_open_waits_again() {
+    let dir = TempDir::new("driver-unconnect-wait");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
+    let connected = bound.handle.connect(Holder::Host).unwrap();
+    // A tick while it is live ends the hand-out's wait.
+    let now = w.now;
+    let ios = w.c(c).tick(now);
+    w.queue_ios(c, ios);
+    assert_eq!(bound.handle.unconnect(connected), Undone::WaitsAgain);
+    // What `Binding::unconnect` tells the driver.
+    w.c(c).unconnected(bound.binding, now);
+    w.run_for(UNCONNECTED_MS / 2);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
+    w.run_for(UNCONNECTED_MS / 2 + 1_000);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert!(!bound.handle.holds_root());
 }

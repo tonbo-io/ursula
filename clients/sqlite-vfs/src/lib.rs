@@ -10,10 +10,13 @@
 //!   default), materializes or builds its generation, takes the stream over and reconciles, and
 //!   returns `{done, path, name, state}`; connections then open `path` with plain SQLite. With
 //!   `timeout_ms` 0 it returns `{done: false, request}` at once, and `ursula_events` reports the
-//!   outcome. After the last connection closes, the binding drains and retires (one `ursula_open`
-//!   handed out retires too if no connection opens it within a minute), and its root unlocks. A
-//!   host reopens through `ursula_open`, which takes a retiring binding back: a plain open of the
-//!   path is refused once the binding retired.
+//!   outcome. After the last connection closes, the binding drains and retires, and its root
+//!   unlocks. A path `ursula_open` handed out stays openable until a connection opens it, or for a
+//!   minute. A host reopens through `ursula_open`, which takes a retiring binding back: a plain
+//!   open of the path is refused once the binding retired. A stream binds under one `dir` at a
+//!   time in the process: `ursula_open` under another one waits for a binding nothing of the host
+//!   holds to retire, and is refused `bound_elsewhere` otherwise (`in_use` when it has commits not
+//!   acknowledged, or does not retire in time).
 //! * Outside the extension a database file is not a database: on disk its bytes 0..16 hold a
 //!   marker in place of SQLite's magic (the VFS translates them for a bound file), from the moment
 //!   its generation is published, since a generation without a commit is published with the page
@@ -38,7 +41,8 @@
 //! Settings: `URSULA_VFS_TOKEN_FILE`, `URSULA_VFS_CA_FILE`, `URSULA_VFS_IDLE_MS`,
 //! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`. Test hooks:
 //! `URSULA_VFS_ABORT_AT=<step>[:<n>]` (`config::Step`), `URSULA_VFS_PANIC_IN=<entry>`,
-//! `URSULA_VFS_FAIL_SYNC=<path suffix>`, `URSULA_VFS_SNAPSHOT_DUE_BYTES=<bytes>`.
+//! `URSULA_VFS_FAIL_SYNC=<path suffix>`, `URSULA_VFS_SNAPSHOT_DUE_BYTES=<bytes>`,
+//! `URSULA_VFS_SNAPSHOT_HOLD=<dir>`.
 //!
 //! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves

@@ -74,6 +74,7 @@ use crate::codec::snapshot::read_image;
 use crate::codec::stream::FrameStream;
 use crate::codec::stream::StreamError;
 use crate::driver::Attach;
+use crate::driver::Kept;
 use crate::driver::disk::DiskDone;
 use crate::driver::disk::DiskJob;
 use crate::driver::disk::NewBuild;
@@ -255,6 +256,14 @@ pub(crate) enum OpenError {
     InvalidUrl(#[from] PathError),
     #[error("in_use: {}: another process, or another binding or open of the stream in this one, holds the stream's local files", .root.display())]
     InUse { root: PathBuf },
+    /// The stream is bound in this process under the cache root `bound`, and the host still holds
+    /// that binding: an open under `requested` would replicate the stream from two caches.
+    #[error("{}: the stream is open in this process under {}, not {}: {kept}", .kept.error_kind().as_str(), .bound.display(), .requested.display())]
+    BoundElsewhere {
+        bound: PathBuf,
+        requested: PathBuf,
+        kept: Kept,
+    },
     #[error("local_setup: {0}")]
     LocalSetup(#[source] LocalSetup),
     #[error("internal: {0}")]

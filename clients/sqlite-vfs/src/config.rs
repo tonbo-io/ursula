@@ -1,9 +1,12 @@
 //! Settings and test hooks read from the environment (`URSULA_VFS_*`), once per process.
 
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::log;
 use crate::log::Level;
@@ -241,4 +244,52 @@ pub(crate) fn fail_sync() -> Option<&'static str> {
 
 fn non_empty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Test hook `URSULA_VFS_SNAPSHOT_HOLD=<dir>`: a snapshot attempt that copied the database creates
+/// `<dir>/held` and keeps its private connection open until `<dir>/release` exists (30 s at most),
+/// and creates `<dir>/dropped` once it closed it. A test closes and reopens the database while the
+/// connection is open. Unset outside tests.
+#[derive(Debug)]
+pub(crate) struct SnapshotHold(Option<PathBuf>);
+
+impl SnapshotHold {
+    /// How long a hold waits for its release at most.
+    const MAX: Duration = Duration::from_secs(30);
+
+    /// Holds until the release, when the hook is set.
+    pub(crate) fn begin() -> Self {
+        static V: OnceLock<Option<PathBuf>> = OnceLock::new();
+        let Some(dir) = V
+            .get_or_init(|| non_empty("URSULA_VFS_SNAPSHOT_HOLD").map(PathBuf::from))
+            .clone()
+        else {
+            return Self(None);
+        };
+        hook_file(&dir.join("held"));
+        let release = dir.join("release");
+        let until = Instant::now().checked_add(Self::MAX);
+        while !release.exists() && until.is_some_and(|u| Instant::now() < u) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Self(Some(dir))
+    }
+}
+
+impl Drop for SnapshotHold {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            hook_file(&dir.join("dropped"));
+        }
+    }
+}
+
+/// Creates a test hook's signal file, logging a failure.
+fn hook_file(path: &Path) {
+    if let Err(e) = std::fs::write(path, b"") {
+        log::emit(Level::Warn, "test_hook_failed", &[
+            ("path", &path.display()),
+            ("error", &e),
+        ]);
+    }
 }

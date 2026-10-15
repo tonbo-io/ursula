@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::driver::Kept;
 use crate::driver::SyncError;
 use crate::driver::runtime::DriverGone;
 use crate::host::HostError;
@@ -54,6 +55,8 @@ pub(crate) enum ErrorKind {
     InvalidUrl,
     NotFound,
     InUse,
+    /// The stream is open in this process under another cache root, which the host holds.
+    BoundElsewhere,
     LocalSetup,
     StreamFormat,
     ServerTooOld,
@@ -83,6 +86,7 @@ impl ErrorKind {
             ErrorKind::InvalidUrl => "invalid_url",
             ErrorKind::NotFound => "not_found",
             ErrorKind::InUse => "in_use",
+            ErrorKind::BoundElsewhere => "bound_elsewhere",
             ErrorKind::LocalSetup => "local_setup",
             ErrorKind::StreamFormat => "stream_format",
             ErrorKind::ServerTooOld => "server_too_old",
@@ -125,7 +129,8 @@ impl ErrorKind {
             | ErrorKind::Unauthorized
             | ErrorKind::PaymentRequired
             | ErrorKind::Forbidden
-            | ErrorKind::NotBound => Action::Fix,
+            | ErrorKind::NotBound
+            | ErrorKind::BoundElsewhere => Action::Fix,
         }
     }
 }
@@ -148,6 +153,7 @@ impl OpenError {
         match self {
             OpenError::InvalidUrl(_) => ErrorKind::InvalidUrl,
             OpenError::InUse { .. } => ErrorKind::InUse,
+            OpenError::BoundElsewhere { kept, .. } => kept.error_kind(),
             OpenError::LocalSetup(_) => ErrorKind::LocalSetup,
             OpenError::Internal(_) | OpenError::Panicked => ErrorKind::Internal,
             OpenError::StreamFormat(_) => ErrorKind::StreamFormat,
@@ -171,6 +177,18 @@ impl OpenError {
             OpenError::GaveUp(_) => ErrorKind::Unavailable,
             OpenError::Reset(kind) => ErrorKind::Reset(*kind),
             OpenError::Cancelled => ErrorKind::Cancelled,
+        }
+    }
+}
+
+impl Kept {
+    /// The kind of an open refused for it: `bound_elsewhere` (`fix`: use the cache root the stream
+    /// is open under, or let go of it there first) while the host holds the binding, `in_use`
+    /// (`retry`) while it only drains.
+    pub(crate) fn error_kind(self) -> ErrorKind {
+        match self {
+            Kept::Connections(_) | Kept::HandedOut | Kept::Opening => ErrorKind::BoundElsewhere,
+            Kept::Pending { .. } | Kept::Draining => ErrorKind::InUse,
         }
     }
 }

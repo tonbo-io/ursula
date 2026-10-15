@@ -44,9 +44,9 @@ fn condition(c: &Condition) -> &'static str {
 fn state(reset: bool, life: Life, provisional: bool) -> &'static str {
     match (reset, life) {
         (true, _) => "reset",
-        (false, Life::Live) if provisional => "provisional",
-        (false, Life::Live) => "live",
-        (false, Life::Retiring) => "retiring",
+        (false, Life::HandedOut { .. } | Life::Live) if provisional => "provisional",
+        (false, Life::HandedOut { .. } | Life::Live) => "live",
+        (false, Life::Retiring | Life::GivenUp) => "retiring",
         (false, Life::Retired) => "retired",
     }
 }
@@ -358,10 +358,12 @@ mod tests {
     use std::time::Duration;
 
     use super::events_json;
+    use super::state;
     use super::stats_json;
     use super::synced_json;
     use crate::driver::BindingId;
     use crate::driver::DriverEvent;
+    use crate::driver::Life;
     use crate::driver::SyncError;
     use crate::driver::Ticket;
     use crate::ids::Position;
@@ -436,5 +438,17 @@ mod tests {
                 r#"{"event":"gap","dropped":2}]}"#
             )
         );
+    }
+
+    // A binding handed out and not connected yet is live, or provisional before its claim; one
+    // given up for another cache root retires.
+    #[test]
+    fn a_handed_out_binding_reports_live_or_provisional() {
+        let handed_out = Life::HandedOut { awaiting: 1 };
+        assert_eq!(state(false, handed_out, false), "live");
+        assert_eq!(state(false, handed_out, true), "provisional");
+        assert_eq!(state(false, Life::Live, true), "provisional");
+        assert_eq!(state(false, Life::GivenUp, false), "retiring");
+        assert_eq!(state(true, handed_out, true), "reset");
     }
 }
