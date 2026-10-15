@@ -10,8 +10,8 @@ use crate::error::HeaderError;
 use crate::fields;
 use crate::names;
 use crate::snapshot::SnapshotRef;
-use crate::value::render_decimal;
-use crate::value::render_offset;
+use crate::value::Incarnation;
+use crate::value::Offset;
 
 /// The contract version this crate implements (`Ursula-Protocol`). A server
 /// that sends none speaks version 1.
@@ -98,10 +98,7 @@ impl ServerIdentity {
 
     /// Emits `Ursula-Protocol` and `Ursula-Cluster-Id`.
     pub fn render(&self, mut emit: impl FnMut(&'static str, &str)) {
-        emit(
-            names::URSULA_PROTOCOL,
-            &render_decimal(u64::from(self.protocol)),
-        );
+        emit(names::URSULA_PROTOCOL, &self.protocol.to_string());
         emit(names::URSULA_CLUSTER_ID, self.cluster_id.as_str());
     }
 }
@@ -111,36 +108,135 @@ impl ServerIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inherited {
     /// The stream's token in the history the current one began from.
-    pub previous_incarnation: u64,
+    pub previous_incarnation: Incarnation,
     /// Bytes below this offset are the same under both tokens. It lies in
     /// the offset space of the previous token, so a client compares its own
     /// offsets with it by order.
-    pub offset: u64,
+    pub offset: Offset,
 }
 
 /// The stream metadata of a successful HEAD of a stream.
+///
+/// The fields keep the invariants a parse checks: the retained offset and
+/// the inherited offset are at most the tail, and the previous token is not
+/// the current one. [`StreamHead::new`] and the `with_*` methods enforce
+/// them, so every value renders headers that parse back to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamHead {
-    /// `Stream-Incarnation`.
-    pub incarnation: u64,
-    /// `Stream-Next-Offset`: the stream's tail.
-    pub next_offset: u64,
-    /// `Stream-Retained-Offset`: the earliest offset the stream retains.
-    pub retained_offset: u64,
-    /// `Stream-Closed`.
-    pub closed: bool,
-    /// The latest published snapshot, if any.
-    pub snapshot: Option<SnapshotRef>,
-    /// Present after a history event.
-    pub inherited: Option<Inherited>,
-    /// `Ursula-Max-Request-Bytes`, as lowered by the gateways in front.
-    pub max_request_bytes: u64,
-    /// `Ursula-Max-Snapshot-Bytes`: present when the server accepts
-    /// snapshots in parts.
-    pub max_snapshot_bytes: Option<u64>,
+    incarnation: Incarnation,
+    next_offset: Offset,
+    retained_offset: Offset,
+    closed: bool,
+    snapshot: Option<SnapshotRef>,
+    inherited: Option<Inherited>,
+    max_request_bytes: u64,
+    max_snapshot_bytes: Option<u64>,
 }
 
 impl StreamHead {
+    /// An open stream with no snapshot and no history event. The retained
+    /// offset must be at most the tail.
+    pub fn new(
+        incarnation: Incarnation,
+        next_offset: Offset,
+        retained_offset: Offset,
+        max_request_bytes: u64,
+    ) -> Result<Self, HeaderError> {
+        if retained_offset > next_offset {
+            return Err(HeaderError::RetainedPastNext {
+                retained: retained_offset,
+                next: next_offset,
+            });
+        }
+        Ok(Self {
+            incarnation,
+            next_offset,
+            retained_offset,
+            closed: false,
+            snapshot: None,
+            inherited: None,
+            max_request_bytes,
+            max_snapshot_bytes: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn with_closed(mut self, closed: bool) -> Self {
+        self.closed = closed;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_snapshot(mut self, snapshot: Option<SnapshotRef>) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_snapshot_bytes(mut self, max_snapshot_bytes: Option<u64>) -> Self {
+        self.max_snapshot_bytes = max_snapshot_bytes;
+        self
+    }
+
+    /// The history the stream began from. The inherited offset must be at
+    /// most the tail, and the previous token must differ from the current.
+    pub fn with_inherited(mut self, inherited: Option<Inherited>) -> Result<Self, HeaderError> {
+        if let Some(inherited) = inherited {
+            if inherited.offset > self.next_offset {
+                return Err(HeaderError::InheritedPastNext {
+                    inherited: inherited.offset,
+                    next: self.next_offset,
+                });
+            }
+            if inherited.previous_incarnation == self.incarnation {
+                return Err(HeaderError::PreviousIncarnationIsCurrent);
+            }
+        }
+        self.inherited = inherited;
+        Ok(self)
+    }
+
+    /// `Stream-Incarnation`.
+    pub const fn incarnation(&self) -> Incarnation {
+        self.incarnation
+    }
+
+    /// `Stream-Next-Offset`: the stream's tail.
+    pub const fn next_offset(&self) -> Offset {
+        self.next_offset
+    }
+
+    /// `Stream-Retained-Offset`: the earliest offset the stream retains.
+    pub const fn retained_offset(&self) -> Offset {
+        self.retained_offset
+    }
+
+    /// `Stream-Closed`.
+    pub const fn closed(&self) -> bool {
+        self.closed
+    }
+
+    /// The latest published snapshot, if any.
+    pub const fn snapshot(&self) -> Option<SnapshotRef> {
+        self.snapshot
+    }
+
+    /// Present after a history event.
+    pub const fn inherited(&self) -> Option<Inherited> {
+        self.inherited
+    }
+
+    /// `Ursula-Max-Request-Bytes`, as lowered by the gateways in front.
+    pub const fn max_request_bytes(&self) -> u64 {
+        self.max_request_bytes
+    }
+
+    /// `Ursula-Max-Snapshot-Bytes`: present when the server accepts
+    /// snapshots in parts.
+    pub const fn max_snapshot_bytes(&self) -> Option<u64> {
+        self.max_snapshot_bytes
+    }
+
     pub fn parse<'a, I>(headers: I) -> Result<Self, HeaderError>
     where I: IntoIterator<Item = (&'a str, &'a [u8])> {
         let [
@@ -169,7 +265,7 @@ impl StreamHead {
         let inherited = fields::pair(
             (
                 names::STREAM_PREVIOUS_INCARNATION,
-                fields::token(names::STREAM_PREVIOUS_INCARNATION, previous)?,
+                fields::incarnation(names::STREAM_PREVIOUS_INCARNATION, previous)?,
             ),
             (
                 names::STREAM_INHERITED_OFFSET,
@@ -180,37 +276,40 @@ impl StreamHead {
             previous_incarnation,
             offset,
         });
-        Ok(Self {
-            incarnation: fields::required(
+        Self::new(
+            fields::required(
                 names::STREAM_INCARNATION,
-                fields::token(names::STREAM_INCARNATION, incarnation)?,
+                fields::incarnation(names::STREAM_INCARNATION, incarnation)?,
             )?,
-            next_offset: fields::required(
+            fields::required(
                 names::STREAM_NEXT_OFFSET,
                 fields::offset(names::STREAM_NEXT_OFFSET, next)?,
             )?,
-            retained_offset: fields::required(
+            fields::required(
                 names::STREAM_RETAINED_OFFSET,
                 fields::offset(names::STREAM_RETAINED_OFFSET, retained)?,
             )?,
-            closed: fields::flag(names::STREAM_CLOSED, closed)?,
-            snapshot: SnapshotRef::from_fields(snapshot_offset, snapshot_digest)?,
-            inherited,
-            max_request_bytes: fields::required(
+            fields::required(
                 names::URSULA_MAX_REQUEST_BYTES,
                 fields::decimal(names::URSULA_MAX_REQUEST_BYTES, max_request)?,
             )?,
-            max_snapshot_bytes: fields::decimal(names::URSULA_MAX_SNAPSHOT_BYTES, max_snapshot)?,
-        })
+        )?
+        .with_closed(fields::flag(names::STREAM_CLOSED, closed)?)
+        .with_snapshot(SnapshotRef::from_fields(snapshot_offset, snapshot_digest)?)
+        .with_max_snapshot_bytes(fields::decimal(
+            names::URSULA_MAX_SNAPSHOT_BYTES,
+            max_snapshot,
+        )?)
+        .with_inherited(inherited)
     }
 
     /// Emits every header this value carries, as `(lowercase name, value)`.
     pub fn render(&self, mut emit: impl FnMut(&'static str, &str)) {
-        emit(names::STREAM_INCARNATION, &render_decimal(self.incarnation));
-        emit(names::STREAM_NEXT_OFFSET, &render_offset(self.next_offset));
+        emit(names::STREAM_INCARNATION, &self.incarnation.to_string());
+        emit(names::STREAM_NEXT_OFFSET, &self.next_offset.to_string());
         emit(
             names::STREAM_RETAINED_OFFSET,
-            &render_offset(self.retained_offset),
+            &self.retained_offset.to_string(),
         );
         if self.closed {
             emit(names::STREAM_CLOSED, "true");
@@ -221,21 +320,21 @@ impl StreamHead {
         if let Some(inherited) = &self.inherited {
             emit(
                 names::STREAM_PREVIOUS_INCARNATION,
-                &render_decimal(inherited.previous_incarnation),
+                &inherited.previous_incarnation.to_string(),
             );
             emit(
                 names::STREAM_INHERITED_OFFSET,
-                &render_offset(inherited.offset),
+                &inherited.offset.to_string(),
             );
         }
         emit(
             names::URSULA_MAX_REQUEST_BYTES,
-            &render_decimal(self.max_request_bytes),
+            &self.max_request_bytes.to_string(),
         );
         if let Some(max_snapshot_bytes) = self.max_snapshot_bytes {
             emit(
                 names::URSULA_MAX_SNAPSHOT_BYTES,
-                &render_decimal(max_snapshot_bytes),
+                &max_snapshot_bytes.to_string(),
             );
         }
     }
@@ -250,7 +349,17 @@ mod tests {
     use super::StreamHead;
     use crate::error::HeaderError;
     use crate::snapshot::SnapshotRef;
-    use crate::value::Digest;
+    use crate::value::Incarnation;
+    use crate::value::Offset;
+    use crate::value::SnapshotDigest;
+
+    fn token(value: u64) -> Incarnation {
+        Incarnation::try_from(value).unwrap()
+    }
+
+    fn offset(value: u64) -> Offset {
+        Offset::from_u64(value)
+    }
 
     type Pairs = Vec<(&'static str, String)>;
 
@@ -373,47 +482,105 @@ mod tests {
 
     fn every_head() -> Vec<StreamHead> {
         let snapshot = SnapshotRef {
-            offset: 4096,
-            digest: Digest::from_bytes([0x11; 32]),
+            offset: offset(4096),
+            digest: SnapshotDigest::from_bytes([0x11; 32]),
         };
         vec![
-            StreamHead {
-                incarnation: 4_503_599_627_370_497,
-                next_offset: 0,
-                retained_offset: 0,
-                closed: false,
-                snapshot: None,
-                inherited: None,
-                max_request_bytes: 33_554_432,
-                max_snapshot_bytes: None,
-            },
-            StreamHead {
-                incarnation: 9_007_199_254_740_991,
-                next_offset: 8192,
-                retained_offset: 4096,
-                closed: true,
-                snapshot: Some(snapshot),
-                inherited: Some(Inherited {
-                    previous_incarnation: 4_503_599_627_370_496,
-                    offset: 6000,
-                }),
-                max_request_bytes: 1_048_576,
-                max_snapshot_bytes: Some(1_073_741_824),
-            },
-            StreamHead {
-                incarnation: u64::MAX,
-                next_offset: u64::MAX,
-                retained_offset: u64::MAX,
-                closed: false,
-                snapshot: Some(snapshot),
-                inherited: Some(Inherited {
-                    previous_incarnation: u64::MAX,
-                    offset: u64::MAX,
-                }),
-                max_request_bytes: u64::MAX,
-                max_snapshot_bytes: Some(u64::MAX),
-            },
+            StreamHead::new(
+                token(4_503_599_627_370_497),
+                offset(0),
+                offset(0),
+                33_554_432,
+            )
+            .unwrap(),
+            StreamHead::new(
+                token(9_007_199_254_740_991),
+                offset(8192),
+                offset(4096),
+                1_048_576,
+            )
+            .unwrap()
+            .with_closed(true)
+            .with_snapshot(Some(snapshot))
+            .with_max_snapshot_bytes(Some(1_073_741_824))
+            .with_inherited(Some(Inherited {
+                previous_incarnation: token(4_503_599_627_370_496),
+                offset: offset(6000),
+            }))
+            .unwrap(),
+            StreamHead::new(token(1), offset(u64::MAX), offset(u64::MAX), u64::MAX)
+                .unwrap()
+                .with_snapshot(Some(snapshot))
+                .with_max_snapshot_bytes(Some(u64::MAX))
+                .with_inherited(Some(Inherited {
+                    previous_incarnation: token(2),
+                    offset: offset(u64::MAX),
+                }))
+                .unwrap(),
         ]
+    }
+
+    #[test]
+    fn heads_keep_their_invariants() {
+        assert_eq!(
+            StreamHead::new(token(1), offset(5), offset(6), 1),
+            Err(HeaderError::RetainedPastNext {
+                retained: offset(6),
+                next: offset(5)
+            })
+        );
+        let head = StreamHead::new(token(1), offset(5), offset(0), 1).unwrap();
+        assert_eq!(
+            head.with_inherited(Some(Inherited {
+                previous_incarnation: token(2),
+                offset: offset(6),
+            })),
+            Err(HeaderError::InheritedPastNext {
+                inherited: offset(6),
+                next: offset(5)
+            })
+        );
+        assert_eq!(
+            head.with_inherited(Some(Inherited {
+                previous_incarnation: token(1),
+                offset: offset(5),
+            })),
+            Err(HeaderError::PreviousIncarnationIsCurrent)
+        );
+        let full = || {
+            let mut pairs = Pairs::new();
+            every_head()[1].render(|name, value| pairs.push((name, value.to_owned())));
+            pairs
+        };
+        for (name, value, expected) in [
+            (
+                "stream-retained-offset",
+                "00000000000000008193",
+                HeaderError::RetainedPastNext {
+                    retained: offset(8193),
+                    next: offset(8192),
+                },
+            ),
+            (
+                "stream-inherited-offset",
+                "00000000000000008193",
+                HeaderError::InheritedPastNext {
+                    inherited: offset(8193),
+                    next: offset(8192),
+                },
+            ),
+            (
+                "stream-previous-incarnation",
+                "9007199254740991",
+                HeaderError::PreviousIncarnationIsCurrent,
+            ),
+        ] {
+            let pairs: Pairs = full()
+                .into_iter()
+                .map(|(key, old)| (key, if key == name { value.to_owned() } else { old }))
+                .collect();
+            assert_eq!(StreamHead::parse(iter(&pairs)), Err(expected), "{name}");
+        }
     }
 
     #[test]
@@ -516,6 +683,13 @@ mod tests {
             ),
             ("stream-closed", "false", HeaderError::InvalidFlag {
                 name: "stream-closed",
+            }),
+            ("stream-closed", "True", HeaderError::InvalidFlag {
+                name: "stream-closed",
+            }),
+            ("stream-incarnation", "0", HeaderError::OutOfRange {
+                name: "stream-incarnation",
+                value: 0,
             }),
         ] {
             let pairs: Pairs = full()

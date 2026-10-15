@@ -13,5 +13,9 @@ description = "Typed HTTP headers of the Ursula protocol, shared by the server a
 # depend on this crate by path, so it must not pull the server's dependencies.
 [dependencies]
 
+# Dev-dependencies of a path dependency do not reach its dependents.
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

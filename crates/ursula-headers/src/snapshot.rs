@@ -1,5 +1,7 @@
 //! Snapshot headers: the answers of a snapshot read and a snapshot publish,
-//! and the headers of a snapshot uploaded in parts (extensions Section 2.2).
+//! and a snapshot uploaded in parts: the staged part's id, the commit's
+//! headers and the commit body, the [`PartsManifest`] (extensions Section
+//! 2.2).
 
 use std::fmt;
 
@@ -7,9 +9,9 @@ use crate::error::HeaderError;
 use crate::fields;
 use crate::fields::Emit;
 use crate::names;
-use crate::value::Digest;
-use crate::value::render_decimal;
-use crate::value::render_offset;
+use crate::value::Incarnation;
+use crate::value::Offset;
+use crate::value::SnapshotDigest;
 
 /// The most parts one snapshot commit may list.
 pub const MAX_SNAPSHOT_PARTS: u32 = 4096;
@@ -21,8 +23,8 @@ pub const PART_ID_MAX_BYTES: usize = 64;
 /// `Stream-Snapshot-Digest`, which always travel together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotRef {
-    pub offset: u64,
-    pub digest: Digest,
+    pub offset: Offset,
+    pub digest: SnapshotDigest,
 }
 
 impl SnapshotRef {
@@ -38,27 +40,27 @@ impl SnapshotRef {
             ),
             (
                 names::STREAM_SNAPSHOT_DIGEST,
-                fields::digest(names::STREAM_SNAPSHOT_DIGEST, digest)?,
+                fields::parsed(names::STREAM_SNAPSHOT_DIGEST, digest, SnapshotDigest::parse)?,
             ),
         )?
         .map(|(offset, digest)| Self { offset, digest }))
     }
 
     pub(crate) fn render_into(&self, emit: &mut Emit<'_>) {
-        emit(names::STREAM_SNAPSHOT_OFFSET, &render_offset(self.offset));
+        emit(names::STREAM_SNAPSHOT_OFFSET, &self.offset.to_string());
         emit(names::STREAM_SNAPSHOT_DIGEST, &self.digest.to_string());
     }
 }
 
-/// The headers of a `200` snapshot read.
+/// The headers of a `200` snapshot read. Its `Stream-Next-Offset` is the
+/// snapshot's offset, where a reader continues with ordinary reads, so it
+/// is rendered from `snapshot.offset` and must equal it on parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotRead {
     /// The snapshot served.
     pub snapshot: SnapshotRef,
-    /// The stream's tail when the snapshot was served.
-    pub next_offset: u64,
     /// The token of the stream that served the snapshot.
-    pub incarnation: u64,
+    pub incarnation: Incarnation,
     /// `Stream-Up-To-Date`: the snapshot covers the whole stream.
     pub up_to_date: bool,
 }
@@ -73,18 +75,25 @@ impl SnapshotRead {
             names::STREAM_INCARNATION,
             names::STREAM_UP_TO_DATE,
         ])?;
+        let snapshot = fields::required(
+            names::STREAM_SNAPSHOT_OFFSET,
+            SnapshotRef::from_fields(offset, digest)?,
+        )?;
+        let next = fields::required(
+            names::STREAM_NEXT_OFFSET,
+            fields::offset(names::STREAM_NEXT_OFFSET, next)?,
+        )?;
+        if next != snapshot.offset {
+            return Err(HeaderError::SnapshotNextOffsetMismatch {
+                snapshot: snapshot.offset,
+                next,
+            });
+        }
         Ok(Self {
-            snapshot: fields::required(
-                names::STREAM_SNAPSHOT_OFFSET,
-                SnapshotRef::from_fields(offset, digest)?,
-            )?,
-            next_offset: fields::required(
-                names::STREAM_NEXT_OFFSET,
-                fields::offset(names::STREAM_NEXT_OFFSET, next)?,
-            )?,
+            snapshot,
             incarnation: fields::required(
                 names::STREAM_INCARNATION,
-                fields::token(names::STREAM_INCARNATION, incarnation)?,
+                fields::incarnation(names::STREAM_INCARNATION, incarnation)?,
             )?,
             up_to_date: fields::flag(names::STREAM_UP_TO_DATE, up_to_date)?,
         })
@@ -93,8 +102,8 @@ impl SnapshotRead {
     /// Emits every header of the read, as `(lowercase name, value)`.
     pub fn render(&self, mut emit: impl FnMut(&'static str, &str)) {
         self.snapshot.render_into(&mut emit);
-        emit(names::STREAM_NEXT_OFFSET, &render_offset(self.next_offset));
-        emit(names::STREAM_INCARNATION, &render_decimal(self.incarnation));
+        emit(names::STREAM_NEXT_OFFSET, &self.snapshot.offset.to_string());
+        emit(names::STREAM_INCARNATION, &self.incarnation.to_string());
         if self.up_to_date {
             emit(names::STREAM_UP_TO_DATE, "true");
         }
@@ -108,12 +117,11 @@ pub enum SnapshotPublishAnswer {
     /// earlier one.
     Published {
         snapshot: SnapshotRef,
-        incarnation: u64,
+        incarnation: Incarnation,
     },
     /// `409`: another snapshot at the same offset (a conflict), or a later
     /// one (the publish is superseded). `latest` is the stream's latest
-    /// snapshot; a client compares its offset with its own to tell the two
-    /// apart.
+    /// snapshot; [`SnapshotPublishAnswer::supersedes`] tells the two apart.
     Conflict { latest: SnapshotRef },
 }
 
@@ -125,6 +133,16 @@ impl SnapshotPublishAnswer {
         }
     }
 
+    /// Whether this is a `409` whose latest snapshot is later than the
+    /// published `offset`: the publish is superseded, not conflicting, and
+    /// the client has nothing to repair.
+    pub fn supersedes(&self, offset: Offset) -> bool {
+        match self {
+            Self::Published { .. } => false,
+            Self::Conflict { latest } => latest.offset > offset,
+        }
+    }
+
     /// Emits every header of the answer, as `(lowercase name, value)`.
     pub fn render(&self, mut emit: impl FnMut(&'static str, &str)) {
         match self {
@@ -133,7 +151,7 @@ impl SnapshotPublishAnswer {
                 incarnation,
             } => {
                 snapshot.render_into(&mut emit);
-                emit(names::STREAM_INCARNATION, &render_decimal(*incarnation));
+                emit(names::STREAM_INCARNATION, &incarnation.to_string());
             }
             Self::Conflict { latest } => latest.render_into(&mut emit),
         }
@@ -144,28 +162,25 @@ impl SnapshotPublishAnswer {
     /// rule refused.
     pub fn parse<'a, I>(status: u16, headers: I) -> Result<Option<Self>, HeaderError>
     where I: IntoIterator<Item = (&'a str, &'a [u8])> {
+        if !matches!(status, 204 | 409) {
+            return Ok(None);
+        }
         let [offset, digest, incarnation] = fields::collect(headers, [
             names::STREAM_SNAPSHOT_OFFSET,
             names::STREAM_SNAPSHOT_DIGEST,
             names::STREAM_INCARNATION,
         ])?;
-        match status {
-            204 => Ok(Some(Self::Published {
-                snapshot: fields::required(
-                    names::STREAM_SNAPSHOT_OFFSET,
-                    SnapshotRef::from_fields(offset, digest)?,
-                )?,
-                incarnation: fields::required(
-                    names::STREAM_INCARNATION,
-                    fields::token(names::STREAM_INCARNATION, incarnation)?,
-                )?,
-            })),
-            409 => {
-                Ok(SnapshotRef::from_fields(offset, digest)?
-                    .map(|latest| Self::Conflict { latest }))
-            }
-            _ => Ok(None),
+        let snapshot = SnapshotRef::from_fields(offset, digest)?;
+        if status == 409 {
+            return Ok(snapshot.map(|latest| Self::Conflict { latest }));
         }
+        Ok(Some(Self::Published {
+            snapshot: fields::required(names::STREAM_SNAPSHOT_OFFSET, snapshot)?,
+            incarnation: fields::required(
+                names::STREAM_INCARNATION,
+                fields::incarnation(names::STREAM_INCARNATION, incarnation)?,
+            )?,
+        }))
     }
 }
 
@@ -177,13 +192,16 @@ pub struct PartId(String);
 impl PartId {
     pub fn new(id: impl Into<String>) -> Result<Self, HeaderError> {
         let id = id.into();
-        if id.is_empty()
-            || id.len() > PART_ID_MAX_BYTES
-            || !id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
-        {
+        if !Self::valid(id.as_bytes()) {
             return Err(HeaderError::InvalidPartId);
         }
         Ok(Self(id))
+    }
+
+    fn valid(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes.len() <= PART_ID_MAX_BYTES
+            && bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
     }
 
     pub fn as_str(&self) -> &str {
@@ -223,13 +241,56 @@ impl PartStaged {
     }
 }
 
+/// The number of parts a commit lists: 1 to [`MAX_SNAPSHOT_PARTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PartCount(u32);
+
+impl PartCount {
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    fn checked(value: u64) -> Result<Self, HeaderError> {
+        u32::try_from(value)
+            .ok()
+            .filter(|count| (1..=MAX_SNAPSHOT_PARTS).contains(count))
+            .map(Self)
+            .ok_or(HeaderError::OutOfRange {
+                name: names::STREAM_SNAPSHOT_PARTS,
+                value,
+            })
+    }
+}
+
+impl TryFrom<u32> for PartCount {
+    type Error = HeaderError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::checked(u64::from(value))
+    }
+}
+
+impl TryFrom<usize> for PartCount {
+    type Error = HeaderError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Self::checked(u64::try_from(value).unwrap_or(u64::MAX))
+    }
+}
+
+impl fmt::Display for PartCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The headers of a parts commit, `PUT {stream}/snapshot/{offset}` whose body
-/// lists the part ids: how many parts, and the digest of the whole snapshot.
+/// is a [`PartsManifest`]: how many parts, and the digest of the whole
+/// snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartsCommit {
-    /// 1 to [`MAX_SNAPSHOT_PARTS`].
-    pub parts: u32,
-    pub digest: Digest,
+    pub parts: PartCount,
+    pub digest: SnapshotDigest,
 }
 
 impl PartsCommit {
@@ -244,38 +305,97 @@ impl PartsCommit {
         let Some(count) = fields::decimal(names::STREAM_SNAPSHOT_PARTS, parts)? else {
             return Ok(None);
         };
-        let parts = u32::try_from(count)
-            .ok()
-            .filter(|parts| (1..=MAX_SNAPSHOT_PARTS).contains(parts))
-            .ok_or(HeaderError::PartCountOutOfRange { count })?;
+        let parts = PartCount::checked(count)?;
         let digest = fields::required(
             names::STREAM_SNAPSHOT_DIGEST,
-            fields::digest(names::STREAM_SNAPSHOT_DIGEST, digest)?,
+            fields::parsed(names::STREAM_SNAPSHOT_DIGEST, digest, SnapshotDigest::parse)?,
         )?;
         Ok(Some(Self { parts, digest }))
     }
 
     /// Emits `Stream-Snapshot-Parts` and `Stream-Snapshot-Digest`.
     pub fn render(&self, mut emit: impl FnMut(&'static str, &str)) {
-        emit(
-            names::STREAM_SNAPSHOT_PARTS,
-            &render_decimal(u64::from(self.parts)),
-        );
+        emit(names::STREAM_SNAPSHOT_PARTS, &self.parts.to_string());
         emit(names::STREAM_SNAPSHOT_DIGEST, &self.digest.to_string());
+    }
+}
+
+/// The body of a parts commit: the part ids in snapshot order.
+///
+/// Grammar: `manifest = count( part-id LF )`, where `count` is the commit's
+/// `Stream-Snapshot-Parts` and `part-id` is a [`PartId`]. Every line ends
+/// with a single LF, the last one too; there is no CR, no empty line and
+/// nothing after the last LF. An id may repeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartsManifest(Vec<PartId>);
+
+impl PartsManifest {
+    /// 1 to [`MAX_SNAPSHOT_PARTS`] part ids.
+    pub fn new(parts: Vec<PartId>) -> Result<Self, HeaderError> {
+        PartCount::try_from(parts.len())?;
+        Ok(Self(parts))
+    }
+
+    pub fn parts(&self) -> &[PartId] {
+        &self.0
+    }
+
+    /// The `Stream-Snapshot-Parts` of the commit that carries this manifest.
+    pub fn count(&self) -> PartCount {
+        // `new` and `parse` keep the length within the range of a count.
+        PartCount(u32::try_from(self.0.len()).unwrap_or(MAX_SNAPSHOT_PARTS))
+    }
+
+    /// Parses a commit body that must list exactly `count` parts.
+    pub fn parse(count: PartCount, body: &[u8]) -> Result<Self, HeaderError> {
+        let Some(lines) = body.strip_suffix(b"\n") else {
+            return Err(HeaderError::ManifestUnterminated);
+        };
+        let mut parts = Vec::new();
+        for (index, line) in lines.split(|byte| *byte == b'\n').enumerate() {
+            if parts.len() >= count.0 as usize {
+                return Err(HeaderError::ManifestPartCount { declared: count });
+            }
+            let id = std::str::from_utf8(line)
+                .ok()
+                .filter(|id| PartId::valid(id.as_bytes()))
+                .ok_or(HeaderError::InvalidManifestLine {
+                    line: index.saturating_add(1),
+                })?;
+            parts.push(PartId(id.to_owned()));
+        }
+        if parts.len() != count.0 as usize {
+            return Err(HeaderError::ManifestPartCount { declared: count });
+        }
+        Ok(Self(parts))
+    }
+
+    /// The commit body: each id followed by LF.
+    pub fn render(&self) -> String {
+        let mut body = String::new();
+        for part in &self.0 {
+            body.push_str(part.as_str());
+            body.push('\n');
+        }
+        body
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::MAX_SNAPSHOT_PARTS;
+    use super::PartCount;
     use super::PartId;
     use super::PartStaged;
     use super::PartsCommit;
+    use super::PartsManifest;
     use super::SnapshotPublishAnswer;
     use super::SnapshotRead;
     use super::SnapshotRef;
     use crate::error::HeaderError;
-    use crate::value::Digest;
+    use crate::value::Incarnation;
+    use crate::value::Offset;
+    use crate::value::SnapshotDigest;
 
     type Pairs = Vec<(&'static str, String)>;
 
@@ -292,13 +412,21 @@ mod tests {
 
     fn snapshot() -> SnapshotRef {
         SnapshotRef {
-            offset: 4096,
-            digest: Digest::from_bytes([0x5a; 32]),
+            offset: Offset::from_u64(4096),
+            digest: SnapshotDigest::from_bytes([0x5a; 32]),
         }
     }
 
     fn hex() -> String {
-        Digest::from_bytes([0x5a; 32]).to_string()
+        SnapshotDigest::from_bytes([0x5a; 32]).to_string()
+    }
+
+    fn incarnation(value: u64) -> Incarnation {
+        Incarnation::try_from(value).unwrap()
+    }
+
+    fn count(value: u32) -> PartCount {
+        PartCount::try_from(value).unwrap()
     }
 
     #[test]
@@ -306,22 +434,21 @@ mod tests {
         for read in [
             SnapshotRead {
                 snapshot: snapshot(),
-                next_offset: 8192,
-                incarnation: 4_503_599_627_370_497,
+                incarnation: incarnation(4_503_599_627_370_497),
                 up_to_date: false,
             },
             SnapshotRead {
                 snapshot: SnapshotRef {
-                    offset: 0,
-                    digest: Digest::from_bytes([0; 32]),
+                    offset: Offset::from_u64(u64::MAX),
+                    digest: SnapshotDigest::from_bytes([0; 32]),
                 },
-                next_offset: u64::MAX,
-                incarnation: u64::MAX,
+                incarnation: incarnation(1),
                 up_to_date: true,
             },
         ] {
             let mut pairs = Pairs::new();
             read.render(|name, value| pairs.push((name, value.to_owned())));
+            assert!(pairs.contains(&("stream-next-offset", read.snapshot.offset.to_string())));
             assert_eq!(SnapshotRead::parse(iter(&pairs)), Ok(read), "{pairs:?}");
         }
     }
@@ -332,7 +459,7 @@ mod tests {
         let full = [
             ("stream-snapshot-offset", "00000000000000004096"),
             ("stream-snapshot-digest", hex.as_str()),
-            ("stream-next-offset", "00000000000000008192"),
+            ("stream-next-offset", "00000000000000004096"),
             ("stream-incarnation", "42"),
         ];
         for (index, expected) in [
@@ -356,6 +483,15 @@ mod tests {
             pairs.remove(index);
             assert_eq!(SnapshotRead::parse(iter(&pairs)), Err(expected));
         }
+        let mut pairs = pairs_of(&full);
+        pairs[2].1 = "00000000000000008192".to_owned();
+        assert_eq!(
+            SnapshotRead::parse(iter(&pairs)),
+            Err(HeaderError::SnapshotNextOffsetMismatch {
+                snapshot: Offset::from_u64(4096),
+                next: Offset::from_u64(8192)
+            })
+        );
         let mut pairs = pairs_of(&full);
         pairs[0].1 = "4096".to_owned();
         assert_eq!(
@@ -387,7 +523,7 @@ mod tests {
         for answer in [
             SnapshotPublishAnswer::Published {
                 snapshot: snapshot(),
-                incarnation: 7,
+                incarnation: incarnation(7),
             },
             SnapshotPublishAnswer::Conflict { latest: snapshot() },
         ] {
@@ -399,6 +535,18 @@ mod tests {
                 "{pairs:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_conflict_tells_superseded_from_conflicting() {
+        let conflict = SnapshotPublishAnswer::Conflict { latest: snapshot() };
+        assert!(conflict.supersedes(Offset::from_u64(4095)));
+        assert!(!conflict.supersedes(Offset::from_u64(4096)));
+        let published = SnapshotPublishAnswer::Published {
+            snapshot: snapshot(),
+            incarnation: incarnation(7),
+        };
+        assert!(!published.supersedes(Offset::ZERO));
     }
 
     #[test]
@@ -461,7 +609,7 @@ mod tests {
 
     #[test]
     fn malformed_part_ids_are_typed() {
-        for invalid in ["", "a b", "a\tb", &"x".repeat(65)] {
+        for invalid in ["", "a b", "a\tb", "a\r", &"x".repeat(65)] {
             assert_eq!(
                 PartId::new(invalid),
                 Err(HeaderError::InvalidPartId),
@@ -483,11 +631,26 @@ mod tests {
     }
 
     #[test]
+    fn part_counts_stay_in_range() {
+        assert_eq!(count(1).get(), 1);
+        assert_eq!(count(MAX_SNAPSHOT_PARTS).get(), MAX_SNAPSHOT_PARTS);
+        for value in [0, MAX_SNAPSHOT_PARTS + 1, u32::MAX] {
+            assert_eq!(
+                PartCount::try_from(value),
+                Err(HeaderError::OutOfRange {
+                    name: "stream-snapshot-parts",
+                    value: u64::from(value)
+                })
+            );
+        }
+    }
+
+    #[test]
     fn parts_commits_round_trip() {
         for parts in [1, 2, MAX_SNAPSHOT_PARTS] {
             let commit = PartsCommit {
-                parts,
-                digest: Digest::from_bytes([0xc3; 32]),
+                parts: count(parts),
+                digest: SnapshotDigest::from_bytes([0xc3; 32]),
             };
             let mut pairs = Pairs::new();
             commit.render(|name, value| pairs.push((name, value.to_owned())));
@@ -504,12 +667,14 @@ mod tests {
     #[test]
     fn malformed_parts_commits_are_typed() {
         let hex = hex();
+        let out_of_range = |value| HeaderError::OutOfRange {
+            name: "stream-snapshot-parts",
+            value,
+        };
         for (parts, expected) in [
-            ("0", HeaderError::PartCountOutOfRange { count: 0 }),
-            ("4097", HeaderError::PartCountOutOfRange { count: 4097 }),
-            ("4294967296", HeaderError::PartCountOutOfRange {
-                count: 4_294_967_296,
-            }),
+            ("0", out_of_range(0)),
+            ("4097", out_of_range(4097)),
+            ("4294967296", out_of_range(4_294_967_296)),
             ("02", HeaderError::NonCanonicalInteger {
                 name: "stream-snapshot-parts",
             }),
@@ -532,5 +697,78 @@ mod tests {
                 name: "stream-snapshot-digest"
             })
         );
+    }
+
+    #[test]
+    fn manifests_round_trip() {
+        let ids = |ids: &[&str]| -> Vec<PartId> {
+            ids.iter().map(|id| PartId::new(*id).unwrap()).collect()
+        };
+        for parts in [
+            ids(&["p"]),
+            ids(&["a", "b", "a"]),
+            ids(&[&"x".repeat(64), "~!"]),
+            (0..MAX_SNAPSHOT_PARTS)
+                .map(|index| PartId::new(format!("part-{index}")).unwrap())
+                .collect(),
+        ] {
+            let manifest = PartsManifest::new(parts.clone()).unwrap();
+            assert_eq!(manifest.parts(), parts.as_slice());
+            let body = manifest.render();
+            assert!(body.ends_with('\n') && !body.contains('\r'));
+            assert_eq!(
+                PartsManifest::parse(manifest.count(), body.as_bytes()),
+                Ok(manifest)
+            );
+        }
+        assert_eq!(
+            PartsManifest::new(ids(&["a", "b"])).unwrap().render(),
+            "a\nb\n"
+        );
+    }
+
+    #[test]
+    fn malformed_manifests_are_typed() {
+        assert_eq!(
+            PartsManifest::new(Vec::new()),
+            Err(HeaderError::OutOfRange {
+                name: "stream-snapshot-parts",
+                value: 0
+            })
+        );
+        let too_many = vec![PartId::new("p").unwrap(); 4097];
+        assert_eq!(
+            PartsManifest::new(too_many),
+            Err(HeaderError::OutOfRange {
+                name: "stream-snapshot-parts",
+                value: 4097
+            })
+        );
+        for (declared, body, expected) in [
+            (2, &b"a\nb"[..], HeaderError::ManifestUnterminated),
+            (1, b"", HeaderError::ManifestUnterminated),
+            (1, b"\n", HeaderError::InvalidManifestLine { line: 1 }),
+            (2, b"a\n\n", HeaderError::InvalidManifestLine { line: 2 }),
+            (2, b"a\r\nb\r\n", HeaderError::InvalidManifestLine {
+                line: 1,
+            }),
+            (2, b"a\nb c\n", HeaderError::InvalidManifestLine { line: 2 }),
+            (1, b"\xff\n", HeaderError::InvalidManifestLine { line: 1 }),
+            (2, b"a\n", HeaderError::ManifestPartCount {
+                declared: count(2),
+            }),
+            (1, b"a\nb\n", HeaderError::ManifestPartCount {
+                declared: count(1),
+            }),
+            (1, b"a\n\n", HeaderError::ManifestPartCount {
+                declared: count(1),
+            }),
+        ] {
+            assert_eq!(
+                PartsManifest::parse(count(declared), body),
+                Err(expected),
+                "{body:?}"
+            );
+        }
     }
 }

@@ -4,7 +4,6 @@
 use crate::error::HeaderError;
 use crate::fields;
 use crate::names;
-use crate::value::render_decimal;
 
 /// The limit a `413 Payload Too Large` applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +55,7 @@ impl SizeLimit {
 
     /// Emits the header that names the limit.
     pub fn render(self, mut emit: impl FnMut(&'static str, &str)) {
-        emit(self.header_name(), &render_decimal(self.bytes()));
+        emit(self.header_name(), &self.bytes().to_string());
     }
 }
 

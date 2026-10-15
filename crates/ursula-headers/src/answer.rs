@@ -3,14 +3,20 @@
 //! Each answer keeps the base protocol's status code; the typed detail
 //! travels in added headers. A `403` without `Producer-Epoch` comes from an
 //! authorizer, not from the producer rules, and is not a producer answer.
+//!
+//! A client that sent the producer headers and gets a `200` or `204` that
+//! [`ProducerAnswer::parse`] reads as `Ok(None)` (no producer header at all)
+//! got an answer from a server or layer that does not speak write keys; it
+//! treats that as a protocol violation, not as a receipt.
 
 use crate::error::HeaderError;
 use crate::fields;
 use crate::fields::Emit;
 use crate::names;
-use crate::value::parse_producer_integer;
-use crate::value::render_decimal;
-use crate::value::render_offset;
+use crate::value::Epoch;
+use crate::value::Incarnation;
+use crate::value::Offset;
+use crate::value::Seq;
 
 /// Whether a receipt reports a write applied by this request or a repeat of
 /// the producer's newest write.
@@ -23,21 +29,97 @@ pub enum Delivery {
 }
 
 /// The range a write occupies: `Stream-Offset`, `Stream-Next-Offset` and
-/// `Stream-Closed`.
+/// `Stream-Closed`. `start` is at most `next`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Receipt {
-    pub start: u64,
-    pub next: u64,
+    start: Offset,
+    next: Offset,
+    closes_stream: bool,
+}
+
+impl Receipt {
+    /// [`HeaderError::ReceiptRangeInverted`] when `start` is above `next`.
+    pub fn new(start: Offset, next: Offset, closes_stream: bool) -> Result<Self, HeaderError> {
+        if start > next {
+            return Err(HeaderError::ReceiptRangeInverted { start, next });
+        }
+        Ok(Self {
+            start,
+            next,
+            closes_stream,
+        })
+    }
+
+    /// Where the write's bytes start.
+    pub const fn start(&self) -> Offset {
+        self.start
+    }
+
+    /// Where the write's bytes end.
+    pub const fn next(&self) -> Offset {
+        self.next
+    }
+
     /// The write closed the stream.
-    pub closed: bool,
+    pub const fn closes_stream(&self) -> bool {
+        self.closes_stream
+    }
 }
 
 /// An epoch that a claim or a history event closed, with its last applied
 /// seq: every seq at or below `seq` applied, and no seq above it ever will.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosedEpoch {
-    pub epoch: u64,
-    pub seq: u64,
+    pub epoch: Epoch,
+    pub seq: Seq,
+}
+
+/// The producer's current epoch on an answer about an applied write, and
+/// the earlier epoch the claim of it closed, if any. The closed epoch is
+/// below the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentEpoch {
+    epoch: Epoch,
+    closed_epoch: Option<ClosedEpoch>,
+}
+
+impl CurrentEpoch {
+    /// An epoch whose claim closed no other.
+    pub const fn new(epoch: Epoch) -> Self {
+        Self {
+            epoch,
+            closed_epoch: None,
+        }
+    }
+
+    /// An epoch whose claim closed `closed_epoch`, which must be earlier.
+    pub fn closing(epoch: Epoch, closed_epoch: ClosedEpoch) -> Result<Self, HeaderError> {
+        if closed_epoch.epoch >= epoch {
+            return Err(HeaderError::ClosedEpochNotEarlier {
+                epoch,
+                closed: closed_epoch.epoch,
+            });
+        }
+        Ok(Self {
+            epoch,
+            closed_epoch: Some(closed_epoch),
+        })
+    }
+
+    fn from_parts(epoch: Epoch, closed_epoch: Option<ClosedEpoch>) -> Result<Self, HeaderError> {
+        match closed_epoch {
+            None => Ok(Self::new(epoch)),
+            Some(closed_epoch) => Self::closing(epoch, closed_epoch),
+        }
+    }
+
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    pub const fn closed_epoch(&self) -> Option<ClosedEpoch> {
+        self.closed_epoch
+    }
 }
 
 /// What closed an epoch, the `by` parameter of `epoch-closed`.
@@ -47,6 +129,66 @@ pub enum ClosedBy {
     Claim,
     /// A restore or an accepted loss rewrote the stream's history.
     History,
+}
+
+/// The detail of a `403 epoch-closed`: the producer's current epoch and the
+/// epoch that is closed. A claim closes an earlier epoch; a history event
+/// closes the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochClosure {
+    by: ClosedBy,
+    epoch: Epoch,
+    closed_epoch: ClosedEpoch,
+}
+
+impl EpochClosure {
+    /// `closed_epoch` was closed by the claim of `epoch`, which is later.
+    pub fn by_claim(epoch: Epoch, closed_epoch: ClosedEpoch) -> Result<Self, HeaderError> {
+        let current = CurrentEpoch::closing(epoch, closed_epoch)?;
+        Ok(Self {
+            by: ClosedBy::Claim,
+            epoch: current.epoch,
+            closed_epoch,
+        })
+    }
+
+    /// A history event closed the producer's current epoch.
+    pub const fn by_history(closed_epoch: ClosedEpoch) -> Self {
+        Self {
+            by: ClosedBy::History,
+            epoch: closed_epoch.epoch,
+            closed_epoch,
+        }
+    }
+
+    pub const fn by(&self) -> ClosedBy {
+        self.by
+    }
+
+    /// The producer's current epoch (`Producer-Epoch`).
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// The closed epoch and its last applied seq (`Producer-Closed-*`).
+    pub const fn closed_epoch(&self) -> ClosedEpoch {
+        self.closed_epoch
+    }
+
+    fn from_parts(
+        by: ClosedBy,
+        epoch: Epoch,
+        closed_epoch: ClosedEpoch,
+    ) -> Result<Self, HeaderError> {
+        match by {
+            ClosedBy::Claim => Self::by_claim(epoch, closed_epoch),
+            ClosedBy::History if closed_epoch.epoch == epoch => Ok(Self::by_history(closed_epoch)),
+            ClosedBy::History => Err(HeaderError::HistoryClosedOtherEpoch {
+                epoch,
+                closed: closed_epoch.epoch,
+            }),
+        }
+    }
 }
 
 /// The value of `Producer-Outcome`.
@@ -104,44 +246,37 @@ impl Outcome {
 pub enum ProducerAnswer {
     /// `200` or `204`: the write applied. `seq` is the epoch's highest
     /// applied seq, and `receipt` describes the request's own write. A claim
-    /// that closed an earlier epoch names it in `closed`, on every repeat too.
+    /// that closed an earlier epoch names it in `epoch`, on every repeat too.
     Receipt {
         delivery: Delivery,
-        epoch: u64,
-        seq: u64,
+        epoch: CurrentEpoch,
+        seq: Seq,
         receipt: Receipt,
-        closed: Option<ClosedEpoch>,
-        incarnation: Option<u64>,
+        incarnation: Incarnation,
     },
     /// `204 receipt-evicted`: a write under this key applied; the server
     /// keeps no range for it. `seq` is the epoch's highest applied seq.
     ReceiptEvicted {
-        epoch: u64,
-        seq: u64,
-        closed: Option<ClosedEpoch>,
-        incarnation: Option<u64>,
+        epoch: CurrentEpoch,
+        seq: Seq,
+        incarnation: Incarnation,
     },
-    /// `403 epoch-closed`: `closed` is closed. `epoch` is the producer's
-    /// current epoch.
-    EpochClosed {
-        by: ClosedBy,
-        epoch: u64,
-        closed: ClosedEpoch,
-    },
+    /// `403 epoch-closed`: an epoch of the producer is closed.
+    EpochClosed(EpochClosure),
     /// `403 key-conflict`: the key holds a write with another identity. This
     /// write did not apply and never will under this key.
-    KeyConflict { epoch: u64 },
+    KeyConflict { epoch: Epoch },
     /// `403 producer-expired`: the server keeps no memory of the write's
     /// epoch. `epoch` is the producer's current epoch, or the stream's epoch
     /// floor.
-    ProducerExpired { epoch: u64 },
+    ProducerExpired { epoch: Epoch },
     /// `403 stale-epoch`: the write's epoch is below the producer's current
     /// epoch `epoch` (the base protocol's stale epoch). Every producer `403`
     /// names its outcome, so a `403` without one is not a producer answer.
-    StaleEpoch { epoch: u64 },
+    StaleEpoch { epoch: Epoch },
     /// `409`: the epoch expects `expected` next; the request carried
     /// `received`.
-    SeqGap { expected: u64, received: u64 },
+    SeqGap { expected: Seq, received: Seq },
     /// `400`: a seq above 0 of an epoch above the producer's, which is not
     /// claimed yet. `Producer-Expected-Seq: 0`.
     EpochNotClaimed,
@@ -159,7 +294,7 @@ impl ProducerAnswer {
                 ..
             }
             | Self::ReceiptEvicted { .. } => 204,
-            Self::EpochClosed { .. }
+            Self::EpochClosed(_)
             | Self::KeyConflict { .. }
             | Self::ProducerExpired { .. }
             | Self::StaleEpoch { .. } => 403,
@@ -177,56 +312,64 @@ impl ProducerAnswer {
                 epoch,
                 seq,
                 receipt,
-                closed,
                 incarnation,
             } => {
-                render_progress(emit, *epoch, *seq, *closed, *incarnation);
-                emit(names::STREAM_OFFSET, &render_offset(receipt.start));
-                emit(names::STREAM_NEXT_OFFSET, &render_offset(receipt.next));
-                if receipt.closed {
+                render_progress(emit, *epoch, *seq, *incarnation);
+                emit(names::STREAM_OFFSET, &receipt.start.to_string());
+                emit(names::STREAM_NEXT_OFFSET, &receipt.next.to_string());
+                if receipt.closes_stream {
                     emit(names::STREAM_CLOSED, "true");
                 }
             }
             Self::ReceiptEvicted {
                 epoch,
                 seq,
-                closed,
                 incarnation,
             } => {
-                render_progress(emit, *epoch, *seq, *closed, *incarnation);
+                render_progress(emit, *epoch, *seq, *incarnation);
                 emit(names::PRODUCER_OUTCOME, Outcome::ReceiptEvicted.as_str());
             }
-            Self::EpochClosed { by, epoch, closed } => {
-                integer(emit, names::PRODUCER_EPOCH, *epoch);
-                render_closed(emit, Some(*closed));
-                emit(names::PRODUCER_OUTCOME, Outcome::EpochClosed(*by).as_str());
+            Self::EpochClosed(closure) => {
+                emit(names::PRODUCER_EPOCH, &closure.epoch.to_string());
+                render_closed(emit, closure.closed_epoch);
+                emit(
+                    names::PRODUCER_OUTCOME,
+                    Outcome::EpochClosed(closure.by).as_str(),
+                );
             }
             Self::KeyConflict { epoch } => {
-                integer(emit, names::PRODUCER_EPOCH, *epoch);
+                emit(names::PRODUCER_EPOCH, &epoch.to_string());
                 emit(names::PRODUCER_OUTCOME, Outcome::KeyConflict.as_str());
             }
             Self::ProducerExpired { epoch } => {
-                integer(emit, names::PRODUCER_EPOCH, *epoch);
+                emit(names::PRODUCER_EPOCH, &epoch.to_string());
                 emit(names::PRODUCER_OUTCOME, Outcome::ProducerExpired.as_str());
             }
             Self::StaleEpoch { epoch } => {
-                integer(emit, names::PRODUCER_EPOCH, *epoch);
+                emit(names::PRODUCER_EPOCH, &epoch.to_string());
                 emit(names::PRODUCER_OUTCOME, Outcome::StaleEpoch.as_str());
             }
             Self::SeqGap { expected, received } => {
-                integer(emit, names::PRODUCER_EXPECTED_SEQ, *expected);
-                integer(emit, names::PRODUCER_RECEIVED_SEQ, *received);
+                emit(names::PRODUCER_EXPECTED_SEQ, &expected.to_string());
+                emit(names::PRODUCER_RECEIVED_SEQ, &received.to_string());
             }
-            Self::EpochNotClaimed => integer(emit, names::PRODUCER_EXPECTED_SEQ, 0),
+            Self::EpochNotClaimed => emit(names::PRODUCER_EXPECTED_SEQ, &Seq::ZERO.to_string()),
         }
     }
 
     /// Parses an answer from its status and `(name, value)` header pairs.
     /// `Ok(None)` when the response is not a producer answer: a write without
     /// a key, an authorizer's `403`, a conflict of another rule, or any other
-    /// status.
+    /// status. Only the headers the status uses are parsed, so a stray
+    /// producer header on a `503` or a `412` is not an error.
+    ///
+    /// Answers come only from Ursula, so their integers are canonical
+    /// decimal.
     pub fn parse<'a, I>(status: u16, headers: I) -> Result<Option<Self>, HeaderError>
     where I: IntoIterator<Item = (&'a str, &'a [u8])> {
+        if !matches!(status, 200 | 204 | 400 | 403 | 409) {
+            return Ok(None);
+        }
         let [
             epoch,
             seq,
@@ -252,166 +395,160 @@ impl ProducerAnswer {
             names::STREAM_CLOSED,
             names::STREAM_INCARNATION,
         ])?;
-        let producer_integer = |name, value| fields::parsed(name, value, parse_producer_integer);
-        let epoch = producer_integer(names::PRODUCER_EPOCH, epoch)?;
-        let expected = producer_integer(names::PRODUCER_EXPECTED_SEQ, expected)?;
+        let seq_field = |name, value| fields::parsed(name, value, Seq::parse);
+        match status {
+            409 => {
+                let Some(expected) = seq_field(names::PRODUCER_EXPECTED_SEQ, expected)? else {
+                    return Ok(None);
+                };
+                let received = fields::required(
+                    names::PRODUCER_RECEIVED_SEQ,
+                    seq_field(names::PRODUCER_RECEIVED_SEQ, received)?,
+                )?;
+                return Ok(Some(Self::SeqGap { expected, received }));
+            }
+            400 => {
+                return match seq_field(names::PRODUCER_EXPECTED_SEQ, expected)? {
+                    None => Ok(None),
+                    Some(Seq::ZERO) => Ok(Some(Self::EpochNotClaimed)),
+                    Some(expected) => Err(HeaderError::UnexpectedExpectedSeq { expected }),
+                };
+            }
+            _ => {}
+        }
+        // A 200, 204 or 403 that carries any producer header is a producer
+        // answer, so it must name the epoch: one without is malformed, never
+        // a plain success or an authorizer's refusal.
+        let Some(epoch) = fields::parsed(names::PRODUCER_EPOCH, epoch, Epoch::parse)? else {
+            let producer_answer = seq.is_some()
+                || outcome.is_some()
+                || closed_epoch.is_some()
+                || closed_seq.is_some();
+            return if producer_answer {
+                Err(HeaderError::Missing {
+                    name: names::PRODUCER_EPOCH,
+                })
+            } else {
+                Ok(None)
+            };
+        };
         let outcome = fields::text(names::PRODUCER_OUTCOME, outcome)?
             .map(Outcome::parse)
             .transpose()?;
         let closed = fields::pair(
             (
                 names::PRODUCER_CLOSED_EPOCH,
-                producer_integer(names::PRODUCER_CLOSED_EPOCH, closed_epoch)?,
+                fields::parsed(names::PRODUCER_CLOSED_EPOCH, closed_epoch, Epoch::parse)?,
             ),
             (
                 names::PRODUCER_CLOSED_SEQ,
-                producer_integer(names::PRODUCER_CLOSED_SEQ, closed_seq)?,
+                seq_field(names::PRODUCER_CLOSED_SEQ, closed_seq)?,
             ),
         )?
         .map(|(epoch, seq)| ClosedEpoch { epoch, seq });
-        let required = fields::required;
-        // A response that carries any producer header is a producer answer,
-        // so it must name the epoch: one without is malformed, never a plain
-        // success or an authorizer's refusal.
-        let producer_answer =
-            seq.is_some() || outcome.is_some() || closed_epoch.is_some() || closed_seq.is_some();
-        let unkeyed = || {
-            if producer_answer {
-                Err(HeaderError::Missing {
-                    name: names::PRODUCER_EPOCH,
-                })
-            } else {
-                Ok(None)
-            }
-        };
-        match status {
-            200 | 204 => {
-                let Some(epoch) = epoch else {
-                    return unkeyed();
-                };
-                let seq = required(
-                    names::PRODUCER_SEQ,
-                    producer_integer(names::PRODUCER_SEQ, seq)?,
-                )?;
-                let incarnation = fields::token(names::STREAM_INCARNATION, incarnation)?;
-                match outcome {
-                    Some(Outcome::ReceiptEvicted) if status == 204 => {
-                        Ok(Some(Self::ReceiptEvicted {
-                            epoch,
-                            seq,
-                            closed,
-                            incarnation,
-                        }))
-                    }
-                    Some(_) => Err(HeaderError::OutcomeStatusMismatch { status }),
-                    None => {
-                        let receipt = Receipt {
-                            start: required(
-                                names::STREAM_OFFSET,
-                                fields::offset(names::STREAM_OFFSET, start)?,
-                            )?,
-                            next: required(
-                                names::STREAM_NEXT_OFFSET,
-                                fields::offset(names::STREAM_NEXT_OFFSET, next)?,
-                            )?,
-                            closed: fields::flag(names::STREAM_CLOSED, stream_closed)?,
-                        };
-                        let delivery = if status == 200 {
-                            Delivery::Applied
-                        } else {
-                            Delivery::Repeat
-                        };
-                        Ok(Some(Self::Receipt {
-                            delivery,
-                            epoch,
-                            seq,
-                            receipt,
-                            closed,
-                            incarnation,
-                        }))
-                    }
+        if status == 403 {
+            return match outcome {
+                None => Err(HeaderError::Missing {
+                    name: names::PRODUCER_OUTCOME,
+                }),
+                Some(Outcome::EpochClosed(by)) => {
+                    let closed = fields::required(names::PRODUCER_CLOSED_EPOCH, closed)?;
+                    Ok(Some(Self::EpochClosed(EpochClosure::from_parts(
+                        by, epoch, closed,
+                    )?)))
                 }
-            }
-            403 => {
-                let Some(epoch) = epoch else {
-                    return unkeyed();
-                };
-                match outcome {
-                    None => Err(HeaderError::Missing {
-                        name: names::PRODUCER_OUTCOME,
-                    }),
-                    Some(Outcome::EpochClosed(by)) => Ok(Some(Self::EpochClosed {
-                        by,
-                        epoch,
-                        closed: closed.ok_or(HeaderError::Missing {
-                            name: names::PRODUCER_CLOSED_EPOCH,
-                        })?,
-                    })),
-                    Some(Outcome::KeyConflict) => Ok(Some(Self::KeyConflict { epoch })),
-                    Some(Outcome::ProducerExpired) => Ok(Some(Self::ProducerExpired { epoch })),
-                    Some(Outcome::StaleEpoch) => Ok(Some(Self::StaleEpoch { epoch })),
-                    Some(Outcome::ReceiptEvicted) => {
-                        Err(HeaderError::OutcomeStatusMismatch { status })
-                    }
-                }
-            }
-            409 => {
-                let Some(expected) = expected else {
-                    return Ok(None);
-                };
-                let received = required(
-                    names::PRODUCER_RECEIVED_SEQ,
-                    producer_integer(names::PRODUCER_RECEIVED_SEQ, received)?,
+                Some(Outcome::KeyConflict) => Ok(Some(Self::KeyConflict { epoch })),
+                Some(Outcome::ProducerExpired) => Ok(Some(Self::ProducerExpired { epoch })),
+                Some(Outcome::StaleEpoch) => Ok(Some(Self::StaleEpoch { epoch })),
+                Some(Outcome::ReceiptEvicted) => Err(HeaderError::OutcomeStatusMismatch { status }),
+            };
+        }
+        let seq = fields::required(names::PRODUCER_SEQ, seq_field(names::PRODUCER_SEQ, seq)?)?;
+        let incarnation = fields::required(
+            names::STREAM_INCARNATION,
+            fields::incarnation(names::STREAM_INCARNATION, incarnation)?,
+        )?;
+        let epoch = CurrentEpoch::from_parts(epoch, closed)?;
+        match outcome {
+            Some(Outcome::ReceiptEvicted) if status == 204 => Ok(Some(Self::ReceiptEvicted {
+                epoch,
+                seq,
+                incarnation,
+            })),
+            Some(_) => Err(HeaderError::OutcomeStatusMismatch { status }),
+            None => {
+                let receipt = Receipt::new(
+                    fields::required(
+                        names::STREAM_OFFSET,
+                        fields::offset(names::STREAM_OFFSET, start)?,
+                    )?,
+                    fields::required(
+                        names::STREAM_NEXT_OFFSET,
+                        fields::offset(names::STREAM_NEXT_OFFSET, next)?,
+                    )?,
+                    fields::flag(names::STREAM_CLOSED, stream_closed)?,
                 )?;
-                Ok(Some(Self::SeqGap { expected, received }))
+                let delivery = if status == 200 {
+                    Delivery::Applied
+                } else {
+                    Delivery::Repeat
+                };
+                Ok(Some(Self::Receipt {
+                    delivery,
+                    epoch,
+                    seq,
+                    receipt,
+                    incarnation,
+                }))
             }
-            400 => match expected {
-                None => Ok(None),
-                Some(0) => Ok(Some(Self::EpochNotClaimed)),
-                Some(expected) => Err(HeaderError::UnexpectedExpectedSeq { expected }),
-            },
-            _ => Ok(None),
         }
     }
 }
 
-fn integer(emit: &mut Emit<'_>, name: &'static str, value: u64) {
-    emit(name, &render_decimal(value));
-}
-
-fn render_closed(emit: &mut Emit<'_>, closed: Option<ClosedEpoch>) {
-    if let Some(closed) = closed {
-        integer(emit, names::PRODUCER_CLOSED_EPOCH, closed.epoch);
-        integer(emit, names::PRODUCER_CLOSED_SEQ, closed.seq);
-    }
+fn render_closed(emit: &mut Emit<'_>, closed: ClosedEpoch) {
+    emit(names::PRODUCER_CLOSED_EPOCH, &closed.epoch.to_string());
+    emit(names::PRODUCER_CLOSED_SEQ, &closed.seq.to_string());
 }
 
 /// The headers every answer about an applied write carries.
-fn render_progress(
-    emit: &mut Emit<'_>,
-    epoch: u64,
-    seq: u64,
-    closed: Option<ClosedEpoch>,
-    incarnation: Option<u64>,
-) {
-    integer(emit, names::PRODUCER_EPOCH, epoch);
-    integer(emit, names::PRODUCER_SEQ, seq);
-    render_closed(emit, closed);
-    if let Some(incarnation) = incarnation {
-        integer(emit, names::STREAM_INCARNATION, incarnation);
+fn render_progress(emit: &mut Emit<'_>, epoch: CurrentEpoch, seq: Seq, incarnation: Incarnation) {
+    emit(names::PRODUCER_EPOCH, &epoch.epoch.to_string());
+    emit(names::PRODUCER_SEQ, &seq.to_string());
+    if let Some(closed) = epoch.closed_epoch {
+        render_closed(emit, closed);
     }
+    emit(names::STREAM_INCARNATION, &incarnation.to_string());
 }
 
 #[cfg(test)]
 mod tests {
     use super::ClosedBy;
     use super::ClosedEpoch;
+    use super::CurrentEpoch;
     use super::Delivery;
+    use super::EpochClosure;
     use super::Outcome;
     use super::ProducerAnswer;
     use super::Receipt;
     use crate::error::HeaderError;
-    use crate::value::MAX_PRODUCER_INTEGER;
+    use crate::value::Epoch;
+    use crate::value::Incarnation;
+    use crate::value::Offset;
+    use crate::value::Seq;
+
+    const TOKEN: &str = "4503599627370497";
+
+    fn epoch(value: u64) -> Epoch {
+        Epoch::try_from(value).unwrap()
+    }
+
+    fn seq(value: u64) -> Seq {
+        Seq::try_from(value).unwrap()
+    }
+
+    fn incarnation(value: u64) -> Incarnation {
+        Incarnation::try_from(value).unwrap()
+    }
 
     fn rendered(answer: &ProducerAnswer) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
@@ -428,62 +565,46 @@ mod tests {
 
     fn every_answer() -> Vec<ProducerAnswer> {
         let closed = ClosedEpoch {
-            epoch: 6,
-            seq: MAX_PRODUCER_INTEGER,
+            epoch: epoch(6),
+            seq: Seq::MAX,
         };
         vec![
             ProducerAnswer::Receipt {
                 delivery: Delivery::Applied,
-                epoch: 7,
-                seq: 0,
-                receipt: Receipt {
-                    start: 0,
-                    next: 12,
-                    closed: false,
-                },
-                closed: Some(closed),
-                incarnation: Some(4_503_599_627_370_497),
+                epoch: CurrentEpoch::closing(epoch(7), closed).unwrap(),
+                seq: Seq::ZERO,
+                receipt: Receipt::new(Offset::ZERO, Offset::from_u64(12), false).unwrap(),
+                incarnation: incarnation(4_503_599_627_370_497),
             },
             ProducerAnswer::Receipt {
                 delivery: Delivery::Repeat,
-                epoch: MAX_PRODUCER_INTEGER,
-                seq: MAX_PRODUCER_INTEGER,
-                receipt: Receipt {
-                    start: 12,
-                    next: u64::MAX,
-                    closed: true,
-                },
-                closed: None,
-                incarnation: None,
+                epoch: CurrentEpoch::new(Epoch::MAX),
+                seq: Seq::MAX,
+                receipt: Receipt::new(Offset::from_u64(12), Offset::from_u64(u64::MAX), true)
+                    .unwrap(),
+                incarnation: incarnation(1),
             },
             ProducerAnswer::ReceiptEvicted {
-                epoch: 1,
-                seq: 9,
-                closed: None,
-                incarnation: Some(5),
+                epoch: CurrentEpoch::new(epoch(1)),
+                seq: seq(9),
+                incarnation: incarnation(5),
             },
             ProducerAnswer::ReceiptEvicted {
-                epoch: 1,
-                seq: 9,
-                closed: Some(closed),
-                incarnation: None,
+                epoch: CurrentEpoch::closing(epoch(7), closed).unwrap(),
+                seq: seq(9),
+                incarnation: incarnation(5),
             },
-            ProducerAnswer::EpochClosed {
-                by: ClosedBy::Claim,
-                epoch: 7,
-                closed,
-            },
-            ProducerAnswer::EpochClosed {
-                by: ClosedBy::History,
-                epoch: 7,
-                closed: ClosedEpoch { epoch: 7, seq: 3 },
-            },
-            ProducerAnswer::KeyConflict { epoch: 2 },
-            ProducerAnswer::ProducerExpired { epoch: 11 },
-            ProducerAnswer::StaleEpoch { epoch: 12 },
+            ProducerAnswer::EpochClosed(EpochClosure::by_claim(epoch(7), closed).unwrap()),
+            ProducerAnswer::EpochClosed(EpochClosure::by_history(ClosedEpoch {
+                epoch: epoch(7),
+                seq: seq(3),
+            })),
+            ProducerAnswer::KeyConflict { epoch: epoch(2) },
+            ProducerAnswer::ProducerExpired { epoch: epoch(11) },
+            ProducerAnswer::StaleEpoch { epoch: epoch(12) },
             ProducerAnswer::SeqGap {
-                expected: 4,
-                received: 6,
+                expected: seq(4),
+                received: seq(6),
             },
             ProducerAnswer::EpochNotClaimed,
         ]
@@ -580,13 +701,129 @@ mod tests {
     }
 
     #[test]
-    fn malformed_answers_are_typed() {
+    fn stray_headers_on_other_statuses_are_ignored() {
+        assert_eq!(parse(503, &[("producer-epoch", "abc")]), Ok(None));
         assert_eq!(
-            parse(403, &[("producer-epoch", "1")]),
-            Err(HeaderError::Missing {
-                name: "producer-outcome"
+            parse(412, &[
+                ("producer-closed-epoch", "1"),
+                ("producer-seq", "x")
+            ]),
+            Ok(None)
+        );
+        assert_eq!(
+            parse(413, &[("producer-epoch", "1"), ("producer-epoch", "1")]),
+            Ok(None)
+        );
+        // A 409 or 400 reads only the expected and received seqs.
+        assert_eq!(
+            parse(409, &[
+                ("producer-expected-seq", "2"),
+                ("producer-received-seq", "5"),
+                ("producer-epoch", "abc"),
+            ]),
+            Ok(Some(ProducerAnswer::SeqGap {
+                expected: seq(2),
+                received: seq(5)
+            }))
+        );
+    }
+
+    #[test]
+    fn closed_epochs_must_fit_the_current_epoch() {
+        let closed = |value| ClosedEpoch {
+            epoch: epoch(value),
+            seq: seq(1),
+        };
+        assert_eq!(
+            CurrentEpoch::closing(epoch(3), closed(3)),
+            Err(HeaderError::ClosedEpochNotEarlier {
+                epoch: epoch(3),
+                closed: epoch(3)
             })
         );
+        assert_eq!(
+            EpochClosure::by_claim(epoch(3), closed(4)),
+            Err(HeaderError::ClosedEpochNotEarlier {
+                epoch: epoch(3),
+                closed: epoch(4)
+            })
+        );
+        assert_eq!(
+            parse(403, &[
+                ("producer-epoch", "3"),
+                ("producer-outcome", "epoch-closed;by=history"),
+                ("producer-closed-epoch", "2"),
+                ("producer-closed-seq", "1"),
+            ]),
+            Err(HeaderError::HistoryClosedOtherEpoch {
+                epoch: epoch(3),
+                closed: epoch(2)
+            })
+        );
+        assert_eq!(
+            parse(403, &[
+                ("producer-epoch", "3"),
+                ("producer-outcome", "epoch-closed;by=claim"),
+                ("producer-closed-epoch", "3"),
+                ("producer-closed-seq", "1"),
+            ]),
+            Err(HeaderError::ClosedEpochNotEarlier {
+                epoch: epoch(3),
+                closed: epoch(3)
+            })
+        );
+        assert_eq!(
+            parse(200, &[
+                ("producer-epoch", "3"),
+                ("producer-seq", "0"),
+                ("producer-closed-epoch", "5"),
+                ("producer-closed-seq", "1"),
+                ("stream-incarnation", TOKEN),
+                ("stream-offset", "00000000000000000000"),
+                ("stream-next-offset", "00000000000000000001"),
+            ]),
+            Err(HeaderError::ClosedEpochNotEarlier {
+                epoch: epoch(3),
+                closed: epoch(5)
+            })
+        );
+    }
+
+    #[test]
+    fn a_receipt_starts_at_or_before_its_end() {
+        let (start, next) = (Offset::from_u64(9), Offset::from_u64(8));
+        assert_eq!(
+            Receipt::new(start, next, false),
+            Err(HeaderError::ReceiptRangeInverted { start, next })
+        );
+        assert_eq!(
+            parse(200, &[
+                ("producer-epoch", "1"),
+                ("producer-seq", "1"),
+                ("stream-incarnation", TOKEN),
+                ("stream-offset", "00000000000000000009"),
+                ("stream-next-offset", "00000000000000000008"),
+            ]),
+            Err(HeaderError::ReceiptRangeInverted { start, next })
+        );
+    }
+
+    #[test]
+    fn malformed_answers_are_typed() {
+        let receipt = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = vec![
+                ("producer-epoch", "1"),
+                ("producer-seq", "1"),
+                ("stream-incarnation", TOKEN),
+                ("stream-offset", "00000000000000000000"),
+                ("stream-next-offset", "00000000000000000001"),
+            ];
+            for (name, value) in extra {
+                pairs.retain(|(old, _)| old != name);
+                pairs.push((name, value));
+            }
+            pairs
+        };
         assert_eq!(
             parse(403, &[
                 ("producer-epoch", "1"),
@@ -610,14 +847,29 @@ mod tests {
             parse(200, &[
                 ("producer-epoch", "1"),
                 ("producer-seq", "1"),
+                ("stream-incarnation", TOKEN),
                 ("producer-outcome", "receipt-evicted"),
             ]),
             Err(HeaderError::OutcomeStatusMismatch { status: 200 })
         );
         assert_eq!(
-            parse(204, &[("producer-epoch", "1"), ("producer-seq", "1")]),
+            parse(204, &[
+                ("producer-epoch", "1"),
+                ("producer-seq", "1"),
+                ("stream-incarnation", TOKEN)
+            ]),
             Err(HeaderError::Missing {
                 name: "stream-offset"
+            })
+        );
+        assert_eq!(
+            parse(204, &[
+                ("producer-epoch", "1"),
+                ("producer-seq", "1"),
+                ("producer-outcome", "receipt-evicted"),
+            ]),
+            Err(HeaderError::Missing {
+                name: "stream-incarnation"
             })
         );
         assert_eq!(
@@ -628,41 +880,45 @@ mod tests {
         );
         assert_eq!(
             parse(400, &[("producer-expected-seq", "3")]),
-            Err(HeaderError::UnexpectedExpectedSeq { expected: 3 })
+            Err(HeaderError::UnexpectedExpectedSeq { expected: seq(3) })
         );
-        assert_eq!(
-            parse(200, &[
-                ("producer-epoch", "1"),
-                ("producer-seq", "1"),
-                ("stream-offset", "00000000000000000000"),
-                ("stream-next-offset", "00000000000000000001"),
-                ("stream-closed", "yes"),
-            ]),
-            Err(HeaderError::InvalidFlag {
-                name: "stream-closed"
-            })
-        );
-        assert_eq!(
-            parse(200, &[
-                ("producer-epoch", "1"),
-                ("producer-seq", "1"),
-                ("stream-offset", "0"),
-                ("stream-next-offset", "00000000000000000001"),
-            ]),
-            Err(HeaderError::InvalidOffset {
-                name: "stream-offset"
-            })
-        );
-        assert_eq!(
-            parse(200, &[
-                ("producer-epoch", "1"),
-                ("producer-seq", "1"),
-                ("stream-offset", "00000000000000000000"),
-                ("stream-next-offset", "00000000000000000001"),
+        for (extra, expected) in [
+            (("stream-closed", "yes"), HeaderError::InvalidFlag {
+                name: "stream-closed",
+            }),
+            (("stream-closed", "TRUE"), HeaderError::InvalidFlag {
+                name: "stream-closed",
+            }),
+            (("stream-offset", "0"), HeaderError::InvalidOffset {
+                name: "stream-offset",
+            }),
+            (
                 ("stream-incarnation", "07"),
+                HeaderError::NonCanonicalInteger {
+                    name: "stream-incarnation",
+                },
+            ),
+            (
+                ("producer-epoch", "004"),
+                HeaderError::NonCanonicalInteger {
+                    name: "producer-epoch",
+                },
+            ),
+            (("producer-seq", "01"), HeaderError::NonCanonicalInteger {
+                name: "producer-seq",
+            }),
+        ] {
+            assert_eq!(parse(200, &receipt(&[extra])), Err(expected), "{extra:?}");
+        }
+        assert_eq!(
+            parse(403, &[
+                ("producer-epoch", "3"),
+                ("producer-outcome", "epoch-closed;by=claim"),
+                ("producer-closed-epoch", "02"),
+                ("producer-closed-seq", "1"),
             ]),
             Err(HeaderError::NonCanonicalInteger {
-                name: "stream-incarnation"
+                name: "producer-closed-epoch"
             })
         );
     }

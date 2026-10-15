@@ -1,12 +1,17 @@
-//! The one error of parsing Ursula's headers.
+//! The one error of parsing Ursula's headers and the parts manifest, and of
+//! constructing a value that would not round-trip.
 
 use std::error::Error;
 use std::fmt;
 
 use crate::names;
-use crate::value::MAX_PRODUCER_INTEGER;
+use crate::snapshot::PART_ID_MAX_BYTES;
+use crate::snapshot::PartCount;
+use crate::value::Epoch;
 use crate::value::OFFSET_WIDTH;
+use crate::value::Offset;
 use crate::value::PRODUCER_ID_MAX_BYTES;
+use crate::value::Seq;
 
 /// A header that is malformed, missing where the rest requires it, or
 /// repeated. A server answers each in a request with `400 Bad Request`; a
@@ -26,12 +31,19 @@ pub enum HeaderError {
     EmptyProducerId,
     /// `Producer-Id` is longer than [`PRODUCER_ID_MAX_BYTES`].
     ProducerIdTooLong { len: usize },
+    /// `Producer-Id` holds bytes outside visible ASCII, spaces and tabs, or
+    /// starts or ends with whitespace.
+    InvalidProducerId,
     /// Not a decimal integer: empty, signed, spaced or not digits.
     InvalidInteger { name: &'static str },
-    /// A producer integer above [`MAX_PRODUCER_INTEGER`], or another integer
-    /// above `u64::MAX`.
+    /// A decimal integer above `u64::MAX`.
     IntegerTooLarge { name: &'static str },
-    /// A token, limit or count with a leading zero.
+    /// An integer outside the range of its header: a producer integer or a
+    /// token above 2^53 - 1, a token of `0`, a part count outside 1 to
+    /// [`MAX_SNAPSHOT_PARTS`](crate::snapshot::MAX_SNAPSHOT_PARTS), a Raft group above `u32::MAX`.
+    OutOfRange { name: &'static str, value: u64 },
+    /// An integer of an answer, or a token, limit or count, with a leading
+    /// zero.
     NonCanonicalInteger { name: &'static str },
     /// An offset that is not exactly [`OFFSET_WIDTH`] decimal digits.
     InvalidOffset { name: &'static str },
@@ -46,17 +58,39 @@ pub enum HeaderError {
     /// `true`.
     InvalidFlag { name: &'static str },
     /// A `400` names another expected sequence number than `0`.
-    UnexpectedExpectedSeq { expected: u64 },
+    UnexpectedExpectedSeq { expected: Seq },
     /// `Producer-Outcome` does not fit the answer's status.
     OutcomeStatusMismatch { status: u16 },
     /// `Ursula-Cluster-Id` is not 1 to 64 bytes of `[A-Za-z0-9._-]`.
     InvalidClusterId,
-    /// `Stream-Snapshot-Part` is not 1 to 64 visible ASCII characters.
+    /// `Stream-Snapshot-Part` is not 1 to [`PART_ID_MAX_BYTES`] visible
+    /// ASCII characters.
     InvalidPartId,
-    /// `Stream-Snapshot-Parts` is `0` or above the server's part limit.
-    PartCountOutOfRange { count: u64 },
     /// A `413` names both limits; it must name the one it applied.
     AmbiguousLimit,
+    /// A receipt starts after it ends.
+    ReceiptRangeInverted { start: Offset, next: Offset },
+    /// A claim closed an epoch that is not below the producer's current
+    /// `epoch`.
+    ClosedEpochNotEarlier { epoch: Epoch, closed: Epoch },
+    /// An `epoch-closed;by=history` closed another epoch than the current
+    /// one.
+    HistoryClosedOtherEpoch { epoch: Epoch, closed: Epoch },
+    /// HEAD's `Stream-Retained-Offset` is above `Stream-Next-Offset`.
+    RetainedPastNext { retained: Offset, next: Offset },
+    /// HEAD's `Stream-Inherited-Offset` is above `Stream-Next-Offset`.
+    InheritedPastNext { inherited: Offset, next: Offset },
+    /// HEAD's `Stream-Previous-Incarnation` is the current token.
+    PreviousIncarnationIsCurrent,
+    /// A snapshot read's `Stream-Next-Offset` is not its snapshot's offset.
+    SnapshotNextOffsetMismatch { snapshot: Offset, next: Offset },
+    /// A parts manifest does not end with LF.
+    ManifestUnterminated,
+    /// Line `line` (from 1) of a parts manifest is not a part id.
+    InvalidManifestLine { line: usize },
+    /// A parts manifest lists another number of parts than its commit's
+    /// `Stream-Snapshot-Parts`.
+    ManifestPartCount { declared: PartCount },
 }
 
 impl fmt::Display for HeaderError {
@@ -79,10 +113,13 @@ impl fmt::Display for HeaderError {
                 names::PRODUCER_ID
             ),
             Self::InvalidInteger { name } => write!(f, "{name} must be a non-negative integer"),
-            Self::IntegerTooLarge { name } => write!(
+            Self::InvalidProducerId => write!(
                 f,
-                "{name} is out of range (producer integers are <= {MAX_PRODUCER_INTEGER})"
+                "{} must be visible ASCII with no surrounding whitespace",
+                names::PRODUCER_ID
             ),
+            Self::IntegerTooLarge { name } => write!(f, "{name} does not fit in 64 bits"),
+            Self::OutOfRange { name, value } => write!(f, "{name} is out of range: {value}"),
             Self::NonCanonicalInteger { name } => {
                 write!(f, "{name} must not have a leading zero")
             }
@@ -115,20 +152,65 @@ impl fmt::Display for HeaderError {
             ),
             Self::InvalidPartId => write!(
                 f,
-                "{} must be 1 to 64 visible ASCII characters",
+                "{} must be 1 to {PART_ID_MAX_BYTES} visible ASCII characters",
                 names::STREAM_SNAPSHOT_PART
-            ),
-            Self::PartCountOutOfRange { count } => write!(
-                f,
-                "{} must be between 1 and {}, got {count}",
-                names::STREAM_SNAPSHOT_PARTS,
-                crate::snapshot::MAX_SNAPSHOT_PARTS
             ),
             Self::AmbiguousLimit => write!(
                 f,
                 "a 413 must name one limit, not both {} and {}",
                 names::URSULA_MAX_REQUEST_BYTES,
                 names::URSULA_MAX_SNAPSHOT_BYTES
+            ),
+            Self::ReceiptRangeInverted { start, next } => write!(
+                f,
+                "{} {start} is above {} {next}",
+                names::STREAM_OFFSET,
+                names::STREAM_NEXT_OFFSET
+            ),
+            Self::ClosedEpochNotEarlier { epoch, closed } => write!(
+                f,
+                "{} {closed} is not below {} {epoch}",
+                names::PRODUCER_CLOSED_EPOCH,
+                names::PRODUCER_EPOCH
+            ),
+            Self::HistoryClosedOtherEpoch { epoch, closed } => write!(
+                f,
+                "a history event closes the current epoch {epoch}, not {closed}"
+            ),
+            Self::RetainedPastNext { retained, next } => write!(
+                f,
+                "{} {retained} is above {} {next}",
+                names::STREAM_RETAINED_OFFSET,
+                names::STREAM_NEXT_OFFSET
+            ),
+            Self::InheritedPastNext { inherited, next } => write!(
+                f,
+                "{} {inherited} is above {} {next}",
+                names::STREAM_INHERITED_OFFSET,
+                names::STREAM_NEXT_OFFSET
+            ),
+            Self::PreviousIncarnationIsCurrent => write!(
+                f,
+                "{} must differ from {}",
+                names::STREAM_PREVIOUS_INCARNATION,
+                names::STREAM_INCARNATION
+            ),
+            Self::SnapshotNextOffsetMismatch { snapshot, next } => write!(
+                f,
+                "a snapshot read's {} {next} must equal its {} {snapshot}",
+                names::STREAM_NEXT_OFFSET,
+                names::STREAM_SNAPSHOT_OFFSET
+            ),
+            Self::ManifestUnterminated => write!(f, "a parts manifest must end with LF"),
+            Self::InvalidManifestLine { line } => write!(
+                f,
+                "line {line} of a parts manifest is not a part id of 1 to {PART_ID_MAX_BYTES} \
+                 visible ASCII characters"
+            ),
+            Self::ManifestPartCount { declared } => write!(
+                f,
+                "a parts manifest must list exactly {declared} parts, as {} says",
+                names::STREAM_SNAPSHOT_PARTS
             ),
         }
     }

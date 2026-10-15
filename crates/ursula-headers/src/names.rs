@@ -33,8 +33,9 @@ pub const STREAM_PREVIOUS_INCARNATION: &str = "stream-previous-incarnation";
 pub const STREAM_INHERITED_OFFSET: &str = "stream-inherited-offset";
 /// Where a receipt's bytes start.
 pub const STREAM_OFFSET: &str = "stream-offset";
-/// Where a receipt's bytes end; the stream's tail on HEAD and on a snapshot
-/// read.
+/// Where a receipt's bytes end; the stream's tail on HEAD and on a `409` of
+/// a closed stream; the snapshot's offset on a snapshot read, where the
+/// reader continues.
 pub const STREAM_NEXT_OFFSET: &str = "stream-next-offset";
 /// `true` when the stream is closed, or when a receipt's write closed it.
 pub const STREAM_CLOSED: &str = "stream-closed";
@@ -63,3 +64,12 @@ pub const URSULA_MAX_REQUEST_BYTES: &str = "ursula-max-request-bytes";
 /// The largest snapshot the server accepts in parts. HEAD with a cold store,
 /// and a `413` that applied it.
 pub const URSULA_MAX_SNAPSHOT_BYTES: &str = "ursula-max-snapshot-bytes";
+
+/// The node that leads the stream's Raft group. `307` of a node that does
+/// not lead it; the same name as 0.7.
+pub const X_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
+/// The stream's Raft group. `307` of a node that does not lead it, and the
+/// `503` of a node that knows no leader.
+pub const X_URSULA_RAFT_GROUP: &str = "x-ursula-raft-group";
+/// The term of the leader that [`X_URSULA_RAFT_LEADER_ID`] names. `307`.
+pub const X_URSULA_RAFT_TERM: &str = "x-ursula-raft-term";

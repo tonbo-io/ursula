@@ -2,10 +2,9 @@
 //! and the typed reads of those values.
 
 use crate::error::HeaderError;
-use crate::value::Digest;
+use crate::value::Incarnation;
+use crate::value::Offset;
 use crate::value::parse_decimal;
-use crate::value::parse_offset;
-use crate::value::parse_token;
 
 /// The callback a value renders its headers through.
 pub(crate) type Emit<'e> = dyn FnMut(&'static str, &str) + 'e;
@@ -60,12 +59,18 @@ pub(crate) fn parsed<'a, T>(
     text(name, value)?.map(|text| parse(name, text)).transpose()
 }
 
-pub(crate) fn offset(name: &'static str, value: Option<&[u8]>) -> Result<Option<u64>, HeaderError> {
-    parsed(name, value, parse_offset)
+pub(crate) fn offset(
+    name: &'static str,
+    value: Option<&[u8]>,
+) -> Result<Option<Offset>, HeaderError> {
+    parsed(name, value, Offset::parse)
 }
 
-pub(crate) fn token(name: &'static str, value: Option<&[u8]>) -> Result<Option<u64>, HeaderError> {
-    parsed(name, value, parse_token)
+pub(crate) fn incarnation(
+    name: &'static str,
+    value: Option<&[u8]>,
+) -> Result<Option<Incarnation>, HeaderError> {
+    parsed(name, value, Incarnation::parse)
 }
 
 pub(crate) fn decimal(
@@ -75,18 +80,11 @@ pub(crate) fn decimal(
     parsed(name, value, parse_decimal)
 }
 
-pub(crate) fn digest(
-    name: &'static str,
-    value: Option<&[u8]>,
-) -> Result<Option<Digest>, HeaderError> {
-    parsed(name, value, Digest::parse)
-}
-
-/// A flag: `false` when absent, `true` when `true` (any case).
+/// A flag: `false` when absent, `true` when exactly `true`.
 pub(crate) fn flag(name: &'static str, value: Option<&[u8]>) -> Result<bool, HeaderError> {
     match text(name, value)? {
         None => Ok(false),
-        Some(text) if text.eq_ignore_ascii_case("true") => Ok(true),
+        Some("true") => Ok(true),
         Some(_) => Err(HeaderError::InvalidFlag { name }),
     }
 }
