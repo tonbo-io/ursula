@@ -159,6 +159,8 @@
 //! - `client`: the stream over blocking HTTP, with the retries.
 //! - `config`: settings and test hooks from the environment.
 //! - `db`: attached databases (their poison and fence flag) and the process-wide registry.
+//! - `driver`: the process-wide driver of the 0.8 replicators and opens: a deterministic core and
+//!   its runtime (a driver thread and blocking HTTP workers), not yet wired.
 //! - `descriptors`: the scan for descriptors of this process on a database's files outside the
 //!   extension, which attach refuses.
 //! - `error`: the error type, the classes the code acts on (gone, recreated, fenced, refused,
@@ -177,6 +179,8 @@
 //! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
 //!   the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
+//! - `open`: opening a stream (design §5.5, the rows M1 supports) up to its takeover, run by the
+//!   driver (0.8, not yet wired).
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle
 //!   (0.8, not yet wired).
 //! - `replicator`: the replicator state machine of one bound database (0.8).
@@ -199,6 +203,11 @@ pub mod codec;
 mod config;
 mod db;
 mod descriptors;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired to the SQL functions by the 0.8 switch PR")
+)]
+mod driver;
 mod error;
 mod extension;
 pub mod frame;
@@ -214,6 +223,11 @@ mod materialize;
 #[cfg(any(test, feature = "model"))]
 pub mod model;
 mod net;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired to the SQL functions by the 0.8 switch PR")
+)]
+mod open;
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 mod publication;
 #[cfg_attr(

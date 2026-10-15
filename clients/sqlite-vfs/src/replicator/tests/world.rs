@@ -33,6 +33,8 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use proptest::prelude::Just;
 use proptest::prelude::Strategy;
@@ -93,6 +95,9 @@ const MAX_OWNERS: usize = 6;
 const HEAL_MS: u64 = 30 * 60 * 1000;
 /// The default case count; `PROPTEST_CASES` overrides it.
 const CASES: u32 = 1024;
+
+/// The deterministic cases of the coverage check.
+const COVERAGE_CASES: u32 = 4096;
 
 /// A scripted answer of a layer in front of the server.
 #[derive(Debug, Clone, Copy)]
@@ -229,9 +234,24 @@ struct Instance {
     discards: Vec<Position>,
     /// A rebuild read the stream up to the next acknowledged offset.
     rebuilt: bool,
+    /// Reads applied in place by this takeover.
+    applies: u32,
+    /// The `CaughtUp` the driver sends for the last Apply or Rebuild, delivered at the end of the
+    /// next op, so restarts, clock steps and late answers land while the replicator waits.
+    caught_up_due: Option<Position>,
     /// The clock passed idle expiry while this owner's continuation claim was outstanding and
     /// already in the stream: the floor rose past its own claim, and it loses by design.
     claim_expired: bool,
+}
+
+/// What the scripts of one [`check`] run reached, beyond the properties.
+#[derive(Debug, Default)]
+struct Coverage {
+    /// Takeovers that caught up in place over two reads or more.
+    chunked_catch_ups: AtomicU64,
+    /// Takeovers that rebuilt after applying a read in place (grown past the database, or a
+    /// `410`).
+    rebuilds_after_apply: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +298,7 @@ struct World {
     violations: Vec<String>,
     /// Another writer (a foreign append or claim) wrote on the stream.
     others: bool,
+    coverage: Arc<Coverage>,
 }
 
 fn decode_all(bytes: &[u8]) -> Vec<(usize, usize, Option<Frame>)> {
@@ -298,9 +319,26 @@ fn decode_all(bytes: &[u8]) -> Vec<(usize, usize, Option<Frame>)> {
     out
 }
 
+/// An owner's db file size: from empty (every catch-up in place rebuilds) to unbounded (none
+/// does), with sizes in between that frames grow past midway.
+fn db_bytes(family: u64) -> u64 {
+    match family % 4 {
+        0 => 0,
+        // Records are 3 to 9 bytes: room for one or two, so the next read rebuilds.
+        1 => 8,
+        2 => 16,
+        _ => u64::MAX,
+    }
+}
+
 impl World {
-    fn new(knobs: Knobs, seed: u64) -> Self {
+    fn new(knobs: Knobs, seed: u64, coverage: Arc<Coverage>) -> Self {
         let mut server = ModelServer::new(cluster(), seed);
+        // Small reads too, so a reconcile catches up in place over several of them.
+        server.set_limits(Limits {
+            read_chunk: [48, 160, 1 << 20][usize::try_from(seed % 3).unwrap()],
+            ..server.limits()
+        });
         let create = Request {
             content_type: Some(CONTENT_TYPE.to_owned()),
             ..Request::new(Method::Put, Target::Stream)
@@ -324,6 +362,7 @@ impl World {
             acked_frames: HashMap::new(),
             violations: Vec::new(),
             others: false,
+            coverage,
         };
         world.takeover(false);
         world
@@ -369,6 +408,8 @@ impl World {
             calls: BTreeMap::new(),
             discards: Vec::new(),
             rebuilt: false,
+            applies: 0,
+            caught_up_due: None,
             claim_expired: false,
         };
         (inst, actions)
@@ -416,6 +457,7 @@ impl World {
             highest_epoch: None,
             max_request_bytes: self.limits(),
             configured_max_request_bytes: None,
+            db_bytes: db_bytes(family),
         };
         let (inst, actions) = self.instance(local);
         self.owners.push(Owner {
@@ -432,6 +474,7 @@ impl World {
     fn restart(&mut self, index: usize, lag: u8) {
         let activation = self.activation();
         let owner = &self.owners[index];
+        let family = owner.family;
         let log = owner.log.clone();
         let lagged = log
             .acks
@@ -461,6 +504,7 @@ impl World {
             highest_epoch: None,
             max_request_bytes: self.limits(),
             configured_max_request_bytes: None,
+            db_bytes: db_bytes(family),
         };
         let (inst, actions) = self.instance(local);
         self.owners[index].inst = inst;
@@ -577,6 +621,7 @@ impl World {
         takeover: bool,
     ) {
         let mut caught_up = false;
+        let mut applied_chunk = false;
         let fenced = actions.contains(&Action::Reset(ResetKind::Fenced));
         let discarded = actions.iter().any(|a| {
             matches!(a, Action::Rebuild {
@@ -614,11 +659,22 @@ impl World {
                     self.owners[index].inst.timer = Some(at_ms.saturating_add(jitter_ms));
                 }
                 Action::Condition(_) => {}
-                // A catch-up logs every frame it applies as a COMMIT record at the next
-                // positions, then the ACK covering them.
+                // A catch-up logs every frame of one read as a COMMIT record at the next
+                // positions, then the ACK covering them, fsynced, before the next read.
                 Action::Apply(frames) => {
                     if !takeover {
                         self.violation("property 6: a catch-up outside a takeover".to_owned());
+                    }
+                    if caught_up {
+                        self.violation("an Apply before the previous one was caught up".to_owned());
+                    }
+                    let end = frames.last().map(|f| f.end_offset);
+                    let inst = &mut self.owners[index].inst;
+                    inst.applies += 1;
+                    if inst.applies == 2 {
+                        self.coverage
+                            .chunked_catch_ups
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     let log = &mut self.owners[index].log;
                     for foreign in frames {
@@ -633,13 +689,24 @@ impl World {
                         log.next_position += 1;
                         log.applied.push(bytes);
                     }
+                    if let Some(end) = end {
+                        let last = log.last_logged();
+                        log.acks.push((last, end, 0));
+                        log.durable_acks = log.acks.len();
+                    }
                     caught_up = true;
+                    applied_chunk = true;
                 }
                 Action::Rebuild { discard_from, .. } => {
                     if !takeover {
                         self.violation("property 6: a rebuild outside a takeover".to_owned());
                     }
                     let owner = &mut self.owners[index];
+                    if discard_from.is_none() && owner.inst.applies > 0 {
+                        self.coverage
+                            .rebuilds_after_apply
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Some(from) = discard_from {
                         owner.log.commits.retain(|p, _| *p < from.0);
                         owner.inst.discards.push(from);
@@ -666,9 +733,10 @@ impl World {
         }
         if caught_up {
             let log = &mut self.owners[index].log;
-            log.catching_up = true;
+            // A chunk's ACK is durable already; a rebuild's comes with the bind.
+            log.catching_up = !applied_chunk;
             let last = log.last_logged();
-            self.event(index, Event::CaughtUp { last, log_bytes: 0 });
+            self.owners[index].inst.caught_up_due = Some(last);
         }
     }
 
@@ -979,6 +1047,29 @@ impl World {
     }
 
     fn step(&mut self, op: &Op) {
+        let due: Vec<u64> = self
+            .owners
+            .iter()
+            .filter(|o| o.inst.caught_up_due.is_some())
+            .map(|o| o.inst.uid)
+            .collect();
+        self.apply_op(op);
+        for uid in due {
+            self.catch_up(uid);
+        }
+    }
+
+    /// Sends the instance `uid` its due `CaughtUp`, if it still waits for one.
+    fn catch_up(&mut self, uid: u64) {
+        let Some(index) = self.owners.iter().position(|o| o.inst.uid == uid) else {
+            return;
+        };
+        if let Some(last) = self.owners[index].inst.caught_up_due.take() {
+            self.event(index, Event::CaughtUp { last, log_bytes: 0 });
+        }
+    }
+
+    fn apply_op(&mut self, op: &Op) {
         match *op {
             Op::Commit(o) => {
                 let i = self.owner(o);
@@ -1182,6 +1273,15 @@ impl World {
         });
         let until = self.now() + HEAL_MS;
         for _ in 0..50_000 {
+            if let Some(uid) = self
+                .owners
+                .iter()
+                .find(|o| o.inst.caught_up_due.is_some())
+                .map(|o| o.inst.uid)
+            {
+                self.catch_up(uid);
+                continue;
+            }
             if !self.msgs.is_empty() {
                 self.deliver(0);
                 continue;
@@ -1247,6 +1347,7 @@ fn ending(inst: &Instance) -> Result<&'static str, String> {
         Replicator::Activating { step, .. } => Err(format!("activating, {}", match step {
             Step::Claim { .. } => "claiming",
             Step::Reconcile { .. } => "reconciling",
+            Step::Applying { .. } => "applying a read",
             Step::CatchingUp(_) => "catching up",
         })),
         Replicator::Reset(_) | Replicator::Refused(_) | Replicator::Stopped => Ok("reset"),
@@ -1255,7 +1356,12 @@ fn ending(inst: &Instance) -> Result<&'static str, String> {
 
 /// Runs `ops` then heals; the violations found.
 fn run(knobs: Knobs, seed: u64, ops: &[Op]) -> Vec<String> {
-    let mut world = World::new(knobs, seed);
+    run_counted(knobs, seed, ops, Arc::default())
+}
+
+/// [`run`], counting what the script reached in `coverage`.
+fn run_counted(knobs: Knobs, seed: u64, ops: &[Op], coverage: Arc<Coverage>) -> Vec<String> {
+    let mut world = World::new(knobs, seed, coverage);
     for op in ops {
         world.step(op);
     }
@@ -1270,12 +1376,14 @@ fn cases() -> u32 {
         .unwrap_or(CASES)
 }
 
-/// Runs `cases` random scripts, from a fixed seed when `deterministic`.
+/// Runs `cases` random scripts, from a fixed seed when `deterministic`, and returns what they
+/// reached.
 fn check(
     knobs: Knobs,
     cases: u32,
     deterministic: bool,
-) -> Result<(), proptest::test_runner::TestError<(u64, Vec<Op>)>> {
+) -> Result<Arc<Coverage>, proptest::test_runner::TestError<(u64, Vec<Op>)>> {
+    let coverage = Arc::new(Coverage::default());
     let config = Config {
         cases,
         failure_persistence: None,
@@ -1291,13 +1399,14 @@ fn check(
         proptest::collection::vec(op(), 20..160),
     );
     runner.run(&strategy, |(seed, ops)| {
-        let violations = run(knobs, seed, &ops);
+        let violations = run_counted(knobs, seed, &ops, Arc::clone(&coverage));
         if violations.is_empty() {
             Ok(())
         } else {
             Err(TestCaseError::fail(violations.join("; ")))
         }
-    })
+    })?;
+    Ok(coverage)
 }
 
 #[test]
@@ -1305,6 +1414,18 @@ fn the_replicator_keeps_its_properties_against_the_model() {
     if let Err(failure) = check(Knobs::default(), cases(), false) {
         panic!("{failure}");
     }
+}
+
+/// The scripts reach a catch-up in place read by read, and one that rebuilds midway: checked on
+/// a fixed seed, so the coverage is reproducible.
+#[test]
+fn the_world_catches_up_in_place_read_by_read() {
+    let coverage = match check(Knobs::default(), COVERAGE_CASES, true) {
+        Ok(coverage) => coverage,
+        Err(failure) => panic!("{failure}"),
+    };
+    assert!(coverage.chunked_catch_ups.load(Ordering::Relaxed) > 0);
+    assert!(coverage.rebuilds_after_apply.load(Ordering::Relaxed) > 0);
 }
 
 /// Streaming owner 0 acknowledges a commit, is cloned, and both copies commit different bytes at
@@ -1406,7 +1527,7 @@ fn a_lagging_takeover_below_retention_rebuilds() {
         Op::Takeover(true),
         Op::Flush,
     ];
-    let mut world = World::new(Knobs::default(), 1);
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
     for op in &ops {
         world.step(op);
     }

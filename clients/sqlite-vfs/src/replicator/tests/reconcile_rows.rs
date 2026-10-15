@@ -27,6 +27,8 @@ use crate::replicator::Action;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
 use crate::replicator::ForeignFrame;
+use crate::replicator::LocalState;
+use crate::replicator::Pending;
 use crate::replicator::Replicator;
 use crate::replicator::ResetKind;
 use crate::replicator::reconcile::FrameClass;
@@ -34,6 +36,7 @@ use crate::replicator::reconcile::Mode;
 use crate::replicator::reconcile::RowDecision;
 use crate::replicator::reconcile::decide_frame;
 use crate::wire::RawAnswer;
+use crate::wire::Target;
 
 const FOREIGN: Activation = Activation([0xf0; 16]);
 const OTHER_LINEAGE: Lineage = Lineage([0x22; 16]);
@@ -309,11 +312,18 @@ fn row_6_a_410_with_nothing_pending_still_rebuilds() {
     }));
 }
 
-#[test]
-fn a_410_after_frames_were_collected_rebuilds_and_drops_them() {
-    let foreign = commit(OTHER_LINEAGE, 9, 9);
-    let (mut h, _) = Harness::activate(KINDS[0], local(Vec::new(), 0));
-    let len = u64::try_from(foreign.frame.len()).unwrap();
+/// Takes over with nothing pending and `db_bytes`, the claim at `2 * len`: two foreign commits of
+/// `len` bytes each come before it.
+fn two_foreign(db_bytes: u64) -> (Harness, Pending, Pending, u64) {
+    let first = commit(OTHER_LINEAGE, 9, 9);
+    let second = commit(OTHER_LINEAGE, 14, 9);
+    assert_eq!(first.frame.len(), second.frame.len());
+    let local = LocalState {
+        db_bytes,
+        ..local(Vec::new(), 0)
+    };
+    let (mut h, _) = Harness::activate(KINDS[0], local);
+    let len = u64::try_from(first.frame.len()).unwrap();
     h.answer(&producer(&receipt(
         Delivery::Applied,
         1,
@@ -322,8 +332,82 @@ fn a_410_after_frames_were_collected_rebuilds_and_drops_them() {
         2 * len + 37,
         None,
     )));
-    // The first read returns one foreign commit, the next finds it retained away.
-    let actions = h.answer(&read(&foreign.frame, len));
+    (h, first, second, len)
+}
+
+#[test]
+fn a_catch_up_in_place_applies_each_read_before_the_next() {
+    let (mut h, first, second, len) = two_foreign(u64::MAX);
+    // The first read's frame is applied; the next read waits for the driver.
+    let actions = h.answer(&read(&first.frame, len));
+    assert_eq!(actions, vec![Action::Apply(vec![ForeignFrame {
+        frame: decoded(&first.frame),
+        end_offset: off(len),
+    }])]);
+    assert!(h.on(Event::Tick).is_empty());
+    let actions = h.on(Event::CaughtUp {
+        last: Position(1),
+        log_bytes: 10,
+    });
+    let reads = sends(&actions);
+    assert_eq!(reads.len(), 1);
+    assert!(matches!(reads[0].target, Target::Read { from: Some(from), .. } if from == off(len)));
+    let actions = h.answer(&read(&second.frame, 2 * len));
+    assert_eq!(actions, vec![Action::Apply(vec![ForeignFrame {
+        frame: decoded(&second.frame),
+        end_offset: off(2 * len),
+    }])]);
+    assert!(!streaming(&h));
+    let actions = h.on(Event::CaughtUp {
+        last: Position(2),
+        log_bytes: 20,
+    });
+    assert!(actions.contains(&Action::Bound { epoch: epoch(1) }));
+    assert_eq!(acked(&actions), Some(Position(2)));
+    assert!(streaming(&h));
+}
+
+#[test]
+fn a_catch_up_in_place_that_grows_past_the_database_rebuilds() {
+    let record = |p: &Pending| match decoded(&p.frame) {
+        Frame::Commit { compressed, .. } => u64::try_from(compressed.len()).unwrap(),
+        _ => unreachable!(),
+    };
+    let (mut h, first, second, len) = two_foreign(0);
+    let one = record(&first);
+    // Room for one frame's record: the first applies, the second rebuilds.
+    let (mut h2, _, _, _) = two_foreign(one);
+    let actions = h2.answer(&read(&first.frame, len));
+    assert!(
+        matches!(actions.as_slice(), [Action::Apply(_)]),
+        "{actions:?}"
+    );
+    h2.on(Event::CaughtUp {
+        last: Position(1),
+        log_bytes: 10,
+    });
+    let actions = h2.answer(&read(&second.frame, 2 * len));
+    let len_usize = usize::try_from(len).unwrap();
+    assert_eq!(actions, vec![rebuild(None, 2 * len_usize + 37)]);
+    assert!(record(&second) > 0);
+    // An empty database rebuilds at the first frame.
+    let actions = h.answer(&read(&first.frame, len));
+    assert_eq!(actions, vec![rebuild(None, 2 * len_usize + 37)]);
+}
+
+#[test]
+fn a_410_after_a_read_was_applied_rebuilds() {
+    let (mut h, first, _, len) = two_foreign(u64::MAX);
+    // The first read returns one foreign commit, applied; the next finds it retained away.
+    let actions = h.answer(&read(&first.frame, len));
+    assert!(
+        matches!(actions.as_slice(), [Action::Apply(_)]),
+        "{actions:?}"
+    );
+    let actions = h.on(Event::CaughtUp {
+        last: Position(1),
+        log_bytes: 10,
+    });
     assert_eq!(sends(&actions).len(), 1);
     let actions = h.answer(&RawAnswer::new(410));
     let len = usize::try_from(len).unwrap();

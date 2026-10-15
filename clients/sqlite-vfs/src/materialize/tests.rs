@@ -396,7 +396,7 @@ fn catching_up_logs_applies_and_survives_a_reopen() {
             end_offset: Offset::from_u64(180),
         },
     ];
-    catch_up(&mut m, &frames).unwrap();
+    catch_up(&mut m, Position(0), &frames).unwrap();
     let want = {
         let mut s = State {
             size: 3,
@@ -432,7 +432,7 @@ fn catching_up_logs_applies_and_survives_a_reopen() {
     };
     let mut m = m;
     assert!(matches!(
-        catch_up(&mut m, &[part]),
+        catch_up(&mut m, Position(0), &[part]),
         Err(super::LocalError::Part { end_offset }) if end_offset == Offset::from_u64(200)
     ));
 }
@@ -471,7 +471,9 @@ fn catching_up_is_refused_while_our_commits_are_pending() {
         end_offset: Offset::from_u64(37),
     }];
     assert!(matches!(
-        catch_up(&mut m, &frames),
+        catch_up(&mut m, Position(0), &frames),
         Err(super::LocalError::OwnPending { first: Position(1) })
     ));
+    // Once the caller knows commit 1 acknowledged, the frames go after it.
+    catch_up(&mut m, Position(1), &frames).unwrap();
 }

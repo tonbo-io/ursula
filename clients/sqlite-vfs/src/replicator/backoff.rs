@@ -52,6 +52,112 @@ pub(crate) enum Hit {
     None,
 }
 
+/// The retry rules of one request, without the replicator's state: backoff doubling from 25 ms to
+/// 5 s with the driver's full jitter, never before `Retry-After` (capped at 60 s), a blocked
+/// condition every 30 s, one token reread after a `401`, a few resends of a redirect. [`Link`]
+/// carries them out for the replicator, and the driver's open uses them for its own requests:
+/// one policy.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Policy {
+    failures: u32,
+    token_refused: bool,
+    redirects: u8,
+}
+
+/// What [`Policy`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// Send again at a time in `at_ms ..= at_ms + jitter_ms`, under `condition` meanwhile.
+    Wait {
+        at_ms: u64,
+        jitter_ms: u64,
+        attempt: Attempt,
+        condition: Condition,
+    },
+    /// Send again at once (the token reread after a `401`).
+    Resend(Attempt),
+    /// HEAD before deciding.
+    Head(HeadReason),
+    Reset(ResetKind),
+}
+
+impl Policy {
+    /// Backoff after one more failure.
+    pub(crate) fn backoff(
+        &mut self,
+        retry_after: Option<Duration>,
+        attempt: Attempt,
+        now_ms: u64,
+    ) -> Next {
+        self.failures = self.failures.saturating_add(1);
+        let floor = retry_after.map_or(0, |after| {
+            u64::try_from(after.as_millis())
+                .unwrap_or(u64::MAX)
+                .min(RETRY_AFTER_CAP_MS)
+        });
+        Next::Wait {
+            at_ms: now_ms.saturating_add(floor),
+            jitter_ms: backoff_ms(self.failures),
+            attempt,
+            condition: Condition::Retrying,
+        }
+    }
+
+    /// Blocked by `reason`: sent again every 30 s.
+    pub(crate) fn block(reason: BlockedReason, now_ms: u64) -> Next {
+        Next::Wait {
+            at_ms: now_ms.saturating_add(BLOCKED_RETRY_MS),
+            jitter_ms: 0,
+            attempt: Attempt::default(),
+            condition: Condition::Blocked(reason),
+        }
+    }
+
+    /// What an answer without a producer outcome leads to. A typed `413` blocks
+    /// `request_too_large`: lowering the limit is the caller's.
+    pub(crate) fn decide(
+        &mut self,
+        common: Common,
+        retry_after: Option<Duration>,
+        now_ms: u64,
+    ) -> Next {
+        if !matches!(common, Common::Reauthorize) {
+            self.token_refused = false;
+        }
+        match common {
+            Common::Reset(kind) => Next::Reset(kind),
+            Common::Resend { fresh, .. } => {
+                let attempt = Attempt {
+                    fresh_connection: fresh,
+                    refresh_token: false,
+                };
+                self.backoff(retry_after, attempt, now_ms)
+            }
+            Common::Head(reason) => Next::Head(reason),
+            Common::Reauthorize if self.token_refused => {
+                Self::block(BlockedReason::Unauthorized, now_ms)
+            }
+            Common::Reauthorize => {
+                self.token_refused = true;
+                Next::Resend(Attempt {
+                    fresh_connection: false,
+                    refresh_token: true,
+                })
+            }
+            Common::Redirect { location } => {
+                self.redirects = self.redirects.saturating_add(1);
+                if self.redirects > REDIRECTS {
+                    Self::block(BlockedReason::Redirected { location }, now_ms)
+                } else {
+                    self.backoff(None, Attempt::default(), now_ms)
+                }
+            }
+            Common::LowerLimit { .. } => Self::block(BlockedReason::RequestTooLarge, now_ms),
+            Common::Blocked(reason) => Self::block(reason, now_ms),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum LinkState {
     InFlight(RequestId),
@@ -64,9 +170,7 @@ enum LinkState {
 pub(crate) struct Link {
     request: Request,
     state: LinkState,
-    failures: u32,
-    token_refused: bool,
-    redirects: u8,
+    policy: Policy,
 }
 
 impl Link {
@@ -81,9 +185,7 @@ impl Link {
         Self {
             request,
             state: LinkState::InFlight(id),
-            failures: 0,
-            token_refused: false,
-            redirects: 0,
+            policy: Policy::default(),
         }
     }
 
@@ -124,46 +226,35 @@ impl Link {
         self.state = LinkState::InFlight(id);
     }
 
-    fn wait(&mut self, at_ms: u64, jitter_ms: u64, attempt: Attempt, actions: &mut Vec<Action>) {
-        actions.push(Action::Timer { at_ms, jitter_ms });
-        self.state = LinkState::Waiting { at_ms, attempt };
-    }
-
-    fn backoff(
+    /// Carries out what the policy decided. `Err` is a reset.
+    fn carry(
         &mut self,
-        retry_after: Option<Duration>,
-        attempt: Attempt,
-        now_ms: u64,
-        actions: &mut Vec<Action>,
-    ) {
-        self.failures = self.failures.saturating_add(1);
-        let floor = retry_after.map_or(0, |after| {
-            u64::try_from(after.as_millis())
-                .unwrap_or(u64::MAX)
-                .min(RETRY_AFTER_CAP_MS)
-        });
-        self.wait(
-            now_ms.saturating_add(floor),
-            backoff_ms(self.failures),
-            attempt,
-            actions,
-        );
-    }
-
-    fn block(
-        &mut self,
-        reason: BlockedReason,
-        now_ms: u64,
+        next: Next,
         ctx: &mut Ctx,
         actions: &mut Vec<Action>,
-    ) {
-        ctx.set_condition(Some(Condition::Blocked(reason)), actions);
-        self.wait(
-            now_ms.saturating_add(BLOCKED_RETRY_MS),
-            0,
-            Attempt::default(),
-            actions,
-        );
+    ) -> Result<(), ResetKind> {
+        match next {
+            Next::Wait {
+                at_ms,
+                jitter_ms,
+                attempt,
+                condition,
+            } => {
+                ctx.set_condition(Some(condition), actions);
+                actions.push(Action::Timer { at_ms, jitter_ms });
+                self.state = LinkState::Waiting { at_ms, attempt };
+            }
+            Next::Resend(attempt) => self.resend(attempt, ctx, actions),
+            Next::Head(reason) => {
+                let head = Self::send(Request::new(Method::Head, Target::Stream), ctx, actions);
+                self.state = LinkState::Checking {
+                    head: Box::new(head),
+                    reason,
+                };
+            }
+            Next::Reset(kind) => return Err(kind),
+        }
+        Ok(())
     }
 
     /// Carries out what an answer without a producer outcome decided. `Err` is a reset.
@@ -175,53 +266,11 @@ impl Link {
         ctx: &mut Ctx,
         actions: &mut Vec<Action>,
     ) -> Result<(), ResetKind> {
-        if !matches!(common, Common::Reauthorize) {
-            self.token_refused = false;
+        if let Common::LowerLimit { bytes } = common {
+            ctx.limits.named = Some(ctx.limits.named.map_or(bytes, |named| named.min(bytes)));
         }
-        match common {
-            Common::Reset(kind) => return Err(kind),
-            Common::Resend { fresh, .. } => {
-                ctx.set_condition(Some(Condition::Retrying), actions);
-                let attempt = Attempt {
-                    fresh_connection: fresh,
-                    refresh_token: false,
-                };
-                self.backoff(retry_after, attempt, now_ms, actions);
-            }
-            Common::Head(reason) => {
-                let head = Self::send(Request::new(Method::Head, Target::Stream), ctx, actions);
-                self.state = LinkState::Checking {
-                    head: Box::new(head),
-                    reason,
-                };
-            }
-            Common::Reauthorize if self.token_refused => {
-                self.block(BlockedReason::Unauthorized, now_ms, ctx, actions);
-            }
-            Common::Reauthorize => {
-                self.token_refused = true;
-                let attempt = Attempt {
-                    fresh_connection: false,
-                    refresh_token: true,
-                };
-                self.resend(attempt, ctx, actions);
-            }
-            Common::Redirect { location } => {
-                self.redirects = self.redirects.saturating_add(1);
-                if self.redirects > REDIRECTS {
-                    self.block(BlockedReason::Redirected { location }, now_ms, ctx, actions);
-                } else {
-                    ctx.set_condition(Some(Condition::Retrying), actions);
-                    self.backoff(None, Attempt::default(), now_ms, actions);
-                }
-            }
-            Common::LowerLimit { bytes } => {
-                ctx.limits.named = Some(ctx.limits.named.map_or(bytes, |named| named.min(bytes)));
-                self.block(BlockedReason::RequestTooLarge, now_ms, ctx, actions);
-            }
-            Common::Blocked(reason) => self.block(reason, now_ms, ctx, actions),
-        }
-        Ok(())
+        let next = self.policy.decide(common, retry_after, now_ms);
+        self.carry(next, ctx, actions)
     }
 
     /// The answer to the HEAD this request waits on. `Err` is a reset.
@@ -239,25 +288,23 @@ impl Link {
         match decide_head(exchange, &ctx.cluster_id, ctx.incarnation) {
             HeadDecision::Rewound => Err(ResetKind::Rewound),
             HeadDecision::Deleted => Err(ResetKind::Deleted),
-            HeadDecision::WrongCluster => {
-                self.block(BlockedReason::WrongCluster, now_ms, ctx, actions);
-                Ok(())
-            }
+            HeadDecision::WrongCluster => self.carry(
+                Policy::block(BlockedReason::WrongCluster, now_ms),
+                ctx,
+                actions,
+            ),
             HeadDecision::Same { max_request_bytes } => {
                 ctx.limits.head = max_request_bytes;
                 ctx.limits.named = None;
-                match reason {
+                let next = match reason {
                     // Our token unchanged: the request is retried.
                     HeadReason::Precondition => {
-                        ctx.set_condition(Some(Condition::Retrying), actions);
-                        self.backoff(None, Attempt::default(), now_ms, actions);
+                        self.policy.backoff(None, Attempt::default(), now_ms)
                     }
                     // No re-cut in M1, whatever the advertised limit.
-                    HeadReason::TooLarge => {
-                        self.block(BlockedReason::RequestTooLarge, now_ms, ctx, actions);
-                    }
-                }
-                Ok(())
+                    HeadReason::TooLarge => Policy::block(BlockedReason::RequestTooLarge, now_ms),
+                };
+                self.carry(next, ctx, actions)
             }
             HeadDecision::Common(common) => {
                 // The HEAD's own failure: a HEAD never waits on another HEAD.

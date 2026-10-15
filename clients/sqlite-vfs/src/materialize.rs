@@ -151,21 +151,37 @@ pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
 
 /// Logs the foreign `frames` (COMMITs, then one ACK at the last), fsyncs the log, applies them,
 /// fsyncs the db and appends a BASE, so a crash midway replays. Refused while this generation has
-/// pending commits.
-pub(crate) fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<(), LocalError> {
+/// pending commits: commits after both the log's latest ACK and `acked`, the position the caller
+/// knows acknowledged (a takeover's reconcile acknowledges commits before any ACK names them).
+pub(crate) fn catch_up(
+    m: &mut Materialized,
+    acked: Position,
+    frames: &[ForeignFrame],
+) -> Result<(), LocalError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    // Foreign frames go after our pending commits only by discarding them, which rebuilds.
+    let acked = acked.max(m.log.acked());
+    if let Some(&(first, _)) = m.recovered.pending().iter().find(|(p, _)| *p > acked) {
+        return Err(LocalError::OwnPending { first });
+    }
+    let db_path = m.generation.db();
+    catch_up_files(&mut m.log, &m.db, &db_path, frames)
+}
+
+/// [`catch_up`] into a log and db file of any generation, a published one or one being built,
+/// with no check of pending commits: the caller knows there are none.
+pub(crate) fn catch_up_files(
+    log: &mut Log,
+    db: &File,
+    db_path: &Path,
+    frames: &[ForeignFrame],
+) -> Result<(), LocalError> {
     let Some(last) = frames.last() else {
         return Ok(());
     };
-    // Foreign frames go after our pending commits only by discarding them, which rebuilds.
-    if let Some(&(first, _)) = m
-        .recovered
-        .pending()
-        .iter()
-        .find(|(p, _)| *p > m.log.acked())
-    {
-        return Err(LocalError::OwnPending { first });
-    }
-    let mut log_bytes = m.log.log_bytes();
+    let mut log_bytes = log.log_bytes();
     let mut logged = Vec::new();
     for f in frames {
         let bytes = match &f.frame {
@@ -178,18 +194,17 @@ pub(crate) fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<
         };
         log_bytes = log_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         if matches!(f.frame, Frame::Commit { .. }) {
-            let position = m.log.append(&RecordBody::Commit { frame: bytes })?;
+            let position = log.append(&RecordBody::Commit { frame: bytes })?;
             logged.push(position);
         }
     }
-    let acked = logged.last().copied().unwrap_or_else(|| m.log.acked());
-    m.log.append(&RecordBody::Ack {
+    let acked = logged.last().copied().unwrap_or_else(|| log.acked());
+    log.append(&RecordBody::Ack {
         acked,
         acked_offset: last.end_offset,
         log_bytes,
     })?;
-    m.log.sync()?;
-    let db_path = m.generation.db();
+    log.sync()?;
     let commits = frames
         .iter()
         .filter_map(|f| match &f.frame {
@@ -198,8 +213,8 @@ pub(crate) fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<
         })
         .zip(logged)
         .map(|(compressed, position)| (position, compressed));
-    if apply_compressed(&m.db, &db_path, commits)? {
-        base(m)?;
+    if apply_compressed(db, db_path, commits)? {
+        base_files(log, db, db_path)?;
     }
     Ok(())
 }
@@ -209,9 +224,13 @@ pub(crate) fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<
 /// position instead, since a logged commit may be undecided then.
 fn base(m: &mut Materialized) -> Result<(), LocalError> {
     let db_path = m.generation.db();
-    m.db.sync_all().map_err(io("fsync", &db_path))?;
-    let last = Position(m.log.next_position().0.saturating_sub(1));
-    m.log.append(&RecordBody::Base { position: last })?;
+    base_files(&mut m.log, &m.db, &db_path)
+}
+
+fn base_files(log: &mut Log, db: &File, db_path: &Path) -> Result<(), LocalError> {
+    db.sync_all().map_err(io("fsync", db_path))?;
+    let last = Position(log.next_position().0.saturating_sub(1));
+    log.append(&RecordBody::Base { position: last })?;
     Ok(())
 }
 

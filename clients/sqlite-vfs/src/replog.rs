@@ -15,7 +15,8 @@
 //! write fails. [`Log::sync`] fdatasyncs the current segment when it holds unsynced records. A roll
 //! fdatasyncs the segment it leaves and fsyncs the new one and the directory before the first
 //! record goes there, so no record of a later segment outlives an earlier one's. [`Log::trim`]
-//! fsyncs, then deletes the segments whose records are all at or below `min(base, acked)` (F3).
+//! deletes the segments whose records are all at or below `min(base, acked)` (F3), after an fsync
+//! that makes those records durable, and does nothing (no fsync) when no segment would go.
 
 use std::fs::File;
 use std::fs::{self};
@@ -623,11 +624,11 @@ impl Log {
         Ok(())
     }
 
-    /// fsyncs the log, then deletes the segments whose records all lie at or below
-    /// `min(base, acked)` of the records now durable (F3). The current segment stays. Returns
+    /// Deletes the segments whose records all lie at or below `min(base, acked)` (F3), after
+    /// fsyncing the log so the records that make them unnecessary are durable. With nothing to
+    /// delete it does nothing. The current segment stays. Returns
     /// how many were deleted.
     pub(crate) fn trim(&mut self) -> Result<usize, LogError> {
-        self.sync()?;
         let durable_min = self.state.base.min(self.state.acked);
         // Segment i holds positions below segment i+1's first.
         let removable = self
@@ -637,6 +638,11 @@ impl Log {
                 |w| matches!(w, [_, next] if next.first.0 <= durable_min.0.saturating_add(1)),
             )
             .count();
+        if removable == 0 {
+            return Ok(0);
+        }
+        // The records that make the segments unnecessary are durable before any goes.
+        self.sync()?;
         // From the front, oldest first, each unlink durable before the next, and a segment leaves
         // the list only once it is gone for good: a failed step leaves both as they were.
         for _ in 0..removable {

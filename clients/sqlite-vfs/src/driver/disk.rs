@@ -1,0 +1,126 @@
+//! The driver's disk jobs: the local work of opens and takeovers that may take long (materialize,
+//! a build's reads applied, a publish, a catch-up in place). The core hands each out as an
+//! [`super::Io::Disk`] and gets its [`DiskDone`] back, so the runtime runs them off the driver
+//! thread and one database's catch-up never stalls the others. The state a job works on (a
+//! generation, a build) moves into the job and comes back in its outcome, and every job holds
+//! the stream's root (its lock) while it runs.
+
+use std::sync::Arc;
+
+use ursula_headers::ClusterId;
+use ursula_headers::Epoch;
+use ursula_headers::Incarnation;
+use ursula_headers::Offset;
+
+use crate::generation::CanonicalPath;
+use crate::generation::Root;
+use crate::ids::Activation;
+use crate::ids::Lineage;
+use crate::ids::Position;
+use crate::materialize;
+use crate::materialize::ForeignFrame;
+use crate::materialize::LocalError;
+use crate::materialize::Materialized;
+use crate::open::Build;
+use crate::open::OpenError;
+use crate::open::OpenSpec;
+use crate::open::Prepared;
+use crate::open::new_build;
+use crate::open::prepare;
+
+/// A build to start: a fresh generation in `gen-<lineage>.tmp`, read up to `end`.
+#[derive(Debug)]
+pub(crate) struct NewBuild {
+    pub(crate) root: Arc<Root>,
+    pub(crate) name: CanonicalPath,
+    pub(crate) lineage: Lineage,
+    pub(crate) cluster_id: ClusterId,
+    pub(crate) incarnation: Incarnation,
+    /// The first position of its log: above every position the generation it replaces logged.
+    pub(crate) first: Position,
+    /// A rebuild's claim, logged in the new generation.
+    pub(crate) claim: Option<(Epoch, Activation)>,
+    pub(crate) end: Offset,
+}
+
+#[derive(Debug)]
+pub(crate) enum DiskJob {
+    /// An open's local steps ([`prepare`]).
+    Prepare(OpenSpec),
+    NewBuild(NewBuild),
+    /// One read's frames into a build.
+    Chunk {
+        build: Box<Build>,
+        frames: Vec<ForeignFrame>,
+    },
+    /// A complete build, published.
+    Publish(Box<Build>),
+    /// One read of a takeover's catch-up in place, nothing pending.
+    CatchUp {
+        m: Box<Materialized>,
+        frames: Vec<ForeignFrame>,
+        /// Holds the root's lock while the job runs.
+        root: Arc<Root>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum DiskDone {
+    Prepared(Result<Prepared, OpenError>),
+    Built(Result<Box<Build>, OpenError>),
+    Chunk {
+        build: Box<Build>,
+        result: Result<(), OpenError>,
+    },
+    Published(Result<(Box<Materialized>, Option<Epoch>), OpenError>),
+    /// The last position the frames took and the log's bytes.
+    CaughtUp {
+        m: Box<Materialized>,
+        outcome: Result<(Position, u64), LocalError>,
+    },
+    /// The job panicked: what it worked on is gone.
+    Panicked,
+}
+
+/// The last position a generation's log took, and its frame bytes.
+pub(crate) fn caught_up(m: &Materialized) -> (Position, u64) {
+    (
+        Position(m.log.next_position().0.saturating_sub(1)),
+        m.log.log_bytes(),
+    )
+}
+
+impl DiskJob {
+    pub(crate) fn run(self) -> DiskDone {
+        match self {
+            Self::Prepare(spec) => DiskDone::Prepared(prepare(&spec)),
+            Self::NewBuild(job) => DiskDone::Built(new_build(job).map(Box::new)),
+            Self::Chunk { mut build, frames } => {
+                let result = build.apply(&frames);
+                DiskDone::Chunk { build, result }
+            }
+            Self::Publish(build) => {
+                DiskDone::Published(build.publish().map(|(m, highest)| (Box::new(m), highest)))
+            }
+            Self::CatchUp {
+                mut m,
+                frames,
+                root,
+            } => {
+                let outcome = catch_up(&mut m, &frames);
+                drop(root);
+                DiskDone::CaughtUp { m, outcome }
+            }
+        }
+    }
+}
+
+/// Logs the frames as COMMIT records with an ACK covering them, fsyncs, then applies them. The
+/// replicator asks for a catch-up in place only with nothing pending, so the frames go straight
+/// after the log (its reconcile may have acknowledged commits no ACK names yet, which the
+/// pending check of [`materialize::catch_up`] cannot know).
+fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<(Position, u64), LocalError> {
+    let db_path = m.generation.db();
+    materialize::catch_up_files(&mut m.log, &m.db, &db_path, frames)?;
+    Ok(caught_up(m))
+}
