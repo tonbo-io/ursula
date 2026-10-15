@@ -26,6 +26,11 @@ Producer writes now get a typed answer to every repeat, so a client resolves an 
 - **A create with producer headers answers `400`.** Create the stream, then claim an epoch.
 - **Producer metrics changed.** Each record keeps one receipt, so the per-group state gauges in `/__ursula/metrics` no longer report `receipts`, `receipt_items` or `max_receipt_items_per_stream`. New: the `floored_streams` gauge counts streams with an epoch floor, and the `producer_expired_answers` counter counts writes answered `producer-expired`.
 
+### Request limits
+
+- **`HEAD` advertises the request and snapshot limits.** Every successful `HEAD` of a stream carries `Ursula-Max-Request-Bytes: 33554432`, the largest request body any request to the stream may carry, and, on a node with a cold backend, `Ursula-Max-Snapshot-Bytes: 1073741824`, the largest snapshot it accepts. The gateway lowers `Ursula-Max-Request-Bytes` to its own limit for the request, the smaller of `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, on every response that carries it. See [server metadata](/docs/specs/extensions#10-server-metadata).
+- **Every `413` names the limit it applied.** A node's and a gateway's `413` carry `Ursula-Max-Request-Bytes`, or `Ursula-Max-Snapshot-Bytes` for a snapshot above 1 GiB, set to the limit. 0.7 sent a bare `413` with a text body. A node refuses a declared `Content-Length` above the limit before it reads the body, and a snapshot publish above 32 MiB on a node without a cold backend is now refused from its `Content-Length` too, where 0.7 read 32 MiB of it first. A tenant's `max_request_body_bytes` now stops the gateway's reading at that limit instead of at `--max-request-body-bytes`.
+
 ## 0.7.5
 
 0.7.5 is a drop-in patch for 0.7.0, 0.7.1, 0.7.2, 0.7.3 and 0.7.4: format epoch 3 is unchanged, with no storage, snapshot, WAL or Raft protocol change. Upgrade in place with an ordinary rolling restart (`helm upgrade`). No fresh install or data move is needed.

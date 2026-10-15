@@ -30,6 +30,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
 - [9. Read Path](#9-read-path)
+- [10. Server Metadata](#10-server-metadata)
 
 ---
 
@@ -111,10 +112,10 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 - `404 Not Found`: Stream does not exist.
 - `409 Conflict`: `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
-- `413 Payload Too Large`: Snapshot exceeds the server's size limit.
+- `413 Payload Too Large`: Snapshot exceeds the server's size limit. The response names the limit it applied (Section 10).
 - `503 Service Unavailable`: For a JSON stream, the server could not verify that `snapshot_offset` is a message boundary. It MUST NOT publish an unverified offset; the client MAY retry.
 
-> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB; only the reference is replicated, and the digest is the same as for an inline body.
+> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB in one request. Only the reference is replicated, and the digest is the same as for an inline body. A body above 32 MiB without a cold backend answers `413` with `Ursula-Max-Request-Bytes`, and one above 1 GiB with a cold backend answers `413` with `Ursula-Max-Snapshot-Bytes`.
 
 **Idempotency:**
 
@@ -456,3 +457,20 @@ A `live=sse` read of a stream whose content type is neither `text/*` nor `applic
 - Each data event is followed by an `event: control` event whose `streamNextOffset` is the offset just past the decoded bytes.
 
 There is no client opt-in or opt-out: the stream's content type decides the encoding.
+
+---
+
+## 10. Server Metadata
+
+A server implementing this extension sends on every successful `HEAD` of a stream:
+
+- `Ursula-Max-Request-Bytes: <bytes>`: the largest request body that any request to the stream may carry, as far as the server and the intermediaries that implement this section know.
+- `Ursula-Max-Snapshot-Bytes: <bytes>`, when the server accepts snapshots larger than `Ursula-Max-Request-Bytes`: the largest snapshot it accepts.
+
+Both values are canonical decimal integers: no sign and no leading zero.
+
+**Size refusals.** A server that refuses a request for its size MUST answer `413 Payload Too Large` with the header of the limit it applied, set to that limit: `Ursula-Max-Request-Bytes` for a request body, `Ursula-Max-Snapshot-Bytes` for a snapshot. It SHOULD decide the refusal from `Content-Length` before reading the body. A body without `Content-Length` is refused once it crosses the limit, after the server read that much, and the client may then see a reset instead of the `413`. Clients that want the typed answer send `Content-Length`.
+
+**Intermediaries.** An intermediary that limits request bodies and implements this section MUST replace `Ursula-Max-Request-Bytes` on every response that carries it with the smaller of the received value and its own limit for that request, and MUST answer its own size refusals as above. It leaves `Ursula-Max-Snapshot-Bytes` alone. A `413` without either header comes from a layer that does not implement this section, such as a proxy with its own body limit. It tells the client only that some layer refused the size.
+
+> **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes). With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in one request and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit.
