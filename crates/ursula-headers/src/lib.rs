@@ -21,7 +21,9 @@
 //! - the routing answers a node sends before it reads the body (Section
 //!   5.7);
 //! - the `412` of the incarnation precondition and the `409` of a closed
-//!   stream.
+//!   stream;
+//! - the JSON body of every error answer, `{"error":"<code>"}`, with its
+//!   stable code (Section 11).
 //!
 //! Not yet typed: the `400` of a `Producer-Digest` mismatch, the answer of a
 //! retention request (`Stream-Retained-Offset`), and the immutable-read
@@ -69,10 +71,13 @@
 //!   not lead the stream's group.
 //! - [`refusal`]: [`IncarnationMismatch`] (`412`) and
 //!   [`StreamClosedConflict`] (`409`).
+//! - [`error_body`]: [`ErrorBody`], the body of every error answer, and its
+//!   [`ErrorCode`].
 //! - [`error`]: the one error, [`HeaderError`].
 
 pub mod answer;
 pub mod error;
+pub mod error_body;
 pub mod head;
 pub mod limit;
 pub mod names;
@@ -97,6 +102,8 @@ pub use answer::Outcome;
 pub use answer::ProducerAnswer;
 pub use answer::Receipt;
 pub use error::HeaderError;
+pub use error_body::ErrorBody;
+pub use error_body::ErrorCode;
 pub use head::CLUSTER_ID_MAX_BYTES;
 pub use head::ClusterId;
 pub use head::Inherited;

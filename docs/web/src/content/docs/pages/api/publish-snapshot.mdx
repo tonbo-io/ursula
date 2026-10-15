@@ -44,7 +44,9 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
 | `413` | The body is above `Ursula-Max-Request-Bytes`, which the response names. For a commit of parts, the assembled snapshot is above `Ursula-Max-Snapshot-Bytes`, which the response names instead. |
 | `501` | A commit of parts on a node without a cold backend. |
 | `502` | The cold backend failed while storing the body or copying the parts. |
-| `503` | Retry after `Retry-After`. Nothing was published. The JSON `error` names the cause: `SnapshotCommitsBusy` (every copy slot taken, or no room in the in-flight budget beside a request), `SnapshotCommitInProgress` (this commit runs now), `IngressBodyBytesLimitReached`, `WalDiskPressure` or `RaftLogPressure`. A plain-text `503` means no leader is known, or, on a JSON stream, that Ursula could not read the byte before the offset to check the boundary. |
+| `503` | Retry after `Retry-After`. Nothing was published. The error body names the cause: `SnapshotCommitsBusy` (every copy slot taken, or no room in the in-flight budget beside a request), `SnapshotCommitInProgress` (this commit runs now), `IngressBodyBytesLimitReached`, `WalDiskPressure`, `RaftLogPressure`, `NoLeader` (no leader is known), or `JsonBoundaryUnverified` (on a JSON stream, Ursula could not read the byte before the offset to check the boundary). |
+
+Every error answer carries a JSON body that names its code, such as `{"error":"SnapshotConflict"}`. See [errors](/docs/api/overview#errors).
 
 A `204` carries `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Incarnation`. A publish is keyed by its offset and digest. Repeating the same offset, content type, and body returns the same digest while that snapshot is the latest. Reusing an offset with different content returns `409`.
 

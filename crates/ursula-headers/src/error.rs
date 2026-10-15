@@ -1,5 +1,5 @@
-//! The one error of parsing Ursula's headers and the parts manifest, and of
-//! constructing a value that would not round-trip.
+//! The one error of parsing Ursula's headers, the parts manifest and error
+//! bodies, and of constructing a value that would not round-trip.
 
 use std::error::Error;
 use std::fmt;
@@ -103,6 +103,10 @@ pub enum HeaderError {
     /// `Content-Range` is not `bytes first-last/total` with `first <= last <
     /// total` on a `206`, or `bytes */total` on a `416`.
     InvalidContentRange,
+    /// An error answer's body is not `{"error":"<code>"}`.
+    InvalidErrorBody,
+    /// An error body names a code this version does not know.
+    UnknownErrorCode,
 }
 
 impl fmt::Display for HeaderError {
@@ -235,6 +239,10 @@ impl fmt::Display for HeaderError {
                  `bytes */total` on a 416",
                 names::CONTENT_RANGE
             ),
+            Self::InvalidErrorBody => {
+                write!(f, r#"an error body must be {{"error":"<code>"}}"#)
+            }
+            Self::UnknownErrorCode => write!(f, "an error body names an unknown code"),
             Self::DuplicateManifestPart { line } => {
                 write!(
                     f,

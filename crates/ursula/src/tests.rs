@@ -1552,11 +1552,9 @@ async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
         response.headers().get(axum::http::header::RETRY_AFTER),
         Some(&axum::http::HeaderValue::from_static("1"))
     );
-    let body = body_bytes(response).await;
-    assert!(
-        std::str::from_utf8(&body)
-            .expect("utf8 body")
-            .contains("live read waiters")
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::LiveReadBackpressure
     );
 
     first.abort();
@@ -1858,6 +1856,10 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_get(&app, "/benchcmp/raft-retention?offset=0").await;
     assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::StreamGone
+    );
 
     let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);

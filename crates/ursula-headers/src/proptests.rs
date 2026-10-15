@@ -19,6 +19,7 @@ use crate::answer::EpochClosure;
 use crate::answer::Outcome;
 use crate::answer::ProducerAnswer;
 use crate::answer::Receipt;
+use crate::error_body::ErrorBody;
 use crate::head::ClusterId;
 use crate::head::Inherited;
 use crate::head::ServerIdentity;
@@ -550,6 +551,24 @@ proptest! {
         if let Ok(manifest) = PartsManifest::parse(count, &body) {
             prop_assert_eq!(manifest.count(), count);
             prop_assert_eq!(manifest.render().into_bytes(), body);
+        }
+    }
+
+    #[test]
+    fn error_body_parser_never_panics(
+        body in prop_oneof![
+            vec(any::<u8>(), 0..64),
+            vec(
+                prop_oneof![
+                    Just(b'{'), Just(b'}'), Just(b'"'), Just(b':'), Just(b' '),
+                    Just(b'e'), Just(b'r'), Just(b'o'), Just(b'N'),
+                ],
+                0..32,
+            ),
+        ],
+    ) {
+        if let Ok(parsed) = ErrorBody::parse(&body) {
+            prop_assert_eq!(ErrorBody::parse(parsed.render().as_bytes()), Ok(parsed));
         }
     }
 }

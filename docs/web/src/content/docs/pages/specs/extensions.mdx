@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, snapshot upload in parts, byte ranges on snapshot reads, multipart bootstrap delivery, write keys with typed answers, server metadata, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, snapshot upload in parts, byte ranges on snapshot reads, multipart bootstrap delivery, write keys with typed answers, server metadata, error bodies, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -31,6 +31,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [8. URL Encoding](#8-url-encoding)
 - [9. Read Path](#9-read-path)
 - [10. Server Metadata](#10-server-metadata)
+- [11. Error Bodies](#11-error-bodies)
 
 ---
 
@@ -452,7 +453,7 @@ A server MAY answer a producer write that carries `Stream-Incarnation` before re
 
 A server that does not lead a stream's writes answers a write `307 Temporary Redirect` to the server that does, or `503 Service Unavailable` with `Retry-After` when it knows none, before it reads any of the request body, so that a proxy that sent `Expect: 100-continue` can send the unread body elsewhere. Once it has read any of the body, a server MUST NOT answer with a redirect. The client resolves the outcome of a request it could not complete by repeating it (Section 5.6).
 
-> **Note (informative).** Ursula routes a create, an append or close, and a snapshot publish before its body. The redirect carries `x-ursula-raft-leader-id`, `x-ursula-raft-group` and `x-ursula-raft-term`, so a router can cache the leader per group and discard a hint of an older term. The `503` carries `x-ursula-raft-group`. A node that hosts no replica of the group redirects to a node that does and names only the group, in `x-ursula-raft-group`, since it knows no leader and no term. A `307` that carries `x-ursula-raft-group` without `x-ursula-raft-leader-id` and `x-ursula-raft-term` is such a redirect, and its target answers as any replica does. Every other redirect, of a read as of a write, carries the leader, the group and the term. A node that knows a leader but not its term answers `503` with `Retry-After` and `x-ursula-raft-group` instead, so every `307` it sends parses as one of these two shapes. A node that loses the group's leadership while it reads a body answers `503` with `Retry-After`.
+> **Note (informative).** Ursula routes a create, an append or close, and a snapshot publish before its body. The redirect carries `x-ursula-raft-leader-id`, `x-ursula-raft-group` and `x-ursula-raft-term`, so a router can cache the leader per group and discard a hint of an older term. The `503` carries `x-ursula-raft-group`. A node that hosts no replica of the group redirects to a node that does and names only the group, in `x-ursula-raft-group`, since it knows no leader and no term. A `307` that carries `x-ursula-raft-group` without `x-ursula-raft-leader-id` and `x-ursula-raft-term` is such a redirect, and its target answers as any replica does. Every other redirect, of a read as of a write, carries the leader, the group and the term. A node that knows a leader but not its term answers `503` with `Retry-After` and `x-ursula-raft-group` instead, so every `307` it sends parses as one of these two shapes. A node that loses the group's leadership while it reads a body answers `503` with `Retry-After`. Each of these `503`s carries the error body `NoLeader` (Section 11).
 
 ---
 
@@ -520,7 +521,7 @@ There is no client opt-in or opt-out: the stream's content type decides the enco
 
 A server implementing this extension sends on every answer to a `HEAD`, `404`, redirects and `503` included:
 
-- `Ursula-Protocol: 2`, the version of the contract that Sections 2.4, 5 and 10 define. A later breaking change to them raises it. A server that sends none speaks version 1. A client MAY refuse a server that sends a lower version or none.
+- `Ursula-Protocol: 2`, the version of the contract that Sections 2.4, 5, 10 and 11 define. A later breaking change to them raises it. A server that sends none speaks version 1. A client MAY refuse a server that sends a lower version or none.
 - `Ursula-Cluster-Id: <id>`: 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, naming the deployment that serves the request. It does not change across restarts, upgrades, leader changes or history events, and an operator keeps it when a restore replaces a deployment. Two deployments that one client can reach MUST NOT share an id. A client that keeps state across requests SHOULD keep the id with it, and treat a different id as a different deployment, not as a new history of the same stream.
 
 These two headers are route-level, so a client tells a host alias routed to another deployment from a deleted stream. Intermediaries pass them through. They come on answers from a server: an answer an intermediary sends itself, such as a gateway's `401`, `403`, `429` or `503`, carries neither, and a client judges the protocol and the deployment only from answers that carry them.
@@ -534,6 +535,47 @@ Both values are canonical decimal integers: no sign and no leading zero.
 
 **Size refusals.** A server that refuses a request for its size MUST answer `413 Payload Too Large` with the header of the limit it applied, set to that limit: `Ursula-Max-Request-Bytes` for a request body, `Ursula-Max-Snapshot-Bytes` for a snapshot assembled from parts. It SHOULD decide the refusal from `Content-Length` before reading the body. A body without `Content-Length` is refused once it crosses the limit, after the server read that much, and the client may then see a reset instead of the `413`. Clients that want the typed answer send `Content-Length`.
 
-**Intermediaries.** An intermediary that limits request bodies and implements this section MUST replace `Ursula-Max-Request-Bytes` on every response that carries it with the smaller of the received value and its own limit for that request, and MUST answer its own size refusals as above. It leaves `Ursula-Max-Snapshot-Bytes` alone. A `413` without either header comes from a layer that does not implement this section, such as a proxy with its own body limit. It tells the client only that some layer refused the size.
+**Intermediaries.** An intermediary that limits request bodies and implements this section MUST replace `Ursula-Max-Request-Bytes` on every response that carries it with the smaller of the received value and its own limit for that request, and MUST answer its own size refusals as above. It leaves `Ursula-Max-Snapshot-Bytes` alone. A `413` without either header comes from a layer that does not implement this section, such as a proxy with its own body limit. It tells the client only that some layer refused the size. The error body of a typed `413` (Section 11) is `RequestTooLarge` for `Ursula-Max-Request-Bytes` and `SnapshotTooLarge` for `Ursula-Max-Snapshot-Bytes`. The header names the limit, and the body adds nothing to it.
 
 > **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes) on every route. With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in parts and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit. An Ursula cluster's id is set by its operator (`server.cluster_id`). A single node without one generates one at its first start and keeps it in its WAL.
+
+---
+
+## 11. Error Bodies
+
+Every error answer of a server implementing this extension, any `4xx` or `5xx`, carries one body shape:
+
+```
+Content-Type: application/json
+
+{"error":"<code>"}
+```
+
+`<code>` is a stable code of ASCII letters and digits that names the refusal, so a client matches it without parsing text. The status and the typed headers of Sections 2, 5 and 10 keep their meaning, and the body adds the code beside them: a `413` still names its limit in a header, a `503` still carries `Retry-After`, a producer refusal still carries `Producer-Outcome`. An answer to `HEAD` carries the `Content-Type` and no body. A redirect is no error answer and carries no error body.
+
+A client MUST NOT require the body. An answer from a layer that does not implement this section, such as a proxy, may carry any body or none, and a later version may add codes. A client that does not know a code acts on the status and the headers alone.
+
+An intermediary that implements this section renders its own error answers with the same shape, and passes the server's through unchanged.
+
+| Status | Codes |
+| ------ | ----- |
+| `400` | `InvalidRequest`, `InvalidHeader`, `InvalidQuery`, `InvalidOffset`, `InvalidBucketId`, `InvalidStreamId`, `InvalidProducer`, `ProducerDigestMismatch`, `MissingContentType`, `EmptyAppend`, `InvalidRecordBoundaries`, `NotJsonBoundary`, `InvalidRetention`, `InvalidSnapshot`, `InvalidColdFlush`, `ImportInvalid`, `InvalidPartsCommit`, `UnknownPart`, `SnapshotDigestMismatch`, `BodyUnreadable`, `Unsupported` |
+| `401` | `InvalidCredential`, `CredentialExpired` (an intermediary) |
+| `403` | `ProducerEpochClosed`, `ProducerEpochStale`, `ProducerExpired`, `ProducerKeyConflict`, and `Forbidden` (an intermediary) |
+| `404` | `StreamNotFound`, `BucketNotFound`, `BucketErased`, `SnapshotNotFound`, `NotFound` (no such route, or an intermediary concealing a resource) |
+| `405` | `MethodNotAllowed`, `Unsupported` (the removed latest-snapshot path) |
+| `409` | `StreamClosed`, `StreamSeqConflict`, `ContentTypeMismatch`, `StreamAlreadyExistsConflict`, `ProducerSeqConflict`, `SnapshotConflict`, `ImportConflict` |
+| `410` | `StreamGone` |
+| `412` | `IncarnationMismatch` |
+| `413` | `RequestTooLarge`, `SnapshotTooLarge` |
+| `416` | `OffsetOutOfRange`, `RangeNotSatisfiable` (a snapshot read's byte range) |
+| `429` | `ProducerLimit`, and `RateLimited`, `LiveReadsExhausted` (an intermediary) |
+| `500` | `Internal`, `CreatedAtOutOfRange`, `ColdStoreFailed` |
+| `501` | `NoColdStore` |
+| `502` | `ColdStoreFailed`, `UpstreamFailed` (an intermediary) |
+| `503` | `NoLeader`, `WalDiskPressure`, `RaftLogPressure`, `IngressBodyBytesLimitReached`, `ColdBackpressure`, `RaftUncommittedBackpressure`, `LiveReadBackpressure`, `HistoryPending`, `ApplyStopped`, `OutcomeUnknown`, `JsonBoundaryUnverified`, `SnapshotCommitsBusy`, `SnapshotCommitInProgress`, `ColdStoreFailed`, and `AuthenticationUnavailable`, `AuthorizationUnavailable`, `NoUpstream`, `UpstreamUnreachable` (an intermediary) |
+| `504` | `UpstreamTimeout` (an intermediary) |
+
+A code says what refused the request. It says nothing more about a write's outcome than its status does: `OutcomeUnknown`, like any `503` after the body was read, leaves the outcome unknown (Section 5.6).
+
+> **Note (informative).** `ursula-headers` defines the codes (`ErrorCode`) and parses and renders the body (`ErrorBody`). Ursula's operator routes under `/__ursula/` keep their own answers.

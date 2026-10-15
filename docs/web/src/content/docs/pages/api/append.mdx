@@ -60,7 +60,9 @@ api: "POST /{bucket}/{stream}"
 | `409` | Content type does not match the stream, stream is already closed (also for a close with producer headers that is not a repeat of the producer's own close), `Stream-Seq` not greater than the stored value, or `Producer-Seq` out of order. |
 | `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. Nothing was appended; the response's `Stream-Incarnation` is the current token. |
 | `413` | Body larger than 32 MiB. `Ursula-Max-Request-Bytes` names the limit, and a gateway with a smaller limit names its own. |
-| `503` | Write admission refused the append (the JSON `error` names `WalDiskPressure`, `RaftLogPressure` or `IngressBodyBytesLimitReached`), or the stream's Raft group refused it with cold-write or uncommitted-bytes backpressure. A node also answers `503` when it knows no leader for the group yet (with `x-ursula-raft-group`), when it knows no node that hosts the group, and when it lost the group's leadership while it read the body. Retry after the duration in `Retry-After`. |
+| `503` | Write admission refused the append (`WalDiskPressure`, `RaftLogPressure` or `IngressBodyBytesLimitReached`), or the stream's Raft group refused it with cold-write or uncommitted-bytes backpressure (`ColdBackpressure` or `RaftUncommittedBackpressure`). A node also answers `503 NoLeader` when it knows no leader for the group yet (with `x-ursula-raft-group`), when it knows no node that hosts the group, and when it lost the group's leadership while it read the body. Retry after the duration in `Retry-After`. |
+
+Every error answer carries a JSON body that names its code, such as `{"error":"StreamClosed"}`. See [errors](/docs/api/overview#errors).
 
 Any answer other than a `2xx` or a producer refusal of [extensions Section 5.3](/docs/specs/extensions#53-producer-write-answers) leaves the outcome unknown: repeat the same write. See [write outcomes](/docs/api/overview#write-outcomes).
 

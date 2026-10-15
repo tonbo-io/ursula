@@ -29,6 +29,7 @@ use axum::http::header::LOCATION;
 use axum::http::header::RETRY_AFTER;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use ursula_headers::ErrorCode;
 use ursula_headers::NodeId;
 use ursula_headers::RaftGroup;
 use ursula_headers::RaftTerm;
@@ -45,6 +46,7 @@ use ursula_shard::RaftGroupId;
 use crate::HttpState;
 use crate::admission::AdmissionPermit;
 use crate::admission::DeferredAdmission;
+use crate::render::error_answer;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 
@@ -198,12 +200,11 @@ fn routing_response(answer: RoutingAnswer, location: Option<&str>) -> Response {
         }
         _ => {
             headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
-            (
+            error_answer(
                 StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::NoLeader,
                 headers,
-                "no leader of the stream's group is known",
             )
-                .into_response()
         }
     }
 }

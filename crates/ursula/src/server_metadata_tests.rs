@@ -16,6 +16,7 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use tower::ServiceExt;
+use ursula_headers::ErrorCode;
 use ursula_headers::PROTOCOL_VERSION;
 use ursula_headers::ServerIdentity;
 use ursula_headers::SizeLimit;
@@ -27,6 +28,7 @@ use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
+use crate::render::error_code_of;
 use crate::router;
 
 const OCTET: &str = "application/octet-stream";
@@ -214,6 +216,11 @@ async fn a_declared_body_over_the_request_limit_is_refused_before_it_is_read() {
             Some(SizeLimit::Request(REQUEST_LIMIT)),
             "{method}"
         );
+        assert_eq!(
+            error_code_of(response).await,
+            ErrorCode::RequestTooLarge,
+            "{method}"
+        );
         assert!(!polled.load(Ordering::SeqCst), "{method} read the body");
     }
 }
@@ -240,6 +247,11 @@ async fn a_chunked_body_crossing_the_request_limit_names_it() {
         assert_eq!(
             named_limit(&response),
             Some(SizeLimit::Request(REQUEST_LIMIT)),
+            "{method}"
+        );
+        assert_eq!(
+            error_code_of(response).await,
+            ErrorCode::RequestTooLarge,
             "{method}"
         );
     }
@@ -270,6 +282,11 @@ async fn a_snapshot_over_the_request_limit_names_the_request_limit_with_or_witho
                 Some(SizeLimit::Request(REQUEST_LIMIT)),
                 "{store} {declared}"
             );
+            assert_eq!(
+                error_code_of(response).await,
+                ErrorCode::RequestTooLarge,
+                "{store} {declared}"
+            );
             assert!(!polled.load(Ordering::SeqCst), "{store}: read the body");
         }
 
@@ -286,6 +303,11 @@ async fn a_snapshot_over_the_request_limit_names_the_request_limit_with_or_witho
         assert_eq!(
             named_limit(&response),
             Some(SizeLimit::Request(REQUEST_LIMIT)),
+            "{store}"
+        );
+        assert_eq!(
+            error_code_of(response).await,
+            ErrorCode::RequestTooLarge,
             "{store}"
         );
     }

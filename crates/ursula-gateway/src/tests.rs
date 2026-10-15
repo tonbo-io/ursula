@@ -3883,3 +3883,116 @@ mod refused_bodies {
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
     }
 }
+
+/// Every answer the gateway sends itself carries the error body Ursula
+/// renders, `{"error":"<code>"}`, beside its typed headers.
+#[tokio::test]
+async fn the_gateways_own_answers_carry_an_error_body() {
+    let cases = [
+        (Refusal::NotFound.into_response(), 404, ErrorCode::NotFound),
+        (
+            Refusal::Authentication(AuthenticationError::InvalidCredential).into_response(),
+            401,
+            ErrorCode::InvalidCredential,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::WrongAudience).into_response(),
+            401,
+            ErrorCode::InvalidCredential,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::Expired).into_response(),
+            401,
+            ErrorCode::CredentialExpired,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::Unavailable).into_response(),
+            503,
+            ErrorCode::AuthenticationUnavailable,
+        ),
+        (
+            Refusal::Forbidden.into_response(),
+            403,
+            ErrorCode::Forbidden,
+        ),
+        (
+            Refusal::Authorization(AuthorizationError::Unavailable).into_response(),
+            503,
+            ErrorCode::AuthorizationUnavailable,
+        ),
+        (
+            Refusal::Admission(AdmissionRejection::RateLimited {
+                retry_after_secs: 2,
+            })
+            .into_response(),
+            429,
+            ErrorCode::RateLimited,
+        ),
+        (
+            Refusal::Admission(AdmissionRejection::LiveReadsExhausted).into_response(),
+            429,
+            ErrorCode::LiveReadsExhausted,
+        ),
+        (
+            Refusal::BodyTooLarge { limit: 7 }.into_response(),
+            413,
+            ErrorCode::RequestTooLarge,
+        ),
+        (
+            Refusal::BodyUnreadable.into_response(),
+            400,
+            ErrorCode::BodyUnreadable,
+        ),
+        (
+            Refusal::NoUpstream.into_response(),
+            503,
+            ErrorCode::NoUpstream,
+        ),
+        (
+            GatewayError::LeaderNotFound { followed: 3 }.into_response(),
+            503,
+            ErrorCode::NoLeader,
+        ),
+        (
+            GatewayError::UpstreamTimeout {
+                upstream: "http://node:4437".to_owned(),
+                timeout: Duration::from_secs(1),
+            }
+            .into_response(),
+            504,
+            ErrorCode::UpstreamTimeout,
+        ),
+        (unreachable_response(), 503, ErrorCode::UpstreamUnreachable),
+    ];
+    for (response, status, code) in cases {
+        assert_eq!(response.status().as_u16(), status, "{code}");
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(ErrorBody::CONTENT_TYPE),
+            "{code}"
+        );
+        let typed_413 = SizeLimit::parse(
+            status,
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        );
+        if status == 413 {
+            assert_eq!(typed_413, Ok(Some(SizeLimit::Request(7))));
+        }
+        if code == ErrorCode::RateLimited {
+            assert_eq!(
+                response.headers().get(RETRY_AFTER),
+                Some(&HeaderValue::from_static("2"))
+            );
+        }
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(ErrorBody::parse(&body), Ok(ErrorBody::new(code)));
+    }
+}

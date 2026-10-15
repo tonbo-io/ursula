@@ -56,6 +56,7 @@ use axum::http::StatusCode;
 use axum::http::Uri;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONNECTION;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::header::LOCATION;
 use axum::http::header::RETRY_AFTER;
 use axum::http::header::WWW_AUTHENTICATE;
@@ -66,6 +67,8 @@ use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::SizeLimit;
 use ursula_headers::lowered_request_limit;
 use ursula_headers::names;
@@ -1276,48 +1279,72 @@ enum Refusal {
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> AxumResponse {
-        match self {
-            Self::NotFound => StatusCode::NOT_FOUND.into_response(),
-            Self::Authentication(AuthenticationError::Unavailable) => {
-                StatusCode::SERVICE_UNAVAILABLE.into_response()
-            }
+        let mut headers = HeaderMap::new();
+        let (status, code) = match self {
+            Self::NotFound => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
+            Self::Authentication(AuthenticationError::Unavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::AuthenticationUnavailable,
+            ),
             Self::Authentication(
-                AuthenticationError::InvalidCredential
+                error @ (AuthenticationError::InvalidCredential
                 | AuthenticationError::Expired
-                | AuthenticationError::WrongAudience,
-            ) => (StatusCode::UNAUTHORIZED, [(
-                WWW_AUTHENTICATE,
-                HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-            )])
-                .into_response(),
-            Self::Forbidden => StatusCode::FORBIDDEN.into_response(),
-            Self::Authorization(AuthorizationError::Unavailable) => {
-                StatusCode::SERVICE_UNAVAILABLE.into_response()
+                | AuthenticationError::WrongAudience),
+            ) => {
+                headers.insert(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+                );
+                let code = match error {
+                    AuthenticationError::Expired => ErrorCode::CredentialExpired,
+                    _ => ErrorCode::InvalidCredential,
+                };
+                (StatusCode::UNAUTHORIZED, code)
             }
-            Self::Admission(AdmissionRejection::RateLimited { retry_after_secs }) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(RETRY_AFTER, HeaderValue::from(retry_after_secs))],
-                "tenant request rate limit exceeded",
-            )
-                .into_response(),
-            Self::Admission(AdmissionRejection::LiveReadsExhausted) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "tenant live-read connection limit exceeded",
-            )
-                .into_response(),
+            Self::Forbidden => (StatusCode::FORBIDDEN, ErrorCode::Forbidden),
+            Self::Authorization(AuthorizationError::Unavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::AuthorizationUnavailable,
+            ),
+            Self::Admission(AdmissionRejection::RateLimited { retry_after_secs }) => {
+                headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited)
+            }
+            Self::Admission(AdmissionRejection::LiveReadsExhausted) => {
+                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::LiveReadsExhausted)
+            }
             Self::BodyTooLarge { limit } => {
-                let mut headers = HeaderMap::new();
-                SizeLimit::Request(limit).render(|name, value| {
+                let limit = SizeLimit::Request(limit);
+                limit.render(|name, value| {
                     if let Ok(value) = HeaderValue::from_str(value) {
                         headers.insert(name, value);
                     }
                 });
-                (StatusCode::PAYLOAD_TOO_LARGE, headers).into_response()
+                (StatusCode::PAYLOAD_TOO_LARGE, limit.error_code())
             }
-            Self::BodyUnreadable => StatusCode::BAD_REQUEST.into_response(),
-            Self::NoUpstream => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+            Self::BodyUnreadable => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
+            Self::NoUpstream => (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoUpstream),
+        };
+        error_answer(status, code, headers)
     }
+}
+
+/// The one renderer of the gateway's own error answers: `status`, `headers`
+/// and the JSON error body naming `code` (extensions Section 11), the body
+/// Ursula renders.
+fn error_answer(status: StatusCode, code: ErrorCode, mut headers: HeaderMap) -> AxumResponse {
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(ErrorBody::CONTENT_TYPE),
+    );
+    (status, headers, ErrorBody::new(code).render()).into_response()
+}
+
+/// [`error_answer`] with `Retry-After: 1`.
+fn retry_answer(status: StatusCode, code: ErrorCode) -> AxumResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    error_answer(status, code, headers)
 }
 
 /// Replaces `Ursula-Max-Request-Bytes` on a forwarded response with the
@@ -1754,32 +1781,28 @@ impl GatewayError {
             Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => {
                 unreachable_response()
             }
-            Self::LeaderNotFound { .. } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(RETRY_AFTER, HeaderValue::from_static("1"))],
-                "no leader found; retry",
-            )
-                .into_response(),
-            Self::UpstreamTimeout { .. } => (
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream sent no response in time",
-            )
-                .into_response(),
-            Self::Upstream { .. } => {
-                (StatusCode::BAD_GATEWAY, "upstream request failed").into_response()
+            Self::LeaderNotFound { .. } => {
+                retry_answer(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
             }
-            Self::ResponseBuild(_) => StatusCode::BAD_GATEWAY.into_response(),
+            Self::UpstreamTimeout { .. } => error_answer(
+                StatusCode::GATEWAY_TIMEOUT,
+                ErrorCode::UpstreamTimeout,
+                HeaderMap::new(),
+            ),
+            Self::Upstream { .. } | Self::ResponseBuild(_) => error_answer(
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::UpstreamFailed,
+                HeaderMap::new(),
+            ),
         }
     }
 }
 
 fn unreachable_response() -> AxumResponse {
-    (
+    retry_answer(
         StatusCode::SERVICE_UNAVAILABLE,
-        [(RETRY_AFTER, HeaderValue::from_static("1"))],
-        "upstream unreachable; retry",
+        ErrorCode::UpstreamUnreachable,
     )
-        .into_response()
 }
 
 #[cfg(test)]

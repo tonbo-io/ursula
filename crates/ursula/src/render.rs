@@ -5,6 +5,7 @@ use std::hash::Hasher;
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
+use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::ETAG;
 use axum::http::header::HeaderMap;
@@ -26,6 +27,8 @@ use ursula_headers::ContentRange;
 use ursula_headers::CurrentEpoch;
 use ursula_headers::Delivery;
 use ursula_headers::EpochClosure;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::Inherited;
@@ -46,6 +49,8 @@ use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ClosedBy;
 use ursula_runtime::ClosedEpoch as StreamClosedEpoch;
 use ursula_runtime::ColdStoreInfo;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::ProducerAck;
 use ursula_runtime::ProducerDelivery;
@@ -145,7 +150,7 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::InvalidSnapshot
         | StreamErrorCode::InvalidRecordBoundaries
         | StreamErrorCode::ImportInvalid => StatusCode::BAD_REQUEST,
-        // F3 producer cap; the plain-text body starts with `producer_limit`.
+        // F3 producer cap.
         StreamErrorCode::ProducerLimit => StatusCode::TOO_MANY_REQUESTS,
         // The HTTP layer verifies the boundary and proposes again; reaching
         // a client means the stream changed during the check (fail closed).
@@ -160,6 +165,167 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         // soon succeeds.
         StreamErrorCode::HistoryPending => StatusCode::SERVICE_UNAVAILABLE,
     }
+}
+
+/// The code of a runtime error's body. It names what the status names:
+/// the stream's refusal for a stream error, the node's condition for a
+/// `503`, and [`ErrorCode::Internal`] for a fault.
+pub(crate) fn runtime_error_code(err: &RuntimeError) -> ErrorCode {
+    match err {
+        RuntimeError::InvalidRaftGroup { .. } | RuntimeError::SnapshotPlacementMismatch { .. } => {
+            ErrorCode::InvalidRequest
+        }
+        RuntimeError::InvalidConfig(_)
+        | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::StaticMembershipConfig { .. }
+        | RuntimeError::MailboxClosed { .. }
+        | RuntimeError::ResponseDropped { .. }
+        | RuntimeError::SpawnCoreThread { .. }
+        | RuntimeError::GroupRestartAborted { .. } => ErrorCode::Internal,
+        RuntimeError::ColdStoreIo { .. } => ErrorCode::ColdStoreFailed,
+        RuntimeError::LiveReadBackpressure { .. } => ErrorCode::LiveReadBackpressure,
+        RuntimeError::GroupNotHosted { .. } => ErrorCode::NoLeader,
+        RuntimeError::GroupEngine { error, .. } => match error {
+            GroupEngineError::Stream(_) => {
+                error.code().map_or(ErrorCode::Internal, stream_error_code)
+            }
+            GroupEngineError::Infra(infra) => infra_error_code(infra),
+            // A forward the caller did not route answers `500`.
+            GroupEngineError::ForwardToLeader { .. } => ErrorCode::Internal,
+        },
+    }
+}
+
+fn infra_error_code(err: &GroupInfraError) -> ErrorCode {
+    match err {
+        GroupInfraError::ColdBackpressure { .. } => ErrorCode::ColdBackpressure,
+        GroupInfraError::RaftUncommittedBackpressure { .. } => {
+            ErrorCode::RaftUncommittedBackpressure
+        }
+        GroupInfraError::RecoveryPending { .. } => ErrorCode::HistoryPending,
+        GroupInfraError::ApplyStopped { .. } => ErrorCode::ApplyStopped,
+        GroupInfraError::OutcomeUnknown => ErrorCode::OutcomeUnknown,
+        GroupInfraError::InvalidRaftCommand { .. } => ErrorCode::InvalidRequest,
+        GroupInfraError::RecoveryNodeMismatch { .. }
+        | GroupInfraError::RaftGroupNotRegistered { .. }
+        | GroupInfraError::RecoveryAlreadyBound { .. }
+        | GroupInfraError::RecoveryGroupMismatch { .. }
+        | GroupInfraError::WalOpen { .. }
+        | GroupInfraError::RecoveryVoteFloor { .. }
+        | GroupInfraError::RecoveryCutting { .. }
+        | GroupInfraError::RecoveryPlanFenced { .. }
+        | GroupInfraError::OwnerStopped
+        | GroupInfraError::Internal { .. }
+        | GroupInfraError::ProtoDecode { .. } => ErrorCode::Internal,
+    }
+}
+
+/// The code of a stream refusal: the refusal's own name.
+pub(crate) fn stream_error_code(code: StreamErrorCode) -> ErrorCode {
+    match code {
+        StreamErrorCode::InvalidBucketId => ErrorCode::InvalidBucketId,
+        StreamErrorCode::InvalidStreamId => ErrorCode::InvalidStreamId,
+        StreamErrorCode::BucketNotFound => ErrorCode::BucketNotFound,
+        StreamErrorCode::BucketErased => ErrorCode::BucketErased,
+        StreamErrorCode::StreamNotFound => ErrorCode::StreamNotFound,
+        StreamErrorCode::StreamGone => ErrorCode::StreamGone,
+        StreamErrorCode::StreamAlreadyExistsConflict => ErrorCode::StreamAlreadyExistsConflict,
+        StreamErrorCode::MissingContentType => ErrorCode::MissingContentType,
+        StreamErrorCode::ContentTypeMismatch => ErrorCode::ContentTypeMismatch,
+        StreamErrorCode::EmptyAppend => ErrorCode::EmptyAppend,
+        StreamErrorCode::StreamClosed => ErrorCode::StreamClosed,
+        StreamErrorCode::StreamSeqConflict => ErrorCode::StreamSeqConflict,
+        StreamErrorCode::InvalidProducer => ErrorCode::InvalidProducer,
+        StreamErrorCode::ProducerEpochClosed => ErrorCode::ProducerEpochClosed,
+        StreamErrorCode::ProducerExpired => ErrorCode::ProducerExpired,
+        StreamErrorCode::ProducerEpochStale => ErrorCode::ProducerEpochStale,
+        StreamErrorCode::ProducerKeyConflict => ErrorCode::ProducerKeyConflict,
+        StreamErrorCode::ProducerDigestMismatch => ErrorCode::ProducerDigestMismatch,
+        StreamErrorCode::ProducerSeqConflict => ErrorCode::ProducerSeqConflict,
+        StreamErrorCode::InvalidRetention => ErrorCode::InvalidRetention,
+        StreamErrorCode::OffsetOutOfRange => ErrorCode::OffsetOutOfRange,
+        StreamErrorCode::InvalidColdFlush => ErrorCode::InvalidColdFlush,
+        StreamErrorCode::InvalidSnapshot => ErrorCode::InvalidSnapshot,
+        StreamErrorCode::SnapshotNotFound => ErrorCode::SnapshotNotFound,
+        StreamErrorCode::SnapshotConflict => ErrorCode::SnapshotConflict,
+        StreamErrorCode::InvalidRecordBoundaries => ErrorCode::InvalidRecordBoundaries,
+        StreamErrorCode::JsonBoundaryUnverified => ErrorCode::JsonBoundaryUnverified,
+        StreamErrorCode::ImportConflict => ErrorCode::ImportConflict,
+        StreamErrorCode::ImportInvalid => ErrorCode::ImportInvalid,
+        StreamErrorCode::ProducerLimit => ErrorCode::ProducerLimit,
+        StreamErrorCode::CreatedAtOutOfRange => ErrorCode::CreatedAtOutOfRange,
+        StreamErrorCode::IncarnationMismatch => ErrorCode::IncarnationMismatch,
+        StreamErrorCode::HistoryPending => ErrorCode::HistoryPending,
+    }
+}
+
+/// The code of an error answer's body, for tests: panics unless the
+/// answer is JSON and its body parses.
+#[cfg(test)]
+pub(crate) async fn error_code_of(response: Response) -> ErrorCode {
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(ErrorBody::CONTENT_TYPE),
+        "an error answer is JSON"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("an error body");
+    match ErrorBody::parse(&body) {
+        Ok(body) => body.code,
+        Err(err) => panic!("{err}: {}", String::from_utf8_lossy(&body)),
+    }
+}
+
+/// Marks an answer whose error body [`error_answer`] rendered, so the
+/// client plane's net ([`render_unrendered_error`]) leaves it alone.
+#[derive(Debug, Clone, Copy)]
+struct RenderedErrorBody;
+
+/// [`error_answer`] with no headers of its own.
+pub(crate) fn error_response(status: StatusCode, code: ErrorCode) -> Response {
+    error_answer(status, code, HeaderMap::new())
+}
+
+/// The one renderer of an error answer on the client plane: `status`, the
+/// default headers, then `headers`, and the JSON body naming `code`
+/// (extensions Section 11).
+pub(crate) fn error_answer(status: StatusCode, code: ErrorCode, headers: HeaderMap) -> Response {
+    let mut all = HeaderMap::new();
+    insert_default_response_headers(&mut all);
+    all.extend(headers);
+    all.remove(CONTENT_LENGTH);
+    all.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(ErrorBody::CONTENT_TYPE),
+    );
+    let mut response = (status, all, ErrorBody::new(code).render()).into_response();
+    response.extensions_mut().insert(RenderedErrorBody);
+    response
+}
+
+/// Renders the body of a client-plane error answer that no handler
+/// rendered: axum's `404` of an unknown path, its `405`, its extractor
+/// rejections and its body limit. The code comes from the status alone.
+pub(crate) fn render_unrendered_error(response: &mut Response) {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error())
+        || response.extensions().get::<RenderedErrorBody>().is_some()
+    {
+        return;
+    }
+    let code = match status {
+        StatusCode::NOT_FOUND => ErrorCode::NotFound,
+        StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
+        StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::RequestTooLarge,
+        status if status.is_server_error() => ErrorCode::Internal,
+        _ => ErrorCode::InvalidRequest,
+    };
+    let headers = std::mem::take(response.headers_mut());
+    *response = error_answer(status, code, headers);
 }
 
 /// `Stream-Incarnation` (D12): the opaque token of the stream incarnation
@@ -413,11 +579,7 @@ pub(crate) fn producer_refusal_answer(
 /// state machine produced is outside what the protocol carries.
 pub(crate) fn producer_answer_failed(err: &HeaderError) -> Response {
     tracing::error!(error = %err, "a producer answer is outside the protocol's range");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "producer answer outside the protocol's range",
-    )
-        .into_response()
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
 }
 
 /// Renders a producer answer's headers with the shared header crate.
@@ -506,11 +668,7 @@ pub(crate) fn snapshot_published_response(offset: u64, digest: &str, incarnation
         }
         Err(err) => {
             tracing::error!(error = %err, "a published snapshot outside the protocol's range");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "snapshot answer outside the protocol's range",
-            )
-                .into_response()
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
         }
     }
 }

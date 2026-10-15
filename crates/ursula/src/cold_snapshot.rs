@@ -21,6 +21,7 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::StreamExt;
 use futures_util::stream;
+use ursula_headers::ErrorCode;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
@@ -44,11 +45,8 @@ pub(crate) enum SnapshotUpload {
 }
 
 fn body_read_error(err: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        format!("read snapshot body: {err}"),
-    )
-        .into_response()
+    tracing::debug!(error = %err, "read snapshot body");
+    render::error_response(StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable)
 }
 
 /// Receives a snapshot body of at most the request limit (`413` above it).
@@ -91,11 +89,10 @@ pub(crate) async fn receive_snapshot_body(
     }
 
     let Some(cold_store) = state.runtime.cold_store() else {
-        return Err((
+        return Err(render::error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "cold backend must be configured before staging snapshots",
-        )
-            .into_response());
+            ErrorCode::ColdStoreFailed,
+        ));
     };
     let path = new_external_payload_path(stream_id);
     let mut digest = SnapshotDigest::new(content_type);
@@ -196,11 +193,8 @@ pub(crate) async fn stream_into_object<E: std::error::Error + 'static>(
 }
 
 fn stage_error(err: io::Error) -> Response {
-    (
-        StatusCode::BAD_GATEWAY,
-        format!("write snapshot object: {err}"),
-    )
-        .into_response()
+    tracing::warn!(error = %err, "write snapshot object");
+    render::error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
 }
 
 /// Streams `len` bytes of a cold snapshot body from `start`, piece by
@@ -279,11 +273,7 @@ pub(crate) async fn read_piece(
 
 fn cold_read_error(err: io::Error) -> Response {
     tracing::error!(error = %err, "read cold snapshot body");
-    (
-        StatusCode::BAD_GATEWAY,
-        format!("read snapshot object: {err}"),
-    )
-        .into_response()
+    render::error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
 }
 
 /// The response body of a snapshot read whose body lives in `object`: its
