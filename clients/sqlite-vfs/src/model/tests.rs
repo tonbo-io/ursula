@@ -1200,10 +1200,11 @@ fn s4_8_row_11_closes_the_epoch_at_its_last_seq_after_the_412() {
 }
 
 #[test]
-fn s4_8_a_restore_reports_the_source_token_and_the_restored_tail() {
-    // The source was taken after an event with no write since: its token, not the one before.
+fn s4_8_a_restore_reports_the_token_last_written_under_and_the_restored_tail() {
+    // The source was taken after an event with no write since: the token before that event, as
+    // two events with no write between them report.
     let world = World::new();
-    world.create();
+    let before = world.create();
     world.server().foreign_append(PATH, &[1; 10]).unwrap();
     world
         .server()
@@ -1221,8 +1222,34 @@ fn s4_8_a_restore_reports_the_source_token_and_the_restored_tail() {
     assert_eq!(
         head.inherited(),
         Some(Inherited {
-            previous_incarnation: source,
+            previous_incarnation: before,
             offset: Offset::from_u64(10),
+        })
+    );
+}
+
+#[test]
+fn s4_8_a_restore_of_a_source_written_since_its_event_reports_the_source_token() {
+    let world = World::new();
+    world.create();
+    world.server().foreign_append(PATH, &[1; 10]).unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::NewHistory)
+        .unwrap();
+    world.server().foreign_append(PATH, &[2; 5]).unwrap();
+    let source = world.server().token(PATH).unwrap();
+    let point = world.server().checkpoint();
+    world.server().foreign_append(PATH, &[3; 20]).unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::Restore(point))
+        .unwrap();
+    assert_eq!(
+        world.stream_head().inherited(),
+        Some(Inherited {
+            previous_incarnation: source,
+            offset: Offset::from_u64(15),
         })
     );
 }
