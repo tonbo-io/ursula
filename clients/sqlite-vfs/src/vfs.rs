@@ -7,7 +7,11 @@
 //! binding resets `local_damage`), reads the transaction's final frames back from the WAL and
 //! checks their crc32c, encodes one `USQ2` COMMIT frame, appends it to the log (one write, no
 //! fsync), hands it to the driver and only then forwards the commit page. A failure before the log
-//! write fails the transaction alone.
+//! write fails the transaction alone. Before all that, a commit point waits while the snapshot
+//! thread's window is open, and at most a second for a wanted one (design §4.11).
+//!
+//! The snapshot thread's private connection opens through this VFS too (`opening_private`), so its
+//! checkpoints take F1; it counts as a connection of the binding only beside one of the host's.
 //!
 //! A logged commit is final. SQLite publishes it when it sends `SQLITE_FCNTL_COMMIT_PHASETWO` on
 //! the committing connection's main db handle as the very next call after the WAL write lock's
@@ -66,6 +70,7 @@ use crate::config::abort_at;
 use crate::config::fail_sync;
 use crate::db::Binding;
 use crate::db::Commit;
+use crate::db::Window;
 use crate::db::lookup;
 use crate::driver::runtime::driver;
 use crate::error::WriteRefusal;
@@ -97,6 +102,33 @@ const WAL_READ_LOCK_0: c_int = 3;
 /// The longest a commit waits at its commit point for another connection's logged commit to be
 /// decided (design §4.2).
 const UNDECIDED_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest a commit waits at its commit point for a wanted snapshot window to open.
+const WINDOW_WAIT: Duration = Duration::from_secs(1);
+
+/// How often a commit waiting on a snapshot window looks at it again: the window's close wakes
+/// it, this only bounds a missed wake-up.
+const WINDOW_POLL: Duration = Duration::from_millis(100);
+
+thread_local! {
+    /// The extension's private connection is opening on this thread (`opening_private`).
+    static PRIVATE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `open`, the open of the extension's private connection (`host::Private`), so that it
+/// counts as a connection of its binding only while the binding has one already: it never takes
+/// a retiring binding back, so it never keeps a binding no host connection holds.
+pub(crate) fn opening_private<R>(open: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PRIVATE.set(false);
+        }
+    }
+    PRIVATE.set(true);
+    let _reset = Reset;
+    open()
+}
 
 /// A file of this VFS: its own header and state, then the "unix" file it wraps.
 #[repr(C)]
@@ -177,6 +209,16 @@ unsafe fn ext<'a>(f: *mut ffi::sqlite3_file) -> Option<&'a Ext> {
     // SAFETY: a non-null `ext` is the `Box` `x_open` leaked for this file, freed only by
     // `take_ext`, once the file is closed or its open failed.
     unsafe { ext.as_ref() }
+}
+
+/// fsyncs the "unix" file inside `file`, bypassing this VFS's `xSync`, which is a no-op for a
+/// bound database: the snapshot thread's db fsync before its BASE (design §4.11).
+///
+/// # Safety
+///
+/// `file` is an open file of this VFS.
+pub(crate) unsafe fn sync_unix(file: *mut ffi::sqlite3_file) -> c_int {
+    fwd!(file, xSync, ffi::SQLITE_SYNC_NORMAL)
 }
 
 /// The open main db handle at address `addr`, which a binding recorded (`Commit::writer`,
@@ -265,7 +307,12 @@ unsafe fn x_open(
     let ext = match name {
         Some(name) if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 => match lookup(name) {
             Some(binding) => {
-                if !binding.connect() {
+                let connected = if PRIVATE.get() {
+                    binding.connect_private()
+                } else {
+                    binding.connect()
+                };
+                if !connected {
                     log::emit(Level::Warn, "open_refused", &[
                         ("file", &name),
                         ("reason", &"its binding retired: ursula_open it again"),
@@ -655,8 +702,26 @@ unsafe fn commit(
     off: i64,
 ) -> c_int {
     let started = Instant::now();
+    // A snapshot's window (design §4.11): the commit waits while it is open, so the snapshot's
+    // read sees exactly its `k`, and at most a second for a wanted one to open, so a writer
+    // committing back to back cannot starve it.
+    let deadline = started.checked_add(WINDOW_WAIT).unwrap_or(started);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let wait = match c.window {
+            Window::Open => WINDOW_POLL,
+            Window::Wanted if !left.is_zero() => left.min(WINDOW_POLL),
+            Window::Wanted | Window::Closed => break,
+        };
+        c = b.wait_decided(c, wait);
+        if b.reset_kind().is_some() {
+            return ffi::SQLITE_IOERR_WRITE;
+        }
+    }
     // Nothing is logged on top of another connection's undecided commit.
-    let deadline = started.checked_add(UNDECIDED_WAIT).unwrap_or(started);
+    let deadline = Instant::now()
+        .checked_add(UNDECIDED_WAIT)
+        .unwrap_or(started);
     while c.undecided.keys().any(|&h| h != c.writer) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1032,6 +1097,8 @@ unsafe fn x_shm_lock(file: *mut ffi::sqlite3_file, offset: c_int, n: c_int, flag
     if let Some((started, _)) = c.checkpoint.take() {
         c.stats.checkpoint(started.elapsed());
     }
+    // A snapshot waiting for no other checkpointer looks again.
+    b.notify_decided();
     fwd!(file, xShmLock, offset, n, flags)
 }
 

@@ -1,6 +1,5 @@
 //! The host's SQLite, reached through the `sqlite3_api_routines` it passed at load: the
-//! "unix" VFS underneath, path resolution, and a private connection outside this VFS's
-//! bookkeeping.
+//! "unix" VFS underneath, path resolution, and the extension's private connections.
 //!
 //! Everything here is a safe wrapper over the host's C API: the rest of the crate never touches it
 //! directly.
@@ -18,6 +17,7 @@ use std::sync::atomic::Ordering;
 
 use libsqlite3_sys as ffi;
 
+use crate::codec::PAGE;
 use crate::error::ErrorKind;
 
 pub(crate) const OK: c_int = ffi::SQLITE_OK;
@@ -62,6 +62,16 @@ pub(crate) enum HostError {
     SqliteOpen { path: String, message: String },
     #[error("{sql:?}: {message}")]
     SqliteQuery { sql: &'static CStr, message: String },
+    #[error("{sql:?} returned no row")]
+    NoResultRow { sql: &'static CStr },
+    #[error("the db file handle: SQLite error {code}")]
+    FileHandle { code: c_int },
+    #[error("reading {pages} pages of the db file: SQLite error {code}")]
+    ReadPages { code: c_int, pages: u32 },
+    #[error("copying the db file's pages: {0}")]
+    Copy(#[source] std::io::Error),
+    #[error("fsync of the db file: SQLite error {code}")]
+    FileSync { code: c_int },
 }
 
 impl HostError {
@@ -70,7 +80,13 @@ impl HostError {
             HostError::NulInPath { .. } | HostError::FullPathname { .. } => {
                 ErrorKind::InvalidArgument
             }
-            HostError::SqliteOpen { .. } | HostError::SqliteQuery { .. } => ErrorKind::LocalSetup,
+            HostError::SqliteOpen { .. }
+            | HostError::SqliteQuery { .. }
+            | HostError::NoResultRow { .. }
+            | HostError::FileHandle { .. }
+            | HostError::ReadPages { .. }
+            | HostError::Copy(_)
+            | HostError::FileSync { .. } => ErrorKind::LocalSetup,
             HostError::MissingRoutine(_) => ErrorKind::Internal,
         }
     }
@@ -122,16 +138,35 @@ pub(crate) fn full_pathname(path: &str) -> Result<String, HostError> {
     Ok(name.to_string_lossy().into_owned())
 }
 
-/// A private connection on the "unix" VFS, outside this VFS's bookkeeping: giving a bound
-/// database's empty db file its WAL-format page 1 before any connection opens it.
+/// The result of `PRAGMA wal_checkpoint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Checkpoint {
+    /// Every frame of the WAL is in the db file.
+    Done,
+    /// Another connection held the checkpoint lock.
+    Busy,
+    /// A reader kept some frames out of the db file.
+    Pinned,
+}
+
+/// A private connection of the extension's own, in the extension's process. [`Private::open`]
+/// goes through the "ursula" VFS, so its checkpoints take F1 (design §4.3) and it counts as a
+/// connection of the binding: the snapshot thread's checkpoint, read transaction, page copy and
+/// db fsync. [`init_wal_format`] alone goes through "unix", before the database is bound.
 pub(crate) struct Private {
     /// From `sqlite3_open_v2` (possibly a failed open's handle, which still needs closing).
     db: *mut ffi::sqlite3,
 }
 
 impl Private {
-    /// Opens `path` read-write, creating it when `create` is set.
-    pub(crate) fn open(path: &str, create: bool) -> Result<Self, HostError> {
+    /// Opens the bound database at `path` read-write through the "ursula" VFS, as a connection
+    /// of its binding that never takes a retiring binding back (`vfs::opening_private`).
+    pub(crate) fn open(path: &str) -> Result<Self, HostError> {
+        crate::vfs::opening_private(|| Self::open_on(path, false, c"ursula"))
+    }
+
+    /// Opens `path` read-write on `vfs`, creating it when `create` is set.
+    fn open_on(path: &str, create: bool, vfs: &CStr) -> Result<Self, HostError> {
         let c = c_path(path)?;
         let open_v2 = routine!(open_v2)?;
         let mut flags = ffi::SQLITE_OPEN_READWRITE;
@@ -140,7 +175,7 @@ impl Private {
         }
         let mut db = null_mut();
         // SAFETY: the path and the VFS name are NUL-terminated, and `db` is a valid out-pointer.
-        let rc = unsafe { open_v2(c.as_ptr(), &raw mut db, flags, c"unix".as_ptr()) };
+        let rc = unsafe { open_v2(c.as_ptr(), &raw mut db, flags, vfs.as_ptr()) };
         let conn = Private { db };
         if rc != OK {
             return Err(HostError::SqliteOpen {
@@ -149,6 +184,124 @@ impl Private {
             });
         }
         Ok(conn)
+    }
+
+    /// Runs `sql` and returns the integer columns of its first row (empty without a row).
+    pub(crate) fn query(&self, sql: &'static CStr) -> Result<Vec<i64>, HostError> {
+        let prepare = routine!(prepare_v2)?;
+        let step = routine!(step)?;
+        let column_count = routine!(column_count)?;
+        let column_int64 = routine!(column_int64)?;
+        let finalize = routine!(finalize)?;
+        let mut stmt = null_mut();
+        // SAFETY: `db` is open, `sql` is NUL-terminated (length -1: up to the NUL), and `stmt` is
+        // a valid out-pointer; the tail pointer may be null.
+        let rc = unsafe { prepare(self.db, sql.as_ptr(), -1, &raw mut stmt, null_mut()) };
+        if rc != OK {
+            return Err(HostError::SqliteQuery {
+                sql,
+                message: self.errmsg(),
+            });
+        }
+        // SAFETY: `stmt` was just prepared on `db`.
+        let r = match unsafe { step(stmt) } {
+            ffi::SQLITE_ROW => {
+                // SAFETY: `stmt` holds a row.
+                let n = unsafe { column_count(stmt) };
+                // SAFETY: every index below the row's column count is a column of it.
+                Ok((0..n).map(|i| unsafe { column_int64(stmt, i) }).collect())
+            }
+            ffi::SQLITE_DONE => Ok(Vec::new()),
+            _ => Err(HostError::SqliteQuery {
+                sql,
+                message: self.errmsg(),
+            }),
+        };
+        // SAFETY: `stmt` is finalized once, here, after its error message was read.
+        unsafe { finalize(stmt) };
+        r
+    }
+
+    /// `PRAGMA wal_checkpoint(PASSIVE)`.
+    pub(crate) fn checkpoint(&self) -> Result<Checkpoint, HostError> {
+        let sql = c"PRAGMA wal_checkpoint(PASSIVE)";
+        match *self.query(sql)?.as_slice() {
+            [0, log, done] if log == done => Ok(Checkpoint::Done),
+            [0, ..] => Ok(Checkpoint::Pinned),
+            [_, ..] => Ok(Checkpoint::Busy),
+            [] => Err(HostError::NoResultRow { sql }),
+        }
+    }
+
+    /// The connection's open db file and its io methods (the "ursula" VFS's). Live while the
+    /// connection is: closing a descriptor of our own instead would drop the process's POSIX
+    /// locks on the file.
+    fn db_file(
+        &self,
+    ) -> Result<(*mut ffi::sqlite3_file, &'static ffi::sqlite3_io_methods), HostError> {
+        let file_control = routine!(file_control)?;
+        let mut f: *mut ffi::sqlite3_file = null_mut();
+        // SAFETY: `db` is open, "main" is NUL-terminated, and FILE_POINTER writes the
+        // `sqlite3_file*` of the main database at the pointer.
+        let rc = unsafe {
+            file_control(
+                self.db,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&raw mut f).cast(),
+            )
+        };
+        // SAFETY: when non-null, `f` is a file of the connection, live while `db` is.
+        let opened = unsafe { f.as_ref() };
+        // SAFETY: an open file's methods are its VFS's io methods, a static table (null while the
+        // file is closed).
+        let methods = opened.and_then(|o| unsafe { o.pMethods.as_ref() });
+        match methods {
+            Some(methods) if rc == OK => Ok((f, methods)),
+            _ => Err(HostError::FileHandle { code: rc }),
+        }
+    }
+
+    /// Copies pages `1..=n` of the db file to `out`, 256 pages at a time, through the
+    /// connection's own file handle.
+    pub(crate) fn copy_pages(
+        &self,
+        n: u32,
+        out: &mut impl std::io::Write,
+    ) -> Result<(), HostError> {
+        /// The most read at once: 256 pages.
+        const CHUNK_PAGES: u32 = 256;
+        let (f, methods) = self.db_file()?;
+        let read = methods.xRead.ok_or(HostError::MissingRoutine("xRead"))?;
+        let mut buf = vec![0u8; PAGE.saturating_mul(CHUNK_PAGES as usize)];
+        let mut done: u32 = 0;
+        while done < n {
+            let pages = (n.saturating_sub(done)).min(CHUNK_PAGES);
+            let len = PAGE.saturating_mul(pages as usize);
+            let chunk = buf.get_mut(..len).unwrap_or_default();
+            let amt = c_int::try_from(len).unwrap_or(c_int::MAX);
+            let at = i64::from(done).saturating_mul(PAGE as i64);
+            // SAFETY: `chunk` is `amt` writable bytes, and `f` is the open file `read` belongs to.
+            let rc = unsafe { read(f, chunk.as_mut_ptr().cast(), amt, at) };
+            if rc != OK {
+                return Err(HostError::ReadPages { code: rc, pages: n });
+            }
+            out.write_all(chunk).map_err(HostError::Copy)?;
+            done = done.saturating_add(pages);
+        }
+        Ok(())
+    }
+
+    /// fsyncs the db file through the connection's own handle, bypassing the "ursula" VFS's
+    /// `xSync`, which is a no-op for a bound database (design §4.3).
+    pub(crate) fn sync_db(&self) -> Result<(), HostError> {
+        let (f, _) = self.db_file()?;
+        // SAFETY: `f` is the connection's open db file, a file of the "ursula" VFS.
+        let rc = unsafe { crate::vfs::sync_unix(f) };
+        if rc != OK {
+            return Err(HostError::FileSync { code: rc });
+        }
+        Ok(())
     }
 
     fn errmsg(&self) -> String {
@@ -196,7 +349,8 @@ impl Drop for Private {
 /// Gives an empty db file its WAL-format page 1 through a private "unix" connection, so no
 /// connection ever commits through a rollback journal, which the VFS refuses. Its WAL and `-shm`
 /// go when it closes. Not a commit: the first commit writes page 1 again (every schema change
-/// does), so the stream holds it.
+/// does), so the stream holds it. It runs before the database is bound and writes no page from
+/// the log, so it needs neither the "ursula" VFS nor F1, which would refuse its db write.
 pub(crate) fn init_wal_format(path: &str) -> Result<(), HostError> {
-    Private::open(path, true)?.exec(c"PRAGMA journal_mode=WAL")
+    Private::open_on(path, true, c"unix")?.exec(c"PRAGMA journal_mode=WAL")
 }

@@ -25,7 +25,12 @@
 //! 11. after `Heal`, every ticket of an owner that ends acknowledged resolved or was abandoned;
 //! 12. no append carries a frame the owner caught up;
 //! 13. an owner resets `fenced` or `stale` only when another writer, owner or clone was on the
-//!     stream.
+//!     stream;
+//! 14. a boundary's receipt names the end of its record's frame in the stream with only claims
+//!     after it, and a receipt without an offset publishes no snapshot.
+//!
+//! Snapshots carry real `USS3` headers (the owner's lineage, an acknowledged position and its
+//! offset): the `410` rule reads them.
 //!
 //! Two negative controls must fail them: the model with digest comparison off (requests reach it
 //! without `Producer-Digest`), and a replicator that re-seals its in-flight batch on resend.
@@ -59,6 +64,8 @@ use crate::codec::frame;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::Decoded;
 use crate::codec::frame::Frame;
+use crate::codec::snapshot::SnapshotFields;
+use crate::codec::snapshot::write_body;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
@@ -72,6 +79,7 @@ use crate::model::faults::Fault;
 use crate::model::faults::Scripted;
 use crate::model::producer::IDLE_RETIREMENT_MS;
 use crate::replicator::Action;
+use crate::replicator::BoundaryReceipt;
 use crate::replicator::ClaimKind;
 use crate::replicator::Condition;
 use crate::replicator::Event;
@@ -139,6 +147,9 @@ enum Op {
     /// A new owner on a fresh host takes over; with `true` its build lags, from offset 0.
     Takeover(bool),
     Sync(u8),
+    /// The owner's snapshot thread asks for a batch ending at its last logged commit; its
+    /// receipt publishes a snapshot there (property 14).
+    Boundary(u8),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -176,6 +187,7 @@ fn op() -> impl Strategy<Value = Op> {
         2 => ((0u8..8), (0u8..3)).prop_map(|(o, lag)| Op::Restart(o, lag)),
         1 => proptest::bool::ANY.prop_map(Op::Takeover),
         5 => (0u8..8).prop_map(Op::Sync),
+        2 => (0u8..8).prop_map(Op::Boundary),
     ]
 }
 
@@ -204,6 +216,9 @@ struct LogModel {
     durable_acks: usize,
     /// The next ACK record is a catch-up's.
     catching_up: bool,
+    /// The last position when a rebuild published: the frames it brought in take no positions
+    /// in this model (the driver logs each at the next one).
+    rebuilt_through: u64,
 }
 
 impl LogModel {
@@ -449,8 +464,10 @@ impl World {
             applied: Vec::new(),
             durable_acks: 0,
             catching_up: false,
+            rebuilt_through: 0,
         };
         let local = LocalState {
+            lineage: log.lineage,
             activation,
             cluster_id: cluster(),
             incarnation: log.incarnation,
@@ -498,6 +515,7 @@ impl World {
             .map(|(_, p)| p.clone())
             .collect();
         let local = LocalState {
+            lineage: log.lineage,
             activation,
             cluster_id: cluster(),
             incarnation: log.incarnation,
@@ -638,6 +656,7 @@ impl World {
         takeover: bool,
     ) {
         let mut caught_up = false;
+        let mut receipts = Vec::new();
         let fenced = actions.contains(&Action::Reset(ResetKind::Fenced));
         let discarded = actions.iter().any(|a| {
             matches!(a, Action::Rebuild {
@@ -675,6 +694,7 @@ impl World {
                     self.owners[index].inst.timer = Some(at_ms.saturating_add(jitter_ms));
                 }
                 Action::Condition(_) => {}
+                Action::Boundary(receipt) => receipts.push(receipt),
                 // A catch-up logs every frame of one read as a COMMIT record at the next
                 // positions, then the ACK covering them, fsynced, before the next read.
                 Action::Apply(frames) => {
@@ -746,6 +766,9 @@ impl World {
             // A rebuild's positions continue above the last one logged.
             let last = self.owners[index].log.last_logged();
             self.owners[index].inst.caught_up_due = Some(last);
+        }
+        for receipt in receipts {
+            self.boundary_reached(index, receipt);
         }
     }
 
@@ -845,6 +868,83 @@ impl World {
         let inst = &mut self.owners[index].inst;
         inst.acked = inst.acked.max(acked);
         inst.acked_offset = offset;
+    }
+
+    /// Publishes a snapshot at `offset` whose `USS3` header names `last`, as a snapshot thread
+    /// would (the image is a stand-in: only the header is ever read here).
+    fn publish_snapshot(&mut self, offset: Offset, last: CommitId) {
+        let fields = SnapshotFields {
+            offset,
+            epoch: Epoch::try_from(1).unwrap(),
+            last,
+        };
+        let mut body = Vec::new();
+        write_body(
+            &fields,
+            &mut std::io::Cursor::new(vec![0u8; 4096]),
+            &mut body,
+        )
+        .unwrap();
+        let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+        digester.update(&body);
+        let publish = Request {
+            content_type: Some(CONTENT_TYPE.to_owned()),
+            snapshot_digest: Some(digester.finalize()),
+            body: Arc::from(body),
+            ..Request::new(Method::Put, Target::Snapshot { offset })
+        };
+        drop(self.server.handle(PATH, &publish));
+    }
+
+    /// Property 14: a boundary's receipt names the end of record `k`'s frame in the stream with
+    /// only claims after it; then the snapshot is published there, and its bytes stop counting.
+    /// A receipt without an offset publishes nothing.
+    fn boundary_reached(&mut self, index: usize, receipt: BoundaryReceipt) {
+        let Some(offset) = receipt.offset else {
+            return;
+        };
+        let owner = self.owners[index].clone();
+        if owner.log.incarnation != self.token() {
+            return;
+        }
+        // A boundary at or below `rebuilt_through` is published unchecked: the frames the rebuild
+        // brought in take no positions in this model (the driver logs each at the next one), so
+        // nothing here names the frame that ends at its receipt.
+        let record = owner
+            .log
+            .commits
+            .get(&receipt.position.0)
+            .filter(|_| receipt.position.0 > owner.log.rebuilt_through);
+        if let Some(record) = record {
+            let stream = self.stream();
+            let end = usize::try_from(offset.get()).unwrap();
+            let holds = stream
+                .windows(record.frame.len())
+                .enumerate()
+                .filter(|(_, w)| *w == &record.frame[..])
+                .map(|(i, _)| i + record.frame.len())
+                .any(|after| {
+                    after <= end
+                        && decode_all(stream.get(after..end).unwrap_or_default())
+                            .iter()
+                            .all(|(_, _, f)| matches!(f, Some(Frame::Claim { .. })))
+                });
+            if !holds {
+                self.violation(format!(
+                    "property 14: the receipt of boundary {:?} names {offset}, not the end of \
+                     its frame with only claims after it",
+                    receipt.position
+                ));
+                return;
+            }
+        }
+        self.publish_snapshot(offset, CommitId {
+            lineage: owner.log.lineage,
+            position: receipt.position,
+        });
+        self.event(index, Event::Snapshotted {
+            log_bytes: receipt.log_bytes,
+        });
     }
 
     /// Property 10: what lies between the previous acknowledged offset and `offset`.
@@ -1077,7 +1177,11 @@ impl World {
             if let Some(discard_from) = self.owners[index].inst.unpublished.take() {
                 self.publish(index, discard_from);
             }
-            self.event(index, Event::CaughtUp { last, log_bytes: 0 });
+            self.event(index, Event::CaughtUp {
+                last,
+                log_bytes: 0,
+                lineage: self.owners[index].log.lineage,
+            });
         }
     }
 
@@ -1093,6 +1197,7 @@ impl World {
         }
         log.lineage = Lineage(lineage);
         log.catching_up = true;
+        log.rebuilt_through = log.next_position.saturating_sub(1);
     }
 
     fn apply_op(&mut self, op: &Op) {
@@ -1209,19 +1314,21 @@ impl World {
             Op::Retain(o) => {
                 let i = self.owner(o);
                 let offset = self.owners[i].inst.acked_offset;
-                // A snapshot at the offset first: retention never passes the latest snapshot.
-                let body: Arc<[u8]> = Arc::from(b"snapshot".to_vec());
-                let mut digester = SnapshotDigester::new(CONTENT_TYPE);
-                digester.update(&body);
-                let publish = Request {
-                    content_type: Some(CONTENT_TYPE.to_owned()),
-                    snapshot_digest: Some(digester.finalize()),
-                    body,
-                    ..Request::new(Method::Put, Target::Snapshot { offset })
+                // A snapshot at the offset first, of the owner's lineage at its acknowledged
+                // position: retention never passes the latest snapshot.
+                let last = CommitId {
+                    lineage: self.owners[i].log.lineage,
+                    position: self.owners[i].inst.acked,
                 };
-                drop(self.server.handle(PATH, &publish));
+                self.publish_snapshot(offset, last);
                 let request = Request::new(Method::Put, Target::Retention { offset });
                 drop(self.server.handle(PATH, &request));
+            }
+            Op::Boundary(o) => {
+                let i = self.owner(o);
+                if let Some(&k) = self.owners[i].log.commits.keys().last() {
+                    self.event(i, Event::Boundary(Position(k)));
+                }
             }
             Op::Checkpoint => {
                 let id = self.server.checkpoint();
@@ -1375,6 +1482,7 @@ fn ending(inst: &Instance) -> Result<&'static str, String> {
             Step::Reconcile { .. } => "reconciling",
             Step::Applying { .. } => "applying a read",
             Step::CatchingUp(_) => "catching up",
+            Step::Gone { .. } => "reading the latest snapshot after a 410",
         })),
         Replicator::Reset(_) | Replicator::Refused(_) | Replicator::Stopped => Ok("reset"),
     }
@@ -1539,6 +1647,34 @@ fn negative_controls_fail_the_proptest_too() {
         // must not flake.
         assert!(check(knobs, 512, true).is_err(), "{knobs:?} passed");
     }
+}
+
+/// A clone commits at the next position with its own bytes, its snapshot of our shared lineage
+/// moves retention past the original's acknowledged offset, and the original's commit at the same
+/// position meets the `410`. The rule must not take the clone's snapshot as covering the
+/// original's own record above its acknowledged position: that would acknowledge a commit the
+/// stream never held (property 8) and append after another copy's state.
+#[test]
+fn a_clones_snapshot_never_covers_the_originals_commit() {
+    let ops = vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::Clone(0),
+        Op::Commit(1),
+        Op::Flush,
+        Op::Retain(1),
+        Op::Commit(0),
+        Op::Flush,
+        Op::Restart(0, 0),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
 }
 
 /// A host whose build lags reconciles from below retention: the `410` rebuilds, never skips the

@@ -104,7 +104,11 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
         },
         16 => snapshot(5, b"image"),
         17 => snapshot(5, b"other image"),
-        18 => Request::snapshot_read(Offset::from_u64(5), 1 << 20),
+        18 => Request::snapshot_read(
+            Offset::from_u64(5),
+            token()?.incarnation,
+            crate::wire::SnapshotPart::Header,
+        ),
         19 => Request {
             keys: keys(token()),
             ..Request::new(Method::Put, Target::Retention {
@@ -141,6 +145,53 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
     Some(request)
 }
 
+// A header read gets the body's first bytes alone whether the server honors `Range` (`206`) or
+// answers `200` with the whole body: the transport reads no more and drops the connection.
+#[test]
+fn a_header_read_takes_only_the_first_bytes_whether_or_not_range_is_honored() {
+    let (server, url) = served();
+    let http = HttpTransport::new(url);
+    let send = |request: &Request| match http.send(request, Attempt::default()) {
+        Exchange::Answered(answer) => *answer,
+        Exchange::NoAnswer(no) => panic!("{no:?}"),
+    };
+    assert_eq!(send(&create()).status, 201);
+    let token = server.lock().unwrap().token(PATH).unwrap();
+    let body = vec![0x5a; 200_000];
+    let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+    digester.update(&body);
+    let publish = Request {
+        keys: keys(Some(IncarnationPrecondition { incarnation: token })),
+        content_type: Some(CONTENT_TYPE.to_owned()),
+        snapshot_digest: Some(digester.finalize()),
+        body: Arc::from(body),
+        ..Request::new(Method::Put, Target::Snapshot {
+            offset: Offset::ZERO,
+        })
+    };
+    assert_eq!(send(&publish).status, 204);
+    let header = Request::snapshot_read(Offset::ZERO, token, crate::wire::SnapshotPart::Header);
+    let statuses: Vec<u16> = (0..4)
+        .map(|_| {
+            let answer = send(&header);
+            assert!(
+                matches!(answer.typed, Ok(Typed::SnapshotRead(_))),
+                "{answer:?}"
+            );
+            assert_eq!(answer.body, vec![0x5a; 56]);
+            answer.status
+        })
+        .collect();
+    assert_eq!(statuses, [206, 200, 206, 200]);
+    // The whole body still reads in full.
+    let whole = send(&Request::snapshot_read(
+        Offset::ZERO,
+        token,
+        crate::wire::SnapshotPart::Body { limit: 1 << 20 },
+    ));
+    assert_eq!(whole.body.len(), 200_000);
+}
+
 // The header crate end to end: every answer the model renders reads back identically over
 // loopback HTTP and in process.
 #[test]
@@ -171,7 +222,7 @@ fn model_answers_round_trip_through_http() {
     }
     assert_eq!(statuses, [
         404, 201, 200, 200, 200, 204, 403, 204, 409, 400, 200, 403, 403, 400, 200, 200, 204, 409,
-        200, 204, 412, 413, 200, 409, 409
+        206, 204, 412, 413, 200, 409, 409
     ]);
 }
 

@@ -24,6 +24,10 @@ use ursula_headers::Offset;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
 use ursula_headers::Seq;
+use ursula_headers::ServerIdentity;
+use ursula_headers::SnapshotRead;
+use ursula_headers::SnapshotRef;
+use ursula_headers::StreamHead;
 use ursula_headers::names;
 
 use super::Action;
@@ -33,8 +37,11 @@ use super::LocalState;
 use super::Pending;
 use super::Replicator;
 use super::RequestId;
+use crate::codec::digest::SnapshotDigester;
 use crate::codec::frame;
 use crate::codec::frame::Frame;
+use crate::codec::snapshot::SnapshotFields;
+use crate::codec::snapshot::write_body;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
@@ -91,6 +98,7 @@ pub(crate) fn local(pending: Vec<Pending>, acked_offset: u64) -> LocalState {
         .first()
         .map_or(logged, |p| Position(p.id.position.0 - 1));
     LocalState {
+        lineage: LINEAGE,
         activation: ACTIVATION,
         cluster_id: cluster(),
         incarnation: token(),
@@ -140,6 +148,56 @@ pub(crate) fn read(body: &[u8], next: u64) -> RawAnswer {
     let mut raw = RawAnswer::new(200);
     raw.header(names::STREAM_NEXT_OFFSET, off(next).to_string());
     raw.body = body.to_vec();
+    raw
+}
+
+/// A HEAD's `200` of our stream with its tail at `tail`, naming `snapshot` as the latest.
+pub(crate) fn head_naming(snapshot: Option<SnapshotRef>, tail: u64) -> RawAnswer {
+    let mut raw = RawAnswer::new(200);
+    ServerIdentity::current(cluster()).render(raw.emit());
+    StreamHead::new(token(), off(tail), off(0), 32 << 20)
+        .unwrap()
+        .with_snapshot(snapshot)
+        .unwrap()
+        .render(raw.emit());
+    raw
+}
+
+/// A `USS3` body at `offset` whose last commit is `last`, over a one-page image, and its
+/// reference as HEAD names it.
+pub(crate) fn snapshot_body(offset: u64, last: CommitId) -> (Vec<u8>, SnapshotRef) {
+    let fields = SnapshotFields {
+        offset: off(offset),
+        epoch: epoch(1),
+        last,
+    };
+    let mut body = Vec::new();
+    write_body(
+        &fields,
+        &mut std::io::Cursor::new(vec![7u8; 4096]),
+        &mut body,
+    )
+    .unwrap();
+    let mut digester = SnapshotDigester::new(frame::CONTENT_TYPE);
+    digester.update(&body);
+    let snapshot = SnapshotRef {
+        offset: off(offset),
+        digest: digester.finalize(),
+    };
+    (body, snapshot)
+}
+
+/// A snapshot read's `200` with `body`.
+pub(crate) fn snapshot_read(snapshot: SnapshotRef, body: Vec<u8>) -> RawAnswer {
+    let mut raw = RawAnswer::new(200);
+    SnapshotRead {
+        snapshot,
+        incarnation: token(),
+        up_to_date: false,
+    }
+    .render(raw.emit());
+    raw.header("content-type", frame::CONTENT_TYPE.to_owned());
+    raw.body = body;
     raw
 }
 

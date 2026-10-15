@@ -96,12 +96,27 @@ impl Transport for HttpTransport {
             Ok(response) => response,
             Err(e) => return Exchange::NoAnswer(no_answer_from(e)),
         };
-        let body = match response
-            .body_mut()
-            .with_config()
-            .limit(ANSWER_BODY_LIMIT)
-            .read_to_vec()
-        {
+        // Only the body's first bytes (a snapshot header): a server that ignores `Range` answers
+        // `200` with the whole body, of which no more is read. The connection, its body unread,
+        // is dropped rather than pooled.
+        let read = match request.head_bytes {
+            Some(n) => {
+                let mut head = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(response.body_mut().as_reader(), n),
+                    &mut head,
+                )
+                .map(|_len| head)
+                .map_err(|e| e.to_string())
+            }
+            None => response
+                .body_mut()
+                .with_config()
+                .limit(ANSWER_BODY_LIMIT)
+                .read_to_vec()
+                .map_err(|e| e.to_string()),
+        };
+        let body = match read {
             Ok(body) => body,
             Err(e) => {
                 return Exchange::NoAnswer(NoAnswer::Lost {

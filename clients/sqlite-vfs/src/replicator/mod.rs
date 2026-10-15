@@ -12,9 +12,17 @@
 //! At most one append or claim is outstanding at a time, beside at most one `synced()` probe, and
 //! an answer whose id is not an outstanding one (a late duplicate, an earlier attempt) is ignored.
 //!
-//! Left for later milestones: re-key while bound (M2), resume (M4), re-cut and PART sending (M3),
-//! the provisional deferred claim (M2) and the `410` snapshot rule (M2). In M1 a `410` in a
-//! takeover's reconcile is a divergence, and in a continuation's it resets `stale`.
+//! A `410` in a reconcile follows design §4.9's rule: a HEAD names the latest snapshot, its header
+//! alone is read and its checksum verified, and when its last commit is of our lineage at or below
+//! the acknowledged position, the reconcile reads on from its offset. Clones share a lineage, so
+//! a snapshot above it is never trusted: a takeover diverges and rebuilds, and a continuation
+//! resets `stale`.
+//!
+//! A snapshot asks for a batch ending exactly at its `k` ([`Event::Boundary`]); once `k` is
+//! acknowledged, [`Action::Boundary`] hands back `W`, the end offset of that batch's receipt.
+//!
+//! Left for later milestones: re-key while bound (M2), resume (M4), re-cut and PART sending (M3)
+//! and the provisional deferred claim (M2).
 //!
 //! Module map:
 //!
@@ -49,13 +57,18 @@ use ursula_headers::ProducerId;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
 use ursula_headers::Seq;
+use ursula_headers::SnapshotRef;
 
 use self::answer::AppendDecision;
 use self::answer::ClaimDecision;
+use self::answer::Common;
+use self::answer::HeadDecision;
 use self::answer::ReadDecision;
 use self::answer::decide_append;
 use self::answer::decide_claim;
+use self::answer::decide_head;
 use self::answer::decide_read;
+use self::answer::decide_status;
 use self::backoff::Hit;
 use self::backoff::Link;
 use self::batch::SealError;
@@ -69,16 +82,23 @@ use self::sync::Tickets;
 use crate::codec::digest::producer_digest;
 use crate::codec::frame;
 use crate::codec::frame::CONTENT_TYPE;
+use crate::codec::snapshot::SnapshotHeader;
+use crate::codec::snapshot::read_header;
 use crate::ids::Activation;
 use crate::ids::CommitId;
+use crate::ids::Lineage;
 use crate::ids::Position;
+use crate::log;
+use crate::log::Level;
 pub(crate) use crate::materialize::ForeignFrame;
 use crate::transport::Attempt;
 use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::PRODUCER_ID;
 use crate::wire::Request;
+use crate::wire::SnapshotPart;
 use crate::wire::Target;
+use crate::wire::Typed;
 
 /// The largest batch, whatever the request limit (design §4.6).
 pub(crate) const MAX_BATCH_BYTES: u64 = 4 << 20;
@@ -161,8 +181,13 @@ pub(crate) enum Event {
     Answer { id: RequestId, exchange: Exchange },
     /// The time moved; timers that are due fire.
     Tick,
-    /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11).
+    /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11): once it is
+    /// acknowledged, [`Action::Boundary`] reports it.
     Boundary(Position),
+    /// A snapshot published (or found superseded) covers `log_bytes` of the frame bytes counted
+    /// since the previous one ([`BoundaryReceipt::log_bytes`]): they no longer count toward the
+    /// next.
+    Snapshotted { log_bytes: u64 },
     /// `synced()` with ticket `ticket`: `target` is at most the last COMMIT position at the call.
     /// The ticket waits for every commit at or below `target`, whatever record sits at `target`,
     /// so the driver delivers `Logged(p)` before any `Sync` whose target is at or above `p`.
@@ -171,8 +196,12 @@ pub(crate) enum Event {
     /// it logged is at or below `last`, and `last` is at or above the last position logged
     /// before (a rebuilt generation's positions continue above the old ones). `log_bytes` is the
     /// log's frame byte count after it (the ACK's `log_bytes`). The ACK covering `last` is
-    /// written and fsynced.
-    CaughtUp { last: Position, log_bytes: u64 },
+    /// written and fsynced. `lineage` is the generation's: a rebuilt one has a new lineage.
+    CaughtUp {
+        last: Position,
+        log_bytes: u64,
+        lineage: Lineage,
+    },
     /// The binding retires.
     Stop,
 }
@@ -241,11 +270,31 @@ pub(crate) enum Action {
     },
     Reset(ResetKind),
     Refuse(Refusal),
+    /// A boundary of [`Event::Boundary`] is acknowledged, or passed.
+    Boundary(BoundaryReceipt),
+}
+
+/// What came of a boundary `position` (design §4.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundaryReceipt {
+    pub(crate) position: Position,
+    /// `W`: the stream holds every record up to `position` before it and none after. The end
+    /// offset of the receipt of the batch ending exactly at `position`, or the acknowledged
+    /// offset when `position` was already the acknowledged one (only claims follow it). `None`
+    /// when acknowledgements passed it without a receipt ending there.
+    pub(crate) offset: Option<Offset>,
+    /// The highest epoch known claimed when `position` was acknowledged: at or above every epoch
+    /// claimed before `offset`.
+    pub(crate) epoch: Option<Epoch>,
+    /// The frame bytes acknowledged since the latest snapshot, up to `position`.
+    pub(crate) log_bytes: u64,
 }
 
 /// What the log and the open's HEAD say when the replicator starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalState {
+    /// The generation's: our commit ids carry it.
+    pub(crate) lineage: Lineage,
     pub(crate) activation: Activation,
     pub(crate) cluster_id: ClusterId,
     pub(crate) incarnation: Incarnation,
@@ -306,6 +355,7 @@ pub(crate) struct SentBatch {
 /// What every state but the terminal ones carries.
 #[derive(Debug, Clone)]
 pub(crate) struct Ctx {
+    pub(crate) lineage: Lineage,
     pub(crate) activation: Activation,
     pub(crate) cluster_id: ClusterId,
     pub(crate) incarnation: Incarnation,
@@ -321,6 +371,8 @@ pub(crate) struct Ctx {
     pub(crate) tickets: Tickets,
     pub(crate) sent: Vec<SentBatch>,
     pub(crate) condition: Option<Condition>,
+    /// Boundaries acknowledged or passed, reported with the next ACK.
+    reached: Vec<BoundaryReceipt>,
     /// The db file's size at the start.
     pub(crate) db_bytes: u64,
     /// `Producer-Id`, checked once when the replicator starts.
@@ -337,6 +389,7 @@ impl Ctx {
     fn new(local: LocalState) -> Option<Self> {
         let producer = ProducerId::new(PRODUCER_ID).ok()?;
         Some(Self {
+            lineage: local.lineage,
             activation: local.activation,
             cluster_id: local.cluster_id,
             incarnation: local.incarnation,
@@ -356,6 +409,7 @@ impl Ctx {
             tickets: Tickets::default(),
             sent: Vec::new(),
             condition: None,
+            reached: Vec::new(),
             db_bytes: local.db_bytes,
             producer,
             next_id: 0,
@@ -403,15 +457,18 @@ impl Ctx {
         activation == self.activation || self.claims.iter().any(|(_, a)| *a == activation)
     }
 
-    /// Above every epoch seen: own claims, answers, the snapshot.
-    fn takeover_epoch(&self) -> Option<Epoch> {
-        let highest = self
-            .claims
+    /// The highest epoch seen: own claims, answers, the snapshot.
+    fn highest_epoch(&self) -> Option<Epoch> {
+        self.claims
             .iter()
             .map(|(epoch, _)| *epoch)
             .chain(self.seen)
-            .max();
-        match highest {
+            .max()
+    }
+
+    /// Above every epoch seen: own claims, answers, the snapshot.
+    fn takeover_epoch(&self) -> Option<Epoch> {
+        match self.highest_epoch() {
             None => Epoch::try_from(1).ok(),
             Some(epoch) => next_epoch(epoch),
         }
@@ -454,6 +511,11 @@ impl Ctx {
         }
     }
 
+    /// A read of the header of the snapshot at `offset`, under the precondition.
+    pub(crate) fn snapshot_header_request(&self, offset: Offset) -> Request {
+        Request::snapshot_read(offset, self.incarnation, SnapshotPart::Header)
+    }
+
     /// The first position not acknowledged: tickets at or above it wait.
     pub(crate) fn first_pending(&self) -> Option<Position> {
         self.pending.front().map(|p| p.id.position)
@@ -477,12 +539,26 @@ impl Ctx {
         self.acked = self.acked.max(last);
         self.acked_offset = offset;
         let acked = self.acked;
+        let passed: Vec<Position> = self.boundaries.range(..=acked).copied().collect();
+        for position in passed {
+            self.reach(position, (position == last).then_some(offset));
+        }
         self.boundaries.retain(|b| *b > acked);
         // An acknowledged batch is at or below any closed seq: only the in-flight one is kept.
         self.sent.retain(|b| b.last > acked);
     }
 
-    fn ack_actions(&self, actions: &mut Vec<Action>) {
+    /// Boundary `position` is acknowledged, at `offset` when a receipt ends exactly there.
+    fn reach(&mut self, position: Position, offset: Option<Offset>) {
+        self.reached.push(BoundaryReceipt {
+            position,
+            offset,
+            epoch: self.highest_epoch(),
+            log_bytes: self.log_bytes,
+        });
+    }
+
+    fn ack_actions(&mut self, actions: &mut Vec<Action>) {
         actions.push(Action::PersistAck {
             acked: self.acked,
             acked_offset: self.acked_offset,
@@ -492,6 +568,7 @@ impl Ctx {
             acked: self.acked,
             offset: self.acked_offset,
         });
+        actions.extend(self.reached.drain(..).map(Action::Boundary));
     }
 }
 
@@ -522,6 +599,13 @@ pub(crate) enum Step {
     /// Takeover: the driver carries out an [`Action::Rebuild`] and answers with
     /// [`Event::CaughtUp`].
     CatchingUp(Box<Done>),
+    /// A read of the reconcile met a `410`: the rule of design §4.9 reads the latest snapshot's
+    /// header. `snapshot` is `None` while the HEAD that names it is out, then the snapshot read.
+    Gone {
+        reconcile: Box<Reconcile>,
+        link: Box<Link>,
+        snapshot: Option<SnapshotRef>,
+    },
 }
 
 /// What a streaming replicator's append slot is doing.
@@ -712,7 +796,22 @@ fn common_event(
         Event::Boundary(position) => {
             if position > ctx.acked {
                 ctx.boundaries.insert(position);
+            } else {
+                // Acknowledged already: at the acknowledged position the stream holds it up to
+                // the acknowledged offset, with only claims after it.
+                let offset = (position == ctx.acked).then_some(ctx.acked_offset);
+                ctx.reach(position, offset);
+                actions.extend(ctx.reached.drain(..).map(Action::Boundary));
             }
+            Ok(None)
+        }
+        Event::Snapshotted { log_bytes } => {
+            ctx.log_bytes = ctx.log_bytes.saturating_sub(log_bytes);
+            actions.push(Action::PersistAck {
+                acked: ctx.acked,
+                acked_offset: ctx.acked_offset,
+                log_bytes: ctx.log_bytes,
+            });
             Ok(None)
         }
         // Only the streaming state settles: a claim's reconcile acknowledges records before it
@@ -774,6 +873,7 @@ fn activating(
             },
             Event::Logged(_)
             | Event::Boundary(_)
+            | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
             | Event::Stop => Replicator::Activating {
@@ -820,8 +920,16 @@ fn activating(
                     }
                     ReadDecision::Gone => {
                         ctx.set_condition(None, actions);
-                        let fed = reconcile.gone(&mut ctx);
-                        reconciled(kind, reconcile, fed, ctx, now_ms, actions)
+                        let link = Box::new(Link::send(head_request(), &mut ctx, actions));
+                        Replicator::Activating {
+                            kind,
+                            step: Step::Gone {
+                                reconcile,
+                                link,
+                                snapshot: None,
+                            },
+                            ctx,
+                        }
                     }
                     ReadDecision::Common(common) => {
                         match link.common(common, retry_after(&exchange), now_ms, &mut ctx, actions)
@@ -838,6 +946,7 @@ fn activating(
             },
             Event::Logged(_)
             | Event::Boundary(_)
+            | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
             | Event::Stop => Replicator::Activating {
@@ -847,11 +956,16 @@ fn activating(
             },
         },
         Step::Applying { reconcile, end } => match event {
-            Event::CaughtUp { last, log_bytes } => {
+            Event::CaughtUp {
+                last,
+                log_bytes,
+                lineage,
+            } => {
                 if last < ctx.logged {
                     return reset(ResetKind::Internal, actions);
                 }
                 // The read's frames hold positions up to `last`, acknowledged up to `end`.
+                ctx.lineage = lineage;
                 ctx.logged = last;
                 ctx.acknowledge(last, end);
                 ctx.log_bytes = log_bytes;
@@ -869,6 +983,7 @@ fn activating(
             | Event::Answer { .. }
             | Event::Logged(_)
             | Event::Boundary(_)
+            | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::Stop => Replicator::Activating {
                 kind,
@@ -877,11 +992,24 @@ fn activating(
             },
         },
         Step::CatchingUp(done) => match event {
-            Event::CaughtUp { last, log_bytes } => {
+            Event::CaughtUp {
+                last,
+                log_bytes,
+                lineage,
+            } => {
                 if last < ctx.logged {
                     return reset(ResetKind::Internal, actions);
                 }
+                // A ticket added while catching up whose target lies in the discarded tail never
+                // resolves, like those the divergence abandoned.
+                if let CatchUp::Rebuild {
+                    discard_from: Some(from),
+                } = done.catch_up
+                {
+                    ctx.tickets.abandon_from(from, actions);
+                }
                 // The caught-up frames hold positions up to `last`, acknowledged.
+                ctx.lineage = lineage;
                 ctx.logged = last;
                 let offset = ctx.acked_offset;
                 ctx.acknowledge(last, offset);
@@ -892,6 +1020,7 @@ fn activating(
             | Event::Answer { .. }
             | Event::Logged(_)
             | Event::Boundary(_)
+            | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::Stop => Replicator::Activating {
                 kind,
@@ -899,6 +1028,235 @@ fn activating(
                 ctx,
             },
         },
+        Step::Gone {
+            reconcile,
+            mut link,
+            snapshot,
+        } => {
+            let hit = match &event {
+                Event::Answer { id, .. } => link.hit(*id),
+                _ => Hit::None,
+            };
+            match (event, hit) {
+                (Event::Tick, _) => link.tick(now_ms, &mut ctx, actions),
+                (Event::Answer { exchange, .. }, Hit::Head) => {
+                    if let Err(kind) = link.head_answer(&exchange, now_ms, &mut ctx, actions) {
+                        return reset(kind, actions);
+                    }
+                }
+                (Event::Answer { exchange, .. }, Hit::Main) => {
+                    let gone = Gone {
+                        kind,
+                        reconcile,
+                        link,
+                        snapshot,
+                    };
+                    return gone.answered(&exchange, ctx, now_ms, actions);
+                }
+                _ => {}
+            }
+            Replicator::Activating {
+                kind,
+                step: Step::Gone {
+                    reconcile,
+                    link,
+                    snapshot,
+                },
+                ctx,
+            }
+        }
+    }
+}
+
+/// A HEAD without a precondition.
+fn head_request() -> Request {
+    Request::new(Method::Head, Target::Stream)
+}
+
+/// The `410` rule of design §4.9 while its HEAD or snapshot read is out.
+struct Gone {
+    kind: ClaimKind,
+    reconcile: Box<Reconcile>,
+    link: Box<Link>,
+    snapshot: Option<SnapshotRef>,
+}
+
+impl Gone {
+    fn waiting(self, ctx: Box<Ctx>) -> Replicator {
+        Replicator::Activating {
+            kind: self.kind,
+            step: Step::Gone {
+                reconcile: self.reconcile,
+                link: self.link,
+                snapshot: self.snapshot,
+            },
+            ctx,
+        }
+    }
+
+    /// Carries out what an answer that decides nothing about the rule decided.
+    fn common(
+        mut self,
+        common: Common,
+        exchange: &Exchange,
+        mut ctx: Box<Ctx>,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        match self
+            .link
+            .common(common, retry_after(exchange), now_ms, &mut ctx, actions)
+        {
+            Err(kind) => reset(kind, actions),
+            Ok(()) => self.waiting(ctx),
+        }
+    }
+
+    /// The answer to the HEAD or to the snapshot read.
+    fn answered(
+        self,
+        exchange: &Exchange,
+        mut ctx: Box<Ctx>,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let Exchange::Answered(answer) = exchange else {
+            let common = Common::Resend {
+                retry_after: None,
+                fresh: true,
+            };
+            return self.common(common, exchange, ctx, now_ms, actions);
+        };
+        let Some(snapshot) = self.snapshot else {
+            return match decide_head(exchange, &ctx.cluster_id, ctx.incarnation) {
+                HeadDecision::Same { max_request_bytes } => {
+                    ctx.set_condition(None, actions);
+                    ctx.limits.head = max_request_bytes;
+                    let latest = match &answer.typed {
+                        Ok(Typed::Head {
+                            stream: Some(head), ..
+                        }) => head.snapshot(),
+                        _ => None,
+                    };
+                    match latest.filter(|s| s.offset >= self.reconcile.at()) {
+                        None => self.fails(ctx, now_ms, actions),
+                        Some(latest) => {
+                            let request = ctx.snapshot_header_request(latest.offset);
+                            let link = Link::send(request, &mut ctx, actions);
+                            Self {
+                                link: Box::new(link),
+                                snapshot: Some(latest),
+                                ..self
+                            }
+                            .waiting(ctx)
+                        }
+                    }
+                }
+                HeadDecision::Rewound => reset(ResetKind::Rewound, actions),
+                HeadDecision::Deleted => reset(ResetKind::Deleted, actions),
+                HeadDecision::WrongCluster => {
+                    let common = Common::Blocked(BlockedReason::WrongCluster);
+                    self.common(common, exchange, ctx, now_ms, actions)
+                }
+                HeadDecision::Common(common) => {
+                    // A HEAD never waits on another HEAD.
+                    let common = match common {
+                        Common::Head(_) => Common::Blocked(BlockedReason::Rejected {
+                            status: answer.status,
+                        }),
+                        other => other,
+                    };
+                    self.common(common, exchange, ctx, now_ms, actions)
+                }
+            };
+        };
+        match &answer.typed {
+            Ok(Typed::SnapshotRead(read))
+                if matches!(answer.status, 200 | 206) && read.snapshot == snapshot =>
+            {
+                ctx.set_condition(None, actions);
+                // The header verifies without the body (design §4.11).
+                match read_header(&answer.body) {
+                    Ok((header, _))
+                        if header.fields.offset == snapshot.offset
+                            && self.covers(&ctx, &header) =>
+                    {
+                        self.continue_from(&header, ctx, now_ms, actions)
+                    }
+                    // Not ours, or not at or below what this copy acknowledged.
+                    Ok(_) => self.fails(ctx, now_ms, actions),
+                    Err(e) => {
+                        log::emit(Level::Warn, "snapshot_unreadable", &[
+                            ("offset", &snapshot.offset),
+                            ("error", &e),
+                        ]);
+                        self.fails(ctx, now_ms, actions)
+                    }
+                }
+            }
+            // Superseded since the HEAD: the HEAD again names the latest.
+            Ok(Typed::Untyped) if answer.status == 404 => {
+                let link = Link::send(head_request(), &mut ctx, actions);
+                Self {
+                    link: Box::new(link),
+                    snapshot: None,
+                    ..self
+                }
+                .waiting(ctx)
+            }
+            _ => {
+                let common = decide_status(answer);
+                self.common(common, exchange, ctx, now_ms, actions)
+            }
+        }
+    }
+
+    /// Whether the snapshot of `header` is a state this copy knows the stream holds: its last
+    /// commit is of our lineage at or below the acknowledged position (durable, or matched by id
+    /// and bytes in this reconcile), and its offset lies in what the reconcile reads. Clones
+    /// share a lineage, so a position above our acknowledged one may be another copy's commit
+    /// with other bytes: never trusted, a divergence. Our own snapshot never runs ahead of the
+    /// durable acknowledged position (the snapshot thread fsyncs ACK(k, W) before publishing).
+    fn covers(&self, ctx: &Ctx, header: &SnapshotHeader) -> bool {
+        let last = header.fields.last;
+        let offset = header.fields.offset;
+        last.lineage == ctx.lineage
+            && last.position <= ctx.acked
+            && self.reconcile.at() <= offset
+            && offset <= self.reconcile.end()
+    }
+
+    /// The snapshot covers the acknowledged records: those it includes are acknowledged, and the
+    /// reconcile reads on from its offset.
+    fn continue_from(
+        mut self,
+        header: &SnapshotHeader,
+        mut ctx: Box<Ctx>,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        ctx.see_epoch(header.fields.epoch);
+        ctx.acknowledge(header.fields.last.position, header.fields.offset);
+        self.reconcile.restart(header.fields.offset);
+        if self.reconcile.complete() {
+            return finish(self.kind, *self.reconcile, ctx, now_ms, actions);
+        }
+        let link = Link::send(ctx.read_request(self.reconcile.at()), &mut ctx, actions);
+        Replicator::Activating {
+            kind: self.kind,
+            step: Step::Reconcile {
+                reconcile: self.reconcile,
+                link,
+            },
+            ctx,
+        }
+    }
+
+    /// The snapshot does not cover the acknowledged records: a takeover diverges, a continuation
+    /// resets `stale`.
+    fn fails(mut self, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
+        let fed = self.reconcile.gone(&mut ctx);
+        reconciled(self.kind, self.reconcile, fed, ctx, now_ms, actions)
     }
 }
 
@@ -1213,6 +1571,7 @@ impl Stream {
             }
             Event::Logged(_)
             | Event::Boundary(_)
+            | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
             | Event::Stop => {

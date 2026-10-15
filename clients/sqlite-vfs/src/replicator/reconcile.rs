@@ -45,7 +45,8 @@ pub(crate) enum FrameClass {
     ForeignCommit,
     /// Bytes that are not `USQ2` frames.
     Undecodable,
-    /// `410` at the start: below retention.
+    /// `410` and the latest snapshot does not cover this owner's acknowledged records (the rule
+    /// of design §4.9 did not continue from its offset): below retention.
     Gone,
 }
 
@@ -59,7 +60,8 @@ pub(crate) enum RowDecision {
     Reset(ResetKind),
 }
 
-/// The table of design §4.9 (M1: no `410` snapshot rule).
+/// The table of design §4.9. The `410` row's snapshot check runs first (the replicator's
+/// `Step::Gone`): [`FrameClass::Gone`] is its failure.
 pub(crate) fn decide_frame(mode: Mode, class: FrameClass) -> RowDecision {
     match (class, mode) {
         (FrameClass::OwnClaim, _) => RowDecision::Skip,
@@ -164,6 +166,18 @@ impl Reconcile {
         self.stream.done()
     }
 
+    /// The claim's start, where the reads end.
+    pub(crate) fn end(&self) -> Offset {
+        self.stream.end()
+    }
+
+    /// The `410` rule found the latest snapshot covering this owner's acknowledged records: the
+    /// reads go on from its offset `from` (design §4.9).
+    pub(crate) fn restart(&mut self, from: Offset) {
+        self.stream = FrameStream::new(from, self.stream.end(), MAX_BATCH_BYTES);
+        self.chunk.clear();
+    }
+
     pub(crate) fn into_done(self) -> Done {
         Done {
             epoch: self.epoch,
@@ -192,7 +206,8 @@ impl Reconcile {
         Some(std::mem::take(&mut self.chunk))
     }
 
-    /// `410`: the frames below retention cannot be read.
+    /// `410`, and the latest snapshot does not cover the acknowledged records: the frames below
+    /// retention cannot be read.
     pub(crate) fn gone(&mut self, ctx: &mut Ctx) -> Fed {
         match decide_frame(self.mode, FrameClass::Gone) {
             RowDecision::Diverge => self.rebuild(ctx),

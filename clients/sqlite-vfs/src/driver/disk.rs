@@ -48,6 +48,13 @@ pub(crate) enum DiskJob {
     /// An open's local steps ([`prepare`]).
     Prepare(OpenSpec),
     NewBuild(NewBuild),
+    /// The latest snapshot's body into a build; done as a [`DiskDone::Chunk`].
+    Install {
+        build: Box<Build>,
+        body: Vec<u8>,
+    },
+    /// A build started over in a fresh `.tmp`; done as a [`DiskDone::Built`].
+    Restart(Box<Build>),
     /// One read's frames into a build.
     Chunk {
         build: Box<Build>,
@@ -95,6 +102,11 @@ impl DiskJob {
         match self {
             Self::Prepare(spec) => DiskDone::Prepared(prepare(&spec)),
             Self::NewBuild(job) => DiskDone::Built(new_build(job).map(Box::new)),
+            Self::Install { mut build, body } => {
+                let result = build.install(&body);
+                DiskDone::Chunk { build, result }
+            }
+            Self::Restart(build) => DiskDone::Built(build.restart().map(Box::new)),
             Self::Chunk { mut build, frames } => {
                 let result = build.apply(&frames);
                 DiskDone::Chunk { build, result }

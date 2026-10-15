@@ -589,7 +589,14 @@ impl Core {
                     b.acknowledged(acked);
                     if let Some(handle) = b.handle() {
                         handle.set_acked(acked);
+                        let log_bytes = b.replicator.ctx().map_or(0, |ctx| ctx.log_bytes);
+                        handle.snapshots.acknowledged(log_bytes);
                         self.events.push(DriverEvent::Acked { binding, acked });
+                    }
+                }
+                Action::Boundary(receipt) => {
+                    if let Some(handle) = b.handle() {
+                        handle.snapshots.snapper.receipt(receipt);
                     }
                 }
                 Action::Synced { ticket } => {
@@ -748,6 +755,14 @@ impl Core {
                     wake_at: Some(at),
                 };
             }
+            BuildStep::Install(body) => {
+                *local = Local::Busy;
+                self.disk(Owner::Disk(binding), DiskJob::Install { build, body }, ios);
+            }
+            BuildStep::Restart => {
+                *local = Local::Busy;
+                self.disk(Owner::Disk(binding), DiskJob::Restart(build), ios);
+            }
             BuildStep::Apply(frames) => {
                 *local = Local::Busy;
                 self.disk(Owner::Disk(binding), DiskJob::Chunk { build, frames }, ios);
@@ -822,6 +837,7 @@ impl Core {
             Stage::Bound { handle } => {
                 handle.mark_reset(kind);
                 handle.reset_retired();
+                handle.snapshots.snapper.stop();
                 self.events.push(DriverEvent::Reset {
                     binding,
                     cause: kind,
@@ -879,6 +895,8 @@ impl Core {
                 epoch,
                 condition: ctx.and_then(|ctx| ctx.condition.clone()),
                 pending: b.unacked.len(),
+                log_bytes: ctx.map_or(0, |ctx| ctx.log_bytes),
+                request_limit: ctx.map_or(MAX_BATCH_BYTES, |ctx| ctx.limits.request()),
             },
             ctx.map(|ctx| ctx.limits.batch()),
         );
@@ -893,6 +911,11 @@ impl Core {
     fn bind(&mut self, binding: BindingId, now_ms: u64) {
         let Some(mut b) = self.bindings.remove(&binding) else {
             return;
+        };
+        // Bound, the replicator streams with its context.
+        let Some(incarnation) = b.replicator.ctx().map(|c| c.incarnation) else {
+            self.bindings.insert(binding, b);
+            return self.fail_open(binding, OpenError::Panicked);
         };
         // A result nobody takes or cancels retires too.
         b.unconnected_since = Some((now_ms, 0));
@@ -918,7 +941,7 @@ impl Core {
             generation,
             name: b.name.clone(),
             cluster_id: ctx.map(|c| c.cluster_id.to_string()).unwrap_or_default(),
-            incarnation: ctx.map(|c| c.incarnation.to_string()).unwrap_or_default(),
+            incarnation,
             log,
             pending_bytes: pending,
             max_pending_bytes: b.max_pending_bytes,
@@ -946,6 +969,7 @@ impl Core {
             ]);
         }
         if let Some(handle) = b.handle() {
+            handle.snapshots.snapper.stop();
             handle.release_root();
         }
         for ticket in std::mem::take(&mut b.tickets) {
@@ -1061,18 +1085,30 @@ impl Core {
             }
             DiskDone::Published(Ok((m, _highest))) => {
                 let (last, log_bytes) = caught_up(&m);
+                let lineage = m.generation.lineage;
                 *local = Local::Ready(m);
                 // Every record of the new log is a stream frame, acknowledged.
                 b.last_commit = last;
-                self.drive(binding, Event::CaughtUp { last, log_bytes }, now_ms, ios);
+                let event = Event::CaughtUp {
+                    last,
+                    log_bytes,
+                    lineage,
+                };
+                self.drive(binding, event, now_ms, ios);
             }
             DiskDone::CaughtUp {
                 m,
                 outcome: Ok((last, log_bytes)),
             } => {
+                let lineage = m.generation.lineage;
                 *local = Local::Ready(m);
                 b.last_commit = last;
-                self.drive(binding, Event::CaughtUp { last, log_bytes }, now_ms, ios);
+                let event = Event::CaughtUp {
+                    last,
+                    log_bytes,
+                    lineage,
+                };
+                self.drive(binding, event, now_ms, ios);
             }
             DiskDone::CaughtUp {
                 outcome: Err(e), ..
@@ -1279,6 +1315,19 @@ impl Core {
     ) -> Vec<Io> {
         let mut ios = Vec::new();
         self.drive(binding, Event::Boundary(position), now_ms, &mut ios);
+        ios
+    }
+
+    /// A snapshot published (or found superseded) covers `log_bytes` of the frame bytes counted
+    /// toward the next one.
+    pub(crate) fn snapshotted(
+        &mut self,
+        binding: BindingId,
+        log_bytes: u64,
+        now_ms: u64,
+    ) -> Vec<Io> {
+        let mut ios = Vec::new();
+        self.drive(binding, Event::Snapshotted { log_bytes }, now_ms, &mut ios);
         ios
     }
 

@@ -195,6 +195,9 @@ pub(crate) struct ModelServer {
     streams: BTreeMap<String, Stream>,
     checkpoints: Vec<Checkpoint>,
     faults: Faults,
+    /// Ranged snapshot reads so far: every other one is answered `200` with the whole body, as
+    /// a server that ignores `Range` answers.
+    ranged_reads: u64,
 }
 
 impl ModelServer {
@@ -211,6 +214,7 @@ impl ModelServer {
             streams: BTreeMap::new(),
             checkpoints: Vec::new(),
             faults: Faults::default(),
+            ranged_reads: 0,
         };
         server.history = server.draw_history();
         server
@@ -694,6 +698,12 @@ impl ModelServer {
     /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`.
     fn snapshot_read(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
         let history = self.history;
+        let honored = request
+            .head_bytes
+            .filter(|_| self.ranged_reads.is_multiple_of(2));
+        if request.head_bytes.is_some() {
+            self.ranged_reads = self.ranged_reads.wrapping_add(1);
+        }
         let stream = match self.stream(path, request) {
             Ok(stream) => stream,
             Err(answer) => return answer,
@@ -705,7 +715,16 @@ impl ModelServer {
         else {
             return RawAnswer::new(404);
         };
-        let mut answer = RawAnswer::new(200);
+        // A `Range` of the body's first bytes is answered `206` with those bytes, or (every other
+        // time) ignored: `200` with the whole body, as the server does today.
+        let (status, body) = match honored {
+            Some(n) => {
+                let n = usize::try_from(n).unwrap_or(usize::MAX);
+                (206, snapshot.body.get(..n).unwrap_or(&snapshot.body))
+            }
+            None => (200, snapshot.body.as_ref()),
+        };
+        let mut answer = RawAnswer::new(status);
         SnapshotRead {
             snapshot: snapshot.snapshot,
             incarnation: stream.token_in(history),
@@ -713,7 +732,7 @@ impl ModelServer {
         }
         .render(answer.emit());
         answer.header(CONTENT_TYPE, snapshot.content_type.clone());
-        answer.body = snapshot.body.to_vec();
+        answer.body = body.to_vec();
         answer
     }
 

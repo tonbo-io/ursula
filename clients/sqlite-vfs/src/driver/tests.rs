@@ -753,10 +753,52 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     assert_eq!(bound.handle.pending_bytes(), 0);
 }
 
-/// Publishes a snapshot at the stream's tail and moves retention up to it.
-fn snapshot_and_retain(server: &mut ModelServer) {
-    let tail = ursula_headers::Offset::from_u64(server.frames(PATH).unwrap().len() as u64);
-    let body = b"snapshot".to_vec();
+/// The db file a full replay of `bytes` (stream frames) builds: every commit's pages, in order,
+/// the file cut or grown to each commit's size. A model independent of the Applier.
+fn image_of(bytes: &[u8]) -> Vec<u8> {
+    let mut image = Vec::new();
+    for f in frames(bytes) {
+        if let Frame::Commit { compressed, .. } = decode(&f) {
+            let record = frame::decompress(&compressed).unwrap();
+            image.resize(record.db_pages_after as usize * 4096, 0);
+            for (pgno, page) in record.pages {
+                let at = (pgno as usize - 1) * 4096;
+                image[at..at + 4096].copy_from_slice(&page[..]);
+            }
+        }
+    }
+    image
+}
+
+/// The highest epoch the CLAIM frames of `bytes` name.
+fn highest_claim(bytes: &[u8]) -> Epoch {
+    frames(bytes)
+        .iter()
+        .filter_map(|f| match decode(f) {
+            Frame::Claim { epoch, .. } => Some(epoch),
+            _ => None,
+        })
+        .max()
+        .unwrap()
+}
+
+/// Publishes a real `USS3` snapshot at the stream's tail, the image a full replay builds, whose
+/// last commit is `last`, and moves retention up to it.
+fn snapshot_as(server: &mut ModelServer, last: CommitId) {
+    let bytes = server.frames(PATH).unwrap().to_vec();
+    let tail = ursula_headers::Offset::from_u64(bytes.len() as u64);
+    let fields = crate::codec::snapshot::SnapshotFields {
+        offset: tail,
+        epoch: highest_claim(&bytes),
+        last,
+    };
+    let mut body = Vec::new();
+    crate::codec::snapshot::write_body(
+        &fields,
+        &mut std::io::Cursor::new(image_of(&bytes)),
+        &mut body,
+    )
+    .unwrap();
     let mut digester = crate::codec::digest::SnapshotDigester::new(CONTENT_TYPE);
     digester.update(&body);
     let token = server.token(PATH).unwrap();
@@ -779,75 +821,543 @@ fn snapshot_and_retain(server: &mut ModelServer) {
     assert_eq!(server.handle(PATH, &retain).status, 204);
 }
 
-/// Every file under `dir` with its bytes.
-fn tree(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_owned()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                let bytes = std::fs::read(&path).unwrap();
-                out.push((path, bytes));
-            }
-        }
-    }
-    out.sort();
-    out
+/// [`snapshot_as`] by an owner of another lineage.
+fn snapshot_and_retain(server: &mut ModelServer) {
+    snapshot_as(server, CommitId {
+        lineage: crate::ids::Lineage([0x5a; 16]),
+        position: Position(9),
+    });
 }
 
+// A snapshot's boundary seals a batch ending exactly at `k`, and the driver hands the snapshot
+// thread `W`, the end offset of that batch's receipt.
 #[test]
-fn an_open_below_retention_is_refused_before_any_claim_with_its_files_kept() {
+fn a_boundary_seals_a_batch_ending_at_k_and_hands_back_its_receipt_end() {
+    let dir = TempDir::new("driver-boundary");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.down[c] = true;
+    for salt in 1..=4 {
+        w.commit(c, &bound, salt).unwrap();
+    }
+    let positions: Vec<Position> = log_records(&bound.handle.generation.dir)
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r, RecordBody::Commit { .. }))
+        .map(|(i, _)| Position(i as u64 + 1))
+        .collect();
+    let k = positions[1];
+    let now = w.now;
+    let ios = w.c(c).boundary(bound.binding, k, now);
+    w.queue_ios(c, ios);
+    w.down[c] = false;
+    w.run_for(30_000);
+    let receipt = bound.handle.snapshots.snapper.wait_receipt(k).unwrap();
+    // The first append ended at the second commit: W is where the third begins.
+    let commits = w.stream_commits();
+    let bytes = w.server.frames(PATH).unwrap().to_vec();
+    let third = bytes
+        .windows(commits[2].len())
+        .position(|win| win == commits[2].as_slice())
+        .unwrap();
+    assert_eq!(
+        receipt.offset,
+        Some(ursula_headers::Offset::from_u64(third as u64))
+    );
+    assert_eq!(receipt.epoch, Some(Epoch::try_from(1).unwrap()));
+    let batches: Vec<_> = w
+        .appends(c)
+        .into_iter()
+        .filter(|(_, seq, _)| *seq > 0)
+        .map(|(_, _, body)| body)
+        .collect();
+    // The first commit's batch was sealed (alone) before the outage; the next one ends at `k`
+    // although the third and fourth were pending, and they follow in a batch of their own.
+    assert!(batches.contains(&commits[1]), "{batches:?}");
+    assert!(batches.contains(&[commits[2].clone(), commits[3].clone()].concat()));
+}
+
+/// A model stream at `PATH` with a claim and a commit, for publishes.
+fn published_world() -> (Arc<Mutex<ModelServer>>, ursula_headers::Incarnation) {
+    let dir = TempDir::new("driver-publish");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let token = w.server.token(PATH).unwrap();
+    let server = std::mem::replace(&mut w.server, server());
+    (Arc::new(Mutex::new(server)), token)
+}
+
+/// A `USS3` body file of `pages` pages at `offset`, written as the snapshot thread writes it.
+struct BodyFile {
+    _dir: TempDir,
+    path: std::path::PathBuf,
+    offset: ursula_headers::Offset,
+    len: u64,
+    digest: ursula_headers::SnapshotDigest,
+}
+
+fn body_file(offset: u64, pages: usize) -> BodyFile {
+    let dir = TempDir::new("driver-publish-body");
+    let image_path = dir.path().join("image");
+    let image: Vec<u8> = (0..pages * 4096).map(|i| (i * 31 % 251) as u8).collect();
+    std::fs::write(&image_path, &image).unwrap();
+    let mut image = std::fs::File::open(&image_path).unwrap();
+    let fields = crate::codec::snapshot::SnapshotFields {
+        offset: ursula_headers::Offset::from_u64(offset),
+        epoch: Epoch::try_from(1).unwrap(),
+        last: CommitId {
+            lineage: crate::ids::Lineage([1; 16]),
+            position: Position(2),
+        },
+    };
+    let path = dir.path().join("body");
+    let (len, digest) = crate::snapshotter::write_snapshot(&fields, &mut image, &path).unwrap();
+    BodyFile {
+        _dir: dir,
+        path,
+        offset: fields.offset,
+        len,
+        digest,
+    }
+}
+
+/// Publishes `body` under `request_limit` through the model transport.
+fn publish_file(
+    server: &Arc<Mutex<ModelServer>>,
+    token: ursula_headers::Incarnation,
+    request_limit: u64,
+    body: &BodyFile,
+) -> Result<crate::snapshotter::Outcome, crate::snapshotter::SnapshotFailure> {
+    let transport = ModelTransport::new(Arc::clone(server), PATH);
+    let snapper = crate::snapshotter::Snapper::default();
+    crate::snapshotter::publish(&crate::snapshotter::Publish {
+        transport: &transport,
+        snapper: &snapper,
+        incarnation: token,
+        request_limit,
+        offset: body.offset,
+        digest: body.digest,
+        body: &body.path,
+        len: body.len,
+    })
+}
+
+/// Publishes a body of `pages` pages at the stream's tail under `request_limit`.
+fn publish_at_tail(
+    server: &Arc<Mutex<ModelServer>>,
+    token: ursula_headers::Incarnation,
+    request_limit: u64,
+    pages: usize,
+) -> Result<crate::snapshotter::Outcome, crate::snapshotter::SnapshotFailure> {
+    let tail = tail_of(server);
+    publish_file(server, token, request_limit, &body_file(tail, pages))
+}
+
+fn tail_of(server: &Arc<Mutex<ModelServer>>) -> u64 {
+    server.lock().unwrap().frames(PATH).unwrap().len() as u64
+}
+
+/// The stream's retained offset and latest snapshot offset, from a HEAD.
+fn retention(server: &Arc<Mutex<ModelServer>>) -> (u64, Option<u64>) {
+    let request = Request::new(Method::Head, Target::Stream);
+    let answer = server
+        .lock()
+        .unwrap()
+        .handle(PATH, &request)
+        .parse(&request);
+    match answer.typed {
+        Ok(crate::wire::Typed::Head {
+            stream: Some(head), ..
+        }) => (
+            head.retained_offset().get(),
+            head.snapshot().map(|s| s.offset.get()),
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Appends an unkeyed frame of bytes so the tail moves, as another commit would.
+fn grow(server: &Arc<Mutex<ModelServer>>) {
+    let commit = frame::encode_commit(
+        CommitId {
+            lineage: crate::ids::Lineage([1; 16]),
+            position: Position(3),
+        },
+        &CommitRecord {
+            db_pages_after: 1,
+            pages: vec![(1, Box::new([5; 4096]))],
+        },
+    )
+    .unwrap();
+    server
+        .lock()
+        .unwrap()
+        .foreign_append(PATH, &commit)
+        .unwrap();
+}
+
+// A body at or under the request limit is published, its 204 naming the digest; retention moves
+// to the snapshot before it, one behind, and never before a first one; a body above the limit is
+// not sent.
+#[test]
+fn publishes_keep_retention_one_snapshot_behind_and_refuse_bodies_above_the_limit() {
+    let (server, token) = published_world();
+    let first = server.lock().unwrap().frames(PATH).unwrap().len() as u64;
+    let outcome = publish_at_tail(&server, token, 32 << 20, 2).unwrap();
+    assert_eq!(outcome, crate::snapshotter::Outcome::Published {
+        offset: ursula_headers::Offset::from_u64(first),
+    });
+    assert_eq!(retention(&server), (0, Some(first)));
+    // Publishing the same body again is a repeat: still published.
+    assert!(matches!(
+        publish_at_tail(&server, token, 32 << 20, 2),
+        Ok(crate::snapshotter::Outcome::Published { .. })
+    ));
+    grow(&server);
+    let second = server.lock().unwrap().frames(PATH).unwrap().len() as u64;
+    publish_at_tail(&server, token, 32 << 20, 2).unwrap();
+    assert_eq!(retention(&server), (first, Some(second)));
+    grow(&server);
+    let third = server.lock().unwrap().frames(PATH).unwrap().len() as u64;
+    publish_at_tail(&server, token, 32 << 20, 2).unwrap();
+    assert_eq!(retention(&server), (second, Some(third)));
+    // Another body at the same offset conflicts: snapshots stop with stream_state.
+    let e = publish_at_tail(&server, token, 32 << 20, 3).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::Conflict { .. }),
+        "{e}"
+    );
+    assert!(e.to_string().starts_with("stream_state: "));
+    // Above the request limit: not published, reported as request_too_large.
+    grow(&server);
+    let e = publish_at_tail(&server, token, 100, 2).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            limit: Some(100),
+            ..
+        }),
+        "{e}"
+    );
+    assert!(e.to_string().starts_with("request_too_large: "));
+    assert_eq!(retention(&server), (second, Some(third)));
+}
+
+// A publish behind a later snapshot is superseded, and moves nothing.
+#[test]
+fn a_publish_behind_a_later_snapshot_is_superseded() {
+    let (server, token) = published_world();
+    let stale = server.lock().unwrap().frames(PATH).unwrap().len() as u64;
+    grow(&server);
+    let later = server.lock().unwrap().frames(PATH).unwrap().len() as u64;
+    publish_at_tail(&server, token, 32 << 20, 1).unwrap();
+    // A body for the earlier offset, published after the later one.
+    let outcome = publish_file(&server, token, 32 << 20, &body_file(stale, 1)).unwrap();
+    assert_eq!(outcome, crate::snapshotter::Outcome::Superseded {
+        offset: ursula_headers::Offset::from_u64(later),
+    });
+    assert_eq!(retention(&server), (0, Some(later)));
+}
+
+/// Commits a transaction writing pages `pgnos` (of a db of `size` pages) with `salt`.
+fn commit_pages(w: &mut World, core: usize, bound: &Bound, size: u32, pgnos: &[u32], salt: u8) {
+    let handle = &bound.handle;
+    let pending = {
+        let mut log = handle.log().unwrap();
+        let position = log.next_position();
+        let id = CommitId {
+            lineage: handle.generation.lineage,
+            position,
+        };
+        let record = CommitRecord {
+            db_pages_after: size,
+            pages: pgnos
+                .iter()
+                .map(|&p| (p, Box::new([salt.wrapping_add(p as u8); 4096])))
+                .collect(),
+        };
+        let frame = frame::encode_commit(id, &record).unwrap();
+        log.append(&RecordBody::Commit {
+            frame: frame.clone(),
+        })
+        .unwrap();
+        handle.record_commit(position);
+        handle.add_pending(frame.len() as u64);
+        Pending {
+            id,
+            frame: Arc::from(frame),
+        }
+    };
+    w.logged(core, bound, pending);
+}
+
+// Below retention, a fresh directory builds from the latest snapshot and the tail after it, and
+// a trusted generation's takeover meets a 410 whose snapshot is another owner's: it rebuilds from
+// that snapshot. Both equal a full replay of the stream; nothing acknowledged is lost.
+#[test]
+fn an_open_below_retention_builds_from_the_snapshot_and_the_tail() {
     let dir_a = TempDir::new("driver-gone-a");
     let dir_b = TempDir::new("driver-gone-b");
     let mut w = World::new();
     let a = w.core();
     let bound = w.open(a, spec(dir_a.path(), 1));
-    w.commit(a, &bound, 1).unwrap();
+    commit_pages(&mut w, a, &bound, 3, &[1, 2, 3], 1);
     w.run_for(1_000);
     w.retire(a, &bound);
     let generation = bound.handle.generation.clone();
     drop(bound);
     let b = w.core();
     let bound_b = w.open(b, spec(dir_b.path(), 2));
-    w.commit(b, &bound_b, 2).unwrap();
+    commit_pages(&mut w, b, &bound_b, 4, &[2, 4], 2);
+    w.run_for(1_000);
+    // A full replay before retention moves: what every build below must equal.
+    let full_dir = TempDir::new("driver-gone-full");
+    snapshot_and_retain(&mut w.server);
+    let retained = w.server.frames(PATH).unwrap().len();
+    // The tail after the snapshot: a shrink, and a page rewritten.
+    commit_pages(&mut w, b, &bound_b, 2, &[1], 3);
+    w.run_for(1_000);
+    let expected = image_of(w.server.frames(PATH).unwrap());
+    assert_eq!(expected.len(), 2 * 4096);
+    // The fresh directory reads the snapshot, then only the frames after it.
+    let c = w.core();
+    let sent_before = w.sent.len();
+    let bound_c = w.open(c, spec(full_dir.path(), 4));
+    assert_eq!(
+        std::fs::read(bound_c.handle.generation.db()).unwrap(),
+        expected
+    );
+    let reads: Vec<_> = w.sent[sent_before..]
+        .iter()
+        .filter(|s| s.core == c)
+        .map(|s| s.request.target)
+        .collect();
+    assert!(reads.contains(&Target::Snapshot {
+        offset: ursula_headers::Offset::from_u64(retained as u64),
+    }));
+    assert!(!reads.contains(&Target::Read {
+        from: None,
+        leader: false
+    }));
+    w.retire(c, &bound_c);
+    drop(bound_c);
+    // The trusted generation's takeover: a 410, another owner's snapshot, a rebuild.
+    let a2 = w.core();
+    let bound = w.open(a2, spec(dir_a.path(), 3));
+    assert_ne!(
+        bound.handle.generation.lineage, generation.lineage,
+        "rebuilt"
+    );
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        expected
+    );
+    // It streams from there: its next commit lands and synced() resolves.
+    let e1 = w.commit(a2, &bound, 9).unwrap();
+    let ticket = w.sync(a2, bound.binding);
+    w.run_for(2_000);
+    assert_eq!(w.outcome(a2, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits().last(), Some(&e1));
+}
+
+// A takeover whose records retention passed, with a snapshot of its own lineage past its durable
+// acknowledged position (its ACK record lagging): clones share a lineage, so the 410 rule never
+// trusts it, and the takeover rebuilds from it. Nothing acknowledged is lost.
+#[test]
+fn a_410_with_our_lineages_snapshot_past_the_durable_ack_rebuilds() {
+    let dir = TempDir::new("driver-gone-own");
+    let mut w = World::new();
+    let a = w.core();
+    let bound = w.open(a, spec(dir.path(), 1));
+    // Acknowledged within the ACK interval, then a crash: the log's ACK lags.
+    let c1 = w.commit(a, &bound, 1).unwrap();
+    w.deliver();
+    let generation = bound.handle.generation.clone();
+    let position = Position(bound.handle.last_commit().0);
+    drop(bound);
+    w.crash(a);
+    assert!(
+        !log_records(&generation.dir)
+            .iter()
+            .any(|r| matches!(r, RecordBody::Ack { acked, .. } if *acked == position))
+    );
+    snapshot_as(&mut w.server, CommitId {
+        lineage: generation.lineage,
+        position,
+    });
+    let a2 = w.core();
+    let bound = w.open(a2, spec(dir.path(), 2));
+    assert_ne!(bound.handle.generation, generation, "rebuilt");
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    assert_eq!(w.stream_commits(), vec![c1]);
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        vec![1u8; 4096]
+    );
+}
+
+// A fresh open whose HEAD is overtaken: a frame lands and a snapshot past the HEAD's tail moves
+// retention before the build's own HEAD. The build reads up to the tail its HEAD names, from that
+// snapshot, and the open succeeds well within its deadline.
+#[test]
+fn a_fresh_open_overtaken_by_a_snapshot_past_its_head_builds_from_it() {
+    let dir_b = TempDir::new("driver-overtaken-b");
+    let dir_c = TempDir::new("driver-overtaken-c");
+    let mut w = World::new();
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    commit_pages(&mut w, b, &bound_b, 2, &[1, 2], 4);
+    w.run_for(1_000);
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        let frame = frame::encode_commit(
+            CommitId {
+                lineage: crate::ids::Lineage([0x6b; 16]),
+                position: Position(1),
+            },
+            &CommitRecord {
+                db_pages_after: 3,
+                pages: vec![(3, Box::new([8; 4096]))],
+            },
+        )
+        .unwrap();
+        server.foreign_append(PATH, &frame).unwrap();
+        snapshot_and_retain(server);
+    }));
+    let started = w.now;
+    let c = w.core();
+    let bound_c = w.open(c, spec(dir_c.path(), 3));
+    assert!(w.now - started < 30_000, "{} ms", w.now - started);
+    let expected = image_of(w.server.frames(PATH).unwrap());
+    assert_eq!(expected.len(), 3 * 4096);
+    assert_eq!(
+        std::fs::read(bound_c.handle.generation.db()).unwrap(),
+        expected
+    );
+    // One HEAD for the open and one for the build: no restart loop.
+    let heads = w.sent[..]
+        .iter()
+        .filter(|s| s.core == c && s.request.method == Method::Head)
+        .count();
+    assert_eq!(heads, 2);
+}
+
+/// Appends a commit of another writer, so the tail moves.
+fn foreign_commit(server: &mut ModelServer, salt: u8) {
+    let frame = frame::encode_commit(
+        CommitId {
+            lineage: crate::ids::Lineage([0x6c; 16]),
+            position: Position(u64::from(salt)),
+        },
+        &CommitRecord {
+            db_pages_after: 1,
+            pages: vec![(1, Box::new([salt; 4096]))],
+        },
+    )
+    .unwrap();
+    server.foreign_append(PATH, &frame).unwrap();
+}
+
+// A takeover's rebuild whose HEAD names a snapshot past its claim: another owner wrote after the
+// claim, so the open fails with a fenced reset instead of reading the stream.
+#[test]
+fn a_rebuild_facing_a_snapshot_past_its_claim_is_fenced() {
+    let dir_a = TempDir::new("driver-rebuild-fenced-a");
+    let dir_b = TempDir::new("driver-rebuild-fenced-b");
+    let mut w = World::new();
+    let a = w.core();
+    let bound = w.open(a, spec(dir_a.path(), 1));
+    w.commit(a, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.down[a] = true;
+    w.commit(a, &bound, 2).unwrap();
+    drop(bound);
+    w.crash(a);
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    w.commit(b, &bound_b, 3).unwrap();
+    w.run_for(1_000);
+    // The reopen diverges and rebuilds; before the rebuild's HEAD, the stream moves on past its
+    // claim and a snapshot there moves retention.
+    w.hold = Some(|job| matches!(job, DiskJob::NewBuild(_)));
+    let a2 = w.core();
+    let now = w.now;
+    let open = OpenId(w.id());
+    let ios = w.c(a2).open(open, spec(dir_a.path(), 3), now);
+    w.queue_ios(a2, ios);
+    w.run_for(5_000);
+    assert_eq!(w.held.len(), 1, "the rebuild started");
+    foreign_commit(&mut w.server, 4);
+    snapshot_and_retain(&mut w.server);
+    w.release_held();
+    w.run_for(5_000);
+    let e = kind(w.c(a2).take_opened(open).expect("resolved"));
+    assert!(matches!(*e, OpenError::Reset(ResetKind::Fenced)), "{e}");
+}
+
+// Retention passing every snapshot a fresh build installs: the build restarts after the open's
+// backoff (virtual time moves), at most 8 times, then fails with `BelowRetention`.
+#[test]
+fn a_build_that_keeps_meeting_410s_gives_up_after_its_restarts() {
+    let dir_b = TempDir::new("driver-restart-cap-b");
+    let dir_c = TempDir::new("driver-restart-cap-c");
+    let mut w = World::new();
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    w.commit(b, &bound_b, 1).unwrap();
     w.run_for(1_000);
     snapshot_and_retain(&mut w.server);
-    let before = tree(&generation.dir);
-    let a2 = w.core();
-    let e = kind(w.open_result(a2, spec(dir_a.path(), 3)));
-    assert!(
-        matches!(
-            &*e,
-            OpenError::StreamState(StreamState::BelowRetention { .. })
-        ),
-        "{e}"
-    );
-    assert!(w.claims(a2).is_empty(), "a claim went out");
-    // Materialize may append a BASE at the open; everything that was there stays.
-    let after = tree(&generation.dir);
-    for (path, bytes) in &before {
-        let kept = after.iter().find(|(p, _)| p == path).unwrap();
-        assert!(kept.1.starts_with(bytes), "{}", path.display());
-    }
-    // A fresh directory is refused the same way: its build would read from the start.
-    let dir_c = TempDir::new("driver-gone-c");
+    foreign_commit(&mut w.server, 9);
     let c = w.core();
-    let e = kind(w.open_result(c, spec(dir_c.path(), 4)));
+    let started = w.now;
+    let open = OpenId(w.id());
+    let ios = w.c(c).open(open, spec(dir_c.path(), 3), started);
+    w.queue_ios(c, ios);
+    let mut installs = 0;
+    let mut result = None;
+    for salt in 10..200u8 {
+        w.hold = Some(|job| matches!(job, DiskJob::Install { .. }));
+        w.run_for(100);
+        if let Some(r) = w.c(c).take_opened(open) {
+            result = Some(r);
+            break;
+        }
+        if !w.held.is_empty() {
+            // Retention passes the snapshot being installed before its tail is read, and a
+            // frame follows the new one, so the next build has a tail to read too.
+            installs += 1;
+            foreign_commit(&mut w.server, salt);
+            snapshot_and_retain(&mut w.server);
+            foreign_commit(&mut w.server, salt.wrapping_add(100));
+            w.release_held();
+        }
+    }
+    let e = kind(result.expect("the open resolved"));
     assert!(
         matches!(
-            &*e,
+            *e,
             OpenError::StreamState(StreamState::BelowRetention { .. })
         ),
         "{e}"
     );
-    assert!(w.claims(c).is_empty());
+    assert_eq!(installs, 9, "one install, then 8 restarts");
+    assert!(
+        w.now > started + 900,
+        "restarts back off: {} ms",
+        w.now - started
+    );
+    let heads = w
+        .sent
+        .iter()
+        .filter(|s| s.core == c && s.request.method == Method::Head)
+        .count();
+    assert_eq!(heads, 10, "the open's HEAD and one per build");
 }
 
 #[test]
-fn a_410_at_a_takeover_with_a_pending_commit_leaves_the_old_generation_intact() {
+fn a_410_at_a_takeover_with_a_pending_commit_rebuilds_from_the_snapshot() {
     let dir_a = TempDir::new("driver-gone-pending-a");
     let dir_b = TempDir::new("driver-gone-pending-b");
     let mut w = World::new();
@@ -864,29 +1374,20 @@ fn a_410_at_a_takeover_with_a_pending_commit_leaves_the_old_generation_intact() 
     let bound_b = w.open(b, spec(dir_b.path(), 2));
     w.commit(b, &bound_b, 3).unwrap();
     w.run_for(1_000);
-    let before = tree(&generation.dir);
     // Retention moves after the reopen's HEAD: the takeover claims, its reconcile meets a 410,
-    // and the rebuild cannot read from the start either.
+    // the latest snapshot is another owner's, and the pending commit (which never reached the
+    // stream) is discarded by a rebuild from that snapshot.
     w.after_head = Some(Box::new(snapshot_and_retain));
     let a2 = w.core();
-    let e = kind(w.open_result(a2, spec(dir_a.path(), 3)));
-    assert!(
-        matches!(
-            &*e,
-            OpenError::StreamState(StreamState::BelowRetention { .. })
-        ),
-        "{e}"
+    let bound = w.open(a2, spec(dir_a.path(), 3));
+    assert!(!generation.dir.exists());
+    assert_ne!(bound.handle.generation.lineage, generation.lineage);
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        vec![3u8; 4096]
     );
-    assert!(!w.claims(a2).is_empty());
-    // The old generation is whole, its pending commit included; the failed build is only a
-    // leftover `.tmp`, which the next open deletes.
-    assert!(generation.dir.exists());
-    let after = tree(&generation.dir);
-    for (path, bytes) in &before {
-        let kept = after.iter().find(|(p, _)| p == path).unwrap();
-        assert!(kept.1.starts_with(bytes), "{}", path.display());
-    }
-    assert!(log_records(&generation.dir).contains(&RecordBody::Commit { frame: pending }));
+    assert!(!w.stream_commits().contains(&pending));
+    assert_eq!(bound.handle.pending_bytes(), 0);
 }
 
 #[test]
@@ -1529,7 +2030,7 @@ fn a_failed_claim_write_sends_no_claim() {
 }
 
 #[test]
-fn a_catch_up_larger_than_the_database_applies_in_place_until_snapshots_install() {
+fn a_catch_up_larger_than_the_database_rebuilds() {
     let dir_a = TempDir::new("driver-large-catch-up-a");
     let dir_b = TempDir::new("driver-large-catch-up-b");
     let mut w = World::new();
@@ -1559,8 +2060,9 @@ fn a_catch_up_larger_than_the_database_applies_in_place_until_snapshots_install(
     w.run_for(1_000);
     let a2 = w.core();
     let bound = w.open(a2, spec(dir_a.path(), 3));
-    // Without a snapshot to install (PR7), a rebuild would cost more: caught up in place.
-    assert_eq!(bound.handle.generation, old);
+    // The frames outgrow A's one-page database: a rebuild rather than a catch-up in place.
+    assert_ne!(bound.handle.generation, old);
+    assert!(!old.dir.exists());
     assert_eq!(std::fs::read(bound.handle.generation.db()).unwrap(), last);
     let ticket = w.sync(a2, bound.binding);
     w.run_for(1_000);

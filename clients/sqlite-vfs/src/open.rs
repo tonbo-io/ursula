@@ -13,9 +13,8 @@
 //! | any | no `Ursula-Protocol: 2` | refuses `server_too_old` |
 //! | any | another content type | refuses `stream_format` |
 //! | trusted | another `Ursula-Cluster-Id` | refuses `wrong_cluster` |
-//! | any | retained offset above what the build would read from | refuses `stream_state` (M1) |
 //! | none | `404` | creates the stream, then HEAD again |
-//! | none | `200` | builds a generation by full replay, then takes over |
+//! | none | `200` | builds a generation from the latest snapshot and the tail, then takes over |
 //! | trusted | `404` | refuses `not_found` |
 //! | trusted, same token | `200` | takes over |
 //! | trusted, other token | `200` | refuses `stream_state`, files kept (re-key and salvage: M2) |
@@ -25,6 +24,8 @@
 //! then fails with the last condition (`unreachable` when nothing ever went out). Provisional
 //! opens, salvage and readers are M2's.
 
+use std::io::BufWriter;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
+use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 
 use crate::codec::frame::CONTENT_TYPE;
@@ -40,6 +42,9 @@ use crate::codec::frame::Frame;
 use crate::codec::frame::FrameError;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
+use crate::codec::snapshot::SnapshotError;
+use crate::codec::snapshot::check_body;
+use crate::codec::snapshot::read_image;
 use crate::codec::stream::FrameStream;
 use crate::codec::stream::StreamError;
 use crate::driver::disk::DiskDone;
@@ -79,8 +84,10 @@ use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
 use crate::wire::Request;
+use crate::wire::SnapshotPart;
 use crate::wire::Target;
 use crate::wire::Typed;
+use crate::wire::snapshot_limit;
 
 /// What `open()` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,10 +178,9 @@ pub(crate) enum StreamState {
     Undecodable,
     /// A read answered a range other than the one it names.
     Contradiction,
-    /// The frames the open would read from `from` are below retention (`retained`, when the
-    /// stream named it), and snapshots are not installed yet (PR7).
+    /// Retention kept passing what a build installed, over every restart it makes: the frames
+    /// from `from` are below retention.
     BelowRetention {
-        retained: Option<Offset>,
         from: Offset,
     },
     /// The stream changed history while the open read it.
@@ -229,6 +235,9 @@ pub(crate) enum OpenError {
     WrongCluster { local: String, stream: ClusterId },
     #[error("stream_state: {0:?}")]
     StreamState(StreamState),
+    /// The snapshot the stream names is not one this extension can install.
+    #[error("stream_state: the stream's latest snapshot: {0}")]
+    Snapshot(#[source] SnapshotError),
     #[error("not_found: the stream is missing and local commits exist")]
     NotFound,
     #[error("claim_races: every claim lost to another claimant")]
@@ -352,8 +361,8 @@ impl Retry {
     }
 }
 
-/// Reads the stream from its start up to `end`, a frame boundary, through the reconcile's
-/// [`FrameStream`].
+/// Reads the stream from `from` (its start, or an installed snapshot's offset) up to `end`, a
+/// frame boundary, through the reconcile's [`FrameStream`].
 #[derive(Debug, Clone)]
 pub(crate) struct Fetch {
     incarnation: Incarnation,
@@ -362,16 +371,26 @@ pub(crate) struct Fetch {
 }
 
 impl Fetch {
-    pub(crate) fn new(incarnation: Incarnation, end: Offset) -> Self {
+    pub(crate) fn new(
+        incarnation: Incarnation,
+        from: Offset,
+        end: Offset,
+        highest_epoch: Option<Epoch>,
+    ) -> Self {
         Self {
             incarnation,
-            stream: FrameStream::new(Offset::ZERO, end, MAX_BATCH_BYTES),
-            highest_epoch: None,
+            stream: FrameStream::new(from, end, MAX_BATCH_BYTES),
+            highest_epoch,
         }
     }
 
     pub(crate) fn done(&self) -> bool {
         self.stream.done()
+    }
+
+    /// Reads up to `end` instead, before anything was read.
+    fn extend_to(&mut self, end: Offset) {
+        self.stream = FrameStream::new(self.stream.at(), end, MAX_BATCH_BYTES);
     }
 
     /// The next read, under the precondition.
@@ -421,26 +440,51 @@ impl Fetch {
     }
 }
 
-/// A generation built from the stream by full replay, in `gen-<lineage>.tmp`: the open's build,
-/// or a takeover's rebuild. It is published by one rename only once complete ([`Build::publish`]),
-/// so the generation it supersedes stays whole until then, and a failed build leaves it in place.
-/// A crash midway leaves only the `.tmp`, which the next open deletes (`finish_leftovers`).
+/// A generation built from the stream in `gen-<lineage>.tmp` (design §5.6): the open's build, or
+/// a takeover's rebuild. It is published by one rename only once complete ([`Build::publish`]), so
+/// the generation it supersedes stays whole until then, and a failed build leaves it in place. A
+/// crash midway leaves only the `.tmp`, which the next open deletes (`finish_leftovers`).
 ///
-/// Each read's frames are logged as COMMIT records with an ACK and fsynced before they are applied
-/// ([`materialize::catch_up_files`]), so memory stays bounded by one read.
-///
-/// PR7 installs the latest snapshot into the `Building` before the tail is read, with the
-/// header's `base` and `acked` set to the snapshot's position and offset, and the tail read from
-/// there.
+/// A HEAD names the latest snapshot. Its body is read, checked (the digest the stream names, the
+/// `USS3` header's checksum and offset) and installed into the db file, whose image's checksum
+/// [`read_image`] checks; an ACK record then names the snapshot's offset as acknowledged at the
+/// position before the log's first (the base the header names). The tail is read from there,
+/// or from the stream's start without a snapshot. Each read's frames are logged as COMMIT records
+/// with an ACK and fsynced before they are applied ([`materialize::catch_up_files`]), so memory
+/// stays bounded by one read. A `410` while the tail is read (retention passed the installed
+/// snapshot) deletes the `.tmp` and starts over from the HEAD ([`Build::restart`]).
 #[derive(Debug)]
 pub(crate) struct Build {
     building: Building,
     /// Holds the root's lock while the build lives, in a disk job or not.
     root: Arc<Root>,
+    /// The log's first segment header, for a restart.
+    header: SegmentHeader,
+    /// The position before the log's first: the snapshot's place in the new log.
+    base: Position,
+    stage: BuildStage,
     fetch: Fetch,
     retry: Retry,
     /// The next attempt's flags, after a failure.
     attempt: Attempt,
+    /// Restarts after a `410` so far, at most [`MAX_BUILD_RESTARTS`].
+    restarts: u32,
+}
+
+/// The restarts a build makes after a `410` before it gives up.
+const MAX_BUILD_RESTARTS: u32 = 8;
+
+/// What a build reads next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildStage {
+    /// The HEAD that names the latest snapshot.
+    Head,
+    /// The latest snapshot's body, at most `limit` bytes.
+    Snapshot { snapshot: SnapshotRef, limit: u64 },
+    /// The frames after the snapshot (or from the start), up to the end.
+    Tail,
+    /// A `410` met the tail: after the backoff, start over ([`Build::restart`]).
+    Restarting,
 }
 
 /// What a build does next.
@@ -454,8 +498,12 @@ pub(crate) enum BuildStep {
         at_ms: u64,
         jitter_ms: u64,
     },
+    /// Install this snapshot body (a disk job: [`Build::install`]).
+    Install(Vec<u8>),
     /// Apply these frames (a disk job: [`Build::apply`]).
     Apply(Vec<ForeignFrame>),
+    /// Retention passed what the build installed: start over (a disk job: [`Build::restart`]).
+    Restart,
     /// Everything is read and applied: publish (a disk job: [`Build::publish`]).
     Done,
     Fail(OpenError),
@@ -465,27 +513,39 @@ impl Build {
     pub(crate) fn new(
         building: Building,
         root: Arc<Root>,
+        header: SegmentHeader,
         incarnation: Incarnation,
         end: Offset,
     ) -> Self {
         Self {
             building,
             root,
-            fetch: Fetch::new(incarnation, end),
+            base: Position(header.first_position.0.saturating_sub(1)),
+            header,
+            stage: BuildStage::Head,
+            fetch: Fetch::new(incarnation, Offset::ZERO, end, None),
             retry: Retry::default(),
             attempt: Attempt::default(),
+            restarts: 0,
         }
     }
 
-    /// The next read, or done.
+    /// The next request, or done.
     pub(crate) fn next(&self) -> BuildStep {
-        if self.fetch.done() {
-            BuildStep::Done
-        } else {
-            BuildStep::Send {
-                request: self.fetch.request(),
-                attempt: self.attempt,
-            }
+        let request = match self.stage {
+            BuildStage::Head => head_request(),
+            BuildStage::Snapshot { snapshot, limit } => Request::snapshot_read(
+                snapshot.offset,
+                self.fetch.incarnation,
+                SnapshotPart::Body { limit },
+            ),
+            BuildStage::Tail if self.fetch.done() => return BuildStep::Done,
+            BuildStage::Tail => self.fetch.request(),
+            BuildStage::Restarting => return BuildStep::Restart,
+        };
+        BuildStep::Send {
+            request,
+            attempt: self.attempt,
         }
     }
 
@@ -499,8 +559,133 @@ impl Build {
         self.retry.seen()
     }
 
-    /// The answer to the last read.
+    /// The answer to the last request.
     pub(crate) fn answered(&mut self, exchange: &Exchange, now_ms: u64) -> BuildStep {
+        let answer = match exchange {
+            Exchange::Answered(answer) => Some(answer),
+            Exchange::NoAnswer(_) => None,
+        };
+        match (self.stage, answer) {
+            (BuildStage::Head, Some(answer)) => {
+                let head = match &answer.typed {
+                    Ok(Typed::Head {
+                        stream: Some(head), ..
+                    }) if answer.status == 200 => *head,
+                    _ => return self.failed(exchange, now_ms),
+                };
+                self.succeeded();
+                if head.incarnation() != self.fetch.incarnation {
+                    return BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged));
+                }
+                // A fresh open's build reads up to the tail this HEAD names. A takeover's rebuild
+                // reads up to its claim: a snapshot past the claim means another owner wrote
+                // after it.
+                match self.header.claim {
+                    None => self.fetch.extend_to(head.next_offset()),
+                    Some(_) => {
+                        if head
+                            .snapshot()
+                            .is_some_and(|s| s.offset > self.fetch.stream.end())
+                        {
+                            return BuildStep::Fail(OpenError::Reset(ResetKind::Fenced));
+                        }
+                    }
+                }
+                self.stage = match head.snapshot() {
+                    Some(snapshot) if snapshot.offset > Offset::ZERO => BuildStage::Snapshot {
+                        snapshot,
+                        limit: snapshot_limit(&head),
+                    },
+                    _ => BuildStage::Tail,
+                };
+                self.next()
+            }
+            (BuildStage::Snapshot { snapshot, .. }, Some(answer)) => match &answer.typed {
+                Ok(Typed::SnapshotRead(read))
+                    if answer.status == 200 && read.snapshot == snapshot =>
+                {
+                    self.succeeded();
+                    BuildStep::Install(answer.body.clone())
+                }
+                // Superseded since the HEAD: the HEAD again names the latest.
+                Ok(Typed::Untyped) if answer.status == 404 => {
+                    self.succeeded();
+                    self.stage = BuildStage::Head;
+                    self.next()
+                }
+                _ => self.failed(exchange, now_ms),
+            },
+            (BuildStage::Head | BuildStage::Snapshot { .. }, None) => self.failed(exchange, now_ms),
+            (BuildStage::Tail, _) => self.tail_answered(exchange, now_ms),
+            // No request is out.
+            (BuildStage::Restarting, _) => BuildStep::Fail(OpenError::Panicked),
+        }
+    }
+
+    fn succeeded(&mut self) {
+        self.retry.succeeded();
+        self.attempt = Attempt::default();
+    }
+
+    /// An answer that decided nothing about the request.
+    fn failed(&mut self, exchange: &Exchange, now_ms: u64) -> BuildStep {
+        match self.retry.failed(exchange, now_ms) {
+            Failure::Again {
+                at_ms,
+                jitter_ms,
+                attempt,
+            } => {
+                self.attempt = attempt;
+                BuildStep::Timer { at_ms, jitter_ms }
+            }
+            Failure::Restart => {
+                BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged))
+            }
+            Failure::Closed => BuildStep::Fail(OpenError::StreamState(StreamState::Closed)),
+        }
+    }
+
+    /// Disk job: checks the snapshot body and installs its image into the db file, then names
+    /// its offset acknowledged in an ACK record, so the tail is read from there.
+    pub(crate) fn install(&mut self, body: &[u8]) -> Result<(), OpenError> {
+        let BuildStage::Snapshot { snapshot, .. } = self.stage else {
+            return Err(OpenError::Panicked);
+        };
+        let (header, at) = check_body(CONTENT_TYPE, body, snapshot.offset, &snapshot.digest)
+            .map_err(OpenError::Snapshot)?;
+        let mut compressed = body.get(at..).unwrap_or_default();
+        let db_path = self.building.db_path();
+        let mut out = BufWriter::new(&self.building.db);
+        read_image(&header, &mut compressed, &mut out).map_err(OpenError::Snapshot)?;
+        out.flush().map_err(|source| {
+            local(LocalError::Io {
+                op: "write",
+                path: db_path,
+                source,
+            })
+        })?;
+        drop(out);
+        self.building
+            .log
+            .append(&RecordBody::Ack {
+                acked: self.base,
+                acked_offset: snapshot.offset,
+                log_bytes: 0,
+            })
+            .map_err(local)?;
+        let highest = Some(header.fields.epoch);
+        self.fetch = Fetch::new(
+            self.fetch.incarnation,
+            snapshot.offset,
+            self.fetch.stream.end(),
+            highest,
+        );
+        self.stage = BuildStage::Tail;
+        Ok(())
+    }
+
+    /// The answer to a read of the tail.
+    fn tail_answered(&mut self, exchange: &Exchange, now_ms: u64) -> BuildStep {
         match decide_read(exchange) {
             ReadDecision::Bytes { next } => {
                 self.retry.succeeded();
@@ -515,28 +700,44 @@ impl Build {
                     Err(e) => BuildStep::Fail(e),
                 }
             }
-            // A `410` names no retained offset.
+            // Retention passed what this build installed: it starts over in a fresh `.tmp`, from
+            // the snapshot the HEAD names then, after the open's backoff, a few times at most.
             ReadDecision::Gone => {
-                BuildStep::Fail(OpenError::StreamState(StreamState::BelowRetention {
-                    retained: None,
-                    from: self.fetch.stream.at(),
-                }))
+                self.restarts = self.restarts.saturating_add(1);
+                if self.restarts > MAX_BUILD_RESTARTS {
+                    return BuildStep::Fail(OpenError::StreamState(StreamState::BelowRetention {
+                        from: self.fetch.stream.at(),
+                    }));
+                }
+                self.stage = BuildStage::Restarting;
+                match self.retry.policy.backoff(None, Attempt::default(), now_ms) {
+                    Next::Wait {
+                        at_ms, jitter_ms, ..
+                    } => BuildStep::Timer { at_ms, jitter_ms },
+                    Next::Resend(_) | Next::Head(_) | Next::Reset(_) => BuildStep::Restart,
+                }
             }
-            ReadDecision::Common(_) => match self.retry.failed(exchange, now_ms) {
-                Failure::Again {
-                    at_ms,
-                    jitter_ms,
-                    attempt,
-                } => {
-                    self.attempt = attempt;
-                    BuildStep::Timer { at_ms, jitter_ms }
-                }
-                Failure::Restart => {
-                    BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged))
-                }
-                Failure::Closed => BuildStep::Fail(OpenError::StreamState(StreamState::Closed)),
-            },
+            ReadDecision::Common(_) => self.failed(exchange, now_ms),
         }
+    }
+
+    /// Disk job: deletes what the build wrote and starts it again in a fresh `.tmp`, from its
+    /// HEAD.
+    pub(crate) fn restart(self) -> Result<Self, OpenError> {
+        let Self {
+            building,
+            root,
+            header,
+            fetch,
+            retry,
+            restarts,
+            ..
+        } = self;
+        building.discard().map_err(local)?;
+        let mut build = start_build(root, header, fetch.incarnation, fetch.stream.end())?;
+        build.retry = retry;
+        build.restarts = restarts;
+        Ok(build)
     }
 
     /// Disk job: logs, acknowledges, fsyncs and applies one read's frames.
@@ -585,15 +786,25 @@ pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
         log_bytes: 0,
         claim,
     };
-    let mut building = root.build(header).map_err(local)?;
-    if let Some((epoch, activation)) = claim {
+    start_build(root, header, incarnation, end)
+}
+
+/// Starts building the generation `header` names, its claim (a rebuild's) logged and fsynced.
+fn start_build(
+    root: Arc<Root>,
+    header: SegmentHeader,
+    incarnation: Incarnation,
+    end: Offset,
+) -> Result<Build, OpenError> {
+    let mut building = root.build(header.clone()).map_err(local)?;
+    if let Some((epoch, activation)) = header.claim {
         building
             .log
             .append(&RecordBody::Claim { epoch, activation })
             .and_then(|_position| building.log.sync())
             .map_err(local)?;
     }
-    Ok(Build::new(building, root, incarnation, end))
+    Ok(Build::new(building, root, header, incarnation, end))
 }
 
 /// What the local steps of an open found.
@@ -648,6 +859,7 @@ fn local_state(
         claims.push(claim);
     }
     LocalState {
+        lineage,
         activation: spec.activation,
         cluster_id,
         incarnation: head.incarnation(),
@@ -667,10 +879,8 @@ fn local_state(
         highest_epoch,
         max_request_bytes: head.max_request_bytes(),
         configured_max_request_bytes: spec.max_request_bytes,
-        // A rebuild that a catch-up larger than the database calls for pays only with a snapshot
-        // to start from. M1 installs none, so it never rebuilds for size; PR7 passes the db
-        // file's size here.
-        db_bytes: u64::MAX,
+        // A catch-up in place larger than the database rebuilds instead (design §5.6).
+        db_bytes: m.db.metadata().map_or(u64::MAX, |meta| meta.len()),
     }
 }
 
@@ -808,12 +1018,22 @@ impl Opening {
     /// The timer fired: send again what failed.
     pub(crate) fn tick(mut self: Box<Self>) -> OpenStep {
         let resend = self.resend.take();
+        if resend.is_none() {
+            let phase = std::mem::replace(&mut self.phase, Phase::Head);
+            if let Phase::Reading {
+                build,
+                cluster_id,
+                head,
+            } = phase
+            {
+                // The build's next step: a read, or a restart after its backoff.
+                let step = build.next();
+                return self.build_step(build, step, cluster_id, head);
+            }
+            self.phase = phase;
+        }
         let (request, attempt) = match (resend, &self.phase) {
             (Some(resend), _) => resend,
-            (None, Phase::Reading { build, .. }) => match build.next() {
-                BuildStep::Send { request, attempt } => (request, attempt),
-                _ => (head_request(), Attempt::default()),
-            },
             (None, Phase::Create) => (create_request(), Attempt::default()),
             (None, _) => (head_request(), Attempt::default()),
         };
@@ -890,6 +1110,20 @@ impl Opening {
                     opening: self,
                     at_ms,
                     jitter_ms,
+                }
+            }
+            BuildStep::Install(body) => {
+                self.phase = Phase::Building { cluster_id, head };
+                OpenStep::Disk {
+                    opening: self,
+                    job: DiskJob::Install { build, body },
+                }
+            }
+            BuildStep::Restart => {
+                self.phase = Phase::Building { cluster_id, head };
+                OpenStep::Disk {
+                    opening: self,
+                    job: DiskJob::Restart(build),
                 }
             }
             BuildStep::Apply(frames) => {
@@ -1038,17 +1272,6 @@ impl Opening {
         };
         if let Err(e) = check_stream(answer, &head) {
             return OpenStep::Fail(e);
-        }
-        // M1 has no snapshot install, so every build reads the stream from its start: a fresh
-        // open's, and a takeover's rebuild, which any divergence or 410 may call for. With
-        // anything below retention such a read cannot succeed, so refuse before any claim,
-        // files kept, rather than claim (fencing the stream's owner) and then fail. PR7 replaces
-        // this refusal with the snapshot install.
-        if head.retained_offset() > Offset::ZERO {
-            return OpenStep::Fail(OpenError::StreamState(StreamState::BelowRetention {
-                retained: Some(head.retained_offset()),
-                from: Offset::ZERO,
-            }));
         }
         match prepared.local.take() {
             Some(m) => {

@@ -157,6 +157,18 @@ pub(crate) fn max_request_bytes() -> Option<u64> {
     })
 }
 
+/// Test hook `URSULA_VFS_SNAPSHOT_DUE_BYTES`: a snapshot is due once more frame bytes than this
+/// are acknowledged since the latest one, instead of past the db file's size or 8 MiB (design
+/// §4.11). Unset, or not a number of bytes: the design's threshold.
+pub(crate) fn snapshot_due_bytes() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_SNAPSHOT_DUE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
 /// `URSULA_VFS_MIN_UPLOAD_KBPS`: the slowest upload, in KiB/s, an attempt's body time limit allows
 /// for (256 by default, at least 1): a body of `n` bytes may take `5 s + n / rate` to send (design
 /// §4.12, #566).

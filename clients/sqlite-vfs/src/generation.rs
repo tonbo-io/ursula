@@ -537,6 +537,16 @@ impl Building {
         self.root.join(format!("{GEN}{}{TRASH}", hex(old.lineage)))
     }
 
+    /// Deletes the generation being built, its `.tmp` and everything in it.
+    pub(crate) fn discard(self) -> Result<(), GenerationError> {
+        let Self {
+            root, tmp, log, db, ..
+        } = self;
+        drop((log, db));
+        fs::remove_dir_all(&tmp).map_err(io("remove", &tmp))?;
+        sync_dir(&root).map_err(io("fsync", &root))
+    }
+
     /// The db file being built.
     pub(crate) fn db_path(&self) -> PathBuf {
         self.tmp.join("db")
