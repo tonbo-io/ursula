@@ -110,11 +110,11 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 
 ### `raft WAL directory … holds data without a format marker`
 
-The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 3 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
+The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 4 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
 
 ### `raft WAL directory … is format epoch N`
 
-The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 3 only. Run the release that wrote it, or start on an empty directory.
+The directory's `FORMAT_EPOCH` marker names another epoch. This release reads format epoch 4 only. Run the release that wrote it, or start on an empty directory.
 
 ### `object storage s3://… is not empty and has no URSULA_FORMAT_EPOCH marker`
 
@@ -126,11 +126,11 @@ The prefix's `URSULA_FORMAT_EPOCH` marker names another epoch. Use a new prefix 
 
 ### `journal … uses Ursula WAL version N`
 
-A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6. This release reads format epoch 3 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
+A Raft WAL journal of another format epoch: version 1 is Ursula 0.5.x, version 2 is 0.6, version 3 is 0.7. This release reads format epoch 4 only. The directory marker normally refuses the directory first, and the journal check is the backstop. Start on an empty `raft.wal.path`.
 
-### `peer N (…) refused Raft protocol 3`
+### `peer N (…) refused Raft protocol 4`
 
-A configured peer runs a release of another format epoch (Ursula 0.6 speaks protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
+A configured peer runs a release of another format epoch (Ursula 0.7 speaks protocol 3, 0.6 protocol 2, 0.5.x protocol 1). A node cannot join a cluster of another format epoch. Install this release as a new cluster.
 
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 
@@ -191,7 +191,7 @@ by the OS lock, not the file's existence.
 
 ### `backup manifest format_version N` or `target cluster speaks backup format N`
 
-The backup or the cluster is of another format epoch. This release reads and writes backup format 3 only, so a backup of another epoch cannot be restored, and a cluster of another epoch cannot be backed up or restored into.
+The backup or the cluster is of another format epoch. This release reads and writes backup format 4 only, so a backup of another epoch cannot be restored, and a cluster of another epoch cannot be backed up or restored into.
 
 ### `… cold objects this backup references are missing from the target cluster's cold store`
 

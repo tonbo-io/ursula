@@ -334,7 +334,7 @@ The recovery contract:
 - **Consistency boundary.** Each group export is the deterministic state-machine snapshot the raft snapshot path persists: internally consistent per group while writes continue. Cross-group consistency is not promised. The boundary is per stream. Acknowledged writes in the exporting replica's applied state are included whether or not they were cold-flushed, so **RPO is bounded by export time**, not by the cold-flush interval. `backup-create` asks every node and keeps the reply with the highest group commit index.
 - **Fresh identity on restore.** Restore replays each snapshot as one replicated write on the target cluster, which keeps its own raft membership and log identity. Nothing from the source cluster's raft metadata is reused. Groups that already hold buckets refuse the import with `409`, and group-count mismatches fail closed before the first import. Group commit indexes and per-stream append counters restart under the new identity. Stream bytes, offsets, close/TTL state, published snapshots, retention floors, and producer dedup states are preserved exactly.
 - **Cold objects are part of the backup set.** Snapshots reference cold-tier chunks, cold-index pages and external payloads by object key. The backup holds the references, not the objects. The restored cluster's cold store must hold the same objects under the same keys: point it at a copy (see [Copying cold objects](#copying-cold-objects)). `backup-verify` validates snapshots but does not dereference cold objects. `restore` asks the target cluster, before the first import, to check every group's references against its own cold store (`POST /__ursula/backup/group/{group}/cold-check`). If any object is missing, it stops with nothing imported and prints how many are missing and the first keys.
-- **Format compatibility.** The backup format is the format epoch: `format_version` 3 in the manifest and in `/__ursula/backup/info`, and `format_epoch` 3 in every group object. A backup restores only into a cluster of the format epoch that wrote it. `ursulactl` refuses a manifest or a target cluster of another version before the first import, and a server refuses to import a group of another format epoch (`400`).
+- **Format compatibility.** The backup format is the format epoch: `format_version` 4 in the manifest and in `/__ursula/backup/info`, and `format_epoch` 4 in every group object. A backup restores only into a cluster of the format epoch that wrote it. `ursulactl` refuses a manifest or a target cluster of another version before the first import, and a server refuses to import a group of another format epoch (`400`).
 - **RTO** is dominated by transferring and importing the group snapshots. Each import is a single replicated write per group.
 
 The recovery drill runs in CI (`backup_restore_drill_preserves_streams_and_allows_continued_appends`): write, snapshot, retain and close, back up, destroy the cluster, restore, verify checksums, offsets and boundaries, and continue appending.
@@ -343,8 +343,8 @@ What you can additionally rely on:
 
 - **Quorum durability.** Acknowledged writes survive as long as a majority of voters survives. Three voters across AZs tolerate any single-AZ outage.
 - **Cold-tier durability.** Once flushed to S3, a chunk inherits S3-grade durability. The unflushed window is bounded by the flush interval (seconds by default).
-- **Format epoch 3, no migration.** The Raft WAL, snapshots, backups, the
-  object-storage prefix and the Raft gRPC protocol carry format epoch 3. A node
+- **Format epoch 4, no migration.** The Raft WAL, snapshots, backups, the
+  object-storage prefix and the Raft gRPC protocol carry format epoch 4. A node
   refuses data, backups and peers of another format epoch and does not migrate
   them.
 

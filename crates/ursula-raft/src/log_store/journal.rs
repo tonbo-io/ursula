@@ -1,4 +1,4 @@
-//! Append-only framed journal segment, format epoch 3.
+//! Append-only framed journal segment, versioned by the format epoch.
 //!
 //! Persistence is kept orthogonal to serialization. A journal segment moves
 //! opaque checksummed frames to and from a file and handles the durability
@@ -1245,7 +1245,13 @@ mod tests {
                 version: 2,
                 ..
             }));
-            assert!(err.to_string().contains("format epoch 3 only"), "{err}");
+            assert!(
+                err.to_string().contains(&format!(
+                    "format epoch {} only",
+                    ursula_stream::FORMAT_EPOCH
+                )),
+                "{err}"
+            );
         }
         let err = JournalWriter::open(&path, FIRST_SEQUENCE).expect_err("no append to epoch 2");
         assert!(matches!(err, JournalError::UnsupportedVersion {
