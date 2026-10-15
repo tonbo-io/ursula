@@ -368,6 +368,12 @@ fn addendum_4_the_order_is_the_same_over_http_and_in_process() {
             },
             11 | 12 => close_only(token, 0, 2),
             13 => close_only(token, 0, 3),
+            // Steps 5 and 6 without the token.
+            14 => Request {
+                content_type: None,
+                ..write(None, 0, 1, b"b1")
+            },
+            15 => with_body(&write(None, 0, 1, b"b1"), b""),
             _ => break,
         };
         let remote = http.send(&request, Attempt::default());
@@ -382,7 +388,7 @@ fn addendum_4_the_order_is_the_same_over_http_and_in_process() {
         statuses.push(answer.status);
     }
     assert_eq!(statuses, [
-        201, 200, 200, 403, 403, 204, 204, 400, 409, 400, 501, 200, 204, 409
+        201, 200, 200, 403, 403, 204, 204, 400, 409, 400, 501, 200, 204, 409, 204, 204
     ]);
 }
 

@@ -509,11 +509,12 @@ impl ModelServer {
     /// 3. The rows of §2.3.1, keyed by the `Producer-Digest` header, never by the body. Every
     ///    refusal and every repeat is answered here.
     /// 4. Only a write that would apply meets the closed stream (`409 Stream-Closed`).
-    /// 5. Only a write that would apply meets the content checks: `Content-Type` present (`400`)
-    ///    and the stream's (`409`), a body unless the write closes the stream (`400`), and the body
+    /// 5. Only a write that would apply meets the content checks: a body unless the write closes
+    ///    the stream (`400`), `Content-Type` present (`400`) and the stream's (`409`), and the body
     ///    matching `Producer-Digest` (`400`).
     ///
-    /// A close-only write applies, keyed or not. An append that also closes is not modeled
+    /// A close-only write applies, keyed or not, and an unkeyed one is idempotent on a closed
+    /// stream (base protocol §5.2). An append that also closes is not modeled
     /// (`501`): the VFS never closes its stream.
     fn append(&mut self, path: &str, request: &Request) -> RawAnswer {
         let (history, now_ms) = (self.history, self.clock_ms);
@@ -540,7 +541,12 @@ impl ModelServer {
                 }
             }
         };
+        let close_only = request.closes && request.body.is_empty();
         if stream.closed {
+            // Base protocol §5.2: an unkeyed close-only write is idempotent.
+            if close_only && applying.is_none() {
+                return closed_append(stream.tail());
+            }
             let mut answer = RawAnswer::new(StreamClosedConflict::STATUS);
             StreamClosedConflict {
                 final_offset: stream.tail(),
@@ -548,7 +554,6 @@ impl ModelServer {
             .render(answer.emit());
             return answer;
         }
-        let close_only = request.closes && request.body.is_empty();
         if request.closes && !close_only {
             return RawAnswer::new(501);
         }
@@ -562,11 +567,11 @@ impl ModelServer {
             stream.append(&request.body, history)
         };
         let Some((write, closes)) = applying else {
+            if close_only {
+                return closed_append(next);
+            }
             let mut answer = RawAnswer::new(204);
             answer.header(names::STREAM_NEXT_OFFSET, next.to_string());
-            if close_only {
-                answer.header(names::STREAM_CLOSED, "true");
-            }
             return answer;
         };
         let id = write.id.as_str();
@@ -726,28 +731,42 @@ impl ModelServer {
     }
 }
 
-/// The content checks of a write that would apply (#581 addendum 4, step 5): `Content-Type`
-/// present (`400`) and the stream's (`409`, the base protocol's mismatch), then, each a `400`, a
-/// body unless the write only closes the stream and the body matching its `Producer-Digest`. A
-/// close-only write is never refused for its content type (base protocol §5.2).
+/// The content checks of a write that would apply (#581 addendum 4, step 5): a body unless the
+/// write only closes the stream (`400`), then `Content-Type` present (`400`) and the stream's
+/// (`409`, the base protocol's mismatch, with the tail), then the body matching its
+/// `Producer-Digest` (`400`). A write without a body is never refused for its content type (base
+/// protocol §5.2).
 fn content_refusal(stream: &Stream, request: &Request, close_only: bool) -> Option<RawAnswer> {
-    if !close_only {
+    if close_only {
+        // Its body is empty, so its digest is checked alike below.
+    } else if request.body.is_empty() {
+        return Some(RawAnswer::new(400));
+    } else {
         match request.content_type.as_deref() {
             None => return Some(RawAnswer::new(400)),
             Some(content_type) if content_type != stream.content_type => {
-                return Some(RawAnswer::new(409));
+                let mut answer = RawAnswer::new(409);
+                answer.header(names::STREAM_NEXT_OFFSET, stream.tail().to_string());
+                return Some(answer);
             }
             Some(_) => {}
         }
     }
-    let body_ok = close_only || !request.body.is_empty();
     let digest_ok = request
         .keys
         .producer
         .as_ref()
         .and_then(|write| write.digest)
         .is_none_or(|digest| digest == producer_digest(&request.body));
-    (!(body_ok && digest_ok)).then(|| RawAnswer::new(400))
+    (!digest_ok).then(|| RawAnswer::new(400))
+}
+
+/// The answer to an unkeyed close-only write: `204`, the tail and `Stream-Closed: true`.
+fn closed_append(tail: Offset) -> RawAnswer {
+    let mut answer = RawAnswer::new(204);
+    answer.header(names::STREAM_NEXT_OFFSET, tail.to_string());
+    answer.header(names::STREAM_CLOSED, "true");
+    answer
 }
 
 /// A producer answer, rendered.

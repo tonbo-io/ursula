@@ -30,6 +30,7 @@ use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
+use ursula_headers::names;
 
 use super::CheckpointId;
 use super::HistoryEvent;
@@ -571,59 +572,67 @@ fn addendum_4_a_digest_that_does_not_match_the_body_on_a_held_key_is_key_conflic
 
 #[test]
 fn addendum_4_a_repeat_without_a_content_type_gets_its_receipt() {
-    let world = World::new();
-    let token = world.create();
-    world.producer(&write(tokened(token), 1, 0, b"claim"));
-    let commit = write(tokened(token), 1, 1, b"commit");
-    let applied = receipt_of(&world.producer(&commit));
-    let bare = Request {
-        content_type: None,
-        ..commit.clone()
-    };
-    let answer = world.producer(&bare);
-    assert!(matches!(answer, ProducerAnswer::Receipt {
-        delivery: Delivery::Repeat,
-        ..
-    }));
-    assert_eq!(receipt_of(&answer), applied);
+    for untokened in [false, true] {
+        let world = World::new();
+        let token = world.create();
+        world.producer(&write(tokened(token), 1, 0, b"claim"));
+        // Rows 8 to 10 answer alike with the token and without it.
+        let p = if untokened { None } else { tokened(token) };
+        let commit = write(p, 1, 1, b"commit");
+        let applied = receipt_of(&world.producer(&commit));
+        let bare = Request {
+            content_type: None,
+            ..commit.clone()
+        };
+        let answer = world.producer(&bare);
+        assert!(matches!(answer, ProducerAnswer::Receipt {
+            delivery: Delivery::Repeat,
+            ..
+        }));
+        assert_eq!(receipt_of(&answer), applied);
+    }
 }
 
 #[test]
 fn addendum_4_an_empty_write_on_an_applied_key_gets_its_row() {
-    let world = World::new();
-    let token = world.create();
-    world.producer(&write(tokened(token), 1, 0, b"claim"));
-    let commit = write(tokened(token), 1, 1, b"commit");
-    world.producer(&commit);
-    // Row 9: the digest names the newest write, the empty body is never read.
-    assert!(matches!(
-        world.producer(&with_body(&commit, b"")),
-        ProducerAnswer::Receipt {
-            delivery: Delivery::Repeat,
-            ..
-        }
-    ));
-    // Row 10: the claim, once a later seq applied.
-    assert!(matches!(
-        world.producer(&with_body(&write(tokened(token), 1, 0, b"claim"), b"")),
-        ProducerAnswer::ReceiptEvicted { .. }
-    ));
-    // Row 8: the empty body's digest under the newest write's key.
-    assert_eq!(
-        world.producer(&write(tokened(token), 1, 1, b"")),
-        ProducerAnswer::KeyConflict { epoch: epoch(1) }
-    );
-    // Row 13 refuses before the content checks.
-    assert_eq!(
-        world.producer(&write(tokened(token), 1, 5, b"")),
-        ProducerAnswer::SeqGap {
-            expected: seq(2),
-            received: seq(5),
-        }
-    );
-    // Row 12 would apply: only then is the empty body refused.
-    let answer = world.send(&write(tokened(token), 1, 2, b""));
-    assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+    for untokened in [false, true] {
+        let world = World::new();
+        let token = world.create();
+        world.producer(&write(tokened(token), 1, 0, b"claim"));
+        // Rows 8 to 10 answer alike with the token and without it.
+        let p = if untokened { None } else { tokened(token) };
+        let commit = write(p, 1, 1, b"commit");
+        world.producer(&commit);
+        // Row 9: the digest names the newest write, the empty body is never read.
+        assert!(matches!(
+            world.producer(&with_body(&commit, b"")),
+            ProducerAnswer::Receipt {
+                delivery: Delivery::Repeat,
+                ..
+            }
+        ));
+        // Row 10: the claim, once a later seq applied.
+        assert!(matches!(
+            world.producer(&with_body(&write(p, 1, 0, b"claim"), b"")),
+            ProducerAnswer::ReceiptEvicted { .. }
+        ));
+        // Row 8: the empty body's digest under the newest write's key.
+        assert_eq!(
+            world.producer(&write(p, 1, 1, b"")),
+            ProducerAnswer::KeyConflict { epoch: epoch(1) }
+        );
+        // Row 13 refuses before the content checks.
+        assert_eq!(
+            world.producer(&write(p, 1, 5, b"")),
+            ProducerAnswer::SeqGap {
+                expected: seq(2),
+                received: seq(5),
+            }
+        );
+        // Row 12 would apply: only then is the empty body refused.
+        let answer = world.send(&write(p, 1, 2, b""));
+        assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+    }
 }
 
 /// Sends `refused`, the next write after a claim with its content type changed by `change`, and
@@ -660,6 +669,57 @@ fn addendum_4_another_content_type_on_a_write_that_would_apply_is_409() {
 fn addendum_4_a_body_that_does_not_match_its_digest_on_a_write_that_would_apply_is_400() {
     let answer = content_refusal(|request| request.body = Arc::from(&b"another body"[..]));
     assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+}
+
+#[test]
+fn addendum_4_an_empty_write_that_would_apply_is_400_whatever_its_content_type() {
+    // Base protocol §5.2: a write without a body is never refused for its content type.
+    for content_type in [None, Some("text/plain"), Some(CONTENT_TYPE)] {
+        let answer = content_refusal(|request| {
+            request.body = Arc::from(&b""[..]);
+            request.content_type = content_type.map(str::to_owned);
+        });
+        assert_eq!(
+            (answer.status, answer.typed),
+            (400, Ok(Typed::Untyped)),
+            "{content_type:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unkeyed_close_only_write_closes_and_its_repeat_gets_204() {
+    // Base protocol §5.2: close-only writes are idempotent.
+    let world = World::new();
+    world.create();
+    world.server().foreign_append(PATH, b"frame").unwrap();
+    let tail = world.stream_head().next_offset();
+    let close = Request {
+        closes: true,
+        ..Request::new(Method::Post, Target::Stream)
+    };
+    for _ in 0..2 {
+        // The rendered answer, since a parsed unkeyed `204` keeps no headers.
+        let answer = world.server().handle(PATH, &close);
+        assert_eq!(answer.status, 204);
+        assert_eq!(answer.headers, [
+            (names::STREAM_NEXT_OFFSET, tail.to_string()),
+            (names::STREAM_CLOSED, "true".to_owned()),
+        ]);
+        assert!(world.stream_head().closed());
+    }
+    // An append still meets the closed stream.
+    let append = Request {
+        content_type: Some(CONTENT_TYPE.to_owned()),
+        body: Arc::from(&b"late"[..]),
+        ..Request::new(Method::Post, Target::Stream)
+    };
+    assert_eq!(
+        world.send(&append).typed,
+        Ok(Typed::StreamClosed(StreamClosedConflict {
+            final_offset: tail
+        }))
+    );
 }
 
 #[test]
