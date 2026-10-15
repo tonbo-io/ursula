@@ -208,11 +208,6 @@ pub(crate) enum Error {
     Options(#[from] OptionsError),
     #[error(transparent)]
     Host(#[from] HostError),
-    #[error(
-        "{path}: this process holds the database's files open outside the extension, whose \
-         commits would never reach the stream"
-    )]
-    OpenOutside { path: String },
     #[error(transparent)]
     DriverGone(#[from] DriverGone),
     #[error("{entry} panicked")]
@@ -227,7 +222,6 @@ impl Error {
             Error::NotBound { .. } | Error::NoRequest { .. } => ErrorKind::NotBound,
             Error::InvalidArgument { .. } | Error::Options(_) => ErrorKind::InvalidArgument,
             Error::Host(e) => e.kind(),
-            Error::OpenOutside { .. } => ErrorKind::InUse,
             Error::DriverGone(_) | Error::Panicked { .. } => ErrorKind::Internal,
         }
     }

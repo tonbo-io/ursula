@@ -133,7 +133,7 @@ fn a_built_generation_becomes_current_once_published() {
     // The next one supersedes it.
     let g2 = root.build(header(2)).unwrap().publish().unwrap();
     assert_eq!(root.current().unwrap(), Some(g2.clone()));
-    assert_eq!(g2.first_header().unwrap().supersedes, Some(g.lineage));
+    assert_eq!(g2.first_header().unwrap().supersedes, Some(g.id));
     assert!(!g.dir.exists());
 }
 
@@ -151,7 +151,7 @@ fn a_crash_after_each_publish_step_converges_to_one_generation() {
         let trash = dir
             .path()
             .join(root_name(&p))
-            .join(format!("gen-{}.trash", "01".repeat(16)));
+            .join(format!("gen-{}.trash", old.id.hex()));
         if trash.exists() {
             fs::remove_dir_all(trash.join("log")).unwrap();
         }
@@ -211,4 +211,75 @@ fn an_unreadable_generation_nothing_supersedes_is_an_error() {
         root.finish_leftovers(),
         Err(GenerationError::NoSegment { .. } | GenerationError::Io { .. })
     ));
+}
+
+// A generation directory is named by its id, and its lineage is read from its log: the current
+// generation is found by its directory, whatever lineage it holds.
+#[test]
+fn a_generation_is_found_by_its_directory_id() {
+    let dir = TempDir::new("gen-id");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let g = root.build(header(1)).unwrap().publish().unwrap();
+    assert_eq!(
+        g.dir.file_name().unwrap().to_str().unwrap(),
+        format!("gen-{}", g.id.hex())
+    );
+    assert_ne!(
+        g.id.0, g.lineage.0,
+        "the directory is not named by the lineage"
+    );
+    let current = root.current().unwrap().unwrap();
+    assert_eq!((current.id, current.lineage), (g.id, Lineage([1; 16])));
+    assert_eq!(current.wal(), g.dir.join("db-uwal"));
+}
+
+// Two directories of one lineage (a copy keeps its lineage) are told apart by id: the one whose
+// first segment names the other's id supersedes it, and without that the root is ambiguous.
+#[test]
+fn two_directories_of_one_lineage_resolve_by_supersedes() {
+    let dir = TempDir::new("gen-same-lineage");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let old = root.build(header(1)).unwrap().publish().unwrap();
+    root.build(header(1)).unwrap().crash_after(5).unwrap();
+    drop(root);
+    let root = Root::lock(dir.path(), &p).unwrap();
+    root.finish_leftovers().unwrap();
+    let current = root.current().unwrap().unwrap();
+    assert_eq!(current.lineage, old.lineage);
+    assert_ne!(current.id, old.id);
+    assert_eq!(current.first_header().unwrap().supersedes, Some(old.id));
+    assert!(!old.dir.exists());
+
+    // A second directory of the lineage that supersedes nothing: neither wins.
+    let side = dir.path().join("side");
+    fs::rename(&current.dir, &side).unwrap();
+    let other = root.build(header(1)).unwrap().publish().unwrap();
+    fs::rename(&side, &current.dir).unwrap();
+    assert_eq!(other.first_header().unwrap().supersedes, None);
+    root.finish_leftovers().unwrap();
+    assert!(matches!(
+        root.current(),
+        Err(GenerationError::Ambiguous { ids, .. }) if ids.len() == 2
+    ));
+}
+
+// An empty db's initialization that a crash cut short (`db.init` and its SQLite files) is deleted
+// with the other leftovers; the db it would have replaced stays.
+#[test]
+fn an_unfinished_init_is_a_leftover() {
+    let dir = TempDir::new("gen-init");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let g = root.build(header(1)).unwrap().publish().unwrap();
+    for name in ["db.init", "db.init-wal", "db.init-shm"] {
+        fs::write(g.dir.join(name), b"x").unwrap();
+    }
+    root.finish_leftovers().unwrap();
+    for name in ["db.init", "db.init-wal", "db.init-shm"] {
+        assert!(!g.dir.join(name).exists(), "{name}");
+    }
+    assert!(g.db().exists());
+    assert_eq!(g.db_init(), g.dir.join("db.init"));
 }

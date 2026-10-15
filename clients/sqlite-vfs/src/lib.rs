@@ -10,11 +10,15 @@
 //!   default), materializes or builds its generation, takes the stream over and reconciles, and
 //!   returns `{done, path, name, state}`; connections then open `path` with plain SQLite. With
 //!   `timeout_ms` 0 it returns `{done: false, request}` at once, and `ursula_events` reports the
-//!   outcome. A database file of the extension opens only while bound. After the last connection
-//!   closes, the binding drains and retires (one `ursula_open` handed out retires too if no
-//!   connection opens it within a minute), and its root unlocks. A host reopens through
-//!   `ursula_open`, which takes a retiring binding back: a plain open of the path is refused once
-//!   the binding retired.
+//!   outcome. After the last connection closes, the binding drains and retires (one `ursula_open`
+//!   handed out retires too if no connection opens it within a minute), and its root unlocks. A
+//!   host reopens through `ursula_open`, which takes a retiring binding back: a plain open of the
+//!   path is refused once the binding retired.
+//! * Outside the extension a database file is not a database: on disk its bytes 0..16 hold a
+//!   marker in place of SQLite's magic (the VFS translates them for a bound file), and its WAL is
+//!   `db-uwal`, a name SQLite never probes. SQLite in another process, a connection opened before
+//!   the extension loaded, `?vfs=unix` and the `sqlite3` shell fail with `SQLITE_NOTADB`, and
+//!   change no file.
 //! * `SELECT ursula_synced(path, timeout_ms)` resolves once every commit logged before the call is
 //!   acknowledged and a round trip that started after it found this owner still the owner.
 //! * `SELECT ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions, resets.
@@ -38,9 +42,9 @@
 //!
 //! Module map:
 //!
-//! - [`codec`]: the formats (`USQ2` frames, `USL1` log segments, `USS3` snapshot bodies) and the
-//!   digests the server checks.
-//! - `applier`: applies commits to a db file in batches of final page images.
+//! - [`codec`]: the formats (`USQ2` frames, `USL1` log segments, `USS3` snapshot bodies, the
+//!   page-1 marker) and the digests the server checks.
+//! - `applier`: applies commits to a db file in batches of final page images, page 1 marked.
 //! - `auth`: the bearer token every request carries.
 //! - `capture`: the WAL's layout, the shape of a write transaction's WAL writes, and its final page
 //!   images at the commit point.
@@ -48,15 +52,13 @@
 //! - `db`: bound databases (their commit-path state) and the process-wide registry.
 //! - `driver`: the process-wide driver of the replicators and opens: a deterministic core and its
 //!   runtime (a driver thread and blocking HTTP workers).
-//! - `descriptors`: the scan for descriptors of this process on a database's files outside the
-//!   extension, which an open refuses.
 //! - `error`: the kinds and actions callers outside the extension see (`ErrorKind`, `Action`), and
 //!   the SQL functions' error type.
 //! - `extension`: the entry point, the SQLite version gate and the SQL functions.
 //! - `generation`: the canonical stream path, a stream's locked root directory and the
-//!   generations in it.
+//!   generations in it (`gen-<id32>` directories).
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
-//! - [`ids`]: lineages, activations, positions and commit ids.
+//! - [`ids`]: lineages, generation directory ids, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and a private connection.
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
@@ -75,7 +77,8 @@
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: the JSON the SQL functions return.
 //! - `transport`: one attempt of a request, over HTTP or to the model in process.
-//! - `vfs`: the VFS file methods and the commit path.
+//! - `vfs`: the VFS file methods (the page-1 marker, the `db-uwal` WAL), its `xAccess` and
+//!   `xDelete`, and the commit path.
 //! - `wire`: the requests and answers as values, shared by the transports and the model.
 
 mod applier;
@@ -84,7 +87,6 @@ mod capture;
 pub mod codec;
 mod config;
 mod db;
-mod descriptors;
 mod driver;
 mod error;
 mod extension;

@@ -24,6 +24,14 @@
 //! generation or a WAL truncate to nothing the db file is fsynced, then a BASE record names the
 //! last confirmed commit. A failed fsync resets `local_damage`.
 //!
+//! Page 1 (design §5.1): on disk bytes 0..16 of a bound db file hold the generation's marker
+//! ([`marker`]). `xRead` gives SQLite its magic in their place, `xWrite` stores the marker in place
+//! of the magic, and `xFetch` maps nothing over them, so SQLite reads them through `xRead`. A read
+//! that finds anything but the marker resets `local_damage` (`SQLITE_IOERR_READ`). The WAL of a
+//! bound db is `db-uwal`: `xOpen` opens it in place of `db-wal`, and the VFS's own `xAccess` and
+//! `xDelete` map SQLite's probes and deletes of `db-wal` to it. Unbound, a generation's db file
+//! reads as no database (`SQLITE_NOTADB`), through this VFS or any other.
+//!
 //! After a reset, a new read transaction fails at its read-mark lock (`SQLITE_IOERR_READ`) and
 //! every write fails (`SQLITE_IOERR_WRITE`), db-file writes included, so no checkpoint moves pages
 //! of a commit that may be discarded. A panic in a file method resets `internal`.
@@ -34,6 +42,7 @@
 //! are valid for the sizes SQLite passes with them.
 //!
 //! [`publication`]: crate::publication
+//! [`marker`]: crate::codec::marker
 #![expect(
     unsafe_code,
     reason = "a SQLite VFS implements C callbacks over raw pointers SQLite owns"
@@ -42,9 +51,10 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
+use std::ffi::CString;
+use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ffi::c_void;
-use std::path::Path;
 use std::ptr::null;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -64,6 +74,7 @@ use crate::capture::page_at;
 use crate::codec::PAGE;
 use crate::codec::frame::FrameError;
 use crate::codec::frame::encode_commit;
+use crate::codec::marker;
 use crate::codec::segment::RecordBody;
 use crate::config::Step;
 use crate::config::abort_at;
@@ -74,7 +85,6 @@ use crate::db::Window;
 use crate::db::lookup;
 use crate::driver::runtime::driver;
 use crate::error::WriteRefusal;
-use crate::generation::in_generation;
 use crate::guard::contain;
 use crate::host::OK;
 use crate::host::unix;
@@ -138,6 +148,9 @@ pub(crate) struct File {
     ext: *mut Ext,
     /// Test hook `URSULA_VFS_FAIL_SYNC`: this file's `xSync` fails.
     fail_sync: bool,
+    /// The name the "unix" file of a bound db's WAL was opened under (`db-uwal`), which "unix"
+    /// keeps as its path until the file closes. Null otherwise.
+    wal_name: *mut WalName,
     /// The underlying "unix" file (szOsFile bytes from here).
     pub(crate) inner: ffi::sqlite3_file,
 }
@@ -145,6 +158,32 @@ pub(crate) struct File {
 struct Ext {
     binding: Arc<Binding>,
     role: Role,
+}
+
+/// A WAL name as SQLite lays file names out for its VFSs: four NULs before it (where
+/// `sqlite3_filename_database` stops looking back) and two after it (no URI parameters).
+struct WalName(Box<[u8]>);
+
+impl WalName {
+    fn new(name: &str) -> WalName {
+        let mut bytes = vec![0u8; 4];
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        WalName(bytes.into_boxed_slice())
+    }
+
+    /// The NUL-terminated name.
+    fn as_ptr(&self) -> *const c_char {
+        self.0.get(4..).unwrap_or_default().as_ptr().cast()
+    }
+}
+
+/// The WAL's name for `name`, a name SQLite gives a WAL (`<db>-wal`), when `bound(<db>)`: the bound
+/// db's WAL is `<db>-uwal`. `None` for any other name, which passes unchanged.
+fn uwal(name: &str, bound: impl FnOnce(&str) -> bool) -> Option<String> {
+    name.strip_suffix("-wal")
+        .filter(|db| bound(db))
+        .map(|db| format!("{db}-uwal"))
 }
 
 enum Role {
@@ -327,16 +366,6 @@ unsafe fn x_open(
                     },
                 })
             }
-            None if in_generation(Path::new(name)) => {
-                log::emit(Level::Warn, "open_refused", &[
-                    ("file", &name),
-                    (
-                        "reason",
-                        &"a database of the extension opens only while bound",
-                    ),
-                ]);
-                return ffi::SQLITE_CANTOPEN;
-            }
             None => None,
         },
         Some(name) if flags & ffi::SQLITE_OPEN_WAL != 0 => name
@@ -350,15 +379,38 @@ unsafe fn x_open(
     };
     // Released when the open fails below, also when a panic unwinds through it.
     let mut counted = Counted(ext.as_ref().map(|e| (Arc::clone(&e.binding), e.is_main())));
+    // A bound db's WAL opens as `db-uwal`, under a name the file owns until it closes ("unix"
+    // keeps it as its path). Without URI parameters: the WAL takes none of its own.
+    let (zname, flags) = match (&ext, name) {
+        (
+            Some(Ext {
+                role: Role::Wal, ..
+            }),
+            Some(name),
+        ) => {
+            let Some(uwal) = uwal(name, |_bound| true) else {
+                return ffi::SQLITE_CANTOPEN;
+            };
+            let mapped = Box::into_raw(Box::new(WalName::new(&uwal)));
+            // SAFETY: as above; freed by `take_wal_name` when the open fails or the file closes.
+            unsafe { (*f).wal_name = mapped };
+            // SAFETY: `mapped` was just leaked above and lives until `take_wal_name`.
+            let ptr = unsafe { (*mapped).as_ptr() };
+            (ptr, flags & !ffi::SQLITE_OPEN_URI)
+        }
+        _ => (zname, flags),
+    };
     let u = unix();
     // SAFETY: `UNIX` is null or SQLite's "unix" VFS, which lives for the process.
     let open = unsafe { u.as_ref() }.and_then(|u| u.xOpen);
     // SAFETY: the "unix" file lies within SQLite's allocation for this file (`szOsFile` counts
-    // it), and the other arguments are SQLite's.
+    // it), and the other arguments are SQLite's, or the WAL name the file owns.
     let rc = open.map_or(ffi::SQLITE_CANTOPEN, |open| unsafe {
         open(u, zname, inner(file), flags, out)
     });
     if rc != OK {
+        // SAFETY: the open failed, so SQLite never closes the file: its name is freed here.
+        drop(unsafe { take_wal_name(file) });
         return rc;
     }
     if ext.is_none() {
@@ -414,7 +466,27 @@ unsafe fn not_open(file: *mut ffi::sqlite3_file) {
     // SAFETY: as above.
     unsafe { (*f).fail_sync = false };
     // SAFETY: as above.
+    unsafe { (*f).wal_name = null_mut() };
+    // SAFETY: as above.
     unsafe { (*f).inner.pMethods = null() };
+}
+
+/// Takes the WAL name out of `file`, once its "unix" file is closed or its open failed.
+///
+/// # Safety
+///
+/// `file` is a file of this VFS that `not_open` set up, whose `wal_name` is null or the `Box`
+/// `x_open` made, taken once.
+unsafe fn take_wal_name(file: *mut ffi::sqlite3_file) -> Option<Box<WalName>> {
+    let f = file.cast::<File>();
+    // SAFETY: the caller's contract; the name is taken once, here.
+    let name = unsafe { std::mem::replace(&mut (*f).wal_name, null_mut()) };
+    if name.is_null() {
+        None
+    } else {
+        // SAFETY: a non-null `wal_name` is the `Box` `x_open` leaked for this file.
+        Some(unsafe { Box::from_raw(name) })
+    }
 }
 
 /// Takes `file`'s state out of it, for `c_close`, and for an open that failed (`failed_open`).
@@ -488,7 +560,7 @@ unsafe fn x_read(
 ) -> c_int {
     let rc = fwd!(file, xRead, buf, amt, off);
     // SAFETY: the module contract.
-    let Some(ext) = (unsafe { ext(file) }).filter(|e| !e.is_main()) else {
+    let Some(ext) = (unsafe { ext(file) }) else {
         return rc;
     };
     if rc != OK && rc != ffi::SQLITE_IOERR_SHORT_READ {
@@ -497,6 +569,22 @@ unsafe fn x_read(
     let Ok(len) = usize::try_from(amt) else {
         return ffi::SQLITE_IOERR_READ;
     };
+    if ext.is_main() {
+        let Ok(at) = u64::try_from(off) else {
+            return rc;
+        };
+        if at >= marker::LEN as u64 {
+            return rc;
+        }
+        // SAFETY: SQLite passes `amt` writable bytes at `buf`, which the read just filled.
+        let data = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
+        let lineage = ext.binding.handle.generation.lineage;
+        if let Err(e) = marker::on_read(data, at, lineage) {
+            ext.binding.reset(ResetKind::LocalDamage, &e);
+            return ffi::SQLITE_IOERR_READ;
+        }
+        return rc;
+    }
     // SAFETY: SQLite passes `amt` bytes at `buf`, which the read just filled.
     let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
     // A page this process wrote that reads back other bytes was lost on its way to the disk (a
@@ -557,7 +645,19 @@ unsafe fn x_write(
                 ),
             );
         }
-        let rc = fwd!(file, xWrite, buf, amt, off);
+        // Page 1 goes to disk with the marker in place of SQLite's magic.
+        let at = u64::try_from(off).unwrap_or(u64::MAX);
+        let marked = match marker::on_write(data, at, b.handle.generation.lineage) {
+            Ok(marked) => marked,
+            Err(e) => {
+                b.reset(ResetKind::LocalDamage, &e);
+                return ffi::SQLITE_IOERR_WRITE;
+            }
+        };
+        let rc = match &marked {
+            Some(bytes) => fwd!(file, xWrite, bytes.as_ptr().cast::<c_void>(), amt, off),
+            None => fwd!(file, xWrite, buf, amt, off),
+        };
         if let Some((_, first @ false)) = &mut c.checkpoint {
             *first = true;
             abort_at(Step::CheckpointPage);
@@ -1115,12 +1215,23 @@ unsafe fn x_shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int) -> c_int {
     fwd!(file, xShmUnmap, delete)
 }
 
+/// Maps nothing over bytes 0..16 of a bound db file, which hold the marker on disk: SQLite reads
+/// such a page through `xRead`, which translates them.
 unsafe fn x_fetch(
     file: *mut ffi::sqlite3_file,
     off: ffi::sqlite3_int64,
     amt: c_int,
     pp: *mut *mut c_void,
 ) -> c_int {
+    // SAFETY: the module contract.
+    let main = unsafe { ext(file) }.is_some_and(Ext::is_main);
+    if main && off < marker::LEN as i64 {
+        if !pp.is_null() {
+            // SAFETY: SQLite passes `pp` writable for the mapping.
+            unsafe { *pp = null_mut() };
+        }
+        return OK;
+    }
     fwd!(file, xFetch, off, amt, pp)
 }
 
@@ -1213,6 +1324,8 @@ unsafe fn failed_open(file: *mut ffi::sqlite3_file) -> c_int {
     let _closed = fwd!(file, xClose);
     // SAFETY: the caller's contract, which `take_ext` asks for.
     drop(unsafe { take_ext(file) });
+    // SAFETY: the caller's contract, which `take_wal_name` asks for; the "unix" file is closed.
+    drop(unsafe { take_wal_name(file) });
     // SAFETY: as above.
     unsafe { (*file).pMethods = null() };
     ffi::SQLITE_CANTOPEN
@@ -1233,13 +1346,100 @@ unsafe extern "C" fn c_close(file: *mut ffi::sqlite3_file) -> c_int {
             || closing(e, addr),
         );
     }
-    contain(
+    let rc = contain(
         "x_close",
         || {
             let _closed = fwd!(file, xClose);
             ffi::SQLITE_IOERR_CLOSE
         },
         || fwd!(file, xClose),
+    );
+    // SAFETY: SQLite closes a file once, and its "unix" file, which kept the name, is closed.
+    drop(unsafe { take_wal_name(file) });
+    rc
+}
+
+/// The name "unix" gets for `zname`: a bound db's WAL (`<db>-wal`) is `<db>-uwal`. `None` when it
+/// passes unchanged.
+///
+/// # Safety
+///
+/// `zname` is null or NUL-terminated.
+unsafe fn mapped_name(zname: *const c_char) -> Option<CString> {
+    if zname.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    let name = unsafe { CStr::from_ptr(zname) }.to_str().ok()?;
+    uwal(name, |db| lookup(db).is_some()).and_then(|n| CString::new(n).ok())
+}
+
+/// `xAccess` of the "ursula" VFS: SQLite's probe of a bound db's `db-wal` looks at its `db-uwal`.
+///
+/// # Safety
+///
+/// SQLite's `xAccess` contract: `zname` is NUL-terminated and `out` writable.
+unsafe fn x_access(zname: *const c_char, flags: c_int, out: *mut c_int) -> c_int {
+    let u = unix();
+    // SAFETY: `UNIX` is null or SQLite's "unix" VFS, which lives for the process.
+    let Some(access) = unsafe { u.as_ref() }.and_then(|u| u.xAccess) else {
+        return ffi::SQLITE_IOERR_ACCESS;
+    };
+    // SAFETY: the caller's contract.
+    let mapped = unsafe { mapped_name(zname) };
+    let name = mapped.as_ref().map_or(zname, |m| m.as_ptr());
+    // SAFETY: SQLite's call, forwarded to "unix" with a NUL-terminated name that outlives it.
+    unsafe { access(u, name, flags, out) }
+}
+
+/// `xDelete` of the "ursula" VFS: SQLite's delete of a bound db's `db-wal` deletes its `db-uwal`.
+///
+/// # Safety
+///
+/// SQLite's `xDelete` contract: `zname` is NUL-terminated.
+unsafe fn x_delete(zname: *const c_char, sync_dir: c_int) -> c_int {
+    let u = unix();
+    // SAFETY: `UNIX` is null or SQLite's "unix" VFS, which lives for the process.
+    let Some(delete) = unsafe { u.as_ref() }.and_then(|u| u.xDelete) else {
+        return ffi::SQLITE_IOERR_DELETE;
+    };
+    // SAFETY: the caller's contract.
+    let mapped = unsafe { mapped_name(zname) };
+    let name = mapped.as_ref().map_or(zname, |m| m.as_ptr());
+    // SAFETY: SQLite's call, forwarded to "unix" with a NUL-terminated name that outlives it.
+    unsafe { delete(u, name, sync_dir) }
+}
+
+/// `xAccess`'s C entry point: a panic answers `SQLITE_IOERR_ACCESS`.
+pub(crate) unsafe extern "C" fn c_access(
+    _vfs: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    flags: c_int,
+    out: *mut c_int,
+) -> c_int {
+    contain(
+        "x_access",
+        || ffi::SQLITE_IOERR_ACCESS,
+        || {
+            // SAFETY: SQLite's call of `xAccess`, forwarded with its arguments.
+            unsafe { x_access(zname, flags, out) }
+        },
+    )
+}
+
+/// `xDelete`'s C entry point: a panic answers `SQLITE_IOERR_DELETE`.
+pub(crate) unsafe extern "C" fn c_delete(
+    _vfs: *mut ffi::sqlite3_vfs,
+    zname: *const c_char,
+    sync_dir: c_int,
+) -> c_int {
+    contain(
+        "x_delete",
+        || ffi::SQLITE_IOERR_DELETE,
+        || {
+            // SAFETY: SQLite's call of `xDelete`, forwarded with its arguments.
+            unsafe { x_delete(zname, sync_dir) }
+        },
     )
 }
 

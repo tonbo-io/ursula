@@ -538,6 +538,11 @@ impl Log {
         self.next
     }
 
+    /// The generation's lineage, as its segment headers name it.
+    pub(crate) fn lineage(&self) -> Lineage {
+        self.state.lineage
+    }
+
     /// The latest ACK, as appended.
     pub(crate) fn acked(&self) -> Position {
         self.state.acked

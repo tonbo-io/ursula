@@ -5,7 +5,12 @@
 //   {"exec": sql} | {"all": sql} -> {"ok": true[, "rows"]} or {"ok": false, "error", "errcode"}
 //   {"status": true} | {"synced": ms} | {"events": true} -> the function's JSON
 //   {"close": true} closes the database, {"exit": true} exits.
+//   {"outside": vfs} opens the database's file as `file:<path>?vfs=<vfs>`, outside the extension,
+//   and reads its schema -> {"ok": false, "uri", "error", "errcode"} (or {"ok": true, "uri"}),
+//   `uri` saying whether this Node honours URI file names (a probe file opened as one).
 // `"conn": 2` runs `exec` or `all` on a second connection to the database.
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 
@@ -45,6 +50,23 @@ for await (const line of createInterface({ input: process.stdin })) {
 			const got = call("SELECT ursula_events(?, 0)", cursor);
 			cursor = got.cursor;
 			say({ ok: true, events: got.events });
+		} else if (cmd.outside !== undefined) {
+			// A URI names the probe in the cache root: honoured, the probe file exists after.
+			const probe = join(dir, `uri-probe-${process.pid}.db`);
+			try {
+				new DatabaseSync(`file:${probe}?vfs=${cmd.outside}`).close();
+			} catch {}
+			const uri = existsSync(probe);
+			let other;
+			try {
+				other = new DatabaseSync(`file:${opened.path}?vfs=${cmd.outside}`);
+				other.prepare("SELECT count(*) AS n FROM sqlite_schema").get();
+				say({ ok: true, uri });
+			} catch (error) {
+				say({ ...failure(error), uri });
+			} finally {
+				other?.close();
+			}
 		} else if (cmd.close) {
 			second?.close();
 			db.close();

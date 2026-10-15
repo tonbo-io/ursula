@@ -22,7 +22,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::capture::WriteTxn;
-use crate::descriptors::open_in_process;
 use crate::driver::BindingHandle;
 use crate::driver::BindingId;
 use crate::driver::Bound;
@@ -32,7 +31,7 @@ use crate::error::Error;
 use crate::error::WriteRefusal;
 use crate::generation::canonical_path;
 use crate::host::full_pathname;
-use crate::host::init_wal_format;
+use crate::host::init_empty;
 use crate::ids::Activation;
 use crate::ids::Position;
 use crate::log;
@@ -394,7 +393,8 @@ fn take(name: &str, open: OpenId, timeout_ms: u64) -> Result<Option<Opened>, Err
     register(bound, url).map(|b| Some(Opened::Bound(b)))
 }
 
-/// A database the driver bound: its empty db file gets WAL format, and it joins the registry.
+/// A database the driver bound: its empty db file is initialized (WAL format, page 1 marked), and
+/// it joins the registry.
 fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     let Bound { binding, handle } = bound;
     let refuse = |e: Error| {
@@ -407,10 +407,7 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     let db = handle.generation.db();
     let path = full_pathname(&db.to_string_lossy()).map_err(|e| refuse(e.into()))?;
     if std::fs::metadata(&db).map_or(0, |m| m.len()) == 0 {
-        init_wal_format(&path).map_err(|e| refuse(e.into()))?;
-    }
-    if open_in_process(&path).is_some() {
-        return Err(refuse(Error::OpenOutside { path }));
+        init_empty(&handle.generation).map_err(|e| refuse(e.into()))?;
     }
     let at_bind = match handle.log() {
         Ok(log) => Position(log.next_position().0.saturating_sub(1)),

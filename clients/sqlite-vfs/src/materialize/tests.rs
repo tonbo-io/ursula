@@ -25,6 +25,8 @@ use crate::codec::PAGE;
 use crate::codec::frame::CommitRecord;
 use crate::codec::frame::Frame;
 use crate::codec::frame::encode_commit;
+use crate::codec::marker::SQLITE_MAGIC;
+use crate::codec::marker::mark;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
 use crate::generation::Generation;
@@ -59,26 +61,51 @@ fn header() -> SegmentHeader {
     }
 }
 
-/// A fresh published generation with an empty db and log.
+/// A fresh published generation with an empty log and its db initialized as a bind initializes
+/// it: one page, page 1 marked (`State::default`).
 fn generation(dir: &TempDir) -> (Root, Generation) {
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
     let g = root.build(header()).unwrap().publish().unwrap();
+    fs::write(g.db(), State::default().bytes()).unwrap();
     (root, g)
 }
 
+/// A page image as SQLite writes it: page 1 starts with SQLite's magic.
 fn image(pgno: u32, fill: u8) -> Box<[u8; PAGE]> {
     let mut p = Box::new([fill; PAGE]);
-    p[..4].copy_from_slice(&pgno.to_be_bytes());
+    p[16..20].copy_from_slice(&pgno.to_be_bytes());
+    if pgno == 1 {
+        p[..16].copy_from_slice(&SQLITE_MAGIC);
+    }
+    p
+}
+
+/// A page image as the db file holds it: page 1 marked.
+fn on_disk(pgno: u32, fill: u8) -> Box<[u8; PAGE]> {
+    let mut p = image(pgno, fill);
+    if pgno == 1 {
+        p[..16].copy_from_slice(&mark(LINEAGE));
+    }
     p
 }
 
 /// The database after a commit: its size and, per page, the image's fill and the commit that
-/// wrote it (1-based). Pages without an entry are zero.
-#[derive(Debug, Clone, Default)]
+/// wrote it (1-based, 0 for the initialized page 1). Pages without an entry are zero.
+#[derive(Debug, Clone)]
 struct State {
     size: u32,
     pages: BTreeMap<u32, (u8, usize)>,
+}
+
+impl Default for State {
+    /// An initialized db: page 1 alone.
+    fn default() -> Self {
+        State {
+            size: 1,
+            pages: BTreeMap::from([(1, (0, 0))]),
+        }
+    }
 }
 
 impl State {
@@ -86,7 +113,7 @@ impl State {
         let mut out = vec![0u8; usize::try_from(db_len(self.size)).unwrap()];
         for (&pgno, &(fill, _)) in &self.pages {
             let at = usize::try_from(page_offset(pgno)).unwrap();
-            out[at..at + PAGE].copy_from_slice(image(pgno, fill).as_slice());
+            out[at..at + PAGE].copy_from_slice(on_disk(pgno, fill).as_slice());
         }
         out
     }
@@ -223,7 +250,7 @@ fn run(ops: &[Op], roll: u64, tear: Tear, crash: Option<u64>) {
                 let j = base + 1 + pick % later;
                 for (&pgno, &(fill, writer)) in &states[j].pages {
                     if writer > base && (*complete || subset & (1 << (pgno % 64)) != 0) {
-                        db.write_all_at(image(pgno, fill).as_slice(), page_offset(pgno))
+                        db.write_all_at(on_disk(pgno, fill).as_slice(), page_offset(pgno))
                             .unwrap();
                     }
                 }
@@ -407,6 +434,11 @@ fn catching_up_logs_applies_and_survives_a_reopen() {
         }
         s.bytes()
     };
+    assert_eq!(
+        want[..16],
+        mark(LINEAGE),
+        "page 1 is stamped with our marker"
+    );
     assert_eq!(read(&g.db()), want);
     drop(m);
     let m = materialize(&g).unwrap();
@@ -476,4 +508,89 @@ fn catching_up_is_refused_while_our_commits_are_pending() {
     ));
     // Once the caller knows commit 1 acknowledged, the frames go after it.
     catch_up(&mut m, Position(1), &frames).unwrap();
+}
+
+/// Logs one commit of page 1 filled with `fill`.
+fn log_commit(g: &Generation, fill: u8) {
+    let mut log = Log::open(&g.log_dir()).unwrap().0;
+    let record = CommitRecord {
+        db_pages_after: 1,
+        pages: vec![(1, image(1, fill))],
+    };
+    let id = CommitId {
+        lineage: LINEAGE,
+        position: log.next_position(),
+    };
+    let frame = encode_commit(id, &record).unwrap();
+    log.append(&RecordBody::Commit { frame }).unwrap();
+}
+
+// A db file whose page 1 is not this generation's marker (plain SQLite copied over it, another
+// generation's db, a file cut short) is refused before anything is written: no replay, no WAL
+// deleted, no BASE.
+#[test]
+fn a_foreign_page_one_is_refused_before_anything_is_written() {
+    let other = Lineage([4; 16]);
+    let mut foreign_marked = State::default().bytes();
+    foreign_marked[..16].copy_from_slice(&mark(other));
+    let mut plain = State::default().bytes();
+    plain[..16].copy_from_slice(&SQLITE_MAGIC);
+    for db in [plain, foreign_marked, b"Ursula08".to_vec()] {
+        let dir = TempDir::new("materialize-foreign");
+        let (_root, g) = generation(&dir);
+        log_commit(&g, 5);
+        fs::write(g.db(), &db).unwrap();
+        fs::write(g.wal(), b"wal").unwrap();
+        let segment = fs::read(g.log_dir().join("00000000000000000001.usl")).unwrap();
+        assert!(matches!(
+            materialize(&g),
+            Err(super::LocalError::Replaced { found, .. }) if found == db[..db.len().min(16)]
+        ));
+        assert_eq!(read(&g.db()), db);
+        assert_eq!(read(&g.wal()), b"wal");
+        assert_eq!(
+            fs::read(g.log_dir().join("00000000000000000001.usl")).unwrap(),
+            segment
+        );
+    }
+}
+
+// An empty db file is one a bind initializes, unless the log holds a commit the db should hold
+// already (after a BASE): then it was emptied, and is refused.
+#[test]
+fn an_empty_db_is_new_only_without_a_based_commit() {
+    let dir = TempDir::new("materialize-empty");
+    let (_root, g) = generation(&dir);
+    fs::write(g.db(), b"").unwrap();
+    let m = materialize(&g).unwrap();
+    assert_eq!(m.db.metadata().unwrap().len(), 0);
+    drop(m);
+    // A commit after the BASE is replayed onto the empty db, page 1 marked.
+    log_commit(&g, 6);
+    let m = materialize(&g).unwrap();
+    assert_eq!(read(&g.db())[..16], mark(LINEAGE));
+    assert_eq!(m.recovered.base, Position(0));
+    drop(m);
+    // Its replay appended a BASE: emptied now, the db lost what the BASE says it holds.
+    fs::write(g.db(), b"").unwrap();
+    assert!(matches!(
+        materialize(&g),
+        Err(super::LocalError::Replaced { found, .. }) if found.is_empty()
+    ));
+}
+
+// The WAL and `-shm` go unread, and so do a `db-wal` and a `db-journal` SQLite outside the
+// extension may have left next to the db.
+#[test]
+fn stray_sqlite_files_are_deleted() {
+    let dir = TempDir::new("materialize-strays");
+    let (_root, g) = generation(&dir);
+    let [stray_wal, journal] = g.strays();
+    for path in [g.wal(), g.shm(), stray_wal.clone(), journal.clone()] {
+        fs::write(&path, b"stale").unwrap();
+    }
+    materialize(&g).unwrap();
+    for path in [g.wal(), g.shm(), stray_wal, journal] {
+        assert!(!path.exists(), "{}", path.display());
+    }
 }

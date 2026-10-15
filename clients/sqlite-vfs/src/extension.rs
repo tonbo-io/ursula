@@ -31,6 +31,8 @@ use crate::host::UNIX;
 use crate::host::api;
 use crate::status;
 use crate::vfs::File;
+use crate::vfs::c_access;
+use crate::vfs::c_delete;
 use crate::vfs::c_open;
 
 /// The "ursula" VFS, registered once per process (null before).
@@ -520,7 +522,8 @@ unsafe fn set_error(err: *mut *mut c_char, a: &ffi::sqlite3_api_routines, messag
 }
 
 /// Registers the "ursula" VFS: a copy of "unix" whose files carry this VFS's state in front of the
-/// "unix" file (`File`), made the default.
+/// "unix" file (`File`), made the default. `xOpen`, `xAccess` and `xDelete` are its own (a bound
+/// db's WAL is `db-uwal`); every other method is "unix"'s.
 fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
     let (Some(vfs_find), Some(vfs_register)) = (a.vfs_find, a.vfs_register) else {
         return ffi::SQLITE_ERROR;
@@ -543,6 +546,8 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
         szOsFile: size,
         pNext: null_mut(),
         xOpen: Some(c_open),
+        xDelete: Some(c_delete),
+        xAccess: Some(c_access),
         ..*unix
     }));
     // SAFETY: `v` is a complete VFS that is never freed (SQLite keeps it registered for the

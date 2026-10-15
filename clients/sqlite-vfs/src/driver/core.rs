@@ -692,7 +692,7 @@ impl Core {
 
     /// A takeover's divergence (the pending tail from `discard_from` on dropped), a `410`, or a
     /// catch-up in place that grew past the database: a new generation is built from the stream in
-    /// `gen-<lineage>.tmp` and published by one rename once complete, and [`Event::CaughtUp`]
+    /// `gen-<id32>.tmp` and published by one rename once complete, and [`Event::CaughtUp`]
     /// follows (design §5.6).
     ///
     /// The old generation stays whole until that rename. A rebuild begins only once it is decided:

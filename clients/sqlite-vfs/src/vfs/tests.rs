@@ -13,12 +13,16 @@ use super::Ext;
 use super::File;
 use super::METHODS;
 use super::Role;
+use super::WalName;
 use super::c_open;
 use super::failed_open;
 use super::lost_page;
+use super::uwal;
 use crate::capture::FIRST_PAGE;
 use crate::capture::FRAME;
 use crate::codec::PAGE;
+use crate::codec::marker::SQLITE_MAGIC;
+use crate::codec::marker::mark;
 use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
 use crate::db::for_tests;
@@ -68,6 +72,7 @@ fn file_of(b: &Arc<Binding>, main: bool, inner: *const ffi::sqlite3_io_methods) 
             role,
         })),
         fail_sync: false,
+        wal_name: null_mut(),
         inner: ffi::sqlite3_file { pMethods: inner },
     }
 }
@@ -78,6 +83,7 @@ fn unopened() -> File {
         base: ffi::sqlite3_file { pMethods: null() },
         ext: null_mut(),
         fail_sync: false,
+        wal_name: null_mut(),
         inner: ffi::sqlite3_file { pMethods: null() },
     }
 }
@@ -198,6 +204,7 @@ fn every_file_entry_point_contains_a_panic() {
         },
         ext: null_mut(),
         fail_sync: true,
+        wal_name: null_mut(),
         inner: ffi::sqlite3_file {
             pMethods: &raw const STAND_IN,
         },
@@ -278,6 +285,7 @@ fn a_close_closes_the_unix_file_even_after_a_panic() {
         },
         ext: null_mut(),
         fail_sync: false,
+        wal_name: null_mut(),
         inner: ffi::sqlite3_file {
             pMethods: &raw const STAND_IN,
         },
@@ -314,25 +322,229 @@ fn a_failed_open_closes_the_unix_file_and_frees_its_state() {
     assert_eq!((answer, CLOSES.get()), (ffi::SQLITE_CANTOPEN, 1));
 }
 
-// A main db inside a generation directory opens only while bound: unbound, it is refused before
-// the "unix" VFS sees it.
-#[test]
-fn an_unbound_generation_db_is_refused() {
-    let name = std::ffi::CString::new(format!("/tmp/root/gen-{}/db", "ab".repeat(16))).unwrap();
-    let mut file = unopened();
-    let mut out: c_int = 0;
-    // SAFETY: a `File` to open, and a name that outlives the call.
-    let opened = unsafe {
-        c_open(
-            null_mut(),
-            name.as_ptr(),
-            (&raw mut file).cast(),
-            ffi::SQLITE_OPEN_MAIN_DB | ffi::SQLITE_OPEN_READWRITE,
-            &raw mut out,
+thread_local! {
+    /// The bytes of a stand-in "unix" file on this thread (`DISK_FILE`).
+    static DISK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The calls of the stand-in's `xFetch` on this thread.
+    static FETCHES: Cell<usize> = const { Cell::new(0) };
+}
+
+extern "C" fn disk_read(
+    _file: *mut ffi::sqlite3_file,
+    buf: *mut c_void,
+    amt: c_int,
+    off: ffi::sqlite3_int64,
+) -> c_int {
+    let (amt, off) = (usize::try_from(amt).unwrap(), usize::try_from(off).unwrap());
+    // SAFETY: the VFS passes `amt` writable bytes at `buf`.
+    let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), amt) };
+    DISK.with_borrow(|disk| {
+        let have = disk.len().saturating_sub(off).min(amt);
+        out[..have].copy_from_slice(&disk[off..off.saturating_add(have)]);
+        out[have..].fill(0);
+        if have < amt {
+            ffi::SQLITE_IOERR_SHORT_READ
+        } else {
+            ffi::SQLITE_OK
+        }
+    })
+}
+
+extern "C" fn disk_write(
+    _file: *mut ffi::sqlite3_file,
+    buf: *const c_void,
+    amt: c_int,
+    off: ffi::sqlite3_int64,
+) -> c_int {
+    let (amt, off) = (usize::try_from(amt).unwrap(), usize::try_from(off).unwrap());
+    // SAFETY: the VFS passes `amt` readable bytes at `buf`.
+    let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), amt) };
+    DISK.with_borrow_mut(|disk| {
+        let end = off.saturating_add(amt);
+        if disk.len() < end {
+            disk.resize(end, 0);
+        }
+        disk[off..end].copy_from_slice(data);
+    });
+    ffi::SQLITE_OK
+}
+
+extern "C" fn disk_fetch(
+    _file: *mut ffi::sqlite3_file,
+    _off: ffi::sqlite3_int64,
+    _amt: c_int,
+    pp: *mut *mut c_void,
+) -> c_int {
+    FETCHES.set(FETCHES.get().saturating_add(1));
+    // SAFETY: the VFS passes `pp` writable.
+    unsafe { *pp = NonNull::dangling().as_ptr() };
+    ffi::SQLITE_OK
+}
+
+/// A stand-in "unix" file over [`DISK`]: it reads, writes and maps.
+static DISK_FILE: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
+    iVersion: 3,
+    xClose: Some(stand_in_close),
+    xRead: Some(disk_read),
+    xWrite: Some(disk_write),
+    xTruncate: None,
+    xSync: None,
+    xFileSize: None,
+    xLock: None,
+    xUnlock: None,
+    xCheckReservedLock: None,
+    xFileControl: None,
+    xSectorSize: None,
+    xDeviceCharacteristics: None,
+    xShmMap: None,
+    xShmLock: None,
+    xShmBarrier: None,
+    xShmUnmap: None,
+    xFetch: Some(disk_fetch),
+    xUnfetch: None,
+};
+
+/// `xRead` of `amt` bytes at `off` from an open file of this VFS: its answer and the bytes.
+fn read(f: *mut ffi::sqlite3_file, amt: usize, off: i64) -> (c_int, Vec<u8>) {
+    let mut buf = vec![0u8; amt];
+    // SAFETY: the tests pass open files of this VFS; `buf` is `amt` writable bytes.
+    let rc = unsafe {
+        METHODS.xRead.unwrap()(
+            f,
+            buf.as_mut_ptr().cast(),
+            c_int::try_from(amt).unwrap(),
+            off,
         )
     };
-    assert_eq!(opened, ffi::SQLITE_CANTOPEN);
-    assert!(file.base.pMethods.is_null());
+    (rc, buf)
+}
+
+// Page 1 of a bound db reaches the disk with the generation's marker in place of SQLite's magic,
+// and reads back as the magic, whatever range a read or write covers. A db write that does not
+// carry the magic resets `local_damage`, nothing written.
+#[test]
+fn page_one_lands_on_disk_marked_and_reads_back_as_magic() {
+    let dir = TempDir::new("vfs-marker");
+    let b = for_tests(dir.path());
+    let lineage = b.handle.generation.lineage;
+    let mut main = file_of(&b, true, &raw const DISK_FILE);
+    let m = (&raw mut main).cast::<ffi::sqlite3_file>();
+    DISK.with_borrow_mut(Vec::clear);
+    // A checkpoint writes the db file.
+    b.lock().checkpoint = Some((std::time::Instant::now(), false));
+    let mut page = vec![7u8; PAGE];
+    page[..16].copy_from_slice(&SQLITE_MAGIC);
+    assert_eq!(write(m, &page, 0), ffi::SQLITE_OK);
+    let disk = DISK.with_borrow(Clone::clone);
+    assert_eq!(disk[..16], mark(lineage));
+    assert_eq!(disk[16..], page[16..]);
+    assert_eq!(read(m, PAGE, 0), (ffi::SQLITE_OK, page.clone()));
+    // SQLite reads the first 100 bytes at open, and any range is translated.
+    assert_eq!(read(m, 100, 0).1, page[..100]);
+    assert_eq!(read(m, 10, 4).1, page[4..14]);
+    assert_eq!(read(m, 8, 16).1, page[16..24]);
+    // A write of part of the header.
+    assert_eq!(write(m, &SQLITE_MAGIC[6..12], 6), ffi::SQLITE_OK);
+    assert_eq!(DISK.with_borrow(|d| d[..16].to_vec()), mark(lineage));
+    // Pages past page 1 pass unchanged.
+    assert_eq!(write(m, &[9u8; PAGE], PAGE as i64), ffi::SQLITE_OK);
+    assert_eq!(read(m, PAGE, PAGE as i64).1, vec![9u8; PAGE]);
+    assert!(b.reset_kind().is_none());
+    // A page 1 without SQLite's magic is no page 1 SQLite wrote.
+    assert_eq!(write(m, &[1u8; PAGE], 0), ffi::SQLITE_IOERR_WRITE);
+    assert_eq!(DISK.with_borrow(|d| d[..16].to_vec()), mark(lineage));
+    assert_eq!(b.reset_kind(), Some(ResetKind::LocalDamage));
+    // SAFETY: the `Box` `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(main.ext) });
+}
+
+// A read that finds another marker on disk (another generation's db file, or SQLite's own magic
+// written outside the extension) resets `local_damage` with SQLITE_IOERR_READ (266).
+#[test]
+fn a_foreign_marker_resets_local_damage() {
+    let dir = TempDir::new("vfs-foreign");
+    let b = for_tests(dir.path());
+    let mut main = file_of(&b, true, &raw const DISK_FILE);
+    let m = (&raw mut main).cast::<ffi::sqlite3_file>();
+    let mut page = vec![0u8; PAGE];
+    page[..16].copy_from_slice(&SQLITE_MAGIC);
+    DISK.with_borrow_mut(|d| *d = page.clone());
+    let (rc, buf) = read(m, PAGE, 0);
+    assert_eq!(rc, ffi::SQLITE_IOERR_READ);
+    assert_eq!(rc, 266);
+    assert_eq!(buf, page, "the bytes read are left as found");
+    assert_eq!(b.reset_kind(), Some(ResetKind::LocalDamage));
+    // SAFETY: the `Box` `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(main.ext) });
+}
+
+// `xFetch` maps nothing over bytes 0..16 of a bound db (SQLite then reads the page through
+// `xRead`), and passes every other range, and every unbound file, to "unix".
+#[test]
+fn fetch_maps_nothing_over_page_one() {
+    let dir = TempDir::new("vfs-fetch");
+    let b = for_tests(dir.path());
+    let mut main = file_of(&b, true, &raw const DISK_FILE);
+    let m = (&raw mut main).cast::<ffi::sqlite3_file>();
+    let fetch = |f: *mut ffi::sqlite3_file, off: i64| {
+        let mut p: *mut c_void = null_mut();
+        // SAFETY: an open file of this VFS, and a writable out-pointer.
+        let rc = unsafe { METHODS.xFetch.unwrap()(f, off, 4096, &raw mut p) };
+        (rc, p.is_null())
+    };
+    FETCHES.set(0);
+    assert_eq!(fetch(m, 0), (ffi::SQLITE_OK, true));
+    assert_eq!(fetch(m, 15), (ffi::SQLITE_OK, true));
+    assert_eq!(FETCHES.get(), 0);
+    assert_eq!(fetch(m, 4096), (ffi::SQLITE_OK, false));
+    assert_eq!(FETCHES.get(), 1);
+    let mut plain = File {
+        base: ffi::sqlite3_file {
+            pMethods: &raw const METHODS,
+        },
+        ext: null_mut(),
+        fail_sync: false,
+        wal_name: null_mut(),
+        inner: ffi::sqlite3_file {
+            pMethods: &raw const DISK_FILE,
+        },
+    };
+    assert_eq!(
+        fetch((&raw mut plain).cast(), 0),
+        (ffi::SQLITE_OK, false),
+        "an unbound file maps as \"unix\" maps it"
+    );
+    assert_eq!(FETCHES.get(), 2);
+    // SAFETY: the `Box` `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(main.ext) });
+}
+
+// The WAL of a bound db is `db-uwal`; `xAccess` and `xDelete` map SQLite's `db-wal` to it only
+// for a bound db, and leave every other name as it is.
+#[test]
+fn the_wal_of_a_bound_db_is_db_uwal() {
+    let bound = |db: &str| db == "/c/gen-1/db";
+    assert_eq!(
+        uwal("/c/gen-1/db-wal", bound).as_deref(),
+        Some("/c/gen-1/db-uwal")
+    );
+    assert_eq!(uwal("/c/gen-2/db-wal", bound), None, "not bound");
+    assert_eq!(uwal("/c/gen-1/db-journal", bound), None);
+    assert_eq!(uwal("/c/gen-1/db", bound), None);
+    assert_eq!(uwal("/c/gen-1/db-shm", bound), None);
+    let dir = TempDir::new("vfs-uwal");
+    let b = for_tests(dir.path());
+    assert_eq!(
+        b.handle.generation.wal(),
+        b.handle.generation.dir.join("db-uwal")
+    );
+    // The name "unix" keeps: NUL-terminated, laid out as SQLite lays out its file names.
+    let name = WalName::new("/c/gen-1/db-uwal");
+    assert_eq!(&name.0[..4], &[0; 4]);
+    assert_eq!(&name.0[name.0.len() - 2..], &[0, 0]);
+    // SAFETY: `as_ptr` points at the NUL-terminated name inside `name`.
+    let c = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    assert_eq!(c.to_str().unwrap(), "/c/gen-1/db-uwal");
 }
 
 /// `xShmLock` of an open file of this VFS over the stand-in.

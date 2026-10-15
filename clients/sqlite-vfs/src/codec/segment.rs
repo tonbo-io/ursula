@@ -21,6 +21,10 @@
 //! | 3 ACK | `u64 acked`, `u64 acked_offset`, `u64 log_bytes` |
 //! | 4 BASE | `u64 position` |
 //!
+//! `supersedes` is the id of the generation directory (`gen-<id32>`) a new generation replaces:
+//! directories are named by a random id, not by the lineage, since a copy of a generation keeps its
+//! lineage.
+//!
 //! Positions start at 1, so a `base` or `acked` of 0 means nothing yet. The valid log is the
 //! longest prefix whose chain verifies and whose positions grow by one from the header's
 //! `first_position`. [`scan`] returns that prefix and says how the rest ends. A record that is cut
@@ -33,6 +37,7 @@ use ursula_headers::Offset;
 
 use super::Take;
 use crate::ids::Activation;
+use crate::ids::GenId;
 use crate::ids::Lineage;
 use crate::ids::Position;
 
@@ -56,8 +61,9 @@ pub struct SegmentHeader {
     pub lineage: Lineage,
     /// The position of the segment's first record, at least 1.
     pub first_position: Position,
-    /// The generation this one replaces, named by the first segment of a new generation.
-    pub supersedes: Option<Lineage>,
+    /// The id of the generation directory this one replaces, named by the first segment of a new
+    /// generation.
+    pub supersedes: Option<GenId>,
     pub cluster_id: String,
     pub stream_path: String,
     /// The stream's incarnation token.
@@ -195,9 +201,9 @@ pub fn encode_header(h: &SegmentHeader) -> Result<(Vec<u8>, u32), SegmentError> 
     out.extend_from_slice(&h.first_position.0.to_le_bytes());
     match h.supersedes {
         None => out.push(0),
-        Some(lineage) => {
+        Some(id) => {
             out.push(1);
-            out.extend_from_slice(&lineage.0);
+            out.extend_from_slice(&id.0);
         }
     }
     put_str(&mut out, "cluster_id", &h.cluster_id)?;
@@ -319,7 +325,7 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
     }
     let supersedes = match t.u8().ok_or_else(truncated)? {
         0 => None,
-        1 => Some(Lineage(t.array().ok_or_else(truncated)?)),
+        1 => Some(GenId(t.array().ok_or_else(truncated)?)),
         tag => return Err(SegmentError::SupersedesTag { tag }),
     };
     let cluster_id = take_str(&mut t, "cluster_id", len)?;

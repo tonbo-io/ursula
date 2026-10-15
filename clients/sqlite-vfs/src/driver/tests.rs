@@ -36,12 +36,15 @@ use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::CommitRecord;
 use crate::codec::frame::Decoded;
 use crate::codec::frame::Frame;
+use crate::codec::marker::SQLITE_MAGIC;
+use crate::codec::marker::mark;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::scan;
 use crate::generation::Root;
 use crate::generation::canonical_path;
 use crate::ids::Activation;
 use crate::ids::CommitId;
+use crate::ids::Lineage;
 use crate::ids::Position;
 use crate::model::Delivered;
 use crate::model::HistoryEvent;
@@ -78,6 +81,24 @@ fn spec(dir: &Path, activation: u8) -> OpenSpec {
         max_request_bytes: None,
         timeout_ms: 30_000,
     }
+}
+
+/// `page` as SQLite writes page 1: its magic in front.
+fn sqlite(mut page: Box<[u8; 4096]>) -> Box<[u8; 4096]> {
+    page[..16].copy_from_slice(&SQLITE_MAGIC);
+    page
+}
+
+/// `image` (pages as SQLite writes them) as the db file of a generation of `lineage` holds it:
+/// page 1 marked.
+fn on_disk(lineage: Lineage, mut image: Vec<u8>) -> Vec<u8> {
+    image[..16].copy_from_slice(&mark(lineage));
+    image
+}
+
+/// A one-page db file of a generation of `lineage` whose page 1 a commit wrote filled with `salt`.
+fn page_on_disk(lineage: Lineage, salt: u8) -> Vec<u8> {
+    on_disk(lineage, sqlite(Box::new([salt; 4096])).to_vec())
 }
 
 fn server() -> ModelServer {
@@ -310,7 +331,7 @@ impl World {
         };
         let record = CommitRecord {
             db_pages_after: 1,
-            pages: vec![(1, page)],
+            pages: vec![(1, sqlite(page))],
         };
         let frame = frame::encode_commit(id, &record).unwrap();
         if handle.admit(frame.len() as u64).is_err() {
@@ -702,7 +723,7 @@ fn a_takeover_fences_the_owner_which_keeps_its_tail_then_discards_it_and_rebuild
     // The rebuilt generation holds the stream's last page, and no pending tail.
     assert_eq!(bound.handle.pending_bytes(), 0);
     let db = std::fs::read(bound.handle.generation.db()).unwrap();
-    assert_eq!(db, vec![3u8; 4096]);
+    assert_eq!(db, page_on_disk(bound.handle.generation.lineage, 3));
     let ticket = w.sync(a2, bound.binding);
     w.run_for(1_000);
     assert_eq!(w.outcome(a2, ticket), Some(Ok(())));
@@ -732,7 +753,10 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     let bound = w.open(a2, spec(dir_a.path(), 3));
     // Caught up in place: the same generation, now holding the other owner's commit.
     assert_eq!(bound.handle.generation, generation);
-    assert_eq!(std::fs::read(generation.db()).unwrap(), vec![2u8; 4096]);
+    assert_eq!(
+        std::fs::read(generation.db()).unwrap(),
+        page_on_disk(generation.lineage, 2)
+    );
     let records = log_records(&generation.dir);
     assert!(records.contains(&RecordBody::Commit { frame: d1 }));
     let e1 = w.commit(a2, &bound, 3).unwrap();
@@ -989,7 +1013,7 @@ fn grow(server: &Arc<Mutex<ModelServer>>) {
         },
         &CommitRecord {
             db_pages_after: 1,
-            pages: vec![(1, Box::new([5; 4096]))],
+            pages: vec![(1, sqlite(Box::new([5; 4096])))],
         },
     )
     .unwrap();
@@ -1076,7 +1100,10 @@ fn commit_pages(w: &mut World, core: usize, bound: &Bound, size: u32, pgnos: &[u
             db_pages_after: size,
             pages: pgnos
                 .iter()
-                .map(|&p| (p, Box::new([salt.wrapping_add(p as u8); 4096])))
+                .map(|&p| {
+                    let page = Box::new([salt.wrapping_add(p as u8); 4096]);
+                    (p, if p == 1 { sqlite(page) } else { page })
+                })
                 .collect(),
         };
         let frame = frame::encode_commit(id, &record).unwrap();
@@ -1128,7 +1155,7 @@ fn an_open_below_retention_builds_from_the_snapshot_and_the_tail() {
     let bound_c = w.open(c, spec(full_dir.path(), 4));
     assert_eq!(
         std::fs::read(bound_c.handle.generation.db()).unwrap(),
-        expected
+        on_disk(bound_c.handle.generation.lineage, expected.clone())
     );
     let reads: Vec<_> = w.sent[sent_before..]
         .iter()
@@ -1153,7 +1180,7 @@ fn an_open_below_retention_builds_from_the_snapshot_and_the_tail() {
     );
     assert_eq!(
         std::fs::read(bound.handle.generation.db()).unwrap(),
-        expected
+        on_disk(bound.handle.generation.lineage, expected.clone())
     );
     // It streams from there: its next commit lands and synced() resolves.
     let e1 = w.commit(a2, &bound, 9).unwrap();
@@ -1195,7 +1222,7 @@ fn a_410_with_our_lineages_snapshot_past_the_durable_ack_rebuilds() {
     assert_eq!(w.stream_commits(), vec![c1]);
     assert_eq!(
         std::fs::read(bound.handle.generation.db()).unwrap(),
-        vec![1u8; 4096]
+        page_on_disk(bound.handle.generation.lineage, 1)
     );
 }
 
@@ -1234,7 +1261,7 @@ fn a_fresh_open_overtaken_by_a_snapshot_past_its_head_builds_from_it() {
     assert_eq!(expected.len(), 3 * 4096);
     assert_eq!(
         std::fs::read(bound_c.handle.generation.db()).unwrap(),
-        expected
+        on_disk(bound_c.handle.generation.lineage, expected)
     );
     // One HEAD for the open and one for the build: no restart loop.
     let heads = w.sent[..]
@@ -1253,7 +1280,7 @@ fn foreign_commit(server: &mut ModelServer, salt: u8) {
         },
         &CommitRecord {
             db_pages_after: 1,
-            pages: vec![(1, Box::new([salt; 4096]))],
+            pages: vec![(1, sqlite(Box::new([salt; 4096])))],
         },
     )
     .unwrap();
@@ -1384,7 +1411,7 @@ fn a_410_at_a_takeover_with_a_pending_commit_rebuilds_from_the_snapshot() {
     assert_ne!(bound.handle.generation.lineage, generation.lineage);
     assert_eq!(
         std::fs::read(bound.handle.generation.db()).unwrap(),
-        vec![3u8; 4096]
+        page_on_disk(bound.handle.generation.lineage, 3)
     );
     assert!(!w.stream_commits().contains(&pending));
     assert_eq!(bound.handle.pending_bytes(), 0);
@@ -1675,6 +1702,29 @@ fn an_unreadable_segment_header_is_local_setup() {
     assert!(matches!(*e, OpenError::LocalSetup(_)), "{e}");
 }
 
+// A db file that is not the generation's (plain SQLite copied over it) is refused before anything
+// is written or sent: `local_setup`, the files as they were (a later version salvages it).
+#[test]
+fn a_replaced_db_file_is_refused_and_kept() {
+    let (result, generation, _dir) = reopen_after(|_, generation| {
+        let page = sqlite(Box::new([0; 4096]));
+        std::fs::write(generation.join("db"), &page[..]).unwrap();
+    });
+    let e = kind(result);
+    assert!(
+        matches!(
+            &*e,
+            OpenError::LocalSetup(crate::open::LocalSetup::Replaced { found, .. })
+                if found[..] == SQLITE_MAGIC
+        ),
+        "{e}"
+    );
+    assert_eq!(
+        std::fs::read(generation.join("db")).unwrap()[..16],
+        SQLITE_MAGIC
+    );
+}
+
 #[test]
 fn a_reopen_of_a_retired_binding_takes_over_its_trusted_generation() {
     let (result, generation, _dir) = reopen_after(|_, _| {});
@@ -1757,7 +1807,7 @@ fn the_runtime_opens_replicates_and_waits_for_synced() {
     };
     let frame = frame::encode_commit(id, &CommitRecord {
         db_pages_after: 1,
-        pages: vec![(1, Box::new([7; 4096]))],
+        pages: vec![(1, sqlite(Box::new([7; 4096])))],
     })
     .unwrap();
     log.append(&RecordBody::Commit {
@@ -2063,7 +2113,10 @@ fn a_catch_up_larger_than_the_database_rebuilds() {
     // The frames outgrow A's one-page database: a rebuild rather than a catch-up in place.
     assert_ne!(bound.handle.generation, old);
     assert!(!old.dir.exists());
-    assert_eq!(std::fs::read(bound.handle.generation.db()).unwrap(), last);
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        on_disk(bound.handle.generation.lineage, last)
+    );
     let ticket = w.sync(a2, bound.binding);
     w.run_for(1_000);
     assert_eq!(w.outcome(a2, ticket), Some(Ok(())));

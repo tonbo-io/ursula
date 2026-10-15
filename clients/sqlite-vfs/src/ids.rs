@@ -1,5 +1,6 @@
-//! The VFS's own identifiers: a local generation's lineage, a host activation, a record's
-//! position in its log, and the commit id `(lineage, position)` that frames carry in the clear.
+//! The VFS's own identifiers: a local generation's lineage, a generation directory's id, a host
+//! activation, a record's position in its log, and the commit id `(lineage, position)` that frames
+//! carry in the clear.
 //! Protocol values (epochs, sequence numbers, offsets, incarnation tokens, digests) are
 //! `ursula_headers` types.
 
@@ -12,6 +13,37 @@ pub const URANDOM: &str = "/dev/urandom";
 /// 16 random bytes per local generation: tells one local history from another (design §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lineage(pub [u8; 16]);
+
+/// 16 random bytes per generation directory (`gen-<id32>`): a copy of a generation keeps its
+/// lineage in a directory of its own, so the directory is named by this id, and a generation's
+/// first log segment names the directory it supersedes by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GenId(pub [u8; 16]);
+
+impl GenId {
+    /// A fresh id from [`URANDOM`].
+    pub fn random() -> std::io::Result<GenId> {
+        random16().map(GenId)
+    }
+
+    /// 32 lowercase hex digits.
+    pub fn hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The id 32 hex digits spell, if they do.
+    pub fn parse_hex(s: &str) -> Option<GenId> {
+        if s.len() != 32 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (i, o) in out.iter_mut().enumerate() {
+            let at = i.checked_mul(2)?;
+            *o = u8::from_str_radix(s.get(at..at.checked_add(2)?)?, 16).ok()?;
+        }
+        Some(GenId(out))
+    }
+}
 
 /// 16 bytes per activation of a host, carried by CLAIM frames (design §4.8, §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,10 +69,20 @@ pub fn random16() -> std::io::Result<[u8; 16]> {
 
 #[cfg(test)]
 mod tests {
+    use super::GenId;
     use super::random16;
 
     #[test]
     fn random_identifiers_differ() {
         assert_ne!(random16().unwrap(), random16().unwrap());
+    }
+
+    #[test]
+    fn generation_ids_spell_as_32_hex_digits() {
+        let id = GenId([0xa5; 16]);
+        assert_eq!(id.hex(), "a5".repeat(16));
+        assert_eq!(GenId::parse_hex(&id.hex()), Some(id));
+        assert_eq!(GenId::parse_hex("a5"), None);
+        assert_eq!(GenId::parse_hex(&"zz".repeat(16)), None);
     }
 }

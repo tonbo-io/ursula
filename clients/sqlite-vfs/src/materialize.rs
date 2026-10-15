@@ -2,7 +2,9 @@
 //! log before any connection opens it.
 //!
 //! [`materialize`] runs at every open of a trusted generation: open the log (its torn tail cut),
-//! fsync it, delete the WAL and `-shm` unread, re-apply the COMMIT records after the latest BASE
+//! fsync it, check page 1 ([`page_one`]: a db file that is not this generation's is refused before
+//! anything is written), delete the WAL and `-shm` unread (and a `db-wal` or `db-journal` SQLite
+//! outside the extension may have left), re-apply the COMMIT records after the latest BASE
 //! (final images per batch, cutting first, so a crash midway replays again), fsync the db, append
 //! a BASE. By L3 the db holds every commit up to the BASE and otherwise only pages from records
 //! after it, so the result is exactly the state at the end of the valid log; the WAL plays no part.
@@ -12,11 +14,13 @@
 
 use std::fs::File;
 use std::fs::{self};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 
 use ursula_headers::Offset;
 
+use crate::applier::ApplyError;
 use crate::applier::PageBatch;
 use crate::codec::PAGE;
 use crate::codec::frame::Decoded;
@@ -25,8 +29,13 @@ use crate::codec::frame::FrameError;
 use crate::codec::frame::RecordReader;
 use crate::codec::frame::decode;
 use crate::codec::frame::encode;
+use crate::codec::marker;
+use crate::codec::marker::MarkerError;
+use crate::codec::marker::PageOne;
+use crate::codec::marker::page_one;
 use crate::codec::segment::RecordBody;
 use crate::generation::Generation;
+use crate::ids::Lineage;
 use crate::ids::Position;
 use crate::replog::Log;
 use crate::replog::LogError;
@@ -87,11 +96,48 @@ pub(crate) enum LocalError {
     OwnPending { first: Position },
     #[error("encoding a frame to catch up: {0}")]
     Encode(#[source] FrameError),
+    #[error("{}: {source}", .db.display())]
+    PageOne {
+        db: PathBuf,
+        #[source]
+        source: MarkerError,
+    },
+    /// Page 1 of the db file is not this generation's: the file was replaced (a copy, or SQLite
+    /// outside the extension), or cut short.
+    #[error(
+        "{}: page 1 holds \"{}\", not this generation's marker: the db file was replaced",
+        .db.display(),
+        .found.escape_ascii()
+    )]
+    Replaced { db: PathBuf, found: Vec<u8> },
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> LocalError {
     let path = path.to_owned();
     move |source| LocalError::Io { op, path, source }
+}
+
+/// Checks page 1 of the db file `db` of a generation of `lineage`, before anything writes it: the
+/// generation's marker, or an empty file whose log holds no commit the db should hold already
+/// (`holds_commit`). Anything else is [`LocalError::Replaced`].
+fn check_page_one(
+    db: &File,
+    db_path: &Path,
+    lineage: Lineage,
+    holds_commit: bool,
+) -> Result<(), LocalError> {
+    let len = db.metadata().map_err(io("stat", db_path))?.len();
+    let mut head = [0u8; marker::LEN];
+    let n = usize::try_from(len.min(marker::LEN as u64)).unwrap_or(marker::LEN);
+    let read = head.get_mut(..n).unwrap_or_default();
+    db.read_exact_at(read, 0).map_err(io("read", db_path))?;
+    match page_one(read, len, lineage, holds_commit) {
+        PageOne::Marked | PageOne::Uninitialized => Ok(()),
+        PageOne::Foreign { found } => Err(LocalError::Replaced {
+            db: db_path.to_owned(),
+            found,
+        }),
+    }
 }
 
 /// A materialized generation: its log open for appends and its db file.
@@ -116,8 +162,23 @@ pub(crate) struct ForeignFrame {
 pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
     let (mut log, recovered) = Log::open(&g.log_dir())?;
     log.sync()?;
+    let db_path = g.db();
+    let db = File::options()
+        .read(true)
+        .write(true)
+        .open(&db_path)
+        .map_err(io("open", &db_path))?;
+    // A BASE record is written only once the db file holds a commit, and the latest one is never
+    // trimmed (its position is above the base it names). A commit after it is applied below.
+    let holds_commit = recovered.records.iter().any(|r| match r.body {
+        RecordBody::Base { .. } => true,
+        RecordBody::Commit { .. } => r.position <= recovered.base,
+        RecordBody::Claim { .. } | RecordBody::Ack { .. } => false,
+    });
+    check_page_one(&db, &db_path, g.lineage, holds_commit)?;
     let mut removed = false;
-    for path in [g.wal(), g.shm()] {
+    let [stray_wal, journal] = g.strays();
+    for path in [g.wal(), g.shm(), stray_wal, journal] {
         match fs::remove_file(&path) {
             Ok(()) => removed = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -127,17 +188,11 @@ pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
     if removed {
         sync_dir(&g.dir).map_err(io("fsync", &g.dir))?;
     }
-    let db_path = g.db();
-    let db = File::options()
-        .read(true)
-        .write(true)
-        .open(&db_path)
-        .map_err(io("open", &db_path))?;
     let commits = recovered.after_base().filter_map(|r| match &r.body {
         RecordBody::Commit { frame } => Some((r.position, frame.as_slice())),
         _ => None,
     });
-    let applied = apply(&db, &db_path, commits)?;
+    let applied = apply(&db, &db_path, g.lineage, commits)?;
     let mut m = Materialized {
         generation: g.clone(),
         log,
@@ -183,6 +238,7 @@ pub(crate) fn catch_up_files(
     let Some(last) = frames.last() else {
         return Ok(());
     };
+    let lineage = log.lineage();
     let mut log_bytes = log.log_bytes();
     let mut logged = Vec::new();
     for f in frames {
@@ -215,7 +271,7 @@ pub(crate) fn catch_up_files(
         })
         .zip(logged)
         .map(|(compressed, position)| (position, compressed));
-    if apply_compressed(db, db_path, commits)? {
+    if apply_compressed(db, db_path, lineage, commits)? {
         base_files(log, db, db_path)?;
     }
     Ok(())
@@ -236,10 +292,12 @@ fn base_files(log: &mut Log, db: &File, db_path: &Path) -> Result<(), LocalError
     Ok(())
 }
 
-/// Applies COMMIT records (whole `USQ2` frames) in order. Returns whether there was any.
+/// Applies COMMIT records (whole `USQ2` frames) in order to the db file of a generation of
+/// `lineage`. Returns whether there was any.
 fn apply<'a>(
     db: &File,
     db_path: &Path,
+    lineage: Lineage,
     commits: impl Iterator<Item = (Position, &'a [u8])>,
 ) -> Result<bool, LocalError> {
     let compressed = commits.map(|(position, frame)| {
@@ -252,14 +310,14 @@ fn apply<'a>(
             Err(source) => Err(LocalError::Frame { position, source }),
         }
     });
-    let mut batch: PageBatch<Box<[u8; PAGE]>> = PageBatch::default();
+    let mut batch = PageBatch::default();
     let mut any = false;
     for item in compressed {
         let (position, compressed) = item?;
-        add(&mut batch, db, db_path, position, &compressed)?;
+        add(&mut batch, db, db_path, lineage, position, &compressed)?;
         any = true;
     }
-    flush(&mut batch, db, db_path)?;
+    flush(&mut batch, db, db_path, lineage)?;
     Ok(any)
 }
 
@@ -267,23 +325,25 @@ fn apply<'a>(
 fn apply_compressed<'a>(
     db: &File,
     db_path: &Path,
+    lineage: Lineage,
     commits: impl Iterator<Item = (Position, &'a [u8])>,
 ) -> Result<bool, LocalError> {
-    let mut batch: PageBatch<Box<[u8; PAGE]>> = PageBatch::default();
+    let mut batch = PageBatch::default();
     let mut any = false;
     for (position, compressed) in commits {
-        add(&mut batch, db, db_path, position, compressed)?;
+        add(&mut batch, db, db_path, lineage, position, compressed)?;
         any = true;
     }
-    flush(&mut batch, db, db_path)?;
+    flush(&mut batch, db, db_path, lineage)?;
     Ok(any)
 }
 
 /// Adds one commit to the batch, writing the batch out whenever it holds [`BATCH_PAGES`] pages.
 fn add(
-    batch: &mut PageBatch<Box<[u8; PAGE]>>,
+    batch: &mut PageBatch,
     db: &File,
     db_path: &Path,
+    lineage: Lineage,
     position: Position,
     compressed: &[u8],
 ) -> Result<(), LocalError> {
@@ -297,19 +357,24 @@ fn add(
         };
         batch.page(pgno, image);
         if batch.len() >= BATCH_PAGES {
-            flush(batch, db, db_path)?;
+            flush(batch, db, db_path, lineage)?;
         }
     }
 }
 
 fn flush(
-    batch: &mut PageBatch<Box<[u8; PAGE]>>,
+    batch: &mut PageBatch,
     db: &File,
     db_path: &Path,
+    lineage: Lineage,
 ) -> Result<(), LocalError> {
-    batch
-        .flush(db, page_written)
-        .map_err(io("replay into", db_path))
+    batch.flush(db, lineage, page_written).map_err(|e| match e {
+        ApplyError::Io(source) => io("replay into", db_path)(source),
+        ApplyError::PageOne(source) => LocalError::PageOne {
+            db: db_path.to_owned(),
+            source,
+        },
+    })
 }
 
 #[cfg(test)]
