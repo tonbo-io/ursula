@@ -6,11 +6,11 @@
 //! carries out, in order. It does no I/O and draws no randomness: backoff jitter is the driver's
 //! (an [`Action::Timer`] names the earliest time and the jitter span), and every request goes out
 //! through an [`Action::Send`] whose answer comes back as an [`Event::Answer`] with its
-//! [`RequestId`]. The driver makes an [`Action::Persist`] of a CLAIM durable before it carries out
-//! the actions that follow it, so a claim frame whose activation is in the log is always ours.
+//! [`RequestId`]. The driver makes an [`Action::PersistClaim`] durable before it carries out the
+//! actions that follow it, so a claim frame whose activation is in the log is always ours.
 //!
-//! At most one request is outstanding at a time, and an answer whose id is not the outstanding
-//! one (a late duplicate, an earlier attempt) is ignored.
+//! At most one append or claim is outstanding at a time, beside at most one `synced()` probe, and
+//! an answer whose id is not an outstanding one (a late duplicate, an earlier attempt) is ignored.
 //!
 //! Left for later milestones: re-key while bound (M2), resume (M4), re-cut and PART sending (M3),
 //! the provisional deferred claim (M2) and the `410` snapshot rule (M2). In M1 a `410` in a
@@ -165,7 +165,8 @@ pub(crate) enum Event {
     /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11).
     Boundary(Position),
     /// `synced()` with ticket `ticket`: `target` is the last logged position at the call. The
-    /// ticket waits for every commit at or below `target`, whatever record sits at `target`.
+    /// ticket waits for every commit at or below `target`, whatever record sits at `target`, so
+    /// the driver delivers `Logged(p)` before any `Sync` whose target is at or above `p`.
     Sync { ticket: u64, target: Position },
     /// Takeover: the driver carried out an [`Action::Apply`] or [`Action::Rebuild`]. Every record
     /// it logged is at or below `last`, and `last` is at or above the last position logged
@@ -713,6 +714,10 @@ fn activating(
     now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
+    if matches!(step, Step::CatchingUp(_)) && matches!(event, Event::Logged(_)) {
+        // The catch-up takes the next positions: a commit logged meanwhile breaks them.
+        return reset(ResetKind::Internal, actions);
+    }
     let event = match common_event(&mut ctx, event, actions) {
         Err(terminal) => return terminal.into(),
         Ok(None) => return Replicator::Activating { kind, step, ctx },
@@ -1259,9 +1264,14 @@ impl Stream {
             self.kick(now_ms, actions);
             return self.into();
         }
+        // The condition is the append slot's while it is busy: the probe leaves it alone.
+        let quiet = !matches!(self.work, Work::Idle);
         let ctx = &mut self.ctx;
         if link.hit(id) == Hit::Head {
-            if let Err(kind) = link.head_answer(exchange, now_ms, ctx, actions) {
+            let result = quietly(quiet, ctx, actions, |ctx, actions| {
+                link.head_answer(exchange, now_ms, ctx, actions)
+            });
+            if let Err(kind) = result {
                 return reset(kind, actions);
             }
             self.probe = Some(Probe { from, link });
@@ -1296,8 +1306,10 @@ impl Stream {
             // Retention passed our acknowledged tail: another owner moved the stream on.
             ReadDecision::Gone => reset(ResetKind::Fenced, actions),
             ReadDecision::Common(common) => {
-                if let Err(kind) = link.common(common, retry_after(exchange), now_ms, ctx, actions)
-                {
+                let result = quietly(quiet, ctx, actions, |ctx, actions| {
+                    link.common(common, retry_after(exchange), now_ms, ctx, actions)
+                });
+                if let Err(kind) = result {
                     return reset(kind, actions);
                 }
                 self.probe = Some(Probe { from, link });
@@ -1305,6 +1317,27 @@ impl Stream {
             }
         }
     }
+}
+
+/// Runs `f`, and when `quiet` keeps the condition it found: no change, no `Condition` action.
+fn quietly<R>(
+    quiet: bool,
+    ctx: &mut Ctx,
+    actions: &mut Vec<Action>,
+    f: impl FnOnce(&mut Ctx, &mut Vec<Action>) -> R,
+) -> R {
+    if !quiet {
+        return f(ctx, actions);
+    }
+    let condition = ctx.condition.clone();
+    let mut own = Vec::new();
+    let result = f(ctx, &mut own);
+    ctx.condition = condition;
+    actions.extend(
+        own.into_iter()
+            .filter(|action| !matches!(action, Action::Condition(_))),
+    );
+    result
 }
 
 fn streaming(

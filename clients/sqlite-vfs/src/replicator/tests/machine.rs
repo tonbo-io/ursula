@@ -581,3 +581,90 @@ fn a_ticket_on_a_claim_or_ack_position_waits_only_for_the_commits_below_it() {
         offset: off(37 + len),
     }));
 }
+
+/// Streaming with record 1 acknowledged and record 2's append blocked by a 402, and a ticket for
+/// record 1 whose probe is out.
+fn blocked_with_a_probe() -> (Harness, u64) {
+    let mut h = streaming(1);
+    let len = u64::try_from(h.last_request().body.len()).unwrap();
+    h.answer(&producer(&receipt(
+        Delivery::Applied,
+        1,
+        1,
+        37,
+        37 + len,
+        None,
+    )));
+    h.on(Event::Logged(commit(LINEAGE, 2, 1)));
+    h.on(Event::Sync {
+        ticket: 6,
+        target: Position(1),
+    });
+    let actions = h.answer(&RawAnswer::new(402));
+    assert_eq!(
+        condition(&actions),
+        Some(Some(Condition::Blocked(BlockedReason::PaymentRequired)))
+    );
+    assert_eq!(h.last_request().method, Method::Get, "{actions:?}");
+    (h, 37 + len)
+}
+
+#[test]
+fn a_probe_that_succeeds_beside_a_blocked_append_keeps_its_condition() {
+    let (mut h, tail) = blocked_with_a_probe();
+    let actions = h.answer(&read(&[], tail));
+    assert!(actions.contains(&Action::Synced { ticket: 6 }));
+    assert_eq!(condition(&actions), None, "{actions:?}");
+    assert_eq!(
+        h.replicator.ctx().unwrap().condition,
+        Some(Condition::Blocked(BlockedReason::PaymentRequired))
+    );
+}
+
+#[test]
+fn a_probe_that_fails_beside_a_blocked_append_keeps_its_condition() {
+    let (mut h, _) = blocked_with_a_probe();
+    let actions = h.answer(&RawAnswer::new(503));
+    assert_eq!(condition(&actions), None, "{actions:?}");
+    assert_eq!(
+        h.replicator.ctx().unwrap().condition,
+        Some(Condition::Blocked(BlockedReason::PaymentRequired))
+    );
+}
+
+#[test]
+fn a_probe_that_succeeds_while_idle_clears_the_condition() {
+    let mut h = streaming(0);
+    h.on(Event::Sync {
+        ticket: 1,
+        target: Position(0),
+    });
+    let actions = h.answer(&RawAnswer::new(503));
+    assert_eq!(condition(&actions), Some(Some(Condition::Retrying)));
+    let (at, jitter) = timer_of(&actions).unwrap();
+    h.tick_at(at + jitter);
+    let actions = h.answer(&read(&[], 37));
+    assert!(actions.contains(&Action::Synced { ticket: 1 }));
+    assert_eq!(condition(&actions), Some(None));
+}
+
+#[test]
+fn a_410_on_a_fresh_probe_fences() {
+    let mut h = streaming(0);
+    h.on(Event::Sync {
+        ticket: 1,
+        target: Position(0),
+    });
+    let actions = h.answer(&RawAnswer::new(410));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Fenced));
+}
+
+#[test]
+fn a_commit_logged_while_catching_up_resets_internal() {
+    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(Vec::new(), 0));
+    h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 500, 537, None)));
+    let actions = h.answer(&RawAnswer::new(410));
+    assert!(matches!(actions.first(), Some(Action::Rebuild { .. })));
+    let actions = h.on(Event::Logged(commit(LINEAGE, 1, 1)));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Internal));
+}

@@ -229,8 +229,9 @@ struct Instance {
     discards: Vec<Position>,
     /// A rebuild read the stream up to the next acknowledged offset.
     rebuilt: bool,
-    /// The world's expiry count when this owner's latest continuation claim went out.
-    claim_expiries: u64,
+    /// The clock passed idle expiry while this owner's continuation claim was outstanding and
+    /// already in the stream: the floor rose past its own claim, and it loses by design.
+    claim_expired: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -277,10 +278,6 @@ struct World {
     violations: Vec<String>,
     /// Another writer (a foreign append or claim) wrote on the stream.
     others: bool,
-    /// How often the clock passed idle expiry.
-    expiries: u64,
-    /// The event being processed met a continuation claim that expired while outstanding.
-    expired_claim: bool,
 }
 
 fn decode_all(bytes: &[u8]) -> Vec<(usize, usize, Option<Frame>)> {
@@ -327,8 +324,6 @@ impl World {
             acked_frames: HashMap::new(),
             violations: Vec::new(),
             others: false,
-            expiries: 0,
-            expired_claim: false,
         };
         world.takeover(false);
         world
@@ -374,7 +369,7 @@ impl World {
             calls: BTreeMap::new(),
             discards: Vec::new(),
             rebuilt: false,
-            claim_expiries: 0,
+            claim_expired: false,
         };
         (inst, actions)
     }
@@ -560,13 +555,6 @@ impl World {
             kind: ClaimKind::Takeover { .. },
             ..
         });
-        // A continuation whose own claim expired while outstanding loses by design (the floor
-        // rose past it): that fence is not false.
-        let expired_claim = matches!(self.owners[index].inst.replicator, Replicator::Activating {
-            kind: ClaimKind::Continuation { .. },
-            ..
-        }) && self.expiries > self.owners[index].inst.claim_expiries;
-        self.expired_claim = expired_claim;
         let now = self.now();
         let actions = self.owners[index].inst.replicator.on(event, now);
         self.process_in(index, actions, before, takeover);
@@ -665,7 +653,9 @@ impl World {
                     caught_up = true;
                 }
                 Action::Reset(kind @ (ResetKind::Fenced | ResetKind::Stale))
-                    if !self.others && self.owners.len() == 1 && !self.expired_claim =>
+                    if !self.others
+                        && self.owners.len() == 1
+                        && !self.owners[index].inst.claim_expired =>
                 {
                     self.violation(format!(
                         "property 13: a {kind:?} reset with no other writer on the stream"
@@ -700,9 +690,6 @@ impl World {
                     .any(|f| request.body.windows(f.len()).any(|w| w == &f[..]))
             {
                 self.violation("property 12: an append carries a caught-up frame".to_owned());
-            }
-            if write.seq == Seq::ZERO && streaming.is_some() {
-                self.owners[index].inst.claim_expiries = self.expiries;
             }
             if write.seq == Seq::ZERO
                 && let Some(own) = streaming
@@ -1072,7 +1059,20 @@ impl World {
             }),
             Op::Advance(ms) => self.server.advance(u64::from(ms)),
             Op::ExpireIdle => {
-                self.expiries += 1;
+                let stream = self.stream();
+                for owner in &mut self.owners {
+                    if let Replicator::Activating {
+                        kind: ClaimKind::Continuation { .. },
+                        step: Step::Claim { epoch, .. },
+                        ctx,
+                    } = &owner.inst.replicator
+                    {
+                        let claim = frame::encode_claim(*epoch, ctx.activation);
+                        if stream.windows(claim.len()).any(|w| w == &claim[..]) {
+                            owner.inst.claim_expired = true;
+                        }
+                    }
+                }
                 self.server.advance(IDLE_RETIREMENT_MS + 1);
             }
             Op::Tick(o) => {
