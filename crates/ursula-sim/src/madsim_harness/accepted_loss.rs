@@ -157,6 +157,7 @@ pub(super) struct Switched;
 impl Switched {
     pub(super) fn apply(controls: Controls) -> Self {
         set_defences(controls);
+        ursula_stream::sim_controls::reset_fired();
         Self
     }
 }
@@ -321,15 +322,11 @@ impl SlowTransport<'_> {
     }
 }
 
-/// Which defence against an unplanned leader a slow send exercised (N1).
+/// Whether a slow send held the leader-first order (N1): the plan went to
+/// its leader before any other member.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SlowSend {
-    /// The plan went to its leader before any other member.
     leader_first: bool,
-    /// A member took the plan while the plan's leader, without it, held an
-    /// entry above the point at or below the member's plan term: only the
-    /// members' log guard kept that member from electing it.
-    guard_needed: bool,
 }
 
 impl PlanTransport for SlowTransport<'_> {
@@ -380,7 +377,6 @@ async fn recover_group_slowly(
         }
         return (plan, SlowSend {
             leader_first: transport.leader_first,
-            guard_needed: false,
         });
     }
     let request = |member: &PlanMember, step: PlanStep| RecoveryPlanRequest {
@@ -391,7 +387,6 @@ async fn recover_group_slowly(
         expected: member.log,
     };
     let after = "recovery_plan_sending";
-    let mut guard_needed = false;
     for member in members
         .iter()
         .filter(|member| member.node_id != plan.leader)
@@ -400,30 +395,14 @@ async fn recover_group_slowly(
         // No plan term exists before the leader took the plan: the term a
         // hand-built body names is the one read on the member, which the
         // server's lower bound lets through.
-        let leader_term = member.log.current_term;
-        let follow = request(member, PlanStep::Follow { leader_term });
-        match cluster
+        let follow = request(member, PlanStep::Follow {
+            leader_term: member.log.current_term,
+        });
+        if let Err(error) = cluster
             .accept_recovery_plan(group, member.node_id, &follow)
             .await
         {
-            Ok(_) => {
-                // The member votes for the plan's leader above its plan term
-                // unless the leader's last entry is above the point at or
-                // below it: then only the log guard refuses the vote.
-                let leader = member_view(cluster, group, plan.leader).await;
-                guard_needed |= leader.plan.is_none()
-                    && leader
-                        .log
-                        .last_log_index
-                        .is_some_and(|index| index > plan.point)
-                    && leader
-                        .log
-                        .last_log_term
-                        .is_some_and(|term| term <= leader_term);
-            }
-            Err(error) => {
-                tracing::info!(%error, "{context}: group {group}: a member refused the plan");
-            }
+            tracing::info!(%error, "{context}: group {group}: a member refused the plan");
         }
     }
     watch_leaders(cluster, group, plan.point, pause, trace, after).await;
@@ -442,7 +421,6 @@ async fn recover_group_slowly(
     }
     (plan, SlowSend {
         leader_first: false,
-        guard_needed,
     })
 }
 
@@ -714,7 +692,9 @@ pub(super) async fn run_recovery_plan_inner(
         restarts,
         uncut_leader,
         leader_first: !slow_sends.is_empty() && slow_sends.iter().all(|sent| sent.leader_first),
-        guard_needed: slow_sends.iter().any(|sent| sent.guard_needed),
+        guard_refusals: ursula_stream::sim_controls::fired(
+            ursula_stream::sim_controls::Defence::PlanLogGuard,
+        ),
     });
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
@@ -852,12 +832,12 @@ mod tests {
     }
 
     /// Either defence of N1 alone keeps the survivor scenario passing, and
-    /// each run shows that the remaining one fired. Without the log guard,
-    /// the plan reaches its leader before every other member, so no member
-    /// holds the plan while its leader does not. With the plan sent leader
-    /// last, a member takes it while the plan's leader still holds an entry
-    /// above the point at or below the member's plan term, and only the log
-    /// guard refuses that leader the member's vote.
+    /// the runs show that the remaining one fired. Without the log guard,
+    /// every run sends the plan to its leader before every other member, so
+    /// no member holds the plan while its leader does not. With the plan
+    /// sent leader last, some run counts a vote that a member refused the
+    /// unplanned leader for its entry above the point at or below the plan
+    /// term, a refusal only the log guard makes.
     #[test]
     fn either_defence_against_an_unplanned_leader_alone_suffices() {
         let _guard = sim_test_guard();
@@ -880,9 +860,9 @@ mod tests {
                 .find_map(|event| match event {
                     crate::madsim_harness::SimEvent::RecoveryPlanVerified {
                         leader_first,
-                        guard_needed,
+                        guard_refusals,
                         ..
-                    } => Some((*leader_first, *guard_needed)),
+                    } => Some((*leader_first, *guard_refusals)),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("seed {seed} {controls:?}: no plan verified"))
@@ -894,13 +874,12 @@ mod tests {
                 leader_first,
                 "seed {seed}: a member took the plan before its leader"
             );
-            let (_, guard_needed) = verified(leader_last_only, seed);
-            guard_fired |= guard_needed;
+            let (_, guard_refusals) = verified(leader_last_only, seed);
+            guard_fired |= guard_refusals > 0;
         }
         assert!(
             guard_fired,
-            "no seed exposed a member to the unplanned leader: the log guard alone was never \
-             shown"
+            "no seed counted a vote the log guard refused: the guard alone was never shown"
         );
     }
 

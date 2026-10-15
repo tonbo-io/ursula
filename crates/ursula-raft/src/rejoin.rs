@@ -477,11 +477,15 @@ impl VoteGate {
                 leader_term,
                 ..
             } if *leader == candidate => {
-                let no_foreign_entry = candidate_last
-                    .is_none_or(|(index, term)| index <= *point || term > *leader_term)
-                    || ursula_stream::sim_controls::off(
-                        ursula_stream::sim_controls::Defence::PlanLogGuard,
-                    );
+                use ursula_stream::sim_controls::Defence;
+                let foreign_entry = candidate_last
+                    .is_some_and(|(index, term)| index > *point && term <= *leader_term);
+                let guard_off = ursula_stream::sim_controls::off(Defence::PlanLogGuard);
+                if candidate_term > *leader_term && foreign_entry && !guard_off {
+                    // Only the log guard refuses this vote.
+                    ursula_stream::sim_controls::note_fired(Defence::PlanLogGuard);
+                }
+                let no_foreign_entry = !foreign_entry || guard_off;
                 return if candidate_term > *leader_term && no_foreign_entry {
                     VoteScreen::Pass
                 } else {

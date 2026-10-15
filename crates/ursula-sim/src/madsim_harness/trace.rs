@@ -657,9 +657,8 @@ pub enum SimEvent {
     /// leader still held the stale suffix after the plan was sent: the
     /// members' log guard, not the cut, kept it from winning. In the
     /// survivor scenario, `leader_first` when every group's plan reached its
-    /// leader before any other member, and `guard_needed` when a member took
-    /// the plan while the plan's leader, without it, held an entry the log
-    /// guard refuses: only the guard kept that member from electing it.
+    /// leader before any other member. `guard_refusals` counts the votes the
+    /// members' log guard alone refused the plan's leader.
     RecoveryPlanVerified {
         leader: u64,
         cut: bool,
@@ -667,7 +666,7 @@ pub enum SimEvent {
         restarts: u64,
         uncut_leader: bool,
         leader_first: bool,
-        guard_needed: bool,
+        guard_refusals: u64,
     },
     LeaderReadObserved {
         phase: String,
