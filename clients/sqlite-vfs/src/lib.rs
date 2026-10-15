@@ -13,8 +13,8 @@
 //!   outcome. A database file of the extension opens only while bound. After the last connection
 //!   closes, the binding drains and retires (one `ursula_open` handed out retires too if no
 //!   connection opens it within a minute), and its root unlocks. A host reopens through
-//!   `ursula_open`, which takes a retiring binding back: a plain open of the path is refused while
-//!   the binding is not live.
+//!   `ursula_open`, which takes a retiring binding back: a plain open of the path is refused once
+//!   the binding retired.
 //! * `SELECT ursula_synced(path, timeout_ms)` resolves once every commit logged before the call is
 //!   acknowledged and a round trip that started after it found this owner still the owner.
 //! * `SELECT ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions, resets.

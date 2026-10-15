@@ -271,8 +271,11 @@ impl World {
         result.expect("the open never resolved")
     }
 
+    /// An open's binding, with a connection open on it as the VFS opens one.
     fn open(&mut self, core: usize, spec: OpenSpec) -> Bound {
-        self.open_result(core, spec).unwrap()
+        let bound = self.open_result(core, spec).unwrap();
+        assert!(bound.handle.connect());
+        bound
     }
 
     /// Commits a one-page transaction through the binding's log, as the commit path does.
@@ -353,9 +356,11 @@ impl World {
         ticket
     }
 
-    fn retire(&mut self, core: usize, binding: BindingId) {
+    /// The binding's connection closes: it drains, then retires.
+    fn retire(&mut self, core: usize, bound: &Bound) {
         let now = self.now;
-        let ios = self.c(core).retire_untaken(binding, now);
+        assert!(bound.handle.disconnect(), "the last connection");
+        let ios = self.c(core).retire(bound.binding, now);
         self.queue_ios(core, ios);
         self.run_for(1_000);
     }
@@ -635,7 +640,8 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     w.commit(a, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    let ios = w.c(a).retire_untaken(bound.binding, now);
+    assert!(bound.handle.disconnect());
+    let ios = w.c(a).retire(bound.binding, now);
     w.queue_ios(a, ios);
     w.run_for(1_000);
     let generation = bound.handle.generation.clone();
@@ -658,7 +664,8 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     assert_eq!(w.stream_commits().last(), Some(&e1));
     // Its ACKs name the caught-up records, so the next open trusts the log again.
     let now = w.now;
-    let ios = w.c(a2).retire_untaken(bound.binding, now);
+    assert!(bound.handle.disconnect());
+    let ios = w.c(a2).retire(bound.binding, now);
     w.queue_ios(a2, ios);
     w.run_for(1_000);
     drop(bound);
@@ -722,7 +729,7 @@ fn an_open_below_retention_is_refused_before_any_claim_with_its_files_kept() {
     let bound = w.open(a, spec(dir_a.path(), 1));
     w.commit(a, &bound, 1).unwrap();
     w.run_for(1_000);
-    w.retire(a, bound.binding);
+    w.retire(a, &bound);
     let generation = bound.handle.generation.clone();
     drop(bound);
     let b = w.core();
@@ -1031,7 +1038,8 @@ fn reopen_after(
     w.commit(c, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    let ios = w.c(c).retire_untaken(bound.binding, now);
+    assert!(bound.handle.disconnect());
+    let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
     assert!(
@@ -1233,15 +1241,15 @@ fn a_sync_ahead_of_its_logged_waits_for_it() {
 
 #[test]
 fn a_reopen_while_old_handles_live_is_in_use() {
-    // A binding that retired drained with no connection left (the VFS retires it only then): its
-    // root unlocks at once, though the registry may still hold the handle.
+    // A binding that retired drained with no connection left: its root unlocks at once, though
+    // the registry may still hold the handle.
     let dir = TempDir::new("driver-old-handles");
     let mut w = World::new();
     let c = w.core();
     let bound = w.open(c, spec(dir.path(), 1));
     w.commit(c, &bound, 1).unwrap();
     w.run_for(1_000);
-    w.retire(c, bound.binding);
+    w.retire(c, &bound);
     assert!(
         w.events(c)
             .iter()
@@ -1253,7 +1261,6 @@ fn a_reopen_while_old_handles_live_is_in_use() {
     drop(bound);
     // A reset binding's connections may still write its generation: its root stays locked until
     // the last of them closes.
-    assert!(reopened.handle.connect());
     let now = w.now;
     w.c(c2)
         .reset_binding(reopened.binding, ResetKind::LocalDamage, now);
@@ -1275,18 +1282,19 @@ fn a_binding_taken_back_before_its_retire_stays_live() {
     let mut w = World::new();
     let c = w.core();
     let bound = w.open(c, spec(dir.path(), 1));
-    bound.handle.retiring();
-    assert!(bound.handle.revive());
     let now = w.now;
+    // Closed, then handed out again by an open before the retire arrives.
+    assert!(bound.handle.disconnect());
+    assert_eq!(bound.handle.life(), Life::Retiring);
+    assert!(bound.handle.revive());
     let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
     assert_eq!(bound.handle.life(), Life::Live);
     assert!(bound.handle.holds_root());
-    // A connection that opens between its last close and the retire: the same.
+    // Closed, then opened again by a connection before the retire arrives: the same.
     assert!(bound.handle.connect());
     assert!(bound.handle.disconnect(), "the last connection");
-    assert_eq!(bound.handle.life(), Life::Retiring);
     assert!(bound.handle.connect(), "a retiring binding is taken back");
     let ios = w.c(c).retire(bound.binding, now);
     w.queue_ios(c, ios);
@@ -1300,10 +1308,7 @@ fn a_binding_taken_back_before_its_retire_stays_live() {
     let e = kind(w.open_result(c2, spec(dir.path(), 2)));
     assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
     // Its last connection closes: it drains, retires and unlocks the root.
-    assert!(bound.handle.disconnect());
-    let ios = w.c(c).retire(bound.binding, now);
-    w.queue_ios(c, ios);
-    w.run_for(1_000);
+    w.retire(c, &bound);
     assert_eq!(bound.handle.life(), Life::Retired);
     assert!(!bound.handle.holds_root());
     assert!(
@@ -1312,28 +1317,120 @@ fn a_binding_taken_back_before_its_retire_stays_live() {
     );
 }
 
-// A binding `ursula_open` handed out that no connection opens retires after `UNCONNECTED_MS`.
+// A bound result that no connection opens retires after `UNCONNECTED_MS`, unless an open hands it
+// out again meanwhile (which starts its own wait) or a connection opens it.
 #[test]
 fn a_binding_no_connection_opens_retires() {
     let dir = TempDir::new("driver-unconnected");
     let mut w = World::new();
     let c = w.core();
-    let bound = w.open(c, spec(dir.path(), 1));
+    let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
+    w.run_for(UNCONNECTED_MS / 2);
+    // Handed out again halfway: the first wait no longer retires it.
+    assert!(bound.handle.revive());
     let now = w.now;
     w.c(c).unconnected(bound.binding, now);
-    w.run_for(UNCONNECTED_MS - 1_000);
+    w.run_for(UNCONNECTED_MS / 2 + 1_000);
     assert_eq!(bound.handle.life(), Life::Live);
-    w.run_for(2_000);
+    w.run_for(UNCONNECTED_MS / 2);
     assert_eq!(bound.handle.life(), Life::Retired);
     assert!(!bound.handle.holds_root());
     // One a connection opened stays.
     let c2 = w.core();
     let other = w.open(c2, spec(dir.path(), 2));
-    assert!(other.handle.connect());
-    let now = w.now;
-    w.c(c2).unconnected(other.binding, now);
     w.run_for(2 * UNCONNECTED_MS);
     assert_eq!(other.handle.life(), Life::Live);
+}
+
+// The runtime: an open cancelled after its result arrived, untaken, retires and unlocks its root,
+// and so does one whose `wait_open` timed out as the result arrived, whichever came first.
+#[test]
+fn a_cancelled_or_timed_out_open_whose_result_arrived_retires() {
+    let server = Arc::new(Mutex::new(server()));
+    let model = Arc::clone(&server);
+    let transports: Transports = Arc::new(move |_url: &str| {
+        Arc::new(ModelTransport::new(Arc::clone(&model), PATH)) as Arc<dyn Transport>
+    });
+    let driver = Driver::start(transports, [8; 32]);
+    let dir = TempDir::new("driver-runtime-untaken");
+    // `None`: cancelled after the Opened event. `Some(ms)`: a `wait_open` of `ms` racing it.
+    for wait in [None, Some(0), Some(1), Some(3), Some(10), Some(30)] {
+        let open = driver.open(spec(dir.path(), 1)).unwrap();
+        let taken = match wait {
+            None => {
+                let mut cursor = driver.events(0, Duration::ZERO).1.saturating_sub(1);
+                let mut opened = false;
+                for _ in 0..200 {
+                    let (events, next) = driver.events(cursor, Duration::from_millis(50));
+                    cursor = next;
+                    opened |= events.iter().any(
+                        |e| matches!(e, DriverEvent::Opened { open: o, result: Ok(_) } if *o == open),
+                    );
+                    if opened {
+                        break;
+                    }
+                }
+                assert!(opened);
+                driver.cancel(open).unwrap();
+                None
+            }
+            Some(ms) => driver.wait_open(open, Duration::from_millis(ms)),
+        };
+        // A result the wait took is the caller's: it closes its (only) connection.
+        if let Some(Ok(bound)) = taken {
+            assert!(bound.handle.connect());
+            assert!(bound.handle.disconnect());
+            driver.retire(bound.binding).unwrap();
+        }
+        // Whatever happened, the root comes free for the next open.
+        let mut next = None;
+        for _ in 0..100 {
+            let again = driver.open(spec(dir.path(), 2)).unwrap();
+            match driver.wait_open(again, Duration::from_secs(10)) {
+                Some(Ok(bound)) => {
+                    next = Some(bound);
+                    break;
+                }
+                Some(Err(e)) if matches!(*e, OpenError::InUse { .. }) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => panic!("{wait:?}: {other:?}"),
+            }
+        }
+        let bound = next.unwrap_or_else(|| panic!("{wait:?}: the root stayed locked"));
+        assert!(bound.handle.connect());
+        assert!(bound.handle.disconnect());
+        driver.retire(bound.binding).unwrap();
+        drop(bound);
+        // Wait for that one to unlock too before the next round.
+        for _ in 0..100 {
+            if bound_is_free(&driver, dir.path()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Whether an open of the stream in `dir` binds now (and then retires it again).
+fn bound_is_free(driver: &Driver, dir: &Path) -> bool {
+    let open = driver.open(spec(dir, 3)).unwrap();
+    match driver.wait_open(open, Duration::from_secs(10)) {
+        Some(Ok(bound)) => {
+            assert!(bound.handle.connect());
+            assert!(bound.handle.disconnect());
+            driver.retire(bound.binding).unwrap();
+            let handle = bound.handle;
+            for _ in 0..100 {
+                if !handle.holds_root() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 #[test]
@@ -1359,7 +1456,7 @@ fn a_catch_up_larger_than_the_database_applies_in_place_until_snapshots_install(
     let bound = w.open(a, spec(dir_a.path(), 1));
     w.commit(a, &bound, 1).unwrap();
     w.run_for(1_000);
-    w.retire(a, bound.binding);
+    w.retire(a, &bound);
     let old = bound.handle.generation.clone();
     drop(bound);
     let b = w.core();
@@ -1410,7 +1507,7 @@ fn synced_on_an_idle_owner_resolves() {
     w.run_for(1_000);
     assert_eq!(w.outcome(c, ticket), Some(Ok(())));
     // And after a reopen, from the log alone.
-    w.retire(c, bound.binding);
+    w.retire(c, &bound);
     drop(bound);
     let c2 = w.core();
     let bound = w.open(c2, spec(dir.path(), 2));
@@ -1428,7 +1525,7 @@ fn an_open_timing_out_during_a_catch_up_keeps_the_root_until_the_job_returns() {
     let bound = w.open(a, spec(dir_a.path(), 1));
     w.commit(a, &bound, 1).unwrap();
     w.run_for(1_000);
-    w.retire(a, bound.binding);
+    w.retire(a, &bound);
     let generation = bound.handle.generation.clone();
     drop(bound);
     let b = w.core();
@@ -1476,7 +1573,7 @@ fn an_open_timing_out_during_a_catch_up_keeps_the_root_until_the_job_returns() {
     assert_eq!(w.outcome(a4, ticket), Some(Ok(())));
     assert_eq!(w.stream_commits().last(), Some(&frame));
     // The log is whole: it reopens with nothing lost.
-    w.retire(a4, bound.binding);
+    w.retire(a4, &bound);
     drop(bound);
     let records = log_records(&generation.dir);
     assert!(records.contains(&RecordBody::Commit { frame }));

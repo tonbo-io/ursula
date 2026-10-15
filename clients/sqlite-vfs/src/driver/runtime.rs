@@ -317,6 +317,8 @@ impl Driver {
             }
         };
         if let Some(Ok(bound)) = untaken {
+            // Nobody took it, so no connection holds it.
+            bound.handle.retiring();
             return self.command(Command::Retire {
                 binding: bound.binding,
             });

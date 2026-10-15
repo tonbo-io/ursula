@@ -166,6 +166,8 @@ pub(crate) enum Life {
 struct Lifecycle {
     life: Life,
     connections: usize,
+    /// How many times `ursula_open` handed the binding out again.
+    handouts: u64,
 }
 
 /// What status reports of a binding's replicator (design §9).
@@ -217,6 +219,7 @@ impl BindingHandle {
             life: Mutex::new(Lifecycle {
                 life: Life::Live,
                 connections: 0,
+                handouts: 0,
             }),
             replication: Mutex::new(Replication::default()),
             last_commit: AtomicU64::new(0),
@@ -354,16 +357,28 @@ impl BindingHandle {
         }
     }
 
-    /// `ursula_open` takes a retiring binding back: false once it retired.
+    /// `ursula_open` hands the binding out again, taking a retiring one back: false once it
+    /// retired.
     pub(crate) fn revive(&self) -> bool {
         let mut l = self.life_lock();
-        match l.life {
-            Life::Live => true,
-            Life::Retiring => {
-                l.life = Life::Live;
-                true
-            }
-            Life::Retired => false,
+        if l.life == Life::Retired {
+            return false;
+        }
+        l.life = Life::Live;
+        l.handouts = l.handouts.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn handouts(&self) -> u64 {
+        self.life_lock().handouts
+    }
+
+    /// No connection opened the binding since `ursula_open` handed it out for the `handouts`-th
+    /// time: it retires once drained. A hand-out since, or a connection, keeps it.
+    pub(crate) fn idle_retire(&self, handouts: u64) {
+        let mut l = self.life_lock();
+        if l.life == Life::Live && l.connections == 0 && l.handouts == handouts {
+            l.life = Life::Retiring;
         }
     }
 

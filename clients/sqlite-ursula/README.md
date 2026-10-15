@@ -19,7 +19,7 @@ db.prepare("INSERT INTO notes(body) VALUES (?)").run("hello"); // committed on t
 call("SELECT ursula_synced(?, 10000)", path); // in the stream
 ```
 
-After closing every connection, reopen through `ursula_open`: once its last connection closes, a database retires and its files unlock, and a plain `new DatabaseSync(path)` of the path is refused until `ursula_open` binds it again.
+After closing every connection, reopen through `ursula_open`: once its last connection closes, a database retires and its files unlock, and a plain `new DatabaseSync(path)` of the path is refused once it retired, until `ursula_open` binds it again.
 
 0.8 servers and streams do not read 0.7 data, and 0.8 does not read 0.7 caches.
 

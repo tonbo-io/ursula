@@ -190,7 +190,8 @@ struct Binding {
     max_pending_bytes: u64,
     /// Since when `ursula_open` handed the binding out with no connection open: it retires
     /// [`UNCONNECTED_MS`] later if none opened meanwhile.
-    unconnected_since: Option<u64>,
+    /// With the hand-outs the handle had counted then.
+    unconnected_since: Option<(u64, u64)>,
     /// The open failed while a disk job held the generation: the binding stays, its root locked
     /// and its replicator ignored, until the job returns, and the open resolves then.
     failing: Option<OpenError>,
@@ -268,7 +269,7 @@ impl Binding {
         }
         let unconnected = self
             .unconnected_since
-            .map(|since| since.saturating_add(UNCONNECTED_MS));
+            .map(|(since, _)| since.saturating_add(UNCONNECTED_MS));
         let mut at = [min(self.wake_at, unconnected), self.acks.flush_at];
         if let Stage::Opening {
             deadline_ms, local, ..
@@ -628,7 +629,7 @@ impl Core {
             }
         }
         if bound {
-            self.bind(binding);
+            self.bind(binding, now_ms);
         }
     }
 
@@ -861,10 +862,12 @@ impl Core {
 
     /// The replicator bound ([`Action::Bound`]): the open resolves with a handle that now holds
     /// the log and the root's lock.
-    fn bind(&mut self, binding: BindingId) {
+    fn bind(&mut self, binding: BindingId, now_ms: u64) {
         let Some(mut b) = self.bindings.remove(&binding) else {
             return;
         };
+        // A result nobody takes or cancels retires too.
+        b.unconnected_since = Some((now_ms, 0));
         let Stage::Opening {
             open,
             root,
@@ -1106,12 +1109,13 @@ impl Core {
         else {
             return;
         };
-        if let (Some(since), Stage::Bound { handle }) = (b.unconnected_since, &b.stage)
+        if let (Some((since, handouts)), Stage::Bound { handle }) = (b.unconnected_since, &b.stage)
             && (handle.connections() > 0 || now_ms >= since.saturating_add(UNCONNECTED_MS))
         {
             b.unconnected_since = None;
-            // `retiring` leaves a binding a connection opened alone.
-            handle.retiring();
+            // Leaves alone a binding a connection opened, or that `ursula_open` handed out again
+            // since (its own timer runs).
+            handle.idle_retire(handouts);
             self.settle(binding, now_ms);
             let Some(b) = self.bindings.get_mut(&binding) else {
                 return;
@@ -1269,7 +1273,8 @@ impl Core {
     /// root for good.
     pub(crate) fn unconnected(&mut self, binding: BindingId, now_ms: u64) {
         if let Some(b) = self.bindings.get_mut(&binding) {
-            b.unconnected_since = Some(now_ms);
+            let handouts = b.handle().map_or(0, |h| h.handouts());
+            b.unconnected_since = Some((now_ms, handouts));
         }
     }
 
