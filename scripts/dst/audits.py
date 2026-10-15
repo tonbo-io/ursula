@@ -520,6 +520,7 @@ EXPECTED_PR_FAMILIES = {
     "history-rewind-under-leader-churn",
     "stale-writers-after-restore",
     "recovery-plan-cut-under-restarts",
+    "recovery-plan-survivor-campaigns",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
@@ -528,6 +529,7 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "producer-repeats-exactly-once-extended",
     "history-rewind-under-leader-churn-extended",
     "recovery-plan-cut-under-restarts-extended",
+    "recovery-plan-survivor-campaigns-extended",
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199"}
 

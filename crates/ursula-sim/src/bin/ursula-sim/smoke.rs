@@ -318,6 +318,10 @@ fn generate_recovery_plan_cut_under_restarts(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanCutUnderRestarts)
 }
 
+fn generate_recovery_plan_survivor_campaigns(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanSurvivorCampaigns)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -359,6 +363,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 899,
         kind: "recovery-plan-cut-under-restarts",
         generate: generate_recovery_plan_cut_under_restarts,
+    },
+    SeedFamily {
+        name: "recovery-plan-survivor-campaigns",
+        start: 390,
+        end: 394,
+        kind: "recovery-plan-survivor-campaigns",
+        generate: generate_recovery_plan_survivor_campaigns,
+    },
+    SeedFamily {
+        name: "recovery-plan-survivor-campaigns-extended",
+        start: 900,
+        end: 919,
+        kind: "recovery-plan-survivor-campaigns",
+        generate: generate_recovery_plan_survivor_campaigns,
     },
     SeedFamily {
         name: "history-rewind-under-leader-churn-extended",

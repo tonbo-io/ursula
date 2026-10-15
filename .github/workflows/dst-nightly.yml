@@ -36,6 +36,9 @@ jobs:
             > target/dst-nondeterminism-report.md
           python3 -m scripts.dst seed-report
 
+      - name: Run DST negative controls
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib negative_control
+
       - name: Run nightly madsim seed sweep
         run: |
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
@@ -55,7 +58,9 @@ jobs:
             --seed-family history-rewind-under-leader-churn-extended \
             --seed-family stale-writers-after-restore \
             --seed-family recovery-plan-cut-under-restarts \
-            --seed-family recovery-plan-cut-under-restarts-extended
+            --seed-family recovery-plan-cut-under-restarts-extended \
+            --seed-family recovery-plan-survivor-campaigns \
+            --seed-family recovery-plan-survivor-campaigns-extended
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

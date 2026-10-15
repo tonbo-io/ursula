@@ -14,7 +14,8 @@ use super::ThreeNodeRaftSim;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
 use super::accepted_loss::Controls as RecoveryPlanControls;
-use super::accepted_loss::run_recovery_plan_cut_inner;
+use super::accepted_loss::Shape as RecoveryPlanShape;
+use super::accepted_loss::run_recovery_plan_inner;
 use super::cold_read_delay_ms_from_fault_plan;
 use super::cold_read_truncate_len_from_fault_plan;
 use super::cold_write_delay_ms_from_fault_plan;
@@ -264,9 +265,11 @@ impl ThreeNodeRaftSim {
             SimScenario::HistoryRewindUnderLeaderChurn | SimScenario::StaleWritersAfterRestore => {
                 Self::run_history_report(config, scenario)
             }
-            SimScenario::RecoveryPlanCutUnderRestarts => {
+            SimScenario::RecoveryPlanCutUnderRestarts
+            | SimScenario::RecoveryPlanSurvivorCampaigns => {
                 Self::run_recovery_plan_with_controls_report(
                     config,
+                    scenario,
                     RecoveryPlanControls::default(),
                 )
             }
@@ -281,16 +284,21 @@ impl ThreeNodeRaftSim {
         Self::run_history_with_controls_report(config, scenario, HistoryControls::default())
     }
 
-    /// Runs the recovery-plan scenario (#581 section 4.5) with `controls`.
+    /// Runs a recovery-plan scenario (#581 section 4.5) with `controls`.
     pub(super) fn run_recovery_plan_with_controls_report(
         config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
         controls: RecoveryPlanControls,
     ) -> SimReport {
         let seed = config.seed;
+        let shape = match scenario {
+            SimScenario::RecoveryPlanSurvivorCampaigns => RecoveryPlanShape::SurvivorCampaigns,
+            _ => RecoveryPlanShape::CutUnderRestarts,
+        };
         report_of(
-            SimScenario::RecoveryPlanCutUnderRestarts,
+            scenario,
             seed,
-            run_recovery_plan_cut_inner(config, controls),
+            run_recovery_plan_inner(config, shape, controls),
         )
     }
 

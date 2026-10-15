@@ -160,6 +160,7 @@ pub enum SimScenario {
     HistoryRewindUnderLeaderChurn,
     StaleWritersAfterRestore,
     RecoveryPlanCutUnderRestarts,
+    RecoveryPlanSurvivorCampaigns,
 }
 
 #[derive(Clone)]
@@ -206,6 +207,7 @@ impl SimScenario {
             Self::HistoryRewindUnderLeaderChurn => "history-rewind-under-leader-churn",
             Self::StaleWritersAfterRestore => "stale-writers-after-restore",
             Self::RecoveryPlanCutUnderRestarts => "recovery-plan-cut-under-restarts",
+            Self::RecoveryPlanSurvivorCampaigns => "recovery-plan-survivor-campaigns",
         }
     }
 }

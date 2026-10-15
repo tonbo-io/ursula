@@ -134,6 +134,11 @@ jobs:
       - name: Test Raft units under madsim
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib
 
+      # Each negative control switches off exactly one defence and asserts
+      # that its scenario then fails the invariant the defence keeps.
+      - name: Run DST negative controls
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib negative_control
+
       - name: Run madsim smoke corpus and PR seed set
         run: |
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
@@ -149,7 +154,8 @@ jobs:
             --seed-family idle-expiry-cannot-reopen-an-epoch \
             --seed-family history-rewind-under-leader-churn \
             --seed-family stale-writers-after-restore \
-            --seed-family recovery-plan-cut-under-restarts
+            --seed-family recovery-plan-cut-under-restarts \
+            --seed-family recovery-plan-survivor-campaigns
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json

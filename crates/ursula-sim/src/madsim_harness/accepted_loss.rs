@@ -14,13 +14,28 @@
 //! `A`'s uncommitted write, which the lost history may have overwritten,
 //! and every replica applies the plan's history event.
 //!
-//! [`Controls::DEFERRED_CUT`] runs the cut as before the review: at the
-//! member's next start, with members voting for the uncut leader. `A` then
-//! wins with its stale entry and commits it.
+//! Invariant `recovery_plan_never_elects_an_unplanned_leader` (scenario
+//! `recovery-plan-survivor-campaigns`, N1 of the second #581 review): the
+//! same quorum loss, but the tool sends the plan slowly, pausing at least
+//! one election timeout before each replica, while `A`, the lagging open
+//! survivor, campaigns all along. Until the plan is satisfied, no replica
+//! leads without holding the plan.
+//!
+//! Negative controls, each switching off one defence:
+//!
+//! - [`Controls::DEFERRED_CUT`] runs the cut as before the first review: at
+//!   the member's next start. `A` then wins with its stale entry and
+//!   commits it.
+//! - [`Controls::LEADER_LAST`] sends the plan as the tool did before the
+//!   second review: to the members first, without the leader's plan term,
+//!   and to the leader last. A member that took the plan elects `A` before
+//!   `A` took it, and `A` leads without the plan.
 
 use std::time::Duration;
 
 use ursula_config::WalFsync;
+use ursula_proto::admin::PlanStep;
+use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::GroupEngine;
@@ -33,18 +48,23 @@ use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
 use super::journal_cluster::JOURNAL_GROUPS;
 use super::journal_cluster::JournalCluster;
+use super::journal_cluster::MemberView;
 use super::journal_cluster::NODES;
 use super::journal_cluster::group_placement;
 use super::journal_cluster::group_stream;
 use super::journal_cluster::lead_every_group;
 use super::journal_cluster::leader_by_state;
+use super::journal_cluster::member_view;
 use super::journal_cluster::metrics;
 use super::journal_cluster::recover_group;
+use super::journal_cluster::recovery_plan;
 use super::journal_cluster::wait_leader;
 use super::journal_cluster::wait_plan_satisfied;
 use super::recovery_wiring::RECOVERY_STALL_AFTER;
 
 pub(super) const CUT_INVARIANT: &str = "accepted_loss_never_applies_a_stale_entry";
+pub(super) const UNPLANNED_LEADER_INVARIANT: &str =
+    "recovery_plan_never_elects_an_unplanned_leader";
 
 /// The write the cut-off leader holds uncommitted.
 const STALE: &[u8] = b"stale-uncommitted;";
@@ -53,14 +73,33 @@ const STALE: &[u8] = b"stale-uncommitted;";
 /// default, with every defence on; only tests construct the others.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Controls {
-    /// The cut waits for each member's next start, and members vote for the
-    /// plan's leader with its log uncut, as before the #581 review.
+    /// The cut waits for each member's next start, as before the #581
+    /// review.
     deferred_cut: bool,
+    /// The tool sends the plan to the members first, without a plan term,
+    /// and to the leader last, as before the second #581 review.
+    leader_last: bool,
 }
 
 #[cfg(test)]
 impl Controls {
-    pub(super) const DEFERRED_CUT: Self = Self { deferred_cut: true };
+    pub(super) const DEFERRED_CUT: Self = Self {
+        deferred_cut: true,
+        leader_last: false,
+    };
+    pub(super) const LEADER_LAST: Self = Self {
+        deferred_cut: false,
+        leader_last: true,
+    };
+}
+
+/// Which scenario of the family runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Shape {
+    /// The plan is sent at once, and every member restarts after it.
+    CutUnderRestarts,
+    /// The plan is sent slowly while the open survivor campaigns.
+    SurvivorCampaigns,
 }
 
 /// The defences [`Controls`] turned off for this simulation, until dropped.
@@ -80,19 +119,20 @@ impl Drop for Switched {
 }
 
 fn set_defences(controls: Controls) {
+    // `leader_last` is the tool's order, not a server defence.
     ursula_stream::sim_controls::set_off(
         ursula_stream::sim_controls::Defence::RecoveryCut,
         controls.deferred_cut,
     );
 }
 
-fn fail(trace: &mut SimTrace, after_event: &str, message: String) -> ! {
+fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: String) -> ! {
     trace.push(SimEvent::InvariantFailed {
-        invariant: CUT_INVARIANT.to_owned(),
+        invariant: invariant.to_owned(),
         after_event: after_event.to_owned(),
         message: message.clone(),
     });
-    panic!("invariant `{CUT_INVARIANT}` failed after `{after_event}`: {message}");
+    panic!("invariant `{invariant}` failed after `{after_event}`: {message}");
 }
 
 /// The plan of one run.
@@ -106,6 +146,9 @@ struct Plan {
     lost: usize,
     /// The order in which the members restart after taking the plan.
     restarts: Vec<u64>,
+    /// How long the tool pauses before each replica it sends the plan to,
+    /// in the survivor scenario: at least one election timeout.
+    pause: Duration,
 }
 
 impl Plan {
@@ -128,7 +171,173 @@ impl Plan {
             before: 2_usize.saturating_add(usize::try_from(rng.next_bounded(3)).expect("small")),
             lost: 1_usize.saturating_add(usize::try_from(rng.next_bounded(3)).expect("small")),
             restarts,
+            pause: Duration::from_millis(
+                100_u64.saturating_add(rng.next_bounded(4).saturating_mul(100)),
+            ),
         }
+    }
+}
+
+/// Fails the invariant when a replica of `group` leads without holding the
+/// plan at `point`, before it applied the plan's history event.
+fn assert_no_unplanned_leader(
+    cluster: &JournalCluster,
+    group: u32,
+    point: u64,
+    trace: &mut SimTrace,
+    after: &str,
+) {
+    let Some(leader) = leader_by_state(cluster, group) else {
+        return;
+    };
+    let history = cluster.engines[&(group, leader)].history();
+    let satisfied = history
+        .applied()
+        .is_some_and(|event| event.event_index > point);
+    if history.plan().is_none() && !satisfied {
+        fail(
+            trace,
+            UNPLANNED_LEADER_INVARIANT,
+            after,
+            format!(
+                "node {leader} leads group {group} without the recovery plan at point {point}: \
+                 it serves under the history the plan replaces"
+            ),
+        );
+    }
+}
+
+/// Checks [`assert_no_unplanned_leader`] for `pause`.
+async fn watch_leaders(
+    cluster: &JournalCluster,
+    group: u32,
+    point: u64,
+    pause: Duration,
+    trace: &mut SimTrace,
+    after: &str,
+) {
+    let until = madsim::time::Instant::now() + pause;
+    loop {
+        assert_no_unplanned_leader(cluster, group, point, trace, after);
+        if madsim::time::Instant::now() >= until {
+            return;
+        }
+        madsim::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The recovery tool, slowly: reads the members, computes the plan and
+/// sends it one replica at a time, pausing `pause` before each and checking
+/// that no replica leads without the plan. The leader goes first and every
+/// member gets its plan term, or, with `leader_last`, as before the second
+/// #581 review. A member that a leader reached meanwhile refuses, as it
+/// follows a live leader. Returns the plan's leader, point and cut.
+async fn recover_group_slowly(
+    cluster: &mut JournalCluster,
+    group: u32,
+    pause: Duration,
+    leader_last: bool,
+    trace: &mut SimTrace,
+    context: &str,
+) -> (u64, u64, bool) {
+    let mut members = Vec::new();
+    for node_id in NODES {
+        members.push(member_view(cluster, group, node_id).await);
+    }
+    let (leader, point, cut) = recovery_plan(&members);
+    cluster.plan_leaders.insert(leader);
+    let request = |member: &MemberView, step: PlanStep| RecoveryPlanRequest {
+        leader,
+        point,
+        cut,
+        step,
+        expected: member.log,
+    };
+    let lead = members
+        .iter()
+        .find(|member| member.node_id == leader)
+        .copied()
+        .expect("the plan's leader is reachable");
+    let others = members
+        .iter()
+        .filter(|member| member.node_id != leader)
+        .copied()
+        .collect::<Vec<_>>();
+    let after = "recovery_plan_sending";
+    if leader_last {
+        for member in &others {
+            watch_leaders(cluster, group, point, pause, trace, after).await;
+            let follow = request(member, PlanStep::Follow { leader_term: 0 });
+            if let Err(error) = cluster
+                .accept_recovery_plan(group, member.node_id, &follow)
+                .await
+            {
+                tracing::info!(%error, "{context}: group {group}: a member refused the plan");
+            }
+        }
+        watch_leaders(cluster, group, point, pause, trace, after).await;
+        if let Err(error) = cluster
+            .accept_recovery_plan(group, leader, &request(&lead, PlanStep::Lead))
+            .await
+        {
+            tracing::info!(%error, "{context}: group {group}: the plan's leader refused");
+        }
+    } else {
+        watch_leaders(cluster, group, point, pause, trace, after).await;
+        let report = cluster
+            .accept_recovery_plan(group, leader, &request(&lead, PlanStep::Lead))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{context}: group {group}: the plan's leader {leader} refused: {error}")
+            });
+        for member in &others {
+            watch_leaders(cluster, group, point, pause, trace, after).await;
+            let follow = request(member, PlanStep::Follow {
+                leader_term: report.leader_term,
+            });
+            if let Err(error) = cluster
+                .accept_recovery_plan(group, member.node_id, &follow)
+                .await
+            {
+                tracing::info!(%error, "{context}: group {group}: a member refused the plan");
+            }
+        }
+    }
+    (leader, point, cut)
+}
+
+/// Waits until every replica of `group` applied the plan's history event,
+/// checking meanwhile that no replica leads without the plan.
+async fn wait_satisfied_watching(
+    cluster: &JournalCluster,
+    group: u32,
+    point: u64,
+    trace: &mut SimTrace,
+    context: &str,
+) {
+    let deadline = madsim::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert_no_unplanned_leader(cluster, group, point, trace, "recovery_plan_sent");
+        let satisfied = NODES.iter().all(|node_id| {
+            cluster
+                .engines
+                .get(&(group, *node_id))
+                .is_some_and(|engine| {
+                    engine
+                        .history()
+                        .applied()
+                        .is_some_and(|event| event.event_index > point)
+                        && engine.history().plan().is_none()
+                })
+        });
+        if satisfied {
+            return;
+        }
+        assert!(
+            madsim::time::Instant::now() < deadline,
+            "{context}: group {group}: the recovery plan's history event never applied everywhere"
+        );
+        madsim::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -185,6 +394,7 @@ async fn assert_no_stale_entry(cluster: &JournalCluster, trace: &mut SimTrace, a
             if served.windows(STALE.len()).any(|window| window == STALE) {
                 fail(
                     trace,
+                    CUT_INVARIANT,
                     after,
                     format!(
                         "node {node_id} group {group} applied the cut-off leader's uncommitted \
@@ -196,8 +406,9 @@ async fn assert_no_stale_entry(cluster: &JournalCluster, trace: &mut SimTrace, a
     }
 }
 
-pub(super) async fn run_recovery_plan_cut_inner(
+pub(super) async fn run_recovery_plan_inner(
     config: ThreeNodeRaftSimConfig,
+    shape: Shape,
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
     let _switched = Switched::apply(controls);
@@ -296,10 +507,29 @@ pub(super) async fn run_recovery_plan_cut_inner(
         if leader_by_state(&cluster, group).is_some() {
             continue;
         }
-        let request = recover_group(&mut cluster, group, &NODES, &context).await;
-        leader = request.leader;
-        cut |= request.cut;
-        points.push((group, request.point));
+        let (plan_leader, point, plan_cut) = match shape {
+            Shape::CutUnderRestarts => {
+                let request = recover_group(&mut cluster, group, &NODES, &context).await;
+                (request.leader, request.point, request.cut)
+            }
+            Shape::SurvivorCampaigns => {
+                recover_group_slowly(
+                    &mut cluster,
+                    group,
+                    plan.pause,
+                    controls.leader_last,
+                    &mut trace,
+                    &context,
+                )
+                .await
+            }
+        };
+        if shape == Shape::SurvivorCampaigns {
+            wait_satisfied_watching(&cluster, group, point, &mut trace, &context).await;
+        }
+        leader = plan_leader;
+        cut |= plan_cut;
+        points.push((group, point));
     }
     trace.push(SimEvent::FaultApplied {
         phase: "recovery_planned".to_owned(),
@@ -307,7 +537,11 @@ pub(super) async fn run_recovery_plan_cut_inner(
 
     // The members restart in any order.
     let mut restarts = 0_u64;
-    for node in &plan.restarts {
+    let restart_order = match shape {
+        Shape::CutUnderRestarts => plan.restarts.clone(),
+        Shape::SurvivorCampaigns => Vec::new(),
+    };
+    for node in &restart_order {
         let wal = cluster.wals[node].clone();
         wal.clean_shutdown(cluster.stop_node(*node)).await;
         cluster.start_node(*node).await;
@@ -340,6 +574,7 @@ pub(super) async fn run_recovery_plan_cut_inner(
 mod tests {
     use super::CUT_INVARIANT;
     use super::Controls;
+    use super::UNPLANNED_LEADER_INVARIANT;
     use crate::madsim_harness::SimScenario;
     use crate::madsim_harness::SimTrace;
     use crate::madsim_harness::ThreeNodeRaftSim;
@@ -347,22 +582,39 @@ mod tests {
     use crate::madsim_harness::introspect::invariant_failed;
     use crate::madsim_harness::tests::sim_test_guard;
 
-    fn config(seed: u64) -> ThreeNodeRaftSimConfig {
-        let scenario = SimScenario::RecoveryPlanCutUnderRestarts;
+    fn config(seed: u64, scenario: SimScenario) -> ThreeNodeRaftSimConfig {
         ThreeNodeRaftSimConfig::new(seed, format!("ursula-sim-{seed}-{}", scenario.slug()))
     }
 
-    #[test]
-    fn a_recovery_plan_with_a_cut_never_applies_a_stale_entry_and_replays() {
-        let _guard = sim_test_guard();
-        let scenario = SimScenario::RecoveryPlanCutUnderRestarts;
-        for seed in 385..=389 {
+    fn assert_fails(scenario: SimScenario, seed: u64, controls: Controls, invariant: &str) {
+        SimTrace::clear_recorded();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
+                config(seed, scenario),
+                scenario,
+                controls,
+            )
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(result.is_err(), "{controls:?} left seed {seed} passing");
+        assert!(
+            invariant_failed(&SimTrace::last_recorded(), invariant),
+            "{controls:?} did not fail `{invariant}` on seed {seed}"
+        );
+    }
+
+    fn assert_passes_and_replays(scenario: SimScenario, seeds: std::ops::RangeInclusive<u64>) {
+        for seed in seeds {
             let first = ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
-                config(seed),
+                config(seed, scenario),
+                scenario,
                 Controls::default(),
             );
             let second = ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
-                config(seed),
+                config(seed, scenario),
+                scenario,
                 Controls::default(),
             );
             assert_eq!(first, second, "seed {seed}");
@@ -370,28 +622,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_recovery_plan_with_a_cut_never_applies_a_stale_entry_and_replays() {
+        let _guard = sim_test_guard();
+        assert_passes_and_replays(SimScenario::RecoveryPlanCutUnderRestarts, 385..=389);
+    }
+
+    /// N1 of the second #581 review: sent slowly, leader first, a plan never
+    /// lets the campaigning survivor lead without it.
+    #[test]
+    fn a_slow_plan_never_elects_an_unplanned_leader_and_replays() {
+        let _guard = sim_test_guard();
+        assert_passes_and_replays(SimScenario::RecoveryPlanSurvivorCampaigns, 390..=394);
+    }
+
     /// B1 of the #581 review, against the cut as it was: the uncut leader
     /// wins and commits its stale entry.
     #[test]
-    fn a_deferred_cut_applies_the_stale_entry() {
+    fn negative_control_a_deferred_cut_applies_the_stale_entry() {
         let _guard = sim_test_guard();
-        SimTrace::clear_recorded();
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(|| {
-            ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
-                config(386),
-                Controls::DEFERRED_CUT,
-            )
-        });
-        std::panic::set_hook(previous_hook);
-        assert!(
-            result.is_err(),
-            "the deferred cut left the scenario passing"
+        assert_fails(
+            SimScenario::RecoveryPlanCutUnderRestarts,
+            386,
+            Controls::DEFERRED_CUT,
+            CUT_INVARIANT,
         );
-        assert!(
-            invariant_failed(&SimTrace::last_recorded(), CUT_INVARIANT),
-            "the deferred cut did not fail `{CUT_INVARIANT}`"
+    }
+
+    /// N1 of the second #581 review, against the order the tool used: a
+    /// member that took the plan elects the survivor before the survivor
+    /// took it, and it leads without the plan.
+    #[test]
+    fn negative_control_a_plan_sent_leader_last_elects_an_unplanned_leader() {
+        let _guard = sim_test_guard();
+        assert_fails(
+            SimScenario::RecoveryPlanSurvivorCampaigns,
+            394,
+            Controls::LEADER_LAST,
+            UNPLANNED_LEADER_INVARIANT,
         );
     }
 }

@@ -847,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn without_the_history_fence_a_stale_epoch_applies_after_a_restore() {
+    fn negative_control_without_the_history_fence_a_stale_epoch_applies_after_a_restore() {
         assert_fails(
             SimScenario::StaleWritersAfterRestore,
             380,
@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn without_the_token_check_a_write_of_the_source_history_applies() {
+    fn negative_control_without_the_token_check_a_write_of_the_source_history_applies() {
         assert_fails(
             SimScenario::StaleWritersAfterRestore,
             380,
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn without_the_import_key_a_repeated_restore_is_refused() {
+    fn negative_control_without_the_import_key_a_repeated_restore_is_refused() {
         assert_fails(
             SimScenario::HistoryRewindUnderLeaderChurn,
             375,
