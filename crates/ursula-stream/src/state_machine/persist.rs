@@ -265,6 +265,7 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
             claim_digest: state.claim_digest,
             newest: state.newest.clone(),
             closed_epoch: state.closed_epoch,
+            opened: state.opened,
             last_seen_ms: state.last_seen_ms,
         })
         .collect::<Vec<_>>();
@@ -285,6 +286,7 @@ fn restore_producer_states(
                 claim_digest: snapshot.claim_digest,
                 newest: snapshot.newest,
                 closed_epoch: snapshot.closed_epoch,
+                opened: snapshot.opened,
                 last_seen_ms: snapshot.last_seen_ms,
             })
             .is_some()

@@ -7,6 +7,7 @@ use super::CreateExternalStreamInput;
 use super::CreateStreamInput;
 use super::HashMap;
 use super::HotBuffer;
+use super::IncarnationCheck;
 use super::ObjectPayloadRef;
 use super::ProducerRequest;
 use super::StreamColdState;
@@ -279,6 +280,7 @@ impl StreamStateMachine {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
+        check: IncarnationCheck,
     ) -> StreamResponse {
         self.append_borrowed(AppendStreamInput {
             stream_id,
@@ -289,6 +291,7 @@ impl StreamStateMachine {
             producer,
             now_ms,
             kind: WriteKind::CloseOnly,
+            check,
         })
     }
 

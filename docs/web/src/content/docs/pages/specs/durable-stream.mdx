@@ -347,7 +347,7 @@ if seq > state.lastSeq + 1:
 - `403 Forbidden`: Stale producer epoch (zombie fencing). Response includes `Producer-Epoch` header with current server epoch.
 - `409 Conflict`: Sequence gap detected. Response includes `Producer-Expected-Seq` and `Producer-Received-Seq` headers.
 
-> **Note (informative).** Ursula refuses producer headers on create, adds `Producer-Expected-Seq: 0` to the `400` of an epoch increase with a non-zero seq, types its producer refusals with `Producer-Outcome`, and never opens a producer epoch at or below a stream's epoch floor, so a producer whose state expired claims above the floor instead of being treated as new (see [extensions Section 5](/docs/specs/extensions#5-write-keys-and-typed-answers)).
+> **Note (informative).** Ursula refuses producer headers on create, adds `Producer-Expected-Seq: 0` to the `400` of an epoch increase with a non-zero seq, types its producer refusals with `Producer-Outcome`, and refuses a write with `Stream-Incarnation` that could reach a producer epoch at or below a stream's epoch floor. A write without it keeps this section's rule that a producer whose state expired is treated as new (see [extensions Section 5](/docs/specs/extensions#5-write-keys-and-typed-answers)).
 
 #### Bootstrap and Restart Flow
 

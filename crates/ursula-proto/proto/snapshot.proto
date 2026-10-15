@@ -173,6 +173,10 @@ message ProducerSnapshotV1 {
   optional bytes newest_digest = 11;
   // The epoch the claim of `epoch` closed, with its last applied seq.
   ClosedEpochV1 closed_epoch = 12;
+  // The record's lineage opened at or below the stream's epoch floor (an
+  // untokened claim of a forgotten producer). A tokened write on it is
+  // producer-expired until it claims above the floor.
+  bool opened_below_floor = 13;
 }
 
 message ClosedEpochV1 {

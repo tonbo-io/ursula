@@ -4,7 +4,9 @@ use super::AppendExternalInput;
 use super::AppendStreamInput;
 use super::BucketStreamId;
 use super::ClosedEpoch;
+use super::IncarnationCheck;
 use super::ObjectPayloadRef;
+use super::Opened;
 use super::ProducerAck;
 use super::ProducerDelivery;
 use super::ProducerEarlyAnswer;
@@ -46,6 +48,7 @@ impl StreamStateMachine {
                 producer,
                 now_ms,
                 kind,
+                check,
             } = input;
             if let Err(response) = self.validate_stream_scope(&stream_id) {
                 break 'append response;
@@ -66,7 +69,7 @@ impl StreamStateMachine {
             if let Some(producer) = producer.as_ref() {
                 self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
             }
-            let gate = match self.producer_gate(&stream_id, producer.as_ref(), now_ms) {
+            let gate = match self.producer_gate(&stream_id, producer.as_ref(), check, now_ms) {
                 Ok(gate) => gate,
                 Err(response) => break 'append response,
             };
@@ -236,6 +239,7 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            check,
         } = input;
         if let Err(response) = validate_external_payload_ref(&payload) {
             return response;
@@ -258,7 +262,7 @@ impl StreamStateMachine {
         if let Some(producer) = producer.as_ref() {
             self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
         }
-        let gate = match self.producer_gate(&stream_id, producer.as_ref(), now_ms) {
+        let gate = match self.producer_gate(&stream_id, producer.as_ref(), check, now_ms) {
             Ok(ProducerGate::Repeat(ack)) => return self.repeat_response(&stream_id, ack, false),
             Ok(ProducerGate::Unkeyed) => None,
             Ok(ProducerGate::Apply(key, advance)) => Some((key, advance)),
@@ -375,12 +379,13 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
+        check: IncarnationCheck,
         now_ms: u64,
     ) -> bool {
         self.stream_is_live(stream_id, now_ms)
             && self.validate_stream_scope(stream_id).is_ok()
             && matches!(
-                self.producer_gate(stream_id, producer, now_ms),
+                self.producer_gate(stream_id, producer, check, now_ms),
                 Ok(ProducerGate::Repeat(_))
             )
     }
@@ -404,7 +409,13 @@ impl StreamStateMachine {
             return None;
         }
         let key = producer_write_key(producer).ok()?;
-        match self.evaluate_write(stream_id, &producer.producer_id, key, now_ms)? {
+        match self.evaluate_write(
+            stream_id,
+            &producer.producer_id,
+            key,
+            IncarnationCheck::Matched,
+            now_ms,
+        )? {
             Evaluation::Repeat(ack) => Some(ProducerEarlyAnswer::Repeat(ack)),
             Evaluation::Refuse(Refusal::Producer(ProducerRefusal::KeyConflict { epoch })) => {
                 Some(ProducerEarlyAnswer::KeyConflict { epoch })
@@ -421,6 +432,7 @@ impl StreamStateMachine {
         stream_id: &BucketStreamId,
         producer_id: &str,
         key: WriteKey,
+        check: IncarnationCheck,
         now_ms: u64,
     ) -> Option<Evaluation> {
         let slot = self.stream_slot(stream_id)?;
@@ -435,7 +447,7 @@ impl StreamStateMachine {
             ),
             record => (record, slot.retired_epoch_watermark),
         };
-        Some(evaluate(record, floor, key))
+        Some(evaluate(record, floor, key, check))
     }
 
     /// Evaluates a write's producer key before it applies. A refusal is the
@@ -444,13 +456,15 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
+        check: IncarnationCheck,
         now_ms: u64,
     ) -> Result<ProducerGate, StreamResponse> {
         let Some(producer) = producer else {
             return Ok(ProducerGate::Unkeyed);
         };
         let key = producer_write_key(producer)?;
-        let Some(evaluation) = self.evaluate_write(stream_id, &producer.producer_id, key, now_ms)
+        let Some(evaluation) =
+            self.evaluate_write(stream_id, &producer.producer_id, key, check, now_ms)
         else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
@@ -458,7 +472,7 @@ impl StreamStateMachine {
             ));
         };
         match evaluation {
-            Evaluation::Claim { closes } => {
+            Evaluation::Claim { closes, opened } => {
                 // F3 producer cap: a new producer needs room, either below the
                 // cap or by evicting producers idle for an hour.
                 if closes.is_none()
@@ -473,7 +487,7 @@ impl StreamStateMachine {
                         ),
                     ));
                 }
-                Ok(ProducerGate::Apply(key, Advance::Claim { closes }))
+                Ok(ProducerGate::Apply(key, Advance::Claim { closes, opened }))
             }
             Evaluation::Next => Ok(ProducerGate::Apply(key, Advance::Next)),
             Evaluation::Repeat(ack) => Ok(ProducerGate::Repeat(ack)),
@@ -536,8 +550,8 @@ impl StreamStateMachine {
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before producer evaluation");
         match advance {
-            Advance::Claim { closes } => {
-                let state = ProducerState::claimed(key, closes, receipt, now_ms);
+            Advance::Claim { closes, opened } => {
+                let state = ProducerState::claimed(key, closes, opened, receipt, now_ms);
                 let ack = state.applied_ack();
                 slot.producers.insert(producer_id, state);
                 ack
@@ -558,7 +572,10 @@ impl StreamStateMachine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Advance {
     /// Rows 2 and 6.
-    Claim { closes: Option<ClosedEpoch> },
+    Claim {
+        closes: Option<ClosedEpoch>,
+        opened: Opened,
+    },
     /// Row 12.
     Next,
 }

@@ -5,8 +5,12 @@
 //!   `receipt-evicted`.
 //! - **Epoch floor.** Retiring a record, by idle expiry, the producer cap or
 //!   `TidyStream`, raises the stream's `retired_epoch_watermark` to at least
-//!   its epoch (#581 section 2.3), so a tokened write never reopens an epoch
-//!   the stream forgot.
+//!   its epoch (#581 section 2.3). With each record's [`Opened`] marker, a
+//!   tokened write never reaches an epoch the stream forgot; an untokened
+//!   writer keeps the base protocol's rule that a forgotten producer is new
+//!   (see `producer_record`).
+//!
+//! [`Opened`]: crate::Opened
 //! - **Idle expiry.** A producer whose newest write is at least
 //!   [`PRODUCER_IDLE_EXPIRY_MS`] old (by the persisted `last_seen_ms` and the
 //!   command's `now_ms`) is treated as absent at its own next write and

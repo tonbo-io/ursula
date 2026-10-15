@@ -18,6 +18,7 @@ use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
 use ursula_stream::HotPayloadSegment;
 use ursula_stream::ObjectPayloadRef;
+use ursula_stream::Opened;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
 use ursula_stream::StreamMetadata;
@@ -484,6 +485,7 @@ fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
             epoch: closed.epoch,
             seq: closed.seq,
         }),
+        opened_below_floor: producer.opened == Opened::BelowFloor,
     }
 }
 
@@ -530,6 +532,11 @@ fn producer_from_proto(
             epoch: closed.epoch,
             seq: closed.seq,
         }),
+        opened: if producer.opened_below_floor {
+            Opened::BelowFloor
+        } else {
+            Opened::AboveFloor
+        },
         last_seen_ms,
         producer_id: producer.producer_id,
     })
@@ -727,11 +734,33 @@ mod tests {
             stream_id: stream_id.clone(),
             now_ms: tidy_at,
         });
+        // Without the token `b` is new, and its claim of the forgotten epoch
+        // 3 opens a record below the floor.
+        let reclaim = machine.apply(ursula_stream::StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            payload: bytes::Bytes::from_static(b"xy"),
+            close_after: false,
+            stream_seq: None,
+            producer: Some(ursula_stream::ProducerRequest {
+                producer_id: "b".to_owned(),
+                producer_epoch: 3,
+                producer_seq: 0,
+                ..Default::default()
+            }),
+            now_ms: tidy_at,
+        });
+        assert!(
+            matches!(reclaim, ursula_stream::StreamResponse::Appended { .. }),
+            "{reclaim:?}"
+        );
         let stream_snapshot = machine.snapshot();
         let entry = &stream_snapshot.streams[0];
         assert_eq!(entry.retired_epoch_watermark, Some(3));
         let producers = &entry.producer_states;
-        assert_eq!(producers.len(), 1);
+        assert_eq!(producers.len(), 2);
+        assert_eq!(producers[1].opened, ursula_stream::Opened::BelowFloor);
+        assert_eq!(producers[0].opened, ursula_stream::Opened::AboveFloor);
         assert_eq!(producers[0].last_seen_ms, tidy_at - 1);
         assert_eq!(producers[0].claim_digest, Some([7; 32]));
         assert_eq!(producers[0].newest.digest, Some([8; 32]));

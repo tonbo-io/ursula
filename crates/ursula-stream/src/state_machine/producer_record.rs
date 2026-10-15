@@ -10,15 +10,26 @@
 //! answered as a repeat. Row 11, a record fenced by a history event, comes
 //! with history identity.
 //!
-//! The epoch floor (G2b) binds every write, with or without
-//! `Stream-Incarnation`: no record is ever created at, or moved to, an epoch
-//! at or below the stream's `retired_epoch_watermark`. Every record's epoch is
-//! therefore above the floor when it opens, so an epoch that was closed or
-//! forgotten never opens again. Such a write answers `producer-expired` with
-//! the floor, and the producer claims above it.
+//! The epoch floor (G2b) binds writes that carry `Stream-Incarnation`, the
+//! same opt-in as G1 and G2 (#581 section 2.3.1 row 1, section 13 item 10,
+//! and the decision on PR #592). A tokened write from a producer without a
+//! record, at or below the stream's `retired_epoch_watermark`, answers
+//! `producer-expired` with the floor (row 1). Without the token the base
+//! protocol's rule holds: a forgotten producer is new, at any epoch.
+//!
+//! Such an untokened claim can open a record at or below the floor, which
+//! may hold an epoch the stream forgot. Every record therefore carries
+//! [`Opened`]: a tokened write on a record opened below the floor answers
+//! `producer-expired` too, unless it claims above the floor, which marks the
+//! record [`Opened::AboveFloor`]. A record opened above the floor holds
+//! epochs above every epoch its producer ever had retired, so claims on it
+//! (row 6) are not checked against the floor again: a retirement elsewhere
+//! on the stream never refuses a live producer.
 
 use super::ClosedBy;
 use super::ClosedEpoch;
+use super::IncarnationCheck;
+use super::Opened;
 use super::ProducerAck;
 use super::ProducerDelivery;
 use super::ProducerReceipt;
@@ -38,8 +49,12 @@ pub(crate) struct WriteKey {
 /// The decision for one producer write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Evaluation {
-    /// Rows 2 and 6: the write claims its epoch, closing `closes`.
-    Claim { closes: Option<ClosedEpoch> },
+    /// Rows 2 and 6: the write claims its epoch, closing `closes`, and the
+    /// record is `opened` above or below the floor.
+    Claim {
+        closes: Option<ClosedEpoch>,
+        opened: Opened,
+    },
     /// Row 12: the next seq of the current epoch.
     Next,
     /// Rows 9 and 10: the key applied before.
@@ -57,30 +72,42 @@ pub(crate) enum Refusal {
     SeqGap { expected: u64, received: u64 },
 }
 
-/// `producer-expired` with the floor when `epoch` is at or below it: an
-/// epoch the stream may have forgotten never opens.
-fn at_or_below_floor(floor: Option<u64>, epoch: u64) -> Option<Evaluation> {
-    let floor = floor.filter(|floor| epoch <= *floor)?;
-    Some(Evaluation::Refuse(Refusal::Producer(
-        ProducerRefusal::Expired { epoch: floor },
-    )))
+/// Whether `epoch` is at or below the floor: an epoch the stream may have
+/// forgotten.
+fn at_or_below(floor: Option<u64>, epoch: u64) -> bool {
+    floor.is_some_and(|floor| epoch <= floor)
+}
+
+fn expired(floor: u64) -> Evaluation {
+    Evaluation::Refuse(Refusal::Producer(ProducerRefusal::Expired { epoch: floor }))
 }
 
 /// Evaluates the write `key` against the producer's record `record` (after
-/// idle retirement) and the stream's epoch floor `floor`.
+/// idle retirement) and the stream's epoch floor `floor`. `check` says
+/// whether the write carried `Stream-Incarnation`.
 pub(crate) fn evaluate(
     record: Option<&ProducerState>,
     floor: Option<u64>,
     key: WriteKey,
+    check: IncarnationCheck,
 ) -> Evaluation {
+    let tokened = check == IncarnationCheck::Matched;
     let Some(record) = record else {
-        // Row 1, the epoch floor.
-        if let Some(refused) = at_or_below_floor(floor, key.epoch) {
-            return refused;
+        // Row 1, the epoch floor, for tokened writes.
+        if tokened && let Some(floor) = floor.filter(|floor| key.epoch <= *floor) {
+            return expired(floor);
         }
-        // Rows 2 and 3.
+        // Rows 2 and 3. An untokened claim at or below the floor opens a
+        // record below it.
         return if key.seq == 0 {
-            Evaluation::Claim { closes: None }
+            Evaluation::Claim {
+                closes: None,
+                opened: if at_or_below(floor, key.epoch) {
+                    Opened::BelowFloor
+                } else {
+                    Opened::AboveFloor
+                },
+            }
         } else {
             Evaluation::Refuse(Refusal::SeqGap {
                 expected: 0,
@@ -88,6 +115,15 @@ pub(crate) fn evaluate(
             })
         };
     };
+    // A record opened below the floor may hold a forgotten epoch: a tokened
+    // write on it is expired, unless it claims above the floor.
+    if tokened
+        && record.opened == Opened::BelowFloor
+        && let Some(floor) = floor
+        && !(key.seq == 0 && key.epoch > record.epoch && key.epoch > floor)
+    {
+        return expired(floor);
+    }
     if key.epoch < record.epoch {
         // Rows 4 and 5: the record remembers only the epoch its own epoch's
         // claim closed. Any older epoch is the base protocol's stale epoch,
@@ -105,17 +141,19 @@ pub(crate) fn evaluate(
         return Evaluation::Refuse(Refusal::Producer(refusal));
     }
     if key.epoch > record.epoch {
-        // The floor first: a record never moves to an epoch at or below it.
-        if let Some(refused) = at_or_below_floor(floor, key.epoch) {
-            return refused;
-        }
-        // Rows 6 and 7.
+        // Rows 6 and 7. A record opened above the floor stays above it; one
+        // opened below rises above only with a claim above the floor.
         return if key.seq == 0 {
             Evaluation::Claim {
                 closes: Some(ClosedEpoch {
                     epoch: record.epoch,
                     seq: record.last_seq,
                 }),
+                opened: if record.opened == Opened::AboveFloor || !at_or_below(floor, key.epoch) {
+                    Opened::AboveFloor
+                } else {
+                    Opened::BelowFloor
+                },
             }
         } else {
             Evaluation::Refuse(Refusal::Producer(ProducerRefusal::EpochNotClaimed))
@@ -172,6 +210,7 @@ impl ProducerState {
     pub(crate) fn claimed(
         key: WriteKey,
         closes: Option<ClosedEpoch>,
+        opened: Opened,
         receipt: WriteReceipt,
         now_ms: u64,
     ) -> Self {
@@ -184,6 +223,7 @@ impl ProducerState {
                 digest: key.digest,
             },
             closed_epoch: closes,
+            opened,
             last_seen_ms: now_ms,
         }
     }

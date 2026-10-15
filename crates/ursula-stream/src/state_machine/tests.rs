@@ -2460,6 +2460,7 @@ fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
             digest: None,
         },
         closed_epoch: None,
+        opened: Opened::AboveFloor,
         last_seen_ms: 0,
     }
 }

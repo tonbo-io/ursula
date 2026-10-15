@@ -42,6 +42,31 @@ pub enum ContentFault {
     MalformedJson,
 }
 
+/// Whether a write's `Stream-Incarnation` precondition matched. A write that
+/// carries it is "tokened"; the epoch floor binds tokened writes (#581
+/// section 2.3.1, row 1, and the decision on PR #592). A mismatch is refused
+/// before evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncarnationCheck {
+    /// The request carried no `Stream-Incarnation`.
+    Absent,
+    /// The request carried `Stream-Incarnation`, and it matched.
+    Matched,
+}
+
+/// Whether a producer record holds a lineage of epochs that opened above the
+/// stream's epoch floor of its time. A record opened above the floor holds
+/// epochs above every epoch its producer ever had retired, so no claim on it
+/// reopens a forgotten epoch. A record opened at or below the floor, by a
+/// claim without `Stream-Incarnation` (the base protocol treats a forgotten
+/// producer as new), may hold a forgotten epoch: a tokened write on it is
+/// `producer-expired` until it claims above the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Opened {
+    AboveFloor,
+    BelowFloor,
+}
+
 /// What a write asks for, which fixes its answer's shape: an append (a
 /// body, perhaps closing the stream) or a close-only request. A keyed append
 /// whose body the proposer found faulty is proposed without its bytes, so
@@ -62,6 +87,7 @@ pub struct AppendStreamInput<'a> {
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
     pub kind: WriteKind,
+    pub check: IncarnationCheck,
 }
 
 #[derive(Debug)]
@@ -74,6 +100,7 @@ pub(crate) struct AppendExternalInput<'a> {
     pub(crate) stream_seq: Option<String>,
     pub(crate) producer: Option<ProducerRequest>,
     pub(crate) now_ms: u64,
+    pub(crate) check: IncarnationCheck,
 }
 
 /// BLAKE3-256 of a producer write's body (`Producer-Digest`), part of the
@@ -119,6 +146,8 @@ pub struct ProducerSnapshot {
     pub newest: ProducerReceipt,
     /// The epoch the claim of `epoch` closed, with its last seq.
     pub closed_epoch: Option<ClosedEpoch>,
+    /// Whether the record's lineage opened above the epoch floor.
+    pub opened: Opened,
     /// `now_ms` of the producer's newest accepted write (F3 idle expiry).
     pub last_seen_ms: u64,
 }
@@ -132,6 +161,7 @@ pub(crate) struct ProducerState {
     pub(crate) claim_digest: Option<WriteDigest>,
     pub(crate) newest: ProducerReceipt,
     pub(crate) closed_epoch: Option<ClosedEpoch>,
+    pub(crate) opened: Opened,
     pub(crate) last_seen_ms: u64,
 }
 

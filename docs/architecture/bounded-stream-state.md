@@ -28,7 +28,7 @@ H(s)    = unflushed payload bytes (also capped per group by admission)
 Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (0 for streams without Producer-* headers)
 ```
 
-`Prod(s)` covers each producer's id and its fixed-size record (scalars, the newest write's receipt, up to two digests and the closed epoch), plus the stream's epoch floor (F3). The constant term is slack. No term grows with record count or with cold history.
+`Prod(s)` covers each producer's id and its fixed-size record (scalars, the newest write's receipt, up to two digests, the closed epoch and the floor marker), plus the stream's epoch floor (F3). The constant term is slack. No term grows with record count or with cold history.
 
 **I2. Per group.** The sum of I1 over the group's streams, plus three terms. The hot window is capped by the 64 MiB per-group admission cap (F6c). Shared-pack maps hold at most one entry per live pack. The cold-GC queue stays bounded while GC is healthy (F14b). Tenant tombstones are the one documented exception (F15).
 
@@ -74,7 +74,7 @@ The leader-side driver (`ursula-runtime/src/tidy_worker.rs`) runs every 60 s on 
 - **One receipt per producer.** A repeat of the producer's newest write gets that write's receipt. A repeat of an older write of the epoch answers `204` with `Producer-Outcome: receipt-evicted` and no range headers: the record's highest applied sequence says it applied, so it never appends again.
 - **Identity.** A record holds at most two 32-byte digests, the newest write's and the current epoch's claim's, and only when those writes carried `Producer-Digest`.
 - **Closed epoch.** A record remembers the last sequence of the one epoch its current epoch's claim closed. A write of an older epoch answers `stale-epoch`.
-- **Epoch floor.** Retiring a record, by idle expiry, the producer cap or F0, raises `retired_epoch_watermark` to at least its epoch. No record is created at, or moved to, an epoch at or below the floor, with or without `Stream-Incarnation`: such a write answers `403 producer-expired` with the floor. Every record's epoch is above the floor of its creation, so a closed or forgotten epoch never opens again.
+- **Epoch floor.** Retiring a record, by idle expiry, the producer cap or F0, raises `retired_epoch_watermark` to at least its epoch. A write with `Stream-Incarnation` from a producer without a record, at or below the floor, answers `403 producer-expired` with the floor. Without the token a forgotten producer is new, and each record carries one marker, opened above or below the floor: a tokened write on a record opened below answers `producer-expired` until it claims above the floor. A record opened above the floor holds epochs above every retired epoch of its producer, so its claims are never checked against the floor again.
 - **Idle expiry.** A producer whose `last_seen_ms` is at least 7 days older than the command's `now_ms` is treated as absent at its next write and removed then. F0 removes idle producers in bulk.
 - **Producer cap.** A new producer beyond 4,096 evicts the least recently seen producers idle for at least an hour, at most 1,024 per command. When none is idle that long the write fails with `ProducerLimit` (`429`).
 - **Length caps.** `Producer-Id` and `Stream-Seq` are capped at 256 B on every HTTP write path and at apply.
