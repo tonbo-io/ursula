@@ -4554,6 +4554,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ursula-headers"
+version = "0.7.5"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ursula-index"
 version = "0.7.5"
 dependencies = [
