@@ -654,6 +654,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .current_leader(2, "initial leader")
         .await
         .unwrap();
+    wait_history(&engines[1]).await;
     let stream_id = bsid("acked-recovery");
     engines[1]
         .raft

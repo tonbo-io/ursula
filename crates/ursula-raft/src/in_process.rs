@@ -106,13 +106,14 @@ impl InProcessRaftRegistry {
         &self,
         node_id: u64,
         plan: &ursula_proto::admin::RecoveryPlanRequest,
+        restart: &mut dyn crate::ReplicaRestart,
     ) -> Result<ursula_proto::admin::RecoveryPlanReport, crate::RecoveryGateError> {
         let (group, endpoint) =
             self.endpoint(node_id)
                 .ok_or(crate::RecoveryGateError::NotRegistered {
                     raft_group_id: ursula_shard::RaftGroupId(0),
                 })?;
-        endpoint.accept_recovery_plan(group, plan).await
+        endpoint.accept_recovery_plan(group, plan, restart).await
     }
 
     fn endpoint(

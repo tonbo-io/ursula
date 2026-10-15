@@ -153,6 +153,9 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         // The proposer's clock is about 140,000 years ahead: a server fault
         // a retry does not fix.
         StreamErrorCode::CreatedAtOutOfRange => StatusCode::INTERNAL_SERVER_ERROR,
+        // A write that raced its group's genesis applied nothing; a retry
+        // soon succeeds.
+        StreamErrorCode::HistoryPending => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 

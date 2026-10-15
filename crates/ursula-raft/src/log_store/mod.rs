@@ -57,6 +57,7 @@ pub use disk::JournalFile;
 #[cfg(madsim)]
 pub use disk::LockAttempt;
 pub use file::RaftGroupFileLogStore;
+pub use file::RecoveryCutError;
 pub use frozen::ArchiveDefect;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;

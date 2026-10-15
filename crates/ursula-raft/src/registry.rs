@@ -198,6 +198,13 @@ impl ActiveGroup {
         let Some(rejoin) = &self.recovery else {
             return Ok(None);
         };
+        if rejoin.cutting() {
+            return Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RecoveryCutting {
+                    raft_group_id: group,
+                },
+            ));
+        }
         let floor = rejoin.recovery_vote().ok_or(GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::RecoveryVoteFloor {
                 raft_group_id: group,
@@ -612,6 +619,7 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         plan: &RecoveryPlanRequest,
+        restart: &mut dyn crate::rejoin::ReplicaRestart,
     ) -> Result<RecoveryPlanReport, RecoveryGateError> {
         let entry = self
             .groups
@@ -626,14 +634,39 @@ impl RaftGroupHandleRegistry {
         let owner = entry.raft().clone();
         let plan = *plan;
         let job = rejoin.clone();
-        let report = owner
-            .call(move |_| async move { job.accept_recovery_plan(&plan).await })
+        let taken = owner
+            .call(move |raft| async move {
+                job.accept_recovery_plan(&plan, || raft.runtime_config().elect(false))
+                    .await
+            })
             .await
             .map_err(|source| RecoveryGateError::OwnerStopped {
                 raft_group_id,
                 source,
             })??;
-        entry.history.set_plan(rejoin.recovery_record());
+        let report = match taken {
+            crate::rejoin::PlanTaken::Holds(report) => {
+                entry.history.set_plan(rejoin.recovery_record());
+                report
+            }
+            // B1 (#581 review): the cut runs before the plan answers. The
+            // group's engine stops, its log store closes, and the new
+            // replica's recovery gate cuts the log before its Raft core
+            // starts, then takes the plan's gate; a cut that cannot run
+            // fails the restart.
+            crate::rejoin::PlanTaken::Restart(report) => {
+                drop(entry);
+                drop(rejoin);
+                restart
+                    .restart_replica(raft_group_id)
+                    .await
+                    .map_err(|source| RecoveryGateError::Restart {
+                        raft_group_id,
+                        source: Box::new(source),
+                    })?;
+                report
+            }
+        };
         self.refresh_group_elections(raft_group_id);
         Ok(report)
     }
@@ -1643,6 +1676,9 @@ mod tests {
             raft.trigger().elect(false).await.unwrap();
             raft.wait(Some(Duration::from_secs(2)))
                 .current_leader(1, "recovered group elects")
+                .await
+                .unwrap();
+            raft.client_write(crate::tests::genesis_command())
                 .await
                 .unwrap();
             let response = raft

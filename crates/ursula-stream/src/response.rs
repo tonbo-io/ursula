@@ -182,6 +182,10 @@ pub enum StreamErrorCode {
     /// [`StreamErrorContext::StreamIncarnation`]), or a create found no
     /// stream. Nothing was applied.
     IncarnationMismatch,
+    /// The group has no history yet: its genesis has not applied (#581
+    /// section 4.3). Every command but the history event is refused at
+    /// apply, so a write that raced the genesis applies nothing. Retryable.
+    HistoryPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

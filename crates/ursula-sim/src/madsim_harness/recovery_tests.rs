@@ -256,7 +256,6 @@ pub(super) async fn recover_group(
     let (leader, point, cut) = recovery_plan(&members);
     cluster.plan_leaders.insert(leader);
     members.sort_by_key(|member| member.node_id == leader);
-    let mut restart = Vec::new();
     let mut plan = None;
     for member in &members {
         let request = RecoveryPlanRequest {
@@ -266,8 +265,7 @@ pub(super) async fn recover_group(
             expected: member.log,
         };
         let report: RecoveryPlanReport = cluster
-            .registry(group)
-            .accept_recovery_plan(member.node_id, &request)
+            .accept_recovery_plan(group, member.node_id, &request)
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -275,15 +273,21 @@ pub(super) async fn recover_group(
                     member.node_id
                 )
             });
-        if report.outcome == RecoveryPlanOutcome::RestartToCut {
-            restart.push(member.node_id);
+        let expected = if member.node_id == leader {
+            RecoveryPlanOutcome::Leads
+        } else {
+            RecoveryPlanOutcome::Follows
+        };
+        assert_eq!(report.outcome, expected, "{context}: group {group}");
+        if cut && member.node_id == leader {
+            // B1 (#581 review): the cut ran before the answer.
+            let last = member_view(cluster, group, leader).await.log.last_log_index;
+            assert!(
+                last.is_none_or(|last| last <= point),
+                "{context}: group {group}: the plan's leader answered with its log uncut at {last:?}"
+            );
         }
         plan = Some(request);
-    }
-    for node_id in restart {
-        let wal = cluster.wals[&node_id].clone();
-        wal.clean_shutdown(cluster.stop_node(node_id)).await;
-        cluster.start_node(node_id).await;
     }
     plan.expect("a reachable member")
 }

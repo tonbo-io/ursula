@@ -234,8 +234,7 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                 assert!(
                     matches!(
                         cluster
-                            .registry(group)
-                            .accept_recovery_plan(ex_leader, &other_log)
+                            .accept_recovery_plan(group, ex_leader, &other_log)
                             .await,
                         Err(RecoveryGateError::ReplicaChanged { .. })
                     ),
@@ -539,12 +538,16 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                     .unwrap();
                 let seen = member_view(&cluster, group, wiped).await.log;
                 let error = admin
-                    .accept_recovery_plan(RaftGroupId(group), &RecoveryPlanRequest {
-                        leader: wiped,
-                        point: seen.last_log_index.unwrap_or(0),
-                        cut: false,
-                        expected: seen,
-                    })
+                    .accept_recovery_plan(
+                        RaftGroupId(group),
+                        &RecoveryPlanRequest {
+                            leader: wiped,
+                            point: seen.last_log_index.unwrap_or(0),
+                            cut: false,
+                            expected: seen,
+                        },
+                        &mut NeverRestart,
+                    )
                     .await
                     .expect_err(
                         "the production admin entry point must reject unknown vote history",
@@ -706,5 +709,22 @@ fn bootstrap_membership_survives_full_cluster_power_loss_under_never() {
             }
             wait_healed(&cluster, &context, Duration::from_secs(10)).await;
         });
+    }
+}
+
+/// A replica restart for plans that never cut.
+struct NeverRestart;
+
+impl ursula_raft::ReplicaRestart for NeverRestart {
+    fn restart_replica(
+        &mut self,
+        raft_group_id: RaftGroupId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), ursula_runtime::RuntimeError>> + Send + '_>,
+    > {
+        panic!(
+            "a plan without a cut restarted raft group {}",
+            raft_group_id.0
+        )
     }
 }

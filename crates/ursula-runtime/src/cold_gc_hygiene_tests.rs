@@ -427,7 +427,7 @@ async fn retention_reclaims_external_payloads_still_held_in_state() {
 #[tokio::test]
 async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store.clone());
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store.clone());
     let placement = ursula_shard::ShardPlacement {
         core_id: ursula_shard::CoreId(0),
         shard_id: ursula_shard::ShardId(0),

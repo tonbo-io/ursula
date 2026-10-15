@@ -38,6 +38,7 @@ use ursula_shard::ShardPlacement;
 use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::core_meta::GroupLogState;
+use super::core_meta::GroupMetadata;
 use super::core_meta::RecoveryRecord;
 use super::disk::Disk;
 use super::disk::JournalDisk;
@@ -142,6 +143,33 @@ impl StoreLog {
             Self::Empty(EmptyHistory::New) | Self::Initialized => GroupLogState::Initialized,
             Self::Empty(EmptyHistory::Unknown) | Self::Recovering => GroupLogState::Recovering,
         }
+    }
+}
+
+/// A recovery cut that did not run.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryCutError {
+    /// The log no longer holds the committed entry the plan recorded: it
+    /// changed after the plan was taken, so the cut would keep another log.
+    #[error("the log holds {held:?} where the plan recorded the committed entry {committed:?}")]
+    Diverged {
+        committed: LogIdOf<UrsulaRaftTypeConfig>,
+        held: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+    },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Journal(#[from] CoreJournalError),
+}
+
+impl Drop for RaftGroupFileLogStore {
+    fn drop(&mut self) {
+        self.core_writer
+            .close_group(self.placement.raft_group_id, GroupMetadata {
+                vote: *lock(&self.vote),
+                log: self.store_log().durable(),
+                recovery: *lock(&self.recovery),
+            });
     }
 }
 
@@ -356,18 +384,29 @@ impl RaftGroupFileLogStore {
         Ok(())
     }
 
+    /// The id of the entry this store holds at `index`, or of the last
+    /// purged entry when that is at `index`.
+    pub(crate) fn log_id_at(&self, index: u64) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+        lock(&self.log).log_id_at(index)
+    }
+
     /// Runs the cut of the replica's recovery plan, before its Raft core
     /// starts: the log keeps only entries the replica knew were committed.
-    /// It persists the committed entry, truncates the log after it, and
+    /// It checks that the log still holds the committed entry the plan
+    /// recorded, persists it as committed, truncates the log after it, and
     /// records the cut as done; the journal is synced before that record.
     /// Returns whether a cut ran.
-    pub(crate) async fn run_recovery_cut(self: &Arc<Self>) -> Result<bool, io::Error> {
+    pub(crate) async fn run_recovery_cut(self: &Arc<Self>) -> Result<bool, RecoveryCutError> {
         let Some(record) = self.recovery_record() else {
             return Ok(false);
         };
         let Some(committed) = record.cut_after else {
             return Ok(false);
         };
+        let held = self.log_id_at(committed.index());
+        if held != Some(committed) {
+            return Err(RecoveryCutError::Diverged { committed, held });
+        }
         let mut store = Arc::clone(self);
         if self
             .last_log_id()

@@ -268,6 +268,16 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
         check: IncarnationCheck,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        // Minor 1 (#581 review): before its genesis a group applies nothing
+        // but the genesis, whatever a leader's fence let through.
+        if self.state_machine.history().is_none()
+            && !matches!(command, StreamCommand::NewHistory { .. })
+        {
+            return Err(GroupEngineError::stream(
+                StreamErrorCode::HistoryPending,
+                "the group's genesis has not applied; it serves nothing before it",
+            ));
+        }
         let history_event = matches!(
             command,
             StreamCommand::NewHistory { .. } | StreamCommand::ImportSnapshot { .. }
@@ -2230,6 +2240,31 @@ impl InMemoryGroupEngineFactory {
 
     pub fn with_cold_store(cold_store: Option<ColdStoreHandle>) -> Self {
         Self { cold_store }
+    }
+}
+
+#[cfg(test)]
+impl InMemoryGroupEngine {
+    /// An engine whose group applied its genesis, for tests that apply
+    /// commands to it directly: a group applies nothing before its genesis.
+    pub(crate) fn started() -> Self {
+        let mut engine = Self::default();
+        engine.start_genesis(
+            ShardPlacement {
+                core_id: ursula_shard::CoreId(0),
+                shard_id: ursula_shard::ShardId(0),
+                raft_group_id: ursula_shard::RaftGroupId(0),
+            },
+            0,
+        );
+        engine
+    }
+
+    /// [`Self::started`] over `cold_store`.
+    pub(crate) fn started_with_cold_store(cold_store: ColdStoreHandle) -> Self {
+        let mut engine = Self::started();
+        engine.set_cold_store(Some(cold_store));
+        engine
     }
 }
 

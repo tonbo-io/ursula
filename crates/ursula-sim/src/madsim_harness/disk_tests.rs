@@ -361,6 +361,29 @@ impl DurableGroupLog {
     }
 }
 
+/// Restarts one node's replica of a group in a [`JournalCluster`], for a
+/// recovery plan's cut.
+struct ReplicaRestarter<'a> {
+    cluster: &'a mut JournalCluster,
+    node_id: u64,
+}
+
+impl ursula_raft::ReplicaRestart for ReplicaRestarter<'_> {
+    fn restart_replica(
+        &mut self,
+        raft_group_id: RaftGroupId,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), ursula_runtime::RuntimeError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.cluster
+                .restart_replica(raft_group_id.0, self.node_id)
+                .await;
+            Ok(())
+        })
+    }
+}
+
 /// Three nodes whose two raft groups share each node's core-0 journal. Every
 /// replica runs the production recovery gate and its drivers, and node 1
 /// bootstraps each group as an initializer does.
@@ -471,63 +494,98 @@ impl JournalCluster {
     }
 
     pub(super) async fn start_node(&mut self, node_id: u64) {
-        let voters = recovery_wiring::configured_voters(1..=3);
         for group in JOURNAL_GROUPS {
-            let placement = group_placement(group);
-            let store = self.wals[&node_id]
-                .open(placement, self.metrics[&node_id].group_engine_metrics())
-                .await;
-            let rejoin = Arc::new(
-                GroupRejoin::durable(node_id, placement.raft_group_id, &store)
-                    .await
-                    .expect("open the recovery gate"),
-            );
-            let registry = self.registries[&group].clone();
-            let mut config = (*self.config).clone();
-            config.enable_elect =
-                ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
-            let mut options = RaftGroupEngineOptions::default();
-            options.apply_fault = self
-                .faulty
-                .filter(|(faulty, _)| *faulty == group)
-                .map(|(_, fault)| fault);
-            let started = RaftGroupEngine::new_node(
-                placement,
-                node_id,
-                Arc::new(config),
-                InProcessRaftNetworkFactory::new(registry.clone())
-                    .with_source(node_id)
-                    .with_policy(self.policy.clone())
-                    .with_rejoin(rejoin.clone()),
-                store,
-                options,
-            )
-            .await;
-            let engine = match started {
-                Ok(engine) => engine,
-                // Faulty code replays a committed poison record: that group
-                // stays stopped and the node's other groups start.
-                Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped { index, .. }))
-                    if self.faulty.is_some() =>
-                {
-                    self.replay_stopped.insert((group, node_id), index);
-                    continue;
-                }
-                Err(error) => panic!("start a journal-backed replica: {error}"),
-            };
-            recovery_wiring::wire_recovery(
-                node_id,
-                placement,
-                &engine,
-                &rejoin,
-                &registry,
-                &self.policy,
-                &voters,
-            );
-            registry.register(node_id, &engine);
-            self.engines.insert((group, node_id), engine);
-            self.rejoins.insert((group, node_id), rejoin);
+            self.start_replica(group, node_id).await;
         }
+    }
+
+    /// Starts `node_id`'s replica of `group` from its log store, as the
+    /// node's engine factory does.
+    async fn start_replica(&mut self, group: u32, node_id: u64) {
+        let voters = recovery_wiring::configured_voters(1..=3);
+        let placement = group_placement(group);
+        let store = self.wals[&node_id]
+            .open(placement, self.metrics[&node_id].group_engine_metrics())
+            .await;
+        let rejoin = Arc::new(
+            GroupRejoin::durable(node_id, placement.raft_group_id, &store)
+                .await
+                .expect("open the recovery gate"),
+        );
+        let registry = self.registries[&group].clone();
+        let mut config = (*self.config).clone();
+        config.enable_elect = ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
+        let mut options = RaftGroupEngineOptions::default();
+        options.apply_fault = self
+            .faulty
+            .filter(|(faulty, _)| *faulty == group)
+            .map(|(_, fault)| fault);
+        let started = RaftGroupEngine::new_node(
+            placement,
+            node_id,
+            Arc::new(config),
+            InProcessRaftNetworkFactory::new(registry.clone())
+                .with_source(node_id)
+                .with_policy(self.policy.clone())
+                .with_rejoin(rejoin.clone()),
+            store,
+            options,
+        )
+        .await;
+        let engine = match started {
+            Ok(engine) => engine,
+            // Faulty code replays a committed poison record: that group
+            // stays stopped and the node's other groups start.
+            Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped { index, .. }))
+                if self.faulty.is_some() =>
+            {
+                self.replay_stopped.insert((group, node_id), index);
+                return;
+            }
+            Err(error) => panic!("start a journal-backed replica: {error}"),
+        };
+        recovery_wiring::wire_recovery(
+            node_id,
+            placement,
+            &engine,
+            &rejoin,
+            &registry,
+            &self.policy,
+            &voters,
+        );
+        registry.register(node_id, &engine);
+        self.engines.insert((group, node_id), engine);
+        self.rejoins.insert((group, node_id), rejoin);
+    }
+
+    /// Restarts `node_id`'s replica of `group` alone, as the node's runtime
+    /// restarts one group's engine for a recovery plan's cut: the engine
+    /// stops, its log store closes, and the replica starts again from it.
+    pub(super) async fn restart_replica(&mut self, group: u32, node_id: u64) {
+        self.registries[&group].unregister(node_id);
+        self.rejoins.remove(&(group, node_id));
+        if let Some(engine) = self.engines.remove(&(group, node_id)) {
+            engine.shutdown().await.expect("stop the replica");
+        }
+        self.start_replica(group, node_id).await;
+    }
+
+    /// The `accept-unsynced-loss` admin route on `node_id` for `group`: the
+    /// replica takes `plan`, and a plan that cuts restarts its replica.
+    pub(super) async fn accept_recovery_plan(
+        &mut self,
+        group: u32,
+        node_id: u64,
+        plan: &ursula_proto::admin::RecoveryPlanRequest,
+    ) -> Result<ursula_proto::admin::RecoveryPlanReport, ursula_raft::RecoveryGateError> {
+        let registry = self.registries[&group].clone();
+        let mut restart = ReplicaRestarter {
+            cluster: self,
+            node_id,
+        };
+        registry
+            .accept_recovery_plan(node_id, plan, &mut restart)
+            .await
     }
 
     pub(super) async fn stop_node(&mut self, node_id: u64) {

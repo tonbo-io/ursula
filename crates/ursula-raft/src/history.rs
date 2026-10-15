@@ -4,10 +4,12 @@
 //!
 //! - **Pending history.** A group's history is pending on a replica while
 //!   it applied no history event yet (a new group before its genesis), or
-//!   while it holds a recovery plan ([`RecoveryRecord`]) that no applied
-//!   history event above the plan's point satisfies yet. The test reads
-//!   replicated state, so it holds after an apply, a snapshot install and a
-//!   startup replay alike, on every replica at the same index.
+//!   while it holds a recovery plan ([`RecoveryRecord`]). A plan is
+//!   satisfied once an applied history event above its point reads so in
+//!   replicated state, after an apply, a snapshot install and a startup
+//!   replay alike; the history stays pending until the satisfied record is
+//!   removed from disk, so a restart never finds a record whose fence it
+//!   already lifted.
 //! - **The fence.** A replica that leads its group while the history is
 //!   pending admits no proposal but the history event, serves no engine
 //!   read and confirms no rejoin barrier ([`GroupHistory::admit`]). A
@@ -18,11 +20,13 @@
 //! - **The obligation** ([`run_history_driver`]). Once a leader applied an
 //!   entry of its own term (its blank entry, so every earlier committed
 //!   entry applied too), and the history is still pending, it proposes
-//!   `NewHistory` with a fresh random id, once per term. An event that an
-//!   earlier attempt already committed applies before the leader looks, so
-//!   it proposes no second one. The driver also retires a satisfied
-//!   recovery record on every replica, outside OpenRaft's state-machine
-//!   worker.
+//!   `NewHistory` with a fresh random id, once per term and debt (the
+//!   genesis, or one plan), and again after a proposal that did not answer.
+//!   It looks only once it applied its whole log, so an event an earlier
+//!   attempt committed applies first and it proposes no second one. Only the
+//!   driver proposes `NewHistory`: every other write path refuses it. The
+//!   driver also retires a satisfied recovery record on every replica,
+//!   outside OpenRaft's state-machine worker, before the fence lifts.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -61,13 +65,38 @@ pub(crate) fn plan_satisfied(plan: &RecoveryRecord, applied: Option<HistoryEvent
 }
 
 /// Whether a replica that applied `applied` and holds `plan` has a pending
-/// history.
+/// history: no genesis applied, or it still holds a recovery plan. A
+/// satisfied plan keeps the history pending until its record is removed
+/// from disk (M1, #581 review), so a leader that restarts with the record
+/// never served without it.
 pub(crate) fn history_pending(
     applied: Option<HistoryEvent>,
     plan: Option<&RecoveryRecord>,
 ) -> bool {
-    applied.is_none() || plan.is_some_and(|plan| !plan_satisfied(plan, applied))
+    applied.is_none() || plan.is_some()
 }
+
+/// The history event a leader owes its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// The group's genesis.
+    Genesis,
+    /// The event of the recovery plan at `point`.
+    Plan { point: u64 },
+}
+
+/// What a replica that applied `applied` and holds `plan` owes, if it leads.
+fn owed(applied: Option<HistoryEvent>, plan: Option<&RecoveryRecord>) -> Option<Owed> {
+    match plan {
+        Some(plan) if !plan_satisfied(plan, applied) => Some(Owed::Plan { point: plan.point }),
+        Some(_) => None,
+        None => applied.is_none().then_some(Owed::Genesis),
+    }
+}
+
+/// How long the driver waits before it proposes a history event again after
+/// a proposal that did not answer.
+const PROPOSAL_RETRY: Duration = Duration::from_millis(200);
 
 /// One replica's view of its group's history: what it applied, and the
 /// recovery plan it holds. Waiters wake through `Notify`s, in the order they
@@ -194,25 +223,23 @@ impl GroupHistory {
         Ok(())
     }
 
-    /// Admits `command` on `raft`: the history event always, anything else
-    /// through [`Self::admit`].
+    /// Admits `command` on `raft`: refused when the proposal path may not
+    /// carry it (a history event included, which only the driver proposes),
+    /// then through [`Self::admit`].
     pub(crate) async fn admit_proposal(
         &self,
         raft: &RaftGroupHandle,
         command: &GroupWriteCommand,
     ) -> Result<(), GroupEngineError> {
-        if matches!(
-            command,
-            GroupWriteCommand::Stream(StreamCommand::NewHistory { .. })
-        ) {
-            return Ok(());
-        }
+        crate::forward::validate_proposal(command)?;
         self.admit(raft).await
     }
 }
 
-/// Whether `metrics` show a leader that applied an entry of its own term:
-/// its blank entry, and with it every entry an earlier term committed.
+/// Whether `metrics` show a leader that applied an entry of its own term
+/// (its blank entry, and with it every entry an earlier term committed) and
+/// every entry of its log: a history event an earlier proposal committed has
+/// then applied, so the leader never proposes a second one.
 fn leader_applied_own_term(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> Option<u64> {
     if metrics.state != ServerState::Leader || !metrics.vote.is_committed() {
         return None;
@@ -220,37 +247,47 @@ fn leader_applied_own_term(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> Optio
     let term = metrics.current_term;
     metrics
         .last_applied
-        .filter(|applied| applied.leader_id.term == term)
+        .filter(|applied| {
+            applied.leader_id.term == term && Some(applied.index) >= metrics.last_log_index
+        })
         .map(|_| term)
 }
 
 /// The history driver of one replica (see the module docs): proposes the
-/// history event a pending leader owes, once per term, and retires a
-/// satisfied recovery record. Runs until the group stops.
+/// history event a pending leader owes, once per term and debt, again after
+/// a proposal that did not answer, and retires a satisfied recovery record,
+/// removing it from disk before the fence lifts. Runs until the group stops.
 pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<GroupHistory>) {
     let mut metrics = raft.metrics();
     let mut applied = history.applied.clone();
     let mut plan = history.plan_version.load(Ordering::SeqCst);
-    let mut proposed_in_term = None;
+    let mut proposed: Option<(u64, Owed)> = None;
     loop {
         if let Some(record) = history.plan()
             && plan_satisfied(&record, history.applied())
         {
-            history.set_plan(None);
-            if let Some(rejoin) = history.rejoin()
-                && let Err(error) = rejoin.retire_recovery_plan(record).await
-            {
-                tracing::warn!(
-                    raft_group_id = history.raft_group_id.0,
-                    %error,
-                    "could not remove a satisfied recovery plan; the next start removes it"
-                );
+            let retired = match history.rejoin() {
+                Some(rejoin) => rejoin.retire_recovery_plan(record).await,
+                None => Ok(()),
+            };
+            match retired {
+                Ok(()) => history.set_plan(None),
+                Err(error) => {
+                    tracing::warn!(
+                        raft_group_id = history.raft_group_id.0,
+                        %error,
+                        "could not remove a satisfied recovery plan; retrying"
+                    );
+                    crate::rt::time::sleep(PROPOSAL_RETRY).await;
+                    continue;
+                }
             }
         }
         let owed = leader_applied_own_term(&metrics.borrow_watched())
-            .filter(|term| history.pending() && proposed_in_term != Some(*term));
-        if let Some(term) = owed {
-            proposed_in_term = Some(term);
+            .zip(owed(history.applied(), history.plan().as_ref()))
+            .filter(|debt| proposed != Some(*debt));
+        if let Some((term, debt)) = owed {
+            proposed = Some((term, debt));
             let command = GroupWriteCommand::Stream(StreamCommand::NewHistory {
                 history: ursula_runtime::draw_history_id(),
                 now_ms: ursula_runtime::unix_time_ms(),
@@ -259,15 +296,24 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
                 Ok(_) => tracing::info!(
                     raft_group_id = history.raft_group_id.0,
                     term,
+                    ?debt,
                     "a new history started"
                 ),
-                Err(error) => tracing::warn!(
-                    raft_group_id = history.raft_group_id.0,
-                    term,
-                    %error,
-                    "the history event this leader proposed did not answer; a later leader \
-                     proposes another if it did not commit"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        raft_group_id = history.raft_group_id.0,
+                        term,
+                        ?debt,
+                        %error,
+                        "the history event this leader proposed did not answer; it proposes \
+                         again unless the event applied"
+                    );
+                    // The next look waits until the leader applied its whole
+                    // log, so an event this proposal committed applies first
+                    // and no second history starts.
+                    proposed = None;
+                    crate::rt::time::sleep(PROPOSAL_RETRY).await;
+                }
             }
             continue;
         }

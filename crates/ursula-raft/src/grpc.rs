@@ -588,6 +588,7 @@ pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic
         }
         Some(
             ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
+            | ursula_runtime::GroupInfraError::RecoveryCutting { .. }
             | ursula_runtime::GroupInfraError::OwnerStopped
             | ursula_runtime::GroupInfraError::ApplyStopped { .. }
             | ursula_runtime::GroupInfraError::OutcomeUnknown,

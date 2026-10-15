@@ -181,7 +181,7 @@ async fn d3_flush_clips_the_page_entry_of_a_rejected_external_append() {
     let placement = placement();
     let cold_store = memory_cold_store();
     let stream = BucketStreamId::new("benchcmp", "d3-clip");
-    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store.clone());
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store.clone());
     engine
         .create_stream(
             CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
@@ -659,7 +659,7 @@ async fn retention_gc_never_touches_the_boundary_page() {
     let placement = placement();
     let cold_store = memory_cold_store();
     let stream = BucketStreamId::new("benchcmp", "retention-gc");
-    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store.clone());
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store.clone());
     engine
         .create_stream(
             CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),

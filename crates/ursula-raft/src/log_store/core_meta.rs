@@ -67,9 +67,12 @@ pub struct RecoveryRecord {
     pub leader: u64,
     /// The plan's leader's last log index after the plan.
     pub point: u64,
-    /// When the plan cuts this replica's log: the committed entry it keeps
-    /// the log up to. The cut runs when the group next starts, before its
-    /// Raft core, and is then recorded as done (`None`).
+    /// Whether the plan cuts every member's log: a member grants the
+    /// leader its vote only once the leader shows it was cut.
+    pub cut: bool,
+    /// This replica's cut until it ran: the committed entry it keeps the
+    /// log up to. It runs while the group restarts, before its new Raft
+    /// core, and is then recorded as done (`None`).
     pub cut_after: Option<LogIdOf<UrsulaRaftTypeConfig>>,
 }
 

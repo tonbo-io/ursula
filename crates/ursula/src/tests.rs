@@ -6064,6 +6064,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
 /// closed gate gave.
 #[tokio::test]
 async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
+    use openraft::entry::RaftEntry;
     use openraft::storage::RaftLogReader;
     use openraft::storage::RaftLogStorage;
 
@@ -6098,6 +6099,32 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 .await
                 .expect("open the gate"),
         );
+        // The log kept the group's membership: a plan elects one of its
+        // voters. The gate is closed, so the entry records it recovering.
+        let (flushed, appended) =
+            <ursula_raft::UrsulaRaftTypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
+        store
+            .append(
+                [
+                    openraft::alias::EntryOf::<ursula_raft::UrsulaRaftTypeConfig>::new(
+                        openraft::LogId::new(openraft::vote::RaftLeaderId::new(0, 0), 0),
+                        openraft::EntryPayload::Membership(
+                            openraft::Membership::new(
+                                vec![std::collections::BTreeSet::from([1])],
+                                BTreeMap::from([(1, openraft::BasicNode::new("local"))]),
+                            )
+                            .expect("membership"),
+                        ),
+                    ),
+                ],
+                openraft::storage::IOFlushed::signal(flushed),
+            )
+            .await
+            .expect("submit the membership entry");
+        appended
+            .await
+            .expect("flush callback")
+            .expect("append the membership entry");
         let engine = ursula_raft::RaftGroupEngine::new_node(
             placement,
             1,

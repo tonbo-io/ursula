@@ -809,6 +809,19 @@ impl CoreFileLogWriter {
         })
     }
 
+    /// Takes back a group whose store closed, with what that store recorded
+    /// last, so the group opens again in this process (a recovery plan's cut
+    /// restarts one group's replica, #581 section 4.5).
+    pub(crate) fn close_group(&self, raft_group_id: RaftGroupId, recorded: GroupMetadata) {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if groups.opened.remove(&raft_group_id.0) {
+            groups.recorded.insert(raft_group_id.0, recorded);
+        }
+    }
+
     fn stopped(&self) -> CoreJournalError {
         CoreJournalError::WriterStopped {
             journal: self.dir.clone(),

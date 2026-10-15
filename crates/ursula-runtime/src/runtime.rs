@@ -1623,6 +1623,19 @@ impl ShardRuntime {
         .await
     }
 
+    /// Stops one hosted group's engine, waiting for its durable resources to
+    /// be released, and starts it again from its durable state through the
+    /// engine factory. A recovery plan's cut runs in between (#581 section
+    /// 4.5).
+    pub async fn restart_group_engine(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<(), RuntimeError> {
+        let placement = self.placement_for_group(raft_group_id)?;
+        self.shutdown_group_engine(placement).await?;
+        self.warm_group(raft_group_id).await.map(|_placement| ())
+    }
+
     /// Shuts down every hosted group engine, one per group concurrently,
     /// waiting for each to release its durable resources. A group that was
     /// never created is skipped. Returns the first failure after every group

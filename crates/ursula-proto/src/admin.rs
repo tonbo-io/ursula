@@ -280,9 +280,6 @@ pub enum RecoveryPlanOutcome {
     Leads,
     /// The replica votes only for the plan's leader until the event applies.
     Follows,
-    /// The plan cuts this replica's log, which runs when the node restarts:
-    /// restart it, then it leads or follows as the plan says.
-    RestartToCut,
 }
 
 /// The answer of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
@@ -627,6 +624,9 @@ pub enum RecoveryGateStatus {
     /// A recovery plan holds the replica: it votes only for the plan's
     /// leader until the plan's history event applies (#581 section 4.5).
     Planned,
+    /// The replica took a plan that cuts its log and its group restarts to
+    /// run the cut: it votes for no one and takes no replication.
+    Cutting,
 }
 
 impl RecoveryGateStatus {

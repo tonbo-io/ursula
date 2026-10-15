@@ -2724,9 +2724,10 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
 /// knew was committed, and this replica's log as the tool read it. A
 /// replica that follows a live leader, holds another log, or committed above
 /// the point refuses with `409 Conflict` and changes nothing; a 0.7 body is
-/// refused with `422`. The operator computes the plan and sends it to every
-/// reachable member, the leader last (operations docs, "Recovering after a
-/// host crash").
+/// refused with `422`. A plan that cuts the logs restarts the group's
+/// replica to run the cut before it answers. The operator computes the plan
+/// and sends it to every reachable member, the leader last (operations
+/// docs, "Recovering after a host crash").
 pub(crate) async fn accept_unsynced_loss(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
@@ -2743,7 +2744,11 @@ pub(crate) async fn accept_unsynced_loss(
         )
             .into_response();
     };
-    match registry.accept_recovery_plan(raft_group_id, &plan).await {
+    let mut restart = RuntimeReplicaRestart(state.runtime.clone());
+    match registry
+        .accept_recovery_plan(raft_group_id, &plan, &mut restart)
+        .await
+    {
         Ok(report) => (StatusCode::OK, axum::Json(report)).into_response(),
         Err(err @ ursula_raft::RecoveryGateError::NotRegistered { .. }) => {
             (StatusCode::NOT_FOUND, err.to_string()).into_response()
@@ -2753,18 +2758,36 @@ pub(crate) async fn accept_unsynced_loss(
             | ursula_raft::RecoveryGateError::FollowsLeader { .. }
             | ursula_raft::RecoveryGateError::NotStalled { .. }
             | ursula_raft::RecoveryGateError::RecoveryPointBehind { .. }
-            | ursula_raft::RecoveryGateError::NoCommittedEntry { .. }
+            | ursula_raft::RecoveryGateError::NothingCommitted { .. }
+            | ursula_raft::RecoveryGateError::CommittedEntryMissing { .. }
+            | ursula_raft::RecoveryGateError::LeaderNotVoter { .. }
+            | ursula_raft::RecoveryGateError::PointMismatch { .. }
             | ursula_raft::RecoveryGateError::MissingVoteFloor { .. }
             | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
         ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
         Err(
             err @ (ursula_raft::RecoveryGateError::Record { .. }
             | ursula_raft::RecoveryGateError::Cut { .. }
+            | ursula_raft::RecoveryGateError::Restart { .. }
             | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
         ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-        Err(err @ ursula_raft::RecoveryGateError::OwnerStopped { .. }) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
-        }
+        Err(
+            err @ (ursula_raft::RecoveryGateError::OwnerStopped { .. }
+            | ursula_raft::RecoveryGateError::NotStarted { .. }),
+        ) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
+    }
+}
+
+/// Restarts a group's replica through the node's runtime, for a recovery
+/// plan's cut.
+struct RuntimeReplicaRestart(ShardRuntime);
+
+impl ursula_raft::ReplicaRestart for RuntimeReplicaRestart {
+    fn restart_replica(
+        &mut self,
+        raft_group_id: RaftGroupId,
+    ) -> futures_util::future::BoxFuture<'_, Result<(), ursula_runtime::RuntimeError>> {
+        Box::pin(self.0.restart_group_engine(raft_group_id))
     }
 }
 

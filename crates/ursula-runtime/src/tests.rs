@@ -312,7 +312,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
         raft_group_id: RaftGroupId(0),
     };
     let stream = BucketStreamId::new("benchcmp", "apply-command");
-    let mut engine = InMemoryGroupEngine::default();
+    let mut engine = InMemoryGroupEngine::started();
 
     let created = engine
         .apply_committed_write(
@@ -336,11 +336,20 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             next_offset: 0,
             closed: false,
             already_exists: false,
-            group_commit_index: 1,
+            // The genesis is the group's first entry.
+            group_commit_index: 2,
             hot_backlog: Some(crate::request::WriteHotBacklog::default()),
-            // The first incarnation of an empty group (C7), in the group's
-            // history before its genesis.
-            incarnation: ursula_stream::incarnation_token(1, 0),
+            // The first incarnation of an empty group (C7), in the history
+            // its genesis started.
+            incarnation: ursula_stream::incarnation_token(
+                1,
+                engine
+                    .subscribe_history()
+                    .current()
+                    .expect("the genesis applied")
+                    .id
+                    .get(),
+            ),
         })
     );
 
@@ -365,13 +374,21 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             start_offset: 0,
             next_offset: 3,
             stream_append_count: 1,
-            group_commit_index: 2,
+            group_commit_index: 3,
             closed: false,
             producer: None,
             // F6c: a binary stream's real hot bytes are its payload.
             stream_hot_bytes: 3,
             group_hot_bytes: 3,
-            incarnation: ursula_stream::incarnation_token(1, 0),
+            incarnation: ursula_stream::incarnation_token(
+                1,
+                engine
+                    .subscribe_history()
+                    .current()
+                    .expect("the genesis applied")
+                    .id
+                    .get(),
+            ),
         })
     );
 
@@ -399,7 +416,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
         GroupWriteResponse::FlushCold(FlushColdResponse {
             placement,
             hot_start_offset: 2,
-            group_commit_index: 3,
+            group_commit_index: 4,
             // F6a: the write response carries the backlog it left. F6c: a
             // binary stream keeps nothing per message, so the hot fragment
             // [2, 3) costs its payload only; a replica restored from a
@@ -434,7 +451,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
         .write_chunk("benchcmp/cold-read/chunks/000000.bin", b"abcd")
         .await
         .expect("write cold object");
-    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store);
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store);
 
     engine
         .apply_committed_write(
@@ -659,7 +676,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
         .write_chunk(stale_path, b"abcd")
         .await
         .expect("write stale cold object");
-    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store.clone());
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store.clone());
 
     engine
         .create_stream(
@@ -769,7 +786,7 @@ async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
             .await
             .expect("index input chunk");
     }
-    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store);
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store);
 
     engine
         .compact_cold(
@@ -891,7 +908,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
 async fn bootstrap_issues_one_read_plan_for_all_updates() {
     let placement = placement();
     let stream = BucketStreamId::new("benchcmp", "bootstrap-one-plan");
-    let mut engine = InMemoryGroupEngine::default();
+    let mut engine = InMemoryGroupEngine::started();
     engine
         .create_stream(
             CreateStreamRequest::new(stream.clone(), "application/json"),
@@ -1012,7 +1029,7 @@ async fn cold_store_prefetches_sequential_stream_blocks() {
 async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
     let placement = placement();
     let stream = BucketStreamId::new("benchcmp", "runtime-ttl");
-    let mut engine = InMemoryGroupEngine::default();
+    let mut engine = InMemoryGroupEngine::started();
 
     let mut create = CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE);
     create.initial_payload = Bytes::from_static(b"abc");
@@ -1044,7 +1061,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
             .await
             .expect("snapshot")
             .group_commit_index,
-        2
+        3
     );
 
     engine
@@ -1065,7 +1082,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
             .await
             .expect("snapshot")
             .group_commit_index,
-        2
+        3
     );
 
     let err = engine
@@ -1089,7 +1106,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
             .await
             .expect("snapshot")
             .group_commit_index,
-        3
+        4
     );
 
     let mut recreate = CreateStreamRequest::new(stream, "text/plain");
@@ -3752,7 +3769,7 @@ impl GroupEngineFactory for BlockingReadFactory {
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
             let engine: Box<dyn GroupEngine> = Box::new(BlockingReadEngine {
-                inner: InMemoryGroupEngine::default(),
+                inner: InMemoryGroupEngine::started(),
                 placement,
                 entered: self.entered.clone(),
                 materialized: self.materialized.clone(),
@@ -4214,7 +4231,7 @@ impl GroupEngineFactory for BlockingFirstCreateEngineFactory {
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
             let engine: Box<dyn GroupEngine> = Box::new(BlockingFirstCreateEngine {
-                inner: InMemoryGroupEngine::default(),
+                inner: InMemoryGroupEngine::started(),
                 first_create_blocks: self.first_create_blocks.clone(),
                 entered: self.entered.clone(),
                 release: self.release.clone(),
@@ -4356,7 +4373,7 @@ impl GroupEngineFactory for BlockingOnceFactory {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
-            let engine: Box<dyn GroupEngine> = Box::new(InMemoryGroupEngine::default());
+            let engine: Box<dyn GroupEngine> = Box::new(InMemoryGroupEngine::started());
             Ok(engine)
         })
     }

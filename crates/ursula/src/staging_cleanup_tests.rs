@@ -177,10 +177,12 @@ struct LostResponseEngineFactory {
 impl GroupEngineFactory for LostResponseEngineFactory {
     fn create<'a>(
         &'a self,
-        _placement: ShardPlacement,
+        placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
-        let inner = InMemoryGroupEngine::with_cold_store(self.cold_store.clone());
+        let mut inner = InMemoryGroupEngine::with_cold_store(self.cold_store.clone());
+        // An engine without Raft starts its group with its genesis.
+        inner.start_genesis(placement, 0);
         Box::pin(async move {
             let engine: Box<dyn GroupEngine> = Box::new(LostResponseEngine { inner });
             Ok(engine)

@@ -925,6 +925,8 @@ pub struct StreamEngineError {
 pub enum UnproposableCommand {
     /// Stream commands create their bucket inside their own apply.
     CreateBucket,
+    /// Only a leader's history driver proposes a history event.
+    NewHistory,
 }
 
 /// Serializable startup classification. The WAL facade retains the native
@@ -985,6 +987,10 @@ pub enum GroupInfraError {
     },
     #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
     RecoveryVoteFloor { raft_group_id: RaftGroupId },
+    /// This replica restarts to run a recovery plan's cut (#581 section
+    /// 4.5): it takes no replication until it has. Retryable.
+    #[error("raft group {raft_group_id:?} restarts to cut its log for a recovery plan")]
+    RecoveryCutting { raft_group_id: RaftGroupId },
     /// This replica leads the group, and the group's history is pending: its
     /// genesis, or the history event of a recovery plan, has not applied
     /// (#581 sections 4.3 and 4.5). The leader serves and admits nothing but
@@ -1299,5 +1305,6 @@ impl GroupEngineError {
     /// nothing was proposed, and a retry soon succeeds.
     pub fn is_history_pending(&self) -> bool {
         matches!(self.infra(), Some(GroupInfraError::RecoveryPending { .. }))
+            || self.code() == Some(StreamErrorCode::HistoryPending)
     }
 }

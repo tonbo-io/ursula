@@ -178,6 +178,7 @@ pub use rejoin::RecoveryGate;
 pub use rejoin::RecoveryGateError;
 pub use rejoin::RecoveryGateStatus;
 pub use rejoin::RecoveryTransport;
+pub use rejoin::ReplicaRestart;
 pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::run_group_bootstrap;
 pub use rejoin::run_rejoin_heal;

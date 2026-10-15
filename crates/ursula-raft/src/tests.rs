@@ -398,6 +398,15 @@ fn create_command(stream_id: ursula_shard::BucketStreamId) -> GroupWriteCommand 
     GroupWriteCommand::from(create_req(stream_id))
 }
 
+/// A group's genesis history event, for a test that builds a log or writes
+/// to a raw Raft core: a group applies nothing before it (#581 section 4.3).
+pub(crate) fn genesis_command() -> GroupWriteCommand {
+    GroupWriteCommand::Stream(ursula_stream::StreamCommand::NewHistory {
+        history: std::num::NonZeroU64::new(1).expect("non-zero"),
+        now_ms: 0,
+    })
+}
+
 fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> GroupWriteCommand {
     GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
 }
@@ -1027,16 +1036,17 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
         store
             .append(
                 [
-                    normal_entry(1, create_command(stream_id.clone())),
-                    normal_entry(2, append_command(stream_id.clone(), b"committed")),
-                    normal_entry(3, append_command(stream_id.clone(), b"-uncommitted")),
+                    normal_entry(1, genesis_command()),
+                    normal_entry(2, create_command(stream_id.clone())),
+                    normal_entry(3, append_command(stream_id.clone(), b"committed")),
+                    normal_entry(4, append_command(stream_id.clone(), b"-uncommitted")),
                 ],
                 IOFlushed::noop(),
             )
             .await
             .expect("append committed and uncommitted tail");
         store
-            .save_committed(Some(log_id(2)))
+            .save_committed(Some(log_id(3)))
             .await
             .expect("persist committed marker");
     }
@@ -1047,15 +1057,15 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
         .await
         .expect("read committed marker")
         .expect("committed marker exists");
-    assert_eq!(committed, log_id(2));
+    assert_eq!(committed, log_id(3));
     let mut reader = reopened.get_log_reader().await;
     let durable_entries = reader
-        .try_get_log_entries(1..4)
+        .try_get_log_entries(1..5)
         .await
         .expect("read durable entries");
     assert_eq!(
         durable_entries.len(),
-        3,
+        4,
         "uncommitted tail stays replicable"
     );
     let committed_entries = durable_entries
@@ -1449,6 +1459,9 @@ async fn single_node_openraft_group_applies_client_writes() {
         .current_leader(1, "single-node raft group should elect itself")
         .await
         .expect("wait for leadership");
+    raft.client_write(genesis_command())
+        .await
+        .expect("the group's genesis");
 
     let stream_id = bsid("raft-client-write");
     let created = raft
@@ -2461,6 +2474,7 @@ async fn append_madsim_stream(
 }
 
 async fn create_stream_via_raft(engine: &RaftGroupEngine, stream_id: ursula_shard::BucketStreamId) {
+    wait_history(engine).await;
     let created = engine
         .raft
         .client_write(create_command(stream_id))
@@ -2760,6 +2774,7 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     }
 
     let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
+    wait_history(&engines[leader_index]).await;
     let stream_id = bsid("lagging-learner-snapshot");
     let _created = engines[leader_index]
         .raft
@@ -3038,9 +3053,8 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
 }
 
 /// Waits until `engine`'s replica applied a history event.
-#[cfg(not(madsim))]
 async fn wait_history(engine: &RaftGroupEngine) -> ursula_runtime::HistoryEvent {
-    let started = std::time::Instant::now();
+    let started = crate::rt::time::Instant::now();
     loop {
         if let Some(event) = engine.history().applied() {
             return event;
@@ -3049,7 +3063,7 @@ async fn wait_history(engine: &RaftGroupEngine) -> ursula_runtime::HistoryEvent 
             started.elapsed() < Duration::from_secs(5),
             "the group's genesis never applied"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::rt::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -3166,6 +3180,7 @@ async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
         .set_plan(Some(crate::log_store::RecoveryRecord {
             leader: 1,
             point: u64::MAX,
+            cut: false,
             cut_after: None,
         }));
     let before = engine.snapshot(placement()).await;
@@ -3216,6 +3231,7 @@ fn a_pending_history_fences_only_its_leader() {
     let plan = RecoveryRecord {
         leader: 1,
         point: 10,
+        cut: false,
         cut_after: None,
     };
     // Genesis: no history yet.
@@ -3226,7 +3242,60 @@ fn a_pending_history_fences_only_its_leader() {
     assert!(history_pending(Some(event(10)), Some(&plan)));
     assert!(!plan_satisfied(&plan, Some(event(10))));
     assert!(plan_satisfied(&plan, Some(event(11))));
-    assert!(!history_pending(Some(event(11)), Some(&plan)));
+    // M1 (#581 review): a satisfied plan keeps the history pending until its
+    // record is removed from disk.
+    assert!(history_pending(Some(event(11)), Some(&plan)));
+}
+
+/// A recovery plan's cut restarts one group's engine in the process (#581
+/// section 4.5): its log store closes and opens again with what it held.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn shard_runtime_restarts_one_group_engine_from_its_log_store() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        hosted_config(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1)),
+    )
+    .expect("spawn runtime with raft group engine factory");
+    let stream_id = bsid("restarted-group");
+    runtime
+        .create_stream(create_req(stream_id.clone()))
+        .await
+        .expect("create");
+    runtime
+        .append(AppendRequest::from_bytes(
+            stream_id.clone(),
+            b"kept".to_vec(),
+        ))
+        .await
+        .expect("append");
+    let raft_group_id = runtime.locate(&stream_id).raft_group_id;
+    runtime
+        .restart_group_engine(raft_group_id)
+        .await
+        .expect("restart the group's engine");
+    let read = runtime
+        .read_stream(read_req(stream_id.clone(), 16))
+        .await
+        .expect("read after the restart");
+    assert_eq!(read.payload, b"kept");
+    runtime
+        .append(AppendRequest::from_bytes(
+            stream_id.clone(),
+            b"+more".to_vec(),
+        ))
+        .await
+        .expect("append after the restart");
+    runtime
+        .restart_group_engine(raft_group_id)
+        .await
+        .expect("restart again");
+    let read = runtime
+        .read_stream(read_req(stream_id, 16))
+        .await
+        .expect("read after the second restart");
+    assert_eq!(read.payload, b"kept+more");
 }
 
 #[cfg(not(madsim))]
@@ -3414,8 +3483,9 @@ async fn openraft_state_machine_applies_group_write_commands() {
     let stream_id = bsid("raft-apply");
     let mut sm = RaftGroupStateMachine::new(placement());
     let entries = vec![
-        normal_entry(1, create_command(stream_id.clone())),
-        normal_entry(2, append_command(stream_id.clone(), b"abc")),
+        normal_entry(1, genesis_command()),
+        normal_entry(2, create_command(stream_id.clone())),
+        normal_entry(3, append_command(stream_id.clone(), b"abc")),
     ];
 
     sm.apply(stream::iter(
@@ -3425,7 +3495,7 @@ async fn openraft_state_machine_applies_group_write_commands() {
     .expect("apply raft entries");
 
     let snapshot = sm.group_snapshot().await.expect("snapshot");
-    assert_eq!(snapshot.group_commit_index, 2);
+    assert_eq!(snapshot.group_commit_index, 3);
     assert_eq!(snapshot.stream_append_counts.len(), 1);
     assert_eq!(snapshot.stream_append_counts[0].append_count, 1);
 }
@@ -3435,8 +3505,9 @@ async fn openraft_snapshot_round_trips_group_state() {
     let stream_id = bsid("raft-snapshot");
     let mut source = RaftGroupStateMachine::new(placement());
     let entries = vec![
-        normal_entry(1, create_command(stream_id.clone())),
-        normal_entry(2, append_command(stream_id, b"payload")),
+        normal_entry(1, genesis_command()),
+        normal_entry(2, create_command(stream_id.clone())),
+        normal_entry(3, append_command(stream_id, b"payload")),
     ];
     source
         .apply(stream::iter(

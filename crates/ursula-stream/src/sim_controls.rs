@@ -17,6 +17,11 @@ pub enum Defence {
     /// An import of a backup the group was already restored from answers
     /// `already` instead of rewinding again.
     ImportKey,
+    /// A recovery plan that cuts the logs cuts them inside its accept job,
+    /// and its members grant the plan's leader their vote only once it was
+    /// cut. Off, the cut waits for the member's next start, as before the
+    /// #581 review (B1).
+    RecoveryCut,
 }
 
 #[cfg(madsim)]
@@ -26,7 +31,7 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 3]> = const { Cell::new([false; 3]) };
+        static OFF: Cell<[bool; 4]> = const { Cell::new([false; 4]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -34,6 +39,7 @@ mod switches {
             Defence::HistoryFence => 0,
             Defence::IncarnationCheck => 1,
             Defence::ImportKey => 2,
+            Defence::RecoveryCut => 3,
         }
     }
 
@@ -54,7 +60,7 @@ mod switches {
 
 /// Whether a negative control turned `defence` off on this thread.
 #[inline]
-pub(crate) fn off(defence: Defence) -> bool {
+pub fn off(defence: Defence) -> bool {
     #[cfg(madsim)]
     {
         switches::is_off(defence)
