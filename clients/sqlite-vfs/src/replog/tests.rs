@@ -115,10 +115,7 @@ fn an_injected_write_failure_cuts_the_segment_back() {
     let len = fs::metadata(&log.segment_paths()[0]).unwrap().len();
     log.fail_next_append = Some(20);
     let err = log.append(&commit(2, 50)).unwrap_err();
-    assert!(matches!(err, LogError::Io {
-        op: "append to",
-        ..
-    }));
+    assert!(matches!(err, LogError::CutBack { .. }));
     assert_eq!(fs::metadata(&log.segment_paths()[0]).unwrap().len(), len);
     // The next append takes the position the failed one did not.
     assert_eq!(log.append(&commit(3, 50)).unwrap(), Position(2));
@@ -530,4 +527,30 @@ proptest! {
             fs::write(&path, &full).unwrap();
         }
     }
+}
+
+// A roll that fails leaves a partial segment behind; the next roll replaces it, so one failure
+// (`ENOSPC`, say) does not refuse every later append, and the log reopens whole.
+#[test]
+fn a_failed_roll_leaves_nothing_that_refuses_the_next() {
+    let dir = TempDir::new("log-roll-fail");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.set_roll_bytes(100);
+    log.append(&commit(1, 200)).unwrap();
+    log.fail_next_roll = true;
+    let err = log.append(&commit(2, 50)).unwrap_err();
+    assert!(matches!(err, LogError::Io { op: "write", .. }), "{err}");
+    assert_eq!(log.segment_paths().len(), 1);
+    assert_eq!(
+        fs::read_dir(&log_dir).unwrap().count(),
+        2,
+        "the partial segment is left"
+    );
+    assert_eq!(log.append(&commit(3, 50)).unwrap(), Position(2));
+    assert_eq!(log.segment_paths().len(), 2);
+    drop(log);
+    let (_, r) = Log::open(&log_dir).unwrap();
+    let positions: Vec<Position> = r.records.iter().map(|r| r.position).collect();
+    assert_eq!(positions, vec![Position(1), Position(2)]);
 }

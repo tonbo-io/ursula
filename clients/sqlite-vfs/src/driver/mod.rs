@@ -49,6 +49,9 @@ use crate::wire::Request;
 /// The bounded event queue's length (design §8.6).
 pub(crate) const EVENTS: usize = 4096;
 
+/// How long a binding `ursula_open` handed out waits for a connection before it retires.
+pub(crate) const UNCONNECTED_MS: u64 = 60_000;
+
 /// How often, at most, a bound database writes an ACK record (design §5.2).
 pub(crate) const ACK_INTERVAL_MS: u64 = 1_000;
 
@@ -141,7 +144,7 @@ pub(crate) struct BindingHandle {
     acked: AtomicU64,
     /// The reset, once one happened: [`ResetKind`] + 1, 0 for none. The first one stays.
     reset: AtomicU8,
-    life: Mutex<Life>,
+    life: Mutex<Lifecycle>,
     replication: Mutex<Replication>,
     /// Released when the binding retires with no connection left; otherwise with the last handle.
     root: Mutex<Option<Arc<Root>>>,
@@ -155,6 +158,14 @@ pub(crate) enum Life {
     Retiring,
     /// Gone from the driver.
     Retired,
+}
+
+/// A binding's life with its open connections, decided under one lock: a connection opens only
+/// while the binding is not retired, and a binding retires only while none is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lifecycle {
+    life: Life,
+    connections: usize,
 }
 
 /// What status reports of a binding's replicator (design §9).
@@ -203,7 +214,10 @@ impl BindingHandle {
             max_frame_bytes: AtomicU64::new(bind.max_frame_bytes),
             acked: AtomicU64::new(bind.acked.0),
             reset: AtomicU8::new(0),
-            life: Mutex::new(Life::Live),
+            life: Mutex::new(Lifecycle {
+                life: Life::Live,
+                connections: 0,
+            }),
             replication: Mutex::new(Replication::default()),
             last_commit: AtomicU64::new(0),
             root: Mutex::new(Some(root)),
@@ -287,52 +301,103 @@ impl BindingHandle {
             .is_ok()
     }
 
-    fn life_lock(&self) -> MutexGuard<'_, Life> {
+    fn life_lock(&self) -> MutexGuard<'_, Lifecycle> {
         self.life.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn life(&self) -> Life {
-        *self.life_lock()
+        self.life_lock().life
     }
 
-    /// Its last connection closed: it retires once drained.
-    pub(crate) fn retiring(&self) {
-        let mut life = self.life_lock();
-        if *life == Life::Live {
-            *life = Life::Retiring;
+    pub(crate) fn connections(&self) -> usize {
+        self.life_lock().connections
+    }
+
+    /// A connection opens: a retiring binding is taken back. False once it retired.
+    pub(crate) fn connect(&self) -> bool {
+        let mut l = self.life_lock();
+        if l.life == Life::Retired {
+            return false;
+        }
+        l.life = Life::Live;
+        l.connections = l.connections.saturating_add(1);
+        true
+    }
+
+    /// A connection closed. True when it was the last of a live binding, which now retires once
+    /// drained (the driver hears of it). The last one of a reset binding unlocks its root.
+    pub(crate) fn disconnect(&self) -> bool {
+        let mut l = self.life_lock();
+        l.connections = l.connections.saturating_sub(1);
+        if l.connections > 0 {
+            return false;
+        }
+        match l.life {
+            Life::Live => {
+                l.life = Life::Retiring;
+                true
+            }
+            Life::Retired => {
+                self.release_root();
+                false
+            }
+            Life::Retiring => false,
         }
     }
 
-    /// A new open takes a retiring binding back: false once it retired.
+    /// A binding no connection holds retires once drained: an open's result nobody took, or one
+    /// `ursula_open` handed out that no connection opened.
+    pub(crate) fn retiring(&self) {
+        let mut l = self.life_lock();
+        if l.life == Life::Live && l.connections == 0 {
+            l.life = Life::Retiring;
+        }
+    }
+
+    /// `ursula_open` takes a retiring binding back: false once it retired.
     pub(crate) fn revive(&self) -> bool {
-        let mut life = self.life_lock();
-        match *life {
+        let mut l = self.life_lock();
+        match l.life {
             Life::Live => true,
             Life::Retiring => {
-                *life = Life::Live;
+                l.life = Life::Live;
                 true
             }
             Life::Retired => false,
         }
     }
 
-    /// Retires a retiring binding: false when it was revived (or retired) meanwhile.
+    /// Retires a binding that is still retiring with no connection open: false when a connection
+    /// or an open took it back meanwhile. Retired, no connection opens it again, so the driver
+    /// unlocks its root once its last ACK is written.
     fn try_retire(&self) -> bool {
-        let mut life = self.life_lock();
-        let retiring = *life == Life::Retiring;
+        let mut l = self.life_lock();
+        let retiring = l.life == Life::Retiring && l.connections == 0;
         if retiring {
-            *life = Life::Retired;
+            l.life = Life::Retired;
         }
         retiring
     }
 
-    fn retired(&self) {
-        *self.life_lock() = Life::Retired;
+    /// The binding reset: it retires at once. With no connection open its root unlocks now,
+    /// otherwise when the last one closes.
+    fn reset_retired(&self) {
+        let mut l = self.life_lock();
+        l.life = Life::Retired;
+        if l.connections == 0 {
+            self.release_root();
+        }
     }
 
-    /// Unlocks the root of a binding that retired with no connection left, so another process
-    /// opens the stream while this one still holds the handle (the registry keeps it until the next
-    /// open of the name).
+    /// Whether the root is still locked (tests).
+    #[cfg(test)]
+    pub(crate) fn holds_root(&self) -> bool {
+        self.root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
     fn release_root(&self) {
         drop(
             self.root

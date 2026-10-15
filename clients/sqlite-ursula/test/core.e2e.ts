@@ -94,6 +94,8 @@ class Child {
 
 	constructor(url: string, dir: string, env: NodeJS.ProcessEnv = {}) {
 		this.proc = spawn(process.execPath, [child, ext, url, dir], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, ...env } });
+		// A child that exited on its own closed its stdin: a later write fails, harmlessly.
+		this.proc.stdin?.on("error", () => {});
 		this.lines = createInterface({ input: this.proc.stdout as NodeJS.ReadableStream });
 		this.lines.on("line", (line) => {
 			const waiting = this.waiting;
@@ -114,6 +116,11 @@ class Child {
 				res(JSON.parse(l) as Record<string, unknown>);
 			};
 		});
+	}
+
+	/** The open's outcome, the first line, as it came. */
+	first(): Promise<Record<string, unknown>> {
+		return this.next();
 	}
 
 	/** The open's outcome, the first line. */
@@ -207,6 +214,33 @@ describe.skipIf(inject("ursulaServer") !== "model")("the 0.8 core on node:sqlite
 		expect(await next.rows("SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
 		await next.stop();
 		expect(await fromStream(s.url, "SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+	});
+
+	it("keeps its cache locked while a connection reopened right after a close holds it", async () => {
+		const s = stream("relock");
+		const dir = freshDir();
+		const first = open(s.url, dir);
+		const a = new DatabaseSync(first.path);
+		a.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+		a.close();
+		// Reopened at once through ursula_open: the binding is taken back, or bound anew if it
+		// retired meanwhile. Either way this process holds the cache while the connection lives.
+		const again = open(s.url, dir);
+		const b = new DatabaseSync(again.path);
+		expect(b.prepare("SELECT x FROM t").all()).toEqual([{ x: 1 }]);
+		const intruder = new Child(s.url, dir);
+		const refused = await intruder.first();
+		expect(refused.ok).toBe(false);
+		expect(String(refused.error)).toMatch(/ursula_open: in_use: /);
+		await intruder.stop();
+		b.exec("INSERT INTO t VALUES (2)");
+		expect(synced(again.path).synced).toBe(true);
+		b.close();
+		waitEvent((e) => e.event === "retired" && e.path === again.path);
+		const next = new Child(s.url, dir);
+		await next.opened();
+		expect(await next.rows("SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }]);
+		await next.stop();
 	});
 
 	it("reopens its cache in a second process: materialize, take over, reconcile", async () => {

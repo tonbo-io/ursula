@@ -10,7 +10,11 @@
 //!   default), materializes or builds its generation, takes the stream over and reconciles, and
 //!   returns `{done, path, name, state}`; connections then open `path` with plain SQLite. With
 //!   `timeout_ms` 0 it returns `{done: false, request}` at once, and `ursula_events` reports the
-//!   outcome. A database file of the extension opens only while bound.
+//!   outcome. A database file of the extension opens only while bound. After the last connection
+//!   closes, the binding drains and retires (one `ursula_open` handed out retires too if no
+//!   connection opens it within a minute), and its root unlocks. A host reopens through
+//!   `ursula_open`, which takes a retiring binding back: a plain open of the path is refused while
+//!   the binding is not live.
 //! * `SELECT ursula_synced(path, timeout_ms)` resolves once every commit logged before the call is
 //!   acknowledged and a round trip that started after it found this owner still the owner.
 //! * `SELECT ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions, resets.

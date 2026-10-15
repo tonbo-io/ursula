@@ -7,6 +7,7 @@ use crate::db::Binding;
 use crate::db::Opened;
 use crate::db::by_id;
 use crate::driver::DriverEvent;
+use crate::driver::Life;
 use crate::error::Error;
 use crate::error::reset_action;
 use crate::ids::Position;
@@ -114,7 +115,12 @@ pub(crate) fn status_json(b: &Binding) -> String {
         ("role", json_str("owner")),
         (
             "state",
-            json_str(if reset.is_some() { "reset" } else { "live" }),
+            json_str(match (reset, h.life()) {
+                (Some(_), _) => "reset",
+                (None, Life::Live) => "live",
+                (None, Life::Retiring) => "retiring",
+                (None, Life::Retired) => "retired",
+            }),
         ),
         (
             "epoch",

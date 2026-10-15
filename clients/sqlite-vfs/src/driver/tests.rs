@@ -20,9 +20,11 @@ use super::DiskIo;
 use super::DriverEvent;
 use super::EventLog;
 use super::Io;
+use super::Life;
 use super::OpenId;
 use super::SyncError;
 use super::Ticket;
+use super::UNCONNECTED_MS;
 use super::core::Core;
 use super::disk::DiskDone;
 use super::disk::DiskJob;
@@ -353,7 +355,7 @@ impl World {
 
     fn retire(&mut self, core: usize, binding: BindingId) {
         let now = self.now;
-        let ios = self.c(core).retire(binding, now);
+        let ios = self.c(core).retire_untaken(binding, now);
         self.queue_ios(core, ios);
         self.run_for(1_000);
     }
@@ -633,7 +635,7 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     w.commit(a, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    let ios = w.c(a).retire(bound.binding, now);
+    let ios = w.c(a).retire_untaken(bound.binding, now);
     w.queue_ios(a, ios);
     w.run_for(1_000);
     let generation = bound.handle.generation.clone();
@@ -656,7 +658,7 @@ fn a_reopen_without_pending_commits_catches_up_in_place() {
     assert_eq!(w.stream_commits().last(), Some(&e1));
     // Its ACKs name the caught-up records, so the next open trusts the log again.
     let now = w.now;
-    let ios = w.c(a2).retire(bound.binding, now);
+    let ios = w.c(a2).retire_untaken(bound.binding, now);
     w.queue_ios(a2, ios);
     w.run_for(1_000);
     drop(bound);
@@ -1029,7 +1031,7 @@ fn reopen_after(
     w.commit(c, &bound, 1).unwrap();
     w.run_for(1_000);
     let now = w.now;
-    let ios = w.c(c).retire(bound.binding, now);
+    let ios = w.c(c).retire_untaken(bound.binding, now);
     w.queue_ios(c, ios);
     w.run_for(1_000);
     assert!(
@@ -1187,6 +1189,8 @@ fn the_runtime_opens_replicates_and_waits_for_synced() {
             .iter()
             .any(|e| matches!(e, DriverEvent::Acked { .. }))
     );
+    // Its last connection closed.
+    bound.handle.retiring();
     driver.retire(bound.binding).unwrap();
     let mut cursor = cursor;
     let mut retired = false;
@@ -1247,8 +1251,9 @@ fn a_reopen_while_old_handles_live_is_in_use() {
     let reopened = w.open(c2, spec(dir.path(), 2));
     assert_eq!(reopened.handle.pending_bytes(), 0);
     drop(bound);
-    // A reset binding's connections may still write its generation: its root stays locked while
-    // they hold the handle.
+    // A reset binding's connections may still write its generation: its root stays locked until
+    // the last of them closes.
+    assert!(reopened.handle.connect());
     let now = w.now;
     w.c(c2)
         .reset_binding(reopened.binding, ResetKind::LocalDamage, now);
@@ -1256,9 +1261,79 @@ fn a_reopen_while_old_handles_live_is_in_use() {
     let c3 = w.core();
     let e = kind(w.open_result(c3, spec(dir.path(), 3)));
     assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
-    drop(reopened);
+    assert!(!reopened.handle.disconnect());
+    assert!(!reopened.handle.holds_root());
     let bound = w.open(c3, spec(dir.path(), 4));
     assert_eq!(bound.handle.pending_bytes(), 0);
+}
+
+// A connection or an open that takes a retiring binding back wins over the retire its last close
+// asked for: the binding stays live and keeps its root, so no other process opens the cache.
+#[test]
+fn a_binding_taken_back_before_its_retire_stays_live() {
+    let dir = TempDir::new("driver-revive");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    bound.handle.retiring();
+    assert!(bound.handle.revive());
+    let now = w.now;
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    assert_eq!(bound.handle.life(), Life::Live);
+    assert!(bound.handle.holds_root());
+    // A connection that opens between its last close and the retire: the same.
+    assert!(bound.handle.connect());
+    assert!(bound.handle.disconnect(), "the last connection");
+    assert_eq!(bound.handle.life(), Life::Retiring);
+    assert!(bound.handle.connect(), "a retiring binding is taken back");
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    assert_eq!(
+        (bound.handle.life(), bound.handle.connections()),
+        (Life::Live, 1)
+    );
+    assert!(bound.handle.holds_root());
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    // Its last connection closes: it drains, retires and unlocks the root.
+    assert!(bound.handle.disconnect());
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert!(!bound.handle.holds_root());
+    assert!(
+        !bound.handle.connect(),
+        "a retired binding opens no connection"
+    );
+}
+
+// A binding `ursula_open` handed out that no connection opens retires after `UNCONNECTED_MS`.
+#[test]
+fn a_binding_no_connection_opens_retires() {
+    let dir = TempDir::new("driver-unconnected");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let now = w.now;
+    w.c(c).unconnected(bound.binding, now);
+    w.run_for(UNCONNECTED_MS - 1_000);
+    assert_eq!(bound.handle.life(), Life::Live);
+    w.run_for(2_000);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert!(!bound.handle.holds_root());
+    // One a connection opened stays.
+    let c2 = w.core();
+    let other = w.open(c2, spec(dir.path(), 2));
+    assert!(other.handle.connect());
+    let now = w.now;
+    w.c(c2).unconnected(other.binding, now);
+    w.run_for(2 * UNCONNECTED_MS);
+    assert_eq!(other.handle.life(), Life::Live);
 }
 
 #[test]

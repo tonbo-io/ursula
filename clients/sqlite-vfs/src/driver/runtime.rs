@@ -89,6 +89,9 @@ enum Command {
         binding: BindingId,
         kind: ResetKind,
     },
+    Unconnected {
+        binding: BindingId,
+    },
     Cancel {
         open: OpenId,
     },
@@ -325,6 +328,11 @@ impl Driver {
         self.command(Command::Retire { binding })
     }
 
+    /// `ursula_open` handed the binding out: it retires unless a connection opens it soon.
+    pub(crate) fn unconnected(&self, binding: BindingId) -> Result<(), DriverGone> {
+        self.command(Command::Unconnected { binding })
+    }
+
     /// The binding's connections found it damaged: it resets `kind`.
     pub(crate) fn reset(&self, binding: BindingId, kind: ResetKind) -> Result<(), DriverGone> {
         self.command(Command::Reset { binding, kind })
@@ -542,7 +550,9 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
                 break;
             }
             for binding in retire {
-                let ios = guard::contain("driver_core", Vec::new, || core.retire(binding, now()));
+                let ios = guard::contain("driver_core", Vec::new, || {
+                    core.retire_untaken(binding, now())
+                });
                 threads.dispatch(ios);
             }
         }
@@ -602,6 +612,10 @@ fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {
         } => core.sync(ticket, binding, target, now_ms),
         Command::Boundary { binding, position } => core.boundary(binding, position, now_ms),
         Command::Retire { binding } => core.retire(binding, now_ms),
+        Command::Unconnected { binding } => {
+            core.unconnected(binding, now_ms);
+            Vec::new()
+        }
         Command::Reset { binding, kind } => {
             core.reset_binding(binding, kind, now_ms);
             Vec::new()

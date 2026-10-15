@@ -47,6 +47,7 @@ use super::Replication;
 use super::Rng;
 use super::SyncError;
 use super::Ticket;
+use super::UNCONNECTED_MS;
 use super::disk::DiskDone;
 use super::disk::DiskJob;
 use super::disk::NewBuild;
@@ -187,6 +188,9 @@ struct Binding {
     /// `synced()` calls whose target is past `last_commit`, waiting for its `Logged`.
     held: Vec<(Ticket, Position)>,
     max_pending_bytes: u64,
+    /// Since when `ursula_open` handed the binding out with no connection open: it retires
+    /// [`UNCONNECTED_MS`] later if none opened meanwhile.
+    unconnected_since: Option<u64>,
     /// The open failed while a disk job held the generation: the binding stays, its root locked
     /// and its replicator ignored, until the job returns, and the open resolves then.
     failing: Option<OpenError>,
@@ -262,7 +266,10 @@ impl Binding {
         if self.failing.is_some() {
             return None;
         }
-        let mut at = [self.wake_at, self.acks.flush_at];
+        let unconnected = self
+            .unconnected_since
+            .map(|since| since.saturating_add(UNCONNECTED_MS));
+        let mut at = [min(self.wake_at, unconnected), self.acks.flush_at];
         if let Stage::Opening {
             deadline_ms, local, ..
         } = &self.stage
@@ -473,6 +480,7 @@ impl Core {
             tickets: BTreeSet::new(),
             held: Vec::new(),
             max_pending_bytes: spec.max_pending_bytes,
+            unconnected_since: None,
             failing: None,
         });
         self.contained(binding, now_ms, |core| {
@@ -784,7 +792,7 @@ impl Core {
             Stage::Opening { open, .. } => self.opened(open, Err(OpenError::Reset(kind))),
             Stage::Bound { handle } => {
                 handle.mark_reset(kind);
-                handle.retired();
+                handle.reset_retired();
                 self.events.push(DriverEvent::Reset {
                     binding,
                     cause: kind,
@@ -900,9 +908,6 @@ impl Core {
             return;
         };
         drop(b.replicator.on(Event::Stop, now_ms));
-        if let Some(handle) = b.handle() {
-            handle.retired();
-        }
         if let Err(e) = b.write_ack(now_ms) {
             log::emit(Level::Warn, "ack_lost", &[
                 ("binding", &binding.0),
@@ -1101,6 +1106,23 @@ impl Core {
         else {
             return;
         };
+        if let (Some(since), Stage::Bound { handle }) = (b.unconnected_since, &b.stage)
+            && (handle.connections() > 0 || now_ms >= since.saturating_add(UNCONNECTED_MS))
+        {
+            b.unconnected_since = None;
+            // `retiring` leaves a binding a connection opened alone.
+            handle.retiring();
+            self.settle(binding, now_ms);
+            let Some(b) = self.bindings.get_mut(&binding) else {
+                return;
+            };
+            if b.failing.is_some() {
+                return;
+            }
+        }
+        let Some(b) = self.bindings.get_mut(&binding) else {
+            return;
+        };
         if let Stage::Opening {
             deadline_ms, local, ..
         } = &mut b.stage
@@ -1223,8 +1245,9 @@ impl Core {
         ios
     }
 
-    /// The binding's last connection closed: it drains, then retires, unless a new open revives
-    /// it first ([`BindingHandle::revive`]). Its root unlocks once the last handle drops.
+    /// The binding's last connection closed ([`BindingHandle::disconnect`] marked it retiring): it
+    /// drains, then retires, unless a connection or an open takes it back first. A stale call, after
+    /// one did, changes nothing.
     pub(crate) fn retire(&mut self, binding: BindingId, now_ms: u64) -> Vec<Io> {
         if let Some(b) = self.bindings.get(&binding) {
             match &b.stage {
@@ -1232,11 +1255,30 @@ impl Core {
                     self.fail_open(binding, OpenError::Cancelled);
                     return Vec::new();
                 }
-                Stage::Bound { handle } => handle.retiring(),
+                // Its last connection closed and marked it retiring: it retires once drained,
+                // unless a connection or an open takes it back first.
+                Stage::Bound { .. } => {}
             }
         }
         self.settle(binding, now_ms);
         Vec::new()
+    }
+
+    /// `ursula_open` handed the binding out: it retires [`UNCONNECTED_MS`] from now unless a
+    /// connection opens it meanwhile, so an open whose caller never connects does not hold the
+    /// root for good.
+    pub(crate) fn unconnected(&mut self, binding: BindingId, now_ms: u64) {
+        if let Some(b) = self.bindings.get_mut(&binding) {
+            b.unconnected_since = Some(now_ms);
+        }
+    }
+
+    /// A binding no connection holds (an open's result nobody took) drains, then retires.
+    pub(crate) fn retire_untaken(&mut self, binding: BindingId, now_ms: u64) -> Vec<Io> {
+        if let Some(Stage::Bound { handle }) = self.bindings.get(&binding).map(|b| &b.stage) {
+            handle.retiring();
+        }
+        self.retire(binding, now_ms)
     }
 
     /// The binding's connections found it damaged (an unconfirmed commit, a failed fsync, a panic):
@@ -1252,7 +1294,7 @@ impl Core {
             if let Ok(bound) = result {
                 let binding = bound.binding;
                 drop(bound);
-                return self.retire(binding, now_ms);
+                return self.retire_untaken(binding, now_ms);
             }
             return Vec::new();
         }

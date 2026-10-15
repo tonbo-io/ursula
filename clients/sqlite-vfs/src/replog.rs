@@ -110,6 +110,14 @@ pub(crate) enum LogError {
         #[source]
         cut: std::io::Error,
     },
+    /// An append's write failed and was cut back: the log ends at the record before, as if
+    /// nothing was appended. The only failure after which the log takes appends as before.
+    #[error("log segment {}: an append failed and was cut back: {source}", .path.display())]
+    CutBack {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("log {}: refused after a failed cut", .dir.display())]
     Broken { dir: PathBuf },
 }
@@ -210,6 +218,9 @@ pub(crate) struct Log {
     /// Test hook: the next directory fsync in a trim fails, after its unlink succeeded.
     #[cfg(test)]
     pub(crate) fail_next_trim_fsync: bool,
+    /// Test hook: the next roll leaves a partial segment and fails.
+    #[cfg(test)]
+    pub(crate) fail_next_roll: bool,
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> LogError {
@@ -318,6 +329,8 @@ impl Log {
             fail_next_unlink: false,
             #[cfg(test)]
             fail_next_trim_fsync: false,
+            #[cfg(test)]
+            fail_next_roll: false,
         })
     }
 
@@ -514,6 +527,8 @@ impl Log {
             fail_next_unlink: false,
             #[cfg(test)]
             fail_next_trim_fsync: false,
+            #[cfg(test)]
+            fail_next_roll: false,
         };
         Ok((log, recovered))
     }
@@ -555,8 +570,7 @@ impl Log {
         if let Err(write) = self.write_at_end(&bytes) {
             self.dirty = true;
             return Err(match self.file.set_len(self.len) {
-                Ok(()) => LogError::Io {
-                    op: "append to",
+                Ok(()) => LogError::CutBack {
                     path,
                     source: write,
                 },
@@ -613,7 +627,33 @@ impl Log {
             first: self.next,
             path: segment_path(&self.dir, self.next),
         };
-        let (file, header_len, seed) = write_segment(&segment.path, &h)?;
+        // A roll that failed before left at most this segment, which no record went into: it goes,
+        // so one failure (`ENOSPC`, say) does not refuse every later roll.
+        match fs::remove_file(&segment.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io("remove", &segment.path)(e)),
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_roll) {
+            fs::write(&segment.path, b"USL1").map_err(io("write", &segment.path))?;
+            return Err(io("write", &segment.path)(std::io::Error::other(
+                "injected roll failure",
+            )));
+        }
+        let written = write_segment(&segment.path, &h);
+        let (file, header_len, seed) = match written {
+            Ok(written) => written,
+            Err(e) => {
+                if let Err(left) = fs::remove_file(&segment.path) {
+                    crate::log::emit(crate::log::Level::Warn, "log_roll_leftover", &[
+                        ("segment", &segment.path.display()),
+                        ("error", &left),
+                    ]);
+                }
+                return Err(e);
+            }
+        };
         sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
         self.file = file;
         self.len = header_len;

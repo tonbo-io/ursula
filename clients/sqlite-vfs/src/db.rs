@@ -53,6 +53,10 @@ pub(crate) struct Binding {
     pub(crate) path: String,
     pub(crate) url: String,
     state: Mutex<Commit>,
+    /// The crc32c of every WAL page this process wrote in the WAL's current generation, by file
+    /// offset: a page read back with other bytes was lost on its way to the disk. Under a lock of
+    /// its own, so WAL reads never wait behind the commit path's fsyncs. Taken after `state`.
+    pub(crate) wal_written: Mutex<BTreeMap<i64, u32>>,
     /// Signalled whenever an undecided commit is decided, or the binding resets.
     decided: Condvar,
 }
@@ -70,8 +74,6 @@ pub(crate) struct Commit {
     pub(crate) exclusive: usize,
     /// Open WAL handles.
     pub(crate) wal_open: usize,
-    /// Open main db handles.
-    pub(crate) connections: usize,
     /// The checkpoint in progress (checkpoint lock held), and whether it wrote a db page yet.
     pub(crate) checkpoint: Option<(Instant, bool)>,
     /// Main db handles whose logged commit is undecided (design §4.2), by address.
@@ -79,9 +81,6 @@ pub(crate) struct Commit {
     /// The last commit SQLite published (PHASETWO), and the last BASE record written.
     pub(crate) confirmed: Position,
     pub(crate) based: Position,
-    /// The crc32c of every WAL page this process wrote in the WAL's current generation, by file
-    /// offset: a page read back with other bytes was lost on its way to the disk.
-    pub(crate) wal_written: BTreeMap<i64, u32>,
     /// The latest write refused, until a commit is logged.
     pub(crate) refused: Option<WriteRefusal>,
     pub(crate) stats: Stats,
@@ -113,6 +112,12 @@ impl Binding {
             .0
     }
 
+    pub(crate) fn wal_written(&self) -> MutexGuard<'_, BTreeMap<i64, u32>> {
+        self.wal_written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn notify_decided(&self) {
         self.decided.notify_all();
     }
@@ -140,26 +145,13 @@ impl Binding {
 
     /// A main db handle opened: a retiring binding is taken back. False once it retired.
     pub(crate) fn connect(&self) -> bool {
-        if !self.handle.revive() {
-            return false;
-        }
-        let mut c = self.lock();
-        c.connections = c.connections.saturating_add(1);
-        true
+        self.handle.connect()
     }
 
     /// A main db handle closed: after the last one, the binding drains and retires.
     pub(crate) fn disconnect(&self) {
-        let last = {
-            let mut c = self.lock();
-            c.connections = c.connections.saturating_sub(1);
-            c.connections == 0
-        };
-        if last {
-            self.handle.retiring();
-            if driver().retire(self.id).is_err() {
-                log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
-            }
+        if self.handle.disconnect() && driver().retire(self.id).is_err() {
+            log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
         }
     }
 }
@@ -223,6 +215,7 @@ pub(crate) fn open(
         let mut reg = registry();
         if let Some(b) = reg.names.get(name.as_str()).cloned() {
             if b.reset_kind().is_none() && b.handle.revive() {
+                handed_out(&b);
                 return Ok(Opened::Bound(b));
             }
             // Reset, or retired: a new open (refused `in_use` while old handles hold its root).
@@ -313,17 +306,27 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
             based: at_bind,
             ..Commit::default()
         }),
+        wal_written: Mutex::new(BTreeMap::new()),
         decided: Condvar::new(),
     });
     let mut reg = registry();
     reg.names
         .insert(handle.name.as_str().to_owned(), Arc::clone(&b));
     reg.paths.insert(path, Arc::clone(&b));
+    drop(reg);
     log::emit(Level::Info, "open", &[
         ("file", &b.path),
         ("stream", &b.url),
     ]);
+    handed_out(&b);
     Ok(b)
+}
+
+/// `ursula_open` hands `b` out: unless a connection opens it soon, it retires again.
+fn handed_out(b: &Binding) {
+    if driver().unconnected(b.id).is_err() {
+        log::emit(Level::Error, "driver_gone", &[("file", &b.path)]);
+    }
 }
 
 /// `ursula_cancel(request)`: gives up an open in progress. One that bound meanwhile and was not
@@ -431,6 +434,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
         path,
         url: "https://h/v1/stream/db".into(),
         state: Mutex::new(Commit::default()),
+        wal_written: Mutex::new(BTreeMap::new()),
         decided: Condvar::new(),
     })
 }

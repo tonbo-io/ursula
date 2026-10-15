@@ -455,7 +455,7 @@ unsafe fn x_read(
     // A page this process wrote that reads back other bytes was lost on its way to the disk (a
     // write-back error, after which the kernel dropped the dirty page): SQLite does not check WAL
     // frames on a read, so commits built on it would log the damage.
-    let lost = lost_page(&ext.binding.lock().wal_written, data, off);
+    let lost = lost_page(&ext.binding.wal_written(), data, off);
     if let Some(at) = lost {
         ext.binding.reset(
             ResetKind::LocalDamage,
@@ -577,23 +577,23 @@ unsafe fn wal_write(file: *mut ffi::sqlite3_file, b: &Binding, data: &[u8], off:
         if rc != OK {
             return rc;
         }
-        c.wal_written.clear();
+        b.wal_written().clear();
     }
     if let Some(point) = point {
         // SAFETY: the caller's contract.
         return unsafe { commit(file, b, c, point, data, off) };
     }
-    forward(file, &mut c, data, off)
+    forward(file, b, data, off)
 }
 
 /// Forwards a WAL write and records the crc32c of a page written.
-fn forward(file: *mut ffi::sqlite3_file, c: &mut Commit, data: &[u8], off: i64) -> c_int {
+fn forward(file: *mut ffi::sqlite3_file, b: &Binding, data: &[u8], off: i64) -> c_int {
     let Ok(amt) = c_int::try_from(data.len()) else {
         return ffi::SQLITE_IOERR_WRITE;
     };
     let rc = fwd!(file, xWrite, data.as_ptr().cast::<c_void>(), amt, off);
     if rc == OK && data.len() == PAGE && page_at(off) {
-        c.wal_written.insert(off, crc32c::crc32c(data));
+        b.wal_written().insert(off, crc32c::crc32c(data));
     }
     rc
 }
@@ -741,8 +741,9 @@ unsafe fn commit(
     let log_time = logging.elapsed();
     let position = match appended {
         Ok(position) => position,
-        // The record was cut back: the transaction fails alone, nothing logged.
-        Err(e @ LogError::Io { .. }) => {
+        // The record was cut back: the transaction fails alone, nothing logged. Anything else (a
+        // failed roll, a failed cut) may have left the log changed: the binding resets.
+        Err(e @ LogError::CutBack { .. }) => {
             log::emit(Level::Warn, "log_write_failed", &[
                 ("file", &b.path),
                 ("error", &e),
@@ -778,7 +779,7 @@ unsafe fn commit(
         state.set(after);
         settle(b, &mut c, writer, after, verdict);
     }
-    let rc = forward(file, &mut c, page, off);
+    let rc = forward(file, b, page, off);
     abort_at(Step::Forward);
     c.stats.commit(CommitStat {
         bytes,
@@ -822,7 +823,7 @@ unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> 
             return rc;
         }
     }
-    c.wal_written
+    b.wal_written()
         .retain(|&o, _| o.saturating_add(PAGE_BYTES) <= size);
     fwd!(file, xTruncate, size)
 }

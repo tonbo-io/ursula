@@ -185,8 +185,14 @@ jobs:
           cargo test --locked --release
 
   sqlite-vfs-e2e:
-    name: sqlite-vfs e2e (model server)
+    name: sqlite-vfs e2e (model server, Node ${{ matrix.node }})
     needs: [sqlite-vfs]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.19.0 is the oldest Node the package supports, whose SQLite (3.50.4) is the extension's
+        # floor: the PHASETWO scenarios run there and on the latest 22.
+        node: ["22.19.0", "22"]
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     timeout-minutes: 30
     steps:
@@ -200,7 +206,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
 
       - name: Download the extension and the model server
         uses: actions/download-artifact@v7
