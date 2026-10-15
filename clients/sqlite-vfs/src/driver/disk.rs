@@ -50,8 +50,12 @@ pub(crate) struct NewBuild {
 
 #[derive(Debug)]
 pub(crate) enum DiskJob {
-    /// An open's local steps ([`prepare`]).
-    Prepare(OpenSpec),
+    /// An open's local steps ([`prepare`]), in `root` when a reset binding of the process still
+    /// holds the stream's root.
+    Prepare {
+        spec: OpenSpec,
+        root: Option<Arc<Root>>,
+    },
     NewBuild(NewBuild),
     /// The latest snapshot's body into a build; done as a [`DiskDone::Chunk`].
     Install {
@@ -111,7 +115,7 @@ pub(crate) fn caught_up(m: &Materialized) -> (Position, u64) {
 impl DiskJob {
     pub(crate) fn run(self) -> DiskDone {
         match self {
-            Self::Prepare(spec) => DiskDone::Prepared(prepare(&spec)),
+            Self::Prepare { spec, root } => DiskDone::Prepared(prepare(&spec, root)),
             Self::NewBuild(job) => DiskDone::Built(new_build(job).map(Box::new)),
             Self::Install { mut build, body } => {
                 let result = build.install(&body);

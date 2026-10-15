@@ -99,6 +99,7 @@ use crate::publication::Verdict;
 use crate::publication::phase_two_reply;
 use crate::replicator::Pending;
 use crate::replicator::ResetKind;
+use crate::replog::Log;
 use crate::replog::LogError;
 use crate::stats::CommitStat;
 
@@ -790,6 +791,23 @@ unsafe fn base(b: &Binding, c: &mut Commit, before: &'static str) -> c_int {
     OK
 }
 
+/// The binding's log, for the commit point to append to: refused once the binding reset. The
+/// reset is checked under the log's lock (G8), and the driver takes that lock after it marks a
+/// reset, so no commit lands in the log once an open may copy the generation (design §5.6).
+fn commit_log(b: &Binding) -> Result<MutexGuard<'_, Log>, c_int> {
+    let log = match b.handle.log() {
+        Ok(log) => log,
+        Err(e) => {
+            b.reset(ResetKind::Internal, &e);
+            return Err(ffi::SQLITE_IOERR_WRITE);
+        }
+    };
+    if b.reset_kind().is_some() {
+        return Err(ffi::SQLITE_IOERR_WRITE);
+    }
+    Ok(log)
+}
+
 /// The commit point (design §4.1): capture, encode, log, hand to the driver, forward.
 ///
 /// # Safety
@@ -860,12 +878,9 @@ unsafe fn commit(
     };
     let raw = record.pages.len().saturating_mul(PAGE);
     let pages = record.pages.len();
-    let mut log = match b.handle.log() {
+    let mut log = match commit_log(b) {
         Ok(log) => log,
-        Err(e) => {
-            b.reset(ResetKind::Internal, &e);
-            return ffi::SQLITE_IOERR_WRITE;
-        }
+        Err(rc) => return rc,
     };
     let id = CommitId {
         lineage: b.handle.generation.lineage,

@@ -2333,7 +2333,7 @@ fn a_sync_ahead_of_its_logged_waits_for_it() {
 }
 
 #[test]
-fn a_reopen_while_old_handles_live_is_in_use() {
+fn a_reopen_while_old_handles_live_builds_from_a_copy() {
     // A binding that retired drained with no connection left: its root unlocks at once, though
     // the registry may still hold the handle.
     let dir = TempDir::new("driver-old-handles");
@@ -2352,19 +2352,77 @@ fn a_reopen_while_old_handles_live_is_in_use() {
     let reopened = w.open(c2, spec(dir.path(), 2));
     assert_eq!(reopened.handle.pending_bytes(), 0);
     drop(bound);
-    // A reset binding's connections may still write its generation: its root stays locked until
-    // the last of them closes.
+    // A commit stays pending while the stream is down, then a reset finds the binding with a
+    // connection open, which may still read its generation.
+    w.down[c2] = true;
+    let pending = w.commit(c2, &reopened, 2).unwrap();
+    w.run_for(1_000);
     let now = w.now;
     w.c(c2)
         .reset_binding(reopened.binding, ResetKind::LocalDamage, now);
     assert_eq!(reopened.handle.reset(), Some(ResetKind::LocalDamage));
+    assert!(reopened.handle.holds_root());
+    let old = reopened.handle.generation.clone();
+    w.down[c2] = false;
+    // Another process is refused while the connection holds the root.
     let c3 = w.core();
     let e = kind(w.open_result(c3, spec(dir.path(), 3)));
     assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    // This process opens again beside it, from a copy of its generation: same lineage, another
+    // directory, the pending commit carried and sent.
+    let copy = w.open(c2, spec(dir.path(), 2));
+    assert_eq!(copy.handle.generation.lineage, old.lineage);
+    assert_ne!(copy.handle.generation.id, old.id);
+    assert!(!old.dir.exists(), "the original is trashed");
+    let ticket = w.sync(c2, copy.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c2, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits().last(), Some(&pending));
+    assert_eq!(
+        copy.handle.last_commit(),
+        reopened.handle.last_commit(),
+        "the copy's last commit is the one carried"
+    );
+    // The old connection closes: its root and hold go, and the new binding still holds the root.
     assert!(!reopened.handle.disconnect());
     assert!(!reopened.handle.holds_root());
+    let e = kind(w.open_result(c3, spec(dir.path(), 3)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    w.retire(c2, &copy);
     let bound = w.open(c3, spec(dir.path(), 4));
     assert_eq!(bound.handle.pending_bytes(), 0);
+    assert_eq!(bound.handle.generation.id, copy.handle.generation.id);
+}
+
+// A reset its connections marked, which the core has not heard of yet, is carried out before an
+// open of the stream copies the generation: the open never runs beside a binding the core still
+// drives.
+#[test]
+fn a_reopen_carries_out_a_reset_the_core_has_not_heard_of() {
+    let dir = TempDir::new("driver-reset-unheard");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    // The commit path marks the reset, and its message to the driver is still on its way.
+    assert!(bound.handle.mark_reset(ResetKind::LocalDamage));
+    let copy = w.open(c, spec(dir.path(), 1));
+    assert!(
+        w.events(c).iter().any(
+            |e| matches!(e, DriverEvent::Reset { binding, cause: ResetKind::LocalDamage } if *binding == bound.binding)
+        )
+    );
+    assert_ne!(copy.handle.generation.id, bound.handle.generation.id);
+    assert_eq!(
+        copy.handle.generation.lineage,
+        bound.handle.generation.lineage
+    );
+    // The message arrives: the binding is gone, nothing happens.
+    let now = w.now;
+    w.c(c)
+        .reset_binding(bound.binding, ResetKind::LocalDamage, now);
+    assert_eq!(copy.handle.reset(), None);
 }
 
 // A connection or an open that takes a retiring binding back wins over the retire its last close
@@ -2748,7 +2806,7 @@ fn tombstone_at_open(hold: fn(&DiskJob) -> bool, ending: Ending) {
     w.queue_ios(a, ios);
     w.run_for(1_000);
     assert_eq!(w.held.len(), 1, "{ending:?}: the job runs");
-    let prepared = !matches!(w.held[0].1.job, DiskJob::Prepare(_));
+    let prepared = !matches!(w.held[0].1.job, DiskJob::Prepare { .. });
     match ending {
         Ending::Cancel => {
             let now = w.now;
@@ -2786,7 +2844,7 @@ fn tombstone_at_open(hold: fn(&DiskJob) -> bool, ending: Ending) {
 #[test]
 fn an_open_ending_during_prepare_resolves_once_the_job_returned() {
     for ending in [Ending::Cancel, Ending::Deadline] {
-        tombstone_at_open(|job| matches!(job, DiskJob::Prepare(_)), ending);
+        tombstone_at_open(|job| matches!(job, DiskJob::Prepare { .. }), ending);
     }
 }
 

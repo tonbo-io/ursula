@@ -6,7 +6,9 @@
 //! whose logged commits are undecided, the last logged, confirmed and based positions, the
 //! WAL-write bookkeeping and the measurements. The reset lives in the driver's
 //! [`BindingHandle`], read without the mutex. After its last connection closes the binding drains
-//! and retires, unless an open takes it back first ([`BindingHandle::revive`]).
+//! and retires, unless an open takes it back first ([`BindingHandle::revive`]). A reset binding
+//! leaves the registry at the next open of its stream, which binds anew beside the connections
+//! still open on it: they keep their generation's files, and the new binding works on a copy.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -293,7 +295,8 @@ pub(crate) fn open(
                     handed_out(&b);
                     return Ok(Opened::Bound(b));
                 }
-                // Reset, or retired: a new open (refused `in_use` while old handles hold its root).
+                // Reset, or retired: a new open. Beside a reset binding's open connections it shares
+                // their root and builds from a copy of their generation (design §5.6).
                 reg.names.remove(name.as_str());
                 reg.paths.remove(&b.path);
             }
@@ -406,10 +409,9 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     };
     let db = handle.generation.db();
     let path = full_pathname(&db.to_string_lossy()).map_err(|e| refuse(e.into()))?;
-    let at_bind = match handle.log() {
-        Ok(log) => Position(log.next_position().0.saturating_sub(1)),
-        Err(_poisoned) => return Err(refuse(Error::Reset(ResetKind::Internal))),
-    };
+    // Every commit the log holds at bind is published: `confirmed` starts at the last one, as
+    // `logged` does, not at the log's last record (an ACK, a CLAIM or a BASE may follow it).
+    let at_bind = handle.last_commit();
     let b = Arc::new(Binding {
         id: binding,
         handle: Arc::clone(&handle),

@@ -714,7 +714,9 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
 }
 
 /// Appends ACK(`k`, `offset`) and fsyncs the log, before the snapshot of `k` is published. A
-/// failure resets the binding `local_damage`.
+/// failure resets the binding `local_damage`. The reset is checked under the log's lock, as the
+/// commit point checks it (G8): an open that copies the generation after a reset finds every ACK
+/// a published snapshot relies on in the copy.
 fn durable_ack(
     b: &Binding,
     k: Position,
@@ -722,10 +724,8 @@ fn durable_ack(
     log_bytes: u64,
 ) -> Result<(), SnapshotFailure> {
     let commits = b.lock();
-    if b.reset_kind().is_some() {
-        return Err(SnapshotFailure::Reset);
-    }
     let written = match b.handle.log() {
+        Ok(_) if b.reset_kind().is_some() => return Err(SnapshotFailure::Reset),
         // Never lower the log's ACK: one at or past `k` only needs its fsync.
         Ok(mut log) if log.acked() >= k => log.sync(),
         Ok(mut log) => log

@@ -2,9 +2,12 @@
 //! runs it as a step machine: every request and every disk job goes out through the core, and
 //! their outcomes come back to [`Opening::answered`] and [`Opening::disk_done`].
 //!
-//! The first disk job ([`prepare`]) takes the stream's root lock (`in_use`), finishes what a crash
-//! left, and materializes the current generation when there is one (a gap under valid checksums
-//! is `internal`). A generation whose db file is not its own, or whose log's first segment header
+//! The first disk job ([`prepare`]) takes the stream's root lock (`in_use` when another process
+//! holds it), or shares the root a reset binding of this process still holds, finishes what a
+//! crash left, and materializes the current generation when there is one (a gap under valid
+//! checksums is `internal`). A generation the connections of a reset binding still hold is never
+//! materialized under them: the open copies it, publishes the copy in its place and materializes
+//! the copy ([`Root::copy`], design §5.6). A generation whose db file is not its own, or whose log's first segment header
 //! is unreadable, is left as found and salvaged as `replaced` by the build that replaces it. Then
 //! a HEAD without a precondition decides, before any claim, by the table of design §5.5
 //! ([`table::decide`]): it creates the stream, builds a generation from the latest snapshot and the
@@ -240,7 +243,7 @@ pub(crate) enum LocalSetup {
 pub(crate) enum OpenError {
     #[error("invalid_url: {0}")]
     InvalidUrl(#[from] PathError),
-    #[error("in_use: {}: another process, or a connection of this one, holds the stream's local files", .root.display())]
+    #[error("in_use: {}: another process holds the stream's local files", .root.display())]
     InUse { root: PathBuf },
     #[error("local_setup: {0}")]
     LocalSetup(#[source] LocalSetup),
@@ -969,6 +972,13 @@ pub(crate) struct Prepared {
     found: Found,
 }
 
+impl Prepared {
+    /// The stream's root, locked.
+    pub(crate) fn root(&self) -> &Arc<Root> {
+        &self.root
+    }
+}
+
 /// Whether the db file in `dir` starts with SQLite's magic.
 fn plain_db(dir: &Path) -> bool {
     let mut head = [0u8; marker::LEN];
@@ -977,23 +987,44 @@ fn plain_db(dir: &Path) -> bool {
         .is_ok_and(|()| head == marker::SQLITE_MAGIC)
 }
 
-/// Disk job: locks the root, finishes leftovers and materializes the current generation, unless
-/// it is replaced (its db file not its own, its log's first segment header unreadable), which is
-/// left as found.
-pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
-    let name = canonical_path(&spec.url)?;
-    let root = Root::lock(&spec.dir, &name).map_err(|e| match e {
-        GenerationError::InUse { root } => OpenError::InUse { root },
-        other => local(other),
-    })?;
-    prepare_locked(Arc::new(root), spec)
+/// Disk job: locks the root (unless `root`, the one a reset binding of this process still holds,
+/// is given), finishes leftovers and materializes the current generation, unless it is replaced
+/// (its db file not its own, its log's first segment header unreadable), which is left as found.
+pub(crate) fn prepare(spec: &OpenSpec, root: Option<Arc<Root>>) -> Result<Prepared, OpenError> {
+    let root = match root {
+        Some(root) => root,
+        None => {
+            let name = canonical_path(&spec.url)?;
+            let root = Root::lock(&spec.dir, &name).map_err(|e| match e {
+                GenerationError::InUse { root } => OpenError::InUse { root },
+                other => local(other),
+            })?;
+            Arc::new(root)
+        }
+    };
+    prepare_locked(root, spec)
 }
 
-/// [`prepare`] in a root this open holds locked already.
+/// [`prepare`] in a root this open holds locked already. A current generation that a reset
+/// binding's connections still hold is copied first, and the copy published in its place.
 pub(crate) fn prepare_locked(root: Arc<Root>, spec: &OpenSpec) -> Result<Prepared, OpenError> {
     let name = canonical_path(&spec.url)?;
     root.finish_leftovers().map_err(local)?;
-    let found = match root.current_or_unreadable().map_err(local)? {
+    let current = match root.current_or_unreadable().map_err(local)? {
+        Some(Ok(generation)) if root.held(&generation) => {
+            let copy = root
+                .copy(&generation)
+                .and_then(|building| building.publish(Fate::Trash))
+                .map_err(local)?;
+            log::emit(Level::Info, "generation_copied", &[
+                ("from", &generation.dir.display()),
+                ("to", &copy.dir.display()),
+            ]);
+            Some(Ok(copy))
+        }
+        current => current,
+    };
+    let found = match current {
         None => Local::None,
         Some(Err(unreadable)) => {
             log::emit(Level::Warn, "generation_replaced", &[
@@ -1213,13 +1244,17 @@ fn create_request() -> Request {
 }
 
 impl Opening {
-    /// Starts with the local steps, a disk job.
-    pub(crate) fn start(spec: OpenSpec, now_ms: u64) -> OpenStep {
+    /// Starts with the local steps, a disk job, in `root` when a reset binding of this process
+    /// still holds the stream's root.
+    pub(crate) fn start(spec: OpenSpec, root: Option<Arc<Root>>, now_ms: u64) -> OpenStep {
         let name = match canonical_path(&spec.url) {
             Ok(name) => name,
             Err(e) => return OpenStep::Fail(e.into()),
         };
-        let job = DiskJob::Prepare(spec.clone());
+        let job = DiskJob::Prepare {
+            spec: spec.clone(),
+            root,
+        };
         OpenStep::Disk {
             opening: Box::new(Self {
                 deadline_ms: now_ms.saturating_add(spec.timeout_ms),
@@ -1238,6 +1273,10 @@ impl Opening {
 
     pub(crate) fn url(&self) -> &str {
         &self.spec.url
+    }
+
+    pub(crate) fn name(&self) -> &CanonicalPath {
+        &self.name
     }
 
     pub(crate) fn deadline_ms(&self) -> u64 {

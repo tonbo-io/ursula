@@ -76,7 +76,9 @@ const byAbort = new WeakSet<object>();
  * Opens the database a stream holds and makes this process its owner: the first open of a stream in
  * the process binds it, catches the local cache up and claims the stream (fencing every earlier
  * owner). Later opens of it in the process return another connection on the same binding, with no
- * network. Concurrent opens share one bind and its outcome. Worker threads call `open` too.
+ * network. Concurrent opens share one bind and its outcome. Worker threads call `open` too. After a
+ * reset, an open binds anew at once, beside the reset database's connections: it works on a copy of
+ * their local cache, and only another process gets `in_use`.
  *
  * Returns a node:sqlite `DatabaseSync` (a subclass, {@link UrsulaDatabase}), which any library that
  * takes one takes. Statements are local: commit, then `await db.synced()` before anything outside the

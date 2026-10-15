@@ -41,6 +41,7 @@ use ursula_headers::Offset;
 use self::disk::DiskJob;
 use crate::generation::CanonicalPath;
 use crate::generation::Generation;
+use crate::generation::Hold;
 use crate::generation::Root;
 use crate::ids::Position;
 use crate::open::OpenError;
@@ -129,10 +130,11 @@ pub(crate) enum SyncError {
 
 /// A bound database's state that its connections share with the driver: the generation, the log
 /// the commit path appends to, the pending bytes admission reads (design §4.4), the reset the
-/// connections refuse their work on, what status reports of the replicator, and the root's lock.
-/// The lock is released when the binding retires with no connection left, and otherwise (a reset)
-/// only when the last handle drops. So a reopen while old handles live is refused `in_use` and
-/// never materializes a generation they still write (M2 builds it a copy instead).
+/// connections refuse their work on, what status reports of the replicator, the root and a hold
+/// on the generation. Both are released when the binding retires with no connection left, and
+/// otherwise (a reset) when its last connection closes. Until then the root stays locked against
+/// other processes, and a reopen in this process shares it and builds from a copy of the held
+/// generation, never materializing the files the old connections still read (design §5.6).
 #[derive(Debug)]
 pub(crate) struct BindingHandle {
     pub(crate) generation: Generation,
@@ -154,13 +156,16 @@ pub(crate) struct BindingHandle {
     reset: AtomicU8,
     life: Mutex<Lifecycle>,
     replication: Mutex<Replication>,
-    /// Released when the binding retires with no connection left; otherwise with the last handle.
-    root: Mutex<Option<Arc<Root>>>,
+    /// The root and the hold on the generation: released when the binding retires with no
+    /// connection left, or when the last connection of a reset binding closes.
+    root: Mutex<Option<(Arc<Root>, Hold)>>,
     /// The snapshot thread's wake-up, the receipts of its boundaries and its status.
     pub(crate) snapshots: Snapshots,
     /// Where the open got the local database.
     pub(crate) attach: Attach,
-    /// The root's salvages, read once: none come or go while the binding holds the root's lock.
+    /// The root's salvages, read once while the binding is live: only an open of the stream
+    /// salvages, and none runs beside a live binding of it in this process, nor in another while
+    /// the root is locked. A reopen beside a reset binding may, so a reset binding lists them anew.
     salvage: OnceLock<Arc<[Salvaged]>>,
 }
 
@@ -223,6 +228,7 @@ pub(crate) struct LogPoisoned;
 
 impl BindingHandle {
     pub(crate) fn new(bind: Bind, root: Arc<Root>) -> Self {
+        let hold = root.hold(&bind.generation);
         Self {
             generation: bind.generation,
             name: bind.name,
@@ -241,7 +247,7 @@ impl BindingHandle {
             }),
             replication: Mutex::new(Replication::default()),
             last_commit: AtomicU64::new(0),
-            root: Mutex::new(Some(root)),
+            root: Mutex::new(Some((root, hold))),
             snapshots: Snapshots::default(),
             attach: bind.attach,
             salvage: OnceLock::new(),
@@ -250,11 +256,15 @@ impl BindingHandle {
 
     /// The salvages of the root the binding's generation is in (`status().salvage`).
     pub(crate) fn salvage(&self) -> Result<Arc<[Salvaged]>, SalvageError> {
-        if let Some(listed) = self.salvage.get() {
+        let reset = self.reset().is_some();
+        if !reset && let Some(listed) = self.salvage.get() {
             return Ok(Arc::clone(listed));
         }
         let dir = &self.generation.dir;
         let listed: Arc<[Salvaged]> = salvage::list(dir.parent().unwrap_or(dir))?.into();
+        if reset {
+            return Ok(listed);
+        }
         Ok(Arc::clone(self.salvage.get_or_init(|| listed)))
     }
 
@@ -398,7 +408,8 @@ impl BindingHandle {
     }
 
     /// A connection closed. True when it was the last of a live binding, which now retires once
-    /// drained (the driver hears of it). The last one of a reset binding unlocks its root.
+    /// drained (the driver hears of it). The last one of a reset binding releases its root and
+    /// its hold on the generation.
     pub(crate) fn disconnect(&self) -> bool {
         let mut l = self.life_lock();
         l.connections = l.connections.saturating_sub(1);
@@ -464,7 +475,7 @@ impl BindingHandle {
         retiring
     }
 
-    /// The binding reset: it retires at once. With no connection open its root unlocks now,
+    /// The binding reset: it retires at once. With no connection open its root and hold go now,
     /// otherwise when the last one closes.
     fn reset_retired(&self) {
         let mut l = self.life_lock();
@@ -474,7 +485,7 @@ impl BindingHandle {
         }
     }
 
-    /// Whether the root is still locked (tests).
+    /// Whether the binding still holds the root and its generation (tests).
     #[cfg(test)]
     pub(crate) fn holds_root(&self) -> bool {
         self.root
@@ -581,7 +592,8 @@ pub(crate) enum DriverEvent {
     /// A ticket that failed alone: its commits were abandoned by a takeover, or its binding was
     /// not bound. A reset fails a binding's tickets with its [`DriverEvent::Reset`] instead.
     SyncFailed { ticket: Ticket, error: SyncError },
-    /// The binding is gone from the driver. Its root unlocks once the last handle drops.
+    /// The binding is gone from the driver. Its root and its hold on the generation go once its
+    /// last connection closes.
     Retired { binding: BindingId },
     /// `dropped` events fell out of the bounded queue before this reader saw them.
     Gap { dropped: u64 },

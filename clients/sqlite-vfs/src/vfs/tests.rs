@@ -21,6 +21,7 @@ use super::WalName;
 use super::c_access;
 use super::c_delete;
 use super::c_open;
+use super::commit_log;
 use super::failed_open;
 use super::lost_page;
 use super::uwal;
@@ -687,6 +688,27 @@ fn a_reset_refuses_new_reads_and_every_write() {
     drop(unsafe { Box::from_raw(main.ext) });
     // SAFETY: as above.
     drop(unsafe { Box::from_raw(wal.ext) });
+}
+
+// The commit point checks the reset under the log's lock (G8): a commit waiting for the lock while
+// the binding resets is refused once it takes it, and appends nothing, so no commit lands in a log
+// an open may be copying. A live binding's commit gets the log.
+#[test]
+fn a_commit_after_a_reset_is_refused_under_the_log_lock() {
+    let dir = TempDir::new("vfs-commit-reset");
+    let b = for_tests(dir.path());
+    let next = commit_log(&b).map(|log| log.next_position()).unwrap();
+    let held = b.handle.log().unwrap();
+    let waiting = {
+        let b = Arc::clone(&b);
+        std::thread::spawn(move || commit_log(&b).map(|log| log.next_position()))
+    };
+    // The commit is blocked on the lock (or not there yet: refused all the same).
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    b.reset(ResetKind::Fenced, &"test");
+    drop(held);
+    assert_eq!(waiting.join().unwrap(), Err(ffi::SQLITE_IOERR_WRITE));
+    assert_eq!(b.handle.log().unwrap().next_position(), next);
 }
 
 // A WAL write without the WAL write lock (EXCLUSIVE locking mode takes no shm lock) fails alone as
