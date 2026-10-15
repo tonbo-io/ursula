@@ -111,11 +111,51 @@ enum Command {
 struct Published {
     events: EventLog,
     opened: BTreeMap<OpenId, Result<Bound, Arc<OpenError>>>,
+    /// `synced()` tickets a caller waits for in [`Driver::wait`], with their binding. A ticket of a
+    /// caller that waits 0 ms is never here: it learns the outcome from the events.
+    waiting: BTreeMap<Ticket, BindingId>,
+    /// Outcomes of waiting tickets, until [`Driver::wait`] takes them.
     synced: BTreeMap<Ticket, Result<(), SyncError>>,
     /// Opens given up before their result arrived: it is dropped, its binding retired.
     cancelled: BTreeSet<OpenId>,
+    /// Cancelled opens whose caller waits for what they ended with ([`Driver::cancel_reporting`]).
+    reporting: BTreeSet<OpenId>,
+    /// What those opens ended with, until their caller takes it.
+    given_up: BTreeMap<OpenId, Arc<OpenError>>,
     /// Opens started whose result has not arrived yet.
     pending: BTreeSet<OpenId>,
+}
+
+impl Published {
+    /// Records the outcomes `event` gives the waiting tickets.
+    fn settle(&mut self, event: &DriverEvent) {
+        let mut outcome =
+            |waiting: &mut BTreeMap<Ticket, BindingId>,
+             pick: &dyn Fn(Ticket, BindingId) -> Option<Result<(), SyncError>>| {
+                let done: Vec<(Ticket, Result<(), SyncError>)> = waiting
+                    .iter()
+                    .filter_map(|(&t, &b)| pick(t, b).map(|o| (t, o)))
+                    .collect();
+                for (t, o) in done {
+                    waiting.remove(&t);
+                    self.synced.insert(t, o);
+                }
+            };
+        match *event {
+            DriverEvent::Synced { binding, through } => outcome(&mut self.waiting, &|t, b| {
+                (b == binding && t <= through).then_some(Ok(()))
+            }),
+            DriverEvent::SyncFailed { ticket, error } => {
+                outcome(&mut self.waiting, &|t, _| {
+                    (t == ticket).then_some(Err(error))
+                });
+            }
+            DriverEvent::Reset { binding, cause } => outcome(&mut self.waiting, &|_, b| {
+                (b == binding).then_some(Err(SyncError::Reset(cause)))
+            }),
+            _ => {}
+        }
+    }
 }
 
 struct Shared {
@@ -251,6 +291,17 @@ impl Driver {
         self.shared.lock().opened.remove(&open)
     }
 
+    /// Waits at most `timeout` until open `open` resolved: its result waits to be taken
+    /// ([`Driver::try_open`]), or it is no longer pending. True when it did.
+    pub(crate) fn wait_resolved(&self, open: OpenId, timeout: Duration) -> bool {
+        self.shared
+            .wait_for(timeout, |state| {
+                (state.opened.contains_key(&open) || !state.pending.contains(&open)).then_some(())
+            })
+            .is_some()
+    }
+
+    #[cfg(test)]
     pub(crate) fn wait_open(
         &self,
         open: OpenId,
@@ -270,25 +321,43 @@ impl Driver {
         self.command(Command::Logged { binding, rec })
     }
 
-    /// `synced()`: [`Driver::wait`] waits for the ticket's outcome.
+    /// `synced()`. With `wait`, [`Driver::wait`] then waits for the ticket's outcome; without, the
+    /// caller learns it from the events. Tickets are numbered and sent under one lock, so the core
+    /// receives them in ticket order.
     pub(crate) fn sync(
         &self,
         binding: BindingId,
         target: Option<Position>,
+        wait: bool,
     ) -> Result<Ticket, DriverGone> {
+        let mut state = self.shared.lock();
         let ticket = Ticket(self.id());
-        self.command(Command::Sync {
+        if wait {
+            state.waiting.insert(ticket, binding);
+        }
+        let sent = self.command(Command::Sync {
             ticket,
             binding,
             target,
-        })?;
-        Ok(ticket)
+        });
+        if sent.is_err() {
+            state.waiting.remove(&ticket);
+        }
+        sent.map(|()| ticket)
     }
 
     /// The ticket's outcome, waiting at most `timeout` for it. It is handed out once.
     pub(crate) fn wait(&self, ticket: Ticket, timeout: Duration) -> Option<Result<(), SyncError>> {
-        self.shared
-            .wait_for(timeout, |state| state.synced.remove(&ticket))
+        let outcome = self
+            .shared
+            .wait_for(timeout, |state| state.synced.remove(&ticket));
+        if outcome.is_some() {
+            return outcome;
+        }
+        // Timed out: nobody takes its outcome any more, unless it arrived just now.
+        let mut state = self.shared.lock();
+        state.waiting.remove(&ticket);
+        state.synced.remove(&ticket)
     }
 
     /// The events from `cursor` on, waiting at most `timeout` for one.
@@ -300,9 +369,20 @@ impl Driver {
             .unwrap_or_else(|| (Vec::new(), cursor))
     }
 
-    /// Gives up an open: one that has not resolved fails `cancelled`, and a result nobody took
-    /// is dropped, its binding retired, so it never keeps the stream's root locked.
+    /// Gives up an open: one that has not resolved fails, and a result nobody took is dropped, its
+    /// binding retired, so it never keeps the stream's root locked.
     pub(crate) fn cancel(&self, open: OpenId) -> Result<(), DriverGone> {
+        self.cancel_reporting(open, Duration::ZERO).map(drop)
+    }
+
+    /// [`Driver::cancel`], waiting at most `timeout` for what the open ended with: the last
+    /// condition it met, or `cancelled` when it met none. `None` when it bound before the cancel,
+    /// when its result was already taken, or when the time ran out.
+    pub(crate) fn cancel_reporting(
+        &self,
+        open: OpenId,
+        timeout: Duration,
+    ) -> Result<Option<Arc<OpenError>>, DriverGone> {
         let untaken = {
             let mut state = self.shared.lock();
             match state.opened.remove(&open) {
@@ -311,19 +391,34 @@ impl Driver {
                     // An open whose result was already taken is the caller's to retire.
                     if state.pending.contains(&open) {
                         state.cancelled.insert(open);
+                        state.reporting.insert(open);
                     }
                     None
                 }
             }
         };
-        if let Some(Ok(bound)) = untaken {
-            // Nobody took it, so no connection holds it.
-            bound.handle.retiring();
-            return self.command(Command::Retire {
-                binding: bound.binding,
-            });
+        match untaken {
+            Some(Ok(bound)) => {
+                // Nobody took it, so no connection holds it.
+                bound.handle.retiring();
+                self.command(Command::Retire {
+                    binding: bound.binding,
+                })?;
+                return Ok(None);
+            }
+            Some(Err(e)) => return Ok(Some(e)),
+            None => {}
         }
-        self.command(Command::Cancel { open })
+        self.command(Command::Cancel { open })?;
+        let ended = self
+            .shared
+            .wait_for(timeout, |state| state.given_up.remove(&open));
+        if ended.is_some() {
+            return Ok(ended);
+        }
+        let mut state = self.shared.lock();
+        state.reporting.remove(&open);
+        Ok(state.given_up.remove(&open))
     }
 
     pub(crate) fn retire(&self, binding: BindingId) -> Result<(), DriverGone> {
@@ -571,30 +666,27 @@ fn publish(core: &mut Core, cursor: &mut u64, shared: &Shared) -> Vec<BindingId>
         {
             let mut state = shared.lock();
             for event in events {
-                match &event {
-                    DriverEvent::Opened { open, .. } => {
-                        if let Some(result) = core.take_opened(*open) {
-                            state.pending.remove(open);
-                            // A cancelled open's result is dropped, its binding retired.
-                            match result {
-                                Ok(bound) if state.cancelled.remove(open) => {
-                                    retire.push(bound.binding);
-                                }
-                                Err(_) if state.cancelled.remove(open) => {}
-                                result => {
-                                    state.opened.insert(*open, result);
-                                }
+                if let DriverEvent::Opened { open, .. } = &event
+                    && let Some(result) = core.take_opened(*open)
+                {
+                    state.pending.remove(open);
+                    // A cancelled open's result is dropped, its binding retired, and its failure
+                    // kept for a caller of `cancel_reporting` still waiting.
+                    match result {
+                        Ok(bound) if state.cancelled.remove(open) => {
+                            retire.push(bound.binding);
+                        }
+                        Err(e) if state.cancelled.remove(open) => {
+                            if state.reporting.remove(open) {
+                                state.given_up.insert(*open, e);
                             }
                         }
+                        result => {
+                            state.opened.insert(*open, result);
+                        }
                     }
-                    DriverEvent::Synced { ticket } => {
-                        state.synced.insert(*ticket, Ok(()));
-                    }
-                    DriverEvent::SyncFailed { ticket, error } => {
-                        state.synced.insert(*ticket, Err(*error));
-                    }
-                    _ => {}
                 }
+                state.settle(&event);
                 state.events.push(event);
             }
         }
@@ -626,5 +718,54 @@ fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {
         Command::Completed { io, exchange } => core.completed(io, exchange, now_ms),
         Command::DiskDone { io, done } => core.disk_done(io, *done, now_ms),
         Command::Shutdown => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BindingId;
+    use super::DriverEvent;
+    use super::Published;
+    use super::SyncError;
+    use super::Ticket;
+    use crate::replicator::ResetKind;
+
+    // Only waiting tickets get an outcome stored: a host that waits 0 ms on `ursula_synced` learns
+    // it from the events, and leaves nothing behind. A watermark settles a binding's tickets up to
+    // it, a reset all of them.
+    #[test]
+    fn outcomes_are_kept_for_waiting_tickets_only() {
+        let (a, b) = (BindingId(1), BindingId(2));
+        let mut p = Published::default();
+        p.waiting.insert(Ticket(3), a);
+        p.waiting.insert(Ticket(5), a);
+        p.waiting.insert(Ticket(4), b);
+        p.settle(&DriverEvent::Synced {
+            binding: a,
+            through: Ticket(4),
+        });
+        assert_eq!(p.synced.get(&Ticket(3)), Some(&Ok(())));
+        assert!(!p.synced.contains_key(&Ticket(5)));
+        assert!(!p.synced.contains_key(&Ticket(4)));
+        p.settle(&DriverEvent::Synced {
+            binding: a,
+            through: Ticket(9),
+        });
+        assert_eq!(p.synced.get(&Ticket(5)), Some(&Ok(())));
+        p.settle(&DriverEvent::Reset {
+            binding: b,
+            cause: ResetKind::Fenced,
+        });
+        assert_eq!(
+            p.synced.get(&Ticket(4)),
+            Some(&Err(SyncError::Reset(ResetKind::Fenced)))
+        );
+        assert!(p.waiting.is_empty());
+        let stored = p.synced.len();
+        p.settle(&DriverEvent::SyncFailed {
+            ticket: Ticket(7),
+            error: SyncError::NotBound,
+        });
+        assert_eq!(p.synced.len(), stored);
     }
 }

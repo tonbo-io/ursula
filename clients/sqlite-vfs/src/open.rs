@@ -288,6 +288,11 @@ impl Retry {
         self.condition.clone().unwrap_or(Unavailable::Unreachable)
     }
 
+    /// The last condition met, if any.
+    pub(crate) fn seen(&self) -> Option<Unavailable> {
+        self.condition.clone()
+    }
+
     fn succeeded(&mut self) {
         self.policy = Policy::default();
     }
@@ -487,6 +492,11 @@ impl Build {
     /// The condition the deadline reports.
     pub(crate) fn condition(&self) -> Unavailable {
         self.retry.condition()
+    }
+
+    /// The last condition met, if any.
+    pub(crate) fn seen(&self) -> Option<Unavailable> {
+        self.retry.seen()
     }
 
     /// The answer to the last read.
@@ -781,6 +791,18 @@ impl Opening {
             }
         };
         OpenError::Unavailable(condition)
+    }
+
+    /// The error of an open given up (`ursula_cancel`): the last condition it met, `cancelled`
+    /// when it met none.
+    pub(crate) fn given_up(&self) -> OpenError {
+        let seen = match &self.phase {
+            Phase::Reading { build, .. } => build.seen(),
+            Phase::Preparing | Phase::Head | Phase::Create | Phase::Building { .. } => {
+                self.retry.seen()
+            }
+        };
+        seen.map_or(OpenError::Cancelled, OpenError::Unavailable)
     }
 
     /// The timer fired: send again what failed.
