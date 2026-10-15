@@ -171,8 +171,10 @@ jobs:
           cd clients/sqlite-vfs
           cargo fmt --check
           cargo clippy --locked --release --all-targets -- -D warnings
+          cargo clippy --locked --release --features model --all-targets -- -D warnings
           cargo test --locked --release
           cargo build --locked --release
+          cargo build --locked --release --features model --bin ursula-vfs-model
           ldd target/release/libsqlite_ursula_vfs.so
 
       - name: Upload the extension

@@ -166,12 +166,16 @@
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
+//! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
+//!   the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: `ursula_status` and `ursula_stats`.
+//! - `transport`: one attempt of a 0.8 request, over HTTP or to the model in process.
 //! - `vfs`: the VFS file methods and the commit path.
 //! - `wal`: the local WAL's format, recovery scan and fold.
+//! - `wire`: the 0.8 requests and answers as values, shared by the transports and the model.
 
 mod attach;
 mod auth;
@@ -189,12 +193,30 @@ mod host;
 pub mod ids;
 mod local;
 mod log;
+#[cfg(any(test, feature = "model"))]
+pub mod model;
 mod net;
 pub mod snapshot;
 mod snapshotter;
 mod stats;
 mod status;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
+mod transport;
 mod vfs;
 mod wal;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
+mod wire;
 
 pub use extension::sqlite3_extension_init;

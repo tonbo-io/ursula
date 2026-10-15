@@ -21,6 +21,16 @@ thiserror = "1"
 blake3 = "1"
 ursula-headers = { path = "../../crates/ursula-headers" }
 
+[features]
+# The model server of #581 (`src/model`) outside tests, and the `ursula-vfs-model` binary that
+# serves it for the e2e suites.
+model = []
+
+[[bin]]
+name = "ursula-vfs-model"
+path = "src/bin/ursula_vfs_model.rs"
+required-features = ["model"]
+
 [dev-dependencies]
 proptest = "1.11"
 
