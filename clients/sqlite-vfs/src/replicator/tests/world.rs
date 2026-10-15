@@ -368,7 +368,8 @@ struct Instance {
     /// The tail the last HEAD of a provisional instance's pre-check saw, up to which it reads
     /// (property 20).
     checked_tail: Option<usize>,
-    /// A provisional instance's claim met `producer-expired`: the floor reached its epoch.
+    /// The claim a provisional instance sent again after its pre-check met `producer-expired`
+    /// naming its epoch, before its first bind.
     expired: bool,
     /// The stream as the last HEAD of a pre-check saw it: a re-key it decided rolls the log only
     /// with the claim, after the reads (property 15).
@@ -1313,6 +1314,7 @@ impl World {
                     // The exemption of property 13 ends with the first claim that binds.
                     self.owners[index].power_lost = false;
                     let inst = &mut self.owners[index].inst;
+                    inst.expired = false;
                     if std::mem::take(&mut inst.provisional) {
                         self.coverage
                             .provisional_live
@@ -1953,11 +1955,18 @@ impl World {
         let head_saw = self.heads.remove(&(to, id));
         if let Some(index) = self.owners.iter().position(|o| o.inst.uid == to) {
             let inst = &mut self.owners[index].inst;
+            // Only an expiry naming the claim a provisional instance sent again after its
+            // pre-check (property 13).
             if let Exchange::Answered(answer) = &exchange
-                && matches!(
-                    answer.typed,
-                    Ok(Typed::Producer(ProducerAnswer::ProducerExpired { .. }))
-                )
+                && let Ok(Typed::Producer(ProducerAnswer::ProducerExpired { epoch: named })) =
+                    &answer.typed
+                && inst.provisional
+                && let Replicator::Activating {
+                    kind: ClaimKind::Continuation { resent: true, .. },
+                    step: Step::Claim { epoch, .. },
+                    ..
+                } = &inst.replicator
+                && named == epoch
             {
                 inst.expired = true;
             }

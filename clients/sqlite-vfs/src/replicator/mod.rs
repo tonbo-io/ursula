@@ -43,18 +43,19 @@
 //! history change never discards a local commit without a salvage.
 //!
 //! A provisional open (design §5.5) defers its claim behind resume's sequence (design §7,
-//! [`Replicator::provisional`]): a HEAD first, which learns the token, the cluster and the
-//! request limit, then a pre-check that reads from the log's acknowledged offset to the tail the
-//! HEAD named. Any foreign frame there resets it with nothing sent (a `410` resets `stale`). Only
-//! then does it send its claim, and nothing is logged before: it sends again the log's latest
-//! claim, same epoch and body, as an unconfirmed claim is sent again after a re-key. A repeat
-//! receipt, or `receipt-evicted` (its digest checked), means the claim applied before, and one
-//! continuation claim of the next epoch follows. So a provisional open claims at most one above
-//! the latest claim of its own the stream applied, and never above an owner an explicit open
-//! installed before its pre-check read the tail. `producer-expired` naming the claim's epoch
-//! claims on too when the pre-check found that claim's frame. Without the frame it is no proof the
-//! retired record was ours: the binding resets `stale`, and the next open (a reopen) takes over
-//! with its pending commits. Any other answer loses, `fenced`, as for any continuation.
+//! [`Replicator::provisional`]): a HEAD first, which learns the token, the cluster and the request
+//! limit, then a pre-check that reads from the log's acknowledged offset to the tail the HEAD
+//! named. Any foreign frame there resets it with nothing sent. A `410` sends a HEAD first: our
+//! token still there resets `stale`, another takes the history path. Only then does it send its
+//! claim, and nothing is logged before: it sends again the log's latest claim, same epoch and body,
+//! as an unconfirmed claim is sent again after a re-key. A repeat receipt, or `receipt-evicted`
+//! (its digest checked), means the claim applied before, and one continuation claim of the next
+//! epoch follows. So a provisional open claims at most one above the latest claim of its own the
+//! stream applied, and never above an owner an explicit open installed before its pre-check read
+//! the tail. `producer-expired` naming the claim's epoch claims on too when the pre-check found
+//! that claim's frame. Without the frame it is no proof the retired record was ours: the binding
+//! resets `stale`, and the next open (a reopen) takes over with its pending commits. Any other
+//! answer loses, `fenced`, as for any continuation.
 //!
 //! Until a claim of it applies, a provisional open's acknowledged state is the log's, as a
 //! takeover's is, so a re-key follows the takeover's rule ([`answer::takeover_may_rekey`]) on the
@@ -176,7 +177,8 @@ pub(crate) enum ClaimKind {
     /// After `producer-expired`, a re-key while bound, or a provisional open's pre-check: exactly
     /// `own + 1`, lost at the first answer but its receipt. `resent`: the claim went out again
     /// (under a new token, or by a provisional open, which sends its log's latest claim `own`
-    /// again), so a repeat receipt may be of an attempt that applied before, and one more claim follows it.
+    /// again), so a repeat receipt may be of an attempt that applied before, and one more claim
+    /// follows it.
     Continuation { own: Epoch, resent: bool },
 }
 
@@ -1619,8 +1621,20 @@ impl PreChecking {
                     }
                 }
             }
-            // Retention passed the log's acknowledged offset: the stream moved on.
-            ReadDecision::Gone => reset(ResetKind::Stale, actions),
+            // Retention passed the log's acknowledged offset, or the read went to another
+            // history (its `410` comes before the `412`): the link's HEAD decides. Our token
+            // still there: the stream moved on, `stale`. Another takes the history path.
+            ReadDecision::Gone => {
+                let common = Common::Head(HeadReason::Gone(ResetKind::Stale));
+                self.common(
+                    PreCheck::Read(reconcile),
+                    common,
+                    exchange,
+                    ctx,
+                    now_ms,
+                    actions,
+                )
+            }
             ReadDecision::Common(common) => self.common(
                 PreCheck::Read(reconcile),
                 common,
@@ -2585,7 +2599,7 @@ impl Stream {
             // moved the stream on, `fenced`. Another token takes the history path.
             ReadDecision::Gone => {
                 let result = quietly(quiet, ctx, actions, |ctx, actions| {
-                    let common = Common::Head(HeadReason::Gone);
+                    let common = Common::Head(HeadReason::Gone(ResetKind::Fenced));
                     link.common(common, None, now_ms, ctx, actions)
                 });
                 if let Err(kind) = result {

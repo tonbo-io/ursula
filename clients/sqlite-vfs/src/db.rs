@@ -575,15 +575,26 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
         },
         Arc::new(root),
     ));
-    Arc::new(Binding {
-        id: BindingId(u64::MAX),
+    Arc::new(connection_for_tests(BindingId(u64::MAX), handle, path))
+}
+
+/// The commit path's view of a binding the driver bound (`id`, `handle`), for driver tests of
+/// what a connection may still do once the binding reset. It is in no registry.
+#[cfg(test)]
+pub(crate) fn connection_for_tests(
+    id: BindingId,
+    handle: Arc<BindingHandle>,
+    path: String,
+) -> Binding {
+    Binding {
+        id,
         handle,
         path,
         url: "https://h/v1/stream/db".into(),
         state: Mutex::new(Commit::default()),
         wal_written: Mutex::new(BTreeMap::new()),
         decided: Condvar::new(),
-    })
+    }
 }
 
 /// Puts `b` in the registry under its path, for tests of the VFS methods that look a db up, until

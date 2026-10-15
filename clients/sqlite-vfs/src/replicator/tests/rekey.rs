@@ -911,7 +911,9 @@ fn a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expi
 
 /// The pre-check finds another owner's claim after the log's acknowledged offset: it resets
 /// `fenced` with nothing sent. One followed by a claim of its own is superseded (N1), and a foreign
-/// commit resets `stale`. A `410` (retention passed the acknowledged offset) resets `stale`.
+/// commit resets `stale`. A `410` sends a HEAD first (a read of another history gets its `410`
+/// before its `412`): our token still there, retention passed the acknowledged offset, `stale`.
+/// A new token that inherits the generation pre-checks again under it, from its HEAD.
 #[test]
 fn a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent() {
     let foreign = frame::encode_claim(epoch(4), FOREIGN);
@@ -933,7 +935,18 @@ fn a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent() {
     let mut h = provisional(Vec::new());
     h.answer(&head(token(), 2 * CLAIM, None));
     let actions = h.answer(&RawAnswer::new(410));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(h.last_request().method, Method::Head);
+    let actions = h.answer(&head(token(), 2 * CLAIM, None));
     assert_eq!(reset_of(&actions), Some(ResetKind::Stale), "{actions:?}");
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), 2 * CLAIM, None));
+    h.answer(&RawAnswer::new(410));
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(h.last_request().method, Method::Head, "{actions:?}");
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert_eq!(claim_of(&actions), Some((3, PRIOR)), "{actions:?}");
 }
 
 /// The pre-check's HEAD names an inheriting history: the claim goes out again under the new

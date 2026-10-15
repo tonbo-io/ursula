@@ -3931,3 +3931,204 @@ fn a_provisional_open_resolves_when_its_first_connect_times_out() {
     assert!((5_000..=5_100).contains(&took), "the open took {took} ms");
     assert!(bound.handle.provisional());
 }
+
+/// A provisional binding reset with its connection still open (the generation held), as each
+/// of its resets comes: what a reopen beside it starts from.
+struct ResetProvisional {
+    w: World,
+    c: usize,
+    bound: Bound,
+    /// The commits it logged while provisional, which never reached the stream.
+    offline: Vec<Vec<u8>>,
+}
+
+/// `kind`'s scenario: `fenced` by another owner's takeover (from `other`), `stale` after a power
+/// loss of an acknowledged commit, `rewound` by a lossy restore. Two commits are logged while
+/// provisional, then the stream answers and the binding resets with its connection open.
+fn provisional_reset(kind: ResetKind, dir: &Path, other: &Path) -> ResetProvisional {
+    let mut w = World::new();
+    match kind {
+        ResetKind::Fenced => {
+            crashed_owner(&mut w, dir, 1);
+            let b = w.core();
+            let bound_b = w.open(b, spec(other, 7));
+            w.commit(b, &bound_b, 3).unwrap();
+            w.run_for(1_000);
+        }
+        ResetKind::Stale => {
+            let c = w.core();
+            let bound = w.open(c, spec(dir, 1));
+            w.run_for(2_000);
+            let generation = bound.handle.generation.dir.clone();
+            let before = files(&generation);
+            w.commit(c, &bound, 1).unwrap();
+            w.run_for(2_000);
+            drop(bound);
+            w.crash(c);
+            // The power loss: the files as they were before the acknowledged commit.
+            std::fs::remove_dir_all(&generation).unwrap();
+            for (path, bytes) in &before {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+        _ => {
+            let c = w.core();
+            let bound = w.open(c, spec(dir, 1));
+            let checkpoint = w.server.checkpoint();
+            w.commit(c, &bound, 1).unwrap();
+            w.run_for(2_000);
+            drop(bound);
+            w.crash(c);
+            w.server
+                .history_event(HistoryEvent::Restore(checkpoint))
+                .unwrap();
+        }
+    }
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir);
+    let offline = vec![
+        w.commit(c, &bound, 2).unwrap(),
+        w.commit(c, &bound, 4).unwrap(),
+    ];
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![kind]);
+    assert_eq!(bound.handle.reset(), Some(kind));
+    assert!(
+        bound.handle.holds_root(),
+        "{kind:?}: the connection holds it"
+    );
+    ResetProvisional {
+        w,
+        c,
+        bound,
+        offline,
+    }
+}
+
+/// The bytes of `dir`'s log segments, in order.
+fn log_bytes(dir: &Path) -> Vec<u8> {
+    files(&dir.join("log")).into_values().flatten().collect()
+}
+
+/// A provisional binding resets (`fenced`, `stale`, `rewound`) while its connection still holds
+/// its generation. Its connection's commits are refused under the log's lock from the reset on
+/// (G8), so the log stays as the reset left it. A reopen in the same core runs beside it from a
+/// copy of that generation (design §5.6), and the original is trashed. After `rewound`, the
+/// reopen's salvage (`history_changed`) takes the copy, whose log holds the original's, and its
+/// manifest counts the provisional commits as unacknowledged. After `fenced` or `stale` the
+/// reopen takes over and rebuilds from the stream, which never held the provisional commits.
+#[test]
+fn a_reset_provisional_binding_is_reopened_beside_its_connection_from_a_copy() {
+    for kind in [ResetKind::Fenced, ResetKind::Stale, ResetKind::Rewound] {
+        let (dir, other) = (
+            TempDir::new("driver-provisional-copy"),
+            TempDir::new("driver-provisional-copy-other"),
+        );
+        let ResetProvisional {
+            mut w,
+            c,
+            bound,
+            offline,
+        } = provisional_reset(kind, dir.path(), other.path());
+        let connection = crate::db::connection_for_tests(
+            bound.binding,
+            Arc::clone(&bound.handle),
+            String::new(),
+        );
+        let next = bound.handle.log().unwrap().next_position();
+        assert!(
+            matches!(connection.log_unless_reset(), Err(crate::db::LogRefused::Reset(k)) if k == kind),
+            "{kind:?}"
+        );
+        assert_eq!(bound.handle.log().unwrap().next_position(), next);
+        let old = bound.handle.generation.clone();
+        let copy = w.open(c, spec(dir.path(), 3));
+        assert_ne!(copy.handle.generation.id, old.id, "{kind:?}");
+        assert!(!old.dir.exists(), "{kind:?}: the original is trashed");
+        assert!(bound.handle.holds_root(), "{kind:?}");
+        let salvages = copy.handle.salvage().unwrap();
+        if kind == ResetKind::Rewound {
+            assert!(
+                matches!(copy.handle.attach, super::Attach::Built {
+                    salvaged: Some(Reason::HistoryChanged),
+                    ..
+                }),
+                "{:?}",
+                copy.handle.attach
+            );
+            let [salvaged] = &salvages[..] else {
+                panic!("{salvages:?}");
+            };
+            // The copy's log, with the provisional commits, superseding the original's.
+            let log = log_bytes(&salvaged.dir);
+            for frame in &offline {
+                assert!(log.windows(frame.len()).any(|w| w == &frame[..]));
+            }
+            assert_eq!(salvaged.manifest.lineage, Some(old.lineage));
+            assert_eq!(
+                salvaged
+                    .manifest
+                    .acknowledged
+                    .as_ref()
+                    .map(|a| a.unacknowledged),
+                Some(2)
+            );
+        } else {
+            assert!(
+                matches!(copy.handle.attach, super::Attach::Built {
+                    salvaged: None,
+                    ..
+                }),
+                "{kind:?}: {:?}",
+                copy.handle.attach
+            );
+            assert!(salvages.is_empty(), "{kind:?}: {salvages:?}");
+        }
+        let ticket = w.sync(c, copy.binding);
+        w.run_for(5_000);
+        assert_eq!(w.outcome(c, ticket), Some(Ok(())), "{kind:?}");
+        assert_eq!(w.resets(c), vec![kind], "the copy is live");
+        let stream = w.stream_commits();
+        assert!(offline.iter().all(|f| !stream.contains(f)), "{kind:?}");
+        drop(connection);
+        assert!(!bound.handle.disconnect());
+        assert!(!bound.handle.holds_root());
+    }
+}
+
+/// A provisional binding resets while the stream is still out of reach, its connection open. A
+/// reopen in the same core opens provisionally again, from a copy of the generation and its CLAIM
+/// records: nothing is logged and nothing sent. Once the stream answers, the copy claims as the
+/// original would have, and the commit both carried replicates.
+#[test]
+fn a_reopen_beside_a_reset_provisional_binding_while_unreachable_is_provisional_again() {
+    let dir = TempDir::new("driver-provisional-copy-offline");
+    let mut w = World::new();
+    let (_, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    let x = w.commit(c, &bound, 2).unwrap();
+    w.run_for(1_000);
+    let now = w.now;
+    w.c(c)
+        .reset_binding(bound.binding, ResetKind::LocalDamage, now);
+    assert_eq!(bound.handle.reset(), Some(ResetKind::LocalDamage));
+    assert!(bound.handle.holds_root());
+    let old = bound.handle.generation.clone();
+    let copy = open_provisionally(&mut w, c, dir.path());
+    assert_eq!(copy.handle.generation.lineage, old.lineage);
+    assert_ne!(copy.handle.generation.id, old.id);
+    assert!(!old.dir.exists(), "the original is trashed");
+    assert_eq!(copy.handle.last_commit(), bound.handle.last_commit());
+    assert!(claimed(&w, c).is_empty(), "nothing sent while unreachable");
+    let ticket = w.sync(c, copy.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(!copy.handle.provisional());
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    assert_eq!(w.stream_commits(), vec![first, x]);
+}

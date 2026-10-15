@@ -39,9 +39,10 @@ pub(crate) enum HeadReason {
     Precondition,
     /// A `413` that names no limit: a layer outside #581 §6.4.
     TooLarge,
-    /// A `410` on a `synced()` probe's read: retention passed our tail, or the read went to
-    /// another history (a `410` comes before a `412`).
-    Gone,
+    /// A `410` on a read: retention passed our tail, or the read went to another history (a `410`
+    /// comes before a `412`). With our token unchanged the binding resets this kind: `fenced`
+    /// for a `synced()` probe (another owner moved on), `stale` for a provisional pre-check.
+    Gone(ResetKind),
 }
 
 /// What any answer without a producer outcome decides.
