@@ -1,4 +1,4 @@
-// `db.synced()` against the model server (E2E_SERVER=model): it resolves once the stream holds every
+// `db.synced()` against the e2e server (test/stack.ts): it resolves once the stream holds every
 // commit made before the call, waits without blocking the event loop while the stream holds its
 // answer back, gives up at its signal, and keeps the process alive while it waits. An idle process
 // exits on its own.
@@ -7,14 +7,14 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open } from "../src/index.ts";
 import { pump } from "../src/pump.ts";
-import { ext, fault, frames, freshDir, onModel, rejection, stream, ursulaUrl } from "./kit.ts";
+import { ext, fault, faultsUrl, frames, freshDir, rejection, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
 /** Runs test/api-child.ts in `mode`: its output, exit code and how long it took to exit after its output. */
 function child(mode: "gate" | "idle", url: string, dir: string): Promise<{ out: string; code: number | null; ms: number }> {
 	let started = Date.now();
-	const proc = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, "api-child.ts"), url, dir, mode, ursulaUrl()], { stdio: ["ignore", "pipe", "inherit"] });
+	const proc = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, "api-child.ts"), url, dir, mode, faultsUrl()], { stdio: ["ignore", "pipe", "inherit"] });
 	let out = "";
 	proc.stdout.on("data", (chunk: Buffer) => {
 		out += chunk.toString();
@@ -24,7 +24,7 @@ function child(mode: "gate" | "idle", url: string, dir: string): Promise<{ out: 
 	return new Promise((resolve) => proc.once("exit", (code) => resolve({ out, code, ms: Date.now() - started })));
 }
 
-describe.skipIf(!onModel())("synced()", () => {
+describe("synced()", () => {
 	it("resolves once the stream holds every commit made before the call", async () => {
 		const s = stream("synced");
 		const db = await open(s.url, { dir: freshDir() });

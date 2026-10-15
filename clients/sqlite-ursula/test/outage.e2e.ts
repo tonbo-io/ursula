@@ -1,4 +1,4 @@
-// A long outage (design §4.6, §5.7, M1 exit criterion), against the model server (E2E_SERVER=model)
+// A long outage (design §4.6, §5.7, M1 exit criterion), against the e2e server (test/stack.ts)
 // behind test/gate.mjs: the stream is cut off for OUTAGE_MS (60 s by default, 600 s in the soak
 // workflow), as a blackhole (requests read and never answered) and as refused connections. Meanwhile
 // commits go on, nothing resets, `synced()` waits, status says `retrying`, and a database with a
@@ -11,7 +11,7 @@ import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, type UrsulaResetError, type UrsulaStatus, UrsulaWriteRefusedError } from "../src/index.ts";
-import { ext, fromStream, freshDir, onModel, stream, thrown, ursulaUrl } from "./kit.ts";
+import { ext, fromStream, freshDir, stream, thrown, ursulaUrl } from "./kit.ts";
 
 const OUTAGE_MS = Number(process.env.OUTAGE_MS ?? 60_000);
 const MODES = (process.env.OUTAGE_MODES ?? "blackhole,refuse").split(",") as ("blackhole" | "refuse")[];
@@ -31,7 +31,6 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 let gate: { url: string; control: string; stop: () => Promise<void> };
 
 beforeAll(async () => {
-	if (!onModel()) return;
 	const proc = spawn(process.execPath, ["--no-warnings", new URL("./gate.mjs", import.meta.url).pathname, ursulaUrl()], { stdio: ["pipe", "pipe", "inherit"] });
 	const lines = createInterface({ input: proc.stdout as NodeJS.ReadableStream })[Symbol.asyncIterator]();
 	const { port, control } = JSON.parse((await lines.next()).value as string) as { port: number; control: number };
@@ -54,7 +53,7 @@ afterAll(async () => {
 /** The databases a test opened: closed after it, whatever happened. */
 const opened = new Set<UrsulaDatabase>();
 beforeEach(async () => {
-	if (onModel()) await mode("forward");
+	await mode("forward");
 });
 afterEach(() => {
 	for (const d of opened) if (d.isOpen) d.close();
@@ -106,7 +105,7 @@ function report(line: string): void {
 	if (summary !== undefined && summary.length > 0) appendFileSync(summary, `${line}\n`);
 }
 
-describe.skipIf(!onModel())(`an outage of ${OUTAGE_MS / 1000} s`, () => {
+describe(`an outage of ${OUTAGE_MS / 1000} s`, () => {
 	for (const m of MODES) {
 		it(
 			`${m}: commits go on, nothing resets, backlog_full past a small bound, then a full catch-up`,

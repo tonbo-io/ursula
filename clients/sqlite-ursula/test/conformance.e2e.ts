@@ -1,5 +1,5 @@
-// Pi Durable's storage conformance on openUrsulaPiStorage (M1 exit criterion), against the model
-// server (E2E_SERVER=model), in three modes: direct, close and reopen in the same cache after every
+// Pi Durable's storage conformance on openUrsulaPiStorage (M1 exit criterion), against the e2e
+// server (test/stack.ts), in three modes: direct, close and reopen in the same cache after every
 // commit, and reopen in a fresh cache after every commit, which rebuilds from the stream.
 //
 // On synced(): every Pi commit resolves only once `synced()` did, and each storage checks that. When a
@@ -18,7 +18,7 @@ import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { afterAll, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, type UrsulaStatus } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
-import { ext, freshDir, onModel, stream, ursulaUrl } from "./kit.ts";
+import { directUrl, ext, freshDir, stream } from "./kit.ts";
 
 // Read once, when the extension first needs it: before it loads.
 process.env.URSULA_VFS_SNAPSHOT_DUE_BYTES ??= "4096";
@@ -134,50 +134,48 @@ const MODES = {
 	fresh: "reopen in a fresh cache after every commit",
 } as const;
 
-if (onModel()) {
-	conformance(MODES.direct, async () => onSynced(await openUrsulaPiStorage(stream("pi").url, { dir: freshDir() }), MODES.direct));
-	conformance(MODES.reopen, () => {
-		const { url } = stream("pi-reopen");
-		const dir = freshDir();
-		return ReopeningStorage.open(async () => onSynced(await openUrsulaPiStorage(url, { dir }), MODES.reopen));
-	});
-	conformance(MODES.fresh, () => {
-		const { url } = stream("pi-fresh");
-		return ReopeningStorage.open(async () => onSynced(await openUrsulaPiStorage(url, { dir: freshDir() }), MODES.fresh));
-	});
-	afterAll(() => {
-		process.stderr.write(`conformance on synced(): commits checked ${JSON.stringify(Object.fromEntries(checked))}, opens ${JSON.stringify(Object.fromEntries(opens))}\n`);
-		// Every mode checked commits against the stream.
-		for (const mode of Object.values(MODES)) expect(checked.get(mode) ?? 0, mode).toBeGreaterThan(10);
-	});
+conformance(MODES.direct, async () => onSynced(await openUrsulaPiStorage(stream("pi").url, { dir: freshDir() }), MODES.direct));
+conformance(MODES.reopen, () => {
+	const { url } = stream("pi-reopen");
+	const dir = freshDir();
+	return ReopeningStorage.open(async () => onSynced(await openUrsulaPiStorage(url, { dir }), MODES.reopen));
+});
+conformance(MODES.fresh, () => {
+	const { url } = stream("pi-fresh");
+	return ReopeningStorage.open(async () => onSynced(await openUrsulaPiStorage(url, { dir: freshDir() }), MODES.fresh));
+});
+afterAll(() => {
+	process.stderr.write(`conformance on synced(): commits checked ${JSON.stringify(Object.fromEntries(checked))}, opens ${JSON.stringify(Object.fromEntries(opens))}\n`);
+	// Every mode checked commits against the stream.
+	for (const mode of Object.values(MODES)) expect(checked.get(mode) ?? 0, mode).toBeGreaterThan(10);
+});
 
-	describe("a fresh cache", () => {
-		it("builds from the snapshot HEAD names, and the tail after it", async () => {
-			const { url, path: name } = stream("pi-snapshot");
-			const owner = await openUrsulaPiStorage(url, { dir: freshDir() });
-			const db = facade(owner);
-			await db.exec("CREATE TABLE pad(i INTEGER PRIMARY KEY, b BLOB)");
-			for (let i = 1; i <= 8; i++) await db.run("INSERT INTO pad VALUES (?, randomblob(3000))", i);
-			// The snapshot that came due: HEAD names it once it is published.
-			let snapshot: number | undefined;
-			for (const deadline = Date.now() + 20_000; snapshot === undefined && Date.now() < deadline; ) {
-				const head = (await fetch(`${ursulaUrl()}${name}`, { method: "HEAD" })).headers.get("stream-snapshot-offset");
-				if (head !== null) snapshot = Number(head);
-				else await new Promise((r) => setTimeout(r, 50));
-			}
-			expect(snapshot, "no snapshot was published within 20 s").toBeDefined();
-			// A commit after it: the tail the build reads.
-			await db.run("INSERT INTO pad VALUES (9, x'00')");
-			const rows = await db.all("SELECT i, hex(b) AS b FROM pad ORDER BY i");
-			await owner.close(ctx);
-			const fresh = onSynced(await openUrsulaPiStorage(url, { dir: freshDir() }), "snapshot");
-			try {
-				expect(status(location(fresh)).attach).toEqual({ local: "built", snapshot_offset: snapshot });
-				expect(await facade(fresh).all("SELECT i, hex(b) AS b FROM pad ORDER BY i")).toEqual(rows);
-				expect(await facade(fresh).all("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
-			} finally {
-				await fresh.close(ctx);
-			}
-		});
+describe("a fresh cache", () => {
+	it("builds from the snapshot HEAD names, and the tail after it", async () => {
+		const { url, path: name } = stream("pi-snapshot");
+		const owner = await openUrsulaPiStorage(url, { dir: freshDir() });
+		const db = facade(owner);
+		await db.exec("CREATE TABLE pad(i INTEGER PRIMARY KEY, b BLOB)");
+		for (let i = 1; i <= 8; i++) await db.run("INSERT INTO pad VALUES (?, randomblob(3000))", i);
+		// The snapshot that came due: HEAD names it once it is published.
+		let snapshot: number | undefined;
+		for (const deadline = Date.now() + 20_000; snapshot === undefined && Date.now() < deadline; ) {
+			const head = (await fetch(`${directUrl()}${name}`, { method: "HEAD" })).headers.get("stream-snapshot-offset");
+			if (head !== null) snapshot = Number(head);
+			else await new Promise((r) => setTimeout(r, 50));
+		}
+		expect(snapshot, "no snapshot was published within 20 s").toBeDefined();
+		// A commit after it: the tail the build reads.
+		await db.run("INSERT INTO pad VALUES (9, x'00')");
+		const rows = await db.all("SELECT i, hex(b) AS b FROM pad ORDER BY i");
+		await owner.close(ctx);
+		const fresh = onSynced(await openUrsulaPiStorage(url, { dir: freshDir() }), "snapshot");
+		try {
+			expect(status(location(fresh)).attach).toEqual({ local: "built", snapshot_offset: snapshot });
+			expect(await facade(fresh).all("SELECT i, hex(b) AS b FROM pad ORDER BY i")).toEqual(rows);
+			expect(await facade(fresh).all("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+		} finally {
+			await fresh.close(ctx);
+		}
 	});
-}
+});

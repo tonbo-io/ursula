@@ -2,7 +2,7 @@ name: Integration
 
 # Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
 # target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against the
-# model of the 0.8 server (`ursula-vfs-model`), which it runs against until the server speaks #581.
+# model of the 0.8 server (`ursula-vfs-model`) and against a release `ursula`, one node and three.
 # S3 is real AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork
 # PRs and release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
@@ -253,6 +253,109 @@ jobs:
           done
           npm run typecheck
           E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts test/conformance.e2e.ts
+
+  # The release `ursula` for the e2e against the real server, cached by the inputs that build it so
+  # a PR that touches only the extension or the package does not rebuild it. Bump the key's version
+  # (v1) when the build command below changes.
+  build-ursula:
+    name: Build release ursula
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 40
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cached ursula
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: ursula-bin/ursula
+          key: ursula-release-v1-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'third_party/**') }}
+
+      - name: Install Rust toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+
+      - name: Build ursula
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build --locked --release -p ursula --bin ursula
+          mkdir -p ursula-bin
+          cp target/release/ursula ursula-bin/ursula
+
+      - name: Upload ursula
+        uses: actions/upload-artifact@v6
+        with:
+          name: ursula-release
+          path: ursula-bin/ursula
+          if-no-files-found: error
+          retention-days: 1
+
+  # The same suites against the real server (E2E_SERVER=ursula): one node with an in-memory cold
+  # store, and three nodes behind the gateway with no cold tier, where test/failover.e2e.ts kills
+  # the leader of a stream's group during commits. A suite or case the real server cannot serve
+  # says so in its name and why. No S3 here.
+  sqlite-vfs-e2e-ursula:
+    name: sqlite-vfs e2e (ursula, ${{ matrix.nodes }} node${{ matrix.nodes == '3' && 's + gateway' || '' }})
+    needs: [build-ursula, sqlite-vfs]
+    strategy:
+      fail-fast: false
+      matrix:
+        nodes: ["1", "3"]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 45
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download ursula
+        uses: actions/download-artifact@v7
+        with:
+          name: ursula-release
+          path: ${{ runner.temp }}/ursula-bin
+
+      - name: Download the extension
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: e2e (every suite, crashes, outages and Pi conformance included)
+        timeout-minutes: 35
+        env:
+          E2E_NODES: ${{ matrix.nodes }}
+          # No S3 here: one node keeps an in-memory cold store, three run with no cold tier.
+          URSULA_COLD: ${{ matrix.nodes == '3' && 'none' || 'memory' }}
+        run: |
+          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          cd clients/sqlite-ursula
+          npm ci
+          npm run build
+          E2E_SERVER=ursula E2E_LOG_DIR="$RUNNER_TEMP/e2e-logs" URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
+
+      - name: Upload the server logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: sqlite-vfs-e2e-ursula-${{ matrix.nodes }}-logs
+          path: ${{ runner.temp }}/e2e-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
   # M1 exit criterion: a commit's p50 on the VFS within 0.5 ms of B1, plain node:sqlite with WAL and
   # synchronous=NORMAL, on the same workload (clients/sqlite-ursula/bench/commit.ts). Latency on a

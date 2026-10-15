@@ -7,10 +7,17 @@
 // `forward` heals it. Requests held by a blackhole stay unanswered after the heal, as a partition's
 // would, and time out on the client.
 //
+// It also scripts faults for the next requests it forwards, as the model's `/__model/faults` does
+// (clients/sqlite-vfs/src/model/faults.rs), so the suites that hold an answer back run against a
+// real server too (test/stack.ts puts a gate in front of it). Only `delay <ms>` is scripted: the
+// request is forwarded at once and its answer held back for `ms`.
+//
 // argv: the server's URL. Prints {"port": n, "control": n} once it listens: the proxy's port and a
 // control port of its own, which no mode affects. Control requests:
 //   PUT /mode {"mode": "forward" | "blackhole" | "refuse"} -> 204
 //   GET /stats -> {"mode", "forwarded", "held", "refused"}
+//   POST /faults[?times=<n>][&method=<METHOD>], body `delay <ms>` -> 204: the fault for the next
+//     `times` (1) forwarded requests with that method (any method when absent)
 // It exits when its stdin closes, so it never outlives the test process that started it.
 import { createServer, request } from "node:http";
 
@@ -18,6 +25,18 @@ const target = new URL(process.argv[2]);
 const state = { mode: "forward", forwarded: 0, held: 0, refused: 0 };
 const sockets = new Set();
 let port = 0;
+/** Scripted faults, in order: `{ method, delayMs, times }`. */
+const faults = [];
+
+/** The answer delay for a request with `method`: the first scripted fault that matches, used once. */
+function takeDelay(method) {
+	const at = faults.findIndex((f) => f.method === undefined || f.method === method);
+	if (at < 0) return 0;
+	const fault = faults[at];
+	fault.times -= 1;
+	if (fault.times <= 0) faults.splice(at, 1);
+	return fault.delayMs;
+}
 
 const proxy = createServer((req, res) => {
 	if (state.mode === "blackhole") {
@@ -27,9 +46,14 @@ const proxy = createServer((req, res) => {
 		return;
 	}
 	state.forwarded++;
+	const delayMs = takeDelay(req.method);
 	const up = request({ host: target.hostname, port: target.port, method: req.method, path: req.url, headers: req.headers }, (answer) => {
-		res.writeHead(answer.statusCode ?? 502, answer.headers);
-		answer.pipe(res);
+		const send = () => {
+			res.writeHead(answer.statusCode ?? 502, answer.headers);
+			answer.pipe(res);
+		};
+		if (delayMs > 0) setTimeout(send, delayMs);
+		else send();
 	});
 	up.on("error", () => res.destroy());
 	req.pipe(up);
@@ -89,7 +113,25 @@ const control = createServer((req, res) => {
 		body += chunk;
 	});
 	req.on("end", () => {
-		const { mode } = JSON.parse(body);
+		const url = new URL(req.url, "http://gate");
+		if (req.method === "POST" && url.pathname === "/faults") {
+			const delay = /^delay (\d+)$/.exec(body.trim());
+			const times = Number(url.searchParams.get("times") ?? 1);
+			if (delay === null || !Number.isInteger(times) || times < 0) {
+				res.writeHead(400).end(`the gate scripts only \`delay <ms>\`: ${body}`);
+				return;
+			}
+			if (times > 0) faults.push({ method: url.searchParams.get("method") ?? undefined, delayMs: Number(delay[1]), times });
+			res.writeHead(204).end();
+			return;
+		}
+		let mode;
+		try {
+			({ mode } = JSON.parse(body));
+		} catch {
+			res.writeHead(400).end(`not a JSON body: ${body}`);
+			return;
+		}
 		if (req.method !== "PUT" || req.url !== "/mode" || !["forward", "blackhole", "refuse"].includes(mode)) {
 			res.writeHead(400).end();
 			return;

@@ -1,5 +1,5 @@
-// `open()` against the model server (E2E_SERVER=model): the first open of a stream binds and claims
-// it, later and concurrent opens in the process share the binding, its signal cancels it, and its
+// `open()` against the e2e server (test/stack.ts): the first open of a stream binds and claims it,
+// later and concurrent opens in the process share the binding, its signal cancels it, and its
 // failures and refused writes are typed.
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { sql } from "drizzle-orm";
@@ -7,11 +7,11 @@ import { drizzle } from "drizzle-orm/node-sqlite";
 import { Kysely, SqliteDialect, type SqliteDatabase } from "kysely";
 import { describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, UrsulaDatabase, UrsulaError, UrsulaSetupError, UrsulaUnavailableError, UrsulaWriteRefusedError } from "../src/index.ts";
-import { ext, fault, frames, freshDir, onModel, rejection, stream, thrown, ursulaUrl } from "./kit.ts";
+import { ext, fault, foreignAppend, frames, freshDir, rejection, stream, thrown } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
-describe.skipIf(!onModel())("open()", () => {
+describe("open()", () => {
 	it("binds and claims the stream, and returns a DatabaseSync named after it", async () => {
 		const s = stream("bind");
 		const db = await open(s.url, { dir: freshDir() });
@@ -70,8 +70,7 @@ describe.skipIf(!onModel())("open()", () => {
 		// Another writer's bytes in the stream: no 0.8 database, so the open fails.
 		const created = await fetch(s.url, { method: "PUT", headers: { "content-type": "application/octet-stream" } });
 		expect(created.ok, await created.text()).toBe(true);
-		const foreign = await fetch(`${ursulaUrl()}/__model/foreign?path=${s.path}`, { method: "POST", body: "not a frame" });
-		expect(foreign.ok, await foreign.text()).toBe(true);
+		await foreignAppend(s.path, "not a frame");
 		const dir = freshDir();
 		const outcomes = await Promise.allSettled([open(s.url, { dir }), open(s.url, { dir }), open(s.url, { dir })]);
 		const errors = outcomes.map((o) => (o.status === "rejected" ? o.reason : o.value));
@@ -171,6 +170,8 @@ describe.skipIf(!onModel())("open()", () => {
 		};
 		const k = new Kysely<{ t: { x: number } }>({ dialect: new SqliteDialect({ database }) });
 		await k.schema.createTable("t").addColumn("x", "integer").execute();
+		// With a 1-byte bound, a commit while this one is unacknowledged is refused (backlog_full).
+		await db.synced();
 		await k.insertInto("t").values([{ x: 1 }, { x: 2 }]).execute();
 		await db.synced();
 		expect(await k.selectFrom("t").select("x").orderBy("x").execute()).toEqual([{ x: 1 }, { x: 2 }]);

@@ -1,14 +1,14 @@
-// Worker threads against the model server (E2E_SERVER=model): every JavaScript thread calls `open`,
-// and the opens of one stream in a process share its binding, whichever thread made them. Each
-// thread runs its own pump: its `synced()` resolves and its listeners hear a reset. A worker thread
-// whose database closed exits on its own.
+// Worker threads against the e2e server (test/stack.ts): every JavaScript thread calls `open`, and
+// the opens of one stream in a process share its binding, whichever thread made them. Each thread
+// runs its own pump: its `synced()` resolves and its listeners hear a reset. A worker thread whose
+// database closed exits on its own.
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, UrsulaResetError } from "../src/index.ts";
-import { ext, frames, freshDir, onModel, rejection, stream } from "./kit.ts";
+import { ext, frames, freshDir, rejection, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -42,7 +42,7 @@ function thread(url: string, dir: string, value: number) {
 	};
 }
 
-describe.skipIf(!onModel())("worker threads", () => {
+describe("worker threads", () => {
 	it("open the stream the main thread holds: one binding, one claim, synced() in each thread", async () => {
 		const s = stream("threads");
 		const dir = freshDir();

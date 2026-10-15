@@ -8,6 +8,12 @@ import { expect, inject } from "vitest";
 /** The base URL of the server the suite runs against (test/stack.ts). */
 export const ursulaUrl = (): string => inject("ursulaUrl");
 
+/**
+ * The server with no gate in front, for the reads and writes a test makes itself: they never take
+ * a fault scripted for the database's requests.
+ */
+export const directUrl = (): string => inject("ursulaDirect");
+
 /** Whether the suite runs against the model server (E2E_SERVER=model). */
 export const onModel = (): boolean => inject("ursulaServer") === "model";
 
@@ -19,20 +25,39 @@ export const ext = (): string => {
 };
 
 let n = 0;
-/** A stream of its own for each test: its URL and its path on the server. */
+/** A stream of its own for each test, in the bucket `sqlite-e2e` (test/stack.ts creates it): its URL and its path on the server. */
 export function stream(label: string): { url: string; path: string } {
 	n += 1;
-	const path = `/e2e/${label}-${process.pid}-${Date.now().toString(36)}-${n}`;
+	const path = `/sqlite-e2e/${label}-${process.pid}-${Date.now().toString(36)}-${n}`;
 	return { url: `${ursulaUrl()}${path}`, path };
 }
 
 /** A new cache root. */
 export const freshDir = (): string => mkdtempSync(join(tmpdir(), "sqlite-ursula-e2e-"));
 
-/** The `USQ2` frames the model holds for `path`, by kind (1 claim, 2 commit). */
+/**
+ * Every byte of the stream at `path`: the model's `/__model/frames`, or a read of the stream from
+ * its start to its tail.
+ */
+async function streamBytes(path: string): Promise<Uint8Array> {
+	if (onModel()) return new Uint8Array(await (await fetch(`${directUrl()}/__model/frames?path=${path}`)).arrayBuffer());
+	const chunks: Uint8Array[] = [];
+	for (let offset = "-1"; ; ) {
+		const r = await fetch(`${directUrl()}${path}?offset=${offset}`);
+		expect(r.status, `read ${path} from ${offset}`).toBe(200);
+		const chunk = new Uint8Array(await r.arrayBuffer());
+		chunks.push(chunk);
+		const next = r.headers.get("stream-next-offset");
+		expect(next, `read ${path}: no Stream-Next-Offset`).not.toBeNull();
+		if (r.headers.has("stream-up-to-date") || chunk.length === 0 || next === offset) break;
+		offset = next as string;
+	}
+	return new Uint8Array(Buffer.concat(chunks));
+}
+
+/** The `USQ2` frames the stream at `path` holds, by kind (1 claim, 2 commit). */
 export async function frames(path: string): Promise<{ claims: number; commits: number }> {
-	const r = await fetch(`${ursulaUrl()}/__model/frames?path=${path}`);
-	const bytes = new Uint8Array(await r.arrayBuffer());
+	const bytes = await streamBytes(path);
 	const view = new DataView(bytes.buffer);
 	const count = { claims: 0, commits: 0 };
 	for (let at = 0; at < bytes.length; ) {
@@ -46,11 +71,26 @@ export async function frames(path: string): Promise<{ claims: number; commits: n
 	return count;
 }
 
-/** Scripts a fault of the model (clients/sqlite-vfs/src/model/faults.rs) for its next `times` requests of `method`. */
+/** Where {@link fault} scripts a fault: the model's `/__model/faults`, or the gate's `/faults` (test/stack.ts). */
+export const faultsUrl = (): string => inject("ursulaFaults");
+
+/**
+ * Scripts a fault for the next `times` requests of `method` to the server: at the model
+ * (clients/sqlite-vfs/src/model/faults.rs), or at the gate in front of Ursula (test/gate.mjs), which
+ * scripts `delay <ms>` only.
+ */
 export async function fault(line: string, times = 1, method?: string): Promise<void> {
 	const query = `times=${times}${method === undefined ? "" : `&method=${method}`}`;
-	const r = await fetch(`${ursulaUrl()}/__model/faults?${query}`, { method: "POST", body: line });
+	const r = await fetch(`${faultsUrl()}?${query}`, { method: "POST", body: line });
 	expect(r.status, await r.text()).toBe(204);
+}
+
+/** An append to the stream at `path` by another writer: `body` with no producer headers. */
+export async function foreignAppend(path: string, body: string): Promise<void> {
+	const r = onModel()
+		? await fetch(`${directUrl()}/__model/foreign?path=${path}`, { method: "POST", body })
+		: await fetch(`${directUrl()}${path}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body });
+	expect(r.ok, `${r.status} ${await r.text()}`).toBe(true);
 }
 
 /** The error `promise` rejects with (it must reject). */

@@ -11,7 +11,6 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { inject, it } from "vitest";
-import { ursulaUrl } from "./kit.ts";
 
 const seconds = Number(process.env.SOAK_SECONDS ?? 0);
 const owners = Number(process.env.SOAK_OWNERS ?? 128);
@@ -136,10 +135,10 @@ async function gauges(url: string): Promise<Json> {
 }
 
 it.skipIf(seconds <= 0)(
-	"soak: VFS-shaped owners stay within bounded server memory",
+	"soak: VFS-shaped owners stay within bounded server memory (runs only with SOAK_SECONDS set: skipped otherwise)",
 	async () => {
 		const nodes = inject("ursulaNodes");
-		const base = ursulaUrl();
+		const base = inject("ursulaDirect");
 		const started = Date.now();
 		let aborted = false;
 		const stop = (): boolean => aborted || Date.now() - started > seconds * 1000;

@@ -1,5 +1,5 @@
-// Resets against the model server (E2E_SERVER=model): another process takes the stream over, and
-// the old owner's pending `synced()` calls reject with an UrsulaResetError (`fenced`, `stop`), then its
+// Resets against the e2e server (test/stack.ts): another process takes the stream over, and the old
+// owner's pending `synced()` calls reject with an UrsulaResetError (`fenced`, `stop`), then its
 // `reset` listeners run once, and every statement of it throws the reset, reads included. A new
 // `open()` takes the stream back.
 import { type ChildProcess, spawn } from "node:child_process";
@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, UrsulaResetError } from "../src/index.ts";
-import { ext, freshDir, onModel, rejection, stream, thrown } from "./kit.ts";
+import { ext, freshDir, rejection, stream, thrown } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -35,7 +35,7 @@ async function takeOver(url: string, dir: string): Promise<{ exec(sql: string): 
 /** The first reset `db` reports to its listeners. */
 const nextReset = (db: UrsulaDatabase): Promise<UrsulaResetError> => new Promise((resolve) => db.on("reset", resolve));
 
-describe.skipIf(!onModel())("resets", () => {
+describe("resets", () => {
 	it("a takeover rejects pending synced() calls, then runs the listeners once, and fails every statement", async () => {
 		const s = stream("takeover");
 		const dir = freshDir();
