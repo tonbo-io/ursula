@@ -12,6 +12,8 @@
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`json_records`]: canonical JSON message text: LF-terminated messages,
 //!   whose ends feed the `committed_records` usage counter.
+//! - [`sim_controls`]: defences a simulation's negative control turns off
+//!   (`cfg(madsim)` only; constant in every other build).
 //! - [`snapshot`]: snapshot wire format and restoration errors.
 //! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group,
 //!   plus [`GroupStateGauges`], the per-group bounded-state gauges
@@ -28,6 +30,7 @@ mod history;
 mod json_records;
 mod model;
 mod response;
+pub mod sim_controls;
 mod snapshot;
 mod state_machine;
 mod validate;

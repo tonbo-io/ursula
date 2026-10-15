@@ -211,7 +211,9 @@ pub(crate) fn evaluate(
     }
     // Row 11: a history event closed the epoch at `last_seq`; no seq above
     // it ever applies.
-    if record.history != history {
+    if record.history != history
+        && !crate::sim_controls::off(crate::sim_controls::Defence::HistoryFence)
+    {
         return Evaluation::Refuse(Refusal::Producer(ProducerRefusal::EpochClosed {
             epoch: record.epoch,
             by: ClosedBy::History,

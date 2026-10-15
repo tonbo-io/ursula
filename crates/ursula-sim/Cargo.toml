@@ -30,6 +30,7 @@ ursula = { workspace = true }
 ursula-ctl = { workspace = true }
 ursula-headers = { workspace = true }
 ursula-proto = { workspace = true }
+ursula-stream = { workspace = true }
 
 [lints]
 workspace = true

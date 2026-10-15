@@ -99,6 +99,7 @@ impl StreamStateMachine {
     ) -> StreamResponse {
         if let Some(current) = self.history
             && current.imported == Some(backup_digest)
+            && !crate::sim_controls::off(crate::sim_controls::Defence::ImportKey)
         {
             return StreamResponse::SnapshotImported {
                 buckets: u64::try_from(self.buckets.len()).unwrap_or(u64::MAX),

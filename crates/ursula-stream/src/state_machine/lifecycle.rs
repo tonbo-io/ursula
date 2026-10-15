@@ -468,6 +468,9 @@ impl StreamStateMachine {
         command: &StreamCommand,
         expected: u64,
     ) -> Option<StreamResponse> {
+        if crate::sim_controls::off(crate::sim_controls::Defence::IncarnationCheck) {
+            return None;
+        }
         let (stream_id, now_ms, create) = match command {
             StreamCommand::CreateStream {
                 stream_id, now_ms, ..

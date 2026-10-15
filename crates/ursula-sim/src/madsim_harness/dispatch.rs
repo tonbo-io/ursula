@@ -34,6 +34,7 @@ use super::has_retry_cold_write_after_failure_in_fault_plan;
 use super::has_stop_current_leader_in_fault_plan;
 use super::has_stop_seeded_follower_in_fault_plan;
 use super::has_verify_runtime_cold_live_reads_in_fault_plan;
+use super::history::Controls as HistoryControls;
 use super::history::run_rewind_applies_exactly_once_inner;
 use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
@@ -269,22 +270,29 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         scenario: SimScenario,
     ) -> SimReport {
+        Self::run_history_with_controls_report(config, scenario, HistoryControls::default())
+    }
+
+    pub(super) fn run_history_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
+        controls: HistoryControls,
+    ) -> SimReport {
         let seed = config.seed;
         match scenario {
             SimScenario::StaleWritersAfterRestore => report_of(
                 scenario,
                 seed,
-                run_stale_writers_never_apply_after_restore_inner(config),
+                run_stale_writers_never_apply_after_restore_inner(config, controls),
             ),
             _ => report_of(
                 SimScenario::HistoryRewindUnderLeaderChurn,
                 seed,
-                run_rewind_applies_exactly_once_inner(config),
+                run_rewind_applies_exactly_once_inner(config, controls),
             ),
         }
     }
 
-    /// Runs a write-key scenario with its defences as `controls` leave them.
     pub(super) fn run_write_keys_with_controls_report(
         config: ThreeNodeRaftSimConfig,
         scenario: SimScenario,

@@ -4733,6 +4733,7 @@ dependencies = [
  "ursula-raft",
  "ursula-runtime",
  "ursula-shard",
+ "ursula-stream",
 ]
 
 [[package]]

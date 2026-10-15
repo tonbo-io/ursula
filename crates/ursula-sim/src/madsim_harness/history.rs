@@ -28,6 +28,10 @@
 //! by a producer whose record did not survive. The stream ends as the
 //! backup's bytes followed by exactly the writes that applied after the
 //! restore.
+//!
+//! [`Controls`] turn off one server defence each, through
+//! [`ursula_stream::sim_controls`], for the tests that show the invariants
+//! catch its loss.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -64,6 +68,64 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 const BODY_LEN: usize = 16;
 /// Attempts of one request before the client gives up.
 const MAX_ATTEMPTS: usize = 60;
+
+/// Server defences a negative control turns off. Production runs use the
+/// default, with every defence on; only tests construct the others.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Controls {
+    /// Row 11 off: a producer record from the source's history keeps its
+    /// epoch open after the restore.
+    history_fence_off: bool,
+    /// G1 off: a write that names the source's token applies to the
+    /// restored incarnation.
+    incarnation_check_off: bool,
+    /// The import is not keyed by its backup: a repeat finds the group
+    /// holding state and is refused.
+    import_key_off: bool,
+}
+
+#[cfg(test)]
+impl Controls {
+    pub(super) const HISTORY_FENCE_OFF: Self = Self {
+        history_fence_off: true,
+        incarnation_check_off: false,
+        import_key_off: false,
+    };
+    pub(super) const INCARNATION_CHECK_OFF: Self = Self {
+        history_fence_off: false,
+        incarnation_check_off: true,
+        import_key_off: false,
+    };
+    pub(super) const IMPORT_KEY_OFF: Self = Self {
+        history_fence_off: false,
+        incarnation_check_off: false,
+        import_key_off: true,
+    };
+}
+
+/// The defences [`Controls`] turned off for this simulation, until dropped.
+struct Switched;
+
+impl Switched {
+    fn apply(controls: Controls) -> Self {
+        set_defences(controls);
+        Self
+    }
+}
+
+impl Drop for Switched {
+    fn drop(&mut self) {
+        set_defences(Controls::default());
+    }
+}
+
+fn set_defences(controls: Controls) {
+    use ursula_stream::sim_controls::Defence;
+    use ursula_stream::sim_controls::set_off;
+    set_off(Defence::HistoryFence, controls.history_fence_off);
+    set_off(Defence::IncarnationCheck, controls.incarnation_check_off);
+    set_off(Defence::ImportKey, controls.import_key_off);
+}
 
 fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: String) -> ! {
     trace.push(SimEvent::InvariantFailed {
@@ -161,45 +223,77 @@ async fn export(cluster: &Cluster) -> Bytes {
     body_bytes(response).await
 }
 
-/// One import of `backup` into `cluster`'s group, as the import route
-/// proposes it: the backup decoded, its digest as the key, and a history id
-/// the request draws. `None` when the outcome is unknown. (The route itself
-/// runs admin mutations on a tokio task, which the simulation does not
-/// host.)
-async fn import_once(cluster: &Cluster, backup: &Bytes) -> Option<BackupImportResponse> {
-    let snapshot: ursula_runtime::StreamSnapshot =
-        rmp_serde::from_slice(backup).expect("decode the backup");
-    let response = cluster
-        .runtime
-        .import_group_state(
-            cluster.placement.raft_group_id,
-            ursula_runtime::ImportGroupStateRequest {
-                snapshot: Box::new(snapshot),
-                history: ursula_runtime::draw_history_id(),
-                backup_digest: *blake3::hash(backup).as_bytes(),
-                now_ms: 0,
-            },
-        )
-        .await
-        .ok()?;
-    Some(BackupImportResponse {
-        buckets: response.buckets,
-        streams: response.streams,
-        group_commit_index: response.group_commit_index,
-        history: response.history,
-        already: response.already,
-    })
+/// What one import attempt came back with.
+enum ImportAnswer {
+    Answered(BackupImportResponse),
+    /// The group refused the import as a conflict: it holds state, and not
+    /// state restored from this backup.
+    Conflict,
+    /// The outcome is unknown.
+    Unknown,
 }
 
-/// Repeats the import until it answers.
-async fn import(cluster: &Cluster, backup: &Bytes) -> BackupImportResponse {
-    for _ in 0..MAX_ATTEMPTS {
-        if let Some(answer) = import_once(cluster, backup).await {
-            return answer;
+/// One import of `backup` into the group of `runtime`, as the import route
+/// proposes it: the backup decoded, its digest as the key, and a history id
+/// the request draws. (The route itself runs admin mutations on a tokio
+/// task, which the simulation does not host.)
+async fn import_once(
+    runtime: &ursula_runtime::ShardRuntime,
+    raft_group_id: ursula_shard::RaftGroupId,
+    backup: &Bytes,
+) -> ImportAnswer {
+    let snapshot: ursula_runtime::StreamSnapshot =
+        rmp_serde::from_slice(backup).expect("decode the backup");
+    let request = ursula_runtime::ImportGroupStateRequest {
+        snapshot: Box::new(snapshot),
+        history: ursula_runtime::draw_history_id(),
+        backup_digest: *blake3::hash(backup).as_bytes(),
+        now_ms: 0,
+    };
+    match runtime.import_group_state(raft_group_id, request).await {
+        Ok(response) => ImportAnswer::Answered(BackupImportResponse {
+            buckets: response.buckets,
+            streams: response.streams,
+            group_commit_index: response.group_commit_index,
+            history: response.history,
+            already: response.already,
+        }),
+        Err(error)
+            if error.stream_error_code()
+                == Some(ursula_runtime::StreamErrorCode::ImportConflict) =>
+        {
+            ImportAnswer::Conflict
         }
-        madsim::time::sleep(Duration::from_millis(20)).await;
+        Err(_unknown) => ImportAnswer::Unknown,
+    }
+}
+
+/// Repeats the import until it gets an answer, a refusal included.
+async fn import(cluster: &Cluster, backup: &Bytes) -> ImportAnswer {
+    for _ in 0..MAX_ATTEMPTS {
+        match import_once(&cluster.runtime, cluster.placement.raft_group_id, backup).await {
+            ImportAnswer::Unknown => madsim::time::sleep(Duration::from_millis(20)).await,
+            answer => return answer,
+        }
     }
     panic!("the import never answered");
+}
+
+/// The rewind invariant's reading of an import's answer: a client that
+/// repeats its own import of an empty group always gets the import's answer.
+fn import_answered(trace: &mut SimTrace, answer: ImportAnswer) -> BackupImportResponse {
+    match answer {
+        ImportAnswer::Answered(answer) => answer,
+        ImportAnswer::Conflict => fail(
+            trace,
+            REWIND_INVARIANT,
+            "import_repeated",
+            "a repeat of the client's own import was refused as a conflict, so the client \
+             cannot tell whether its import applied"
+                .to_owned(),
+        ),
+        ImportAnswer::Unknown => unreachable!("import() repeats an unknown outcome"),
+    }
 }
 
 /// The source cluster: its stream after `writes` writes of each producer,
@@ -326,7 +420,9 @@ impl RewindPlan {
 
 pub(super) async fn run_rewind_applies_exactly_once_inner(
     config: ThreeNodeRaftSimConfig,
+    controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
+    let _switched = Switched::apply(controls);
     let plan = RewindPlan::from_seed(config.seed);
     let mut trace = SimTrace::default();
     let source = source(&config, &mut trace, 2, 3, 0, None).await;
@@ -341,30 +437,13 @@ pub(super) async fn run_rewind_applies_exactly_once_inner(
             target.isolate_leader();
             let in_flight = {
                 let runtime = target.runtime.clone();
-                let placement = target.placement;
+                let raft_group_id = target.placement.raft_group_id;
                 let backup = source.backup.clone();
                 madsim::task::spawn(async move {
-                    let snapshot: ursula_runtime::StreamSnapshot =
-                        rmp_serde::from_slice(&backup).expect("decode the backup");
-                    runtime
-                        .import_group_state(
-                            placement.raft_group_id,
-                            ursula_runtime::ImportGroupStateRequest {
-                                snapshot: Box::new(snapshot),
-                                history: ursula_runtime::draw_history_id(),
-                                backup_digest: *blake3::hash(&backup).as_bytes(),
-                                now_ms: 0,
-                            },
-                        )
-                        .await
-                        .ok()
-                        .map(|response| BackupImportResponse {
-                            buckets: response.buckets,
-                            streams: response.streams,
-                            group_commit_index: response.group_commit_index,
-                            history: response.history,
-                            already: response.already,
-                        })
+                    match import_once(&runtime, raft_group_id, &backup).await {
+                        ImportAnswer::Answered(answer) => Some(answer),
+                        ImportAnswer::Conflict | ImportAnswer::Unknown => None,
+                    }
                 })
             };
             madsim::time::sleep(Duration::from_millis(2)).await;
@@ -373,15 +452,18 @@ pub(super) async fn run_rewind_applies_exactly_once_inner(
             answers.extend(first);
         }
         2 => {
-            answers.push(import(&target, &source.backup).await);
+            let answer = import(&target, &source.backup).await;
+            answers.push(import_answered(&mut trace, answer));
             churn(&mut target, &mut trace, "leader_killed_after_import").await;
         }
         _ => {}
     }
     // The client repeats the import, unchanged, until it has an answer, and
     // once more.
-    answers.push(import(&target, &source.backup).await);
+    let answer = import(&target, &source.backup).await;
+    answers.push(import_answered(&mut trace, answer));
     let repeat = import(&target, &source.backup).await;
+    let repeat = import_answered(&mut trace, repeat);
     if !repeat.already {
         fail(
             &mut trace,
@@ -584,7 +666,9 @@ fn assert_history_closed(trace: &mut SimTrace, producer: u8, seq: u64, last: u64
 
 pub(super) async fn run_stale_writers_never_apply_after_restore_inner(
     config: ThreeNodeRaftSimConfig,
+    controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
+    let _switched = Switched::apply(controls);
     let plan = StalePlan::from_seed(config.seed);
     let mut trace = SimTrace::default();
     let newcomer = plan.producers;
@@ -599,7 +683,12 @@ pub(super) async fn run_stale_writers_never_apply_after_restore_inner(
     .await;
     let mut target = Cluster::start_empty(&config, &mut trace).await;
     wait_followers_joined(&target).await;
-    import(&target, &source.backup).await;
+    if !matches!(
+        import(&target, &source.backup).await,
+        ImportAnswer::Answered(_)
+    ) {
+        panic!("the restore was refused");
+    }
     let restored = head(&target.app, &target.path).await.incarnation();
     let mut appended = source.bytes.clone();
     let mut refused = 0_u64;
@@ -721,13 +810,70 @@ pub(super) async fn run_stale_writers_never_apply_after_restore_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::Controls;
+    use super::REWIND_INVARIANT;
+    use super::STALE_INVARIANT;
     use crate::madsim_harness::SimScenario;
+    use crate::madsim_harness::SimTrace;
     use crate::madsim_harness::ThreeNodeRaftSim;
     use crate::madsim_harness::ThreeNodeRaftSimConfig;
+    use crate::madsim_harness::introspect::invariant_failed;
     use crate::madsim_harness::tests::sim_test_guard;
 
     fn config(seed: u64, scenario: SimScenario) -> ThreeNodeRaftSimConfig {
         ThreeNodeRaftSimConfig::new(seed, format!("ursula-sim-{seed}-{}", scenario.slug()))
+    }
+
+    /// Runs `scenario` at `seed` with `controls` and asserts `invariant`
+    /// failed.
+    fn assert_fails(scenario: SimScenario, seed: u64, controls: Controls, invariant: &str) {
+        let _guard = sim_test_guard();
+        SimTrace::clear_recorded();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            ThreeNodeRaftSim::run_history_with_controls_report(
+                config(seed, scenario),
+                scenario,
+                controls,
+            )
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(result.is_err(), "{controls:?} left {scenario:?} passing");
+        assert!(
+            invariant_failed(&SimTrace::last_recorded(), invariant),
+            "{controls:?} did not fail `{invariant}`"
+        );
+    }
+
+    #[test]
+    fn without_the_history_fence_a_stale_epoch_applies_after_a_restore() {
+        assert_fails(
+            SimScenario::StaleWritersAfterRestore,
+            380,
+            Controls::HISTORY_FENCE_OFF,
+            STALE_INVARIANT,
+        );
+    }
+
+    #[test]
+    fn without_the_token_check_a_write_of_the_source_history_applies() {
+        assert_fails(
+            SimScenario::StaleWritersAfterRestore,
+            380,
+            Controls::INCARNATION_CHECK_OFF,
+            STALE_INVARIANT,
+        );
+    }
+
+    #[test]
+    fn without_the_import_key_a_repeated_restore_is_refused() {
+        assert_fails(
+            SimScenario::HistoryRewindUnderLeaderChurn,
+            375,
+            Controls::IMPORT_KEY_OFF,
+            REWIND_INVARIANT,
+        );
     }
 
     #[test]
