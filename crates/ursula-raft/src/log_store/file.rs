@@ -39,6 +39,7 @@ use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::PlanCut;
 use super::core_meta::RecoveryRecord;
 use super::disk::Disk;
 use super::disk::JournalDisk;
@@ -229,11 +230,6 @@ impl RaftGroupFileLogStore {
         lock(&self.log).last_log_id()
     }
 
-    /// The committed entry the store recorded last.
-    pub(crate) fn committed(&self) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
-        lock(&self.log).committed()
-    }
-
     /// The vote the replica runs with.
     pub(crate) fn vote(&self) -> Option<VoteOf<UrsulaRaftTypeConfig>> {
         *lock(&self.vote)
@@ -365,6 +361,56 @@ impl RaftGroupFileLogStore {
         *lock(&self.recovery)
     }
 
+    /// Takes `record` as the replica's recovery plan and accepts its log as
+    /// it is (a recovering log is recorded initialized), in one synced
+    /// metadata write (N2, #581 review): a crash keeps both or neither.
+    pub(crate) async fn take_recovery_plan(
+        &self,
+        record: RecoveryRecord,
+    ) -> Result<(), CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        let timing = self
+            .core_writer
+            .write(CoreWriteOp::TakePlan {
+                group_id: self.placement.raft_group_id.0,
+                record,
+            })
+            .await?;
+        self.record_timing(1, timing);
+        *lock(&self.recovery) = Some(record);
+        match self.store_log() {
+            StoreLog::Recovering => self.set_store_log(StoreLog::Initialized),
+            StoreLog::Empty(EmptyHistory::Unknown) => {
+                self.set_store_log(StoreLog::Empty(EmptyHistory::New));
+            }
+            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) => {}
+        }
+        Ok(())
+    }
+
+    /// Removes `record` when it is still the replica's recovery plan, under
+    /// the store's write order, so a plan recorded meanwhile stays (m1,
+    /// #581 review). Returns whether it removed it.
+    pub(crate) async fn retire_recovery_plan(
+        &self,
+        record: RecoveryRecord,
+    ) -> Result<bool, CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        if *lock(&self.recovery) != Some(record) {
+            return Ok(false);
+        }
+        let timing = self
+            .core_writer
+            .write(CoreWriteOp::Recovery {
+                group_id: self.placement.raft_group_id.0,
+                record: None,
+            })
+            .await?;
+        self.record_timing(1, timing);
+        *lock(&self.recovery) = None;
+        Ok(true)
+    }
+
     /// Records `record` as the replica's recovery plan, or removes it. The
     /// metadata file is synced, and the journal before it.
     pub(crate) async fn record_recovery(
@@ -400,7 +446,7 @@ impl RaftGroupFileLogStore {
         let Some(record) = self.recovery_record() else {
             return Ok(false);
         };
-        let Some(committed) = record.cut_after else {
+        let PlanCut::Pending { keep: committed } = record.cut else {
             return Ok(false);
         };
         let held = self.log_id_at(committed.index());
@@ -416,7 +462,7 @@ impl RaftGroupFileLogStore {
             store.truncate_after(Some(committed)).await?;
         }
         self.record_recovery(Some(RecoveryRecord {
-            cut_after: None,
+            cut: PlanCut::Done,
             ..record
         }))
         .await?;

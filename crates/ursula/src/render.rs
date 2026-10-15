@@ -77,9 +77,9 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
         | RuntimeError::StaticMembershipConfig { .. }
         | RuntimeError::ColdStoreIo { .. }
         | RuntimeError::MailboxClosed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        RuntimeError::ResponseDropped { .. } | RuntimeError::SpawnCoreThread { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        RuntimeError::ResponseDropped { .. }
+        | RuntimeError::SpawnCoreThread { .. }
+        | RuntimeError::GroupRestartAborted { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::LiveReadBackpressure { .. } => StatusCode::SERVICE_UNAVAILABLE,
         // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
         // fallback when no routing target is available.
@@ -658,6 +658,7 @@ pub(crate) fn raft_group_metrics(
         apply_failure: value.apply_failure.clone(),
         history: value.history,
         recovery: value.recovery,
+        recovery_gate: value.recovery_gate,
     }
 }
 

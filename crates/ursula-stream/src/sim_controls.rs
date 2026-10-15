@@ -17,10 +17,9 @@ pub enum Defence {
     /// An import of a backup the group was already restored from answers
     /// `already` instead of rewinding again.
     ImportKey,
-    /// A recovery plan that cuts the logs cuts them inside its accept job,
-    /// and its members grant the plan's leader their vote only once it was
-    /// cut. Off, the cut waits for the member's next start, as before the
-    /// #581 review (B1).
+    /// A recovery plan that cuts the logs cuts them inside its accept job.
+    /// Off, the cut waits for the member's next start, as before the #581
+    /// review (B1).
     RecoveryCut,
 }
 

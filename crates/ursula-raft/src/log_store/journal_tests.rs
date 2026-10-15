@@ -1777,8 +1777,8 @@ async fn a_group_opens_once_while_its_store_lives_and_again_after_it_closed() {
     let record = crate::log_store::RecoveryRecord {
         leader: 2,
         point: 1,
-        uncut_leader_term: None,
-        cut_after: None,
+        leader_term: 3,
+        cut: crate::log_store::PlanCut::None,
     };
     store
         .record_recovery(Some(record))

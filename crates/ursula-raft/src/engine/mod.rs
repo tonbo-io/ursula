@@ -138,6 +138,11 @@ pub struct RaftGroupEngineOptions {
     pub snapshot_build: Option<SnapshotBuildCoordinator>,
     pub snapshot_install: Option<SnapshotInstallCoordinator>,
     pub snapshot_metadata_path: Option<PathBuf>,
+    /// The replica's recovery gate. Its recovery plan fences the history
+    /// before the Raft core starts, so a plan's leader that restarts never
+    /// leads without it (N1, #581 review). The gate is bound later by
+    /// [`RaftGroupEngine::publish_recovery`].
+    pub recovery: Option<Arc<crate::GroupRejoin>>,
 }
 
 pub struct RaftGroupEngine {
@@ -392,6 +397,7 @@ impl RaftGroupEngine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
+            recovery,
         } = options;
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
@@ -423,6 +429,9 @@ impl RaftGroupEngine {
             placement.raft_group_id,
             state_machine.engine.subscribe_history(),
         );
+        if let Some(gate) = &recovery {
+            history.set_plan(gate.recovery_record());
+        }
         let metadata_serial = state_machine.metadata_serial.clone();
         let apply_health = state_machine.apply_health.clone();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(

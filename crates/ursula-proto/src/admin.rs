@@ -249,11 +249,13 @@ pub struct ReplicaLogView {
 
 /// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
 /// a recovery plan that accepts the loss of the group's unsynced tail
-/// (#581 section 4.5). The tool reads every reachable member, refuses
-/// unless a majority of the voters answer, and sends the plan to every
-/// reachable member, the leader last. A member that takes it votes only for
-/// `leader` until it applied a history event at a log index above `point`;
-/// the leader proposes that event first and serves nothing before it.
+/// (#581 section 4.5). The tool reads every reachable member and refuses
+/// unless a majority of the voters answer. It sends the plan to the leader
+/// first ([`PlanStep::Lead`]), which answers its plan term, and then to every
+/// other reachable member ([`PlanStep::Follow`] with that term). A member
+/// that takes it votes only for `leader`, and only at a term above the plan
+/// term, until it applied a history event at a log index above `point`. The
+/// leader proposes that event first and serves nothing before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryPlanRequest {
@@ -267,13 +269,23 @@ pub struct RecoveryPlanRequest {
     /// the leader's last log term is below the highest vote term a gated
     /// member holds, so its log may hold a stale entry.
     pub cut: bool,
-    /// The plan's leader's last log term as the tool read it, `null` for an
-    /// empty log. Members of a cutting plan grant the leader their vote only
-    /// once its log ends at the point or carries a later term, so its
-    /// stale entries never win an election.
-    pub leader_last_log_term: Option<u64>,
+    /// Whether this replica leads the plan or follows it.
+    pub step: PlanStep,
     /// This replica's log as the tool read it.
     pub expected: ReplicaLogView,
+}
+
+/// Which part of a recovery plan a request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStep {
+    /// To the plan's leader, first: it takes the plan and answers its plan
+    /// term ([`RecoveryPlanReport::leader_term`]).
+    Lead,
+    /// To every other member, after the leader took the plan: it votes for
+    /// the leader only at a term above `leader_term`, which only campaigns
+    /// the leader starts after it took the plan reach.
+    Follow { leader_term: u64 },
 }
 
 /// What a recovery plan did on one replica.
@@ -297,6 +309,8 @@ pub struct RecoveryPlanReport {
     /// The plan this replica holds.
     pub leader: u64,
     pub point: u64,
+    /// The plan term: the leader's vote term when it took the plan.
+    pub leader_term: u64,
 }
 
 /// Deserializes an `Option` field that must be present, so that a missing
@@ -396,6 +410,7 @@ mod tests {
     #[test]
     fn recovery_plans_and_import_answers_keep_their_wire_form() {
         use super::BackupImportResponse;
+        use super::PlanStep;
         use super::RecoveryPlanOutcome;
         use super::RecoveryPlanReport;
         use super::RecoveryPlanRequest;
@@ -404,7 +419,7 @@ mod tests {
             leader: 2,
             point: 12,
             cut: true,
-            leader_last_log_term: Some(3),
+            step: PlanStep::Follow { leader_term: 9 },
             expected: ReplicaLogView {
                 last_log_index: Some(14),
                 last_log_term: Some(3),
@@ -413,7 +428,15 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&plan).unwrap(),
-            r#"{"leader":2,"point":12,"cut":true,"leader_last_log_term":3,"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+            r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+        );
+        let lead = RecoveryPlanRequest {
+            step: PlanStep::Lead,
+            ..plan
+        };
+        assert_eq!(
+            serde_json::to_string(&lead).unwrap(),
+            r#"{"leader":2,"point":12,"cut":true,"step":"lead","expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
         );
         let report = RecoveryPlanReport {
             raft_group_id: 4,
@@ -421,10 +444,11 @@ mod tests {
             outcome: RecoveryPlanOutcome::Follows,
             leader: 2,
             point: 12,
+            leader_term: 9,
         };
         assert_eq!(
             serde_json::to_string(&report).unwrap(),
-            r#"{"raft_group_id":4,"node_id":2,"outcome":"follows","leader":2,"point":12}"#
+            r#"{"raft_group_id":4,"node_id":2,"outcome":"follows","leader":2,"point":12,"leader_term":9}"#
         );
         let answer = BackupImportResponse {
             buckets: 1,
@@ -452,7 +476,7 @@ mod tests {
         use super::ReplicaLogView;
         assert_eq!(
             serde_json::from_str::<RecoveryPlanRequest>(
-                r#"{"leader": 2, "point": 12, "cut": false, "leader_last_log_term": 3,
+                r#"{"leader": 2, "point": 12, "cut": false, "step": "lead",
                     "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
             )
             .unwrap(),
@@ -460,7 +484,7 @@ mod tests {
                 leader: 2,
                 point: 12,
                 cut: false,
-                leader_last_log_term: Some(3),
+                step: super::PlanStep::Lead,
                 expected: ReplicaLogView {
                     last_log_index: Some(12),
                     last_log_term: Some(3),
@@ -684,6 +708,9 @@ pub enum RecoveryGateStatus {
     /// A recovery plan holds the replica: it votes only for the plan's
     /// leader until the plan's history event applies (#581 section 4.5).
     Planned,
+    /// A recovery plan elects this replica: it campaigns and votes for no
+    /// other candidate until the plan's history event applies.
+    LeadsPlan,
     /// The replica took a plan that cuts its log and its group restarts to
     /// run the cut: it votes for no one and takes no replication.
     Cutting,
@@ -861,6 +888,8 @@ pub struct RaftGroupMetrics {
     /// applies (#581 section 4.5).
     #[serde(deserialize_with = "Option::deserialize")]
     pub recovery: Option<RaftGroupRecovery>,
+    /// The replica's recovery gate for this group: `open` when it has none.
+    pub recovery_gate: RecoveryGateStatus,
 }
 
 /// The history event a replica applied last.
@@ -878,7 +907,9 @@ pub struct RaftGroupHistory {
 pub struct RaftGroupRecovery {
     pub leader: u64,
     pub point: u64,
-    /// The plan's cut waits for the node's restart.
+    /// The plan term members require on the leader's vote requests.
+    pub leader_term: u64,
+    /// The plan's cut has not run yet.
     pub cut_pending: bool,
 }
 impl RaftGroupMetrics {
@@ -945,6 +976,7 @@ mod metrics_contract_tests {
                 apply_failure: None,
                 history: None,
                 recovery: None,
+                recovery_gate: RecoveryGateStatus::Open,
             }],
         }
     }

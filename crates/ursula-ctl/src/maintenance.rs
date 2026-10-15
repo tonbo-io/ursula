@@ -525,6 +525,7 @@ mod tests {
             apply_failure: None,
             history: None,
             recovery: None,
+            recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
         });
         metrics.raft_maintenance = Some(ursula_proto::admin::RaftMaintenanceReport {
             version: ursula_proto::admin::SchemaVersion,

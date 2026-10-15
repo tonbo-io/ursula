@@ -175,6 +175,7 @@ mod tests {
             log: Default::default(),
             history: None,
             recovery: None,
+            recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
         }
     }
 

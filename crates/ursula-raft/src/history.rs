@@ -141,6 +141,19 @@ impl GroupHistory {
         *self.plan.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Clears the plan when it is still `record` (m1, #581 review): a plan
+    /// taken meanwhile stays.
+    pub(crate) fn clear_plan(&self, record: RecoveryRecord) {
+        let mut current = self.plan.lock().unwrap_or_else(PoisonError::into_inner);
+        if *current != Some(record) {
+            return;
+        }
+        *current = None;
+        self.plan_version.fetch_add(1, Ordering::SeqCst);
+        drop(current);
+        self.plan_changed.notify_waiters();
+    }
+
     pub(crate) fn set_plan(&self, plan: Option<RecoveryRecord>) {
         let mut current = self.plan.lock().unwrap_or_else(PoisonError::into_inner);
         if *current == plan {
@@ -262,16 +275,26 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
     let mut applied = history.applied.clone();
     let mut plan = history.plan_version.load(Ordering::SeqCst);
     let mut proposed: Option<(u64, Owed)> = None;
+    // m6 (#581 review): the applied index when it last moved or the plan
+    // last changed, the plan's version then, and when.
+    let mut progress = (
+        metrics
+            .borrow_watched()
+            .last_applied
+            .map(|applied| applied.index),
+        plan,
+        crate::rt::time::Instant::now(),
+    );
     loop {
         if let Some(record) = history.plan()
             && plan_satisfied(&record, history.applied())
         {
             let retired = match history.rejoin() {
-                Some(rejoin) => rejoin.retire_recovery_plan(record).await,
+                Some(rejoin) => rejoin.retire_recovery_plan(record).await.map(|_removed| ()),
                 None => Ok(()),
             };
             match retired {
-                Ok(()) => history.set_plan(None),
+                Ok(()) => history.clear_plan(record),
                 Err(error) => {
                     tracing::warn!(
                         raft_group_id = history.raft_group_id.0,
@@ -317,7 +340,41 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
             }
             continue;
         }
-        if !history_changed(&history, &mut applied, &mut plan, &mut metrics).await {
+        // m6 (#581 review): a plan under which nothing applies for the
+        // stall timeout is wedged; its gate reports the group stalled, and
+        // the operator plans again.
+        let rejoin = history.rejoin().filter(|_| {
+            history
+                .plan()
+                .is_some_and(|record| !plan_satisfied(&record, history.applied()))
+        });
+        let applied_now = metrics
+            .borrow_watched()
+            .last_applied
+            .map(|applied| applied.index);
+        // A plan's stall timeout runs from when the replica took it.
+        if applied_now != progress.0 || plan != progress.1 {
+            progress = (applied_now, plan, crate::rt::time::Instant::now());
+        }
+        let wait = rejoin.as_ref().map(|rejoin| {
+            let stall_after = rejoin.stall_after();
+            if progress.2.elapsed() >= stall_after {
+                rejoin.stall_plan();
+                stall_after
+            } else {
+                stall_after.saturating_sub(progress.2.elapsed())
+            }
+        });
+        drop(rejoin);
+        let changed = history_changed(&history, &mut applied, &mut plan, &mut metrics);
+        let changed = match wait {
+            // The stall timeout elapsed: check the plan again.
+            Some(wait) => crate::rt::time::timeout(wait, changed)
+                .await
+                .unwrap_or(true),
+            None => changed.await,
+        };
+        if !changed {
             return;
         }
     }

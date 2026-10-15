@@ -158,6 +158,7 @@ impl RecoveryGate {
             nodes.clone(),
             config.interval,
         )));
+        rejoin.set_stall_after(config.stall_after);
         self.push(crate::rt::spawn(run_rejoin_vote_barrier(
             engine.read_barrier.owner().clone(),
             rejoin.clone(),

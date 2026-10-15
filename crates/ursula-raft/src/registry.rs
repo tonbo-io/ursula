@@ -634,10 +634,14 @@ impl RaftGroupHandleRegistry {
         let owner = entry.raft().clone();
         let plan = *plan;
         let job = rejoin.clone();
+        let history = entry.history.clone();
         let taken = owner
             .call(move |raft| async move {
-                job.accept_recovery_plan(&plan, || raft.runtime_config().elect(false))
-                    .await
+                let core = crate::rejoin::RaftPlanCore {
+                    raft: &raft,
+                    raft_group_id,
+                };
+                job.accept_recovery_plan(&plan, &core, &history).await
             })
             .await
             .map_err(|source| RecoveryGateError::OwnerStopped {
@@ -645,30 +649,43 @@ impl RaftGroupHandleRegistry {
                 source,
             })??;
         let report = match taken {
-            crate::rejoin::PlanTaken::Holds(report) => {
-                entry.history.set_plan(rejoin.recovery_record());
-                report
-            }
+            crate::rejoin::PlanTaken::Holds(report) => report,
             // B1 (#581 review): the cut runs before the plan answers. The
             // group's engine stops, its log store closes, and the new
             // replica's recovery gate cuts the log before its Raft core
-            // starts, then takes the plan's gate; a cut that cannot run
-            // fails the restart.
+            // starts, then takes the plan's gate. A cut that cannot run
+            // drops the plan and closes the gate (m3).
             crate::rejoin::PlanTaken::Restart(report) => {
                 drop(entry);
                 drop(rejoin);
-                restart
+                let restarted = restart
                     .restart_replica(raft_group_id)
                     .await
                     .map_err(|source| RecoveryGateError::Restart {
                         raft_group_id,
                         source: Box::new(source),
-                    })?;
+                    })?
+                    .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+                if let Some((committed, held)) = restarted.cut_refused() {
+                    return Err(RecoveryGateError::CutRefused {
+                        raft_group_id,
+                        committed,
+                        held,
+                    });
+                }
                 report
             }
         };
         self.refresh_group_elections(raft_group_id);
         Ok(report)
+    }
+
+    /// The recovery gate of `raft_group_id` on this node, if it has one.
+    pub fn recovery_gate(&self, raft_group_id: RaftGroupId) -> Option<Arc<GroupRejoin>> {
+        self.groups
+            .load()
+            .get(&raft_group_id.0)
+            .and_then(|entry| entry.active()?.recovery.clone())
     }
 
     /// The recovery gate of every group that has one on this node.
@@ -904,6 +921,7 @@ impl RaftGroupHandleRegistry {
                         log,
                         history: None,
                         recovery: None,
+                        recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
                     });
                     continue;
                 }
@@ -966,7 +984,17 @@ impl RaftGroupHandleRegistry {
                     .map(|record| ursula_proto::admin::RaftGroupRecovery {
                         leader: record.leader,
                         point: record.point,
-                        cut_pending: record.cut_after.is_some(),
+                        leader_term: record.leader_term,
+                        cut_pending: matches!(
+                            record.cut,
+                            crate::log_store::PlanCut::Pending { .. }
+                        ),
+                    }),
+                recovery_gate: entry
+                    .recovery
+                    .as_ref()
+                    .map_or(ursula_proto::admin::RecoveryGateStatus::Open, |rejoin| {
+                        rejoin.status()
                     }),
             });
         }

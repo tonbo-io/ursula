@@ -229,7 +229,7 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                     leader: ex_leader,
                     point: seen.last_log_index.unwrap_or(0),
                     cut: false,
-                    leader_last_log_term: seen.last_log_term,
+                    step: ursula_proto::admin::PlanStep::Lead,
                     expected: seen,
                 };
                 assert!(
@@ -545,7 +545,7 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                             leader: wiped,
                             point: seen.last_log_index.unwrap_or(0),
                             cut: false,
-                            leader_last_log_term: seen.last_log_term,
+                            step: ursula_proto::admin::PlanStep::Lead,
                             expected: seen,
                         },
                         &mut NeverRestart,
@@ -722,7 +722,15 @@ impl ursula_raft::ReplicaRestart for NeverRestart {
         &mut self,
         raft_group_id: RaftGroupId,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), ursula_runtime::RuntimeError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<std::sync::Arc<ursula_raft::GroupRejoin>>,
+                        ursula_runtime::RuntimeError,
+                    >,
+                > + Send
+                + '_,
+        >,
     > {
         panic!(
             "a plan without a cut restarted raft group {}",

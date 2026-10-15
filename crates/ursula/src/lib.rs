@@ -2744,7 +2744,10 @@ pub(crate) async fn accept_unsynced_loss(
         )
             .into_response();
     };
-    let mut restart = RuntimeReplicaRestart(state.runtime.clone());
+    let mut restart = RuntimeReplicaRestart {
+        runtime: state.runtime.clone(),
+        registry: registry.clone(),
+    };
     match registry
         .accept_recovery_plan(raft_group_id, &plan, &mut restart)
         .await
@@ -2756,13 +2759,16 @@ pub(crate) async fn accept_unsynced_loss(
         Err(
             err @ (ursula_raft::RecoveryGateError::StoreClosed { .. }
             | ursula_raft::RecoveryGateError::FollowsLeader { .. }
+            | ursula_raft::RecoveryGateError::LeadsLive { .. }
+            | ursula_raft::RecoveryGateError::StepMismatch { .. }
+            | ursula_raft::RecoveryGateError::SelfVoteRefused { .. }
+            | ursula_raft::RecoveryGateError::CutRefused { .. }
             | ursula_raft::RecoveryGateError::NotStalled { .. }
             | ursula_raft::RecoveryGateError::RecoveryPointBehind { .. }
             | ursula_raft::RecoveryGateError::NothingCommitted { .. }
             | ursula_raft::RecoveryGateError::CommittedEntryMissing { .. }
             | ursula_raft::RecoveryGateError::LeaderNotVoter { .. }
             | ursula_raft::RecoveryGateError::PointMismatch { .. }
-            | ursula_raft::RecoveryGateError::LeaderLogMismatch { .. }
             | ursula_raft::RecoveryGateError::MissingVoteFloor { .. }
             | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
         ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
@@ -2770,6 +2776,7 @@ pub(crate) async fn accept_unsynced_loss(
             err @ (ursula_raft::RecoveryGateError::Record { .. }
             | ursula_raft::RecoveryGateError::Cut { .. }
             | ursula_raft::RecoveryGateError::Restart { .. }
+            | ursula_raft::RecoveryGateError::Core { .. }
             | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
         ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(
@@ -2780,15 +2787,24 @@ pub(crate) async fn accept_unsynced_loss(
 }
 
 /// Restarts a group's replica through the node's runtime, for a recovery
-/// plan's cut.
-struct RuntimeReplicaRestart(ShardRuntime);
+/// plan's cut, and finds its new recovery gate in the node's registry.
+struct RuntimeReplicaRestart {
+    runtime: ShardRuntime,
+    registry: RaftGroupHandleRegistry,
+}
 
 impl ursula_raft::ReplicaRestart for RuntimeReplicaRestart {
     fn restart_replica(
         &mut self,
         raft_group_id: RaftGroupId,
-    ) -> futures_util::future::BoxFuture<'_, Result<(), ursula_runtime::RuntimeError>> {
-        Box::pin(self.0.restart_group_engine(raft_group_id))
+    ) -> futures_util::future::BoxFuture<
+        '_,
+        Result<Option<Arc<ursula_raft::GroupRejoin>>, ursula_runtime::RuntimeError>,
+    > {
+        Box::pin(async move {
+            self.runtime.restart_group_engine(raft_group_id).await?;
+            Ok(self.registry.recovery_gate(raft_group_id))
+        })
     }
 }
 
@@ -4589,6 +4605,7 @@ fn refused_before_proposal(err: &RuntimeError) -> bool {
         | RuntimeError::LiveReadBackpressure { .. }
         | RuntimeError::MailboxClosed { .. }
         | RuntimeError::ResponseDropped { .. }
+        | RuntimeError::GroupRestartAborted { .. }
         | RuntimeError::SpawnCoreThread { .. } => false,
     }
 }

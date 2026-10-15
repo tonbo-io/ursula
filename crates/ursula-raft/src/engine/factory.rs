@@ -486,6 +486,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         .filter(|(group, _)| *group == placement.raft_group_id)
                         .map(|(_, fault)| fault),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
+                    recovery: Some(rejoin.clone()),
                 },
                 health.clone(),
             )

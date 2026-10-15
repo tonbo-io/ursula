@@ -504,6 +504,13 @@ pub(crate) enum CoreWriteOp {
         group_id: u32,
         record: Option<RecoveryRecord>,
     },
+    /// A group takes a recovery plan: the plan, and its log accepted as it
+    /// is (a recovering group recorded initialized), in one replacement of
+    /// the metadata file, so a crash keeps both or neither.
+    TakePlan {
+        group_id: u32,
+        record: RecoveryRecord,
+    },
 }
 
 /// What one request's write cost, as reported to its group's metrics.
@@ -1863,6 +1870,17 @@ fn write_core_log_batch(
             CoreWriteOp::Recovery { group_id, record } => {
                 metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= journal.metadata.set_recovery(*group_id, *record);
+                requires_sync = true;
+                None
+            }
+            CoreWriteOp::TakePlan { group_id, record } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.set_recovery(*group_id, Some(*record));
+                if journal.metadata.group(*group_id).log == GroupLogState::Recovering {
+                    metadata_changed |= journal
+                        .metadata
+                        .set_log_state(*group_id, GroupLogState::Initialized);
+                }
                 requires_sync = true;
                 None
             }

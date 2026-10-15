@@ -240,6 +240,12 @@ impl RollingRestartValidator {
                             apply_failure: None,
                             history: None,
                             recovery: None,
+                            recovery_gate: self
+                                .registry
+                                .rejoin(node_id)
+                                .map_or(ursula_raft::RecoveryGateStatus::Open, |rejoin| {
+                                    rejoin.status()
+                                }),
                         }
                     }],
                     raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {

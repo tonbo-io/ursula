@@ -734,6 +734,19 @@ async fn cli_single_voter_passes_verify_cluster_and_wait_node() {
 /// names the old token answers `412`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_single_voter_with_an_unknown_history_serves_after_a_recovery_plan() {
+    single_voter_recovery_plan(false).await;
+}
+
+/// m3 of the second #581 review: a plan that cuts runs its cut through the
+/// node's own in-process restart of the group (the runtime's restart task,
+/// the production engine factory and the shared registry). The group comes
+/// back under the plan, elects its leader and serves the kept log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_single_voter_runs_a_cutting_plan_through_its_in_process_restart() {
+    single_voter_recovery_plan(true).await;
+}
+
+async fn single_voter_recovery_plan(cut: bool) {
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI recovery gate test");
@@ -822,12 +835,21 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_a_recovery_plan()
         last_log_term: group["last_log_term"].as_u64(),
         current_term: group["current_term"].as_u64().expect("current term"),
     };
-    // A single voter never cuts: its log is a prefix of the old one.
+    // The tool never cuts a single voter's log, which is a prefix of the old
+    // one. A cut back to its committed entry keeps the same log, and runs
+    // through the node's in-process restart of the group.
+    let point = if cut {
+        group["committed_index"]
+            .as_u64()
+            .expect("the single voter knows its committed entry")
+    } else {
+        expected.last_log_index.unwrap_or(0)
+    };
     let plan = ursula_proto::admin::RecoveryPlanRequest {
         leader: 1,
-        point: expected.last_log_index.unwrap_or(0),
-        cut: false,
-        leader_last_log_term: expected.last_log_term,
+        point,
+        cut,
+        step: ursula_proto::admin::PlanStep::Lead,
         expected,
     };
     let response = admin_test_post(&client, accept_url)

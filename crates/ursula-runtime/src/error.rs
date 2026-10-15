@@ -19,6 +19,10 @@ pub enum ErrorStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
+    /// The task that restarted one group's engine ended without finishing:
+    /// the group may be stopped on this node until a request creates it.
+    #[error("the restart of raft group {} did not finish", .raft_group_id.0)]
+    GroupRestartAborted { raft_group_id: RaftGroupId },
     #[error("invalid shard runtime config: {0}")]
     InvalidConfig(#[from] ShardMapError),
     #[error("raft group {} is outside configured range 0..{raft_group_count}", .raft_group_id.0)]

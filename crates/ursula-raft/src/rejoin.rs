@@ -98,6 +98,7 @@ use openraft::type_config::TypeConfigExt;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::type_config::alias::WatchSenderOf;
 use openraft::vote::RaftLeaderId;
+use ursula_proto::admin::PlanStep;
 use ursula_proto::admin::RecoveryPlanOutcome;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
@@ -106,6 +107,7 @@ use ursula_shard::RaftGroupId;
 
 use crate::log_store::CoreJournalError;
 use crate::log_store::GroupLogState;
+use crate::log_store::PlanCut;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RecoveryRecord;
 use crate::registry::RaftGroupHandle;
@@ -202,19 +204,22 @@ pub(crate) enum VoteGate {
         group: GroupEvidence,
         recovery: GateRecovery,
     },
-    /// A recovery plan elects `leader`: the replica votes only for it and
-    /// does not campaign, until the plan's history event applies here. When
-    /// the plan cuts every log, `uncut_leader_term` is the leader's last log
-    /// term before its cut, and the replica grants the leader its vote only
-    /// once the leader shows it was cut: its log ends at most at `point`, or
-    /// its last entry has a later term. Every entry the leader appends after
-    /// the plan does, since it leads in a term above its current one; its
-    /// stale suffix ends at exactly `uncut_leader_term`.
+    /// A recovery plan elects `leader`: the replica votes only for it, at a
+    /// term above `leader_term`, and does not campaign, until the plan's
+    /// history event applies here. The leader took the plan at
+    /// `leader_term`, so only a campaign it started after taking the plan
+    /// (and, for a cutting plan, after its cut) gets this vote (N1, #581
+    /// review). `stalled` once nothing applied here for the stall timeout:
+    /// the plan's leader is gone or behind, and the operator plans again.
     Planned {
         leader: u64,
         point: u64,
-        uncut_leader_term: Option<u64>,
+        leader_term: u64,
+        stalled: bool,
     },
+    /// A recovery plan elects this replica: it campaigns but votes for no
+    /// other candidate, and serves nothing until its history event applies.
+    LeadsPlan { stalled: bool },
     /// The replica took a plan that cuts its log, and its group restarts to
     /// run the cut: it votes for no one, does not campaign and takes no
     /// replication, so its uncut log helps no leader.
@@ -235,6 +240,11 @@ impl VoteGate {
         matches!(self, Self::Open)
     }
 
+    /// Whether the replica may campaign: an open gate, or the plan's leader.
+    pub(crate) fn campaigns(&self) -> bool {
+        matches!(self, Self::Open | Self::LeadsPlan { .. })
+    }
+
     pub(crate) fn status(&self) -> RecoveryGateStatus {
         match self {
             Self::Open => RecoveryGateStatus::Open,
@@ -243,26 +253,56 @@ impl VoteGate {
                 GateRecovery::Stalled => RecoveryGateStatus::Stalled,
                 GateRecovery::CatchingUp(_) => RecoveryGateStatus::CatchingUp,
             },
+            Self::Planned { stalled: true, .. } | Self::LeadsPlan { stalled: true } => {
+                RecoveryGateStatus::Stalled
+            }
             Self::Planned { .. } => RecoveryGateStatus::Planned,
+            Self::LeadsPlan { .. } => RecoveryGateStatus::LeadsPlan,
             Self::Cutting => RecoveryGateStatus::Cutting,
         }
     }
 
-    /// The gate of a member that holds `record` and is not its leader.
-    pub(crate) fn planned(record: &RecoveryRecord) -> Self {
-        Self::Planned {
-            leader: record.leader,
-            point: record.point,
-            uncut_leader_term: record.uncut_leader_term,
+    /// The gate of a replica that holds `record`, whose node is `node_id`.
+    pub(crate) fn planned(record: &RecoveryRecord, node_id: u64) -> Self {
+        if record.leader == node_id {
+            Self::LeadsPlan { stalled: false }
+        } else {
+            Self::Planned {
+                leader: record.leader,
+                point: record.point,
+                leader_term: record.leader_term,
+                stalled: false,
+            }
+        }
+    }
+
+    /// Whether this gate holds the plan `record`.
+    pub(crate) fn holds(&self, record: &RecoveryRecord) -> bool {
+        match self {
+            Self::Planned {
+                leader,
+                point,
+                leader_term,
+                ..
+            } => {
+                *leader == record.leader
+                    && *point == record.point
+                    && *leader_term == record.leader_term
+            }
+            Self::LeadsPlan { .. } => true,
+            Self::Open | Self::Closed { .. } | Self::Cutting => false,
         }
     }
 
     /// Record an inbound AppendEntries that carried `leader_commit`.
     pub(crate) fn observe_append(&mut self, leader_commit: Option<u64>) {
-        if let Self::Closed { group, .. } = self
-            && leader_commit.is_some_and(|index| index >= 1)
-        {
-            *group = GroupEvidence::Initialized;
+        match self {
+            Self::Closed { group, .. } if leader_commit.is_some_and(|index| index >= 1) => {
+                *group = GroupEvidence::Initialized;
+            }
+            // The plan's leader replicates: the plan is not wedged.
+            Self::Planned { stalled, .. } => *stalled = false,
+            Self::Open | Self::Closed { .. } | Self::LeadsPlan { .. } | Self::Cutting => {}
         }
     }
 
@@ -303,7 +343,29 @@ impl VoteGate {
                 *recovery = GateRecovery::Stalled;
                 true
             }
-            Self::Open | Self::Closed { .. } | Self::Planned { .. } | Self::Cutting => false,
+            Self::Open
+            | Self::Closed { .. }
+            | Self::Planned { .. }
+            | Self::LeadsPlan { .. }
+            | Self::Cutting => false,
+        }
+    }
+
+    /// m6 (#581 review): the replica holds a plan under which nothing
+    /// applied for the stall timeout since it took it, so the plan is
+    /// wedged and the operator plans again. Its votes are unchanged.
+    /// Returns whether the gate just stalled.
+    pub(crate) fn stall_plan(&mut self) -> bool {
+        match self {
+            Self::Planned { stalled, .. } | Self::LeadsPlan { stalled } if !*stalled => {
+                *stalled = true;
+                true
+            }
+            Self::Open
+            | Self::Closed { .. }
+            | Self::Planned { .. }
+            | Self::LeadsPlan { .. }
+            | Self::Cutting => false,
         }
     }
 
@@ -311,9 +373,9 @@ impl VoteGate {
     pub(crate) fn caught_up(&self, local: LocalReplica) -> bool {
         match self {
             Self::Open => true,
-            // A planned replica's gate closes when its plan is satisfied,
+            // A planned replica's gate changes when its plan is satisfied,
             // and a cutting replica restarts.
-            Self::Planned { .. } | Self::Cutting => false,
+            Self::Planned { .. } | Self::LeadsPlan { .. } | Self::Cutting => false,
             Self::Closed { recovery, .. } => match recovery {
                 GateRecovery::CatchingUp(target) => local
                     .last_applied
@@ -327,36 +389,33 @@ impl VoteGate {
         *self = Self::Open;
     }
 
-    /// Decide one vote request of `candidate`, whose last log id is
-    /// `candidate_last` (index and term).
+    /// Decide one vote request of `candidate` at term `candidate_term`,
+    /// whose last log index is `candidate_last_log_index`.
     pub(crate) fn screen(
         &mut self,
         candidate: u64,
-        candidate_last: Option<(u64, u64)>,
+        candidate_term: u64,
+        candidate_last_log_index: Option<u64>,
     ) -> VoteScreen {
-        let candidate_last_log_index = candidate_last.map(|(index, _term)| index);
         let group = match self {
             Self::Open => return VoteScreen::Pass,
-            // B3 (#577): a planned replica's vote opens for one candidate,
-            // and, when the plan cuts, only once that candidate was cut.
+            // B3 (#577) and N1 (#581 review): a planned replica's vote opens
+            // for one candidate, in a campaign it started after it took the
+            // plan.
             Self::Planned {
                 leader,
-                point,
-                uncut_leader_term,
+                leader_term,
+                ..
             } if *leader == candidate => {
-                let shows_cut = |uncut_term: u64| {
-                    candidate_last.is_none_or(|(index, term)| index <= *point || term > uncut_term)
-                };
-                return if uncut_leader_term.is_none_or(shows_cut)
-                    || ursula_stream::sim_controls::off(
-                        ursula_stream::sim_controls::Defence::RecoveryCut,
-                    ) {
+                return if candidate_term > *leader_term {
                     VoteScreen::Pass
                 } else {
                     VoteScreen::Refuse
                 };
             }
-            Self::Planned { .. } | Self::Cutting => return VoteScreen::Refuse,
+            Self::Planned { .. } | Self::LeadsPlan { .. } | Self::Cutting => {
+                return VoteScreen::Refuse;
+            }
             Self::Closed { group, .. } => group,
         };
         if candidate_last_log_index.is_some_and(|index| index >= 1) {
@@ -428,8 +487,6 @@ enum GateOpening {
     CaughtUp,
     /// Every voter reported an empty group: this replica initializes it.
     FreshBootstrap,
-    /// A recovery plan elects this replica.
-    PlanLeader,
     /// The history event of this replica's recovery plan applied here, and
     /// it lost nothing since it took the plan.
     PlanSatisfied,
@@ -515,6 +572,48 @@ pub enum RecoveryGateError {
         leader: u64,
     },
     #[error(
+        "this replica leads raft group {} with a live quorum; a recovery plan is only for a \
+         group without a leader",
+        .raft_group_id.0
+    )]
+    LeadsLive { raft_group_id: RaftGroupId },
+    #[error(
+        "raft group {}'s recovery plan elects node {leader}, but this request's step {step:?} \
+         is not this replica's: send `lead` to the leader, then `follow` with its plan term to \
+         every other member",
+        .raft_group_id.0
+    )]
+    StepMismatch {
+        raft_group_id: RaftGroupId,
+        leader: u64,
+        step: PlanStep,
+    },
+    #[error(
+        "raft group {}'s Raft core on this replica did not vote for it at the plan term {term}; \
+         observe the group again",
+        .raft_group_id.0
+    )]
+    SelfVoteRefused {
+        raft_group_id: RaftGroupId,
+        term: u64,
+    },
+    #[error("raft group {}'s Raft core on this replica: {source}", .raft_group_id.0)]
+    Core {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: openraft::error::RaftError<UrsulaRaftTypeConfig>,
+    },
+    #[error(
+        "raft group {}'s recovery cut could not run: its log holds {held:?} where the plan \
+         keeps {committed:?}; the plan was dropped and the replica waits for a new plan",
+        .raft_group_id.0
+    )]
+    CutRefused {
+        raft_group_id: RaftGroupId,
+        committed: LogIdOf<UrsulaRaftTypeConfig>,
+        held: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+    },
+    #[error(
         "raft group {}'s recovery gate on this replica is {status:?}, not stalled: a leader's \
          barrier may still open it without losing anything; plan only a group whose gated \
          replicas report it stalled",
@@ -569,25 +668,15 @@ pub enum RecoveryGateError {
         leader: u64,
     },
     #[error(
-        "raft group {}'s recovery plan elects this replica with point {point}, but its log \
-         continues from {expected} ({basis}); observe the group again",
+        "raft group {}'s recovery plan elects this replica with point {point}, but its {basis} \
+         is {expected}; observe the group again",
         .raft_group_id.0
     )]
     PointMismatch {
         raft_group_id: RaftGroupId,
         point: u64,
         expected: u64,
-        basis: &'static str,
-    },
-    #[error(
-        "raft group {}'s recovery plan names {named:?} as its leader's last log term, but the \
-         leader holds {held:?}; a cutting plan must name it; observe the group again",
-        .raft_group_id.0
-    )]
-    LeaderLogMismatch {
-        raft_group_id: RaftGroupId,
-        named: Option<u64>,
-        held: Option<u64>,
+        basis: PointBasis,
     },
     #[error("raft group {}'s replica on this node has not started", .raft_group_id.0)]
     NotStarted { raft_group_id: RaftGroupId },
@@ -610,10 +699,104 @@ pub enum RecoveryGateError {
 /// recovery plan's cut runs in between (#581 section 4.5). The node's
 /// runtime implements it; simulations restart their own replicas.
 pub trait ReplicaRestart: Send {
+    /// Restarts the replica and returns its new recovery gate, `None` when
+    /// it has none.
     fn restart_replica(
         &mut self,
         raft_group_id: RaftGroupId,
-    ) -> futures_util::future::BoxFuture<'_, Result<(), ursula_runtime::RuntimeError>>;
+    ) -> futures_util::future::BoxFuture<
+        '_,
+        Result<Option<Arc<GroupRejoin>>, ursula_runtime::RuntimeError>,
+    >;
+}
+
+/// Which index of its log the plan's leader continues from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointBasis {
+    /// Without a cut: its last log index.
+    LastLogIndex,
+    /// With a cut: its committed index.
+    CommittedIndex,
+}
+
+impl fmt::Display for PointBasis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LastLogIndex => "last log index",
+            Self::CommittedIndex => "committed index",
+        })
+    }
+}
+
+/// What a recovery plan's accept job needs from its group's Raft core.
+pub(crate) trait PlanCore: Sync {
+    /// Lets the core campaign, or stops it.
+    fn elect(&self, enabled: bool);
+    /// The core's vote term and committed entry, read through the core.
+    fn state(&self) -> futures_util::future::BoxFuture<'_, Result<CoreState, RecoveryGateError>>;
+    /// Has the core vote for its own replica at `term`, with its log ending
+    /// at `last_log_id`. Whether it did.
+    fn vote_for_self(
+        &self,
+        term: u64,
+        last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+    ) -> futures_util::future::BoxFuture<'_, Result<bool, RecoveryGateError>>;
+}
+
+/// A Raft core's vote term and committed entry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoreState {
+    pub(crate) vote_term: u64,
+    pub(crate) committed: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+}
+
+/// [`PlanCore`] for a group's Raft core, inside its owner job.
+pub(crate) struct RaftPlanCore<'a> {
+    pub(crate) raft: &'a RaftGroupHandle,
+    pub(crate) raft_group_id: RaftGroupId,
+}
+
+impl PlanCore for RaftPlanCore<'_> {
+    fn elect(&self, enabled: bool) {
+        self.raft.runtime_config().elect(enabled);
+    }
+
+    fn state(&self) -> futures_util::future::BoxFuture<'_, Result<CoreState, RecoveryGateError>> {
+        Box::pin(async move {
+            self.raft
+                .with_raft_state(|state| CoreState {
+                    vote_term: state.vote_ref().leader_id().term(),
+                    committed: state.local_committed().copied(),
+                })
+                .await
+                .map_err(|source| RecoveryGateError::OwnerStopped {
+                    raft_group_id: self.raft_group_id,
+                    source,
+                })
+        })
+    }
+
+    fn vote_for_self(
+        &self,
+        term: u64,
+        last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+    ) -> futures_util::future::BoxFuture<'_, Result<bool, RecoveryGateError>> {
+        Box::pin(async move {
+            let node_id = self.raft.metrics().borrow_watched().id;
+            let response = self
+                .raft
+                .vote(UrsulaVoteRequest::new(
+                    UrsulaVote::new(term, node_id),
+                    last_log_id,
+                ))
+                .await
+                .map_err(|source| RecoveryGateError::Core {
+                    raft_group_id: self.raft_group_id,
+                    source,
+                })?;
+            Ok(response.vote_granted)
+        })
+    }
 }
 
 /// What a replica that took a recovery plan does next.
@@ -648,6 +831,14 @@ pub struct GroupRejoin {
             openraft::type_config::alias::InstantOf<UrsulaRaftTypeConfig>,
         )>,
     >,
+    /// The cut of the plan this replica took could not run at its start:
+    /// the entry it keeps, and what the log held there.
+    cut_refused: Option<(
+        LogIdOf<UrsulaRaftTypeConfig>,
+        Option<LogIdOf<UrsulaRaftTypeConfig>>,
+    )>,
+    /// How long a plan may apply nothing before it reports stalled.
+    stall_after: OnceLock<Duration>,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -680,20 +871,58 @@ impl GroupRejoin {
             })?;
         // A recovery plan's cut runs before the Raft core starts, so the
         // core never sees the entries it removes.
-        if store
-            .run_recovery_cut()
-            .await
-            .map_err(|source| RecoveryGateError::Cut {
-                raft_group_id,
-                source,
-            })?
-        {
-            tracing::warn!(
-                node_id,
-                raft_group_id = raft_group_id.0,
-                "recovery plan: this replica's log now ends at the last entry it knew was \
-                 committed"
-            );
+        let mut cut_refused = None;
+        match store.run_recovery_cut().await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(
+                    node_id,
+                    raft_group_id = raft_group_id.0,
+                    "recovery plan: this replica's log now ends at the last entry it knew was \
+                     committed"
+                );
+                // m4 (#581 review): a leadership this replica held is for
+                // the log it cut: it never resumes it.
+                store.start_as_follower(node_id).await.map_err(|source| {
+                    RecoveryGateError::StartAsFollower {
+                        raft_group_id,
+                        source,
+                    }
+                })?;
+            }
+            // m3 (#581 review): the log no longer holds the entry the cut
+            // keeps. The plan is dropped and the gate stays closed until a
+            // new plan; the group starts and reports it.
+            Err(crate::log_store::RecoveryCutError::Diverged { committed, held }) => {
+                tracing::error!(
+                    node_id,
+                    raft_group_id = raft_group_id.0,
+                    ?committed,
+                    ?held,
+                    "recovery plan: the log no longer holds the entry the plan's cut keeps; the \
+                     plan is dropped and the replica waits for a new plan"
+                );
+                store
+                    .record_recovery(None)
+                    .await
+                    .map_err(|source| RecoveryGateError::Record {
+                        raft_group_id,
+                        source,
+                    })?;
+                store.start_as_follower(node_id).await.map_err(|source| {
+                    RecoveryGateError::StartAsFollower {
+                        raft_group_id,
+                        source,
+                    }
+                })?;
+                cut_refused = Some((committed, held));
+            }
+            Err(source) => {
+                return Err(RecoveryGateError::Cut {
+                    raft_group_id,
+                    source,
+                });
+            }
         }
         let gate = match (store.recovery_record(), store.log_state()) {
             // M1 (#581 review): a member that may have lost entries keeps a
@@ -716,12 +945,12 @@ impl GroupRejoin {
                 if record.leader == node_id {
                     VoteGate::closed(GroupEvidence::Initialized)
                 } else {
-                    VoteGate::planned(&record)
+                    VoteGate::planned(&record, node_id)
                 }
             }
             // The plan holds across restarts until it is satisfied.
-            (Some(record), _) if record.leader == node_id => VoteGate::Open,
-            (Some(record), _) => VoteGate::planned(&record),
+            (Some(record), _) => VoteGate::planned(&record, node_id),
+            (None, _) if cut_refused.is_some() => VoteGate::closed(GroupEvidence::Initialized),
             (None, GroupLogState::Initialized) => VoteGate::Open,
             (None, GroupLogState::Recovering) => {
                 tracing::warn!(
@@ -763,6 +992,8 @@ impl GroupRejoin {
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
             last_leader_append: Mutex::new(None),
+            cut_refused,
+            stall_after: OnceLock::new(),
         })
     }
 
@@ -797,7 +1028,7 @@ impl GroupRejoin {
                 },
             )
         })?;
-        if !self.vote_gate_open() {
+        if !self.may_campaign() {
             raft.runtime_config().elect(false);
         }
         Ok(())
@@ -891,7 +1122,7 @@ impl GroupRejoin {
 
     /// Campaigning is subject to both this gate and the node's shed policy.
     pub(crate) fn may_campaign(&self) -> bool {
-        self.vote_gate_open()
+        self.gate().campaigns() && !self.needs_vote_floor()
     }
 
     /// Opens the gate, recording it first.
@@ -927,12 +1158,6 @@ impl GroupRejoin {
                 node_id = self.node_id,
                 raft_group_id = self.raft_group_id.0,
                 "recovery gate opened: this replica applied its recovery plan's history event"
-            ),
-            GateOpening::PlanLeader => tracing::warn!(
-                node_id = self.node_id,
-                raft_group_id = self.raft_group_id.0,
-                "recovery gate opened by a recovery plan that elects this replica; it \
-                 campaigns with the log it holds and starts a new history once elected"
             ),
         }
         Ok(())
@@ -980,38 +1205,55 @@ impl GroupRejoin {
         matches!(*self.gate(), VoteGate::Cutting)
     }
 
-    /// Whether this replica follows `leader`, a committed leader whose
-    /// AppendEntries reached it within [`LIVE_LEADER_QUORUM_ACK`].
-    fn follows_live_leader(&self, metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> Option<u64> {
-        let leader = metrics
-            .current_leader
-            .filter(|leader| *leader != self.node_id)?;
+    /// The cut of the plan this replica took could not run at its start
+    /// (m3, #581 review): the entry the cut keeps, and what the log held.
+    pub(crate) fn cut_refused(
+        &self,
+    ) -> Option<(
+        LogIdOf<UrsulaRaftTypeConfig>,
+        Option<LogIdOf<UrsulaRaftTypeConfig>>,
+    )> {
+        self.cut_refused
+    }
+
+    /// The live leader this replica follows: a committed leader whose
+    /// AppendEntries reached it within [`LIVE_LEADER_QUORUM_ACK`] (m2, #581
+    /// review: an append may reach the replica before its metrics show the
+    /// leader).
+    fn follows_live_leader(&self) -> Option<u64> {
         let last = *self
             .last_leader_append
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let (vote, at) = last?;
-        (*vote.leader_id().node_id() == leader
-            && vote.is_committed()
-            && at.elapsed() < LIVE_LEADER_QUORUM_ACK)
+        let leader = *vote.leader_id().node_id();
+        (leader != self.node_id && vote.is_committed() && at.elapsed() < LIVE_LEADER_QUORUM_ACK)
             .then_some(leader)
     }
 
     /// Takes a recovery plan (#581 section 4.5), as one owner job of its
-    /// group; `disable_elections` stops the group's Raft core campaigning.
-    /// Refused, with nothing changed, when the replica leads or follows a
-    /// live leader, the plan's leader is not a voter, the replica no longer
-    /// holds the log the tool read, it committed or applied above the plan's
+    /// group on `core`. Refused, with nothing changed, when the replica leads
+    /// or follows a live leader, the request's step is not this replica's
+    /// role, the plan's leader is not a voter, the replica no longer holds
+    /// the log the tool read, it committed or applied above the plan's
     /// point, or it is the plan's leader and its log does not continue from
-    /// the point. Otherwise the plan is recorded durably. Without a cut the
-    /// gate opens on the plan's leader and opens for that leader only on
-    /// every other member. With a cut the replica closes first
-    /// ([`VoteGate::Cutting`]), and its group must restart
-    /// ([`PlanTaken::Restart`]) to run the cut before the answer.
+    /// the point.
+    ///
+    /// Otherwise, before its first await, the replica closes its gate to
+    /// the plan (the leader's gate campaigns but votes for no one else, a
+    /// member's votes for the leader only) and its leader fence (`history`)
+    /// learns the plan (N1, #581 review). With a cut it closes completely
+    /// ([`VoteGate::Cutting`]). It then reads the committed entry and its
+    /// vote through the core. The plan's leader votes for itself at the next
+    /// term, the plan term, which members require on its vote requests. The
+    /// plan and the accepted log are recorded in one durable write (N2).
+    /// With a cut the group must then restart ([`PlanTaken::Restart`]) to
+    /// run it before the answer.
     pub(crate) async fn accept_recovery_plan(
         &self,
         plan: &RecoveryPlanRequest,
-        disable_elections: impl FnOnce(),
+        core: &dyn PlanCore,
+        history: &crate::history::GroupHistory,
     ) -> Result<PlanTaken, RecoveryGateError> {
         let raft_group_id = self.raft_group_id;
         if self.needs_vote_floor() {
@@ -1024,6 +1266,18 @@ impl GroupRejoin {
         let metrics = self
             .metrics()
             .ok_or(RecoveryGateError::NotStarted { raft_group_id })?;
+        let leads = plan.leader == self.node_id;
+        let follows_term = match (plan.step, leads) {
+            (PlanStep::Lead, true) => None,
+            (PlanStep::Follow { leader_term }, false) => Some(leader_term),
+            (step, _) => {
+                return Err(RecoveryGateError::StepMismatch {
+                    raft_group_id,
+                    leader: plan.leader,
+                    step,
+                });
+            }
+        };
         // #577 N7 and M2 (#581 review): a plan never fences a group that
         // has a live leader, whether this replica leads it with a recent
         // quorum or follows it.
@@ -1033,12 +1287,9 @@ impl GroupRejoin {
                 .as_ref()
                 .is_some_and(|acked| acked.elapsed() < LIVE_LEADER_QUORUM_ACK)
         {
-            return Err(RecoveryGateError::FollowsLeader {
-                raft_group_id,
-                leader: self.node_id,
-            });
+            return Err(RecoveryGateError::LeadsLive { raft_group_id });
         }
-        if let Some(leader) = self.follows_live_leader(&metrics) {
+        if let Some(leader) = self.follows_live_leader() {
             return Err(RecoveryGateError::FollowsLeader {
                 raft_group_id,
                 leader,
@@ -1067,16 +1318,27 @@ impl GroupRejoin {
                 status,
             });
         }
+        // A replica that campaigns (an open one, or a plan's leader) climbs
+        // its vote term with every campaign it starts during a stall, and no
+        // plan reads it (N1 fix 5): only a gated replica's term must be the
+        // one the tool read.
         let actual = ReplicaLog::of(&store);
-        if actual != ReplicaLog::from(plan.expected) {
+        let expected = ReplicaLog::from(plan.expected);
+        let campaigns = self.gate().campaigns();
+        let changed = if campaigns {
+            (actual.last_log_index, actual.last_log_term)
+                != (expected.last_log_index, expected.last_log_term)
+        } else {
+            actual != expected
+        };
+        if changed {
             return Err(RecoveryGateError::ReplicaChanged {
                 raft_group_id,
                 expected: plan.expected,
                 actual: actual.into(),
             });
         }
-        let committed_id = metrics.local_committed.or_else(|| store.committed());
-        let committed = log_index(committed_id.as_ref());
+        let committed = log_index(metrics.local_committed.as_ref());
         let applied = log_index(metrics.last_applied.as_ref());
         if committed.is_some_and(|index| index > plan.point)
             || applied.is_some_and(|index| index > plan.point)
@@ -1089,19 +1351,12 @@ impl GroupRejoin {
             });
         }
         // The plan's leader continues from the point: its last entry, or
-        // with a cut its committed one; and the plan names its log.
-        if plan.leader == self.node_id {
-            if plan.leader_last_log_term != actual.last_log_term {
-                return Err(RecoveryGateError::LeaderLogMismatch {
-                    raft_group_id,
-                    named: plan.leader_last_log_term,
-                    held: actual.last_log_term,
-                });
-            }
+        // with a cut its committed one.
+        if leads {
             let (expected, basis) = if plan.cut {
-                (committed.unwrap_or(0), "its committed index")
+                (committed.unwrap_or(0), PointBasis::CommittedIndex)
             } else {
-                (actual.last_log_index.unwrap_or(0), "its last log index")
+                (actual.last_log_index.unwrap_or(0), PointBasis::LastLogIndex)
             };
             if plan.point != expected {
                 return Err(RecoveryGateError::PointMismatch {
@@ -1112,72 +1367,160 @@ impl GroupRejoin {
                 });
             }
         }
-        let uncut_leader_term = if plan.cut {
-            Some(
-                plan.leader_last_log_term
-                    .ok_or(RecoveryGateError::LeaderLogMismatch {
-                        raft_group_id,
-                        named: None,
-                        held: None,
-                    })?,
-            )
-        } else {
-            None
-        };
         let restart = plan.cut
             && !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::RecoveryCut);
-        // B1 (#581 review): from reading the entry the cut keeps until the
-        // restart, the replica neither votes, campaigns nor acknowledges an
-        // entry. No await comes between the read and the closed gate, so no
-        // inbound append runs in between.
-        let cut_after = if plan.cut {
-            let committed =
-                committed_id.ok_or(RecoveryGateError::NothingCommitted { raft_group_id })?;
-            let held = store.log_id_at(committed.index());
-            if held != Some(committed) {
+        // N1 (#581 review): from here on, before any await, the replica is
+        // closed to every leader but the plan's, and the plan's leader is
+        // fenced: it serves and admits nothing until the plan's event.
+        let provisional = RecoveryRecord {
+            leader: plan.leader,
+            point: plan.point,
+            leader_term: follows_term.unwrap_or(0),
+            cut: PlanCut::None,
+        };
+        let previous_plan = history.plan();
+        let previous_gate = {
+            let mut gate = self.gate();
+            let next = if restart {
+                VoteGate::Cutting
+            } else {
+                VoteGate::planned(&provisional, self.node_id)
+            };
+            std::mem::replace(&mut *gate, next)
+        };
+        if restart || !leads {
+            core.elect(false);
+        }
+        history.set_plan(Some(provisional));
+        self.changes.send_if_modified(|()| true);
+        match self
+            .take_plan(plan, &store, core, follows_term, leads, restart)
+            .await
+        {
+            Ok(record) => {
+                drop(store);
+                if !restart {
+                    *self.gate() = VoteGate::planned(&record, self.node_id);
+                }
+                history.set_plan(Some(record));
+                self.changes.send_if_modified(|()| true);
+                Ok(self.plan_taken(plan, record.leader_term, leads, restart))
+            }
+            Err(error) => {
+                // Refused after the gate changed: nothing was recorded, so
+                // the replica goes back to how it was.
+                drop(store);
+                let campaigns = previous_gate.campaigns();
+                *self.gate() = previous_gate;
+                history.set_plan(previous_plan);
+                if campaigns && !self.needs_vote_floor() {
+                    core.elect(true);
+                }
+                self.changes.send_if_modified(|()| true);
+                Err(error)
+            }
+        }
+    }
+
+    /// The part of [`Self::accept_recovery_plan`] after the gate changed:
+    /// reads the committed entry and the vote through the core, takes the
+    /// plan term on the plan's leader, and records the plan.
+    async fn take_plan(
+        &self,
+        plan: &RecoveryPlanRequest,
+        store: &RaftGroupFileLogStore,
+        core: &dyn PlanCore,
+        follows_term: Option<u64>,
+        leads: bool,
+        restart: bool,
+    ) -> Result<RecoveryRecord, RecoveryGateError> {
+        let raft_group_id = self.raft_group_id;
+        debug_assert_eq!(follows_term.is_none(), leads);
+        // B1 (#581 review): the committed entry the cut keeps is read
+        // through the core, after the gate closed, so nothing acknowledged
+        // since can be cut.
+        let state = core.state().await?;
+        let cut = if plan.cut {
+            let keep = state
+                .committed
+                .ok_or(RecoveryGateError::NothingCommitted { raft_group_id })?;
+            let held = store.log_id_at(keep.index());
+            if held != Some(keep) {
                 return Err(RecoveryGateError::CommittedEntryMissing {
                     raft_group_id,
-                    committed,
+                    committed: keep,
                     held,
                 });
             }
-            if restart {
-                *self.gate() = VoteGate::Cutting;
-                disable_elections();
-                self.changes.send_if_modified(|()| true);
-            }
-            Some(committed)
+            PlanCut::Pending { keep }
         } else {
-            None
+            PlanCut::None
+        };
+        let leader_term = match follows_term {
+            Some(term) => term,
+            None => {
+                // The plan term: every campaign this replica starts from now
+                // on is above it, every campaign it started before at most.
+                let term = state.vote_term.saturating_add(1);
+                if !core.vote_for_self(term, store.last_log_id()).await? {
+                    return Err(RecoveryGateError::SelfVoteRefused {
+                        raft_group_id,
+                        term,
+                    });
+                }
+                term
+            }
         };
         let record = RecoveryRecord {
             leader: plan.leader,
             point: plan.point,
-            uncut_leader_term,
-            cut_after,
+            leader_term,
+            cut,
         };
-        let leads = plan.leader == self.node_id;
-        // The plan accepts this replica's log as it is: the loss is
-        // accepted. A later crash records the log recovering again, and
-        // then the satisfied plan closes the gate until a leader's barrier
-        // (M1, #581 review).
+        // N2 (#581 review): the plan and the accepted log in one write. A
+        // later crash records the log recovering again, and then the
+        // satisfied plan closes the gate until a leader's barrier (M1).
         store
-            .record_recovered()
+            .take_recovery_plan(record)
             .await
             .map_err(|source| RecoveryGateError::Record {
                 raft_group_id,
                 source,
             })?;
-        store
-            .record_recovery(Some(record))
-            .await
-            .map_err(|source| RecoveryGateError::Record {
-                raft_group_id,
-                source,
-            })?;
-        drop(store);
+        if restart {
+            tracing::warn!(
+                node_id = self.node_id,
+                raft_group_id = raft_group_id.0,
+                leader = plan.leader,
+                point = plan.point,
+                leader_term,
+                "recovery plan: this replica's group restarts to cut its log back to the last \
+                 entry it knew was committed"
+            );
+        } else {
+            tracing::warn!(
+                node_id = self.node_id,
+                raft_group_id = raft_group_id.0,
+                leader = plan.leader,
+                point = plan.point,
+                leader_term,
+                "recovery plan taken: the plan's leader campaigns and starts a new history; \
+                 every other member votes only for it"
+            );
+        }
+        Ok(record)
+    }
+
+    /// The answer of a taken plan.
+    fn plan_taken(
+        &self,
+        plan: &RecoveryPlanRequest,
+        leader_term: u64,
+        leads: bool,
+        restart: bool,
+    ) -> PlanTaken {
         let report = RecoveryPlanReport {
-            raft_group_id: raft_group_id.0,
+            raft_group_id: self.raft_group_id.0,
             node_id: self.node_id,
             outcome: if leads {
                 RecoveryPlanOutcome::Leads
@@ -1186,69 +1529,42 @@ impl GroupRejoin {
             },
             leader: plan.leader,
             point: plan.point,
+            leader_term,
         };
         if restart {
-            tracing::warn!(
-                node_id = self.node_id,
-                raft_group_id = raft_group_id.0,
-                leader = plan.leader,
-                point = plan.point,
-                cut_after = ?cut_after,
-                "recovery plan: this replica's group restarts to cut its log back to the last \
-                 entry it knew was committed"
-            );
-            return Ok(PlanTaken::Restart(report));
-        }
-        if leads {
-            self.open(GateOpening::PlanLeader).await?;
+            PlanTaken::Restart(report)
         } else {
-            *self.gate() = VoteGate::planned(&record);
-            self.changes.send_if_modified(|()| true);
-            tracing::warn!(
-                node_id = self.node_id,
-                raft_group_id = raft_group_id.0,
-                leader = plan.leader,
-                point = plan.point,
-                "recovery plan: this replica votes only for the plan's leader until the plan's \
-                 history event applies"
-            );
+            PlanTaken::Holds(report)
         }
-        Ok(PlanTaken::Holds(report))
     }
 
     /// The history event of `record` applied here: the plan is satisfied.
-    /// The record is removed, and a planned gate opens; on a log that a crash
-    /// since the plan left recovering it closes until a leader's barrier
-    /// opens it (M1, #581 review), since the event proves nothing about the
-    /// entries the replica acknowledged after it. Runs outside OpenRaft's
-    /// state-machine worker. A record that a newer plan replaced stays.
+    /// The record is removed if it is still this replica's plan (m1, #581
+    /// review), and the gate it set changes: the leader's opens, and a
+    /// member's opens unless a crash since the plan left its log recovering,
+    /// then it closes until a leader's barrier opens it (M1). Runs outside
+    /// OpenRaft's state-machine worker. Returns whether the record went.
     pub(crate) async fn retire_recovery_plan(
         &self,
         record: RecoveryRecord,
-    ) -> Result<(), RecoveryGateError> {
+    ) -> Result<bool, RecoveryGateError> {
         let raft_group_id = self.raft_group_id;
         let store = self
             .store
             .upgrade()
             .ok_or(RecoveryGateError::StoreClosed { raft_group_id })?;
-        if store.recovery_record() != Some(record) {
-            return Ok(());
-        }
-        store
-            .record_recovery(None)
-            .await
-            .map_err(|source| RecoveryGateError::Record {
+        let removed = store.retire_recovery_plan(record).await.map_err(|source| {
+            RecoveryGateError::Record {
                 raft_group_id,
                 source,
-            })?;
+            }
+        })?;
         let recovering = store.log_state() == GroupLogState::Recovering;
         drop(store);
-        if !matches!(*self.gate(), VoteGate::Planned { .. }) {
-            return Ok(());
+        if !removed || !self.gate().holds(&record) {
+            return Ok(removed);
         }
         if recovering {
-            // The replica may have lost entries it acknowledged after taking
-            // the plan: only a leader's barrier opens it.
             *self.gate() = VoteGate::closed(GroupEvidence::Initialized);
             self.changes.send_if_modified(|()| true);
             tracing::info!(
@@ -1261,7 +1577,36 @@ impl GroupRejoin {
         } else {
             self.open(GateOpening::PlanSatisfied).await?;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Sets how long a plan may apply nothing before it reports stalled.
+    pub(crate) fn set_stall_after(&self, stall_after: Duration) {
+        if self.stall_after.set(stall_after).is_err() {
+            tracing::debug!("the recovery gate's stall timeout was already set");
+        }
+    }
+
+    /// How long a plan may apply nothing before it reports stalled.
+    pub(crate) fn stall_after(&self) -> Duration {
+        self.stall_after
+            .get()
+            .copied()
+            .unwrap_or(RECOVERY_STALL_AFTER)
+    }
+
+    /// Reports a wedged plan (m6, #581 review), from the history driver.
+    pub(crate) fn stall_plan(&self) {
+        if self.gate().stall_plan() {
+            self.changes.send_if_modified(|()| true);
+            tracing::error!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery plan: nothing applied under this replica's plan for the stall \
+                 timeout; the plan's leader may have lost entries its members hold. Send a new \
+                 plan to the group's members (ursulactl recover-group)"
+            );
+        }
     }
 
     /// Returns whether the gate just stalled.
@@ -1322,10 +1667,8 @@ impl GroupRejoin {
             ),
             Some(_) => match self.gate().screen(
                 candidate,
-                request
-                    .last_log_id
-                    .as_ref()
-                    .map(|last| (last.index, last.leader_id.term)),
+                request.vote.leader_id().term(),
+                candidate_index,
             ) {
                 VoteScreen::Pass => return None,
                 VoteScreen::Refuse => tracing::info!(
@@ -1580,27 +1923,27 @@ mod tests {
     fn an_unknown_history_gate_votes_in_a_new_groups_first_election() {
         let mut gate = VoteGate::closed(GroupEvidence::Unknown);
         // The initializer's candidate log is only the membership entry.
-        assert_eq!(gate.screen(9, Some((0, 1))), VoteScreen::Pass);
-        assert_eq!(gate.screen(9, None), VoteScreen::Pass);
+        assert_eq!(gate.screen(9, 1, Some(0)), VoteScreen::Pass);
+        assert_eq!(gate.screen(9, 1, None), VoteScreen::Pass);
         assert!(!gate.is_open(), "passing a first election opens nothing");
     }
 
     #[test]
     fn a_gated_replica_refuses_every_vote_once_the_group_holds_entries() {
         let mut gate = VoteGate::closed(GroupEvidence::Unknown);
-        assert_eq!(gate.screen(9, Some((11, 1))), VoteScreen::Refuse);
+        assert_eq!(gate.screen(9, 1, Some(11)), VoteScreen::Refuse);
         // Having seen entries, it refuses an index-0 candidate too: that can
         // only be another emptied replica.
-        assert_eq!(gate.screen(9, Some((0, 1))), VoteScreen::Refuse);
+        assert_eq!(gate.screen(9, 1, Some(0)), VoteScreen::Refuse);
 
         let mut gate = VoteGate::closed(GroupEvidence::Unknown);
         gate.observe_append(Some(1));
-        assert_eq!(gate.screen(9, None), VoteScreen::Refuse);
+        assert_eq!(gate.screen(9, 1, None), VoteScreen::Refuse);
 
         // A replica that lost its unsynced tail knows from the start.
         let mut gate = VoteGate::closed(GroupEvidence::Initialized);
-        assert_eq!(gate.screen(9, Some((0, 1))), VoteScreen::Refuse);
-        assert_eq!(gate.screen(9, None), VoteScreen::Refuse);
+        assert_eq!(gate.screen(9, 1, Some(0)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(9, 1, None), VoteScreen::Refuse);
     }
 
     #[test]
@@ -1618,11 +1961,11 @@ mod tests {
         assert!(gate.caught_up(follower(Some(11))));
         // Catching up never opens the gate by itself: the driver records it
         // first, so screening keeps refusing until then.
-        assert_eq!(gate.screen(9, Some((12, 1))), VoteScreen::Refuse);
+        assert_eq!(gate.screen(9, 1, Some(12)), VoteScreen::Refuse);
         gate.open();
         assert!(gate.is_open());
         assert_eq!(gate.status(), RecoveryGateStatus::Open);
-        assert_eq!(gate.screen(9, Some((12, 1))), VoteScreen::Pass);
+        assert_eq!(gate.screen(9, 1, Some(12)), VoteScreen::Pass);
         // An open gate stays open and ignores later evidence.
         gate.confirm_barrier(leader(3, 2), 40);
         gate.observe_append(Some(40));
@@ -1684,43 +2027,65 @@ mod tests {
         let planned = VoteGate::Planned {
             leader: 2,
             point: 10,
-            uncut_leader_term: None,
+            leader_term: 7,
+            stalled: false,
         };
         let mut gate = planned.clone();
         assert_eq!(gate.status(), RecoveryGateStatus::Planned);
-        assert!(!gate.is_open(), "a planned replica does not campaign");
-        assert_eq!(gate.screen(2, Some((40, 1))), VoteScreen::Pass);
-        assert_eq!(gate.screen(2, None), VoteScreen::Pass);
-        assert_eq!(gate.screen(3, Some((40, 1))), VoteScreen::Refuse);
-        assert_eq!(gate.screen(3, None), VoteScreen::Refuse);
-        // Barriers, replication and time change nothing: only the plan's
-        // history event closes it.
+        assert!(!gate.campaigns(), "a planned replica does not campaign");
+        assert_eq!(gate.screen(2, 8, Some(40)), VoteScreen::Pass);
+        assert_eq!(gate.screen(2, 8, None), VoteScreen::Pass);
+        assert_eq!(gate.screen(3, 8, Some(40)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(3, 8, None), VoteScreen::Refuse);
+        // Barriers and replication change nothing: only the plan's history
+        // event changes it.
         gate.observe_append(Some(41));
         gate.confirm_barrier(leader(5, 3), 41);
-        assert!(!gate.stall());
         assert!(!gate.caught_up(follower(Some(41))));
+        assert_eq!(gate, planned);
+        // m6 (#581 review): a plan that applied nothing reports the group
+        // stalled, and the leader's replication clears it. A closed gate's
+        // stall timer leaves it alone.
+        assert!(!gate.stall());
+        assert!(gate.stall_plan());
+        assert_eq!(gate.status(), RecoveryGateStatus::Stalled);
+        gate.observe_append(Some(42));
         assert_eq!(gate, planned);
     }
 
-    /// B1 (#581 review): a member of a cutting plan never elects the plan's
-    /// leader while that leader holds its uncut stale suffix.
+    /// N1 (#581 review): a planned member elects the plan's leader only in
+    /// a campaign it started after it took the plan: above the plan term.
     #[test]
-    fn a_cutting_plans_member_votes_for_its_leader_only_once_the_leader_was_cut() {
+    fn a_planned_member_votes_for_its_leader_only_above_the_plan_term() {
         let mut gate = VoteGate::Planned {
             leader: 2,
             point: 10,
-            uncut_leader_term: Some(5),
+            leader_term: 7,
+            stalled: false,
         };
-        // The uncut leader's log runs past the point in its old term:
-        // refused.
-        assert_eq!(gate.screen(2, Some((12, 5))), VoteScreen::Refuse);
-        // Cut back to the point: granted.
-        assert_eq!(gate.screen(2, Some((10, 4))), VoteScreen::Pass);
-        assert_eq!(gate.screen(2, Some((8, 4))), VoteScreen::Pass);
-        // Past the point in a later term: entries it appended as leader after
-        // the cut, granted again after its restart.
-        assert_eq!(gate.screen(2, Some((11, 9))), VoteScreen::Pass);
-        assert_eq!(gate.screen(3, Some((10, 4))), VoteScreen::Refuse);
+        // A campaign the leader started before it took the plan, at or
+        // below the plan term: refused.
+        assert_eq!(gate.screen(2, 6, Some(12)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(2, 7, Some(10)), VoteScreen::Refuse);
+        // After it took the plan: granted.
+        assert_eq!(gate.screen(2, 8, Some(10)), VoteScreen::Pass);
+        assert_eq!(gate.screen(3, 9, Some(10)), VoteScreen::Refuse);
+    }
+
+    /// N1 fix 3 (#581 review): the plan's leader campaigns and votes for
+    /// no other candidate.
+    #[test]
+    fn the_plans_leader_campaigns_and_votes_for_no_one_else() {
+        let mut gate = VoteGate::LeadsPlan { stalled: false };
+        assert_eq!(gate.status(), RecoveryGateStatus::LeadsPlan);
+        assert!(gate.campaigns());
+        assert!(!gate.is_open());
+        assert_eq!(gate.screen(3, 9, Some(40)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(3, 9, None), VoteScreen::Refuse);
+        assert!(!gate.stall());
+        assert!(gate.stall_plan());
+        assert_eq!(gate.status(), RecoveryGateStatus::Stalled);
+        assert!(gate.campaigns(), "a stalled plan's leader still campaigns");
     }
 
     #[test]
@@ -1728,8 +2093,9 @@ mod tests {
         let mut gate = VoteGate::Cutting;
         assert_eq!(gate.status(), RecoveryGateStatus::Cutting);
         assert!(!gate.is_open());
-        assert_eq!(gate.screen(2, Some((0, 1))), VoteScreen::Refuse);
-        assert_eq!(gate.screen(2, None), VoteScreen::Refuse);
+        assert_eq!(gate.screen(2, 1, Some(0)), VoteScreen::Refuse);
+        assert_eq!(gate.screen(2, 1, None), VoteScreen::Refuse);
+        assert!(!gate.campaigns());
         assert!(!gate.stall());
         assert!(!gate.caught_up(follower(Some(100))));
     }
@@ -2003,15 +2369,39 @@ mod tests {
                 leader,
                 point,
                 cut,
-                leader_last_log_term: last_log_term,
+                step: ursula_proto::admin::PlanStep::Lead,
                 expected: ReplicaLogView {
                     last_log_index,
                     last_log_term,
                     current_term,
                 },
             };
+        /// The core of a group that never started: the refusal comes first.
+        struct NoCore;
+        impl super::PlanCore for NoCore {
+            fn elect(&self, _enabled: bool) {
+                unreachable!("refused before the core is asked")
+            }
+            fn state(
+                &self,
+            ) -> futures_util::future::BoxFuture<'_, Result<super::CoreState, RecoveryGateError>>
+            {
+                unreachable!("refused before the core is asked")
+            }
+            fn vote_for_self(
+                &self,
+                _term: u64,
+                _last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+            ) -> futures_util::future::BoxFuture<'_, Result<bool, RecoveryGateError>> {
+                unreachable!("refused before the core is asked")
+            }
+        }
+        let history = crate::history::GroupHistory::new(
+            placement.raft_group_id,
+            ursula_runtime::HistoryPublisher::default().subscribe(),
+        );
         let missing_floor = gate
-            .accept_recovery_plan(&plan(1, 0, false, None, None, 0), || {})
+            .accept_recovery_plan(&plan(1, 0, false, None, None, 0), &NoCore, &history)
             .await
             .expect_err("accepting lost entries cannot replace a lost vote history");
         assert!(matches!(
@@ -2073,7 +2463,7 @@ mod tests {
             .expect("open the gate");
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(gate.holds_group_history(), "it never initializes again");
-        assert_eq!(gate.gate().screen(9, Some((0, 1))), VoteScreen::Refuse);
+        assert_eq!(gate.gate().screen(9, 1, Some(0)), VoteScreen::Refuse);
         // Its refusals report the log it holds, so a bootstrap probe sees
         // that the group exists here.
         assert_eq!(gate.last_log_id(), Some(log_id(1, 1, 1)));
@@ -2100,8 +2490,8 @@ mod tests {
         let record = RecoveryRecord {
             leader: 2,
             point: 1,
-            uncut_leader_term: None,
-            cut_after: None,
+            leader_term: 3,
+            cut: crate::log_store::PlanCut::None,
         };
         let wal = RaftWal::start(
             dir.path(),
@@ -2130,8 +2520,9 @@ mod tests {
             .await
             .expect("open the gate");
         assert_eq!(gate.status(), RecoveryGateStatus::Planned);
-        assert_eq!(gate.gate().screen(2, Some((1, 1))), VoteScreen::Pass);
-        assert_eq!(gate.gate().screen(3, Some((9, 1))), VoteScreen::Refuse);
+        assert_eq!(gate.gate().screen(2, 4, Some(1)), VoteScreen::Pass);
+        assert_eq!(gate.gate().screen(2, 3, Some(1)), VoteScreen::Refuse);
+        assert_eq!(gate.gate().screen(3, 4, Some(9)), VoteScreen::Refuse);
         assert!(!gate.may_campaign());
         // Satisfied: the record goes, and the gate closes until a leader's
         // barrier opens it. The event proves nothing about entries this
@@ -2142,7 +2533,7 @@ mod tests {
         assert_eq!(store.recovery_record(), None);
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(!gate.vote_gate_open());
-        assert_eq!(gate.gate().screen(2, Some((1, 1))), VoteScreen::Refuse);
+        assert_eq!(gate.gate().screen(2, 4, Some(1)), VoteScreen::Refuse);
         drop((gate, store));
         wal.shutdown().await.expect("clean shutdown");
 
@@ -2168,6 +2559,41 @@ mod tests {
             .expect("open the gate");
         assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
         assert!(!gate.may_campaign());
+        store.record_recovery(None).await.expect("drop the plan");
+        drop((gate, store));
+        wal.shutdown().await.expect("clean shutdown");
+
+        // N2 (#581 review): taking a plan records the plan and the accepted
+        // log in one write, so a crash right after keeps both: the replica
+        // comes back planned on an initialized log, never open without its
+        // plan.
+        let wal = RaftWal::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
+        let store = open(&wal);
+        assert_eq!(store.log_state(), GroupLogState::Recovering);
+        store
+            .take_recovery_plan(record)
+            .await
+            .expect("take the plan");
+        assert_eq!(store.log_state(), GroupLogState::Initialized);
+        drop(store);
+        drop(wal);
+        let wal = RaftWal::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
+        let store = open(&wal);
+        assert_eq!(store.recovery_record(), Some(record));
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store)
+            .await
+            .expect("open the gate");
+        assert_eq!(gate.status(), RecoveryGateStatus::Planned);
         store.record_recovery(None).await.expect("drop the plan");
         // The barrier this replica now needs opens it as before.
         gate.gate().confirm_barrier(leader(2, 2), 1);
@@ -2213,6 +2639,40 @@ mod tests {
             cfg!(target_os = "linux"),
             "without a boot id an unclean end reads as a host crash under never"
         );
+        drop((gate, store));
+        wal.shutdown().await.expect("clean shutdown");
+
+        // m3 (#581 review): a cut whose kept entry the log no longer holds
+        // cannot run. The replica still starts: the plan is dropped, the
+        // gate stays closed until a new plan or a leader's barrier, and the
+        // refusal is reported, typed.
+        let wal = RaftWal::start(
+            dir.path(),
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        )
+        .expect("start");
+        let store = open(&wal);
+        let held = store.last_log_id();
+        let keep = log_id(7, 2, 1);
+        assert_ne!(held, Some(keep));
+        store
+            .record_recovery(Some(RecoveryRecord {
+                leader: 1,
+                point: 1,
+                leader_term: 8,
+                cut: crate::log_store::PlanCut::Pending { keep },
+            }))
+            .await
+            .expect("record a plan whose cut cannot run");
+        let gate = GroupRejoin::durable(1, placement.raft_group_id, &store)
+            .await
+            .expect("an unrunnable cut does not fail the start");
+        assert_eq!(gate.cut_refused(), Some((keep, held)));
+        assert_eq!(store.recovery_record(), None, "the plan was dropped");
+        assert_eq!(gate.status(), RecoveryGateStatus::AwaitingBarrier);
+        assert!(!gate.may_campaign());
+        assert_eq!(store.last_log_id(), held, "nothing was cut");
         drop((gate, store));
         wal.shutdown().await.expect("clean shutdown");
     }

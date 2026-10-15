@@ -1627,13 +1627,23 @@ impl ShardRuntime {
     /// be released, and starts it again from its durable state through the
     /// engine factory. A recovery plan's cut runs in between (#581 section
     /// 4.5).
+    ///
+    /// The restart runs in a task of its own (m3, #581 review): a caller that
+    /// stops waiting, such as an HTTP request whose client went away, never
+    /// leaves the group stopped between the two steps.
     pub async fn restart_group_engine(
         &self,
         raft_group_id: RaftGroupId,
     ) -> Result<(), RuntimeError> {
         let placement = self.placement_for_group(raft_group_id)?;
-        self.shutdown_group_engine(placement).await?;
-        self.warm_group(raft_group_id).await.map(|_placement| ())
+        let runtime = self.clone();
+        let restart = crate::rt::spawn(async move {
+            runtime.shutdown_group_engine(placement).await?;
+            runtime.warm_group(raft_group_id).await.map(|_placement| ())
+        });
+        restart
+            .await
+            .map_err(|_join| RuntimeError::GroupRestartAborted { raft_group_id })?
     }
 
     /// Shuts down every hosted group engine, one per group concurrently,

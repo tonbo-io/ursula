@@ -17,6 +17,7 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
+use ursula_proto::admin::PlanStep;
 use ursula_proto::admin::RecoveryPlanOutcome;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
@@ -108,13 +109,25 @@ impl ursula_raft::ReplicaRestart for ReplicaRestarter<'_> {
         &mut self,
         raft_group_id: RaftGroupId,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), ursula_runtime::RuntimeError>> + Send + '_>,
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<std::sync::Arc<ursula_raft::GroupRejoin>>,
+                        ursula_runtime::RuntimeError,
+                    >,
+                > + Send
+                + '_,
+        >,
     > {
         Box::pin(async move {
             self.cluster
                 .restart_replica(raft_group_id.0, self.node_id)
                 .await;
-            Ok(())
+            Ok(self
+                .cluster
+                .rejoins
+                .get(&(raft_group_id.0, self.node_id))
+                .cloned())
         })
     }
 }
@@ -270,6 +283,7 @@ impl JournalCluster {
             .faulty
             .filter(|(faulty, _)| *faulty == group)
             .map(|(_, fault)| fault);
+        options.recovery = Some(rejoin.clone());
         let started = RaftGroupEngine::new_node(
             placement,
             node_id,
@@ -693,9 +707,10 @@ pub(super) fn recovery_plan(members: &[MemberView]) -> (u64, u64, bool) {
 }
 
 /// The recovery tool for `group` over the members in `reachable`: computes
-/// the plan, sends it to every member through its production admin entry
-/// point with the leader last, and restarts the members whose plan cuts
-/// their log, as the runbook says. Returns the plan.
+/// the plan and sends it through each member's production admin entry point,
+/// the leader first and then every other member with the leader's plan term
+/// (N1, #581 review). A plan that cuts restarts each replica inside its
+/// accept. Returns the leader's request.
 pub(super) async fn recover_group(
     cluster: &mut JournalCluster,
     group: u32,
@@ -707,39 +722,57 @@ pub(super) async fn recover_group(
         members.push(member_view(cluster, group, *node_id).await);
     }
     let (leader, point, cut) = recovery_plan(&members);
-    let leader_last_log_term = members
+    cluster.plan_leaders.insert(leader);
+    let request = |member: &MemberView, step: PlanStep| RecoveryPlanRequest {
+        leader,
+        point,
+        cut,
+        step,
+        expected: member.log,
+    };
+    let leader_view = members
         .iter()
         .find(|member| member.node_id == leader)
-        .and_then(|member| member.log.last_log_term);
-    cluster.plan_leaders.insert(leader);
-    members.sort_by_key(|member| member.node_id == leader);
-    let mut plan = None;
-    for member in &members {
-        let request = RecoveryPlanRequest {
-            leader,
-            point,
-            cut,
-            leader_last_log_term,
-            expected: member.log,
-        };
-        let report: RecoveryPlanReport = cluster
-            .accept_recovery_plan(group, member.node_id, &request)
+        .copied()
+        .expect("the plan's leader is reachable");
+    let lead = request(&leader_view, PlanStep::Lead);
+    let report: RecoveryPlanReport = cluster
+        .accept_recovery_plan(group, leader, &lead)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{context}: group {group}: the plan's leader {leader} refused {lead:?}: {error}")
+        });
+    assert_eq!(report.outcome, RecoveryPlanOutcome::Leads, "{context}");
+    for member in members.iter().filter(|member| member.node_id != leader) {
+        let follow = request(member, PlanStep::Follow {
+            leader_term: report.leader_term,
+        });
+        match cluster
+            .accept_recovery_plan(group, member.node_id, &follow)
             .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{context}: group {group}: node {} refused the plan {request:?}: {error}",
+        {
+            Ok(answer) => {
+                assert_eq!(answer.outcome, RecoveryPlanOutcome::Follows, "{context}");
+            }
+            // The members that took the plan already elected its leader,
+            // which reached this one: it rejoins through the leader.
+            Err(
+                error @ (ursula_raft::RecoveryGateError::FollowsLeader { .. }
+                | ursula_raft::RecoveryGateError::NotStalled { .. }),
+            ) if leader_by_state(cluster, group) == Some(leader) => {
+                tracing::info!(
+                    %error,
+                    "{context}: group {group}: node {} rejoins through the plan's leader",
                     member.node_id
-                )
-            });
-        let expected = if member.node_id == leader {
-            RecoveryPlanOutcome::Leads
-        } else {
-            RecoveryPlanOutcome::Follows
-        };
-        assert_eq!(report.outcome, expected, "{context}: group {group}");
-        plan = Some(request);
+                );
+            }
+            Err(error) => panic!(
+                "{context}: group {group}: node {} refused {follow:?}: {error}",
+                member.node_id
+            ),
+        }
     }
-    plan.expect("a reachable member")
+    lead
 }
 
 /// Waits until every replica of `group` in `nodes` applied a history event

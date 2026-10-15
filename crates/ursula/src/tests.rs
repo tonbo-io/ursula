@@ -6185,7 +6185,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
                 .expect("metrics JSON");
         let group = &metrics["raft_groups"][0];
-        let seen = ursula_proto::admin::ReplicaLogView {
+        let mut seen = ursula_proto::admin::ReplicaLogView {
             last_log_index: group["last_log_index"].as_u64(),
             last_log_term: group["last_log_term"].as_u64(),
             current_term: group["current_term"].as_u64().expect("current term"),
@@ -6195,7 +6195,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 leader: 1,
                 point: expected.last_log_index.unwrap_or(0),
                 cut: false,
-                leader_last_log_term: expected.last_log_term,
+                step: ursula_proto::admin::PlanStep::Lead,
                 expected,
             }
         };
@@ -6278,7 +6278,30 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         assert_eq!(changed.status(), StatusCode::CONFLICT);
         assert!(!gate.vote_gate_open(), "a refused request opened the gate");
 
-        // The plan elects this replica; a repeat of it is answered alike.
+        // A refusal after the gate changed, here a cutting plan on a replica
+        // that knows no committed entry, puts the gate, the elections and
+        // the leader's fence back as they were.
+        let before = gate.status();
+        let cutting = ursula_proto::admin::RecoveryPlanRequest {
+            point: 0,
+            cut: true,
+            ..plan(seen)
+        };
+        let refused = http_post(
+            &admin,
+            path,
+            json_body,
+            Body::from(serde_json::to_vec(&cutting).expect("request JSON")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(gate.status(), before);
+        assert_eq!(engine.history().plan(), None);
+
+        // The plan elects this replica: its gate campaigns but votes for no
+        // one else, and it answers its plan term. A repeat of the plan is
+        // taken again, at a later plan term.
+        let mut terms = Vec::new();
         for _ in 0..2 {
             let response = http_post(&admin, path, json_body, accept(seen)).await;
             let status = response.status();
@@ -6298,12 +6321,20 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 ursula_proto::admin::RecoveryPlanOutcome::Leads
             );
             assert_eq!(report.leader, 1);
+            terms.push(report.leader_term);
+            // The leader voted for itself at the plan term: a repeat names
+            // the log as the metrics now show it.
+            seen.current_term = report.leader_term;
         }
-        assert!(gate.vote_gate_open());
-        barrier
-            .await
-            .expect("the barrier driver ends once the gate opens");
-        assert!(registry.recovery_barriers_ready());
+        assert!(terms[1] > terms[0], "{terms:?}");
+        // It campaigns; with no election here (ticks are off) it soon
+        // reports the plan stalled, as a wedged plan does.
+        assert!(matches!(
+            gate.status(),
+            ursula_raft::RecoveryGateStatus::LeadsPlan | ursula_raft::RecoveryGateStatus::Stalled
+        ));
+        assert!(!gate.vote_gate_open());
+        barrier.abort();
         let metrics: ursula_proto::admin::NodeMetrics =
             serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
                 .expect("metrics JSON");
@@ -6312,13 +6343,15 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             Some(ursula_proto::admin::RaftGroupRecovery {
                 leader: 1,
                 point: seen.last_log_index.unwrap_or(0),
+                leader_term: terms[1],
                 cut_pending: false,
             })
         );
-        let ready = http_get(&client, READINESS_PATH).await;
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-        assert_eq!(body["recovery_barriers_ready"], json!(true));
-        assert_eq!(body["recovery_stalled_groups"], json!([]));
+        assert!(matches!(
+            metrics.groups[0].recovery_gate,
+            ursula_proto::admin::RecoveryGateStatus::LeadsPlan
+                | ursula_proto::admin::RecoveryGateStatus::Stalled
+        ));
 
         let missing = http_post(
             &admin,
@@ -6579,6 +6612,7 @@ fn raft_metrics_snapshot(
         log: Default::default(),
         history: None,
         recovery: None,
+        recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
     }
 }
 

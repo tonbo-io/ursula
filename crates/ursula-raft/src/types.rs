@@ -104,6 +104,8 @@ pub struct RaftGroupMetricsSnapshot {
     /// The recovery plan this replica holds until its history event
     /// applies (#581 section 4.5).
     pub recovery: Option<ursula_proto::admin::RaftGroupRecovery>,
+    /// The replica's recovery gate for this group.
+    pub recovery_gate: ursula_proto::admin::RecoveryGateStatus,
 }
 
 pub use ursula_proto::admin::RaftGroupMaintenanceState;
