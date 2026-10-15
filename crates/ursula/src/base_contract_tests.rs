@@ -3,8 +3,8 @@
 //! resume point, the HEAD snapshot and retention headers, `Stream-Incarnation`
 //! as a token that changes on delete and recreate and as an optional request
 //! precondition (D12), `Retry-After` on an
-//! append's temporary 503, a duplicate beyond the receipt window answered 204
-//! without `Stream-Next-Offset`, and the producer-cap 429. The other error headers are pinned in
+//! append's temporary 503, a repeat of an older producer write answered 204
+//! `receipt-evicted` without a range, and the producer-cap 429. The other error headers are pinned in
 //! `tests.rs`: `producer_headers_deduplicate_retries_and_fence_stale_epochs`,
 //! `long_poll_returns_service_unavailable_when_live_waiters_are_full` (a
 //! read's temporary 503) and
@@ -433,16 +433,16 @@ fn producer_headers<'a>(id: &'a str, seq: &'a str) -> [(&'static str, &'a str); 
     ]
 }
 
-/// A duplicate older than the producer's newest 1,024 receipts is still
-/// answered as a duplicate, 204 without `Stream-Next-Offset`, and appends
-/// nothing (bounded producer receipts, F3).
+/// A repeat of a write older than the producer's newest is still answered
+/// as a duplicate, 204 `receipt-evicted` without a range, and appends
+/// nothing (one receipt per producer, F3).
 #[tokio::test]
-async fn duplicate_beyond_the_receipt_window_answers_204_without_next_offset() {
+async fn a_repeat_of_an_older_write_answers_204_without_a_range() {
     let app = app();
-    let uri = "/contract/receipt-window";
+    let uri = "/contract/receipt-evicted";
     let response = create(&app, uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    for seq in 0..=1_025_u64 {
+    for seq in 0..=2_u64 {
         let seq = seq.to_string();
         let response = append(&app, uri, &producer_headers("writer", &seq), "x").await;
         assert_eq!(response.status(), StatusCode::OK, "seq {seq}");
@@ -451,6 +451,10 @@ async fn duplicate_beyond_the_receipt_window_answers_204_without_next_offset() {
 
     let response = append(&app, uri, &producer_headers("writer", "0"), "x").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&response, names::PRODUCER_OUTCOME),
+        "receipt-evicted"
+    );
     assert!(
         response.headers().get(names::STREAM_NEXT_OFFSET).is_none(),
         "{:?}",

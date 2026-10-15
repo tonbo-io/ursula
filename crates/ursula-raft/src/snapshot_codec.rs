@@ -670,11 +670,12 @@ mod tests {
         assert_eq!(decoded, snapshot);
     }
 
-    /// Bounded-state F3: the producer idle clock and the receipt window
-    /// survive the group snapshot codec, so an installed replica holds
+    /// The producer record (#581 section 2.3) survives the group snapshot
+    /// codec with every field set: the idle clock, both digests, the closed
+    /// epoch and the stream's epoch floor, so an installed replica holds
     /// exactly the live replica's producer state.
     #[test]
-    fn producer_last_seen_and_receipt_window_round_trip() {
+    fn producer_record_and_epoch_floor_round_trip() {
         let mut machine = ursula_stream::StreamStateMachine::new();
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
@@ -690,35 +691,59 @@ mod tests {
             stream_expires_at_ms: None,
             now_ms: 1,
         });
-        for seq in 0..1_100u64 {
-            for (producer_id, now_ms) in [("a", 10 + seq), ("b", 20 + seq)] {
-                if producer_id == "b" && seq > 3 {
-                    continue;
-                }
-                let response = machine.apply(ursula_stream::StreamCommand::Append {
-                    stream_id: stream_id.clone(),
-                    content_type: Some("application/octet-stream".to_owned()),
-                    payload: bytes::Bytes::from_static(b"xy"),
-                    close_after: false,
-                    stream_seq: None,
-                    producer: Some(ursula_stream::ProducerRequest {
-                        producer_id: producer_id.to_owned(),
-                        producer_epoch: 1,
-                        producer_seq: seq,
-                        digest: None,
-                    }),
-                    now_ms,
-                });
-                assert!(
-                    matches!(response, ursula_stream::StreamResponse::Appended { .. }),
-                    "{response:?}"
-                );
-            }
+        const IDLE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+        let tidy_at = 20 + IDLE_MS;
+        let mut write = |producer_id: &str, epoch: u64, seq: u64, digest: Option<u8>, now_ms| {
+            let response = machine.apply(ursula_stream::StreamCommand::Append {
+                stream_id: stream_id.clone(),
+                content_type: Some("application/octet-stream".to_owned()),
+                payload: bytes::Bytes::from_static(b"xy"),
+                close_after: false,
+                stream_seq: None,
+                producer: Some(ursula_stream::ProducerRequest {
+                    producer_id: producer_id.to_owned(),
+                    producer_epoch: epoch,
+                    producer_seq: seq,
+                    digest: digest.map(|digest| bytes::Bytes::copy_from_slice(&[digest; 32])),
+                }),
+                now_ms,
+            });
+            assert!(
+                matches!(response, ursula_stream::StreamResponse::Appended { .. }),
+                "{response:?}"
+            );
+        };
+        // `b` goes idle and retires, which raises the floor to its epoch 3.
+        write("b", 3, 0, None, 20);
+        for seq in 0..5 {
+            write("a", 1, seq, Some(1), tidy_at - 1);
         }
+        // `a`'s claim of epoch 2 closes epoch 1 at seq 4, with digests on
+        // the claim and the newest write.
+        write("a", 2, 0, Some(7), tidy_at - 1);
+        write("a", 2, 1, Some(8), tidy_at - 1);
+        machine.apply(ursula_stream::StreamCommand::TidyStream {
+            stream_id: stream_id.clone(),
+            now_ms: tidy_at,
+        });
         let stream_snapshot = machine.snapshot();
-        let producers = &stream_snapshot.streams[0].producer_states;
-        assert_eq!(producers[0].last_seen_ms, 10 + 1_099);
-        assert_eq!(producers[1].last_seen_ms, 23);
+        let entry = &stream_snapshot.streams[0];
+        assert_eq!(entry.retired_epoch_watermark, Some(3));
+        let producers = &entry.producer_states;
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].last_seen_ms, tidy_at - 1);
+        assert_eq!(producers[0].claim_digest, Some([7; 32]));
+        assert_eq!(producers[0].newest.digest, Some([8; 32]));
+        assert_eq!(
+            producers[0].closed_epoch,
+            Some(ursula_stream::ClosedEpoch { epoch: 1, seq: 4 })
+        );
+        // A digest is 32 bytes on the wire.
+        let mut proto_entry =
+            stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+        proto_entry.producer_states[0].claim_digest = Some(Bytes::from_static(b"short"));
+        let error = stream_from_proto(proto_entry).expect_err("a short digest");
+        assert!(error.to_string().contains("claim_digest"), "{error}");
         // Field 9 stays optional on the wire; an absent value is refused.
         let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
         entry.producer_states[0].last_seen_ms = None;

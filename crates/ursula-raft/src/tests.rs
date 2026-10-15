@@ -65,6 +65,8 @@ use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::ProducerEarlyAnswer;
+use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::ReadSnapshotRequest;
@@ -2012,6 +2014,65 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         leader_id = new_leader;
     }
 
+    shutdown_all(&engines).await;
+}
+
+/// Only the leader answers a producer write before its body (#581 section
+/// 2.5): a follower answers nothing, and the write takes its usual path.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn only_the_leader_answers_a_producer_write_early() {
+    let (_registry, mut engines, leader_id, _wal_roots) =
+        build_three_node_cluster("early-answer", None).await;
+    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
+    let stream_id = bsid("early-answer");
+    create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
+    let producer = ProducerRequest {
+        producer_id: "writer".to_owned(),
+        producer_epoch: 0,
+        producer_seq: 0,
+        digest: None,
+    };
+    let mut append = AppendRequest::from_bytes(stream_id.clone(), b"abc".to_vec());
+    append.producer = Some(producer.clone());
+    let appended = engines[leader_index]
+        .raft
+        .client_write(GroupWriteCommand::from(append))
+        .await
+        .expect("append through the leader");
+    let index = appended.log_id.index();
+    let incarnation = match write_result_from_raft_response(appended.data).expect("decode") {
+        Ok(GroupWriteResponse::Append(response)) => response.incarnation,
+        other => panic!("unexpected append response: {other:?}"),
+    };
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(index), "append applied")
+            .await
+            .expect("wait for apply");
+    }
+    let request = ProducerEarlyAnswerRequest {
+        stream_id,
+        producer,
+        incarnation,
+        now_ms: 0,
+    };
+    for (index, engine) in engines.iter_mut().enumerate() {
+        let answer = engine
+            .producer_early_answer(request.clone(), placement())
+            .await
+            .expect("early answer lookup");
+        if index == leader_index {
+            assert!(
+                matches!(answer, Some(ProducerEarlyAnswer::Repeat(_))),
+                "{answer:?}"
+            );
+        } else {
+            assert_eq!(answer, None, "a follower answers nothing early");
+        }
+    }
     shutdown_all(&engines).await;
 }
 

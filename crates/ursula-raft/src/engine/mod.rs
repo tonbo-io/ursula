@@ -916,9 +916,11 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupProducerEarlyAnswerFuture<'a> {
         Box::pin(async move {
-            // Only the leader answers early, so a follower's redirect comes
-            // first. Applied entries are committed, so a deposed leader's
-            // answer is still true under the request's token (#581 2.5).
+            // Only the leader answers early (#581 section 2.5). A follower
+            // answers nothing and the write takes its usual path, which
+            // forwards it. Applied entries are committed, so a leader that was
+            // deposed a moment ago still answers truly under the request's
+            // token.
             if !self.raft.is_leader() {
                 return Ok(None);
             }

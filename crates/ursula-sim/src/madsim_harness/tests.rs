@@ -1823,10 +1823,10 @@ fn smoke_corpus_replays() {
 }
 
 /// Bounded-state Invariant 12: after the same log prefix every
-/// replica holds the same producers, receipt windows and newest
-/// acknowledgements, whether it replayed the log or installed a snapshot.
-/// A learner installs a snapshot taken mid-stream (receipt window
-/// already evicting), then every replica applies the same suffix.
+/// replica holds the same producer records (one receipt each) and epoch
+/// floor, whether it replayed the log or installed a snapshot. A learner
+/// installs a snapshot taken mid-stream, then every replica applies the
+/// same suffix.
 #[test]
 fn producer_state_matches_after_snapshot_install_mid_stream() {
     let _guard = sim_test_guard();
@@ -1847,17 +1847,19 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             )
             .await
             .expect("create stream");
-        let append = |seq: u64, producer_id: &str, now_ms: u64| {
+        let append_in = |epoch: u64, seq: u64, producer_id: &str, now_ms: u64| {
             let mut request = AppendRequest::from_bytes(stream.clone(), b"rec".to_vec());
             request.producer = Some(ProducerRequest {
                 producer_id: producer_id.to_owned(),
-                producer_epoch: 1,
+                producer_epoch: epoch,
                 producer_seq: seq,
                 digest: None,
             });
             request.now_ms = now_ms;
             request
         };
+        let append =
+            |seq: u64, producer_id: &str, now_ms: u64| append_in(1, seq, producer_id, now_ms);
         // Prefix: "quiet" writes twice, "busy" fills and overflows the
         // window, so the snapshot carries evicted state.
         for seq in 0..2 {
@@ -1973,10 +1975,12 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             evicted.producer.map(|ack| ack.delivery),
             Some(ProducerDelivery::Evicted)
         );
+        // Idle expiry retires "quiet" and raises the epoch floor to its
+        // epoch 1, so it claims above the floor.
         let idle_at = 5 + 7 * 24 * 60 * 60 * 1_000;
         engines[leader_index]
             .append(
-                append(0, "quiet", idle_at),
+                append_in(2, 0, "quiet", idle_at),
                 placement(),
                 ColdWriteAdmission::default(),
             )
@@ -2014,7 +2018,11 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         .iter()
         .find(|producer| producer.producer_id == "quiet")
         .expect("quiet producer");
-    assert_eq!(quiet.last_seq, 0, "quiet restarted after idle expiry");
+    assert_eq!(
+        (quiet.epoch, quiet.last_seq),
+        (2, 0),
+        "quiet restarted above the floor after idle expiry"
+    );
     assert_eq!(quiet.last_seen_ms, 5 + 7 * 24 * 60 * 60 * 1_000);
 }
 
