@@ -174,10 +174,7 @@ fn read(precondition: Option<IncarnationPrecondition>, from: Option<u64>) -> Req
             producer: None,
             precondition,
         },
-        ..Request::new(Method::Get, Target::Read {
-            from: from.map(Offset::from_u64),
-            leader: true,
-        })
+        ..Request::read(from.map(Offset::from_u64), true, 1 << 20)
     }
 }
 
@@ -687,9 +684,7 @@ fn snapshots_are_keyed_by_offset_and_digest() {
     bad.body = Arc::from(b"tampered".to_vec());
     assert_eq!(world.send(&bad).status, 400);
     // The snapshot reads back with its headers.
-    let read = world.send(&Request::new(Method::Get, Target::Snapshot {
-        offset: Offset::from_u64(64),
-    }));
+    let read = world.send(&Request::snapshot_read(Offset::from_u64(64), 1 << 20));
     let Ok(Typed::SnapshotRead(snapshot)) = read.typed else {
         panic!("{read:?}");
     };

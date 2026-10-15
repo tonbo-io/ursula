@@ -120,8 +120,10 @@ fn connection_loop(connection: TcpStream, server: &Mutex<ModelServer>) -> io::Re
         let incoming = match read_request(&mut reader, server)? {
             Ok(Some(incoming)) => incoming,
             Ok(None) => return Ok(()),
-            Err(answer) => {
-                write_answer(&mut writer, &answer, false, true)?;
+            // Refused before the body: the connection closes after the answer.
+            Err(Reply::Hang) => return Ok(()),
+            Err(Reply::Answer { answer, head_only }) => {
+                write_answer(&mut writer, &answer, head_only, true)?;
                 return Ok(());
             }
         };
@@ -140,11 +142,11 @@ fn connection_loop(connection: TcpStream, server: &Mutex<ModelServer>) -> io::Re
 }
 
 /// Reads one request: `Ok(None)` when the client closed the connection between requests,
-/// `Err(answer)` for one that cannot be served (the connection closes after the answer).
+/// `Err(reply)` for one refused before its body (the connection closes after the reply).
 fn read_request(
     reader: &mut impl BufRead,
     server: &Mutex<ModelServer>,
-) -> io::Result<Result<Option<Incoming>, RawAnswer>> {
+) -> io::Result<Result<Option<Incoming>, Reply>> {
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -161,7 +163,7 @@ fn read_request(
         }
         head.push(line);
         if head.iter().map(Vec::len).sum::<usize>() > MAX_HEAD_BYTES {
-            return Ok(Err(RawAnswer::new(431)));
+            return Ok(Err(answer(RawAnswer::new(431))));
         }
     }
     let mut lines = head.iter().map(|line| trim_line(line));
@@ -169,12 +171,12 @@ fn read_request(
     let mut parts = request_line.split(' ');
     let (Some(method), Some(target), Some(_version)) = (parts.next(), parts.next(), parts.next())
     else {
-        return Ok(Err(RawAnswer::new(400)));
+        return Ok(Err(answer(RawAnswer::new(400))));
     };
     let mut headers = Vec::new();
     for line in lines {
         let Some(colon) = line.iter().position(|b| *b == b':') else {
-            return Ok(Err(RawAnswer::new(400)));
+            return Ok(Err(answer(RawAnswer::new(400))));
         };
         let (name, value) = line.split_at(colon);
         let value = value.get(1..).unwrap_or_default().trim_ascii();
@@ -191,24 +193,34 @@ fn read_request(
     };
     let close = header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
     if header("transfer-encoding").is_some() {
-        return Ok(Err(RawAnswer::new(501)));
+        return Ok(Err(answer(RawAnswer::new(501))));
     }
-    let limit = if target.starts_with("/__model/") {
-        SizeLimit::Request(MAX_CONTROL_BODY_BYTES)
+    let control = target.starts_with("/__model/");
+    let limit = if control {
+        MAX_CONTROL_BODY_BYTES
     } else {
-        SizeLimit::Request(lock(server).limits().max_request_bytes)
+        lock(server).limits().max_request_bytes
     };
     let length = match header("content-length").map(|v| v.parse::<u64>()) {
-        None if matches!(method, "PUT" | "POST") => return Ok(Err(RawAnswer::new(411))),
+        None if matches!(method, "PUT" | "POST") => return Ok(Err(answer(RawAnswer::new(411)))),
         None => 0,
-        Some(Ok(length)) if length <= limit.bytes() => length,
-        // Decided from `Content-Length`, before the body (#581 §6.4).
+        Some(Ok(length)) if length <= limit => length,
+        // Decided from `Content-Length`, before the body (#581 §6.4), through the same faults
+        // as in process.
         Some(Ok(_)) => {
-            let mut answer = RawAnswer::new(SizeLimit::STATUS);
-            limit.render(answer.emit());
-            return Ok(Err(answer));
+            let refusal = match Method::parse(method) {
+                Some(method) if !control => {
+                    delivered(lock(server).exchange_too_large(method), method)
+                }
+                _ => {
+                    let mut refusal = RawAnswer::new(SizeLimit::STATUS);
+                    SizeLimit::Request(limit).render(refusal.emit());
+                    answer(refusal)
+                }
+            };
+            return Ok(Err(refusal));
         }
-        Some(Err(_not_a_length)) => return Ok(Err(RawAnswer::new(400))),
+        Some(Err(_not_a_length)) => return Ok(Err(answer(RawAnswer::new(400)))),
     };
     let mut body = Vec::new();
     reader.take(length).read_to_end(&mut body)?;
@@ -252,7 +264,12 @@ fn reply(incoming: &Incoming, server: &Mutex<ModelServer>) -> Reply {
         Ok(request) => request,
         Err(e) => return answer(text(400, &e.to_string())),
     };
-    let delivered = lock(server).exchange(path, &request);
+    let exchanged = lock(server).exchange(path, &request);
+    delivered(exchanged, method)
+}
+
+/// The reply to a request the server or a scripted fault decided.
+fn delivered(delivered: Delivered, method: Method) -> Reply {
     match delivered {
         Delivered::Answered { answer, delay_ms } => {
             if delay_ms > 0 {

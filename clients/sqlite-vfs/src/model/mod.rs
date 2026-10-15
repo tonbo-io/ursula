@@ -345,16 +345,39 @@ impl ModelServer {
 
     /// A request through the scripted faults, then the server.
     pub(crate) fn exchange(&mut self, path: &str, request: &Request) -> Delivered {
+        self.deliver(request.method, |server| server.handle(path, request))
+    }
+
+    /// A stream request whose `Content-Length` exceeds the request limit, as the HTTP front meets
+    /// it before reading the body: through the same faults as [`ModelServer::exchange`], so both
+    /// fronts consume a scripted fault alike, then the typed `413`.
+    pub(crate) fn exchange_too_large(&mut self, method: Method) -> Delivered {
+        self.deliver(method, Self::too_large)
+    }
+
+    /// The typed `413` of the request limit (#581 §6.4).
+    fn too_large(&mut self) -> RawAnswer {
+        let mut answer = RawAnswer::new(SizeLimit::STATUS);
+        SizeLimit::Request(self.limits.max_request_bytes).render(answer.emit());
+        answer
+    }
+
+    /// The next scripted fault for `method` around the server's answer, `handle`.
+    fn deliver(
+        &mut self,
+        method: Method,
+        handle: impl FnOnce(&mut Self) -> RawAnswer,
+    ) -> Delivered {
         let answered = |answer| Delivered::Answered {
             answer,
             delay_ms: 0,
         };
-        match self.faults.take(request.method) {
-            None => answered(self.handle(path, request)),
+        match self.faults.take(method) {
+            None => answered(handle(self)),
             Some(Fault::Unreachable) => Delivered::Unreachable,
             Some(Fault::DropRequest) => Delivered::DroppedBeforeApply,
             Some(Fault::DropAnswer) => {
-                drop(self.handle(path, request));
+                drop(handle(self));
                 Delivered::DroppedAfterApply
             }
             Some(Fault::Status {
@@ -374,7 +397,7 @@ impl ModelServer {
             }
             Some(Fault::UntypedTooLarge) => answered(RawAnswer::new(SizeLimit::STATUS)),
             Some(Fault::Delay { ms }) => Delivered::Answered {
-                answer: self.handle(path, request),
+                answer: handle(self),
                 delay_ms: ms,
             },
         }
@@ -385,9 +408,7 @@ impl ModelServer {
     pub(crate) fn handle(&mut self, path: &str, request: &Request) -> RawAnswer {
         let len = u64::try_from(request.body.len()).unwrap_or(u64::MAX);
         if request.method.has_body() && len > self.limits.max_request_bytes {
-            let mut answer = RawAnswer::new(SizeLimit::STATUS);
-            SizeLimit::Request(self.limits.max_request_bytes).render(answer.emit());
-            return answer;
+            return self.too_large();
         }
         match (request.method, request.target) {
             (Method::Head, Target::Stream) => self.head(path),
@@ -540,12 +561,13 @@ impl ModelServer {
         if content_type != stream.content_type {
             return RawAnswer::new(409);
         }
+        if request.closes {
+            // A closing append, with or without a body, is not modeled: the VFS never closes its
+            // stream.
+            return RawAnswer::new(501);
+        }
         if request.body.is_empty() {
             return RawAnswer::new(400);
-        }
-        if request.closes {
-            // A closing append is not modeled: the VFS never closes its stream.
-            return RawAnswer::new(501);
         }
         let (start, next) = stream.append(&request.body, history);
         let Some((write, closes)) = applying else {

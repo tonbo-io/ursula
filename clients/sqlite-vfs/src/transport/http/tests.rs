@@ -98,16 +98,11 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
         13 => write(None, 9, 4, b"unclaimed, untokened"),
         15 => Request {
             keys: keys(token()),
-            ..Request::new(Method::Get, Target::Read {
-                from: None,
-                leader: true,
-            })
+            ..Request::read(None, true, 1 << 20)
         },
         16 => snapshot(5, b"image"),
         17 => snapshot(5, b"other image"),
-        18 => Request::new(Method::Get, Target::Snapshot {
-            offset: Offset::from_u64(5),
-        }),
+        18 => Request::snapshot_read(Offset::from_u64(5), 1 << 20),
         19 => Request {
             keys: keys(token()),
             ..Request::new(Method::Put, Target::Retention {
@@ -264,6 +259,7 @@ fn only_a_proven_unsent_failure_is_not_sent() {
 fn time_limits_scale_with_the_body_and_the_answer() {
     let small = Timeouts::new(0, 0, 256);
     assert_eq!(small.connect, Duration::from_secs(5));
+    assert_eq!(small.send_request, Duration::from_secs(5));
     assert_eq!(small.send_body, Duration::from_secs(5));
     assert_eq!(small.recv_response, Duration::from_secs(15));
     assert_eq!(small.recv_body, Duration::from_secs(10));
@@ -294,4 +290,40 @@ fn the_model_front_types_its_413_with_the_configured_limit() {
         answer.typed,
         Ok(Typed::TooLarge(Some(ursula_headers::SizeLimit::Request(3))))
     );
+}
+
+#[test]
+fn a_fault_is_consumed_alike_before_a_too_large_body() {
+    // The HTTP front refuses an oversized body from `Content-Length`, before it is read; a
+    // scripted fault still applies first, as in process.
+    let (over_http, url) = served();
+    let http = HttpTransport::new(url);
+    let in_process = model();
+    let local = ModelTransport::new(Arc::clone(&in_process), PATH);
+    for server in [&over_http, &in_process] {
+        let mut server = server.lock().unwrap();
+        server.set_limits(Limits {
+            max_request_bytes: 3,
+            ..Limits::default()
+        });
+        server.inject(crate::model::faults::Scripted {
+            method: Some(Method::Post),
+            fault: crate::model::faults::Fault::Status {
+                status: 503,
+                retry_after: Some(1),
+            },
+            times: 1,
+        });
+    }
+    let oversized = write(None, 1, 0, b"too large");
+    let mut statuses = Vec::new();
+    for _ in 0..2 {
+        let remote = http.send(&oversized, Attempt::default());
+        assert_eq!(remote, local.send(&oversized, Attempt::default()));
+        let Exchange::Answered(answer) = remote else {
+            panic!("{remote:?}");
+        };
+        statuses.push(answer.status);
+    }
+    assert_eq!(statuses, [503, 413]);
 }

@@ -267,7 +267,8 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// A request without headers or body.
+    /// A request without headers or body, expecting no answer body. A `GET` goes through
+    /// [`Request::read`] or [`Request::snapshot_read`], which size its answer.
     #[cfg_attr(
         not(any(test, feature = "model")),
         expect(
@@ -285,6 +286,36 @@ impl Request {
             closes: false,
             body: Arc::from(Vec::new()),
             answer_bytes: 0,
+        }
+    }
+
+    /// A read from `from`, expecting up to `answer_bytes` (the read's chunk) in the answer.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+        )
+    )]
+    pub(crate) fn read(from: Option<Offset>, leader: bool, answer_bytes: u64) -> Self {
+        Self {
+            answer_bytes,
+            ..Self::new(Method::Get, Target::Read { from, leader })
+        }
+    }
+
+    /// A read of the snapshot at `offset`, whose body is up to `answer_bytes`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+        )
+    )]
+    pub(crate) fn snapshot_read(offset: Offset, answer_bytes: u64) -> Self {
+        Self {
+            answer_bytes,
+            ..Self::new(Method::Get, Target::Snapshot { offset })
         }
     }
 
@@ -774,10 +805,7 @@ mod tests {
         let mut raw = RawAnswer::new(200);
         raw.header("stream-next-offset", Offset::ZERO.to_string());
         raw.header("stream-next-offset", Offset::ZERO.to_string());
-        let read = Request::new(Method::Get, Target::Read {
-            from: None,
-            leader: true,
-        });
+        let read = Request::read(None, true, 1 << 20);
         assert_eq!(
             raw.parse(&read).typed,
             Err(HeaderError::Duplicate {

@@ -9,7 +9,7 @@
 //! its kind. Any other failure is [`NoAnswer::Lost`].
 //!
 //! Each attempt's time limits scale with its size (design §4.12, #566): connecting 5 s, sending
-//! the body `5 s + n / rate` (`URSULA_VFS_MIN_UPLOAD_KBPS`, 256 KiB/s by default), the answer's
+//! the request head 5 s, sending the body `5 s + n / rate` (`URSULA_VFS_MIN_UPLOAD_KBPS`, 256 KiB/s by default), the answer's
 //! head 15 s, and its body `10 s + m / 256 KiB/s` for the `m` bytes the caller expects. A timeout
 //! is only another lost attempt.
 
@@ -187,6 +187,7 @@ const MIN_DOWNLOAD_KBPS: u64 = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Timeouts {
     connect: Duration,
+    send_request: Duration,
     send_body: Duration,
     recv_response: Duration,
     recv_body: Duration,
@@ -205,6 +206,7 @@ impl Timeouts {
     fn new(body: u64, answer: u64, upload_kbps: u64) -> Self {
         Self {
             connect: Duration::from_secs(5),
+            send_request: Duration::from_secs(5),
             send_body: scaled(Duration::from_secs(5), body, upload_kbps),
             recv_response: Duration::from_secs(15),
             recv_body: scaled(Duration::from_secs(10), answer, MIN_DOWNLOAD_KBPS),
@@ -216,6 +218,7 @@ impl Timeouts {
         req.config()
             .timeout_global(None)
             .timeout_connect(Some(self.connect))
+            .timeout_send_request(Some(self.send_request))
             .timeout_send_body(Some(self.send_body))
             .timeout_recv_response(Some(self.recv_response))
             .timeout_recv_body(Some(self.recv_body))
