@@ -4,8 +4,11 @@
 //! prefix (the F5 staging path) while hashing it, then proposes
 //! `PublishSnapshotExternal` with the object reference and digest, so
 //! replicated state never holds the body. Reads and `/bootstrap` stream the
-//! object back in bounded pieces. Without a cold store, or for bodies under
-//! the staging threshold, publish keeps the inline path and its 32 MiB cap.
+//! object back in bounded pieces, a read with a byte range only the pieces
+//! it covers. Without a cold store, or for bodies under the staging
+//! threshold, publish keeps the inline path. Every publish body is at most
+//! the request limit: a larger snapshot goes up in parts
+//! ([`crate::snapshot_parts`]).
 
 use std::io;
 
@@ -18,12 +21,10 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::StreamExt;
 use futures_util::stream;
-use ursula_headers::SizeLimit;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ExternalPayloadRef;
-use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::SnapshotDigest;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
@@ -34,7 +35,7 @@ use crate::limits;
 use crate::render;
 
 /// Bytes read from the cold store per piece of a streamed snapshot body.
-const COLD_SNAPSHOT_READ_PIECE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const COLD_SNAPSHOT_READ_PIECE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A received snapshot body: inline bytes, or an object already staged.
 pub(crate) enum SnapshotUpload {
@@ -50,11 +51,11 @@ fn body_read_error(err: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-/// Receives a snapshot body. Bodies below the staging threshold (the
-/// smaller of `runtime.external_payload_min_size` and the inline cap) stay
-/// inline; larger ones go to a new object under the stream's external
-/// prefix when cold snapshots are enabled, and are rejected with `413`
-/// above the inline cap otherwise.
+/// Receives a snapshot body of at most the request limit (`413` above it).
+/// Bodies below the staging threshold (the smaller of
+/// `runtime.external_payload_min_size` and the request limit) stay inline;
+/// larger ones go to a new object under the stream's external prefix when
+/// cold snapshots are enabled.
 pub(crate) async fn receive_snapshot_body(
     state: &HttpState,
     stream_id: &BucketStreamId,
@@ -79,7 +80,7 @@ pub(crate) async fn receive_snapshot_body(
             Some(Err(err)) => return Err(body_read_error(err)),
             Some(Ok(frame)) => {
                 buffered.extend_from_slice(&frame);
-                if !cold && buffered.len() > MAX_HTTP_BODY_BYTES {
+                if buffered.len() > MAX_HTTP_BODY_BYTES {
                     return Err(limits::size_refusal(limits::REQUEST_LIMIT));
                 }
                 if cold && buffered.len() >= threshold {
@@ -112,10 +113,8 @@ pub(crate) async fn receive_snapshot_body(
         while let Some(frame) = frames.next().await {
             let frame = frame.map_err(body_read_error)?;
             size = size.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX));
-            if size > MAX_COLD_SNAPSHOT_BYTES {
-                return Err(limits::size_refusal(SizeLimit::Snapshot(
-                    MAX_COLD_SNAPSHOT_BYTES,
-                )));
+            if size > limits::MAX_REQUEST_BYTES {
+                return Err(limits::size_refusal(limits::REQUEST_LIMIT));
             }
             digest.update(&frame);
             writer.write(frame).await.map_err(stage_error)?;
@@ -146,27 +145,31 @@ fn stage_error(err: io::Error) -> Response {
         .into_response()
 }
 
-/// Streams a cold snapshot body piece by piece. The first piece is read
-/// before returning, so a missing object fails the request instead of
-/// truncating a `200`.
+/// Streams `len` bytes of a cold snapshot body from `start`, piece by
+/// piece. The first piece is read before returning, so a missing object
+/// fails the request instead of truncating a `200`.
 async fn object_stream(
     cold_store: ColdStoreHandle,
     object: ExternalPayloadRef,
+    start: u64,
+    len: u64,
 ) -> io::Result<impl futures_util::Stream<Item = io::Result<Bytes>> + Send + 'static> {
-    let size = object.payload_len;
-    let first_len = size.min(COLD_SNAPSHOT_READ_PIECE_BYTES);
-    let first = read_piece(&cold_store, &object, 0, first_len).await?;
-    let rest = stream::try_unfold(first_len, move |offset| {
+    let end = start.saturating_add(len).min(object.payload_len);
+    let first_len = end
+        .saturating_sub(start)
+        .min(COLD_SNAPSHOT_READ_PIECE_BYTES);
+    let first = read_piece(&cold_store, &object, start, first_len).await?;
+    let rest = stream::try_unfold(start.saturating_add(first_len), move |offset| {
         let cold_store = cold_store.clone();
         let object = object.clone();
         async move {
-            let remaining = size.saturating_sub(offset);
+            let remaining = end.saturating_sub(offset);
             if remaining == 0 {
                 return Ok(None);
             }
             let len = remaining.min(COLD_SNAPSHOT_READ_PIECE_BYTES);
             let piece = read_piece(&cold_store, &object, offset, len).await?;
-            // `len <= remaining`, so `offset + len <= size` and never saturates.
+            // `len <= remaining`, so `offset + len <= end` and never saturates.
             Ok(Some((piece, offset.saturating_add(len))))
         }
     });
@@ -196,17 +199,20 @@ fn cold_read_error(err: io::Error) -> Response {
         .into_response()
 }
 
-/// The response body of a snapshot read whose body lives in `object`.
+/// The response body of a snapshot read whose body lives in `object`: its
+/// `len` bytes from `start`.
 pub(crate) async fn cold_snapshot_body(
     state: &HttpState,
     object: ExternalPayloadRef,
+    start: u64,
+    len: u64,
 ) -> Result<Body, Response> {
     let Some(cold_store) = state.runtime.cold_store() else {
         return Err(cold_read_error(io::Error::other(
             "snapshot body is in the cold tier but no cold backend is configured",
         )));
     };
-    object_stream(cold_store, object)
+    object_stream(cold_store, object, start, len)
         .await
         .map(Body::from_stream)
         .map_err(cold_read_error)
@@ -230,7 +236,8 @@ pub(crate) async fn bootstrap_response(
     let len = u64::try_from(prefix.len().saturating_add(suffix.len()))
         .expect("multipart len fits u64")
         .saturating_add(object.payload_len);
-    let body = match object_stream(cold_store, object).await {
+    let size = object.payload_len;
+    let body = match object_stream(cold_store, object, 0, size).await {
         Ok(body) => body,
         Err(err) => return cold_read_error(err),
     };

@@ -43,9 +43,6 @@ pub struct IngressAdmission {
     /// The node's Raft log-pressure flag (set by the snapshot driver's
     /// monitor while the unsnapshotted log is over its hard limit).
     raft_log: Option<ursula_raft::SnapshotBuildCoordinator>,
-    /// Whether the node stages snapshot bodies in a cold store, which sets
-    /// the body limit of a snapshot publish.
-    cold_snapshots: bool,
 }
 
 impl Default for IngressAdmission {
@@ -56,7 +53,6 @@ impl Default for IngressAdmission {
             )),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
-            cold_snapshots: false,
         }
     }
 }
@@ -68,7 +64,6 @@ impl IngressAdmission {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
-            cold_snapshots: false,
         }
     }
 
@@ -77,14 +72,7 @@ impl IngressAdmission {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
-            cold_snapshots: false,
         }
-    }
-
-    /// Sets whether the node stages snapshot bodies in a cold store.
-    pub(crate) fn with_cold_snapshots(mut self, cold_snapshots: bool) -> Self {
-        self.cold_snapshots = cold_snapshots;
-        self
     }
 
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
@@ -106,8 +94,7 @@ impl IngressAdmission {
 /// reaches a handler, so nothing of a refused request was proposed or applied.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AdmissionRefusal {
-    /// The body is larger than admission admits on the route (`413` naming
-    /// the limit).
+    /// The body is larger than the request limit (`413` naming it).
     BodyTooLarge(SizeLimit),
     /// The WAL filesystem is below its free-space floor, or its free-space
     /// check failed (`503`).
@@ -152,21 +139,18 @@ pub(crate) async fn ingress_admission_middleware(
     let Some(body_bytes) = request_write_body_bytes(&request) else {
         return next.run(request).await;
     };
-    // Size first: the head alone decides it (#581 section 6.1).
-    let body_write = front_door::BodyWrite::of(
-        request.method(),
-        request.extensions().get::<axum::extract::MatchedPath>(),
-    );
-    let limit = body_write.map_or(limits::REQUEST_LIMIT, |write| {
-        write.limit(admission.cold_snapshots)
-    });
-    if body_bytes > limit.bytes() {
-        return AdmissionRefusal::BodyTooLarge(limit).into_response();
+    // Size first: the head alone decides it (#581 section 6.1). One limit
+    // for every request (section 3.1).
+    if body_bytes > limits::MAX_REQUEST_BYTES {
+        return AdmissionRefusal::BodyTooLarge(limits::REQUEST_LIMIT).into_response();
     }
     // A write routed before its body meets pressure after routing and its
     // early answer: a follower redirects rather than refusing for its own
     // pressure, and a repeat of an applied write adds nothing to any log.
-    if body_write.is_some() {
+    if front_door::routed_before_body(
+        request.method(),
+        request.extensions().get::<axum::extract::MatchedPath>(),
+    ) {
         request.extensions_mut().insert(DeferredAdmission {
             admission,
             body_bytes,
@@ -197,9 +181,6 @@ impl IngressAdmission {
         {
             return Err(AdmissionRefusal::RaftLogPressure);
         }
-        // A snapshot body above the inline cap streams to the cold store in
-        // bounded parts (F16), so it holds at most the inline cap in memory.
-        let body_bytes = body_bytes.min(limits::MAX_REQUEST_BYTES);
         if body_bytes == 0 {
             return Ok(AdmissionPermit { _held: None });
         }

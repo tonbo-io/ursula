@@ -1,8 +1,8 @@
 //! Decisions before the body (#581 section 6.1).
 //!
 //! A write that carries a body (a create, an append or close, a snapshot
-//! publish) is decided from its head, in this order, before the node polls
-//! any of its body:
+//! publish or part) is decided from its head, in this order, before the node
+//! polls any of its body:
 //!
 //! 1. size (`413`), checked by ingress admission from `Content-Length`,
 //!    which runs before the handler;
@@ -33,7 +33,6 @@ use ursula_headers::NodeId;
 use ursula_headers::RaftGroup;
 use ursula_headers::RaftTerm;
 use ursula_headers::RoutingAnswer;
-use ursula_headers::SizeLimit;
 use ursula_raft::GroupLeadership;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::RouteWriteRequest;
@@ -46,48 +45,30 @@ use ursula_shard::RaftGroupId;
 use crate::HttpState;
 use crate::admission::AdmissionPermit;
 use crate::admission::DeferredAdmission;
-use crate::limits;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 
 /// The route of a stream: create (`PUT`), append or close (`POST`), read,
 /// `HEAD` and delete.
 pub(crate) const STREAM_ROUTE: &str = "/{bucket}/{stream}";
-/// The route of a snapshot: publish (`PUT`) and read.
+/// The route of a snapshot: publish or parts commit (`PUT`) and read.
 pub(crate) const SNAPSHOT_ROUTE: &str = "/{bucket}/{stream}/snapshot/{snapshot_offset}";
+/// The route that stages one part of a snapshot (`POST`, #581 section 3.1).
+pub(crate) const SNAPSHOT_PARTS_ROUTE: &str = "/{bucket}/{stream}/snapshot/{snapshot_offset}/parts";
 
-/// A write that is routed before its body, told by the route that matched
-/// ([`STREAM_ROUTE`] and [`SNAPSHOT_ROUTE`], which the router is built
-/// with), never by parsing the path again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BodyWrite {
-    /// A create, or an append or close.
-    Stream,
-    /// A snapshot publish. With a cold store, admission lets its body
-    /// exceed the request limit, up to the snapshot limit, and charges at
-    /// most the request limit against the in-flight budget, because a large
-    /// body is streamed to the cold store in bounded parts. The handler
-    /// enforces the limit again for a body without `Content-Length`.
-    SnapshotPublish,
-}
-
-impl BodyWrite {
-    pub(crate) fn of(method: &Method, route: Option<&MatchedPath>) -> Option<Self> {
-        match (method, route.map(MatchedPath::as_str)) {
-            (&Method::PUT | &Method::POST, Some(STREAM_ROUTE)) => Some(Self::Stream),
-            (&Method::PUT, Some(SNAPSHOT_ROUTE)) => Some(Self::SnapshotPublish),
-            _ => None,
-        }
-    }
-
-    /// Admission's body limit for the write on a node with or without a
-    /// cold store.
-    pub(crate) fn limit(self, cold_store: bool) -> SizeLimit {
-        match self {
-            Self::Stream => limits::REQUEST_LIMIT,
-            Self::SnapshotPublish => limits::snapshot_publish_limit(cold_store),
-        }
-    }
+/// Whether a request is a write that is routed before its body, told by
+/// the route that matched ([`STREAM_ROUTE`], [`SNAPSHOT_ROUTE`] and
+/// [`SNAPSHOT_PARTS_ROUTE`], which the router is built with), never by
+/// parsing the path again: a create, an append or close, a snapshot publish
+/// or parts commit, and a snapshot part. Its handler runs the pressure
+/// checks after routing.
+pub(crate) fn routed_before_body(method: &Method, route: Option<&MatchedPath>) -> bool {
+    matches!(
+        (method, route.map(MatchedPath::as_str)),
+        (&Method::PUT | &Method::POST, Some(STREAM_ROUTE))
+            | (&Method::PUT, Some(SNAPSHOT_ROUTE))
+            | (&Method::POST, Some(SNAPSHOT_PARTS_ROUTE))
+    )
 }
 
 /// What a write's head decided.
@@ -189,7 +170,7 @@ fn leadership_view(state: &HttpState, raft_group_id: RaftGroupId) -> Option<Writ
 }
 
 /// Runs the deferred pressure checks, if admission runs.
-fn admit(admission: Option<DeferredAdmission>) -> HeadDecision {
+pub(crate) fn admit(admission: Option<DeferredAdmission>) -> HeadDecision {
     match admission.map(DeferredAdmission::admit) {
         None => HeadDecision::Read(None),
         Some(Ok(permit)) => HeadDecision::Read(Some(permit)),

@@ -245,61 +245,48 @@ async fn a_chunked_body_crossing_the_request_limit_names_it() {
     }
 }
 
+/// One request limit on every node (#581 section 3.1): a snapshot above it
+/// is refused in one request, with or without a cold store, from its
+/// `Content-Length` before the body is read, and once a body without one
+/// crosses it.
 #[tokio::test]
-async fn a_snapshot_over_the_request_limit_without_a_cold_store_names_the_request_limit() {
-    let app = app();
-    create(&app, "/limits/s").await;
-    let polled = Arc::new(AtomicBool::new(false));
-    let response = send(
-        &app,
-        Request::put("/limits/s/snapshot/2")
-            .header(CONTENT_TYPE, OCTET)
-            .header(CONTENT_LENGTH, REQUEST_LIMIT + 1)
-            .body(watched(&polled))
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        named_limit(&response),
-        Some(SizeLimit::Request(REQUEST_LIMIT))
-    );
-    assert!(!polled.load(Ordering::SeqCst), "read the body");
+async fn a_snapshot_over_the_request_limit_names_the_request_limit_with_or_without_a_cold_store() {
+    for (store, app) in [("no cold store", app()), ("cold store", cold_app())] {
+        create(&app, "/limits/s").await;
+        for declared in [REQUEST_LIMIT + 1, MAX_COLD_SNAPSHOT_BYTES + 1] {
+            let polled = Arc::new(AtomicBool::new(false));
+            let response = send(
+                &app,
+                Request::put("/limits/s/snapshot/2")
+                    .header(CONTENT_TYPE, OCTET)
+                    .header(CONTENT_LENGTH, declared)
+                    .body(watched(&polled))
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{store}");
+            assert_eq!(
+                named_limit(&response),
+                Some(SizeLimit::Request(REQUEST_LIMIT)),
+                "{store} {declared}"
+            );
+            assert!(!polled.load(Ordering::SeqCst), "{store}: read the body");
+        }
 
-    let over = usize::try_from(REQUEST_LIMIT).expect("limit fits usize") + 1;
-    let response = send(
-        &app,
-        Request::put("/limits/s/snapshot/2")
-            .header(CONTENT_TYPE, OCTET)
-            .body(chunked(over))
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        named_limit(&response),
-        Some(SizeLimit::Request(REQUEST_LIMIT))
-    );
-}
-
-#[tokio::test]
-async fn a_snapshot_over_the_snapshot_limit_names_it() {
-    let app = cold_app();
-    create(&app, "/limits/s").await;
-    let polled = Arc::new(AtomicBool::new(false));
-    let response = send(
-        &app,
-        Request::put("/limits/s/snapshot/2")
-            .header(CONTENT_TYPE, OCTET)
-            .header(CONTENT_LENGTH, MAX_COLD_SNAPSHOT_BYTES + 1)
-            .body(watched(&polled))
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        named_limit(&response),
-        Some(SizeLimit::Snapshot(MAX_COLD_SNAPSHOT_BYTES))
-    );
-    assert!(!polled.load(Ordering::SeqCst), "read the body");
+        let over = usize::try_from(REQUEST_LIMIT).expect("limit fits usize") + 1;
+        let response = send(
+            &app,
+            Request::put("/limits/s/snapshot/2")
+                .header(CONTENT_TYPE, OCTET)
+                .body(chunked(over))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{store}");
+        assert_eq!(
+            named_limit(&response),
+            Some(SizeLimit::Request(REQUEST_LIMIT)),
+            "{store}"
+        );
+    }
 }

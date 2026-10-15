@@ -1560,6 +1560,12 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
             Action::PublishSnapshot
         }
         [suffix, _offset] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
+        // A snapshot part stores bytes for a later publish (#581 section 3.1).
+        [suffix, _offset, parts]
+            if suffix == "snapshot" && parts == "parts" && *method == Method::POST =>
+        {
+            Action::PublishSnapshot
+        }
         [suffix, _offset] if suffix == "retention" && *method == Method::PUT => Action::Update,
         _ => return None,
     };
