@@ -19,11 +19,12 @@
 use std::io::Read;
 use std::io::Write;
 
+use ursula_headers::Epoch;
+
 use super::PAGE;
 use super::Take;
 use crate::ids::Activation;
 use crate::ids::CommitId;
-use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
 
@@ -100,6 +101,8 @@ pub enum FrameError {
     UnknownKind { kind: u8 },
     #[error("frame kind {kind}: a body of {len} bytes")]
     BodyLength { kind: u8, len: u64 },
+    #[error("claim frame: epoch {0}")]
+    Epoch(#[source] ursula_headers::HeaderError),
     #[error("frame checksum {found:#010x}, expected {expected:#010x}")]
     Checksum { expected: u32, found: u32 },
     #[error("part {index} of {count}: a run has at least two parts, each below the count")]
@@ -172,7 +175,7 @@ fn check_part(index: u32, count: u32) -> Result<(), FrameError> {
 
 pub fn encode_claim(epoch: Epoch, activation: Activation) -> Vec<u8> {
     let mut body = Vec::with_capacity(CLAIM_BODY as usize);
-    body.extend_from_slice(&epoch.0.to_le_bytes());
+    body.extend_from_slice(&epoch.get().to_le_bytes());
     body.extend_from_slice(&activation.0);
     assemble(CLAIM, CLAIM_BODY, &body)
 }
@@ -341,7 +344,7 @@ fn body_of(kind: u8, body: &[u8]) -> Result<Frame, FrameError> {
         let epoch = t.u64().ok_or_else(short)?;
         let activation = t.array().ok_or_else(short)?;
         return Ok(Frame::Claim {
-            epoch: Epoch(epoch),
+            epoch: Epoch::try_from(epoch).map_err(FrameError::Epoch)?,
             activation: Activation(activation),
         });
     }

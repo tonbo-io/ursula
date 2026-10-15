@@ -23,10 +23,12 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 
+use ursula_headers::Epoch;
+use ursula_headers::Offset;
+
 use super::PAGE;
 use super::Take;
 use crate::ids::CommitId;
-use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
 
@@ -42,7 +44,7 @@ const CHUNK: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotFields {
     /// `W`, the stream offset the image reflects.
-    pub offset: u64,
+    pub offset: Offset,
     /// The highest epoch claimed before `offset`.
     pub epoch: Epoch,
     /// The last commit included.
@@ -75,6 +77,8 @@ pub enum SnapshotError {
     Magic { found: Vec<u8> },
     #[error("snapshot header cut short: {len} bytes")]
     HeaderTruncated { len: usize },
+    #[error("snapshot header: epoch {0}")]
+    Epoch(#[source] ursula_headers::HeaderError),
     #[error("snapshot header checksum {found:#010x}, expected {expected:#010x}")]
     HeaderChecksum { expected: u32, found: u32 },
     #[error("an image of {len} bytes is not whole pages")]
@@ -176,8 +180,8 @@ pub fn write_body(
 fn encode_header(h: &SnapshotHeader) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER);
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&h.fields.offset.to_le_bytes());
-    out.extend_from_slice(&h.fields.epoch.0.to_le_bytes());
+    out.extend_from_slice(&h.fields.offset.get().to_le_bytes());
+    out.extend_from_slice(&h.fields.epoch.get().to_le_bytes());
     out.extend_from_slice(&h.fields.last.lineage.0);
     out.extend_from_slice(&h.fields.last.position.0.to_le_bytes());
     out.extend_from_slice(&h.pages.to_le_bytes());
@@ -206,25 +210,28 @@ pub fn read_header(body: &[u8]) -> Result<(SnapshotHeader, usize), SnapshotError
         });
     }
     let mut take = || {
-        Some(SnapshotHeader {
-            fields: SnapshotFields {
-                offset: t.u64()?,
-                epoch: Epoch(t.u64()?),
-                last: CommitId {
-                    lineage: Lineage(t.array()?),
-                    position: Position(t.u64()?),
-                },
-            },
-            pages: t.u32()?,
-            crc: t.u32()?,
-        })
+        let offset = Offset::from_u64(t.u64()?);
+        let epoch = t.u64()?;
+        let last = CommitId {
+            lineage: Lineage(t.array()?),
+            position: Position(t.u64()?),
+        };
+        Some((offset, epoch, last, t.u32()?, t.u32()?, t.u32()?))
     };
-    let header = take().ok_or_else(truncated)?;
-    let found = t.u32().ok_or_else(truncated)?;
+    let (offset, epoch, last, pages, crc, found) = take().ok_or_else(truncated)?;
     let expected = crc32c::crc32c(body.get(..HEADER.saturating_sub(4)).unwrap_or_default());
     if found != expected {
         return Err(SnapshotError::HeaderChecksum { expected, found });
     }
+    let header = SnapshotHeader {
+        fields: SnapshotFields {
+            offset,
+            epoch: Epoch::try_from(epoch).map_err(SnapshotError::Epoch)?,
+            last,
+        },
+        pages,
+        crc,
+    };
     Ok((header, HEADER))
 }
 

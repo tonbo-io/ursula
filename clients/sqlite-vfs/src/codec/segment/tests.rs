@@ -11,6 +11,11 @@ use proptest::prop_assert;
 use proptest::prop_assert_eq;
 use proptest::prop_oneof;
 use proptest::proptest;
+use ursula_headers::Epoch;
+use ursula_headers::Incarnation;
+use ursula_headers::MAX_INCARNATION;
+use ursula_headers::MAX_PRODUCER_INTEGER;
+use ursula_headers::Offset;
 
 use super::Record;
 use super::RecordBody;
@@ -21,9 +26,12 @@ use super::encode_header;
 use super::encode_record;
 use super::scan;
 use crate::ids::Activation;
-use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
+
+fn epoch(e: u64) -> Epoch {
+    Epoch::try_from(e).unwrap()
+}
 
 fn header() -> impl Strategy<Value = SegmentHeader> {
     (
@@ -35,12 +43,12 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
             "/[a-z/]{0,20}",
         ),
         (
+            1..=MAX_INCARNATION,
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
-            any::<u64>(),
-            option::of((any::<u64>(), any::<[u8; 16]>())),
+            option::of((0..=MAX_PRODUCER_INTEGER, any::<[u8; 16]>())),
         ),
     )
         .prop_map(
@@ -53,12 +61,12 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
                 supersedes: supersedes.map(Lineage),
                 cluster_id,
                 stream_path,
-                incarnation,
+                incarnation: Incarnation::try_from(incarnation).unwrap(),
                 base: Position(base),
                 acked: Position(acked),
-                acked_offset,
+                acked_offset: Offset::from_u64(acked_offset),
                 log_bytes,
-                claim: claim.map(|(e, a)| (Epoch(e), Activation(a))),
+                claim: claim.map(|(e, a)| (epoch(e), Activation(a))),
             },
         )
 }
@@ -66,13 +74,13 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
 fn body() -> impl Strategy<Value = RecordBody> {
     prop_oneof![
         vec(any::<u8>(), 1..48).prop_map(|frame| RecordBody::Commit { frame }),
-        (any::<u64>(), any::<[u8; 16]>()).prop_map(|(e, a)| RecordBody::Claim {
-            epoch: Epoch(e),
+        (0..=MAX_PRODUCER_INTEGER, any::<[u8; 16]>()).prop_map(|(e, a)| RecordBody::Claim {
+            epoch: epoch(e),
             activation: Activation(a)
         }),
         (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(|(a, o, b)| RecordBody::Ack {
             acked: Position(a),
-            acked_offset: o,
+            acked_offset: Offset::from_u64(o),
             log_bytes: b
         }),
         any::<u64>().prop_map(|p| RecordBody::Base {
@@ -202,12 +210,12 @@ fn sample() -> SegmentHeader {
         supersedes: None,
         cluster_id: "c".into(),
         stream_path: "/b/s".into(),
-        incarnation: 1 << 52,
+        incarnation: Incarnation::try_from(1 << 52).unwrap(),
         base: Position(9),
         acked: Position(9),
-        acked_offset: 42,
+        acked_offset: Offset::from_u64(42),
         log_bytes: 0,
-        claim: Some((Epoch(3), Activation([2; 16]))),
+        claim: Some((epoch(3), Activation([2; 16]))),
     }
 }
 
@@ -346,4 +354,20 @@ fn a_zero_filled_tail_is_torn() {
     let s = scan(&bytes).unwrap();
     assert_eq!(s.records.len(), 1);
     assert_eq!(s.tail, Tail::Torn { at });
+}
+
+// A segment header always names its token: 0 is no token, refused once the checksum verifies.
+#[test]
+fn a_zero_incarnation_is_refused() {
+    let mut h = sample();
+    h.cluster_id = String::new();
+    h.stream_path = String::new();
+    let (mut bytes, _) = encode_header(&h).unwrap();
+    // After the magic, version, lineage, first position, supersedes tag and two empty strings.
+    let at = 4 + 4 + 16 + 8 + 1 + 2 + 2;
+    bytes[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+    let end = bytes.len() - 4;
+    let crc = crc32c::crc32c(&bytes[..end]);
+    bytes[end..].copy_from_slice(&crc.to_le_bytes());
+    assert!(matches!(scan(&bytes), Err(SegmentError::Incarnation(_))));
 }

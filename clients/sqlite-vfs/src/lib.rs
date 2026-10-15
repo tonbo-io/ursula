@@ -162,7 +162,7 @@
 //!   `Action`).
 //! - `extension`: the entry point and the SQL functions.
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
-//! - [`ids`]: lineages, activations, positions, epochs, sequence numbers and commit ids.
+//! - [`ids`]: lineages, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.

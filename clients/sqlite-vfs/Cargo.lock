@@ -478,6 +478,7 @@ dependencies = [
  "proptest",
  "thiserror",
  "ureq",
+ "ursula-headers",
  "zstd",
 ]
 
@@ -576,6 +577,10 @@ dependencies = [
  "httparse",
  "log",
 ]
+
+[[package]]
+name = "ursula-headers"
+version = "0.7.5"
 
 [[package]]
 name = "utf8-zero"

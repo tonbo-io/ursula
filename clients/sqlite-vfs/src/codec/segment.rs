@@ -26,9 +26,12 @@
 //! `first_position`. [`scan`] returns that prefix and says how the rest ends: a torn write at the
 //! tail, or damage that a chain-valid record follows.
 
+use ursula_headers::Epoch;
+use ursula_headers::Incarnation;
+use ursula_headers::Offset;
+
 use super::Take;
 use crate::ids::Activation;
-use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
 
@@ -57,11 +60,11 @@ pub struct SegmentHeader {
     pub cluster_id: String,
     pub stream_path: String,
     /// The stream's incarnation token.
-    pub incarnation: u64,
+    pub incarnation: Incarnation,
     pub base: Position,
     pub acked: Position,
     /// The stream offset just after the last acknowledged commit.
-    pub acked_offset: u64,
+    pub acked_offset: Offset,
     /// Frame bytes logged since the latest snapshot.
     pub log_bytes: u64,
     /// The latest CLAIM, if this generation made one.
@@ -80,7 +83,7 @@ pub enum RecordBody {
     /// How far the stream acknowledged the log.
     Ack {
         acked: Position,
-        acked_offset: u64,
+        acked_offset: Offset,
         log_bytes: u64,
     },
     /// The db file durably holds every commit up to `position`.
@@ -148,6 +151,10 @@ pub enum SegmentError {
     SupersedesTag { tag: u8 },
     #[error("segment header: claim tag {tag}")]
     ClaimTag { tag: u8 },
+    #[error("segment header: incarnation {0}")]
+    Incarnation(#[source] ursula_headers::HeaderError),
+    #[error("segment header: claim epoch {0}")]
+    Epoch(#[source] ursula_headers::HeaderError),
     #[error("segment header: first position 0, positions start at 1")]
     FirstPositionZero,
     #[error("segment header: {field} is not UTF-8: {source}")]
@@ -198,10 +205,10 @@ pub fn encode_header(h: &SegmentHeader) -> Result<(Vec<u8>, u32), SegmentError> 
     put_str(&mut out, "cluster_id", &h.cluster_id)?;
     put_str(&mut out, "stream_path", &h.stream_path)?;
     for n in [
-        h.incarnation,
+        h.incarnation.get(),
         h.base.0,
         h.acked.0,
-        h.acked_offset,
+        h.acked_offset.get(),
         h.log_bytes,
     ] {
         out.extend_from_slice(&n.to_le_bytes());
@@ -210,7 +217,7 @@ pub fn encode_header(h: &SegmentHeader) -> Result<(Vec<u8>, u32), SegmentError> 
         None => out.push(0),
         Some((epoch, activation)) => {
             out.push(1);
-            out.extend_from_slice(&epoch.0.to_le_bytes());
+            out.extend_from_slice(&epoch.get().to_le_bytes());
             out.extend_from_slice(&activation.0);
         }
     }
@@ -240,7 +247,7 @@ pub fn encode_record(
     let (kind, payload): (u8, &[u8]) = match body {
         RecordBody::Commit { frame } => (COMMIT, frame),
         RecordBody::Claim { epoch, activation } => {
-            fixed.extend_from_slice(&epoch.0.to_le_bytes());
+            fixed.extend_from_slice(&epoch.get().to_le_bytes());
             fixed.extend_from_slice(&activation.0);
             (CLAIM, &fixed)
         }
@@ -250,7 +257,7 @@ pub fn encode_record(
             log_bytes,
         } => {
             fixed.extend_from_slice(&acked.0.to_le_bytes());
-            fixed.extend_from_slice(&acked_offset.to_le_bytes());
+            fixed.extend_from_slice(&acked_offset.get().to_le_bytes());
             fixed.extend_from_slice(&log_bytes.to_le_bytes());
             (ACK, &fixed)
         }
@@ -324,7 +331,7 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
     let claim = match t.u8().ok_or_else(truncated)? {
         0 => None,
         1 => Some((
-            Epoch(t.u64().ok_or_else(truncated)?),
+            Epoch::try_from(t.u64().ok_or_else(truncated)?).map_err(SegmentError::Epoch)?,
             Activation(t.array().ok_or_else(truncated)?),
         )),
         tag => return Err(SegmentError::ClaimTag { tag }),
@@ -341,10 +348,10 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
         supersedes,
         cluster_id,
         stream_path,
-        incarnation,
+        incarnation: Incarnation::try_from(incarnation).map_err(SegmentError::Incarnation)?,
         base: Position(base),
         acked: Position(acked),
-        acked_offset,
+        acked_offset: Offset::from_u64(acked_offset),
         log_bytes,
         claim,
     };
@@ -360,12 +367,12 @@ fn body_of(kind: u8, payload: &[u8]) -> Option<RecordBody> {
             });
         }
         CLAIM => RecordBody::Claim {
-            epoch: Epoch(t.u64()?),
+            epoch: Epoch::try_from(t.u64()?).ok()?,
             activation: Activation(t.array()?),
         },
         ACK => RecordBody::Ack {
             acked: Position(t.u64()?),
-            acked_offset: t.u64()?,
+            acked_offset: Offset::from_u64(t.u64()?),
             log_bytes: t.u64()?,
         },
         BASE => RecordBody::Base {

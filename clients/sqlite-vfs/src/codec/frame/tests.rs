@@ -13,6 +13,8 @@ use proptest::prop_assert;
 use proptest::prop_assert_eq;
 use proptest::prop_oneof;
 use proptest::proptest;
+use ursula_headers::Epoch;
+use ursula_headers::MAX_PRODUCER_INTEGER;
 
 use super::CommitRecord;
 use super::Decoded;
@@ -27,9 +29,12 @@ use super::encode_claim;
 use super::encode_commit;
 use crate::ids::Activation;
 use crate::ids::CommitId;
-use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
+
+fn epoch(e: u64) -> Epoch {
+    Epoch::try_from(e).unwrap()
+}
 
 /// The frame limit the tests decode under.
 const MAX_BODY: u64 = 1 << 24;
@@ -66,8 +71,8 @@ fn record() -> impl Strategy<Value = CommitRecord> {
 }
 
 fn claim() -> impl Strategy<Value = Frame> {
-    (any::<u64>(), any::<[u8; 16]>()).prop_map(|(e, a)| Frame::Claim {
-        epoch: Epoch(e),
+    (0..=MAX_PRODUCER_INTEGER, any::<[u8; 16]>()).prop_map(|(e, a)| Frame::Claim {
+        epoch: epoch(e),
         activation: Activation(a),
     })
 }
@@ -293,11 +298,11 @@ fn a_run_restarted_whole_completes() {
 
 #[test]
 fn claims_have_a_fixed_layout() {
-    let bytes = encode_claim(Epoch(7), Activation([3; 16]));
+    let bytes = encode_claim(epoch(7), Activation([3; 16]));
     assert_eq!(bytes.len(), 13 + 24);
     assert_eq!(&bytes[..5], b"USQ2\x01");
     assert_eq!(decoded(&bytes), Frame::Claim {
-        epoch: Epoch(7),
+        epoch: epoch(7),
         activation: Activation([3; 16])
     });
 }
@@ -448,7 +453,7 @@ fn records_carry_a_content_checksum() {
 // A body above the reader's limit is an error as soon as its length is read, never Partial.
 #[test]
 fn a_body_above_the_limit_is_an_error() {
-    let claim = encode_claim(Epoch(1), Activation([0; 16]));
+    let claim = encode_claim(epoch(1), Activation([0; 16]));
     assert!(matches!(
         super::decode(&claim, 10),
         Err(FrameError::BodyTooLarge { len: 24, max: 10 })
@@ -464,7 +469,7 @@ fn a_body_above_the_limit_is_an_error() {
 // A frame of another format fails closed and names what it found.
 #[test]
 fn another_format_is_refused_by_its_magic() {
-    let mut bytes = encode_claim(Epoch(1), Activation([0; 16]));
+    let mut bytes = encode_claim(epoch(1), Activation([0; 16]));
     bytes[3] = b'1';
     let err = decode(&bytes).unwrap_err();
     assert!(matches!(&err, FrameError::Magic { found } if found == b"USQ1"));
@@ -473,10 +478,19 @@ fn another_format_is_refused_by_its_magic() {
             .starts_with("frame magic \"USQ1\": this extension reads \"USQ2\"")
     );
     assert!(matches!(decode(b"UX"), Err(FrameError::Magic { found }) if found == b"UX"));
-    let mut kind = encode_claim(Epoch(1), Activation([0; 16]));
+    let mut kind = encode_claim(epoch(1), Activation([0; 16]));
     kind[4] = 9;
     assert!(matches!(
         decode(&kind),
         Err(FrameError::UnknownKind { kind: 9 })
     ));
+}
+
+// An epoch outside the protocol's range is refused, though the frame checksum verifies.
+#[test]
+fn a_claim_epoch_out_of_range_is_refused() {
+    let mut body = (MAX_PRODUCER_INTEGER + 1).to_le_bytes().to_vec();
+    body.extend([0u8; 16]);
+    let frame = super::assemble(1, 24, &body);
+    assert!(matches!(decode(&frame), Err(FrameError::Epoch(_))));
 }

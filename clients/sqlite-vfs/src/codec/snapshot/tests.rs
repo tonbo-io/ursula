@@ -12,6 +12,9 @@ use proptest::collection::vec;
 use proptest::prelude::any;
 use proptest::prop_assert_eq;
 use proptest::proptest;
+use ursula_headers::Epoch;
+use ursula_headers::MAX_PRODUCER_INTEGER;
+use ursula_headers::Offset;
 
 use super::HEADER;
 use super::PAGE;
@@ -22,14 +25,17 @@ use super::read_header;
 use super::read_image;
 use super::write_body;
 use crate::ids::CommitId;
-use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
 
+fn epoch(e: u64) -> Epoch {
+    Epoch::try_from(e).unwrap()
+}
+
 fn fields() -> SnapshotFields {
     SnapshotFields {
-        offset: 4242,
-        epoch: Epoch(9),
+        offset: Offset::from_u64(4242),
+        epoch: epoch(9),
         last: CommitId {
             lineage: Lineage([5; 16]),
             position: Position(77),
@@ -59,14 +65,14 @@ proptest! {
     #[test]
     fn bodies_round_trip(
         offset in any::<u64>(),
-        epoch in any::<u64>(),
+        epoch_raw in 0..=MAX_PRODUCER_INTEGER,
         lineage in any::<[u8; 16]>(),
         position in any::<u64>(),
         seeds in vec(any::<u8>(), 0..4),
     ) {
         let f = SnapshotFields {
-            offset,
-            epoch: Epoch(epoch),
+            offset: Offset::from_u64(offset),
+            epoch: epoch(epoch_raw),
             last: CommitId { lineage: Lineage(lineage), position: Position(position) },
         };
         let image: Vec<u8> = seeds.iter().flat_map(|&s| [s; PAGE]).collect();
@@ -213,4 +219,13 @@ fn every_header_bit_flip_is_refused() {
         assert!(read_header(&bad).is_err(), "bit {bit}");
     }
     read_header(&body[..HEADER]).unwrap();
+}
+
+#[test]
+fn an_epoch_out_of_range_is_refused() {
+    let (mut body, _) = body(&fields(), &image(1));
+    body[12..20].copy_from_slice(&(MAX_PRODUCER_INTEGER + 1).to_le_bytes());
+    let crc = crc32c::crc32c(&body[..52]);
+    body[52..56].copy_from_slice(&crc.to_le_bytes());
+    assert!(matches!(read_header(&body), Err(SnapshotError::Epoch(_))));
 }

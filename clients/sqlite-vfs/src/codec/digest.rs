@@ -1,11 +1,14 @@
 //! Digests the server checks. `Producer-Digest` is the BLAKE3-256 of an append body. A snapshot's
 //! `Stream-Snapshot-Digest` is the server's `SnapshotDigest` (`crates/ursula-stream/src/model.rs`):
-//! BLAKE3 over the content type's length (u64 little-endian), the content type and the body, in
-//! lowercase hex.
+//! BLAKE3 over the content type's length (u64 little-endian), the content type and the body.
+//! `ursula_headers` holds the digest types and their header syntax. This module computes them.
+
+use ursula_headers::BodyDigest;
+use ursula_headers::SnapshotDigest;
 
 /// The BLAKE3-256 of an append body, sent as `Producer-Digest`.
-pub fn producer_digest(body: &[u8]) -> [u8; 32] {
-    *blake3::hash(body).as_bytes()
+pub fn producer_digest(body: &[u8]) -> BodyDigest {
+    BodyDigest::from_bytes(*blake3::hash(body).as_bytes())
 }
 
 /// The snapshot digest, fed the body piece by piece as it is written.
@@ -24,8 +27,8 @@ impl SnapshotDigester {
         self.0.update(body);
     }
 
-    pub fn finalize(&self) -> String {
-        self.0.finalize().to_hex().to_string()
+    pub fn finalize(&self) -> SnapshotDigest {
+        SnapshotDigest::from_bytes(*self.0.finalize().as_bytes())
     }
 }
 
@@ -40,7 +43,7 @@ mod tests {
         for p in pieces {
             d.update(p);
         }
-        d.finalize()
+        d.finalize().to_string()
     }
 
     // Golden vectors computed with the server's `ursula_stream::SnapshotDigest`.
@@ -58,7 +61,7 @@ mod tests {
     #[test]
     fn producer_digests_are_blake3() {
         assert_eq!(
-            producer_digest(b""),
+            *producer_digest(b"").as_bytes(),
             *blake3::Hash::from_hex(
                 "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
             )
@@ -66,7 +69,7 @@ mod tests {
             .as_bytes()
         );
         assert_eq!(
-            producer_digest(b"abc"),
+            *producer_digest(b"abc").as_bytes(),
             *blake3::Hash::from_hex(
                 "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
             )

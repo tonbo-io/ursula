@@ -1,6 +1,7 @@
-//! Identifiers shared by the formats and the replicator: a local generation's lineage, a host
-//! activation, a record's position in its log, producer epochs and sequence numbers, and the
-//! commit id `(lineage, position)` that frames carry in the clear.
+//! The VFS's own identifiers: a local generation's lineage, a host activation, a record's
+//! position in its log, and the commit id `(lineage, position)` that frames carry in the clear.
+//! Protocol values (epochs, sequence numbers, offsets, incarnation tokens, digests) are
+//! `ursula_headers` types.
 
 use std::fs::File;
 use std::io::Read;
@@ -19,14 +20,6 @@ pub struct Activation(pub [u8; 16]);
 /// A record's place in its log: positions grow by one per record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position(pub u64);
-
-/// A producer epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Epoch(pub u64);
-
-/// A producer sequence number within an epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Seq(pub u64);
 
 /// A commit's identity: the generation that logged it and its position in that generation's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
