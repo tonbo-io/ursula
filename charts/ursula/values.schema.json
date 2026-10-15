@@ -307,6 +307,11 @@
           "pattern": "^[^:]+:[0-9]+$",
           "description": "Admin-plane listen address. Defaults to pod loopback; use a pod-reachable address only for a trusted in-cluster operator."
         },
+        "clusterId": {
+          "type": "string",
+          "pattern": "^([A-Za-z0-9._-]{1,64})?$",
+          "description": "server.cluster_id, sent as Ursula-Cluster-Id on every HEAD. Empty derives it from the release: u followed by the first 32 hex digits of sha256(\"<namespace>/<release name>\"). Keep it when a restore replaces the deployment."
+        },
         "service": {
           "type": "object",
           "additionalProperties": false,

@@ -5,6 +5,10 @@
 {{- $clusterDomain := .Values.global.clusterDomain | toString -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
+{{- $clusterId := .Values.server.clusterId | default "" | toString -}}
+{{- if not $clusterId -}}
+{{- $clusterId = printf "u%s" (sha256sum (printf "%s/%s" $namespace .Release.Name) | trunc 32) -}}
+{{- end -}}
 {{- $peers := list -}}
 {{- $nodes := list -}}
 {{- range $i := until $replicaCount -}}
@@ -102,6 +106,7 @@ data:
     [server]
     listen = "0.0.0.0:{{ $clientPort }}"
     admin_listen = {{ .Values.server.adminListen | quote }}
+    cluster_id = {{ $clusterId | quote }}
 
     [runtime]
     core_count = {{ .Values.server.coreCount }}

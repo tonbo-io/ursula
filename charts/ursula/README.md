@@ -421,6 +421,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.onDeleteMigration.image` | `registry.k8s.io/kubectl:v1.33.3` | Kubectl image used by the Helm pre-upgrade migration when switching an existing StatefulSet to `OnDelete`. |
 | `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, headless peer Service, generated Raft peer URLs, and leader redirects target this port. |
 | `server.adminListen` | `127.0.0.1:4438` | Mutating admin-plane listen address. Keep the loopback default for normal deployments and use `kubectl port-forward`; a trusted in-cluster operator may opt in to `0.0.0.0:4438`. The chart never exposes this port through a Service. |
+| `server.clusterId` | `""` | The deployment's id (`server.cluster_id`), sent as `Ursula-Cluster-Id` on every `HEAD`. Empty derives it from the release: `u` followed by the first 32 hex digits of sha256 of `<namespace>/<release name>`. A node refuses to start when its WAL holds another id, so set it to the old id when a restore replaces a deployment under another release name or namespace. |
 | `server.service.enabled` | `true` | Render the internal client Service. |
 | `server.service.type` | `ClusterIP` | Client Service type. Allowed values are `ClusterIP`, `NodePort`, and `LoadBalancer`. |
 | `server.service.port` | `4437` | Client Service port. |

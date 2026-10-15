@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import re
 import subprocess
 import tomllib
@@ -407,6 +408,23 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "0.0.0.0:4438")
+
+    def test_cluster_id_derives_from_the_namespace_and_release(self) -> None:
+        rendered = subprocess.check_output(
+            ["helm", "template", "rel", "charts/ursula", "--namespace", "prod", "--set", "s3.bucket=bkt"],
+            text=True,
+        )
+        match = re.search(r'cluster_id = "(?P<id>[^"]*)"', rendered)
+        assert match is not None
+        digest = hashlib.sha256(b"prod/rel").hexdigest()[:32]
+        self.assertEqual(match.group("id"), f"u{digest}")
+
+    def test_cluster_id_can_be_set_and_is_validated(self) -> None:
+        config = render_config("--set", "s3.bucket=bkt", "--set", "server.clusterId=prod-eu-1")
+        self.assertEqual(tomllib.loads(config)["server"]["cluster_id"], "prod-eu-1")
+        for invalid in ("a/b", "x" * 65):
+            with self.assertRaises(subprocess.CalledProcessError):
+                render_chart("--set", "s3.bucket=bkt", "--set", f"server.clusterId={invalid}")
 
     def test_max_uncommitted_value_uses_single_raft_table(self) -> None:
         config = render_config("--set", "raft.maxUncommittedBytesPerGroup=8388608", "--set", "s3.bucket=bkt")
