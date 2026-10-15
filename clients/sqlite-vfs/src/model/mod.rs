@@ -136,10 +136,9 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CheckpointId(pub(crate) usize);
 
-/// Every stream as it stood, and the group's history id then: the history its tokens were in.
+/// Every stream as it stood, each with the history it was last written in.
 #[derive(Debug, Clone)]
 struct Checkpoint {
-    history: u64,
     streams: BTreeMap<String, Stream>,
 }
 
@@ -269,7 +268,6 @@ impl ModelServer {
     /// Saves every stream's state, to restore later as a history event.
     pub(crate) fn checkpoint(&mut self) -> CheckpointId {
         self.checkpoints.push(Checkpoint {
-            history: self.history,
             streams: self.streams.clone(),
         });
         CheckpointId(self.checkpoints.len().saturating_sub(1))
@@ -277,8 +275,9 @@ impl ModelServer {
 
     /// Applies a history event (#581 §4.3): a fresh history id, `last_created_at_ms` kept at least
     /// the clock, and nothing else. Tokens, fences and inheritance all derive from the id. A
-    /// restore puts every stream back in the history of its source, so HEAD reports the source's
-    /// token with the restored tail (§4.8).
+    /// restore puts every stream back as the source held it, in the history it was last written
+    /// in, so HEAD reports the token under which the stream was last written with the restored
+    /// tail (§4.8): after events with no write between them, the token before all of them.
     pub(crate) fn history_event(&mut self, event: HistoryEvent) -> Result<(), ModelError> {
         if let HistoryEvent::Restore(CheckpointId(id)) = event {
             let source = self
@@ -286,9 +285,6 @@ impl ModelServer {
                 .get(id)
                 .ok_or(ModelError::NoCheckpoint(id))?;
             self.streams = source.streams.clone();
-            for stream in self.streams.values_mut() {
-                stream.history = source.history;
-            }
         }
         self.history = self.draw_history();
         self.last_created_at_ms = self.last_created_at_ms.max(self.clock_ms);
