@@ -3,13 +3,15 @@
 //!
 //! ```text
 //! "USS3" | u64 W | u64 epoch | [16] lineage | u64 position | u32 pages | u32 crc32c(image)
-//!        | zstd(image)
+//!        | u32 crc32c(header) | zstd(image)
 //! ```
 //!
 //! `W` is the stream offset the image reflects: every frame before it applied, none after.
 //! `epoch` is the highest producer epoch claimed before `W` (retention may trim the claims
 //! themselves). `(lineage, position)` is the last commit included. `image` is `pages` x 4 KiB, page
-//! 1 first, byte-identical to a file built by replaying the stream up to `W`.
+//! 1 first, byte-identical to a file built by replaying the stream up to `W`. The header carries
+//! its own checksum, so it can be verified without the body. The zstd frame declares its content
+//! size and carries a content checksum.
 //!
 //! Bodies stream between files: [`write_body`] reads the image twice (once for its checksum, once
 //! to compress it) and [`read_image`] decompresses into a writer, so neither holds the image in
@@ -30,7 +32,7 @@ use crate::ids::Position;
 
 const MAGIC: &[u8; 4] = b"USS3";
 /// The header's length.
-pub const HEADER: usize = 52;
+pub const HEADER: usize = 56;
 const ZSTD_LEVEL: i32 = 3;
 /// Enough of a zstd frame to read its declared content size (`ZSTD_FRAMEHEADERSIZE_MAX`).
 const ZSTD_FRAME_HEADER_MAX: usize = 18;
@@ -73,6 +75,8 @@ pub enum SnapshotError {
     Magic { found: Vec<u8> },
     #[error("snapshot header cut short: {len} bytes")]
     HeaderTruncated { len: usize },
+    #[error("snapshot header checksum {found:#010x}, expected {expected:#010x}")]
+    HeaderChecksum { expected: u32, found: u32 },
     #[error("an image of {len} bytes is not whole pages")]
     PartialPage { len: u64 },
     #[error("an image of {len} bytes is too large")]
@@ -118,7 +122,9 @@ fn copy_crc(
 }
 
 /// Writes the body of the image read from `image` (from its current position) to `out`. The image
-/// is read twice, so it must not change meanwhile: a change is an error.
+/// is read twice, so it must not change meanwhile: a change is an error. The header goes out
+/// before the second read verifies the image, so `out` must be a temp file that is published only
+/// after this returns `Ok`.
 pub fn write_body(
     fields: &SnapshotFields,
     image: &mut (impl Read + Seek),
@@ -146,6 +152,7 @@ pub fn write_body(
     let mut z =
         zstd::stream::write::Encoder::new(&mut *out, ZSTD_LEVEL).map_err(SnapshotError::Zstd)?;
     z.include_contentsize(true).map_err(SnapshotError::Zstd)?;
+    z.include_checksum(true).map_err(SnapshotError::Zstd)?;
     z.set_pledged_src_size(Some(len))
         .map_err(SnapshotError::Zstd)?;
     let again = copy_crc(image, &mut z, len, SnapshotError::Read)?;
@@ -154,8 +161,13 @@ pub fn write_body(
     }
     // One byte more means the image grew between the two reads.
     let mut extra = [0u8; 1];
-    if image.read(&mut extra).map_err(SnapshotError::Read)? != 0 {
-        return Err(SnapshotError::ImageChanged);
+    loop {
+        match image.read(&mut extra) {
+            Ok(0) => break,
+            Ok(_) => return Err(SnapshotError::ImageChanged),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(SnapshotError::Read(e)),
+        }
     }
     z.finish().map_err(SnapshotError::Zstd)?;
     Ok(header)
@@ -170,6 +182,8 @@ fn encode_header(h: &SnapshotHeader) -> Vec<u8> {
     out.extend_from_slice(&h.fields.last.position.0.to_le_bytes());
     out.extend_from_slice(&h.pages.to_le_bytes());
     out.extend_from_slice(&h.crc.to_le_bytes());
+    let crc = crc32c::crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
@@ -206,6 +220,11 @@ pub fn read_header(body: &[u8]) -> Result<(SnapshotHeader, usize), SnapshotError
         })
     };
     let header = take().ok_or_else(truncated)?;
+    let found = t.u32().ok_or_else(truncated)?;
+    let expected = crc32c::crc32c(body.get(..HEADER.saturating_sub(4)).unwrap_or_default());
+    if found != expected {
+        return Err(SnapshotError::HeaderChecksum { expected, found });
+    }
     Ok((header, HEADER))
 }
 

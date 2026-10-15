@@ -16,6 +16,9 @@
 //! run back together. Frames carry no epoch, sequence or stream identity, so a resend under any
 //! epoch sends the bytes logged at commit time.
 
+use std::io::Read;
+use std::io::Write;
+
 use super::PAGE;
 use super::Take;
 use crate::ids::Activation;
@@ -102,15 +105,25 @@ pub enum FrameError {
     #[error("part {index} of {count}: a run has at least two parts, each below the count")]
     PartIndex { index: u32, count: u32 },
     #[error("a frame body or commit record of {len} bytes is too large")]
-    TooLarge { len: usize },
+    TooLarge { len: u64 },
+    #[error("a frame body of {len} bytes, above the limit of {max}")]
+    BodyTooLarge { len: u64, max: u64 },
     #[error("commit record: page {pgno} after page {previous}, pages go in ascending order")]
     PageOrder { pgno: u32, previous: u32 },
     #[error("commit record: page {pgno} outside a database of {db_pages_after} pages")]
     PageOutside { pgno: u32, db_pages_after: u32 },
-    #[error("commit record: {found:?} bytes declared by its zstd frame, not a whole record")]
-    ContentSize { found: Option<u64> },
-    #[error("commit record: {bytes} bytes for {pages} pages")]
-    PageCount { pages: u32, bytes: usize },
+    #[error(
+        "commit record of {pages} pages ({expected} bytes), but its zstd frame declares {declared}"
+    )]
+    ContentSize {
+        pages: u32,
+        expected: u64,
+        declared: u64,
+    },
+    #[error("commit record of {pages} pages: the record ends before its {expected} bytes")]
+    RecordShort { pages: u32, expected: u64 },
+    #[error("commit record of {pages} pages: bytes follow its {expected} bytes")]
+    RecordLong { pages: u32, expected: u64 },
     #[error("{len} bytes: {source}")]
     Alloc {
         len: usize,
@@ -139,8 +152,9 @@ fn assemble(kind: u8, len: u32, body: &[u8]) -> Vec<u8> {
 }
 
 fn wrap(kind: u8, body: &[u8]) -> Result<Vec<u8>, FrameError> {
-    let len =
-        u32::try_from(body.len()).map_err(|_too_long| FrameError::TooLarge { len: body.len() })?;
+    let len = u32::try_from(body.len()).map_err(|_too_long| FrameError::TooLarge {
+        len: body.len() as u64,
+    })?;
     Ok(assemble(kind, len, body))
 }
 
@@ -203,28 +217,36 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     }
 }
 
-/// The COMMIT frame of `record`. Pages must ascend and lie within the database.
+/// The record's length in bytes for `pages` pages.
+fn record_len(pages: u64) -> Option<u64> {
+    pages
+        .checked_mul(ENTRY as u64)
+        .and_then(|b| b.checked_add(RECORD_HEAD as u64))
+}
+
+/// The COMMIT frame of `record`. Pages must ascend and lie within the database. The zstd frame
+/// declares its content size and carries a content checksum.
 pub fn encode_commit(id: CommitId, record: &CommitRecord) -> Result<Vec<u8>, FrameError> {
-    let n = record.pages.len();
-    let too_large = || FrameError::TooLarge { len: n };
-    let count = u32::try_from(n).map_err(|_too_many| too_large())?;
-    let size = n
-        .checked_mul(ENTRY)
-        .and_then(|b| b.checked_add(RECORD_HEAD))
-        .ok_or_else(too_large)?;
-    let mut raw = Vec::new();
-    raw.try_reserve_exact(size)
-        .map_err(|source| FrameError::Alloc { len: size, source })?;
-    raw.extend_from_slice(&record.db_pages_after.to_le_bytes());
-    raw.extend_from_slice(&count.to_le_bytes());
+    let n = record.pages.len() as u64;
+    let size = record_len(n).ok_or(FrameError::TooLarge { len: u64::MAX })?;
+    let count = u32::try_from(n).map_err(|_too_many| FrameError::TooLarge { len: size })?;
+    let mut z =
+        zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).map_err(FrameError::Compress)?;
+    z.include_checksum(true).map_err(FrameError::Compress)?;
+    z.include_contentsize(true).map_err(FrameError::Compress)?;
+    z.set_pledged_src_size(Some(size))
+        .map_err(FrameError::Compress)?;
+    let mut write = |bytes: &[u8]| z.write_all(bytes).map_err(FrameError::Compress);
+    write(&record.db_pages_after.to_le_bytes())?;
+    write(&count.to_le_bytes())?;
     let mut previous = 0;
     for (pgno, image) in &record.pages {
         check_page(*pgno, previous, record.db_pages_after)?;
         previous = *pgno;
-        raw.extend_from_slice(&pgno.to_le_bytes());
-        raw.extend_from_slice(image.as_slice());
+        write(&pgno.to_le_bytes())?;
+        write(image.as_slice())?;
     }
-    let compressed = zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(FrameError::Compress)?;
+    let compressed = z.finish().map_err(FrameError::Compress)?;
     encode(&Frame::Commit { id, compressed })
 }
 
@@ -242,9 +264,10 @@ fn check_page(pgno: u32, previous: u32, db_pages_after: u32) -> Result<(), Frame
     Ok(())
 }
 
-/// Decodes the frame at the start of `buf`. A kind or length no frame can have is an error as soon
-/// as it is read, so a reader never waits for the body of a damaged header.
-pub fn decode(buf: &[u8]) -> Result<Decoded, FrameError> {
+/// Decodes the frame at the start of `buf`. A kind or length no frame can have, or a body above
+/// `max_body` bytes, is an error as soon as it is read, so a reader never waits for the body of a
+/// damaged header.
+pub fn decode(buf: &[u8], max_body: u64) -> Result<Decoded, FrameError> {
     let Some((magic, rest)) = buf.split_first_chunk::<4>() else {
         // Shorter than the magic: what there is must be its start.
         return if MAGIC.starts_with(buf) {
@@ -279,6 +302,12 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, FrameError> {
         return Err(FrameError::BodyLength {
             kind,
             len: u64::from(len),
+        });
+    }
+    if u64::from(len) > max_body {
+        return Err(FrameError::BodyTooLarge {
+            len: u64::from(len),
+            max: max_body,
         });
     }
     let Some(crc) = t.u32() else {
@@ -339,65 +368,125 @@ fn body_of(kind: u8, body: &[u8]) -> Result<Frame, FrameError> {
     })
 }
 
-/// The commit record in a COMMIT frame's compressed bytes. The record is sized from its zstd
-/// frame's declared content size, which must be a whole record, and allocated fallibly, so damaged
-/// bytes are an error rather than an abort.
-pub fn decompress(compressed: &[u8]) -> Result<CommitRecord, FrameError> {
-    let found = match zstd::zstd_safe::get_frame_content_size(compressed) {
-        Ok(Some(n)) => n,
-        Ok(None) | Err(_) => return Err(FrameError::ContentSize { found: None }),
-    };
-    let whole = usize::try_from(found).ok().filter(|&n| {
-        n.checked_sub(RECORD_HEAD)
-            .is_some_and(|pages| pages.is_multiple_of(ENTRY))
-    });
-    let Some(len) = whole else {
-        return Err(FrameError::ContentSize { found: Some(found) });
-    };
-    let mut raw = Vec::new();
-    raw.try_reserve_exact(len)
-        .map_err(|source| FrameError::Alloc { len, source })?;
-    raw.resize(len, 0); // within the reserved capacity
-    let n = zstd::bulk::decompress_to_buffer(compressed, raw.as_mut_slice())
-        .map_err(FrameError::Decompress)?;
-    if n != len {
-        return Err(FrameError::ContentSize {
-            found: Some(n as u64),
-        });
-    }
-    let mut t = Take(&raw);
-    let (Some(db_pages_after), Some(count)) = (t.u32(), t.u32()) else {
-        return Err(FrameError::ContentSize { found: Some(found) });
-    };
-    let entries = t.rest();
-    if (count as usize).checked_mul(ENTRY) != Some(entries.len()) {
-        return Err(FrameError::PageCount {
-            pages: count,
-            bytes: entries.len(),
-        });
-    }
-    let mut pages = Vec::new();
-    pages
-        .try_reserve_exact(count as usize)
-        .map_err(|source| FrameError::Alloc {
-            len: count as usize,
-            source,
-        })?;
-    let mut previous = 0;
-    for entry in entries.chunks_exact(ENTRY) {
-        let mut e = Take(entry);
-        let (Some(pgno), Some(image)) = (e.u32(), e.array::<PAGE>()) else {
-            return Err(FrameError::PageCount {
-                pages: count,
-                bytes: entries.len(),
-            });
+/// The header of a commit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordHeader {
+    pub db_pages_after: u32,
+    pub pages: u32,
+}
+
+/// Reads a commit record from a COMMIT frame's compressed bytes one page at a time, so no buffer
+/// is sized from the bytes and no more than a page is held. The record header must agree with the
+/// zstd frame's declared content size when it declares one, pages must ascend within the database,
+/// and the record must end exactly after its last page, where zstd checks the content checksum.
+pub struct RecordReader<'a> {
+    z: zstd::stream::read::Decoder<'static, std::io::BufReader<&'a [u8]>>,
+    header: RecordHeader,
+    left: u32,
+    previous: u32,
+}
+
+impl<'a> RecordReader<'a> {
+    pub fn new(compressed: &'a [u8]) -> Result<Self, FrameError> {
+        let mut z = zstd::stream::read::Decoder::new(compressed).map_err(FrameError::Decompress)?;
+        let head_short = FrameError::RecordShort {
+            pages: 0,
+            expected: RECORD_HEAD as u64,
         };
-        check_page(pgno, previous, db_pages_after)?;
-        previous = pgno;
-        pages.push((pgno, Box::new(image)));
+        let mut head = [0u8; RECORD_HEAD];
+        if let Err(e) = z.read_exact(&mut head) {
+            return Err(match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => head_short,
+                _ => FrameError::Decompress(e),
+            });
+        }
+        let mut t = Take(&head);
+        let (Some(db_pages_after), Some(pages)) = (t.u32(), t.u32()) else {
+            return Err(head_short);
+        };
+        // At most 8 + (2^32 - 1) x 4100 bytes: no overflow.
+        let expected = record_len(u64::from(pages)).unwrap_or(u64::MAX);
+        if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(compressed)
+            && declared != expected
+        {
+            return Err(FrameError::ContentSize {
+                pages,
+                expected,
+                declared,
+            });
+        }
+        Ok(Self {
+            z,
+            header: RecordHeader {
+                db_pages_after,
+                pages,
+            },
+            left: pages,
+            previous: 0,
+        })
+    }
+
+    pub fn header(&self) -> RecordHeader {
+        self.header
+    }
+
+    fn expected(&self) -> u64 {
+        record_len(u64::from(self.header.pages)).unwrap_or(u64::MAX)
+    }
+
+    /// The next page's number, its image written to `image`, or `None` after the last page.
+    pub fn next_page(&mut self, image: &mut [u8; PAGE]) -> Result<Option<u32>, FrameError> {
+        let Some(left) = self.left.checked_sub(1) else {
+            self.finish()?;
+            return Ok(None);
+        };
+        let mut pgno = [0u8; 4];
+        for buf in [&mut pgno[..], &mut image[..]] {
+            if let Err(e) = self.z.read_exact(buf) {
+                return Err(match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof => FrameError::RecordShort {
+                        pages: self.header.pages,
+                        expected: self.expected(),
+                    },
+                    _ => FrameError::Decompress(e),
+                });
+            }
+        }
+        let pgno = u32::from_le_bytes(pgno);
+        check_page(pgno, self.previous, self.header.db_pages_after)?;
+        self.previous = pgno;
+        self.left = left;
+        Ok(Some(pgno))
+    }
+
+    /// Checks that the record ends after its last page.
+    fn finish(&mut self) -> Result<(), FrameError> {
+        let mut extra = [0u8; 1];
+        loop {
+            return match self.z.read(&mut extra) {
+                Ok(0) => Ok(()),
+                Ok(_) => Err(FrameError::RecordLong {
+                    pages: self.header.pages,
+                    expected: self.expected(),
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(FrameError::Decompress(e)),
+            };
+        }
+    }
+}
+
+/// The whole commit record, for callers that hold it anyway. Pages are allocated as they are
+/// read, never from a declared size.
+pub fn decompress(compressed: &[u8]) -> Result<CommitRecord, FrameError> {
+    let mut reader = RecordReader::new(compressed)?;
+    let mut pages = Vec::new();
+    let mut image = Box::new([0u8; PAGE]);
+    while let Some(pgno) = reader.next_page(&mut image)? {
+        pages.push((pgno, image.clone()));
     }
     Ok(CommitRecord {
-        db_pages_after,
+        db_pages_after: reader.header().db_pages_after,
         pages,
     })
 }

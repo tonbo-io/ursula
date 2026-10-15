@@ -3,6 +3,8 @@
     reason = "tests compute cuts, bits and positions from small generated sizes"
 )]
 
+use std::io::Write;
+
 use proptest::collection::btree_map;
 use proptest::collection::vec;
 use proptest::prelude::Strategy;
@@ -18,7 +20,7 @@ use super::Frame;
 use super::FrameError;
 use super::PAGE;
 use super::PartRun;
-use super::decode;
+use super::RecordReader;
 use super::decompress;
 use super::encode;
 use super::encode_claim;
@@ -28,6 +30,13 @@ use crate::ids::CommitId;
 use crate::ids::Epoch;
 use crate::ids::Lineage;
 use crate::ids::Position;
+
+/// The frame limit the tests decode under.
+const MAX_BODY: u64 = 1 << 24;
+
+fn decode(buf: &[u8]) -> Result<Decoded, FrameError> {
+    super::decode(buf, MAX_BODY)
+}
 
 fn id() -> impl Strategy<Value = CommitId> {
     (any::<[u8; 16]>(), any::<u64>()).prop_map(|(l, p)| CommitId {
@@ -211,6 +220,45 @@ proptest! {
             prop_assert_eq!(run.push(p.clone()).unwrap(), None);
         }
     }
+
+    // Parts of the run's own commit that do not continue it void it too: a skipped index, a
+    // repeated index or another count. A restart at 0 starts the run again.
+    #[test]
+    fn a_part_of_the_same_commit_out_of_turn_voids_the_run(
+        (frame, _) in commit(),
+        cuts in vec(any::<usize>(), 2..6),
+        at in any::<usize>(),
+        how in 0u8..3,
+    ) {
+        let parts = split(&frame, &cuts);
+        let count = parts.len() as u32;
+        proptest::prop_assume!(count >= 3);
+        let at = 1 + at % (parts.len() - 1);
+        let Frame::Part { id, chunk, .. } = parts[at].clone() else { panic!("a part") };
+        let foreign = match how {
+            0 if at + 1 < parts.len() => Frame::Part { id, index: at as u32 + 1, count, chunk },
+            1 if at >= 2 => parts[at - 1].clone(),
+            _ => Frame::Part { id, index: at as u32, count: count + 1, chunk },
+        };
+        let mut run = PartRun::default();
+        for p in &parts[..at] {
+            prop_assert_eq!(run.push(p.clone()).unwrap(), None);
+        }
+        prop_assert_eq!(run.push(foreign).unwrap(), None);
+        for p in &parts[at..] {
+            prop_assert_eq!(run.push(p.clone()).unwrap(), None);
+        }
+        // A restart at 0 mid-run, then the whole run, completes the commit.
+        let mut run = PartRun::default();
+        for p in &parts[..at] {
+            prop_assert_eq!(run.push(p.clone()).unwrap(), None);
+        }
+        let (last, init) = parts.split_last().unwrap();
+        for p in init {
+            prop_assert_eq!(run.push(p.clone()).unwrap(), None);
+        }
+        prop_assert_eq!(run.push(last.clone()).unwrap(), Some(frame));
+    }
 }
 
 #[test]
@@ -294,27 +342,122 @@ fn records_out_of_order_or_outside_the_database_are_refused() {
     ));
 }
 
+/// `raw` compressed without a declared content size.
+fn compress_unsized(raw: &[u8]) -> Vec<u8> {
+    let mut z = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    z.write_all(raw).unwrap();
+    z.finish().unwrap()
+}
+
+fn record_head(db_pages_after: u32, pages: u32) -> Vec<u8> {
+    let mut raw = db_pages_after.to_le_bytes().to_vec();
+    raw.extend(pages.to_le_bytes());
+    raw
+}
+
 #[test]
-fn a_record_of_the_wrong_size_is_refused_before_allocating() {
-    // Not a whole record by its declared size.
-    let short = zstd::bulk::compress(&[0u8; 9], 3).unwrap();
-    assert!(matches!(
-        decompress(&short),
-        Err(FrameError::ContentSize { found: Some(9) })
-    ));
-    // A whole record by size whose count disagrees.
-    let mut raw = vec![0u8; 8 + 4 + PAGE];
-    raw[0] = 1;
-    raw[4] = 2;
-    let wrong = zstd::bulk::compress(&raw, 3).unwrap();
+fn a_record_whose_size_disagrees_is_refused() {
+    // The declared content size is not the size the record header implies.
+    let wrong = zstd::bulk::compress(&record_head(1_000_000, 1_000_000), 3).unwrap();
     assert!(matches!(
         decompress(&wrong),
-        Err(FrameError::PageCount { pages: 2, .. })
+        Err(FrameError::ContentSize {
+            pages: 1_000_000,
+            declared: 8,
+            ..
+        })
     ));
-    // Not zstd at all.
+    // Without a declared size: fewer pages than the header says, or bytes after the last page.
+    let mut one = record_head(2, 2);
+    one.extend(1u32.to_le_bytes());
+    one.extend([0u8; PAGE]);
+    assert!(matches!(
+        decompress(&compress_unsized(&one)),
+        Err(FrameError::RecordShort { pages: 2, .. })
+    ));
+    let mut long = record_head(1, 1);
+    long.extend(1u32.to_le_bytes());
+    long.extend([0u8; PAGE + 1]);
+    assert!(matches!(
+        decompress(&compress_unsized(&long)),
+        Err(FrameError::RecordLong { pages: 1, .. })
+    ));
+    assert!(matches!(
+        decompress(&compress_unsized(&[0u8; 5])),
+        Err(FrameError::RecordShort { pages: 0, .. })
+    ));
     assert!(matches!(
         decompress(b"not zstd"),
-        Err(FrameError::ContentSize { found: None })
+        Err(FrameError::Decompress(_))
+    ));
+}
+
+// A tiny frame that declares a huge record is read as a stream: nothing is sized from the
+// declaration, and it fails as soon as its bytes run out.
+#[test]
+fn a_huge_declared_size_fails_fast_with_bounded_memory() {
+    let pages = u32::MAX;
+    let declared = 8 + u64::from(pages) * (4 + PAGE as u64);
+    let mut z = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    z.include_contentsize(true).unwrap();
+    z.set_pledged_src_size(Some(declared)).unwrap();
+    z.write_all(&record_head(pages, pages)).unwrap();
+    z.write_all(&1u32.to_le_bytes()).unwrap();
+    z.flush().unwrap();
+    let tiny = z.get_ref().clone();
+    assert!(tiny.len() < 64);
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&tiny).unwrap(),
+        Some(declared)
+    );
+    let started = std::time::Instant::now();
+    let mut reader = RecordReader::new(&tiny).unwrap();
+    assert_eq!(reader.header().pages, pages);
+    let mut image = [0u8; PAGE];
+    assert!(matches!(
+        reader.next_page(&mut image),
+        Err(FrameError::RecordShort { pages: u32::MAX, expected }) if expected == declared
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+// The zstd frame carries a content checksum, so damage the frame checksum missed still fails.
+#[test]
+fn records_carry_a_content_checksum() {
+    let id = CommitId {
+        lineage: Lineage([1; 16]),
+        position: Position(1),
+    };
+    let record = CommitRecord {
+        db_pages_after: 1,
+        pages: vec![(1, page(3, [1; 8]))],
+    };
+    let Frame::Commit { mut compressed, .. } = decoded(&encode_commit(id, &record).unwrap()) else {
+        panic!("a commit")
+    };
+    // The frame header descriptor's checksum flag.
+    assert_eq!(compressed[4] & 0b100, 0b100);
+    let last = compressed.len() - 1;
+    compressed[last] ^= 1;
+    assert!(matches!(
+        decompress(&compressed),
+        Err(FrameError::Decompress(_))
+    ));
+}
+
+// A body above the reader's limit is an error as soon as its length is read, never Partial.
+#[test]
+fn a_body_above_the_limit_is_an_error() {
+    let claim = encode_claim(Epoch(1), Activation([0; 16]));
+    assert!(matches!(
+        super::decode(&claim, 10),
+        Err(FrameError::BodyTooLarge { len: 24, max: 10 })
+    ));
+    let mut head = b"USQ2\x02".to_vec();
+    head.extend(u32::MAX.to_le_bytes());
+    assert!(matches!(
+        decode(&head),
+        Err(FrameError::BodyTooLarge { len, max: MAX_BODY }) if len == u64::from(u32::MAX)
     ));
 }
 

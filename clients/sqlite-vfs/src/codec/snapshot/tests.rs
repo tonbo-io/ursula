@@ -94,6 +94,8 @@ fn the_image_is_read_from_its_current_position() {
 fn a_damaged_page_count_fails_without_allocating() {
     let (mut body, _) = body(&fields(), &image(3));
     body[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+    let crc = crc32c::crc32c(&body[..52]);
+    body[52..56].copy_from_slice(&crc.to_le_bytes());
     let (header, at) = read_header(&body).unwrap();
     assert_eq!(header.pages, u32::MAX);
     let mut out = Vec::new();
@@ -107,7 +109,10 @@ fn a_damaged_page_count_fails_without_allocating() {
 #[test]
 fn a_checksum_mismatch_is_an_error() {
     let (mut body, header) = body(&fields(), &image(3));
+    // The image checksum, with the header checksum fixed up to match.
     body[48] ^= 1;
+    let crc = crc32c::crc32c(&body[..52]);
+    body[52..56].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(
         read(&body),
         Err(SnapshotError::Checksum { expected, found }) if found == header.crc && expected != found
@@ -140,10 +145,11 @@ fn partial_pages_are_refused() {
     ));
 }
 
-/// An image that grows between `write_body`'s two reads.
+/// An image that changes between `write_body`'s two reads: it grows, or one byte changes.
 struct Growing {
     inner: Cursor<Vec<u8>>,
     rewound: bool,
+    grow: bool,
 }
 
 impl Read for Growing {
@@ -157,7 +163,11 @@ impl Seek for Growing {
         if matches!(pos, SeekFrom::Start(_)) && !self.rewound {
             self.rewound = true;
             let mut more = self.inner.get_ref().clone();
-            more.extend(image(1));
+            if self.grow {
+                more.extend(image(1));
+            } else {
+                more[100] ^= 1;
+            }
             *self.inner.get_mut() = more;
         }
         self.inner.seek(pos)
@@ -166,15 +176,18 @@ impl Seek for Growing {
 
 #[test]
 fn an_image_that_changes_between_reads_is_refused() {
-    let mut out = Vec::new();
-    let mut growing = Growing {
-        inner: Cursor::new(image(1)),
-        rewound: false,
-    };
-    assert!(matches!(
-        write_body(&fields(), &mut growing, &mut out),
-        Err(SnapshotError::ImageChanged)
-    ));
+    for grow in [true, false] {
+        let mut out = Vec::new();
+        let mut changing = Growing {
+            inner: Cursor::new(image(1)),
+            rewound: false,
+            grow,
+        };
+        assert!(matches!(
+            write_body(&fields(), &mut changing, &mut out),
+            Err(SnapshotError::ImageChanged)
+        ));
+    }
 }
 
 // A body of another format fails closed and names what it found.
@@ -188,4 +201,16 @@ fn another_format_is_refused_by_its_magic() {
         err.to_string()
             .starts_with("snapshot magic \"USS2\": this extension reads \"USS3\"")
     );
+}
+
+// The header verifies without the body: every damaged header bit is refused.
+#[test]
+fn every_header_bit_flip_is_refused() {
+    let (body, _) = body(&fields(), &image(1));
+    for bit in 0..HEADER * 8 {
+        let mut bad = body[..HEADER].to_vec();
+        bad[bit / 8] ^= 1 << (bit % 8);
+        assert!(read_header(&bad).is_err(), "bit {bit}");
+    }
+    read_header(&body[..HEADER]).unwrap();
 }

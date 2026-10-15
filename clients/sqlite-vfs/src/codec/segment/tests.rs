@@ -29,7 +29,7 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
     (
         (
             any::<[u8; 16]>(),
-            0u64..1 << 40,
+            1u64..1 << 40,
             option::of(any::<[u8; 16]>()),
             "[a-z0-9-]{0,12}",
             "/[a-z/]{0,20}",
@@ -40,14 +40,13 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
-            any::<u64>(),
-            any::<[u8; 16]>(),
+            option::of((any::<u64>(), any::<[u8; 16]>())),
         ),
     )
         .prop_map(
             |(
                 (lineage, first, supersedes, cluster_id, stream_path),
-                (incarnation, base, acked, acked_offset, log_bytes, epoch, activation),
+                (incarnation, base, acked, acked_offset, log_bytes, claim),
             )| SegmentHeader {
                 lineage: Lineage(lineage),
                 first_position: Position(first),
@@ -59,8 +58,7 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
                 acked: Position(acked),
                 acked_offset,
                 log_bytes,
-                claim_epoch: Epoch(epoch),
-                claim_activation: Activation(activation),
+                claim: claim.map(|(e, a)| (Epoch(e), Activation(a))),
             },
         )
 }
@@ -139,6 +137,8 @@ proptest! {
     }
 
     // A damaged bit anywhere in a record breaks the chain there: the prefix before it is the log.
+    // When a chain-valid record follows, it is damage inside the log, not a torn tail. The record
+    // after the damaged one verifies unless the damage hit the chain it is seeded by.
     #[test]
     fn a_chain_break_keeps_the_prefix_before_it(
         h in header(),
@@ -153,7 +153,13 @@ proptest! {
         bytes[bit / 8] ^= 1 << (bit % 8);
         let s = scan(&bytes).unwrap();
         prop_assert_eq!(&s.records[..], &records[..i]);
-        prop_assert_eq!(s.tail, Tail::Torn { at: start });
+        let in_chain = bit / 8 >= records[i].end - 4;
+        let followed = i + 2 < records.len() || (i + 1 < records.len() && !in_chain);
+        if followed {
+            prop_assert_eq!(s.tail, Tail::Damaged { at: start });
+        } else {
+            prop_assert_eq!(s.tail, Tail::Torn { at: start });
+        }
     }
 
     // A record whose chain verifies but whose position skips is a gap, never a torn tail.
@@ -201,8 +207,7 @@ fn sample() -> SegmentHeader {
         acked: Position(9),
         acked_offset: 42,
         log_bytes: 0,
-        claim_epoch: Epoch(3),
-        claim_activation: Activation([2; 16]),
+        claim: Some((Epoch(3), Activation([2; 16]))),
     }
 }
 
@@ -273,4 +278,72 @@ fn long_strings_are_refused() {
             len: 70_000
         })
     ));
+}
+
+// Every damaged bit of a header is refused, whatever field it lands in.
+#[test]
+fn every_header_bit_flip_is_refused() {
+    let mut h = sample();
+    h.supersedes = Some(Lineage([6; 16]));
+    for h in [sample(), h] {
+        let (bytes, _) = encode_header(&h).unwrap();
+        for bit in 0..bytes.len() * 8 {
+            let mut bad = bytes.clone();
+            bad[bit / 8] ^= 1 << (bit % 8);
+            assert!(scan(&bad).is_err(), "bit {bit}");
+        }
+    }
+}
+
+#[test]
+fn positions_start_at_one() {
+    let mut h = sample();
+    h.first_position = Position(0);
+    assert!(matches!(
+        encode_header(&h),
+        Err(SegmentError::FirstPositionZero)
+    ));
+    let (mut bytes, _) = encode_header(&sample()).unwrap();
+    bytes[24..32].copy_from_slice(&0u64.to_le_bytes());
+    assert!(matches!(scan(&bytes), Err(SegmentError::FirstPositionZero)));
+}
+
+#[test]
+fn a_record_after_the_last_position_overflows() {
+    let mut h = sample();
+    h.first_position = Position(u64::MAX);
+    let (mut bytes, seed) = encode_header(&h).unwrap();
+    let base = RecordBody::Base {
+        position: Position(1),
+    };
+    let (first, chain) = encode_record(seed, Position(u64::MAX), &base).unwrap();
+    bytes.extend(first);
+    let one = scan(&bytes).unwrap();
+    assert_eq!(one.records.len(), 1);
+    assert_eq!(one.tail, Tail::Clean);
+    bytes.extend(encode_record(chain, Position(0), &base).unwrap().0);
+    assert!(matches!(
+        scan(&bytes),
+        Err(SegmentError::PositionOverflow {
+            after: Position(u64::MAX)
+        })
+    ));
+}
+
+// A preallocated or zero-filled tail is a torn tail: zeros never verify as a record.
+#[test]
+fn a_zero_filled_tail_is_torn() {
+    let (mut bytes, seed) = encode_header(&sample()).unwrap();
+    bytes.extend(
+        encode_record(seed, Position(10), &RecordBody::Base {
+            position: Position(9),
+        })
+        .unwrap()
+        .0,
+    );
+    let at = bytes.len();
+    bytes.extend([0u8; 4096]);
+    let s = scan(&bytes).unwrap();
+    assert_eq!(s.records.len(), 1);
+    assert_eq!(s.tail, Tail::Torn { at });
 }

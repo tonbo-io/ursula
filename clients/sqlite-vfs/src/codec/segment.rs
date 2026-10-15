@@ -5,12 +5,13 @@
 //! header  = "USL1" | u32 version=1 | [16] lineage | u64 first_position | opt supersedes
 //!         | str cluster_id | str stream_path | u64 incarnation
 //!         | u64 base | u64 acked | u64 acked_offset | u64 log_bytes      carried over
-//!         | u64 claim_epoch | [16] claim_activation                     the latest CLAIM
+//!         | claim                                                       the latest CLAIM
 //!         | u32 crc32c(header)
 //! record  = u32 len | u8 kind | u64 position | payload (len bytes) | u32 chain
 //! chain   = crc32c(le32 previous chain | kind | le64 position | payload), seeded by the header crc
 //! str     = u16 len | utf-8
 //! opt     = u8 0 | u8 1 | [16]
+//! claim   = u8 0 | u8 1 | u64 epoch | [16] activation
 //! ```
 //!
 //! | kind | payload |
@@ -20,8 +21,10 @@
 //! | 3 ACK | `u64 acked`, `u64 acked_offset`, `u64 log_bytes` |
 //! | 4 BASE | `u64 position` |
 //!
-//! The valid log is the longest prefix whose chain verifies and whose positions grow by one from
-//! the header's `first_position`. [`scan`] returns that prefix and says how the rest ends.
+//! Positions start at 1, so a `base` or `acked` of 0 means nothing yet. The valid log is the
+//! longest prefix whose chain verifies and whose positions grow by one from the header's
+//! `first_position`. [`scan`] returns that prefix and says how the rest ends: a torn write at the
+//! tail, or damage that a chain-valid record follows.
 
 use super::Take;
 use crate::ids::Activation;
@@ -47,7 +50,7 @@ const RECORD_TAIL: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentHeader {
     pub lineage: Lineage,
-    /// The position of the segment's first record.
+    /// The position of the segment's first record, at least 1.
     pub first_position: Position,
     /// The generation this one replaces, named by the first segment of a new generation.
     pub supersedes: Option<Lineage>,
@@ -61,8 +64,8 @@ pub struct SegmentHeader {
     pub acked_offset: u64,
     /// Frame bytes logged since the latest snapshot.
     pub log_bytes: u64,
-    pub claim_epoch: Epoch,
-    pub claim_activation: Activation,
+    /// The latest CLAIM, if this generation made one.
+    pub claim: Option<(Epoch, Activation)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,8 +103,12 @@ pub struct Record {
 pub enum Tail {
     /// The valid prefix is the whole segment.
     Clean,
-    /// An incomplete record or one whose chain does not verify: a torn write, cut at open.
+    /// An incomplete record or one whose chain does not verify, with no chain-valid record after
+    /// it: a torn write, cut at open.
     Torn { at: usize },
+    /// A record whose chain does not verify, followed by one whose chain does: damage inside the
+    /// log, which open never cuts silently, since its pages may already be in the db file.
+    Damaged { at: usize },
     /// A record whose chain verifies but whose position does not follow.
     Gap {
         at: usize,
@@ -139,6 +146,10 @@ pub enum SegmentError {
     HeaderChecksum { expected: u32, found: u32 },
     #[error("segment header: supersedes tag {tag}")]
     SupersedesTag { tag: u8 },
+    #[error("segment header: claim tag {tag}")]
+    ClaimTag { tag: u8 },
+    #[error("segment header: first position 0, positions start at 1")]
+    FirstPositionZero,
     #[error("segment header: {field} is not UTF-8: {source}")]
     Utf8 {
         field: &'static str,
@@ -165,6 +176,9 @@ fn put_str(out: &mut Vec<u8>, field: &'static str, s: &str) -> Result<(), Segmen
 
 /// The header's bytes and its checksum, which seeds the first record's chain.
 pub fn encode_header(h: &SegmentHeader) -> Result<(Vec<u8>, u32), SegmentError> {
+    if h.first_position.0 == 0 {
+        return Err(SegmentError::FirstPositionZero);
+    }
     let mut out = Vec::with_capacity(
         160usize
             .saturating_add(h.cluster_id.len())
@@ -189,11 +203,17 @@ pub fn encode_header(h: &SegmentHeader) -> Result<(Vec<u8>, u32), SegmentError> 
         h.acked.0,
         h.acked_offset,
         h.log_bytes,
-        h.claim_epoch.0,
     ] {
         out.extend_from_slice(&n.to_le_bytes());
     }
-    out.extend_from_slice(&h.claim_activation.0);
+    match h.claim {
+        None => out.push(0),
+        Some((epoch, activation)) => {
+            out.push(1);
+            out.extend_from_slice(&epoch.0.to_le_bytes());
+            out.extend_from_slice(&activation.0);
+        }
+    }
     let crc = crc32c::crc32c(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     Ok((out, crc))
@@ -289,6 +309,9 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
     }
     let lineage = Lineage(t.array().ok_or_else(truncated)?);
     let first_position = Position(t.u64().ok_or_else(truncated)?);
+    if first_position.0 == 0 {
+        return Err(SegmentError::FirstPositionZero);
+    }
     let supersedes = match t.u8().ok_or_else(truncated)? {
         0 => None,
         1 => Some(Lineage(t.array().ok_or_else(truncated)?)),
@@ -297,9 +320,15 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
     let cluster_id = take_str(&mut t, "cluster_id", len)?;
     let stream_path = take_str(&mut t, "stream_path", len)?;
     let mut n = || t.u64().ok_or_else(truncated);
-    let (incarnation, base, acked, acked_offset, log_bytes, claim_epoch) =
-        (n()?, n()?, n()?, n()?, n()?, n()?);
-    let claim_activation = Activation(t.array().ok_or_else(truncated)?);
+    let (incarnation, base, acked, acked_offset, log_bytes) = (n()?, n()?, n()?, n()?, n()?);
+    let claim = match t.u8().ok_or_else(truncated)? {
+        0 => None,
+        1 => Some((
+            Epoch(t.u64().ok_or_else(truncated)?),
+            Activation(t.array().ok_or_else(truncated)?),
+        )),
+        tag => return Err(SegmentError::ClaimTag { tag }),
+    };
     let header_end = len.saturating_sub(t.rest_len());
     let found = t.u32().ok_or_else(truncated)?;
     let expected = crc32c::crc32c(bytes.get(..header_end).unwrap_or_default());
@@ -317,8 +346,7 @@ fn header(bytes: &[u8]) -> Result<(SegmentHeader, u32, usize), SegmentError> {
         acked: Position(acked),
         acked_offset,
         log_bytes,
-        claim_epoch: Epoch(claim_epoch),
-        claim_activation,
+        claim,
     };
     Ok((header, found, header_end.saturating_add(4)))
 }
@@ -348,6 +376,47 @@ fn body_of(kind: u8, payload: &[u8]) -> Option<RecordBody> {
     t.rest().is_empty().then_some(body)
 }
 
+/// The record at the start of `bytes`, if it is whole: its kind, position, payload, stored chain
+/// and length.
+fn record_at(bytes: &[u8]) -> Option<(u8, Position, &[u8], u32, usize)> {
+    let mut t = Take(bytes);
+    let len = t.u32()?;
+    let kind = t.u8()?;
+    let position = Position(t.u64()?);
+    let payload = t.bytes(len as usize)?;
+    let chain = t.u32()?;
+    Some((
+        kind,
+        position,
+        payload,
+        chain,
+        bytes.len().saturating_sub(t.rest_len()),
+    ))
+}
+
+/// Whether a record whose chain verifies against the 4 bytes before it, at a position from `from`
+/// on, starts anywhere after byte `at`.
+fn chained_after(bytes: &[u8], at: usize, from: Option<Position>) -> bool {
+    let start = at.saturating_add(1).max(RECORD_TAIL);
+    (start..bytes.len()).any(|p| {
+        let Some(before) = p.checked_sub(RECORD_TAIL) else {
+            return false;
+        };
+        let (Some(previous), Some(rest)) = (
+            bytes
+                .get(before..p)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok()),
+            bytes.get(p..),
+        ) else {
+            return false;
+        };
+        record_at(rest).is_some_and(|(kind, position, payload, found, _)| {
+            from.is_none_or(|f| position >= f)
+                && chain(u32::from_le_bytes(previous), kind, position, payload) == found
+        })
+    })
+}
+
 /// The segment's header and its longest valid prefix of records. A header that is cut short,
 /// damaged or of another format is an error: the records cannot be trusted without it.
 pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
@@ -361,21 +430,22 @@ pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
         if t.rest_len() == 0 {
             break Tail::Clean;
         }
-        let whole = (|| {
-            let len = t.u32()?;
-            let kind = t.u8()?;
-            let position = Position(t.u64()?);
-            let payload = t.bytes(len as usize)?;
-            let chain = t.u32()?;
-            Some((kind, position, payload, chain))
-        })();
-        let Some((kind, position, payload, found)) = whole else {
-            break Tail::Torn { at };
+        let broken = || {
+            if chained_after(bytes, at, expected) {
+                Tail::Damaged { at }
+            } else {
+                Tail::Torn { at }
+            }
+        };
+        let rest = t.rest_slice();
+        let Some((kind, position, payload, found, size)) = record_at(rest) else {
+            break broken();
         };
         let chain = chain(previous, kind, position, payload);
         if chain != found {
-            break Tail::Torn { at };
+            break broken();
         }
+        t = Take(rest.get(size..).unwrap_or_default());
         let Some(want) = expected else {
             let after = records
                 .last()

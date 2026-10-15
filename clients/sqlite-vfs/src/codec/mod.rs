@@ -1,5 +1,8 @@
 //! The 0.8 byte formats. All integers are little-endian.
 //!
+//! The formats are fixed within 0.8.x and carry no extension fields. Unknown kinds, versions and
+//! magics are refused by design, never skipped, and a format change needs a new minor version.
+//!
 //! Module map:
 //!
 //! - [`frame`]: `USQ2` stream frames (claims, commits, parts of a commit) and commit records.
@@ -52,6 +55,10 @@ impl<'a> Take<'a> {
 
     fn rest_len(&self) -> usize {
         self.0.len()
+    }
+
+    fn rest_slice(&self) -> &'a [u8] {
+        self.0
     }
 
     fn rest(self) -> &'a [u8] {
