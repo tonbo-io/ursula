@@ -69,6 +69,11 @@ enum Command {
         open: OpenId,
         spec: OpenSpec,
     },
+    OpenAfter {
+        open: OpenId,
+        spec: OpenSpec,
+        after: BindingId,
+    },
     Logged {
         binding: BindingId,
         rec: Pending,
@@ -287,6 +292,19 @@ impl Driver {
         let open = OpenId(self.id());
         self.shared.lock().pending.insert(open);
         self.command(Command::Open { open, spec })?;
+        Ok(open)
+    }
+
+    /// Starts an open once binding `after`, which `ursula_open` gave up for it, retired
+    /// ([`Core::open_after`]); [`Driver::wait_open`] waits for its outcome.
+    pub(crate) fn open_after(
+        &self,
+        spec: OpenSpec,
+        after: BindingId,
+    ) -> Result<OpenId, DriverGone> {
+        let open = OpenId(self.id());
+        self.shared.lock().pending.insert(open);
+        self.command(Command::OpenAfter { open, spec, after })?;
         Ok(open)
     }
 
@@ -717,6 +735,7 @@ fn publish(core: &mut Core, cursor: &mut u64, shared: &Shared) -> Vec<BindingId>
 fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {
     match command {
         Command::Open { open, spec } => core.open(open, spec, now_ms),
+        Command::OpenAfter { open, spec, after } => core.open_after(open, spec, after, now_ms),
         Command::Logged { binding, rec } => core.logged(binding, rec, now_ms),
         Command::Sync {
             ticket,

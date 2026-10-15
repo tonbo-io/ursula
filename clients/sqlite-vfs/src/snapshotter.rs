@@ -72,6 +72,7 @@ use crate::codec::segment::RecordBody;
 use crate::codec::snapshot::SnapshotError;
 use crate::codec::snapshot::SnapshotFields;
 use crate::codec::snapshot::write_body;
+use crate::config::SnapshotHold;
 use crate::db::Binding;
 use crate::db::LogRefused;
 use crate::db::Window;
@@ -668,7 +669,9 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
     }
     // While the private connection is open the binding cannot retire: the log is still its own.
     base(b, k)?;
+    let hold = SnapshotHold::begin();
     drop(conn);
+    drop(hold);
     let Some(receipt) = snapper.wait_receipt(k) else {
         return Ok(Outcome::Skipped);
     };

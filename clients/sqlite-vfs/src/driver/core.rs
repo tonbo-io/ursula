@@ -60,6 +60,7 @@ use super::EventLog;
 use super::HttpIo;
 use super::Io;
 use super::IoId;
+use super::Kept;
 use super::Life;
 use super::LogPoisoned;
 use super::OpenId;
@@ -160,6 +161,19 @@ impl OpenSlot {
     }
 }
 
+/// An open of a stream under another cache root than its binding's, which `ursula_open` gave up
+/// ([`BindingHandle::give_up`]): it starts once that binding drained and retired, or fails
+/// `in_use` at its deadline.
+#[derive(Debug)]
+struct Deferred {
+    spec: OpenSpec,
+    /// The binding given up.
+    after: BindingId,
+    /// Its cache root.
+    bound: PathBuf,
+    deadline_ms: u64,
+}
+
 /// An opening binding's generation.
 #[derive(Debug)]
 enum Local {
@@ -202,6 +216,8 @@ struct Acks {
 struct Binding {
     url: Arc<str>,
     name: CanonicalPath,
+    /// The cache root the open named.
+    dir: PathBuf,
     replicator: Replicator,
     /// The replicator's timer.
     wake_at: Option<u64>,
@@ -225,8 +241,8 @@ struct Binding {
     /// `synced()` calls whose target is past `last_commit`, waiting for its `Logged`.
     held: Vec<(Ticket, Position)>,
     max_pending_bytes: u64,
-    /// Since when `ursula_open` handed the binding out with no connection open: it retires
-    /// [`UNCONNECTED_MS`] later if none opened meanwhile.
+    /// Since when `ursula_open` handed the binding out ([`Life::HandedOut`]): it retires
+    /// [`UNCONNECTED_MS`] later if no connection of the host opened it meanwhile.
     /// With the hand-outs the handle had counted then.
     unconnected_since: Option<(u64, u64)>,
     /// The open failed while a disk job held the generation: the binding stays, its root locked
@@ -342,6 +358,8 @@ pub(crate) struct Core {
     events: EventLog,
     /// Resolved opens not yet taken.
     opened: BTreeMap<OpenId, Result<Bound, Arc<OpenError>>>,
+    /// Opens waiting for a binding of their stream under another cache root to retire.
+    deferred: BTreeMap<OpenId, Deferred>,
     /// The roots this core's opens locked, by directory: a root stays locked while a binding, an
     /// open or a reset binding's connections hold it. An open of the stream shares it only when
     /// nothing but reset bindings' connections hold it, and otherwise locks it anew (`in_use`).
@@ -362,6 +380,7 @@ impl Core {
             ios: BTreeMap::new(),
             events: EventLog::default(),
             opened: BTreeMap::new(),
+            deferred: BTreeMap::new(),
             roots: HashMap::new(),
             #[cfg(test)]
             fail_next_claim: false,
@@ -412,7 +431,76 @@ impl Core {
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         let opens = self.opens.values().map(OpenSlot::deadline);
         let bindings = self.bindings.values().map(Binding::deadline);
-        opens.chain(bindings).flatten().min()
+        // A deferred open whose binding retired starts at once.
+        let deferred = self.deferred.values().map(|d| {
+            Some(if self.bindings.contains_key(&d.after) {
+                d.deadline_ms
+            } else {
+                0
+            })
+        });
+        opens.chain(bindings).chain(deferred).flatten().min()
+    }
+
+    /// Starts open `open` once binding `after`, of the same stream under another cache root and
+    /// given up ([`BindingHandle::give_up`]), drained and retired: at once if it is gone. The wait
+    /// counts toward the open's time.
+    pub(crate) fn open_after(
+        &mut self,
+        open: OpenId,
+        spec: OpenSpec,
+        after: BindingId,
+        now_ms: u64,
+    ) -> Vec<Io> {
+        let Some(bound) = self
+            .bindings
+            .get(&after)
+            .and_then(Binding::handle)
+            .map(|h| h.dir.clone())
+        else {
+            return self.open(open, spec, now_ms);
+        };
+        let deadline_ms = now_ms.saturating_add(spec.timeout_ms);
+        self.deferred.insert(open, Deferred {
+            spec,
+            after,
+            bound,
+            deadline_ms,
+        });
+        self.settle(after, now_ms);
+        let mut ios = Vec::new();
+        self.start_deferred(now_ms, &mut ios);
+        ios
+    }
+
+    /// Starts the deferred opens whose binding retired, and fails those past their deadline.
+    fn start_deferred(&mut self, now_ms: u64, ios: &mut Vec<Io>) {
+        let opens: Vec<OpenId> = self.deferred.keys().copied().collect();
+        for open in opens {
+            let Some(d) = self.deferred.remove(&open) else {
+                continue;
+            };
+            if !self.bindings.contains_key(&d.after) {
+                let Deferred {
+                    mut spec,
+                    deadline_ms,
+                    ..
+                } = d;
+                spec.timeout_ms = deadline_ms.saturating_sub(now_ms);
+                ios.extend(self.open(open, spec, now_ms));
+            } else if now_ms >= d.deadline_ms {
+                self.opened(
+                    open,
+                    Err(OpenError::BoundElsewhere {
+                        bound: d.bound,
+                        requested: d.spec.dir,
+                        kept: Kept::Draining,
+                    }),
+                );
+            } else {
+                self.deferred.insert(open, d);
+            }
+        }
     }
 
     /// Starts open `open` (design §5.5). Its outcome comes as [`DriverEvent::Opened`].
@@ -598,6 +686,7 @@ impl Core {
         self.bindings.insert(binding, Binding {
             url: Arc::from(spec.url.as_str()),
             name,
+            dir: spec.dir.clone(),
             replicator,
             wake_at: None,
             stage: Stage::Opening {
@@ -1099,7 +1188,7 @@ impl Core {
                 b.replicator,
                 Replicator::Streaming { .. } | Replicator::Activating { .. }
             );
-        if drained && handle.life() == Life::Retiring && handle.try_retire() {
+        if drained && handle.leaving() && handle.try_retire() {
             self.retire_now(binding, now_ms);
         }
     }
@@ -1154,6 +1243,7 @@ impl Core {
             acked: ctx.map_or(Position(0), |c| c.acked),
             attach: b.attach,
             provisional,
+            dir: b.dir.clone(),
         };
         let handle = Arc::new(BindingHandle::new(bind, root));
         handle.record_commit(b.last_commit);
@@ -1348,6 +1438,7 @@ impl Core {
     /// Runs what is due at `now_ms`: resends, deadlines, ACK flushes, replicator timers.
     pub(crate) fn tick(&mut self, now_ms: u64) -> Vec<Io> {
         let mut ios = Vec::new();
+        self.start_deferred(now_ms, &mut ios);
         let opens: Vec<OpenId> = self.opens.keys().copied().collect();
         for open in opens {
             let Some(slot) = self.opens.remove(&open) else {
@@ -1394,11 +1485,11 @@ impl Core {
             return;
         };
         if let (Some((since, handouts)), Stage::Bound { handle }) = (b.unconnected_since, &b.stage)
-            && (handle.connections() > 0 || now_ms >= since.saturating_add(UNCONNECTED_MS))
+            && (!handle.handed_out() || now_ms >= since.saturating_add(UNCONNECTED_MS))
         {
             b.unconnected_since = None;
             // Leaves alone a binding a connection opened, or that `ursula_open` handed out again
-            // since (its own timer runs).
+            // since (its own timer runs). One the host still holds stays live.
             handle.idle_retire(handouts);
             self.settle(binding, now_ms);
             let Some(b) = self.bindings.get_mut(&binding) else {
@@ -1598,6 +1689,10 @@ impl Core {
     /// `cancelled` when it met none (once its disk job, if any, returned), and a result nobody took
     /// goes, its binding retiring.
     pub(crate) fn cancel(&mut self, open: OpenId, now_ms: u64) -> Vec<Io> {
+        if self.deferred.remove(&open).is_some() {
+            self.opened(open, Err(OpenError::Cancelled));
+            return Vec::new();
+        }
         if let Some(result) = self.opened.remove(&open) {
             if let Ok(bound) = result {
                 let binding = bound.binding;

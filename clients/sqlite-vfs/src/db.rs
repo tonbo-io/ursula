@@ -9,10 +9,18 @@
 //! and retires, unless an open takes it back first ([`BindingHandle::revive`]). A reset binding
 //! leaves the registry at the next open of its stream, which binds anew beside the connections
 //! still open on it: they keep their generation's files, and the new binding works on a copy.
+//!
+//! The path an open hands out stays openable until a connection opens it, or until it waited for
+//! one too long ([`BindingHandle::revive`]). A stream binds under one cache root at a time in the
+//! process: an open under another root gives the binding up when nothing of the host holds it
+//! ([`BindingHandle::give_up`]), waits for it to retire and binds anew, and is refused `in_use`
+//! otherwise.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Component;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -27,6 +35,9 @@ use crate::capture::WriteTxn;
 use crate::driver::BindingHandle;
 use crate::driver::BindingId;
 use crate::driver::Bound;
+use crate::driver::Connected;
+use crate::driver::Holder;
+use crate::driver::Kept;
 use crate::driver::LogPoisoned;
 use crate::driver::OpenId;
 use crate::driver::runtime::driver;
@@ -55,6 +66,8 @@ pub(crate) struct Binding {
     /// The db file, as SQLite names it.
     pub(crate) path: String,
     pub(crate) url: String,
+    /// The cache root the binding's files are under.
+    dir: CacheDir,
     state: Mutex<Commit>,
     /// The crc32c of every WAL page this process wrote in the WAL's current generation, by file
     /// offset: a page read back with other bytes was lost on its way to the disk. Under a lock of
@@ -182,20 +195,23 @@ impl Binding {
         self.notify_decided();
     }
 
-    /// A main db handle opened: a retiring binding is taken back. False once it retired.
-    pub(crate) fn connect(&self) -> bool {
-        self.handle.connect()
+    /// A main db handle of `holder` opens ([`BindingHandle::connect`]). `None` once the binding
+    /// retired or was given up.
+    pub(crate) fn connect(&self, holder: Holder) -> Option<Connected> {
+        self.handle.connect(holder)
     }
 
-    /// The extension's private connection opened: counted only beside a connection of the host,
-    /// so it never takes a retiring binding back. False otherwise.
-    pub(crate) fn connect_private(&self) -> bool {
-        self.handle.connect_beside()
+    /// The open of a main db handle failed after [`Binding::connect`]: undone exactly.
+    pub(crate) fn unconnect(&self, connected: Connected) {
+        if self.handle.unconnect(connected) && driver().retire(self.id).is_err() {
+            log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
+        }
     }
 
-    /// A main db handle closed: after the last one, the binding drains and retires.
-    pub(crate) fn disconnect(&self) {
-        if self.handle.disconnect() && driver().retire(self.id).is_err() {
+    /// A main db handle of `holder` closed: after the last one, the binding drains and retires,
+    /// unless `ursula_open` handed it out since a connection last opened it.
+    pub(crate) fn disconnect(&self, holder: Holder) {
+        if self.handle.disconnect(holder) && driver().retire(self.id).is_err() {
             log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
         }
     }
@@ -219,6 +235,8 @@ struct OpenEntry {
     open: OpenId,
     /// The URL it was asked with.
     url: String,
+    /// The cache root it opens under.
+    dir: CacheDir,
     /// Blocking `ursula_open` calls waiting for it now.
     waiting: usize,
     /// A call that returned at once asked for it: it comes back for the result, so no blocking
@@ -294,6 +312,13 @@ pub(crate) fn open(
     if let Some(token) = &options.token {
         crate::auth::set_token(Some(token));
     }
+    let open_ms = if timeout_ms == 0 {
+        options.timeout_ms.unwrap_or(DEFAULT_OPEN_MS)
+    } else {
+        timeout_ms
+    };
+    // Resolved before the registry's lock is taken.
+    let requested = CacheDir::new(&dir.map_or_else(default_dir, PathBuf::from));
     loop {
         let open = {
             let mut reg = registry();
@@ -313,46 +338,32 @@ pub(crate) fn open(
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
-            if let Some(b) = reg.names.get(name.as_str()).cloned() {
-                if b.reset_kind().is_none() && b.handle.revive() {
+            match claim(&mut reg, name.as_str(), &requested, timeout_ms > 0)? {
+                Claim::Bound(b) => {
                     handed_out(&b);
                     return Ok(Opened::Bound(b));
                 }
-                // Reset, or retired: a new open. Beside a reset binding's open connections it shares
-                // their root and builds from a copy of their generation (design §5.6).
-                reg.names.remove(name.as_str());
-                reg.paths.remove(&b.path);
-            }
-            let blocking = timeout_ms > 0;
-            match reg.opens.get_mut(name.as_str()) {
-                Some(entry) => {
-                    if blocking {
-                        entry.waiting = entry.waiting.saturating_add(1);
-                    } else {
-                        entry.returned = true;
-                    }
-                    entry.open
-                }
-                None => {
+                Claim::Join(open) => open,
+                Claim::Start { after } => {
                     let spec = OpenSpec {
                         url: url.to_owned(),
-                        dir: dir.map_or_else(default_dir, PathBuf::from),
+                        dir: requested.path.clone(),
                         activation: options.activation.unwrap_or_else(process_activation),
                         max_pending_bytes: options.max_pending_bytes,
                         max_request_bytes: crate::config::max_request_bytes(),
                         recreate: options.recreate,
-                        timeout_ms: if timeout_ms == 0 {
-                            options.timeout_ms.unwrap_or(DEFAULT_OPEN_MS)
-                        } else {
-                            timeout_ms
-                        },
+                        timeout_ms: open_ms,
                     };
-                    let open = driver().open(spec)?;
+                    let open = match after {
+                        Some(after) => driver().open_after(spec, after)?,
+                        None => driver().open(spec)?,
+                    };
                     reg.opens.insert(name.as_str().to_owned(), OpenEntry {
                         open,
                         url: url.to_owned(),
-                        waiting: usize::from(blocking),
-                        returned: !blocking,
+                        dir: requested.clone(),
+                        waiting: usize::from(timeout_ms > 0),
+                        returned: timeout_ms == 0,
                     });
                     open
                 }
@@ -363,6 +374,105 @@ pub(crate) fn open(
         }
         // Another caller took the open's result: its registration, or a new open, is next.
     }
+}
+
+/// Where `ursula_open` of a stream goes.
+#[derive(Debug)]
+enum Claim {
+    /// Its binding, handed out again.
+    Bound(Arc<Binding>),
+    /// The open of it in progress.
+    Join(OpenId),
+    /// A new open, once the binding given up for it (`after`) retired.
+    Start { after: Option<BindingId> },
+}
+
+/// Decides, under the registry's lock, where an open of stream `name` under the cache root
+/// `requested` goes (a `blocking` call waits for an open in progress, another comes back for it).
+/// A stream binds under one cache root at a time: its binding under another root is given up when
+/// nothing of the host holds it ([`BindingHandle::give_up`]) and leaves the registry, the new open
+/// starting once it retired, and otherwise the open is refused, as one beside an open in progress
+/// under another root is. A reset or retired binding leaves the registry for a new open, which
+/// beside a reset binding's open connections shares their root and builds from a copy of their
+/// generation (design §5.6).
+fn claim(
+    reg: &mut Registry,
+    name: &str,
+    requested: &CacheDir,
+    blocking: bool,
+) -> Result<Claim, Error> {
+    let mut after = None;
+    if let Some(b) = reg.names.get(name).cloned() {
+        if b.reset_kind().is_none() {
+            if !b.dir.same(requested) {
+                b.handle
+                    .give_up()
+                    .map_err(|kept| elsewhere(&b.dir, requested, kept))?;
+                after = Some(b.id);
+            } else if b.handle.revive() {
+                return Ok(Claim::Bound(b));
+            }
+        }
+        reg.names.remove(name);
+        reg.paths.remove(&b.path);
+    }
+    match reg.opens.get_mut(name) {
+        Some(entry) if !entry.dir.same(requested) => {
+            Err(elsewhere(&entry.dir, requested, Kept::Opening))
+        }
+        Some(entry) => {
+            if blocking {
+                entry.waiting = entry.waiting.saturating_add(1);
+            } else {
+                entry.returned = true;
+            }
+            Ok(Claim::Join(entry.open))
+        }
+        None => Ok(Claim::Start { after }),
+    }
+}
+
+/// A cache root, absolute and lexically normal (`.` and `..` resolved), and the directory it
+/// resolves to when it exists.
+#[derive(Debug, Clone)]
+struct CacheDir {
+    path: PathBuf,
+    resolved: Option<PathBuf>,
+}
+
+impl CacheDir {
+    fn new(path: &Path) -> Self {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_no_cwd| path.to_owned());
+        let mut normal = PathBuf::new();
+        for part in absolute.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normal.pop();
+                }
+                other => normal.push(other),
+            }
+        }
+        let resolved = std::fs::canonicalize(&normal).ok();
+        Self {
+            path: normal,
+            resolved,
+        }
+    }
+
+    /// Whether `self` and `other` are one directory: the same path, or two that resolve to one.
+    fn same(&self, other: &CacheDir) -> bool {
+        self.path == other.path || self.resolved.is_some() && self.resolved == other.resolved
+    }
+}
+
+/// The open of a stream under `requested` while it is open under `bound` in this process.
+fn elsewhere(bound: &CacheDir, requested: &CacheDir, kept: Kept) -> Error {
+    Error::Open(Arc::new(crate::open::OpenError::BoundElsewhere {
+        bound: bound.path.clone(),
+        requested: requested.path.clone(),
+        kept,
+    }))
 }
 
 /// How much longer than the open's own deadline `ursula_open` waits, so the driver's failure (the
@@ -435,11 +545,13 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     // Every commit the log holds at bind is published: `confirmed` starts at the last one, as
     // `logged` does, not at the log's last record (an ACK, a CLAIM or a BASE may follow it).
     let at_bind = handle.last_commit();
+    let dir = CacheDir::new(&handle.dir);
     let b = Arc::new(Binding {
         id: binding,
         handle: Arc::clone(&handle),
         path: path.clone(),
         url,
+        dir,
         state: Mutex::new(Commit {
             confirmed: at_bind,
             based: at_bind,
@@ -572,6 +684,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
             acked: Position(0),
             attach: crate::driver::Attach::Resumed,
             provisional: false,
+            dir: dir.to_owned(),
         },
         Arc::new(root),
     ));
@@ -588,6 +701,7 @@ pub(crate) fn connection_for_tests(
 ) -> Binding {
     Binding {
         id,
+        dir: CacheDir::new(&handle.dir),
         handle,
         path,
         url: "https://h/v1/stream/db".into(),
@@ -614,8 +728,127 @@ pub(crate) fn registered_for_tests(b: &Arc<Binding>) -> impl Drop {
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Arc;
+
+    use super::CacheDir;
+    use super::Claim;
     use super::Commit;
+    use super::OpenEntry;
+    use super::Registry;
+    use super::claim;
     use super::default_dir;
+    use super::for_tests;
+    use crate::driver::Holder;
+    use crate::driver::Kept;
+    use crate::driver::Life;
+    use crate::driver::OpenId;
+    use crate::error::Action;
+    use crate::error::Error;
+    use crate::error::ErrorKind;
+    use crate::open::OpenError;
+    use crate::testdir::TempDir;
+
+    // `ursula_open` takes two spellings of one directory for one cache root, existing or not, and
+    // another directory for another.
+    #[test]
+    fn a_cache_dir_is_one_by_its_path_or_where_it_resolves() {
+        let dir = TempDir::new("db-cache-dir");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let bound = CacheDir::new(&root);
+        assert!(bound.same(&CacheDir::new(&root)));
+        assert!(bound.same(&CacheDir::new(&link)));
+        assert!(bound.same(&CacheDir::new(&dir.path().join(".").join("root"))));
+        assert!(!bound.same(&CacheDir::new(dir.path())));
+        let missing = CacheDir::new(&dir.path().join("missing"));
+        assert!(!bound.same(&missing));
+        assert!(missing.same(&CacheDir::new(
+            &dir.path().join("x").join("..").join(".").join("missing")
+        )));
+        assert!(missing.path.is_absolute());
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            CacheDir::new(std::path::Path::new("./a/../b")).path,
+            cwd.join("b")
+        );
+    }
+
+    /// The open error `e` is, with its kind's action.
+    fn kept(e: &Error) -> (Kept, ErrorKind, Action) {
+        let Error::Open(open) = e else {
+            panic!("{e}");
+        };
+        let OpenError::BoundElsewhere { kept, .. } = **open else {
+            panic!("{e}");
+        };
+        (kept, e.kind(), e.kind().action())
+    }
+
+    // The cache-root rule: under its own root the binding is handed out again; under another one it
+    // is refused while the host holds it (`bound_elsewhere`, fixed by the caller), and otherwise
+    // given up and dropped from the registry for a new open that starts after it. An open in
+    // progress is joined under its own root and refused under another.
+    #[test]
+    fn an_open_under_another_cache_root_takes_only_a_binding_the_host_left() {
+        let first = TempDir::new("db-claim-first");
+        let second = TempDir::new("db-claim-second");
+        let b = for_tests(first.path());
+        let name = b.handle.name.as_str().to_owned();
+        let mut reg = Registry::default();
+        reg.names.insert(name.clone(), Arc::clone(&b));
+        reg.paths.insert(b.path.clone(), Arc::clone(&b));
+        let here = CacheDir::new(first.path());
+        let there = CacheDir::new(second.path());
+        // Handed out, not connected yet.
+        let e = claim(&mut reg, &name, &there, true).unwrap_err();
+        assert_eq!(
+            kept(&e),
+            (Kept::HandedOut, ErrorKind::BoundElsewhere, Action::Fix)
+        );
+        assert!(e.to_string().contains(&format!(
+            "bound_elsewhere: the stream is open in this process under {}, not {}",
+            here.path.display(),
+            there.path.display()
+        )));
+        // A connection opens: refused; under its own root it is handed out again.
+        assert!(b.handle.connect(Holder::Host).is_some());
+        let e = claim(&mut reg, &name, &there, true).unwrap_err();
+        assert_eq!(kept(&e).0, Kept::Connections(1));
+        assert!(matches!(
+            claim(&mut reg, &name, &here, true),
+            Ok(Claim::Bound(_))
+        ));
+        assert!(b.handle.connect(Holder::Host).is_some());
+        // Its connections close: given up, and gone from the registry.
+        assert!(!b.handle.disconnect(Holder::Host));
+        assert!(b.handle.disconnect(Holder::Host));
+        let Ok(Claim::Start { after }) = claim(&mut reg, &name, &there, true) else {
+            panic!("not started");
+        };
+        assert_eq!(after, Some(b.id));
+        assert_eq!(b.handle.life(), Life::GivenUp);
+        assert!(reg.names.is_empty() && reg.paths.is_empty());
+        // The open in progress under the second root.
+        reg.opens.insert(name.clone(), OpenEntry {
+            open: OpenId(7),
+            url: b.url.clone(),
+            dir: there.clone(),
+            waiting: 0,
+            returned: false,
+        });
+        assert!(matches!(
+            claim(&mut reg, &name, &there, false),
+            Ok(Claim::Join(OpenId(7)))
+        ));
+        assert!(reg.opens.get(&name).is_some_and(|entry| entry.returned));
+        let e = claim(&mut reg, &name, &here, true).unwrap_err();
+        assert_eq!(
+            kept(&e),
+            (Kept::Opening, ErrorKind::BoundElsewhere, Action::Fix)
+        );
+    }
 
     // The cache root ends in `sqlite-ursula/0.8`, so 0.7's caches are never read.
     #[test]

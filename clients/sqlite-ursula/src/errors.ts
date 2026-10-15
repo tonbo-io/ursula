@@ -44,6 +44,7 @@ export type SetupKind =
 	| "invalid_name"
 	| "not_found"
 	| "in_use"
+	| "bound_elsewhere"
 	| "local_setup"
 	| "stream_format"
 	| "server_too_old"
@@ -87,6 +88,7 @@ const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaEr
 	["stream_format", "fix"],
 	["server_too_old", "fix"],
 	["not_bound", "fix"],
+	["bound_elsewhere", "fix"],
 ]);
 
 /** The action of `kind`, `fix` for a kind this package does not know (a newer extension's). */

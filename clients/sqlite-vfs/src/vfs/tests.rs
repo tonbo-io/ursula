@@ -36,6 +36,7 @@ use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
 use crate::db::for_tests;
 use crate::db::registered_for_tests;
+use crate::driver::Holder;
 use crate::publication::HandleState;
 use crate::replicator::ResetKind;
 use crate::testdir::TempDir;
@@ -67,6 +68,7 @@ fn pages_read_back_are_checked_against_what_was_written() {
 fn file_of(b: &Arc<Binding>, main: bool, inner: *const ffi::sqlite3_io_methods) -> File {
     let role = if main {
         Role::Main {
+            holder: Holder::Host,
             state: Cell::new(HandleState::Idle),
             exclusive: Cell::new(false),
         }

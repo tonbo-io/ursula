@@ -26,6 +26,7 @@ pub(crate) mod runtime;
 mod tests;
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -140,6 +141,8 @@ pub(crate) enum SyncError {
 #[derive(Debug)]
 pub(crate) struct BindingHandle {
     pub(crate) generation: Generation,
+    /// The cache root the open bound under, as its spec named it.
+    pub(crate) dir: PathBuf,
     pub(crate) name: CanonicalPath,
     /// The stream's cluster id.
     pub(crate) cluster_id: String,
@@ -178,11 +181,46 @@ pub(crate) struct BindingHandle {
 /// Where a binding stands between its connections and the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Life {
+    /// `ursula_open` handed it out `awaiting` times (at least once) that no connection of the host
+    /// took up yet: each path it handed out stays openable until a connection opens it, or until
+    /// the binding waited [`UNCONNECTED_MS`] since the latest hand-out. Closing connections leaves
+    /// it be.
+    HandedOut { awaiting: u32 },
+    /// Every hand-out was taken up, and a connection of the host is open.
     Live,
-    /// Its last connection closed: it drains, then retires. A new open revives it first.
+    /// Its last connection of the host closed: it drains, then retires once no private connection
+    /// is open either. A connection of the host, or a new open, takes it back.
     Retiring,
+    /// Given up for an open of its stream under another cache root ([`BindingHandle::give_up`]):
+    /// it drains, then retires once no private connection is open. Nothing takes it back.
+    GivenUp,
     /// Gone from the driver.
     Retired,
+}
+
+impl Life {
+    /// Whether the binding drains toward its retirement.
+    fn leaving(self) -> bool {
+        matches!(self, Life::Retiring | Life::GivenUp)
+    }
+}
+
+/// Who opens a connection on a binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// The host's: it takes a retiring binding back, and takes up a hand-out.
+    Host,
+    /// The extension's private connection (a snapshot attempt): it opens only beside a connection
+    /// of the host, and while open it only delays the retirement.
+    Private,
+}
+
+/// A connection [`BindingHandle::connect`] counted: whose it is, and where the binding stood
+/// before, so an open that fails after it undoes it exactly ([`BindingHandle::unconnect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Connected {
+    pub(crate) holder: Holder,
+    before: Life,
 }
 
 /// A binding's life with its open connections, decided under one lock: a connection opens only
@@ -190,9 +228,49 @@ pub(crate) enum Life {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Lifecycle {
     life: Life,
-    connections: usize,
+    /// Open connections of the host.
+    host: usize,
+    /// Open private connections.
+    private: usize,
     /// How many times `ursula_open` handed the binding out again.
     handouts: u64,
+}
+
+impl Lifecycle {
+    fn count(&mut self, holder: Holder) -> &mut usize {
+        match holder {
+            Holder::Host => &mut self.host,
+            Holder::Private => &mut self.private,
+        }
+    }
+
+    /// Whether no connection is open.
+    fn idle(&self) -> bool {
+        self.host == 0 && self.private == 0
+    }
+}
+
+/// Why a stream stays where it is open in this process: an open of it under another cache root is
+/// refused `in_use` ([`BindingHandle::give_up`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Kept {
+    /// Connections of the host are open on the binding: they would keep writing the other cache.
+    #[error("connections are open on it ({0})")]
+    Connections(usize),
+    /// `ursula_open` handed the binding's path out and no connection opened it yet: the caller it
+    /// went to would find it retired.
+    #[error("ursula_open handed it out and no connection opened it yet")]
+    HandedOut,
+    /// Commits of the binding wait for the stream's acknowledgement: the other cache must not
+    /// build from the stream without them.
+    #[error("{bytes} bytes of its commits are not acknowledged yet")]
+    Pending { bytes: u64 },
+    /// The binding, given up, did not drain and retire before the open's deadline.
+    #[error("it did not retire within the open's deadline")]
+    Draining,
+    /// Not bound yet: an open of the stream under the other cache root is in progress.
+    #[error("an open of it is in progress")]
+    Opening,
 }
 
 /// What status reports of a binding's replicator (design §9).
@@ -236,6 +314,7 @@ impl BindingHandle {
     pub(crate) fn new(bind: Bind, root: Arc<Root>) -> Self {
         Self {
             generation: bind.generation,
+            dir: bind.dir,
             name: bind.name,
             cluster_id: bind.cluster_id,
             incarnation: Mutex::new(bind.incarnation),
@@ -246,8 +325,9 @@ impl BindingHandle {
             acked: AtomicU64::new(bind.acked.0),
             reset: AtomicU8::new(0),
             life: Mutex::new(Lifecycle {
-                life: Life::Live,
-                connections: 0,
+                life: Life::HandedOut { awaiting: 1 },
+                host: 0,
+                private: 0,
                 handouts: 0,
             }),
             replication: Mutex::new(Replication::default()),
@@ -399,71 +479,108 @@ impl BindingHandle {
         self.life_lock().life
     }
 
+    /// The open connections of the host.
     pub(crate) fn connections(&self) -> usize {
-        self.life_lock().connections
+        self.life_lock().host
     }
 
-    /// A connection opens: a retiring binding is taken back. False once it retired.
-    pub(crate) fn connect(&self) -> bool {
+    /// A connection opens: `None` once the binding retired or was given up. One of the host takes
+    /// a retiring binding back and takes up a hand-out. The private one opens only while a
+    /// connection of the host holds the binding.
+    pub(crate) fn connect(&self, holder: Holder) -> Option<Connected> {
         let mut l = self.life_lock();
-        if l.life == Life::Retired {
-            return false;
+        let before = l.life;
+        match (holder, before) {
+            (_, Life::Retired | Life::GivenUp) => return None,
+            (Holder::Host, Life::HandedOut { awaiting }) if awaiting > 1 => {
+                l.life = Life::HandedOut {
+                    awaiting: awaiting.saturating_sub(1),
+                };
+            }
+            (Holder::Host, _) => l.life = Life::Live,
+            (Holder::Private, Life::Live | Life::HandedOut { .. }) if l.host > 0 => {}
+            (Holder::Private, _) => return None,
         }
-        l.life = Life::Live;
-        l.connections = l.connections.saturating_add(1);
-        true
+        let n = l.count(holder);
+        *n = n.saturating_add(1);
+        Some(Connected { holder, before })
     }
 
-    /// The extension's private connection opens: counted only while the binding is live with a
-    /// connection open already. False otherwise.
-    pub(crate) fn connect_beside(&self) -> bool {
+    /// A connection closed. True when the driver should hear of it: the last connection of the
+    /// host of a live binding closed, which now retires once drained, or the last connection of a
+    /// leaving one closed. A binding with hand-outs not taken up stays: its wait for a connection
+    /// decides ([`BindingHandle::idle_retire`]). The last connection of a retired binding (a reset)
+    /// releases its root and its hold on the generation.
+    pub(crate) fn disconnect(&self, holder: Holder) -> bool {
         let mut l = self.life_lock();
-        if l.life != Life::Live || l.connections == 0 {
-            return false;
-        }
-        l.connections = l.connections.saturating_add(1);
-        true
+        let n = l.count(holder);
+        *n = n.saturating_sub(1);
+        self.after_close(&mut l)
     }
 
-    /// A connection closed. True when it was the last of a live binding, which now retires once
-    /// drained (the driver hears of it). The last one of a reset binding releases its root and
-    /// its hold on the generation.
-    pub(crate) fn disconnect(&self) -> bool {
+    /// Undoes `connected`, for an open that failed after it: the binding goes back to where it
+    /// stood, a hand-out it took up waiting again. True when the driver should hear of it, as for
+    /// [`BindingHandle::disconnect`].
+    pub(crate) fn unconnect(&self, connected: Connected) -> bool {
         let mut l = self.life_lock();
-        l.connections = l.connections.saturating_sub(1);
-        if l.connections > 0 {
-            return false;
+        let n = l.count(connected.holder);
+        *n = n.saturating_sub(1);
+        if connected.holder == Holder::Host {
+            match (connected.before, l.life) {
+                // The hand-out it took up waits again.
+                (Life::HandedOut { .. }, Life::Live) => l.life = Life::HandedOut { awaiting: 1 },
+                (Life::HandedOut { .. }, Life::HandedOut { awaiting }) => {
+                    l.life = Life::HandedOut {
+                        awaiting: awaiting.saturating_add(1),
+                    };
+                }
+                // Taken back from retiring by this connection alone: retiring again.
+                (Life::Retiring, Life::Live) if l.host == 0 => l.life = Life::Retiring,
+                _ => {}
+            }
         }
+        self.after_close(&mut l)
+    }
+
+    /// What a connection's close leads to, its count already taken off.
+    fn after_close(&self, l: &mut Lifecycle) -> bool {
         match l.life {
-            Life::Live => {
+            Life::Live if l.host == 0 => {
                 l.life = Life::Retiring;
                 true
             }
+            Life::Retiring | Life::GivenUp => l.idle(),
             Life::Retired => {
-                self.release_root();
+                if l.idle() {
+                    self.release_root();
+                }
                 false
             }
-            Life::Retiring => false,
+            Life::Live | Life::HandedOut { .. } => false,
         }
     }
 
-    /// A binding no connection holds retires once drained: an open's result nobody took, or one
-    /// `ursula_open` handed out that no connection opened.
+    /// A binding no connection of the host holds retires once drained: an open's result nobody
+    /// took, or one `ursula_open` handed out that no connection opened.
     pub(crate) fn retiring(&self) {
         let mut l = self.life_lock();
-        if l.life == Life::Live && l.connections == 0 {
+        if matches!(l.life, Life::Live | Life::HandedOut { .. }) && l.host == 0 {
             l.life = Life::Retiring;
         }
     }
 
     /// `ursula_open` hands the binding out again, taking a retiring one back: false once it
-    /// retired.
+    /// retired or was given up. Until a connection of the host takes the hand-out up, no close
+    /// retires it.
     pub(crate) fn revive(&self) -> bool {
         let mut l = self.life_lock();
-        if l.life == Life::Retired {
-            return false;
-        }
-        l.life = Life::Live;
+        l.life = match l.life {
+            Life::Retired | Life::GivenUp => return false,
+            Life::HandedOut { awaiting } => Life::HandedOut {
+                awaiting: awaiting.saturating_add(1),
+            },
+            Life::Live | Life::Retiring => Life::HandedOut { awaiting: 1 },
+        };
         l.handouts = l.handouts.saturating_add(1);
         true
     }
@@ -472,25 +589,62 @@ impl BindingHandle {
         self.life_lock().handouts
     }
 
-    /// No connection opened the binding since `ursula_open` handed it out for the `handouts`-th
-    /// time: it retires once drained. A hand-out since, or a connection, keeps it.
+    /// Whether hand-outs of the binding wait for a connection.
+    pub(crate) fn handed_out(&self) -> bool {
+        matches!(self.life_lock().life, Life::HandedOut { .. })
+    }
+
+    /// The `handouts`-th hand-out waited long enough for a connection: those not taken up lapse,
+    /// and the binding retires once drained, or stays live with the connections of the host still
+    /// open. A hand-out since, whose own wait runs, or a connection that took them all up, leaves
+    /// it be.
     pub(crate) fn idle_retire(&self, handouts: u64) {
         let mut l = self.life_lock();
-        if l.life == Life::Live && l.connections == 0 && l.handouts == handouts {
-            l.life = Life::Retiring;
+        if matches!(l.life, Life::HandedOut { .. }) && l.handouts == handouts {
+            l.life = if l.host == 0 {
+                Life::Retiring
+            } else {
+                Life::Live
+            };
         }
     }
 
-    /// Retires a binding that is still retiring with no connection open: false when a connection
-    /// or an open took it back meanwhile. Retired, no connection opens it again, so the driver
-    /// unlocks its root once its last ACK is written.
+    /// Gives the binding up for an open of its stream under another cache root: it drains and
+    /// retires once its private connection closed, and nothing takes it back. Refused while the
+    /// host holds it: a connection of the host is open, a hand-out waits for one, or commits are
+    /// not acknowledged. A retired binding is no hold.
+    pub(crate) fn give_up(&self) -> Result<(), Kept> {
+        let mut l = self.life_lock();
+        match l.life {
+            Life::Retired | Life::GivenUp => return Ok(()),
+            _ if l.host > 0 => return Err(Kept::Connections(l.host)),
+            Life::HandedOut { .. } => return Err(Kept::HandedOut),
+            Life::Live | Life::Retiring => {}
+        }
+        match self.pending_bytes() {
+            0 => {
+                l.life = Life::GivenUp;
+                Ok(())
+            }
+            bytes => Err(Kept::Pending { bytes }),
+        }
+    }
+
+    /// Retires a binding that is still leaving with no connection open: false when a connection
+    /// or an open took it back meanwhile, or the private connection is still open. Retired, no
+    /// connection opens it again, so the driver unlocks its root once its last ACK is written.
     fn try_retire(&self) -> bool {
         let mut l = self.life_lock();
-        let retiring = l.life == Life::Retiring && l.connections == 0;
+        let retiring = l.life.leaving() && l.idle();
         if retiring {
             l.life = Life::Retired;
         }
         retiring
+    }
+
+    /// Whether the binding drains toward its retirement.
+    pub(crate) fn leaving(&self) -> bool {
+        self.life_lock().life.leaving()
     }
 
     /// The binding reset: it retires at once. With no connection open its root goes now.
@@ -498,7 +652,7 @@ impl BindingHandle {
     fn reset_retired(&self) {
         let mut l = self.life_lock();
         l.life = Life::Retired;
-        if l.connections == 0 {
+        if l.idle() {
             self.release_root();
         } else if let Some((root, hold)) = self
             .root
@@ -565,6 +719,8 @@ pub(crate) struct Bind {
     pub(crate) attach: Attach,
     /// Bound before its claim: the stream was unreachable at the open (design §5.5).
     pub(crate) provisional: bool,
+    /// The cache root the open bound under, as its spec named it.
+    pub(crate) dir: PathBuf,
 }
 
 /// Where an open got its local database, as status reports it (design §9, `attach`).
