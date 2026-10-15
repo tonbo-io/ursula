@@ -2883,6 +2883,15 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         .expect("read lagging learner state machine")
         .expect("stream restored from snapshot is readable");
     assert_eq!(read.payload, b"snapshot-transfer");
+    // M3 (#581 review): the snapshot covers the group's history event, and
+    // installing it publishes that history on the learner, as an apply does,
+    // so the learner's group actor wakes its watchers.
+    assert_eq!(
+        engines[2].history().applied(),
+        engines[leader_index].history().applied(),
+        "the installed snapshot carries the group's history"
+    );
+    assert!(engines[2].history().applied().is_some());
 
     shutdown_all(&engines).await;
 }
@@ -3358,6 +3367,79 @@ async fn warm_group_registers_runtime_owned_raft_handle() {
         .current_leader(1, "registered single-node group should elect itself")
         .await
         .expect("wait for registered leader");
+}
+
+/// M3 (#581 review): a history event ends a live read pinned to the old
+/// token, which re-reads and finds the stream under its new token (#581
+/// section 4.7); long-poll answers `412` from that and SSE ends.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_history_event_ends_a_live_read_pinned_to_the_old_token() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        hosted_config(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
+            .with_registry(registry.clone()),
+    )
+    .expect("spawn runtime");
+    let stream_id = bsid("pinned-live-read");
+    runtime
+        .create_stream(create_req(stream_id.clone()))
+        .await
+        .expect("create");
+    runtime
+        .append(AppendRequest::from_bytes(
+            stream_id.clone(),
+            b"abc".to_vec(),
+        ))
+        .await
+        .expect("append");
+    let before = runtime
+        .read_stream(read_req(stream_id.clone(), 16))
+        .await
+        .expect("read");
+    let waiter = {
+        let runtime = runtime.clone();
+        let request = ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset: 3,
+            max_len: 16,
+            now_ms: 0,
+            leader_only: false,
+            read_index: None,
+        };
+        let pinned = before.incarnation;
+        tokio::spawn(async move { runtime.wait_read_stream_pinned(request, Some(pinned)).await })
+    };
+    let started = std::time::Instant::now();
+    while runtime.metrics().snapshot().live_read_waiters == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the read never parked"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A plan whose leader is this replica: its history driver proposes the
+    // group's next history event.
+    let raft_group_id = runtime.locate(&stream_id).raft_group_id;
+    let entry = registry.entry(raft_group_id).expect("registered group");
+    let point = openraft::rt::WatchReceiver::borrow_watched(&entry.raft().metrics())
+        .last_log_index
+        .expect("a log");
+    entry.history.set_plan(Some(RecoveryRecord {
+        leader: 1,
+        point,
+        uncut_leader_term: None,
+        cut_after: None,
+    }));
+    let woken = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the history event ends the wait")
+        .expect("waiter task")
+        .expect("the re-read");
+    assert_ne!(woken.incarnation, before.incarnation, "a new token");
+    assert!(woken.payload.is_empty());
 }
 
 #[cfg(not(madsim))]

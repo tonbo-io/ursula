@@ -143,6 +143,8 @@ pub(super) struct JournalCluster {
     /// The leaders recovery plans elected: a planned replica votes for its
     /// plan's leader only.
     pub(super) plan_leaders: std::collections::BTreeSet<u64>,
+    /// The voters, nodes `1..=voters`.
+    pub(super) voters: u64,
 }
 
 impl JournalCluster {
@@ -157,8 +159,13 @@ impl JournalCluster {
 
     /// Three nodes whose WALs run with `tuning`.
     pub(super) async fn start_with_tuning(name: &str, tuning: JournalTuning) -> Self {
-        let mut cluster = Self::unstarted_with_tuning(name, tuning);
-        for node_id in 1..=3 {
+        Self::start_voters(name, tuning, 3).await
+    }
+
+    /// `voters` nodes, `1..=voters`, whose WALs run with `tuning`.
+    pub(super) async fn start_voters(name: &str, tuning: JournalTuning, voters: u64) -> Self {
+        let mut cluster = Self::unstarted_voters(name, tuning, voters);
+        for node_id in 1..=voters {
             cluster.start_node(node_id).await;
         }
         for group in JOURNAL_GROUPS {
@@ -188,7 +195,12 @@ impl JournalCluster {
         Self::unstarted_with_tuning(name, JournalTuning::new(fsync))
     }
 
+    #[cfg(test)]
     fn unstarted_with_tuning(name: &str, tuning: JournalTuning) -> Self {
+        Self::unstarted_voters(name, tuning, 3)
+    }
+
+    fn unstarted_voters(name: &str, tuning: JournalTuning, voters: u64) -> Self {
         let config = Arc::new(
             Config {
                 cluster_name: name.to_owned(),
@@ -205,7 +217,7 @@ impl JournalCluster {
             config,
             policy,
             votes,
-            wals: (1..=3)
+            wals: (1..=voters)
                 .map(|node_id| {
                     (
                         node_id,
@@ -220,13 +232,14 @@ impl JournalCluster {
                 .collect(),
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
-            metrics: (1..=3)
+            metrics: (1..=voters)
                 .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
                 .collect(),
             acknowledged: BTreeMap::new(),
             faulty: None,
             replay_stopped: BTreeMap::new(),
             plan_leaders: std::collections::BTreeSet::new(),
+            voters,
         }
     }
 
@@ -239,7 +252,7 @@ impl JournalCluster {
     /// Starts `node_id`'s replica of `group` from its log store, as the
     /// node's engine factory does.
     async fn start_replica(&mut self, group: u32, node_id: u64) {
-        let voters = recovery_wiring::configured_voters(1..=3);
+        let voters = recovery_wiring::configured_voters(1..=self.voters);
         let placement = group_placement(group);
         let store = self.wals[&node_id]
             .open(placement, self.metrics[&node_id].group_engine_metrics())
@@ -423,7 +436,7 @@ impl JournalCluster {
         for group in JOURNAL_GROUPS {
             leaders.push(self.leader(group).await);
         }
-        let followers = (1..=3)
+        let followers = (1..=self.voters)
             .filter(|node_id| !leaders.contains(node_id))
             .collect::<Vec<_>>();
         let count = u64::try_from(followers.len()).expect("follower count fits u64");
@@ -571,7 +584,7 @@ pub(super) fn metrics(
 
 /// The replica of `group` that currently is in the leader state, if any.
 pub(super) fn leader_by_state(cluster: &JournalCluster, group: u32) -> Option<u64> {
-    NODES.into_iter().find(|node_id| {
+    (1..=cluster.voters).find(|node_id| {
         cluster.engines.contains_key(&(group, *node_id))
             && metrics(cluster, group, *node_id).state == openraft::ServerState::Leader
     })
