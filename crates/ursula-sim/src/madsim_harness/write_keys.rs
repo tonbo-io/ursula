@@ -56,6 +56,8 @@ use super::sim_network_policy;
 
 pub(super) const REPEATS_INVARIANT: &str = "producer_repeats_are_exactly_once";
 pub(super) const EXPIRY_INVARIANT: &str = "idle_expiry_cannot_reopen_an_epoch";
+/// The epoch the expiry scenario's producer holds when it retires.
+const EXPIRY_EPOCH: u64 = 3;
 const CONTENT_TYPE: &str = "application/octet-stream";
 /// Every body is this long, so the stream splits back into bodies.
 const BODY_LEN: usize = 16;
@@ -901,6 +903,20 @@ pub(super) async fn run_producer_repeats_are_exactly_once_inner(
     }
 }
 
+/// The epoch at or below the retired one that an answer reports as closed:
+/// a claim's closure, or an `epoch-closed` refusal's.
+fn reported_closure(answer: &ProducerAnswer) -> Option<u64> {
+    let closed = match answer {
+        ProducerAnswer::Receipt { epoch, .. } | ProducerAnswer::ReceiptEvicted { epoch, .. } => {
+            epoch.closed_epoch()?
+        }
+        ProducerAnswer::EpochClosed(closure) => closure.closed_epoch(),
+        _ => return None,
+    };
+    let epoch = closed.epoch.get();
+    (epoch <= EXPIRY_EPOCH).then_some(epoch)
+}
+
 /// The plan of one `idle_expiry_cannot_reopen_an_epoch` run.
 #[derive(Debug)]
 struct ExpiryPlan {
@@ -910,6 +926,10 @@ struct ExpiryPlan {
     tidy: bool,
     /// Whether the leader dies after the retirement.
     kill: bool,
+    /// Whether a writer without the token re-claims the retired epoch
+    /// before the stale writer returns: the base protocol treats it as new,
+    /// and its record opens below the floor.
+    reclaim: bool,
 }
 
 impl ExpiryPlan {
@@ -919,6 +939,7 @@ impl ExpiryPlan {
             writes: 2_u64.saturating_add(rng.next_bounded(3)),
             tidy: rng.next_bounded(2) == 0,
             kill: rng.next_bounded(4) != 0,
+            reclaim: rng.next_bounded(2) == 0,
         }
     }
 }
@@ -928,7 +949,7 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
     const STALE: u8 = 25;
-    const EPOCH: u64 = 3;
+    const EPOCH: u64 = EXPIRY_EPOCH;
     let plan = ExpiryPlan::from_seed(config.seed);
     let mut trace = SimTrace::default();
     let mut cluster = Cluster::start(&config, &mut trace).await;
@@ -972,7 +993,34 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
             phase: "tidy_stream".to_owned(),
         });
     }
+    if plan.reclaim {
+        // Another writer under the same id, without the token, writes the
+        // retired epoch again. Its bodies are clones, told apart from the
+        // stale writer's.
+        for seq in 0..2 {
+            let key = Key {
+                label: Label {
+                    clone: true,
+                    ..label(EPOCH, seq)
+                },
+                seq,
+            };
+            let body = key.label.body();
+            match cluster.request(key, &body, false, true, false).send().await {
+                Answer::Producer(ProducerAnswer::Receipt {
+                    delivery: Delivery::Applied,
+                    ..
+                }) => {}
+                _ => panic!("an untokened re-claim of a forgotten producer applies as new"),
+            }
+        }
+        trace.push(SimEvent::FaultApplied {
+            phase: "untokened_reclaim".to_owned(),
+        });
+    }
     if plan.kill {
+        // The leader dies, so the record and its marker come back from the
+        // log on the new leader and on the restarted node.
         let old_leader = cluster.kill_leader(&mut trace, "after_idle").await;
         cluster.restart(&mut trace, old_leader).await;
     }
@@ -997,6 +1045,18 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
             .request(key, &body, !controls.floor_off, true, false)
             .send()
             .await;
+        if let Answer::Producer(answer) = &answer
+            && let Some(closed) = reported_closure(answer)
+        {
+            fail(
+                &mut trace,
+                EXPIRY_INVARIANT,
+                "stale_write",
+                format!(
+                    "epoch {epoch} seq {seq} was told epoch {closed} closed, which the stream forgot"
+                ),
+            );
+        }
         match answer {
             Answer::Producer(ProducerAnswer::Receipt {
                 delivery: Delivery::Applied,
@@ -1022,10 +1082,21 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
         .send()
         .await
     {
-        Answer::Producer(ProducerAnswer::Receipt {
-            delivery: Delivery::Applied,
-            ..
-        }) => {}
+        Answer::Producer(
+            answer @ ProducerAnswer::Receipt {
+                delivery: Delivery::Applied,
+                ..
+            },
+        ) => {
+            if let Some(closed) = reported_closure(&answer) {
+                fail(
+                    &mut trace,
+                    EXPIRY_INVARIANT,
+                    "claim_above_floor",
+                    format!("the claim above the floor reported forgotten epoch {closed} closed"),
+                );
+            }
+        }
         Answer::Producer(other) => fail(
             &mut trace,
             EXPIRY_INVARIANT,
@@ -1034,13 +1105,49 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
         ),
         Answer::Unknown(status) => panic!("claim above the floor answered {status}"),
     }
-    // The stream holds no write of the retired epoch past its retirement.
+    // The stale writer resends its retired epoch once more, after the claim:
+    // still no answer reports that epoch closed.
+    let resend = Key {
+        label: label(EPOCH, plan.writes.saturating_sub(1)),
+        seq: plan.writes.saturating_sub(1),
+    };
+    let body = resend.label.body();
+    match cluster
+        .request(resend, &body, true, true, false)
+        .send()
+        .await
+    {
+        Answer::Producer(answer) => {
+            if let Some(closed) = reported_closure(&answer) {
+                fail(
+                    &mut trace,
+                    EXPIRY_INVARIANT,
+                    "resend_after_claim",
+                    format!("a resend after the claim was told epoch {closed} closed"),
+                );
+            }
+            if matches!(answer, ProducerAnswer::Receipt {
+                delivery: Delivery::Applied,
+                ..
+            }) {
+                fail(
+                    &mut trace,
+                    EXPIRY_INVARIANT,
+                    "resend_after_claim",
+                    "a resend of the retired epoch applied after the claim".to_owned(),
+                );
+            }
+        }
+        Answer::Unknown(status) => panic!("resend after the claim answered {status}"),
+    }
+    // The stream holds no write of the retired epoch past its retirement,
+    // but the untokened re-claim's own.
     let bytes = cluster.read_all().await;
     let tail = bytes
         .get(usize::try_from(retired_at).expect("offset fits usize")..)
         .unwrap_or_default();
     for chunk in tail.chunks(BODY_LEN) {
-        if Label::parse(chunk).is_some_and(|written| written.epoch <= EPOCH) {
+        if Label::parse(chunk).is_some_and(|written| written.epoch <= EPOCH && !written.clone) {
             fail(
                 &mut trace,
                 EXPIRY_INVARIANT,
