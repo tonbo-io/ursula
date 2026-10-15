@@ -36,7 +36,7 @@ export interface UrsulaSalvage {
 	readonly incarnation: string | null;
 	/** The stream's token when it was moved aside. */
 	readonly stream_incarnation: string | null;
-	/** Every commit up to this position was in the stream under `incarnation`; `null` for a replaced one. */
+	/** Every commit up to this position was in the stream under `incarnation`. It is `null` for a replaced one. */
 	readonly acknowledged_position: number | null;
 	/** The cache's commits after `acknowledged_position`, which the stream may never have held. */
 	readonly unacknowledged: number | null;

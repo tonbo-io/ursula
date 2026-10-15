@@ -365,3 +365,33 @@ fn a_crash_after_each_salvaging_publish_step_converges() {
     }
     assert_eq!(steps, 9);
 }
+
+/// A crash while a manifest was written leaves `manifest.json.tmp`, in a generation or in a
+/// salvage: the next open deletes it.
+#[test]
+fn leftover_temporary_manifests_are_deleted() {
+    let dir = TempDir::new("gen-manifest-tmp");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let g = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    let salvaged = root
+        .path()
+        .join(salvage::DIR)
+        .join("20261016T120000Z-replaced");
+    fs::create_dir_all(&salvaged).unwrap();
+    salvage::write_manifest(&salvaged, &Manifest {
+        reason: Reason::Replaced,
+        state: State::Complete,
+        ..manifest(1)
+    })
+    .unwrap();
+    for at in [&g.dir, &salvaged] {
+        fs::write(at.join("manifest.json.tmp"), b"{").unwrap();
+    }
+    root.finish_leftovers().unwrap();
+    for at in [&g.dir, &salvaged] {
+        assert!(!at.join("manifest.json.tmp").exists(), "{}", at.display());
+    }
+    assert_eq!(root.current().unwrap().unwrap().dir, g.dir);
+    assert_eq!(salvage::list(root.path()).unwrap().len(), 1);
+}

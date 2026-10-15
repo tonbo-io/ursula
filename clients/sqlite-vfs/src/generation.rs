@@ -279,8 +279,17 @@ impl Generation {
 /// The header of the first log segment of the generation in `dir`.
 fn first_header(dir: &Path) -> Result<SegmentHeader, GenerationError> {
     let log = dir.join("log");
-    let mut segments: Vec<PathBuf> = fs::read_dir(&log)
-        .map_err(io("list", &log))?
+    let entries = match fs::read_dir(&log) {
+        Ok(entries) => entries,
+        // No `log/` at all: a generation with no segment.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(GenerationError::NoSegment {
+                dir: dir.to_owned(),
+            });
+        }
+        Err(e) => return Err(io("list", &log)(e)),
+    };
+    let mut segments: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "usl"))
         .collect();
@@ -424,6 +433,7 @@ impl Root {
             }
         }
         for g in &gens {
+            salvage::clear_tmp(&g.path)?;
             match (superseded.contains(&g.id), salvage::read_manifest(&g.path)?) {
                 (true, Some(manifest)) => {
                     let moved = salvage::move_into(&self.dir, &g.path, &manifest)?;

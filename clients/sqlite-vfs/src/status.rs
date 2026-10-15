@@ -19,7 +19,6 @@ use crate::json::str as json_str;
 use crate::open::OpenError;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
-use crate::salvage;
 use crate::salvage::Salvaged;
 use crate::stats::Drained;
 use crate::stats::Dropped;
@@ -40,8 +39,8 @@ fn condition(c: &Condition) -> &'static str {
     }
 }
 
-/// `ursula_status` of a bound database.
-pub(crate) fn status_json(b: &Binding) -> String {
+/// `ursula_status` of a bound database. Fails only when the root's `salvage/` cannot be listed.
+pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
     let h = &b.handle;
     let replication = h.replication();
     let reset = h.reset();
@@ -124,14 +123,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
             ("action", json_str(reset_action(kind).as_str())),
         ])
     });
-    // The root's salvages, beside the generation's directory.
-    let salvage = h
-        .generation
-        .dir
-        .parent()
-        .and_then(|root| salvage::list(root).ok())
-        .unwrap_or_default();
-    let salvage: Vec<String> = salvage.iter().map(salvaged_json).collect();
+    let salvage: Vec<String> = h.salvage()?.iter().map(salvaged_json).collect();
     let lineage: String = h
         .generation
         .lineage
@@ -139,7 +131,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    object(&[
+    Ok(object(&[
         ("name", json_str(h.name.as_str())),
         ("path", json_str(&b.path)),
         ("role", json_str("owner")),
@@ -166,7 +158,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
         ("refused", refused),
         ("salvage", json::array(&salvage)),
         ("reset", reset_json),
-    ])
+    ]))
 }
 
 /// A salvage in `status().salvage`: its directory and its manifest's fields.

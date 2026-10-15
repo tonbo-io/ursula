@@ -37,7 +37,10 @@
 //! 17. a misrouted answer never resets an owner, and after `Heal` no owner ends blocked
 //!     `wrong_cluster`;
 //! 18. a rebuild that discards pending records of a log re-keyed at open (and not bound since,
-//!     across restarts) carries `salvage: true`.
+//!     across restarts) carries `salvage: true`;
+//! 19. after `Heal`, every commit an owner was told is acknowledged is in the stream, in a log,
+//!     or in a salvage: none is lost, whatever history changes came (clones apart, whose copies
+//!     commit at one commit id).
 //!
 //! Snapshots carry real `USS3` headers (the owner's lineage, an acknowledged position and its
 //! offset): the `410` rule reads them.
@@ -253,6 +256,8 @@ struct LogModel {
     /// The last position when a rebuild published: the frames it brought in take no positions
     /// in this model (the driver logs each at the next one).
     rebuilt_through: u64,
+    /// The stream's bytes the latest rebuild brought in: its db holds those commits.
+    rebuilt: Arc<[u8]>,
     /// The log rolled to a new token at open, and no claim bound under it since (property 18).
     rekeyed_at_open: bool,
 }
@@ -298,6 +303,8 @@ struct Instance {
     /// restart before that finds the old generation whole, as a crash before the publishing
     /// rename does (design §5.1, §5.6).
     unpublished: Option<Option<Position>>,
+    /// The stream's bytes up to a rebuild's claim, which its generation holds once published.
+    rebuilt_bytes: Option<Arc<[u8]>>,
     /// The replicator reported itself blocked `wrong_cluster` and has not resumed since.
     blocked_wrong_cluster: bool,
     /// The highest epoch of this instance's claims the world saw the server receipt (applied, or
@@ -397,6 +404,11 @@ struct World {
     others: bool,
     /// The commit frames of every log a restart salvaged.
     salvaged: Vec<Arc<[u8]>>,
+    /// Every commit frame an owner was told its stream acknowledged (property 19).
+    acknowledged: Vec<Arc<[u8]>>,
+    /// The lineages of logs cloned: two copies commit at one commit id, and a takeover of one
+    /// may discard what the other had acknowledged (clones are outside property 19).
+    cloned: Vec<Lineage>,
     coverage: Arc<Coverage>,
 }
 
@@ -470,6 +482,8 @@ impl World {
             violations: Vec::new(),
             others: false,
             salvaged: Vec::new(),
+            acknowledged: Vec::new(),
+            cloned: Vec::new(),
             coverage,
         };
         world.takeover(false);
@@ -527,6 +541,7 @@ impl World {
             caught_up_due: None,
             claim_expired: false,
             unpublished: None,
+            rebuilt_bytes: None,
             blocked_wrong_cluster: false,
             claim_applied: None,
             claims_sent: Vec::new(),
@@ -584,6 +599,7 @@ impl World {
             durable_acks: 0,
             catching_up: false,
             rebuilt_through: 0,
+            rebuilt: Arc::from(Vec::new()),
             rekeyed_at_open: false,
         };
         let local = LocalState {
@@ -666,7 +682,8 @@ impl World {
             stream: stream.as_ref(),
             content_type: answer.content_type.as_deref(),
         };
-        let row = match decide(Local::Trusted(summary.clone(), ()), Asked::default(), seen) {
+        let local = Local::<(), ()>::Trusted(summary.clone(), ());
+        let row = match decide(local, Asked::default(), seen) {
             // The negative control: an inheriting history re-keys a log with commits pending.
             OpenRow::Build {
                 superseded:
@@ -699,13 +716,11 @@ impl World {
             OpenRow::Build { superseded, .. } => {
                 if matches!(superseded, Superseded::Salvage { .. }) {
                     self.coverage.salvages.fetch_add(1, Ordering::Relaxed);
-                    let lineage = log.lineage;
-                    self.salvaged.extend(
-                        log.commits
-                            .values()
-                            .filter(|p| p.id.lineage == lineage)
-                            .map(|p| Arc::clone(&p.frame)),
-                    );
+                    // The salvage holds what the log holds, and what its db holds.
+                    self.salvaged
+                        .extend(log.commits.values().map(|p| Arc::clone(&p.frame)));
+                    self.salvaged.extend(log.applied.iter().cloned());
+                    self.salvaged.push(Arc::clone(&log.rebuilt));
                 }
                 let (owner, actions) = self.fresh_owner(false);
                 self.owners[index] = owner;
@@ -754,6 +769,7 @@ impl World {
         }
         let mut copy = self.owners[index].clone();
         let original = copy.inst.uid;
+        self.cloned.push(copy.log.lineage);
         copy.family = self.next_family;
         self.next_family += 1;
         copy.salt = u8::try_from(copy.family % 250).unwrap();
@@ -994,8 +1010,12 @@ impl World {
                 Action::Rebuild {
                     discard_from,
                     salvage,
+                    to,
                     ..
                 } => {
+                    let stream = self.stream();
+                    let to = usize::try_from(to.get()).unwrap().min(stream.len());
+                    self.owners[index].inst.rebuilt_bytes = Some(Arc::from(&stream[..to]));
                     if !takeover {
                         self.violation("property 6: a rebuild outside a takeover".to_owned());
                     }
@@ -1170,6 +1190,17 @@ impl World {
             .take_while(|(p, _)| **p <= acked.0)
             .map(|(_, p)| p.clone())
             .collect();
+        // Property 19: the owner's own commits it was told are acknowledged, unless a clone
+        // shares their lineage.
+        let lineage = self.owners[index].log.lineage;
+        if !self.cloned.contains(&lineage) {
+            self.acknowledged.extend(
+                records
+                    .iter()
+                    .filter(|p| p.id.lineage == lineage)
+                    .map(|p| Arc::clone(&p.frame)),
+            );
+        }
         // Searched as bytes: foreign garbage may sit between frames. An answer that comes back
         // after a rewind is about the history it applied in, which the stream no longer shows.
         let stream = self.stream();
@@ -1612,6 +1643,10 @@ impl World {
         log.lineage = Lineage(lineage);
         log.catching_up = true;
         log.rebuilt_through = log.next_position.saturating_sub(1);
+        if let Some(bytes) = self.owners[index].inst.rebuilt_bytes.take() {
+            self.owners[index].log.rebuilt = bytes;
+        }
+        let log = &mut self.owners[index].log;
         log.rekeyed_at_open = false;
     }
 
@@ -1894,6 +1929,31 @@ impl World {
                     "property 17: owner {index} ends blocked wrong_cluster"
                 ));
             }
+        }
+        let stream = self.stream();
+        let cloned = |frame: &[u8]| match frame::decode(frame, u64::MAX) {
+            Ok(Decoded::Frame {
+                frame: Frame::Commit { id, .. },
+                ..
+            }) => self.cloned.contains(&id.lineage),
+            _ => false,
+        };
+        let lost = self.acknowledged.iter().find(|frame| {
+            if cloned(frame) {
+                return false;
+            }
+            let within = |bytes: &[u8]| bytes.windows(frame.len()).any(|w| w == &frame[..]);
+            let held = self.owners.iter().any(|o| {
+                o.log.commits.values().any(|p| p.frame == **frame)
+                    || o.log.applied.contains(frame)
+                    || within(&o.log.rebuilt)
+            });
+            !within(&stream) && !held && !self.salvaged.iter().any(|s| within(s))
+        });
+        if let Some(frame) = lost {
+            self.violation(format!(
+                "property 19: an acknowledged commit is in no stream, log or salvage: {frame:?}"
+            ));
         }
     }
 }
@@ -2314,6 +2374,10 @@ fn negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage
     );
     assert!(
         violations.iter().any(|v| v.starts_with("property 18")),
+        "{violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 19")),
         "{violations:?}"
     );
 }

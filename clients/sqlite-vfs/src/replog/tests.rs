@@ -756,3 +756,61 @@ fn own_commits_after_the_ack_are_kept() {
     assert_eq!(r.cut, None);
     assert_eq!(r.pending().len(), 1);
 }
+
+/// The generation's own pending commits stay when caught-up frames no ACK follows come after
+/// them: only the trailing run of caught-up frames goes.
+#[test]
+fn own_pending_commits_before_a_trailing_caught_up_run_stay() {
+    let dir = TempDir::new("log-cut-after-own");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    for body in [commit(1, 10), commit(2, 10), caught_up(3), caught_up(4)] {
+        log.append(&body).unwrap();
+    }
+    log.sync().unwrap();
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert!(r.cut.is_some());
+    assert_eq!(records(&r), vec![
+        (Position(1), commit(1, 10)),
+        (Position(2), commit(2, 10))
+    ]);
+    assert_eq!(r.pending().len(), 2);
+    assert_eq!(log.next_position(), Position(3));
+}
+
+/// A cut across an empty segment a re-key rolled to brings back the state carried to the cut
+/// point: the later segments the log rolls to name the token before the re-key.
+#[test]
+fn a_cut_across_a_re_key_segment_restores_the_token_before_it() {
+    let dir = TempDir::new("log-cut-rekey");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    for body in [
+        commit(1, 10),
+        RecordBody::Ack {
+            acked: Position(1),
+            acked_offset: Offset::from_u64(10),
+            log_bytes: 0,
+        },
+        caught_up(2),
+    ] {
+        log.append(&body).unwrap();
+    }
+    log.roll_to(token(2)).unwrap();
+    drop(log);
+    let (mut log, r) = Log::open(&log_dir).unwrap();
+    assert!(r.cut.is_some());
+    assert_eq!(r.header.incarnation, header().incarnation);
+    assert_eq!(log.segment_paths().len(), 1);
+    // A roll after the cut carries the restored token.
+    log.set_roll_bytes(1);
+    log.append(&commit(3, 10)).unwrap();
+    log.append(&commit(4, 10)).unwrap();
+    log.sync().unwrap();
+    assert!(log.segment_paths().len() > 1);
+    drop(log);
+    let (_, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.header.incarnation, header().incarnation);
+    assert_eq!(r.pending().len(), 2);
+}

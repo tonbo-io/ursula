@@ -121,6 +121,9 @@ struct Sent {
 /// A change to the server, run at a chosen moment.
 type ServerHook = Box<dyn FnOnce(&mut ModelServer)>;
 
+/// A change to the server after every HEAD it answers.
+type EveryHead = Box<dyn FnMut(&mut ModelServer)>;
+
 /// Cores, the model server, a network each core can lose, and a virtual clock.
 struct World {
     server: ModelServer,
@@ -134,8 +137,11 @@ struct World {
     /// Disk jobs it matches wait in `held` instead of running.
     hold: Option<fn(&DiskJob) -> bool>,
     held: Vec<(usize, DiskIo)>,
-    /// Runs on the server after the next HEAD it answers.
+    /// Runs on the server after the next HEAD it answers, once `skip_heads` more went by.
     after_head: Option<ServerHook>,
+    skip_heads: u32,
+    /// Runs on the server after every HEAD it answers.
+    every_head: Option<EveryHead>,
     /// Another deployment, which every request reaches while `misrouted`.
     other: ModelServer,
     misrouted: bool,
@@ -155,6 +161,8 @@ impl World {
             sent: Vec::new(),
             legacy: false,
             after_head: None,
+            skip_heads: 0,
+            every_head: None,
             other: ModelServer::new(ClusterId::new("cluster-b").unwrap(), 9),
             misrouted: false,
             hold: None,
@@ -208,10 +216,15 @@ impl World {
             return Exchange::Answered(Box::new(answer.parse(request)));
         }
         let delivered = self.server.exchange(PATH, request);
-        if request.method == Method::Head
-            && let Some(hook) = self.after_head.take()
-        {
-            hook(&mut self.server);
+        if request.method == Method::Head {
+            if self.skip_heads > 0 {
+                self.skip_heads -= 1;
+            } else if let Some(hook) = self.after_head.take() {
+                hook(&mut self.server);
+            }
+            if let Some(hook) = &mut self.every_head {
+                hook(&mut self.server);
+            }
         }
         match delivered {
             Delivered::Answered { answer, .. } => {
@@ -2142,8 +2155,7 @@ fn a_replaced_db_file_is_salvaged_as_replaced() {
     let (result, generation, _dir) = reopen_after(|_, generation| {
         std::fs::write(generation.join("db"), &page[..]).unwrap();
     });
-    let lineage = scan(&std::fs::read(first_segment(&generation)).unwrap_or_default());
-    assert!(lineage.is_err(), "the generation moved");
+    assert!(!generation.exists(), "the generation moved");
     let bound = result.unwrap();
     assert_eq!(bound.handle.attach, salvaged_attach(Reason::Replaced));
     let s = only_salvage(&generation, Reason::Replaced);
@@ -3021,11 +3033,6 @@ fn salvaged_attach(reason: Reason) -> Attach {
     }
 }
 
-/// The first log segment of the generation at `generation`.
-fn first_segment(generation: &Path) -> PathBuf {
-    generation.join("log").join(format!("{:020}.usl", 1))
-}
-
 // A generation built from a snapshot holds no COMMIT record, only the ACK naming the snapshot.
 // Its db file emptied is salvaged as `replaced`, never taken for a new database (whose pages the
 // next commits would ship on top of the snapshot), and the open builds anew.
@@ -3098,4 +3105,178 @@ fn a_history_change_during_a_fresh_build_starts_it_over() {
     w.run_for(1_000);
     assert_eq!(w.outcome(b, ticket), Some(Ok(())));
     assert_eq!(w.stream_commits().last(), Some(&next));
+}
+
+/// The HEADs core `core` sent.
+fn heads(w: &World, core: usize) -> usize {
+    w.sent
+        .iter()
+        .filter(|s| s.core == core && s.request.method == Method::Head)
+        .count()
+}
+
+/// A stream with one commit, its owner retired.
+fn stream_with_a_commit(w: &mut World) -> (Vec<u8>, TempDir) {
+    let dir = TempDir::new("driver-d8-source");
+    let a = w.core();
+    let bound = w.open(a, spec(dir.path(), 1));
+    let c1 = w.commit(a, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.retire(a, &bound);
+    (c1, dir)
+}
+
+/// A history event after a fresh build's HEAD: its tail read meets a `412`, the HEAD names the new
+/// token, and the build starts over under it. Eight times in a row the build starts over, each
+/// counted once, within its eight restarts, and the open takes over with the last token.
+#[test]
+fn a_412_during_a_fresh_builds_read_restarts_it_once_per_history_change() {
+    let mut w = World::new();
+    let (c1, _source) = stream_with_a_commit(&mut w);
+    // HEADs alternate: the build's own (a history event follows) and the one its read's `412`
+    // sends (none follows), after the open's first.
+    let mut n = 0u32;
+    w.every_head = Some(Box::new(move |server: &mut ModelServer| {
+        n += 1;
+        if n.is_multiple_of(2) && n <= 16 {
+            server.history_event(HistoryEvent::NewHistory).unwrap();
+        }
+    }));
+    let dir = TempDir::new("driver-d8-412");
+    let b = w.core();
+    let bound = w.open(b, spec(dir.path(), 2));
+    w.every_head = None;
+    assert_eq!(bound.handle.incarnation(), w.server.token(PATH).unwrap());
+    assert_eq!(heads(&w, b), 18);
+    assert_eq!(w.stream_commits(), vec![c1]);
+}
+
+/// A fresh build whose stream changes history before every HEAD it sends gives up after its eight
+/// restarts, publishing nothing (the `.tmp` of its last build goes at the next open).
+#[test]
+fn a_fresh_build_gives_up_after_its_restarts() {
+    let mut w = World::new();
+    let _source = stream_with_a_commit(&mut w);
+    w.every_head = Some(Box::new(|server: &mut ModelServer| {
+        server.history_event(HistoryEvent::NewHistory).unwrap();
+    }));
+    let dir = TempDir::new("driver-d8-limit");
+    let b = w.core();
+    let e = kind(w.open_result(b, spec(dir.path(), 2)));
+    w.every_head = None;
+    assert!(
+        matches!(&*e, OpenError::StreamState(StreamState::HistoryChanged)),
+        "{e}"
+    );
+    // The open's HEAD, then nine builds' HEADs: the ninth history change is one too many.
+    assert_eq!(heads(&w, b), 10);
+    let root = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let gens: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("gen-") && !n.ends_with(".tmp"))
+        .collect();
+    assert!(gens.is_empty(), "{gens:?}");
+}
+
+/// The stream is deleted while a fresh open builds it: the build is abandoned and the open goes
+/// back through the open table, which creates the stream (no local generation) and builds that.
+#[test]
+fn a_stream_deleted_during_a_fresh_build_is_created_by_the_open() {
+    let mut w = World::new();
+    let _source = stream_with_a_commit(&mut w);
+    let before = w.server.token(PATH).unwrap();
+    w.skip_heads = 1;
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        server.delete(PATH).unwrap();
+    }));
+    let dir = TempDir::new("driver-d8-deleted");
+    let b = w.core();
+    let bound = w.open(b, spec(dir.path(), 2));
+    let token = w.server.token(PATH).unwrap();
+    assert_ne!(token, before);
+    assert_eq!(bound.handle.incarnation(), token);
+    assert!(w.stream_commits().is_empty());
+    let root = bound.handle.generation.dir.parent().unwrap().to_owned();
+    let gens: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("gen-"))
+        .collect();
+    assert_eq!(gens.len(), 1, "{gens:?}");
+}
+
+/// The same while a build is about to salvage a trusted generation holding data: back through the
+/// open table, the missing stream is `not_found`, and the generation stays, not salvaged.
+#[test]
+fn a_stream_deleted_during_a_salvaging_build_is_not_found() {
+    let dir = TempDir::new("driver-d8-deleted-local");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let checkpoint = w.server.checkpoint();
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.retire(c, &bound);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    w.skip_heads = 1;
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        server.delete(PATH).unwrap();
+    }));
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(matches!(&*e, OpenError::NotFound), "{e}");
+    assert!(generation.exists());
+    assert!(salvages(&generation).is_empty());
+}
+
+/// Another writer creates the missing stream between the open's HEAD and its create: the create
+/// answers `200`, so the stream is not this open's, and the generation is salvaged as a history
+/// change, not `recreated`.
+#[test]
+fn a_create_answered_200_salvages_as_a_history_change() {
+    let dir = TempDir::new("driver-recreate-200");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.retire(c, &bound);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.server.delete(PATH).unwrap();
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        let create = Request {
+            content_type: Some(CONTENT_TYPE.to_owned()),
+            ..Request::new(Method::Put, Target::Stream)
+        };
+        assert_eq!(server.handle(PATH, &create).status, 201);
+    }));
+    let c2 = w.core();
+    let bound = w.open(c2, OpenSpec {
+        recreate: true,
+        ..spec(dir.path(), 2)
+    });
+    assert_eq!(bound.handle.attach, salvaged_attach(Reason::HistoryChanged));
+    only_salvage(&generation, Reason::HistoryChanged);
+}
+
+/// A generation directory with no `log/` at all is salvaged as `replaced`.
+#[test]
+fn a_generation_without_a_log_is_salvaged_as_replaced() {
+    let (result, generation, _dir) = reopen_after(|_, generation| {
+        std::fs::remove_dir_all(generation.join("log")).unwrap();
+    });
+    let bound = result.unwrap();
+    assert_eq!(bound.handle.attach, salvaged_attach(Reason::Replaced));
+    only_salvage(&generation, Reason::Replaced);
 }

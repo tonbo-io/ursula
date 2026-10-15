@@ -168,6 +168,15 @@ pub(crate) struct Recovered {
 }
 
 impl Recovered {
+    /// Whether a COMMIT record, the generation's own or a caught-up one, follows the latest ACK.
+    /// [`Log::open`] cuts caught-up ones no ACK follows, so only the generation's own remain, but
+    /// a caller deciding whether the history may have lost one checks both.
+    pub(crate) fn commit_after_ack(&self) -> bool {
+        self.records
+            .iter()
+            .any(|r| r.position > self.acked && matches!(r.body, RecordBody::Commit { .. }))
+    }
+
     /// This generation's COMMIT records after the latest ACK: logged, not acknowledged. Stream
     /// frames a catch-up logged carry another lineage and are never pending: an ACK follows them,
     /// or [`Log::open`] cut them.
@@ -476,11 +485,13 @@ impl Log {
         // Stream frames a catch-up logged with no ACK after them were never applied: a catch-up
         // applies its frames only once the ACK after them is fsynced, and nothing logs a record
         // between them. They are the log's last records, and go like a torn tail, so the log
-        // holds no COMMIT record after its latest ACK but the generation's own pending ones.
-        if let Some(st) = &state {
+        // holds no COMMIT record after its latest ACK but the generation's own pending ones. The
+        // state carried to the cut point comes back with them: a later segment (an empty one a
+        // re-key rolled to, say) may name another token.
+        if let Some((acked, lineage)) = state.as_ref().map(|st| (st.acked, st.lineage)) {
             let unapplied = |r: &LogRecord| {
-                r.position > st.acked
-                    && matches!(&r.body, RecordBody::Commit { frame } if foreign(frame, st.lineage))
+                r.position > acked
+                    && matches!(&r.body, RecordBody::Commit { frame } if foreign(frame, lineage))
             };
             let keep = records
                 .iter()
@@ -495,6 +506,16 @@ impl Log {
             {
                 let later = kept.split_off(seg.saturating_add(1));
                 removed.splice(0..0, later);
+                let mut carried = h.clone();
+                for (r, _) in records
+                    .iter()
+                    .zip(&marks)
+                    .take(keep)
+                    .filter(|(_, m)| m.0 == seg)
+                {
+                    carry(&mut carried, &r.body);
+                }
+                state = Some(carried);
                 current = Some((h, start, header_len, before));
                 next = first;
                 records.truncate(keep);

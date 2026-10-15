@@ -3,11 +3,12 @@
 //!
 //! [`materialize`] runs at every open of a trusted generation: check page 1 (a db file that is not
 //! this generation's, an empty one included, is refused before anything is written, and the open
-//! salvages it as found), open the log (its torn tail cut), fsync it, delete the WAL and `-shm` unread (and a `db-wal` or `db-journal`
-//! SQLite outside the extension may have left), re-apply the COMMIT records after the latest BASE
-//! (final images per batch, cutting first, so a crash midway replays again), fsync the db, append
-//! a BASE. By L3 the db holds every commit up to the BASE and otherwise only pages from records
-//! after it, so the result is exactly the state at the end of the valid log; the WAL plays no part.
+//! salvages it as found), open the log (its torn tail cut), fsync it, delete the WAL and `-shm`
+//! unread (and a `db-wal` or `db-journal` SQLite outside the extension may have left), re-apply
+//! the COMMIT records after the latest BASE (final images per batch, cutting first, so a crash
+//! midway replays again), fsync the db, append a BASE. By L3 the db holds every commit up to the
+//! BASE and otherwise only pages from records after it, so the result is exactly the state at the
+//! end of the valid log; the WAL plays no part.
 //!
 //! [`catch_up`] applies frames a takeover found on the stream after the log: each COMMIT is logged
 //! with an ACK, the log fsynced, the frames applied, the db fsynced, a BASE appended.

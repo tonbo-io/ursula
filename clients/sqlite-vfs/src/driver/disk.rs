@@ -66,6 +66,12 @@ pub(crate) enum DiskJob {
     },
     /// A complete build, published.
     Publish(Box<Build>),
+    /// A fresh build that found the stream missing, abandoned, then the open's local steps
+    /// again; done as a [`DiskDone::Prepared`].
+    Abandon {
+        build: Box<Build>,
+        spec: OpenSpec,
+    },
     /// One read of a takeover's catch-up in place, nothing pending.
     CatchUp {
         m: Box<Materialized>,
@@ -116,6 +122,9 @@ impl DiskJob {
                 DiskDone::Chunk { build, result }
             }
             Self::Publish(build) => DiskDone::Published(build.publish()),
+            Self::Abandon { build, spec } => {
+                DiskDone::Prepared(build.abandon().and_then(|()| prepare(&spec)))
+            }
             Self::CatchUp {
                 mut m,
                 frames,

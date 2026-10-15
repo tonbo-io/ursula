@@ -819,6 +819,11 @@ impl Core {
                 *local = Local::Busy;
                 self.disk(Owner::Disk(binding), DiskJob::Publish(build), ios);
             }
+            // A rebuild reads under its claim: it fails `deleted` instead, so this never comes.
+            BuildStep::Missing => {
+                *local = Local::Idle;
+                self.fail_open(binding, OpenError::Reset(ResetKind::Deleted));
+            }
             BuildStep::Fail(e) => {
                 *local = Local::Idle;
                 self.fail_open(binding, e);

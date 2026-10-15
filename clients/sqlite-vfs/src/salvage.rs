@@ -438,8 +438,28 @@ pub(crate) fn complete(dir: &Path, mut m: Manifest) -> Result<(), SalvageError> 
     write_manifest(dir, &m)
 }
 
-/// Completes every salvage of `root` still marked `moving`.
+/// Deletes the `manifest.json.tmp` a crash during [`write_manifest`] left in `dir`, if any.
+pub(crate) fn clear_tmp(dir: &Path) -> Result<(), SalvageError> {
+    let tmp = dir.join(format!("{MANIFEST}.tmp"));
+    match fs::remove_file(&tmp) {
+        Ok(()) => sync_dir(dir).map_err(io("fsync", dir)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io("remove", &tmp)(e)),
+    }
+}
+
+/// Completes every salvage of `root` still marked `moving`, and deletes the temporary manifests
+/// a crash left.
 pub(crate) fn finish(root: &Path) -> Result<(), SalvageError> {
+    let dir = root.join(DIR);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries {
+            let path = entry.map_err(io("list", &dir))?.path();
+            if path.is_dir() {
+                clear_tmp(&path)?;
+            }
+        }
+    }
     for s in list(root)? {
         if s.manifest.state == State::Moving {
             complete(&s.dir, s.manifest)?;

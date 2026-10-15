@@ -204,8 +204,7 @@ pub(crate) enum StreamState {
     BelowRetention {
         from: Offset,
     },
-    /// The stream changed history while a takeover's rebuild read it, or a fresh build started
-    /// over after a history change more times than it restarts.
+    /// A fresh build started over after a history change more times than it restarts.
     HistoryChanged,
     /// A commit or snapshot whose page 1 is not a SQLite database's.
     NotSqlite,
@@ -554,6 +553,9 @@ pub(crate) enum BuildStep {
     Restart,
     /// Everything is read and applied: publish (a disk job: [`Build::publish`]).
     Done,
+    /// A fresh build found the stream missing: it is abandoned and the open goes back through
+    /// the open table (a disk job: [`Build::abandon`], then [`prepare`]).
+    Missing,
     Fail(OpenError),
 }
 
@@ -622,6 +624,15 @@ impl Build {
                     Ok(Typed::Head {
                         stream: Some(head), ..
                     }) if answer.status == 200 => *head,
+                    // The stream is gone: a fresh build goes back through the open table, and a
+                    // rebuild's claim went with it.
+                    Ok(Typed::Head { stream: None, .. }) if answer.status == 404 => {
+                        self.succeeded();
+                        return match self.header.claim {
+                            None => BuildStep::Missing,
+                            Some(_) => BuildStep::Fail(OpenError::Reset(ResetKind::Deleted)),
+                        };
+                    }
                     _ => return self.failed(exchange, now_ms),
                 };
                 self.succeeded();
@@ -690,33 +701,27 @@ impl Build {
                 self.attempt = attempt;
                 BuildStep::Timer { at_ms, jitter_ms }
             }
-            // A `412` or a `404`: the HEAD tells whether the history changed.
-            Failure::Restart => match self.restarted() {
-                Ok(()) => {
-                    self.stage = BuildStage::Head;
-                    self.next()
-                }
-                Err(e) => BuildStep::Fail(e),
-            },
+            // A `412` or a `404`: the HEAD tells whether the history changed or the stream went.
+            // Only a changed history counts as a restart.
+            Failure::Restart => {
+                self.stage = BuildStage::Head;
+                self.next()
+            }
             Failure::Closed => BuildStep::Fail(OpenError::StreamState(StreamState::Closed)),
         }
     }
 
-    /// Counts a restart: past [`MAX_BUILD_RESTARTS`], or for a takeover's rebuild (which reads up
-    /// to its claim, in the history the claim landed in), the build gives up.
-    fn restarted(&mut self) -> Result<(), OpenError> {
-        self.restarts = self.restarts.saturating_add(1);
-        if self.header.claim.is_some() || self.restarts > MAX_BUILD_RESTARTS {
-            return Err(OpenError::StreamState(StreamState::HistoryChanged));
-        }
-        Ok(())
-    }
-
-    /// The stream changed history while a fresh build read it (design D8): it starts over in a
-    /// fresh `.tmp`, under the token the HEAD named.
+    /// The stream changed history while the build read it. A fresh build starts over in a fresh
+    /// `.tmp`, under the token the HEAD named (design D8), at most [`MAX_BUILD_RESTARTS`] times. A
+    /// takeover's rebuild reads up to its claim, which the new history may not hold: the takeover
+    /// resets `rewound`, and the reopen goes through the open table.
     fn history_changed(&mut self, incarnation: Incarnation) -> BuildStep {
-        if let Err(e) = self.restarted() {
-            return BuildStep::Fail(e);
+        if self.header.claim.is_some() {
+            return BuildStep::Fail(OpenError::Reset(ResetKind::Rewound));
+        }
+        self.restarts = self.restarts.saturating_add(1);
+        if self.restarts > MAX_BUILD_RESTARTS {
+            return BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged));
         }
         self.header.incarnation = incarnation;
         self.fetch.incarnation = incarnation;
@@ -823,6 +828,14 @@ impl Build {
         Ok(build)
     }
 
+    /// Disk job: deletes what the build wrote, its `.tmp`, and lets go of the root.
+    pub(crate) fn abandon(self) -> Result<(), OpenError> {
+        let Self { building, root, .. } = self;
+        let discarded = building.discard().map_err(local);
+        drop(root);
+        discarded
+    }
+
     /// Disk job: logs, acknowledges, fsyncs and applies one read's frames.
     pub(crate) fn apply(&mut self, frames: &[ForeignFrame]) -> Result<(), OpenError> {
         let db_path = self.building.db_path();
@@ -915,12 +928,7 @@ pub(crate) struct Replaced {
 }
 
 /// The local generation the open found.
-#[derive(Debug)]
-enum Found {
-    None,
-    Replaced(Replaced),
-    Trusted(Box<Materialized>),
-}
+type Found = Local<Box<Materialized>, Replaced>;
 
 /// What the local steps of an open found.
 #[derive(Debug)]
@@ -948,13 +956,13 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
     })?;
     root.finish_leftovers().map_err(local)?;
     let found = match root.current_or_unreadable().map_err(local)? {
-        None => Found::None,
+        None => Local::None,
         Some(Err(unreadable)) => {
             log::emit(Level::Warn, "generation_replaced", &[
                 ("dir", &unreadable.dir.display()),
                 ("error", &unreadable.error),
             ]);
-            Found::Replaced(Replaced {
+            Local::Replaced(Replaced {
                 lineage: None,
                 cluster_id: None,
                 plain: plain_db(&unreadable.dir),
@@ -969,7 +977,7 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
                         expected: name.as_str().to_owned(),
                     }));
                 }
-                Found::Trusted(Box::new(m))
+                Local::Trusted(summary(&m), Box::new(m))
             }
             // Refused before anything was written: the generation stays as it was found.
             Err(e) if e.is_replaced() => {
@@ -977,7 +985,7 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
                     ("dir", &generation.dir.display()),
                     ("error", &e),
                 ]);
-                Found::Replaced(Replaced {
+                Local::Replaced(Replaced {
                     lineage: Some(generation.lineage),
                     cluster_id: generation.first_header().ok().map(|h| h.cluster_id),
                     plain: matches!(e, LocalError::Unmarked { .. }),
@@ -1004,13 +1012,13 @@ fn summary(m: &Materialized) -> LocalSummary {
     }
 }
 
-/// Whether the log holds a commit of the generation after its latest ACK. A stream frame a
-/// catch-up logged is followed by an ACK, or the log's open cut it.
+/// Whether the log holds any COMMIT record after its latest ACK, own or caught up. The log's open
+/// cuts caught-up ones no ACK follows, so this is the generation's pending commits, checked whole.
 fn unacked(m: &Materialized) -> Unacked {
-    if m.recovered.pending().is_empty() {
-        Unacked::Nothing
-    } else {
+    if m.recovered.commit_after_ack() {
         Unacked::Commits
+    } else {
+        Unacked::Nothing
     }
 }
 
@@ -1354,6 +1362,16 @@ impl Opening {
                     job: DiskJob::Publish(build),
                 }
             }
+            // The open starts again from its local steps, its root lock let go first.
+            BuildStep::Missing => {
+                self.prepared = None;
+                self.phase = Phase::Preparing;
+                let spec = self.spec.clone();
+                OpenStep::Disk {
+                    opening: self,
+                    job: DiskJob::Abandon { build, spec },
+                }
+            }
             BuildStep::Fail(e) => OpenStep::Fail(e),
         }
     }
@@ -1423,7 +1441,8 @@ impl Opening {
         match &answer.typed {
             Ok(Typed::Created { .. }) => {
                 self.retry.succeeded();
-                self.created = true;
+                // A `200` names a stream that existed: only a `201` is ours.
+                self.created |= answer.status == 201;
                 self.phase = Phase::Head;
                 OpenStep::Send {
                     opening: self,
@@ -1457,12 +1476,7 @@ impl Opening {
         let Some(prepared) = &mut self.prepared else {
             return OpenStep::Fail(OpenError::Panicked);
         };
-        let found = std::mem::replace(&mut prepared.found, Found::None);
-        let (local, replaced) = match found {
-            Found::None => (Local::None, None),
-            Found::Replaced(replaced) => (Local::Replaced, Some(replaced)),
-            Found::Trusted(m) => (Local::Trusted(summary(&m), m), None),
-        };
+        let local = std::mem::replace(&mut prepared.found, Local::None);
         let seen = HeadSeen {
             identity: identity.as_ref(),
             stream: stream.as_ref(),
@@ -1472,21 +1486,14 @@ impl Opening {
             recreate: self.spec.recreate,
             created: self.created,
         };
-        // What the open found stays for a later HEAD unless a row takes it.
-        let keep = |prepared: &mut Prepared, local: Option<Box<Materialized>>| {
-            prepared.found = match (local, replaced.clone()) {
-                (Some(m), _) => Found::Trusted(m),
-                (None, Some(replaced)) => Found::Replaced(replaced),
-                (None, None) => Found::None,
-            };
-        };
         match table::decide(local, asked, seen) {
             OpenRow::Refuse { refused, local } => {
-                keep(prepared, local);
+                prepared.found = local;
                 OpenStep::Fail(refused.into())
             }
+            // What the open found stays for the HEAD after the create.
             OpenRow::Create { local } => {
-                keep(prepared, local);
+                prepared.found = local;
                 self.phase = Phase::Create;
                 OpenStep::Send {
                     opening: self,
@@ -1513,32 +1520,21 @@ impl Opening {
                 let stream = Some(head.incarnation());
                 let fate = match superseded {
                     Superseded::Nothing | Superseded::Trash(_) => Fate::Trash,
-                    Superseded::Salvage {
-                        reason,
-                        local: Some(m),
-                    } => Fate::Salvage(salvage_manifest(&m, reason, stream)),
-                    Superseded::Salvage {
-                        reason,
-                        local: None,
-                    } => {
-                        let replaced = replaced.unwrap_or(Replaced {
-                            lineage: None,
-                            cluster_id: None,
-                            plain: false,
-                        });
-                        Fate::Salvage(Manifest {
-                            reason,
-                            state: State::Moving,
-                            time: utc_now(),
-                            path: self.name.as_str().to_owned(),
-                            cluster_id: replaced.cluster_id,
-                            lineage: replaced.lineage,
-                            incarnation: None,
-                            stream_incarnation: stream,
-                            acknowledged: None,
-                            plain: replaced.plain,
-                        })
+                    Superseded::Salvage { reason, local } => {
+                        Fate::Salvage(salvage_manifest(&local, reason, stream))
                     }
+                    Superseded::Replaced(replaced) => Fate::Salvage(Manifest {
+                        reason: Reason::Replaced,
+                        state: State::Moving,
+                        time: utc_now(),
+                        path: self.name.as_str().to_owned(),
+                        cluster_id: replaced.cluster_id,
+                        lineage: replaced.lineage,
+                        incarnation: None,
+                        stream_incarnation: stream,
+                        acknowledged: None,
+                        plain: replaced.plain,
+                    }),
                 };
                 let job = DiskJob::NewBuild(NewBuild {
                     root: Arc::clone(&prepared.root),
