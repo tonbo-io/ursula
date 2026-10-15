@@ -8,6 +8,7 @@ on:
       - Cargo.toml
       - scripts/crates_release.py
       - scripts/test_crates_release.py
+      - scripts/release-source-branch.sh
       - scripts/validate-release-version.sh
       - scripts/test_validate_release_version.sh
   workflow_call:

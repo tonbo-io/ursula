@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       source_revision:
-        description: Exact 40-character current main commit
+        description: Exact 40-character HEAD of main, or of release/<major>.<minor> for a patch
         required: true
         type: string
       confirm:
@@ -29,12 +29,13 @@ concurrency:
 
 jobs:
   validate:
-    name: Authorize exact main release
+    name: Authorize exact branch-head release
     runs-on: ubuntu-24.04
     outputs:
       chaos_image_latest: ${{ steps.latest.outputs.chaos_image_latest }}
       image_latest: ${{ steps.latest.outputs.image_latest }}
       is_highest: ${{ steps.latest.outputs.is_highest }}
+      source_ref: ${{ steps.release.outputs.source_ref }}
       source_revision: ${{ steps.release.outputs.source_revision }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -61,13 +62,14 @@ jobs:
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
           # The image attestations name the ref and commit this run was
-          # dispatched on as the build source, so dispatch it on main at the
-          # commit it releases.
-          test "$RUN_REF" = refs/heads/main
+          # dispatched on as the build source, so dispatch it at the commit it
+          # releases, on main or, for a patch to an older line, on that line's
+          # release/<major>.<minor> branch.
+          branch="$(./scripts/release-source-branch.sh "$RELEASE_VERSION" "$RUN_REF")"
           test "$RUN_SHA" = "$SOURCE_REVISION"
 
-          git fetch origin main --no-tags
-          test "$(git rev-parse origin/main)" = "$SOURCE_REVISION"
+          git fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch" --no-tags
+          test "$(git rev-parse "refs/remotes/origin/$branch")" = "$SOURCE_REVISION"
           ./scripts/check-release-versions.sh
           workspace_version="$(awk '
             /^\[workspace\.package\]/ { in_section = 1; next }
@@ -80,10 +82,11 @@ jobs:
             --repo "$REPOSITORY" \
             --workflow CI \
             --commit "$SOURCE_REVISION" \
+            --branch "$branch" \
             --event push \
             --limit 20 \
-            --json conclusion,headSha \
-            --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .conclusion == "success")] | length')"
+            --json conclusion,headBranch,headSha \
+            --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .headBranch == "'"$branch"'" and .conclusion == "success")] | length')"
           test "$successful_ci" -ge 1
 
           tag="v${RELEASE_VERSION}"
@@ -100,8 +103,11 @@ jobs:
             fi
           fi
 
-          echo "source_revision=$SOURCE_REVISION" >>"$GITHUB_OUTPUT"
-          echo "version=$RELEASE_VERSION" >>"$GITHUB_OUTPUT"
+          {
+            echo "source_ref=$RUN_REF"
+            echo "source_revision=$SOURCE_REVISION"
+            echo "version=$RELEASE_VERSION"
+          } >>"$GITHUB_OUTPUT"
 
       # The latest image tag moves only to a stable version above every other
       # stable release tag, so a patch to an older line or an X.Y.Z-patchN
@@ -238,6 +244,7 @@ jobs:
           IS_HIGHEST: ${{ needs.validate.outputs.is_highest }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
           SOURCE_REVISION: ${{ needs.validate.outputs.source_revision }}
         run: |
           set -euo pipefail
@@ -261,8 +268,8 @@ jobs:
           # The release tag resolves to the published index, which holds
           # exactly the two platform images and no attestation manifests.
           # Provenance and the SBOM are GitHub artifact attestations on the
-          # index digest, signed by the image's publish workflow on main at
-          # the released commit.
+          # index digest, signed by the image's publish workflow on the
+          # branch validate authorized, at the released commit.
           verify_image() {
             local image="$1" digest="$2" workflow="$3" expected_latest="$4"
             local index config latest predicate_type
@@ -293,7 +300,7 @@ jobs:
               gh attestation verify "oci://$image:$RELEASE_VERSION" \
                 --repo "$REPOSITORY" \
                 --signer-workflow "$REPOSITORY/.github/workflows/$workflow" \
-                --source-ref refs/heads/main \
+                --source-ref "$SOURCE_REF" \
                 --source-digest "$SOURCE_REVISION" \
                 --predicate-type "$predicate_type"
             done
