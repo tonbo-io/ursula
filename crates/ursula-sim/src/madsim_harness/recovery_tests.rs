@@ -190,15 +190,22 @@ pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u
         committed: metrics(cluster, group, node_id)
             .local_committed
             .map(|committed| committed.index),
-        restricted: gate(cluster, group, node_id) != RecoveryGateStatus::Open,
+        // A closed gate or an unsatisfied plan: the replica kept its vote
+        // while it may have lost entries (#581 section 4.5, `floor`).
+        restricted: gate(cluster, group, node_id) != RecoveryGateStatus::Open
+            || cluster.engines[&(group, node_id)]
+                .history()
+                .plan()
+                .is_some(),
     }
 }
 
 /// The recovery tool's plan (#581 section 4.5) from the members it reached:
 /// the leader is the member with the greatest last log id; when its last
-/// log term is below the highest vote term a restricted member holds (a
-/// stale entry is possible), every member cuts its log to what it knew was
-/// committed and the leader is the member with the greatest committed index.
+/// log term is below the highest vote term a restricted member (a closed
+/// gate or an unsatisfied plan) holds, a stale entry is possible, so every
+/// member cuts its log to what it knew was committed and the leader is the
+/// member with the greatest committed index.
 pub(super) fn recovery_plan(members: &[MemberView]) -> (u64, u64, bool) {
     let floor = members
         .iter()
@@ -247,6 +254,7 @@ pub(super) async fn recover_group(
         members.push(member_view(cluster, group, *node_id).await);
     }
     let (leader, point, cut) = recovery_plan(&members);
+    cluster.plan_leaders.insert(leader);
     members.sort_by_key(|member| member.node_id == leader);
     let mut restart = Vec::new();
     let mut plan = None;
@@ -339,7 +347,18 @@ async fn lead_every_group(cluster: &JournalCluster, leader: u64, context: &str) 
 
 /// No vote was granted by a replica whose gate was closed.
 fn assert_no_vote_while_gated(cluster: &JournalCluster, context: &str) {
-    let granted = cluster.votes.granted_while_gated();
+    // A planned replica votes for its plan's leader (#581 section 4.5).
+    let granted = cluster
+        .votes
+        .granted_while_gated()
+        .into_iter()
+        .filter(|answer| {
+            answer.target_gate != Some(RecoveryGateStatus::Planned)
+                || !answer
+                    .source
+                    .is_some_and(|source| cluster.plan_leaders.contains(&source))
+        })
+        .collect::<Vec<_>>();
     assert!(
         granted.is_empty(),
         "{context}: gated replicas granted votes: {granted:?}"

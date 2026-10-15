@@ -34,6 +34,8 @@ use super::has_retry_cold_write_after_failure_in_fault_plan;
 use super::has_stop_current_leader_in_fault_plan;
 use super::has_stop_seeded_follower_in_fault_plan;
 use super::has_verify_runtime_cold_live_reads_in_fault_plan;
+use super::history::run_rewind_applies_exactly_once_inner;
+use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
 use super::leader_reads::run_leader_read_linearizability_inner;
 use super::run_cold_delete_fault_inner;
@@ -256,6 +258,29 @@ impl ThreeNodeRaftSim {
             | SimScenario::IdleExpiryCannotReopenAnEpoch => {
                 Self::run_write_keys_with_controls_report(config, scenario, Controls::default())
             }
+            SimScenario::HistoryRewindUnderLeaderChurn | SimScenario::StaleWritersAfterRestore => {
+                Self::run_history_report(config, scenario)
+            }
+        }
+    }
+
+    /// Runs a history-identity scenario (#581 section 10).
+    pub(super) fn run_history_report(
+        config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
+    ) -> SimReport {
+        let seed = config.seed;
+        match scenario {
+            SimScenario::StaleWritersAfterRestore => report_of(
+                scenario,
+                seed,
+                run_stale_writers_never_apply_after_restore_inner(config),
+            ),
+            _ => report_of(
+                SimScenario::HistoryRewindUnderLeaderChurn,
+                seed,
+                run_rewind_applies_exactly_once_inner(config),
+            ),
         }
     }
 

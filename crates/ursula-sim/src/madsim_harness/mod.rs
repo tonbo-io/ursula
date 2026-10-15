@@ -157,6 +157,8 @@ pub enum SimScenario {
     LeaderReadLinearizability,
     ProducerRepeatsExactlyOnce,
     IdleExpiryCannotReopenAnEpoch,
+    HistoryRewindUnderLeaderChurn,
+    StaleWritersAfterRestore,
 }
 
 #[derive(Clone)]
@@ -200,6 +202,8 @@ impl SimScenario {
             Self::LeaderReadLinearizability => "leader-read-linearizability",
             Self::ProducerRepeatsExactlyOnce => "producer-repeats-exactly-once",
             Self::IdleExpiryCannotReopenAnEpoch => "idle-expiry-cannot-reopen-an-epoch",
+            Self::HistoryRewindUnderLeaderChurn => "history-rewind-under-leader-churn",
+            Self::StaleWritersAfterRestore => "stale-writers-after-restore",
         }
     }
 }
@@ -534,6 +538,7 @@ use cold_path::run_cold_read_fault_inner;
 use cold_path::run_cold_read_truncate_inner;
 use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
+mod history;
 mod http;
 mod leader_reads;
 mod write_keys;
@@ -802,6 +807,16 @@ impl MadsimRuntimeRaftNetworkFactory {
     fn with_aggressive_snapshot_purge(mut self) -> Self {
         self.aggressive_snapshot_purge = true;
         self
+    }
+
+    /// The history every retained follower applied last.
+    fn follower_histories(&self) -> Vec<(u64, Option<ursula_runtime::HistoryEvent>)> {
+        self.followers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .map(|(node_id, engine)| (*node_id, engine.history().applied()))
+            .collect()
     }
 
     fn leader_id(&self, raft_group_id: RaftGroupId) -> Option<u64> {
@@ -1388,6 +1403,20 @@ impl GroupEngine for MadsimScopedGroupEngine {
     fn shutdown<'a>(&'a mut self) -> GroupShutdownFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.shutdown().await
+        }))
+    }
+
+    fn history_watch(&self) -> Option<ursula_runtime::HistoryWatch> {
+        self.inner.history_watch()
+    }
+
+    fn import_group_state<'a>(
+        &'a mut self,
+        request: ursula_runtime::ImportGroupStateRequest,
+        placement: ShardPlacement,
+    ) -> ursula_runtime::GroupImportGroupStateFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.import_group_state(request, placement).await
         }))
     }
 }

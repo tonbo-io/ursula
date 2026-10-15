@@ -24,6 +24,7 @@ ursula-shard = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }
 madsim = { workspace = true }
+rmp-serde = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 ursula = { workspace = true }
 ursula-ctl = { workspace = true }

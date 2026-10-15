@@ -382,6 +382,9 @@ pub(super) struct JournalCluster {
     /// Replicas whose startup replay stopped at a committed record, by the
     /// failing index. They have no engine.
     replay_stopped: BTreeMap<(u32, u64), u64>,
+    /// The leaders recovery plans elected: a planned replica votes for its
+    /// plan's leader only.
+    pub(super) plan_leaders: std::collections::BTreeSet<u64>,
 }
 
 impl JournalCluster {
@@ -463,6 +466,7 @@ impl JournalCluster {
             acknowledged: BTreeMap::new(),
             faulty: None,
             replay_stopped: BTreeMap::new(),
+            plan_leaders: std::collections::BTreeSet::new(),
         }
     }
 

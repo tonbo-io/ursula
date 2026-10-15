@@ -50,7 +50,10 @@ jobs:
             --seed-family leader-read-linearizability-extended \
             --seed-family producer-repeats-exactly-once \
             --seed-family producer-repeats-exactly-once-extended \
-            --seed-family idle-expiry-cannot-reopen-an-epoch
+            --seed-family idle-expiry-cannot-reopen-an-epoch \
+            --seed-family history-rewind-under-leader-churn \
+            --seed-family history-rewind-under-leader-churn-extended \
+            --seed-family stale-writers-after-restore
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

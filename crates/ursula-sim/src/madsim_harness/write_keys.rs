@@ -177,20 +177,45 @@ fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: Strin
 }
 
 /// A runtime over a three-node group, its HTTP router and its clock.
-struct Cluster {
-    app: Router,
+pub(super) struct Cluster {
+    pub(super) app: Router,
     policy: InProcessRaftNetworkPolicy,
-    runtime: ShardRuntime,
-    factory: MadsimRuntimeRaftNetworkFactory,
-    placement: ShardPlacement,
+    pub(super) runtime: ShardRuntime,
+    pub(super) factory: MadsimRuntimeRaftNetworkFactory,
+    pub(super) placement: ShardPlacement,
     now_ms: Arc<AtomicU64>,
-    path: String,
+    pub(super) path: String,
     incarnation: String,
-    leader_kills: u64,
+    pub(super) leader_kills: u64,
 }
 
 impl Cluster {
-    async fn start(config: &ThreeNodeRaftSimConfig, trace: &mut SimTrace) -> Self {
+    pub(super) async fn start(config: &ThreeNodeRaftSimConfig, trace: &mut SimTrace) -> Self {
+        let mut cluster = Self::start_empty(config, trace).await;
+        let create = send(
+            &cluster.app,
+            "PUT",
+            &cluster.path,
+            &[("content-type", CONTENT_TYPE)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+        cluster.incarnation = create
+            .headers()
+            .get("stream-incarnation")
+            .and_then(|value| value.to_str().ok())
+            .expect("a created stream names its incarnation")
+            .to_owned();
+        trace.push(SimEvent::StreamCreated {
+            stream: config.stream.clone(),
+        });
+        cluster
+    }
+
+    /// A cluster whose group holds nothing yet: no stream, only the group's
+    /// genesis once its first leader proposed it.
+    pub(super) async fn start_empty(config: &ThreeNodeRaftSimConfig, trace: &mut SimTrace) -> Self {
         let policy = sim_network_policy();
         let factory = MadsimRuntimeRaftNetworkFactory::new(config.seed, policy.clone());
         let mut runtime_config = RuntimeConfig::new(1, 1);
@@ -210,24 +235,11 @@ impl Cluster {
         let app = router_with_http_state(state);
         trace.push(SimEvent::ClusterBuilt { seed: config.seed });
         let path = format!("/{}/{}", config.stream.bucket_id, config.stream.stream_id);
-        let create = send(
-            &app,
-            "PUT",
-            &path,
-            &[("content-type", CONTENT_TYPE)],
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let incarnation = create
-            .headers()
-            .get("stream-incarnation")
-            .and_then(|value| value.to_str().ok())
-            .expect("a created stream names its incarnation")
-            .to_owned();
-        trace.push(SimEvent::StreamCreated {
-            stream: config.stream.clone(),
-        });
+        // Building the group elects its first leader.
+        runtime
+            .warm_all_groups()
+            .await
+            .expect("start the group's replicas");
         let placement = runtime.locate(&config.stream);
         let leader_id = factory
             .leader_id(placement.raft_group_id)
@@ -241,7 +253,7 @@ impl Cluster {
             placement,
             now_ms,
             path,
-            incarnation,
+            incarnation: String::new(),
             leader_kills: 0,
         }
     }
@@ -249,7 +261,7 @@ impl Cluster {
     /// Kills the leader: the runtime drops its engine and the others elect
     /// a new leader. Returns the old leader, for [`Self::restart`] once no
     /// request holds its engine.
-    async fn kill_leader(&mut self, trace: &mut SimTrace, phase: &str) -> u64 {
+    pub(super) async fn kill_leader(&mut self, trace: &mut SimTrace, phase: &str) -> u64 {
         let old_leader_id = self
             .factory
             .unregister_current_leader(self.placement.raft_group_id)
@@ -285,11 +297,11 @@ impl Cluster {
     /// partition heals so the old one steps down and fails the write, and
     /// the runtime swaps engines. Returns the old leader, for
     /// [`Self::restart`], and the write's first answer.
-    async fn depose_isolated_leader(
+    pub(super) async fn depose_isolated_leader<T>(
         &mut self,
         trace: &mut SimTrace,
-        in_flight: madsim::task::JoinHandle<Answer>,
-    ) -> (u64, Answer) {
+        in_flight: madsim::task::JoinHandle<T>,
+    ) -> (u64, T) {
         let old_leader_id = self
             .factory
             .leader_id(self.placement.raft_group_id)
@@ -324,7 +336,7 @@ impl Cluster {
 
     /// Cuts the leader off from the followers: what it proposes now cannot
     /// commit.
-    fn isolate_leader(&self) {
+    pub(super) fn isolate_leader(&self) {
         let leader = self
             .factory
             .leader_id(self.placement.raft_group_id)
@@ -335,7 +347,7 @@ impl Cluster {
     }
 
     /// Heals every partition.
-    fn heal(&self) {
+    pub(super) fn heal(&self) {
         for a in 1..=3 {
             for b in 1..=3 {
                 self.policy.heal_bidirectional(a, b);
@@ -344,7 +356,7 @@ impl Cluster {
     }
 
     /// Restarts a killed node from its log as a follower.
-    async fn restart(&self, trace: &mut SimTrace, node_id: u64) {
+    pub(super) async fn restart(&self, trace: &mut SimTrace, node_id: u64) {
         self.factory
             .restart_follower(node_id)
             .await
@@ -380,7 +392,7 @@ impl Cluster {
     }
 
     /// The whole stream, read from offset 0.
-    async fn read_all(&self) -> Vec<u8> {
+    pub(super) async fn read_all(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         loop {
             let offset = u64::try_from(bytes.len()).expect("offset fits u64");

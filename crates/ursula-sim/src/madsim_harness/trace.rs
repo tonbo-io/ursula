@@ -633,6 +633,22 @@ pub enum SimEvent {
         tidied: bool,
         leader_kills: u64,
     },
+    /// `rewind_applies_exactly_once` held: a restore started one history,
+    /// which `answers` import answers named, across `leader_kills` kills.
+    HistoryRewindVerified {
+        stream: BucketStreamId,
+        answers: u64,
+        leader_kills: u64,
+    },
+    /// `stale_writers_never_apply_after_restore` held: `refused` writes of
+    /// the source's history were refused; `boundary_claims` claims of a
+    /// producer whose record did not survive applied, as documented.
+    StaleWritersVerified {
+        stream: BucketStreamId,
+        refused: u64,
+        boundary_claims: u64,
+        leader_kills: u64,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

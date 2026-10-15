@@ -291,6 +291,7 @@ pub use ursula_stream::StreamErrorContext;
 pub use ursula_stream::StreamSnapshot;
 pub use ursula_stream::WriteReceipt;
 pub use ursula_stream::draw_history_id;
+pub use ursula_stream::incarnation_token;
 pub use ursula_stream::validate_bucket_id;
 
 #[cfg(test)]

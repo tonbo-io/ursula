@@ -4719,6 +4719,7 @@ dependencies = [
  "blake3",
  "madsim",
  "openraft",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tower 0.5.3",
