@@ -20,6 +20,33 @@ use opentelemetry::metrics::Meter;
 use ursula_runtime::RuntimeMetrics;
 use ursula_runtime::RuntimeMetricsSnapshot;
 
+/// Register `ursula.cluster.info`, 1 with this node's `cluster_id` as a
+/// label, so dashboards and alerts tell deployments apart, and
+/// `ursula.raft.peer_cluster_refusals`, the Raft RPCs refused since start
+/// because the peer is in another cluster.
+pub(crate) fn register_cluster(
+    cluster_id: &ursula_headers::ClusterId,
+    registry: Option<ursula_raft::RaftGroupHandleRegistry>,
+) {
+    let label = KeyValue::new("cluster_id", cluster_id.to_string());
+    let _ = global::meter("ursula")
+        .u64_observable_gauge("ursula.cluster.info")
+        .with_description("1, labelled with this node's server.cluster_id")
+        .with_callback(move |observer| observer.observe(1, std::slice::from_ref(&label)))
+        .build();
+    let Some(registry) = registry else {
+        return;
+    };
+    let _ = global::meter("ursula-raft")
+        .u64_observable_counter("ursula.raft.peer_cluster_refusals")
+        .with_description(
+            "Raft RPCs refused since start because the peer is in another cluster; check \
+             server.cluster_id and raft.peers",
+        )
+        .with_callback(move |observer| observer.observe(registry.peer_cluster().refusals(), &[]))
+        .build();
+}
+
 /// Register `ursula.wal.recovering`: 1 while this node's Raft logs may be
 /// missing entries it acknowledged (see `ursula_raft::RecoveryState`).
 pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {

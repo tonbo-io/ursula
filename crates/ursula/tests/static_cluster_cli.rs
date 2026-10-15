@@ -1523,6 +1523,243 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// A node configured with another `server.cluster_id` (#581 section 6.5):
+/// a voter replaced with an empty WAL and a mistyped cluster id. Its peers
+/// refuse its Raft traffic and it refuses theirs, both sides report the other
+/// in readiness and count the refusals in metrics, and each logs the peer
+/// once. The two nodes that agree keep serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI cluster id test");
+        return;
+    };
+    const CLUSTER: &str = "static-cluster-cli";
+    const OTHER: &str = "another-cluster";
+    let ports = [free_port(), free_port(), free_port()];
+    let peers: Vec<(u64, String)> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let root = std::env::temp_dir().join(format!(
+        "ursula-cli-cluster-id-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    remove_test_path(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let mut configs = Vec::new();
+    for (index, (node_id, _)) in peers.iter().enumerate() {
+        let config_path = root.join(format!("node-{node_id}.toml"));
+        write_cluster_config(
+            &config_path,
+            ports[index],
+            *node_id,
+            2,
+            &peers,
+            *node_id == 1,
+            &root.join(format!("node-{node_id}-log")),
+        );
+        configs.push(config_path);
+    }
+    let mut children = configs
+        .iter()
+        .map(|config| spawn_node_with_cluster_config(binary, config))
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::new();
+    for (_, base_url) in &peers {
+        wait_until_ready(&client, base_url, &mut children).await;
+    }
+    let stream = format!("{}/benchcmp/cli-cluster-id", peers[0].1);
+    put_until_created(&client, &stream).await;
+    post_until_no_content(&client, &stream, "same-cluster").await;
+    let replicated = read_until_replicated(
+        &client,
+        &format!(
+            "{}/benchcmp/cli-cluster-id?offset=0&max_bytes=64",
+            peers[2].1
+        ),
+    )
+    .await;
+    assert_eq!(replicated, b"same-cluster");
+
+    // Node 3 comes back on an empty disk, configured for another cluster.
+    drop(children.pop());
+    remove_test_path(root.join("node-3-log"));
+    let config = std::fs::read_to_string(&configs[2]).expect("read node 3 config");
+    let other = config.replace(
+        &format!("cluster_id = \"{CLUSTER}\""),
+        &format!("cluster_id = \"{OTHER}\""),
+    );
+    assert_ne!(config, other, "node 3's config names the cluster id");
+    std::fs::write(&configs[2], other).expect("write node 3 config");
+    children.push(spawn_node_with_cluster_config(binary, &configs[2]));
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
+
+    let mismatch = |node_id: u64, cluster_id: &str| ursula_proto::admin::PeerClusterMismatch {
+        node_id,
+        cluster_id: cluster_id.to_owned(),
+    };
+    // A leader's appends to node 3 are refused there, so both report the
+    // other. Either of nodes 1 and 2 may lead the groups.
+    let (leader, _, leader_ready) =
+        wait_any_peer_cluster_mismatch(&client, &peers[..2], &mut children, |ready| {
+            ready.peer_cluster_mismatch.contains(&mismatch(3, OTHER))
+        })
+        .await;
+    assert_eq!(leader_ready.cluster_id, CLUSTER);
+    let (_, other_status, other_ready) =
+        wait_any_peer_cluster_mismatch(&client, &peers[2..], &mut children, |ready| {
+            !ready.peer_cluster_mismatch.is_empty()
+        })
+        .await;
+    assert_eq!(other_ready.cluster_id, OTHER);
+    assert_eq!(
+        other_status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "{other_ready:?}"
+    );
+    assert_eq!(
+        other_ready.reason,
+        Some(ursula_proto::admin::ServingReadinessReason::PeerClusterMismatch),
+        "{other_ready:?}"
+    );
+    assert!(
+        other_ready
+            .peer_cluster_mismatch
+            .iter()
+            .all(|peer| peer.cluster_id == CLUSTER && peer.node_id != 3),
+        "{other_ready:?}"
+    );
+
+    // Nodes 1 and 2 are a quorum of their own cluster and keep serving:
+    // the misconfigured peer does not take them out of service.
+    post_until_no_content(&client, &stream, "-still-serving").await;
+    let replicated = read_until_matches(
+        &client,
+        &format!(
+            "{}/benchcmp/cli-cluster-id?offset=0&max_bytes=64",
+            peers[1].1
+        ),
+        b"same-cluster-still-serving",
+    )
+    .await;
+    assert_eq!(replicated, b"same-cluster-still-serving");
+    let leader_node = &peers[leader..=leader];
+    let (_, status, _) =
+        wait_any_peer_cluster_mismatch(&client, leader_node, &mut children, |ready| {
+            ready.ready && ready.peer_cluster_mismatch.contains(&mismatch(3, OTHER))
+        })
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // Metrics name each node's cluster and count the refusals.
+    for (node, cluster) in [(leader, CLUSTER), (2, OTHER)] {
+        let metrics: serde_json::Value = client
+            .get(format!("{}/__ursula/metrics", peers[node].1))
+            .send()
+            .await
+            .expect("metrics")
+            .json()
+            .await
+            .expect("metrics JSON");
+        assert_eq!(metrics["cluster_id"], cluster, "{metrics}");
+        assert!(
+            metrics["raft_grpc_peer_cluster_refusals"]
+                .as_u64()
+                .is_some_and(|refusals| refusals > 1),
+            "{metrics}"
+        );
+        assert!(
+            metrics["peer_cluster_mismatch"]
+                .as_array()
+                .is_some_and(|peers| !peers.is_empty()),
+            "{metrics}"
+        );
+    }
+
+    // Each node logs a refused peer once, however often it retries.
+    let leader_log =
+        strip_ansi(&std::fs::read_to_string(&children[leader].stderr_path).expect("leader stderr"));
+    let logged = leader_log
+        .lines()
+        .filter(|line| {
+            line.contains("refusing Raft traffic with a peer of another cluster")
+                && line.contains("peer_node_id=3")
+        })
+        .count();
+    assert_eq!(logged, 1, "{leader_log}");
+
+    drop(children);
+    std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
+/// `text` without its ANSI escape sequences (the colors of a log line).
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // `ESC [ parameters final-byte`: skip through the final byte.
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+    plain
+}
+
+/// Polls the readiness of `nodes` until one's answer satisfies `done`, and
+/// returns its index in `nodes` and its answer.
+async fn wait_any_peer_cluster_mismatch(
+    client: &reqwest::Client,
+    nodes: &[(u64, String)],
+    children: &mut [ChildGuard],
+    done: impl Fn(&ursula_proto::admin::ServingReadiness) -> bool,
+) -> (
+    usize,
+    reqwest::StatusCode,
+    ursula_proto::admin::ServingReadiness,
+) {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .unwrap();
+    loop {
+        if let Some(report) = exited_child_report(children) {
+            panic!("a node exited while waiting for a peer cluster mismatch:\n{report}");
+        }
+        let mut answers = Vec::new();
+        for (index, (_, base_url)) in nodes.iter().enumerate() {
+            let response = client
+                .get(format!("{base_url}/__ursula/ready"))
+                .send()
+                .await
+                .expect("readiness");
+            let status = response.status();
+            let ready: ursula_proto::admin::ServingReadiness =
+                response.json().await.expect("readiness JSON");
+            if done(&ready) {
+                return (index, status, ready);
+            }
+            answers.push(ready);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no node reported the peer cluster mismatch: {answers:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     let _guard = static_cluster_cli_test_guard().await;

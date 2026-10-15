@@ -35,6 +35,8 @@ jq '{physical: .wal_physical_bytes, segments: .wal_segments, reclaims: .wal_recl
 jq '{opening: .wal_recovery, gates: .recovery_gates}' metrics.json
 # Local Raft issues that make the node unready or block maintenance
 jq '.raft_maintenance | {node_issues, group_issues}' metrics.json
+# This node's cluster id, and Raft traffic refused for another one
+jq '{cluster_id, refusals: .raft_grpc_peer_cluster_refusals, peers: .peer_cluster_mismatch}' metrics.json
 ```
 
 `GET /__ursula/ready` is the process readiness probe. It answers `200` when the
@@ -45,6 +47,7 @@ it reports the first of:
 | -------- | ------- |
 | `format_epoch_mismatch` | The node exchanged a Raft RPC with a peer of another format epoch. It stays unready until it restarts |
 | `wal_disk_pressure` | The WAL filesystem is below `raft.wal.min_available_size`, or its free-space check failed |
+| `peer_cluster_mismatch` | The node is unready, and a peer of another cluster id refused its Raft traffic or sent some within the last minute. The peers are listed under `peer_cluster_mismatch` |
 | `recovery_stalled` | A group's recovery gate on this node is stalled. The groups are listed under `recovery_stalled_groups` |
 | `recovery_gate_closed` | A group's recovery gate on this node is closed until the replica has applied a fresh barrier from the group's leader |
 | `raft_replica_unready` | A local replica is not a healthy voter. `raft_maintenance.group_issues` names the issue |
@@ -157,6 +160,10 @@ A configured peer runs a release of another format epoch (Ursula 0.7 speaks prot
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 
 The node exchanged a Raft RPC with a peer on another format epoch: a peer that was unreachable during the startup probe, or a node of another release that has this node in its peer list. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart.
+
+### `refusing Raft traffic with a peer of another cluster`
+
+The node and a configured peer have different `server.cluster_id` values: one of them is mistyped, or a peer URL points at a node of another deployment. Each refuses the other's Raft traffic. `/__ursula/ready` and `/__ursula/metrics` list the peer under `peer_cluster_mismatch` with the id it reported, and `raft_grpc_peer_cluster_refusals` counts the refusals. Find the node whose id differs from the rest of the deployment and correct its `server.cluster_id` or the peer URL. A node whose WAL already holds the wrong id refuses to start with the corrected one, so restart it on an empty WAL and let it rejoin as a [wiped node](/docs/operations#rejoining-a-wiped-node). The healthy nodes stop listing the peer a minute after its last refusal. See [Peers of another cluster](/docs/operations#peers-of-another-cluster).
 
 ### `/__ursula/ready` answers `503` with `recovery_gate_closed`
 

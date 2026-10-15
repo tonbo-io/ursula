@@ -917,6 +917,9 @@ pub struct MembershipQuery {
 /// by readers, so new server diagnostics cannot break maintenance tooling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetrics {
+    /// The node's `server.cluster_id` (`Ursula-Cluster-Id`): every node of
+    /// one deployment reports the same.
+    pub cluster_id: String,
     pub process_incarnation: ProcessIncarnation,
     #[serde(deserialize_with = "Option::deserialize")]
     pub process_node_id: Option<u64>,
@@ -1023,6 +1026,7 @@ mod metrics_contract_tests {
 
     fn complete() -> NodeMetrics {
         NodeMetrics {
+            cluster_id: "prod-eu-1".to_owned(),
             process_incarnation: ProcessIncarnation::from_bits(1),
             process_node_id: Some(1),
             maintenance_fence: MaintenanceFenceState::Unclaimed,
@@ -1166,6 +1170,9 @@ mod metrics_contract_tests {
 pub enum ServingReadinessReason {
     FormatEpochMismatch,
     WalDiskPressure,
+    /// The node is unready and a peer refused Raft traffic for another
+    /// cluster id, or sent some ([`ServingReadiness::peer_cluster_mismatch`]).
+    PeerClusterMismatch,
     RecoveryStalled,
     RecoveryGateClosed,
     RaftReplicaUnready,
@@ -1180,6 +1187,12 @@ pub struct ServingReadiness {
     pub ready: bool,
     #[serde(deserialize_with = "Option::deserialize")]
     pub reason: Option<ServingReadinessReason>,
+    /// The node's `server.cluster_id`.
+    pub cluster_id: String,
+    /// Peers whose Raft traffic was refused for another cluster id within
+    /// the last minute, either way. It does not fail readiness by itself:
+    /// a misconfigured node must not take its healthy peers out of service.
+    pub peer_cluster_mismatch: Vec<PeerClusterMismatch>,
     pub format_epoch_mismatch: bool,
     pub recovery_barriers_ready: bool,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -1190,6 +1203,14 @@ pub struct ServingReadiness {
     pub wal_min_available_bytes: u64,
     pub wal_resume_available_bytes: u64,
     pub wal_disk_stat_errors: u64,
+}
+
+/// A peer seen with another cluster id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerClusterMismatch {
+    pub node_id: u64,
+    /// The cluster id the peer sent or answered with.
+    pub cluster_id: String,
 }
 
 #[cfg(test)]
@@ -1204,6 +1225,10 @@ mod serving_readiness_tests {
                 "format_epoch_mismatch",
             ),
             (ServingReadinessReason::WalDiskPressure, "wal_disk_pressure"),
+            (
+                ServingReadinessReason::PeerClusterMismatch,
+                "peer_cluster_mismatch",
+            ),
             (ServingReadinessReason::RecoveryStalled, "recovery_stalled"),
             (
                 ServingReadinessReason::RecoveryGateClosed,

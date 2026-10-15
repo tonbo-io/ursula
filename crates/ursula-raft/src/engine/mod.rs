@@ -143,6 +143,9 @@ pub struct RaftGroupEngineOptions {
     /// leads without it (N1, #581 review). The gate is bound later by
     /// [`RaftGroupEngine::publish_recovery`].
     pub recovery: Option<Arc<crate::GroupRejoin>>,
+    /// This node as its peers know it, stamped on the reads and purges it
+    /// forwards to a leader. `None` for a replica without peers.
+    pub peer_identity: Option<crate::PeerIdentity>,
 }
 
 pub struct RaftGroupEngine {
@@ -162,6 +165,8 @@ pub struct RaftGroupEngine {
     /// The group's coalescing ReadIndex barrier, shared with the runtime and
     /// with forwarded gRPC reads (through the registry).
     pub(crate) read_barrier: Arc<ReadIndexBarrier>,
+    /// See [`RaftGroupEngineOptions::peer_identity`].
+    pub(crate) peer_identity: Option<crate::PeerIdentity>,
 }
 
 pub(crate) fn should_forward_stale_follower_read_error(
@@ -344,6 +349,7 @@ impl RaftGroupEngine {
             RaftGroupEngineOptions {
                 metrics,
                 cold_store,
+                peer_identity: Some(crate::peer_cluster::test_identity(node_id)),
                 ..Default::default()
             },
         )
@@ -398,6 +404,7 @@ impl RaftGroupEngine {
             snapshot_install,
             snapshot_metadata_path,
             recovery,
+            peer_identity,
         } = options;
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
@@ -469,6 +476,7 @@ impl RaftGroupEngine {
             placement,
             cold_store,
             cold_index_cache,
+            peer_identity,
         })
     }
 
@@ -865,12 +873,13 @@ impl RaftGroupEngine {
 /// A read the group leader answers: the forwarded RPC, which the runtime
 /// awaits outside the group actor.
 fn leader_read(
+    identity: Option<crate::PeerIdentity>,
     placement: ShardPlacement,
     leader_node: BasicNode,
     request: ReadStreamRequest,
 ) -> GroupReadRoute<GroupReadStreamParts> {
     GroupReadRoute::Leader(Box::pin(async move {
-        forward_read_stream_to_leader(placement, leader_node, request)
+        forward_read_stream_to_leader(identity, placement, leader_node, request)
             .await
             .map(GroupReadStreamParts::from_response)
     }))
@@ -1001,7 +1010,12 @@ impl GroupEngine for RaftGroupEngine {
                 && let Some(leader_node) = self.current_leader_node().await
             {
                 return Ok(GroupReadRoute::Leader(Box::pin(
-                    forward_head_stream_to_leader(placement, leader_node, request),
+                    forward_head_stream_to_leader(
+                        self.peer_identity.clone(),
+                        placement,
+                        leader_node,
+                        request,
+                    ),
                 )));
             }
             if request.linearizable {
@@ -1095,7 +1109,12 @@ impl GroupEngine for RaftGroupEngine {
                 if !self.raft.is_leader()
                     && let Some(leader_node) = self.current_leader_node().await
                 {
-                    return Ok(leader_read(placement, leader_node, request));
+                    return Ok(leader_read(
+                        self.peer_identity.clone(),
+                        placement,
+                        leader_node,
+                        request,
+                    ));
                 }
                 self.require_linearizable_leader_read(
                     "leader-only read_stream",
@@ -1114,7 +1133,12 @@ impl GroupEngine for RaftGroupEngine {
                     Ok(false) => {}
                     Ok(true) | Err(_) => {
                         if let Some(leader_node) = self.current_leader_node().await {
-                            return Ok(leader_read(placement, leader_node, request));
+                            return Ok(leader_read(
+                                self.peer_identity.clone(),
+                                placement,
+                                leader_node,
+                                request,
+                            ));
                         }
                         self.require_local_leader_for_read("read_stream").await?;
                     }
@@ -1154,7 +1178,12 @@ impl GroupEngine for RaftGroupEngine {
                         // whether this stream/cursor actually exists.
                         let mut authoritative_request = original_request;
                         authoritative_request.leader_only = true;
-                        return Ok(leader_read(placement, leader_node, authoritative_request));
+                        return Ok(leader_read(
+                            self.peer_identity.clone(),
+                            placement,
+                            leader_node,
+                            authoritative_request,
+                        ));
                     }
                     return Err(self.not_leader_for_read("read_stream boundary").await);
                 }
@@ -1174,7 +1203,12 @@ impl GroupEngine for RaftGroupEngine {
                 if parts.payload_is_empty()
                     && let Some(leader_node) = self.current_leader_node().await
                 {
-                    return Ok(leader_read(placement, leader_node, original_request));
+                    return Ok(leader_read(
+                        self.peer_identity.clone(),
+                        placement,
+                        leader_node,
+                        original_request,
+                    ));
                 }
                 parts.up_to_date = false;
             }
@@ -1583,8 +1617,13 @@ impl GroupEngine for RaftGroupEngine {
                         true,
                     ));
                 };
-                return forward_purge_bucket_to_leader(self.placement, &leader_node, bucket_id)
-                    .await;
+                return forward_purge_bucket_to_leader(
+                    self.peer_identity.as_ref(),
+                    self.placement,
+                    &leader_node,
+                    bucket_id,
+                )
+                .await;
             }
             match self
                 .write(GroupWriteCommand::Stream(StreamCommand::PurgeBucket {

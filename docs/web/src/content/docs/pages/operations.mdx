@@ -34,6 +34,26 @@ from metrics. `ursulactl wait-ready` checks both the metrics and this existing
 readiness endpoint. `ursulactl status` presents leadership fields across the
 cluster.
 
+### Peers of another cluster
+
+Every Raft gRPC request a node sends, replication, votes, snapshots, recovery probes and forwarded reads included, carries the id its WAL holds (`server.cluster_id`) and its `raft.node_id` as the `ursula-cluster-id` and `ursula-node-id` request metadata. A node checks them before it decodes the request and refuses a peer with another id with `FAILED_PRECONDITION`, before any Raft RPC runs. The refusal names the refusing node's id, so the sender learns it as well. A mistyped `server.cluster_id` or a peer URL that points at another deployment therefore fails loudly instead of exchanging Raft traffic between two clusters. A node that sends no id runs an older format epoch and is refused as a [format-epoch mismatch](#upgrading-to-07).
+
+Both sides of a refusal report the other:
+
+- `/__ursula/ready` lists the peer under `peer_cluster_mismatch`, with its `node_id` and the `cluster_id` it sent or answered with, for a minute after its last refusal. It does not make a node unready by itself, so one misconfigured node does not take its healthy peers out of service. A node that is unready for another reason while it has such peers, such as the misconfigured node whose groups cannot reach their voters, reports `"reason": "peer_cluster_mismatch"`.
+- `/__ursula/metrics` counts every refusal, both ways, in `raft_grpc_peer_cluster_refusals`, and lists the same peers under `peer_cluster_mismatch`.
+- The node logs each refused peer once at error level while it keeps being refused, not once per RPC.
+
+At startup, a node's [format-epoch probe](#upgrading-to-07) also reports a configured peer of another cluster at error level and starts anyway. A refusal lasts until an operator fixes the configuration: correct `server.cluster_id` or the peer URL on the wrong node. A node whose WAL already holds another id refuses to start, so give a replaced node an empty WAL (see [Rejoining a wiped node](#rejoining-a-wiped-node)).
+
+`cluster_id` is in both `/__ursula/ready` and `/__ursula/metrics`, so tooling can check that every node of a deployment reports the same id:
+
+```bash
+for node in NODE1 NODE2 NODE3; do
+  curl -s http://$node:4437/__ursula/ready | jq -c '{cluster_id, peer_cluster_mismatch}'
+done
+```
+
 ## Admin endpoints
 
 These are the primitives `ursulactl` and any custom operator tooling builds on. They live on the **admin plane** (`server.admin_listen`, loopback `127.0.0.1:4438` by default), not the public client plane. Nodes expose no cluster-mutation surface on the network. Reach them over a tunnel to the admin port (see [ursulactl's operation providers](/docs/cli#the-admin-plane)). The examples below assume a forward from local `4438` to the node's admin plane. Each call is local to one node. To act on every group, loop over the IDs in metrics.

@@ -21,6 +21,7 @@ use super::RaftGroupEngine;
 use super::RaftGroupEngineOptions;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::RaftWal;
+use crate::peer_cluster::PeerIdentity;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RECOVERY_STALL_AFTER;
@@ -104,6 +105,9 @@ fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_
     base.saturating_add(seed.checked_rem(base).unwrap_or(0))
 }
 
+/// The Raft node id of every single-node group.
+const SINGLE_NODE_ID: u64 = 1;
+
 /// Single-node groups over the per-core journals of `log_stores`.
 #[derive(Debug, Clone)]
 pub struct DurableRaftGroupEngineFactory {
@@ -132,6 +136,12 @@ impl DurableRaftGroupEngineFactory {
     /// Publishes each live group's barrier, Raft handle and cold cache, or its
     /// terminal replay-failure diagnostics when committed application stops.
     pub fn with_registry(mut self, registry: RaftGroupHandleRegistry) -> Self {
+        // A single node has no peers, but its Raft gRPC plane still refuses a
+        // node of another cluster by the id of its WAL root.
+        registry.peer_cluster().bind(PeerIdentity::new(
+            SINGLE_NODE_ID,
+            self.log_stores.cluster_id().clone(),
+        ));
         self.registry = Some(registry);
         self
     }
@@ -167,7 +177,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
             let health = crate::apply_failure::ApplyHealth::default();
             let engine = RaftGroupEngine::new_single_node_observed(
                 placement,
-                1,
+                SINGLE_NODE_ID,
                 BasicNode::new("local"),
                 config,
                 log_store,
@@ -194,7 +204,11 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 if let Some(stopped) = health.stopped()
                     && let Some(registry) = &self.registry
                 {
-                    registry.register_apply_stopped(placement.raft_group_id, 1, stopped);
+                    registry.register_apply_stopped(
+                        placement.raft_group_id,
+                        SINGLE_NODE_ID,
+                        stopped,
+                    );
                 }
             })?;
             if let Some(registry) = &self.registry {
@@ -210,6 +224,8 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
 pub struct StaticGrpcRaftGroupEngineFactory {
     transports: Arc<Mutex<BTreeMap<u16, Arc<crate::grpc::CoreRaftTransport>>>>,
     node_id: u64,
+    /// This node and the cluster id of its WAL root, which its peers check.
+    identity: PeerIdentity,
     peers: BTreeMap<u64, String>,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     initialize_membership: bool,
@@ -226,7 +242,8 @@ pub struct StaticGrpcRaftGroupEngineFactory {
 
 impl StaticGrpcRaftGroupEngineFactory {
     /// Groups of a static gRPC cluster whose Raft logs live in `log_stores`'
-    /// journals; how they opened is published in `registry`.
+    /// journals; how they opened is published in `registry`, and the cluster
+    /// id their root holds is the one this node's peers must share.
     pub fn new(
         node_id: u64,
         peers: impl IntoIterator<Item = (u64, String)>,
@@ -235,9 +252,12 @@ impl StaticGrpcRaftGroupEngineFactory {
         log_stores: RaftWal,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
+        let identity = PeerIdentity::new(node_id, log_stores.cluster_id().clone());
+        registry.peer_cluster().bind(identity.clone());
         Self {
             transports: Arc::default(),
             node_id,
+            identity,
             peers: peers.into_iter().collect(),
             per_group_voters: BTreeMap::new(),
             initialize_membership,
@@ -459,6 +479,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .or_insert_with(|| {
                     Arc::new(crate::grpc::CoreRaftTransport::with_budget(
                         self.registry.append_send_budget.clone(),
+                        self.identity.clone(),
+                        self.registry.peer_cluster().clone(),
                     ))
                 })
                 .clone();
@@ -487,6 +509,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         .map(|(_, fault)| fault),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                     recovery: Some(rejoin.clone()),
+                    peer_identity: Some(self.identity.clone()),
                 },
                 health.clone(),
             )

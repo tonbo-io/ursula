@@ -254,6 +254,9 @@ pub struct RaftGroupHandleRegistry {
     snapshot_install: SnapshotInstallCoordinator,
     /// How this node's Raft WAL opened, when its logs are durable.
     wal_opening: Arc<Mutex<Option<WalOpening>>>,
+    /// This node's cluster identity on the Raft gRPC plane and the peers
+    /// refused for another cluster id.
+    peer_cluster: crate::peer_cluster::PeerCluster,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -270,6 +273,7 @@ impl Default for RaftGroupHandleRegistry {
             snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
             wal_opening: Arc::new(Mutex::new(None)),
+            peer_cluster: crate::peer_cluster::PeerCluster::default(),
         }
     }
 }
@@ -515,6 +519,12 @@ impl RaftGroupHandleRegistry {
             .wal_opening
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(opening);
+    }
+
+    /// This node's side of the cluster-id check between peers: its identity
+    /// once an engine factory binds its WAL's, and the peers it refused.
+    pub fn peer_cluster(&self) -> &crate::peer_cluster::PeerCluster {
+        &self.peer_cluster
     }
 
     /// How this node's Raft WAL opened; `None` until a WAL is attached.

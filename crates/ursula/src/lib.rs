@@ -128,7 +128,6 @@ use ursula_raft::RAFT_GRPC_APPEND_STREAM_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
-use ursula_raft::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use ursula_raft::RAFT_GRPC_REJOIN_BARRIER_PATH;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
@@ -373,6 +372,7 @@ impl HttpState {
     /// provider is installed.
     pub fn register_otel_metrics(&self) {
         otel_metrics::register(&self.runtime.metrics());
+        otel_metrics::register_cluster(self.cluster_id(), self.raft_registry.clone());
         if let Some(raft_wal) = &self.raft_wal {
             otel_metrics::register_wal_recovery(raft_wal.recovery_state());
         }
@@ -530,6 +530,26 @@ impl HttpState {
     /// The id this node sends as `Ursula-Cluster-Id`.
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
+    }
+
+    /// Peers refused on the Raft gRPC plane for another cluster id, in the
+    /// shape readiness and metrics report them.
+    fn peer_cluster_mismatches(&self) -> Vec<ursula_proto::admin::PeerClusterMismatch> {
+        self.raft_registry()
+            .map(|registry| registry.peer_cluster().mismatches())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peer| ursula_proto::admin::PeerClusterMismatch {
+                node_id: peer.node_id,
+                cluster_id: peer.cluster_id.to_string(),
+            })
+            .collect()
+    }
+
+    /// Raft RPCs refused for a cluster-id mismatch since start, both ways.
+    fn peer_cluster_refusals(&self) -> u64 {
+        self.raft_registry()
+            .map_or(0, |registry| registry.peer_cluster().refusals())
     }
 
     pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::RaftWal> {
@@ -973,13 +993,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
 fn raft_grpc_service(
     state: HttpState,
     registry: RaftGroupHandleRegistry,
-) -> raft_internal_proto::raft_internal_server::RaftInternalServer<HttpRaftGrpcService> {
-    raft_internal_proto::raft_internal_server::RaftInternalServer::new(HttpRaftGrpcService::new(
-        registry, state,
-    ))
-    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-    .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+) -> ursula_raft::RaftGrpcServer<HttpRaftGrpcService> {
+    let peer_cluster = registry.peer_cluster().clone();
+    ursula_raft::raft_grpc_server(HttpRaftGrpcService::new(registry, state), &peer_cluster)
 }
 
 pub fn router(runtime: ShardRuntime) -> Router {
@@ -1349,6 +1365,10 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .map(RaftGroupHandleRegistry::stalled_recovery_groups)
         .unwrap_or_default();
+    // Peers refused for another cluster id. They explain an unready node
+    // (its groups cannot reach their voters) but never fail readiness alone:
+    // one misconfigured node must not take its healthy peers out of service.
+    let peer_cluster_mismatch = state.peer_cluster_mismatches();
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1363,6 +1383,8 @@ async fn readiness(State(state): State<HttpState>) -> Response {
                 Some(Reason::FormatEpochMismatch)
             } else if disk.pressure {
                 Some(Reason::WalDiskPressure)
+            } else if !ready && !peer_cluster_mismatch.is_empty() {
+                Some(Reason::PeerClusterMismatch)
             } else if !stalled_groups.is_empty() {
                 Some(Reason::RecoveryStalled)
             } else if !recovery_ready {
@@ -1372,6 +1394,8 @@ async fn readiness(State(state): State<HttpState>) -> Response {
             } else {
                 None
             },
+            cluster_id: state.cluster_id().to_string(),
+            peer_cluster_mismatch,
             format_epoch_mismatch,
             recovery_barriers_ready: recovery_ready,
             raft_maintenance,
@@ -1828,6 +1852,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let wal_disk = state.wal_disk.snapshot();
     axum::Json(render::MetricsResponse {
         node: ursula_proto::admin::NodeMetrics {
+            cluster_id: state.cluster_id().to_string(),
             maintenance_fence: state.admin_fence.snapshot().await,
             maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
             process_incarnation: state.process_incarnation.clone(),
@@ -1863,6 +1888,8 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         wal_resume_available_bytes: wal_disk.resume_available_bytes,
         wal_disk_pressure: wal_disk.pressure,
         wal_disk_stat_errors: wal_disk.stat_errors,
+        raft_grpc_peer_cluster_refusals: state.peer_cluster_refusals(),
+        peer_cluster_mismatch: state.peer_cluster_mismatches(),
     })
     .into_response()
 }

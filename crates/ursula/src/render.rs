@@ -567,6 +567,11 @@ pub(crate) struct MetricsResponse {
     pub wal_resume_available_bytes: u64,
     pub wal_disk_pressure: bool,
     pub wal_disk_stat_errors: u64,
+    /// Raft RPCs refused since start because the peer is in another
+    /// cluster, inbound and outbound.
+    pub raft_grpc_peer_cluster_refusals: u64,
+    /// The peers refused for another cluster id within the last minute.
+    pub peer_cluster_mismatch: Vec<ursula_proto::admin::PeerClusterMismatch>,
 }
 
 #[derive(serde::Serialize)]

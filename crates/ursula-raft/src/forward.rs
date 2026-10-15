@@ -30,6 +30,7 @@ use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
 use crate::grpc::RaftClient;
 use crate::peer_channel::peer_endpoint;
+use crate::peer_cluster::PeerIdentity;
 use crate::raft_internal_proto;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::RaftGroupResponse;
@@ -41,12 +42,14 @@ use crate::types::UrsulaRaftTypeConfig;
     fields(group = placement.raft_group_id.0, bucket = %request.stream_id.bucket_id, stream = %request.stream_id.stream_id),
 )]
 pub(crate) async fn forward_head_stream_to_leader(
+    identity: Option<PeerIdentity>,
     placement: ShardPlacement,
     leader_node: BasicNode,
     request: HeadStreamRequest,
 ) -> Result<HeadStreamResponse, GroupEngineError> {
     let head = head_stream_read_v1(&request);
     forward_typed_read_to_leader(
+        identity.as_ref(),
         placement,
         &leader_node,
         request.stream_id,
@@ -63,12 +66,14 @@ pub(crate) async fn forward_head_stream_to_leader(
     fields(group = placement.raft_group_id.0, bucket = %request.stream_id.bucket_id, stream = %request.stream_id.stream_id, offset = request.offset),
 )]
 pub(crate) async fn forward_read_stream_to_leader(
+    identity: Option<PeerIdentity>,
     placement: ShardPlacement,
     leader_node: BasicNode,
     request: ReadStreamRequest,
 ) -> Result<ReadStreamResponse, GroupEngineError> {
     let read = read_stream_read_v1(&request)?;
     forward_typed_read_to_leader(
+        identity.as_ref(),
         placement,
         &leader_node,
         request.stream_id,
@@ -106,6 +111,7 @@ pub(crate) fn read_stream_read_v1(
 /// two public forwarders above differ only in the read variant they
 /// construct and the decode target, so they all funnel through here.
 async fn forward_typed_read_to_leader<T>(
+    identity: Option<&PeerIdentity>,
     placement: ShardPlacement,
     leader_node: &BasicNode,
     stream_id: BucketStreamId,
@@ -117,7 +123,8 @@ where
     T: DeserializeOwned,
 {
     let response =
-        forward_group_read_to_leader(placement, leader_node, stream_id, now_ms, read).await?;
+        forward_group_read_to_leader(identity, placement, leader_node, stream_id, now_ms, read)
+            .await?;
     if response.ok {
         decode_wire(&response.payload, what)
     } else {
@@ -126,6 +133,7 @@ where
 }
 
 pub(crate) async fn forward_group_read_to_leader(
+    identity: Option<&PeerIdentity>,
     placement: ShardPlacement,
     leader_node: &BasicNode,
     stream_id: BucketStreamId,
@@ -143,6 +151,7 @@ pub(crate) async fn forward_group_read_to_leader(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     };
     call_leader(
+        identity,
         placement,
         &leader_node.addr,
         ForwardedRpc::GroupRead,
@@ -159,6 +168,7 @@ pub(crate) async fn forward_group_read_to_leader(
 /// replication. PurgeBucket has no per-stream admission step, and constraining
 /// this helper to that exact command keeps the exception narrow.
 pub(crate) async fn forward_purge_bucket_to_leader(
+    identity: Option<&PeerIdentity>,
     placement: ShardPlacement,
     leader_node: &BasicNode,
     bucket_id: String,
@@ -173,6 +183,7 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     };
     let response = call_leader(
+        identity,
         placement,
         &leader_node.addr,
         ForwardedRpc::GroupWrite,
@@ -240,6 +251,10 @@ impl std::fmt::Display for ForwardedRpc {
 /// Why a forwarded leader RPC got no answer from the leader's group.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
+    /// This replica has no peers (no [`PeerIdentity`]), so no leader to
+    /// forward to: nothing was sent.
+    #[error("{rpc} has no leader to go to: this replica has no Raft peers")]
+    NoPeers { rpc: ForwardedRpc },
     #[error("invalid gRPC leader endpoint {address}")]
     InvalidEndpoint {
         address: String,
@@ -338,6 +353,7 @@ fn is_transport_failure(status: &tonic::Status) -> bool {
 /// One forwarded leader RPC under [`FORWARD_RPC_TIMEOUT`]. A call that fails
 /// at the transport drops its cached channel, so the next one reconnects.
 async fn call_leader<Req, Resp, Fut>(
+    identity: Option<&PeerIdentity>,
     placement: ShardPlacement,
     address: &str,
     rpc: ForwardedRpc,
@@ -347,6 +363,9 @@ async fn call_leader<Req, Resp, Fut>(
 where
     Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
 {
+    let Some(identity) = identity else {
+        return Err(ForwardError::NoPeers { rpc });
+    };
     let started = crate::rt::time::Instant::now();
     let timed_out = || ForwardError::TimedOut {
         rpc,
@@ -361,7 +380,11 @@ where
         Ok(Err(error)) => error,
         Ok(Ok(leader)) => {
             let remaining = FORWARD_RPC_TIMEOUT.saturating_sub(started.elapsed());
-            let client = RaftClient::new(leader.channel.clone())
+            let client =
+                raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
+                    leader.channel.clone(),
+                    identity.clone(),
+                )
                 .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
             let mut request = tonic::Request::new(request);

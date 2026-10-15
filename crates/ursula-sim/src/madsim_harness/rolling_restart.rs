@@ -186,6 +186,7 @@ impl RollingRestartValidator {
             let view = NodeMetricsView {
                 node: synthetic_node_info(node_id),
                 metrics: ursula_proto::admin::NodeMetrics {
+                    cluster_id: "sim".to_owned(),
                     process_node_id: Some(node_id),
                     // This harness models Raft state directly, not an HTTP process.
                     process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(

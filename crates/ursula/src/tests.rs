@@ -603,6 +603,12 @@ struct StaticGrpcTestNodeStorage {
     snapshot_store: Option<ursula_runtime::SharedSnapshotStore>,
 }
 
+/// The cluster every static gRPC test node is in: peers refuse a node of
+/// another cluster.
+fn static_test_cluster_id() -> ursula_headers::ClusterId {
+    ursula_headers::ClusterId::new("static-grpc-test").expect("a valid cluster id")
+}
+
 async fn spawn_static_grpc_test_node(
     node_id: u64,
     listener: tokio::net::TcpListener,
@@ -621,10 +627,11 @@ async fn spawn_static_grpc_test_node(
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
     let (log_stores, wal_root) = match storage.raft_log_dir {
         Some(raft_log_dir) => (
-            ursula_raft::RaftWal::start(
+            ursula_raft::RaftWal::start_in_cluster(
                 raft_log_dir,
-                ursula_config::WalFsync::Always,
+                ursula_raft::JournalTuning::new(ursula_config::WalFsync::Always),
                 &ursula_shard::StaticShardMap::new(1, raft_group_count).expect("valid topology"),
+                Some(&static_test_cluster_id()),
             )
             .expect("start the Raft WAL"),
             None,
@@ -632,11 +639,12 @@ async fn spawn_static_grpc_test_node(
         None => {
             let wal_root = tempfile::tempdir().expect("WAL root");
             (
-                ursula_raft::RaftWal::start(
+                ursula_raft::RaftWal::start_in_cluster(
                     wal_root.path(),
-                    ursula_config::WalFsync::Never,
+                    ursula_raft::JournalTuning::new(ursula_config::WalFsync::Never),
                     &ursula_shard::StaticShardMap::new(1, raft_group_count)
                         .expect("valid topology"),
+                    Some(&static_test_cluster_id()),
                 )
                 .expect("start the Raft WAL"),
                 Some(wal_root),
@@ -2084,6 +2092,18 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
 }
 
+/// A transport that sends as a node of `registry`'s cluster.
+fn peer_transport(registry: &RaftGroupHandleRegistry) -> Arc<ursula_raft::CoreRaftTransport> {
+    let identity = registry
+        .peer_cluster()
+        .identity()
+        .expect("the engine factory bound the registry's cluster");
+    Arc::new(ursula_raft::CoreRaftTransport::new(
+        identity,
+        ursula_raft::PeerCluster::default(),
+    ))
+}
+
 #[tokio::test]
 async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -2096,7 +2116,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .warm_group(RaftGroupId(0))
         .await
         .expect("warm raft group");
-    let app = router_with_raft_registry(runtime.clone(), registry);
+    let app = router_with_raft_registry(runtime.clone(), registry.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -2146,7 +2166,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     assert!(!observed.maintenance_fence_uncertain);
 
     let mut network = ursula_raft::GrpcRaftNetwork::new(
-        Arc::default(),
+        peer_transport(&registry),
         RaftGroupId(0),
         1,
         format!("http://{addr}"),
@@ -2159,7 +2179,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .expect("send vote over gRPC Raft network");
 
     let mut missing_group = ursula_raft::GrpcRaftNetwork::new(
-        Arc::default(),
+        peer_transport(&registry),
         RaftGroupId(1),
         1,
         format!("http://{addr}"),
@@ -4079,8 +4099,12 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .await
         .expect("build leader snapshot");
     let vote = ursula_raft::UrsulaVote::new(1, 1);
-    let mut snapshot_network =
-        ursula_raft::GrpcRaftNetwork::new(Arc::default(), RaftGroupId(0), 2, peers[1].1.clone());
+    let mut snapshot_network = ursula_raft::GrpcRaftNetwork::new(
+        peer_transport(&nodes[0].registry),
+        RaftGroupId(0),
+        2,
+        peers[1].1.clone(),
+    );
     let _: SnapshotResponse<UrsulaRaftTypeConfig> = snapshot_network
         .full_snapshot(
             vote,

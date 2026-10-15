@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::codec::CompressionEncoding;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -58,6 +59,9 @@ use crate::format_epoch::observe_outbound_status;
 use crate::format_epoch::record_format_epoch_mismatch;
 use crate::forward::write_commands_on_raft;
 use crate::peer_channel::peer_endpoint;
+use crate::peer_cluster::ClusterCheck;
+use crate::peer_cluster::PeerCluster;
+use crate::peer_cluster::PeerIdentity;
 use crate::raft_internal_proto;
 use crate::rejoin::GroupRejoin;
 use crate::types::UrsulaAppendEntriesRequest;
@@ -80,6 +84,10 @@ fn reply_to<T>(tx: oneshot::Sender<T>, value: T) {
 #[derive(Debug)]
 pub struct CoreRaftTransport {
     pub(crate) budget: AppendTransportBudget,
+    /// Stamped on every request this transport sends.
+    identity: PeerIdentity,
+    /// Where a peer's refusal for another cluster id is recorded.
+    peer_cluster: PeerCluster,
     channels: Mutex<BTreeMap<String, SharedRaftChannel>>,
     sessions: Mutex<BTreeMap<String, SharedAppendSession>>,
 }
@@ -106,19 +114,38 @@ impl Default for AppendTransportBudget {
     }
 }
 impl CoreRaftTransport {
-    pub(crate) fn with_budget(budget: AppendTransportBudget) -> Self {
+    /// A transport that sends as `identity` and records peers that refuse it
+    /// for another cluster id in `peer_cluster`.
+    pub fn new(identity: PeerIdentity, peer_cluster: PeerCluster) -> Self {
+        Self::with_budget(
+            AppendTransportBudget::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES),
+            identity,
+            peer_cluster,
+        )
+    }
+
+    pub(crate) fn with_budget(
+        budget: AppendTransportBudget,
+        identity: PeerIdentity,
+        peer_cluster: PeerCluster,
+    ) -> Self {
         Self {
             channels: Mutex::default(),
             sessions: Mutex::default(),
             budget,
+            identity,
+            peer_cluster,
         }
     }
 }
+/// A transport of the test cluster ([`crate::peer_cluster::test_identity`]).
+#[cfg(test)]
 impl Default for CoreRaftTransport {
     fn default() -> Self {
-        Self::with_budget(AppendTransportBudget::new(
-            RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES,
-        ))
+        Self::new(
+            crate::peer_cluster::test_identity(0),
+            PeerCluster::default(),
+        )
     }
 }
 static GRPC_APPEND_STREAM_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
@@ -183,7 +210,17 @@ use crate::registry::RaftGroupHandleRegistry;
 
 const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
 
-pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
+/// A Raft gRPC client that stamps this node's [`PeerIdentity`] on every
+/// request.
+pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<
+    InterceptedService<Channel, PeerIdentity>,
+>;
+
+/// A Raft gRPC server that admits only peers of this node's cluster.
+pub type RaftGrpcServer<S> = InterceptedService<
+    raft_internal_proto::raft_internal_server::RaftInternalServer<S>,
+    ClusterCheck,
+>;
 
 pub use ursula_proto::admin::QuorumPrefix;
 
@@ -570,15 +607,23 @@ impl RaftGrpcService {
     }
 }
 
-pub fn raft_grpc_service(
-    registry: RaftGroupHandleRegistry,
-) -> raft_internal_proto::raft_internal_server::RaftInternalServer<RaftGrpcService> {
-    raft_internal_proto::raft_internal_server::RaftInternalServer::new(RaftGrpcService::new(
-        registry,
-    ))
-    .accept_compressed(CompressionEncoding::Zstd)
-    .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+pub fn raft_grpc_service(registry: RaftGroupHandleRegistry) -> RaftGrpcServer<RaftGrpcService> {
+    let peer_cluster = registry.peer_cluster().clone();
+    raft_grpc_server(RaftGrpcService::new(registry), &peer_cluster)
+}
+
+/// Serves `service` on the Raft gRPC plane: the cluster-id check of
+/// `peer_cluster` runs before a request is decoded, then the plane's
+/// compression and message limits apply.
+pub fn raft_grpc_server<S>(service: S, peer_cluster: &PeerCluster) -> RaftGrpcServer<S>
+where S: raft_internal_proto::raft_internal_server::RaftInternal {
+    InterceptedService::new(
+        raft_internal_proto::raft_internal_server::RaftInternalServer::new(service)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES),
+        peer_cluster.server_check(),
+    )
 }
 
 pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
@@ -939,6 +984,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             });
             let apply_health = entry.apply_health.clone();
             let history = entry.history.clone();
+            let peer_identity = self.registry.peer_cluster().identity();
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
@@ -956,6 +1002,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         // apply-time invalidation reaches; a request-scoped cache only
                         // when none was registered.
                         cold_index_cache,
+                        peer_identity,
                     };
                     let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
                     let result = match required(request.read, "group_read.read")
@@ -1289,6 +1336,13 @@ impl GrpcRaftNetwork {
         status: tonic::Status,
     ) -> RPCError<UrsulaRaftTypeConfig> {
         observe_outbound_status(route, &status);
+        // A peer of another cluster refuses every RPC until an operator fixes
+        // a configuration: to OpenRaft it is unreachable, so replication backs
+        // off instead of retrying at once.
+        let other_cluster = self
+            .transport
+            .peer_cluster
+            .observe_refusal(self.target, &status);
         let message = format!(
             "{route} to node {} at {} failed: {}",
             self.target, self.endpoint, status
@@ -1297,6 +1351,7 @@ impl GrpcRaftNetwork {
             tonic::Code::Unavailable | tonic::Code::Cancelled => {
                 RPCError::Unreachable(Unreachable::from_string(message))
             }
+            _ if other_cluster => RPCError::Unreachable(Unreachable::from_string(message)),
             _ => raft_rpc_network_error(message),
         }
     }
@@ -1343,7 +1398,7 @@ impl GrpcRaftNetwork {
         let client = self
             .client()
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
-        let session = shared_append_session(&self.transport, &self.endpoint, client)
+        let session = shared_append_session(&self.transport, &self.endpoint, self.target, client)
             .map_err(tonic::Status::unavailable)?;
         let charge = append_budget_charge(envelope.encoded_len(), self.transport.budget.bytes);
         // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
@@ -1440,11 +1495,14 @@ impl GrpcRaftNetwork {
     }
 }
 
-fn raft_client(channel: Channel) -> RaftClient {
-    RaftClient::new(channel)
-        .accept_compressed(CompressionEncoding::Zstd)
-        .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+fn raft_client(channel: Channel, identity: &PeerIdentity) -> RaftClient {
+    raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
+        channel,
+        identity.clone(),
+    )
+    .accept_compressed(CompressionEncoding::Zstd)
+    .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
 
 /// Return the owner-core HTTP/2 channel for a Raft peer.
@@ -1486,7 +1544,10 @@ fn shared_raft_client(
     if let Some(shared) = channels.get(endpoint)
         && observed_generation.is_none_or(|generation| generation != shared.generation)
     {
-        return (Ok(raft_client(shared.channel.clone())), shared.generation);
+        return (
+            Ok(raft_client(shared.channel.clone(), &transport.identity)),
+            shared.generation,
+        );
     }
     let generation = channels
         .get(endpoint)
@@ -1496,7 +1557,7 @@ fn shared_raft_client(
         generation,
         channel: channel.clone(),
     });
-    (Ok(raft_client(channel)), generation)
+    (Ok(raft_client(channel, &transport.identity)), generation)
 }
 
 /// Return the one healthy Append stream for this peer endpoint.
@@ -1510,6 +1571,7 @@ fn shared_raft_client(
 fn shared_append_session(
     transport: &CoreRaftTransport,
     endpoint: &str,
+    target: u64,
     client: RaftClient,
 ) -> Result<SharedAppendSession, String> {
     let sessions = &transport.sessions;
@@ -1523,7 +1585,11 @@ fn shared_append_session(
     }
 
     let (sender, receiver) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run_append_session(client, receiver));
+    let refusals = PeerRefusals {
+        peer_cluster: transport.peer_cluster.clone(),
+        target,
+    };
+    let task = tokio::spawn(run_append_session(client, receiver, refusals));
     let session = SharedAppendSession {
         _task: Arc::new(AppendSessionTask::Running(task)),
         sender,
@@ -1608,9 +1674,17 @@ type WireFrame = (
     Vec<QueuedAppendBytes>,
 );
 
+/// Where an append session records its peer's refusal to open it for
+/// another cluster id: the stream's calls only see it close.
+struct PeerRefusals {
+    peer_cluster: PeerCluster,
+    target: u64,
+}
+
 async fn run_append_session(
     mut client: RaftClient,
     mut calls: mpsc::UnboundedReceiver<AppendStreamCall>,
+    refusals: PeerRefusals,
 ) {
     let (wire_sender, wire_receiver) =
         mpsc::channel::<WireFrame>(RAFT_GRPC_APPEND_STREAM_WIRE_FRAMES);
@@ -1631,8 +1705,11 @@ async fn run_append_session(
             GRPC_APPEND_STREAM_SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
             response.into_inner()
         }
-        Ok(Err(_status)) => {
+        Ok(Err(status)) => {
             GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            refusals
+                .peer_cluster
+                .observe_refusal(refusals.target, &status);
             return;
         }
         Err(_) => {
@@ -1908,8 +1985,14 @@ mod reconnect_tests {
     #[test]
     fn node_budget_is_shared_across_core_pools_and_small_limits_are_valid() {
         let budget = super::AppendTransportBudget::new(512);
-        let a = super::CoreRaftTransport::with_budget(budget.clone());
-        let b = super::CoreRaftTransport::with_budget(budget);
+        let identity = crate::peer_cluster::test_identity(0);
+        let a = super::CoreRaftTransport::with_budget(
+            budget.clone(),
+            identity.clone(),
+            super::PeerCluster::default(),
+        );
+        let b =
+            super::CoreRaftTransport::with_budget(budget, identity, super::PeerCluster::default());
         let charge = super::append_budget_charge(1, 512);
         assert_eq!(charge, 512);
         let permit = a
@@ -1957,9 +2040,9 @@ mod reconnect_tests {
         let endpoint = "http://127.0.0.1:9";
         let (client_a, _) = shared_raft_client(&a, endpoint, None);
         let (client_b, _) = shared_raft_client(&b, endpoint, None);
-        let first = shared_append_session(&a, endpoint, client_a.clone().unwrap()).unwrap();
-        let same = shared_append_session(&a, endpoint, client_a.unwrap()).unwrap();
-        let other = shared_append_session(&b, endpoint, client_b.unwrap()).unwrap();
+        let first = shared_append_session(&a, endpoint, 1, client_a.clone().unwrap()).unwrap();
+        let same = shared_append_session(&a, endpoint, 1, client_a.unwrap()).unwrap();
+        let other = shared_append_session(&b, endpoint, 1, client_b.unwrap()).unwrap();
         assert!(first.sender.same_channel(&same.sender));
         assert!(!first.sender.same_channel(&other.sender));
         assert!(!Arc::ptr_eq(&first.budget, &other.budget));
@@ -2034,6 +2117,9 @@ mod reconnect_tests {
             .expect("bind test raft grpc listener");
         let address = listener.local_addr().expect("read test listener address");
         let registry = RaftGroupHandleRegistry::default();
+        registry
+            .peer_cluster()
+            .bind(crate::peer_cluster::test_identity(1));
         let service_registry = registry.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -2290,7 +2376,10 @@ mod reconnect_tests {
             .await
             .expect("connect to test server");
         let mut client =
-            raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel);
+            raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
+                channel,
+                crate::peer_cluster::test_identity(2),
+            );
         let (sender, receiver) = mpsc::channel(1);
         let item = |request_id, raft_group_id| raft_internal_proto::RaftAppendStreamRequestItem {
             request_id,
@@ -2494,6 +2583,61 @@ mod reconnect_tests {
         server.abort();
     }
 
+    /// A peer of another cluster refuses this node's votes and appends
+    /// before they run, and both sides record the other by node id: the
+    /// sender from the refusals of a unary call and of an append stream's
+    /// open, the peer from the requests it refused.
+    #[tokio::test]
+    async fn a_peer_of_another_cluster_is_recorded_from_its_refusals() {
+        let (endpoint, registry, server) = spawn_append_stream_server().await;
+        let other = ursula_headers::ClusterId::new("other-cluster").unwrap();
+        let peer_cluster = PeerCluster::default();
+        let transport = Arc::new(CoreRaftTransport::new(
+            PeerIdentity::new(3, other.clone()),
+            peer_cluster.clone(),
+        ));
+        let mut network = test_network(transport, RaftGroupId(1), 1, endpoint);
+        let option = RPCOption::new(Duration::from_secs(2));
+        let vote = network
+            .vote(
+                UrsulaVoteRequest::new(UrsulaVote::new(1, 3), None),
+                option.clone(),
+            )
+            .await
+            .expect_err("a peer of another cluster refuses the vote");
+        assert!(matches!(vote, RPCError::Unreachable(_)), "{vote:?}");
+        assert_eq!(peer_cluster.refusals(), 1);
+        let append = network
+            .append_rpc(
+                raft_internal_proto::RaftRpcEnvelopeV1 {
+                    raft_group_id: 1,
+                    node_id: 1,
+                    protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+                    payload: Vec::new().into(),
+                },
+                option,
+            )
+            .await;
+        assert!(append.is_err(), "the append stream does not open");
+        assert_eq!(peer_cluster.refusals(), 2);
+        let test_cluster =
+            ursula_headers::ClusterId::new(crate::peer_cluster::TEST_CLUSTER_ID).unwrap();
+        assert_eq!(peer_cluster.mismatches(), vec![
+            crate::peer_cluster::PeerClusterMismatch {
+                node_id: 1,
+                cluster_id: test_cluster,
+            }
+        ]);
+        assert_eq!(registry.peer_cluster().mismatches(), vec![
+            crate::peer_cluster::PeerClusterMismatch {
+                node_id: 3,
+                cluster_id: other,
+            }
+        ]);
+        assert_eq!(registry.peer_cluster().refusals(), 2);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn node_transport_shutdown_closes_append_stream() {
         let (endpoint, registry, server) = spawn_append_stream_server().await;
@@ -2503,7 +2647,10 @@ mod reconnect_tests {
             .await
             .expect("connect to test server");
         let mut client =
-            raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel);
+            raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
+                channel,
+                crate::peer_cluster::test_identity(2),
+            );
         let (_sender, receiver) = mpsc::channel(1);
         let response = client
             .append_stream(tonic::Request::new(ReceiverStream::new(receiver)))

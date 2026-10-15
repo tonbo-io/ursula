@@ -5,7 +5,8 @@
 //!
 //! 1. classify the Raft WAL directory and the object-storage namespace
 //!    read-only (E1-E4);
-//! 2. probe every configured peer's Raft protocol (E8);
+//! 2. probe every configured peer's Raft protocol (E8), as this node of its
+//!    configured cluster; a peer of another cluster is logged, not fatal;
 //! 3. only then write the missing markers: object storage first, then the
 //!    directory.
 //!
@@ -17,6 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ursula_raft::PeerFormatEpoch;
+use ursula_raft::PeerIdentity;
 use ursula_runtime::format_marker::FormatEpochNamespace;
 use ursula_runtime::format_marker::MarkerState;
 use ursula_runtime::format_marker::classify_data_dir;
@@ -60,16 +62,42 @@ async fn probe_peers(config: &ursula_config::UrsulaConfig) -> io::Result<()> {
         .iter()
         .filter(|peer| peer.node_id != config.raft.node_id)
         .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return Ok(());
+    }
+    // Peers check the cluster id before anything else, so the probe carries
+    // the configured one (validation requires it once `raft.peers` is set).
+    let Some(cluster_id) = config.server.cluster_id.clone() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server.cluster_id is required when raft.peers is set",
+        ));
+    };
+    let identity = PeerIdentity::new(config.raft.node_id, cluster_id);
+    let identity = &identity;
     let answers = futures_util::future::join_all(peers.iter().map(|peer| async move {
         (
             peer,
-            ursula_raft::probe_peer_format_epoch(&peer.url, PEER_PROBE_TIMEOUT).await,
+            ursula_raft::probe_peer_format_epoch(&peer.url, identity, PEER_PROBE_TIMEOUT).await,
         )
     }))
     .await;
     for (peer, answer) in answers {
         match answer {
             PeerFormatEpoch::Compatible => {}
+            PeerFormatEpoch::OtherCluster(peer_cluster_id) => {
+                // A misconfigured peer must not keep the rest of the cluster
+                // from starting. The Raft plane refuses its traffic and
+                // readiness lists it under peer_cluster_mismatch.
+                tracing::error!(
+                    peer_id = peer.node_id,
+                    peer_url = %peer.url,
+                    %peer_cluster_id,
+                    local_cluster_id = %identity.cluster_id(),
+                    "a configured peer is in another cluster; its Raft traffic is refused. \
+                     Check server.cluster_id and raft.peers on both nodes"
+                );
+            }
             PeerFormatEpoch::Unreachable(reason) => {
                 // A fresh cluster starts its pods in parallel; readiness
                 // covers a peer that turns out to differ later.
