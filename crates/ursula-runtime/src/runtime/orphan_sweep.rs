@@ -31,6 +31,10 @@
 //! sweep logs an error and counts `cold_orphan_uncovered_chunks_kept` for an
 //! operator to repair the stream's cold index.
 //!
+//! Staged snapshot parts (`.part`, #581 section 3.1) in the external
+//! directory are swept the same way. No state references a part and it holds
+//! no stream bytes, so the guard below does not apply to it.
+//!
 //! External payloads carry no range in their name, so the same guard works
 //! per stream: an unreferenced external payload of a stream is deleted only
 //! when the stream's retained bytes `[retained, tail)` are fully covered by
@@ -60,6 +64,7 @@ use crate::cold_store::cold_chunk_file_range;
 use crate::cold_store::cold_external_dir;
 use crate::cold_store::is_cold_chunk_file_name;
 use crate::cold_store::is_external_payload_file_name;
+use crate::cold_store::is_snapshot_part_file_name;
 use crate::error::RuntimeError;
 
 /// A live chunk directory, its stream's cold range and the byte ranges its
@@ -143,7 +148,9 @@ impl ShardRuntime {
                 .await
                 .map_err(cold_io)?
             {
-                if is_external_payload_file_name(&name) {
+                // A snapshot part no commit used is garbage once its grace
+                // passed: no state ever references one (#581 section 3.1).
+                if is_external_payload_file_name(&name) || is_snapshot_part_file_name(&name) {
                     aged.push((format!("{external_dir}{name}"), name));
                 }
             }

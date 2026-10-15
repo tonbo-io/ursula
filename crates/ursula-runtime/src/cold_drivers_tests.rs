@@ -30,6 +30,7 @@ use crate::cold_store::cold_pack_dir;
 use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::cold_store::new_cold_pack_path;
 use crate::cold_store::new_external_payload_path;
+use crate::cold_store::new_snapshot_part_path;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
 const BUCKET: &str = "benchcmp";
@@ -474,10 +475,13 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
     let orphan_pack = new_cold_pack_path(BUCKET, GROUP.0);
     let orphan_chunk = new_cold_chunk_path_in_generation(&a, generation(&runtime, &a).await, 0, 2);
     let orphan_external = new_external_payload_path(&b);
+    // A snapshot part no commit used (#581 section 3.1).
+    let orphan_part = new_snapshot_part_path(&a);
     for (path, payload) in [
         (&orphan_pack, b"orphan-pack".as_slice()),
         (&orphan_chunk, b"oc".as_slice()),
         (&orphan_external, b"orphan-external".as_slice()),
+        (&orphan_part, b"part".as_slice()),
     ] {
         cold_store
             .write_chunk(path, payload)
@@ -510,20 +514,23 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
         .expect("sweep within the grace");
     assert!(young.cycle_completed);
     assert_eq!(young.orphans_deleted, 0, "nothing is older than the grace");
-    assert!(young.objects_scanned >= 7);
+    assert!(young.objects_scanned >= 8);
 
     tokio::time::sleep(Duration::from_millis(5)).await;
     let swept = runtime
         .sweep_cold_orphans_group_once(GROUP, 16, 0)
         .await
         .expect("sweep after the grace");
-    assert_eq!(swept.orphans_deleted, 3);
+    assert_eq!(swept.orphans_deleted, 4);
     assert_eq!(swept.delete_errors, 0);
     assert_eq!(
         swept.orphan_bytes,
-        u64::try_from(b"orphan-pack".len() + b"oc".len() + b"orphan-external".len()).unwrap()
+        u64::try_from(
+            b"orphan-pack".len() + b"oc".len() + b"orphan-external".len() + b"part".len()
+        )
+        .unwrap()
     );
-    for orphan in [&orphan_pack, &orphan_chunk, &orphan_external] {
+    for orphan in [&orphan_pack, &orphan_chunk, &orphan_external, &orphan_part] {
         assert!(!exists(&cold_store, orphan).await, "{orphan} is reclaimed");
     }
     for referenced in referenced_packs
@@ -539,7 +546,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
     assert_eq!(read_all(&runtime, &a).await, b"a1a2EXTERNAL".to_vec());
     assert_eq!(read_all(&runtime, &b).await, b"b1b2".to_vec());
     let metrics = runtime.metrics().snapshot();
-    assert_eq!(metrics.cold_orphan_cleanup_attempts, 3);
+    assert_eq!(metrics.cold_orphan_cleanup_attempts, 4);
     assert_eq!(metrics.cold_orphan_cleanup_errors, 0);
     assert_eq!(metrics.cold_orphan_bytes, swept.orphan_bytes);
 

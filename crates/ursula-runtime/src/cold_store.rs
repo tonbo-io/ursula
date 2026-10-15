@@ -1708,6 +1708,28 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
+/// Names a new staged snapshot part of `stream_id` (#581 section 3.1),
+/// `{stream}/external/{nanos:032x}-{seq:016x}.part`. Its file name is the
+/// part id a client lists in a commit. The `.part` suffix keeps parts apart
+/// from the `.bin` objects that state references, so a commit can name only
+/// parts, and deleting a part after its commit can never remove data.
+pub fn new_snapshot_part_path(stream_id: &BucketStreamId) -> String {
+    let unix_nanos = cold_object_unix_nanos();
+    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}{unix_nanos:032x}-{sequence:016x}{SNAPSHOT_PART_SUFFIX}",
+        cold_external_dir(stream_id)
+    )
+}
+
+const SNAPSHOT_PART_SUFFIX: &str = ".part";
+
+/// Whether `name` has the form of a staged snapshot part,
+/// `{nanos:032x}-{seq:016x}.part`. No replicated state references one.
+pub fn is_snapshot_part_file_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[32, 16])
+}
+
 /// Reset the global cold-object sequence counter. Only available under
 /// `cfg(madsim)` so the simulator can clear state between scenarios when
 /// running multiple seeds in one process (e.g. `Runtime::check_determinism`).
