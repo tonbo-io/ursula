@@ -55,6 +55,10 @@ impl WallClock for Clock {
 }
 
 fn app(now_ms: &Arc<AtomicU64>) -> Router {
+    app_with_runtime(now_ms).0
+}
+
+fn app_with_runtime(now_ms: &Arc<AtomicU64>) -> (Router, ursula_runtime::ShardRuntime) {
     let mut config = ursula_config::UrsulaConfig::default();
     config.runtime.core_count = 1;
     config.raft.group_count = 1;
@@ -63,8 +67,11 @@ fn app(now_ms: &Arc<AtomicU64>) -> Router {
     })
     .expect("runtime")
     .runtime;
-    let state = HttpState::new(runtime).with_wall_clock(Clock(Arc::clone(now_ms)));
-    client_router_with_admission(state, IngressAdmission::default())
+    let state = HttpState::new(runtime.clone()).with_wall_clock(Clock(Arc::clone(now_ms)));
+    (
+        client_router_with_admission(state, IngressAdmission::default()),
+        runtime,
+    )
 }
 
 /// A request body of `body` that records in `polled` whether the server
@@ -692,4 +699,90 @@ async fn producer_rows_come_before_content_checks_on_both_paths() {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     }
     assert_eq!(tail(&app).await, before);
+}
+
+/// A keyed write whose body is faulty is proposed with its fault and no
+/// bytes (#581 section 5.3, step 5): apply answers the fault without the
+/// body, so a garbage body never reaches the Raft log or the hot ring. A
+/// write without a key is refused here.
+#[test]
+fn a_faulty_keyed_write_is_proposed_without_its_body() {
+    use axum::http::HeaderMap;
+    use ursula_proto::ContentFaultV1;
+
+    let body = Bytes::from(vec![b'x'; 70_000]);
+    let typed = {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers
+    };
+    let digest_of_other = Bytes::copy_from_slice(blake3::hash(b"other").as_bytes());
+    for (headers, content_type, digest, fault) in [
+        (
+            HeaderMap::new(),
+            "application/octet-stream",
+            None,
+            ContentFaultV1::ContentFaultMissingContentType,
+        ),
+        (
+            typed.clone(),
+            "application/json",
+            None,
+            ContentFaultV1::ContentFaultMalformedJson,
+        ),
+        (
+            typed.clone(),
+            "application/octet-stream",
+            Some(digest_of_other.clone()),
+            ContentFaultV1::ContentFaultDigestMismatch,
+        ),
+    ] {
+        let mut producer = ursula_runtime::ProducerRequest {
+            producer_id: "writer".to_owned(),
+            digest,
+            ..Default::default()
+        };
+        let payload =
+            crate::content_checks(&headers, content_type, body.clone(), Some(&mut producer))
+                .expect("a keyed fault is proposed");
+        assert!(payload.is_empty(), "{fault:?}");
+        assert_eq!(producer.content_fault, i32::from(fault));
+        // A write without a key carries no digest, so only its own faults
+        // apply, and they are answered before any proposal.
+        let unkeyed = crate::content_checks(&headers, content_type, body.clone(), None);
+        assert_eq!(
+            unkeyed.is_err(),
+            fault != ContentFaultV1::ContentFaultDigestMismatch,
+            "{fault:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_faulty_keyed_write_leaves_the_tail_and_the_hot_ring_alone() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let (app, runtime) = app_with_runtime(&now_ms);
+    let token = create(&app).await;
+    let hot = |runtime: ursula_runtime::ShardRuntime| async move {
+        runtime
+            .state_gauges_all_groups()
+            .await
+            .into_iter()
+            .map(|(_, gauges)| gauges.expect("gauges").hot_payload_bytes)
+            .sum::<u64>()
+    };
+    let (first, _) = send(&app, &Write::new(0, 0, "first").tokened(&token)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let tail_before = tail(&app).await;
+    let hot_before = hot(runtime.clone()).await;
+    let big = "y".repeat(70_000);
+    for write in [
+        Write::new(0, 1, &big).untyped().tokened(&token),
+        Write::new(0, 1, &big).digest_of("other").tokened(&token),
+    ] {
+        let (refused, _) = send(&app, &write).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(tail(&app).await, tail_before);
+    assert_eq!(hot(runtime).await, hot_before);
 }

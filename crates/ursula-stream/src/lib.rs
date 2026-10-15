@@ -66,6 +66,7 @@ pub use model::StreamReadSegment;
 pub use model::StreamStatus;
 pub use model::StreamVisibleSnapshot;
 pub use model::WriteDigest;
+pub use model::WriteKind;
 pub use model::WriteReceipt;
 pub use response::ClosedBy;
 pub use response::ProducerAck;

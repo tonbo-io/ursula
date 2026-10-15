@@ -73,6 +73,7 @@ use crate::model::StreamReadSegment;
 use crate::model::StreamStatus;
 use crate::model::StreamVisibleSnapshot;
 use crate::model::WriteDigest;
+use crate::model::WriteKind;
 use crate::model::WriteReceipt;
 use crate::response::ClosedBy;
 use crate::response::ProducerAck;
@@ -449,6 +450,7 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
+                    kind: WriteKind::Append,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response

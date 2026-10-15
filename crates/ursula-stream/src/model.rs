@@ -42,6 +42,16 @@ pub enum ContentFault {
     MalformedJson,
 }
 
+/// What a write asks for, which fixes its answer's shape: an append (a
+/// body, perhaps closing the stream) or a close-only request. A keyed append
+/// whose body the proposer found faulty is proposed without its bytes, so
+/// the payload's emptiness does not tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    Append,
+    CloseOnly,
+}
+
 #[derive(Debug)]
 pub struct AppendStreamInput<'a> {
     pub stream_id: BucketStreamId,
@@ -51,6 +61,7 @@ pub struct AppendStreamInput<'a> {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    pub kind: WriteKind,
 }
 
 #[derive(Debug)]

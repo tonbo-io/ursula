@@ -18,6 +18,7 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
+use super::WriteKind;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
 use super::validate_bucket_id;
@@ -287,6 +288,7 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            kind: WriteKind::CloseOnly,
         })
     }
 

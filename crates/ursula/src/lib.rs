@@ -2993,11 +2993,12 @@ pub(crate) async fn append_stream_by_id(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let content_type = request_content_type(&headers);
+    let close_only = body.is_empty() && close_after;
     let payload = match content_checks(&headers, &content_type, body, producer.as_mut()) {
         Ok(payload) => payload,
         Err(response) => return *response,
     };
-    if payload.is_empty() && close_after {
+    if close_only {
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
@@ -4192,8 +4193,10 @@ pub(crate) fn producer_write(
 /// The content checks of a write's body (step 5 of #581 section 5.3) and
 /// the payload to propose. A keyed write carries its fault into apply,
 /// which answers it only when the write would apply, after the producer
-/// rows and the closed check; its raw body is proposed when it is not valid
-/// JSON. A write without a key has no rows, so its fault is answered here.
+/// rows and the closed check. Apply never needs the bytes of a faulty
+/// write, so it is proposed with an empty payload: one small log entry,
+/// and nothing in the hot ring. A write without a key has no rows, so its
+/// fault is answered here.
 fn content_checks(
     headers: &HeaderMap,
     content_type: &str,
@@ -4223,7 +4226,7 @@ fn content_checks(
         (_, None) => Ok(payload),
         (Some(producer), Some(fault)) => {
             producer.content_fault = fault.into();
-            Ok(payload)
+            Ok(Bytes::new())
         }
         (None, Some(fault)) => {
             let message = match fault {

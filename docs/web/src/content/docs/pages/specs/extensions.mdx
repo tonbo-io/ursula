@@ -349,6 +349,8 @@ A server implementing this section evaluates every write in one order, whether i
 4. A closed stream: a write that would apply answers `409` with `Stream-Closed: true`.
 5. Content, for a write that would apply: a `Content-Type` present and matching the stream, a non-empty body unless `Stream-Closed: true` is set (`400`), well-formed message text for a JSON stream, and the body against `Producer-Digest` (`400` on a mismatch).
 
+A write without producer headers has no step 3, so a server MAY answer its content faults of step 5 (a body without a `Content-Type`, malformed JSON) before step 2: such a write to a missing stream can answer `400` rather than `404`.
+
 It answers producer writes with the base protocol's status codes, and adds:
 
 - Every response about an applied write, new (`200`) or repeated (`204`), carries the write's receipt: `Stream-Offset` (where its bytes start), `Stream-Next-Offset` (where they end), and `Stream-Closed: true` when it closed the stream. A close-only producer write (an empty body with `Stream-Closed: true`) answers `204` even when it applies now: the base protocol requires `204` for a close-only request, and its conformance suite checks it for a fresh producer close. A close without producer headers is answered as the base protocol defines. A server MAY keep the range of a producer's newest write only. A repeat of an older write is then answered `204` with `Producer-Outcome: receipt-evicted` and no range.

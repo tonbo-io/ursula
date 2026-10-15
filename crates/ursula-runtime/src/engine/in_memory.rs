@@ -20,6 +20,7 @@ use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamResponse;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
+use ursula_stream::WriteKind;
 
 use super::GroupAckColdGcFuture;
 use super::GroupAdvanceRetentionFuture;
@@ -735,6 +736,7 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
+            kind: WriteKind::Append,
         });
         self.append_response_from_stream(stream_count_key, response, placement)
     }

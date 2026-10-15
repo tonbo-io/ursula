@@ -17,6 +17,7 @@ use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
+use super::WriteKind;
 use super::WriteReceipt;
 use super::canonical_json_record_ends;
 use super::content_fault_response;
@@ -44,6 +45,7 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
+                kind,
             } = input;
             if let Err(response) = self.validate_stream_scope(&stream_id) {
                 break 'append response;
@@ -73,7 +75,7 @@ impl StreamStateMachine {
                     break 'append self.repeat_response(
                         &stream_id,
                         ack,
-                        close_after && payload.is_empty(),
+                        kind == WriteKind::CloseOnly,
                     );
                 }
                 ProducerGate::Unkeyed => None,
@@ -93,7 +95,7 @@ impl StreamStateMachine {
                 // An unkeyed close of a closed stream is idempotent. A keyed
                 // one that would apply gets `409` like any other write: its
                 // repeat was answered by the gate above (#581 addendum 3).
-                if close_after && payload.is_empty() && gate.is_none() {
+                if kind == WriteKind::CloseOnly && gate.is_none() {
                     break 'append StreamResponse::Closed {
                         next_offset: stream.tail_offset,
                         producer: None,
@@ -183,7 +185,7 @@ impl StreamStateMachine {
                 _ => None,
             };
 
-            if payload.is_empty() {
+            if kind == WriteKind::CloseOnly {
                 StreamResponse::Closed {
                     next_offset,
                     producer: producer_ack,
