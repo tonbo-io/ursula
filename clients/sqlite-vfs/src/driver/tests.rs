@@ -3693,15 +3693,60 @@ fn a_provisional_claim_meeting_an_inheriting_history_re_keys() {
     assert_eq!(segment_tokens(&generation), tokens);
 }
 
-/// The same history event with a commit the provisional binding logged: its log may not re-key
-/// with a commit pending (the #611 B2 gate), and its connections are live, so it resets `rewound`
-/// before the log rolls and sends nothing. The next open, which reaches the stream, salvages the
-/// generation (`history_changed`), the provisional commit with it.
+/// The same history event with a commit the provisional binding logged during the outage:
+/// that commit was never sent, so the B2 gate counts only what the log held at the open, and
+/// nothing. The binding re-keys, its commit replicates, and nothing is salvaged. On a single
+/// voter with `fsync=never` every unclean restart is such an event, and offline work must survive
+/// it.
 #[test]
-fn a_provisional_binding_with_a_commit_resets_rewound_at_a_history_and_the_next_open_salvages() {
+fn an_offline_commit_survives_a_history_that_keeps_everything() {
+    let dir = TempDir::new("driver-provisional-rekey-offline");
+    let mut w = World::new();
+    let (generation, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let before = segment_tokens(&generation);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    let x = w.commit(c, &bound, 2).unwrap();
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(w.resets(c).is_empty());
+    let token = w.server.token(PATH).unwrap();
+    assert_eq!(bound.handle.incarnation(), token);
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    assert_eq!(w.stream_commits(), vec![first, x]);
+    let mut tokens = before;
+    tokens.push(token);
+    assert_eq!(segment_tokens(&generation), tokens);
+    assert!(bound.handle.salvage().unwrap().is_empty());
+}
+
+/// The opposite case: a commit logged before this open, after the log's latest ACK, may have been
+/// sent and acknowledged, so the B2 gate holds. The binding resets `rewound` before its log rolls
+/// and sends nothing (its connections are live, it cannot salvage under them), and the next open,
+/// which reaches the stream, salvages the generation (`history_changed`). The manifest counts that
+/// commit and the provisional one as unacknowledged.
+#[test]
+fn a_commit_before_the_open_after_the_ack_resets_rewound_at_a_history_and_the_next_open_salvages() {
     let dir = TempDir::new("driver-provisional-rekey-pending");
     let mut w = World::new();
-    let (generation, own, _) = crashed_owner(&mut w, dir.path(), 1);
+    let first = w.core();
+    let bound = w.open(first, spec(dir.path(), 1));
+    w.commit(first, &bound, 1).unwrap();
+    w.run_for(2_000);
+    w.server.inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::DropRequest,
+        times: 1,
+    });
+    w.commit(first, &bound, 3).unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    let own = *w.claims(first).last().unwrap();
+    drop(bound);
+    w.crash(first);
     let before = segment_tokens(&generation);
     w.server.history_event(HistoryEvent::NewHistory).unwrap();
     let c = w.core();
@@ -3732,7 +3777,6 @@ fn a_provisional_binding_with_a_commit_resets_rewound_at_a_history_and_the_next_
         "{:?}",
         bound.handle.attach
     );
-    // The salvage's manifest counts the provisional commit as unacknowledged.
     let salvages = bound.handle.salvage().unwrap();
     let [salvaged] = &salvages[..] else {
         panic!("{salvages:?}");
@@ -3743,7 +3787,7 @@ fn a_provisional_binding_with_a_commit_resets_rewound_at_a_history_and_the_next_
             .acknowledged
             .as_ref()
             .map(|a| a.unacknowledged),
-        Some(1)
+        Some(2)
     );
 }
 

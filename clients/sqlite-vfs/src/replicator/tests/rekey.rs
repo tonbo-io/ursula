@@ -889,9 +889,10 @@ fn a_provisional_open_sends_its_logs_claim_again_after_the_pre_check() {
 
 /// `receipt-evicted` for the claim sent again: its digest is ours, and later writes under it
 /// evicted its receipt, so it applied before and the next epoch follows. `producer-expired` naming
-/// its epoch proves nothing about whose record retired: the claim loses, `fenced`.
+/// its epoch, the pre-check without its frame, proves nothing about whose record retired: the
+/// binding resets `stale`, and a reopen takes over.
 #[test]
-fn a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expiry_fences() {
+fn a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expiry_goes_stale() {
     let mut h = provisional(Vec::new());
     h.answer(&head(token(), CLAIM, None));
     let actions = h.answer(&producer(&ProducerAnswer::ReceiptEvicted {
@@ -905,7 +906,7 @@ fn a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expi
     let actions = h.answer(&producer(&ProducerAnswer::ProducerExpired {
         epoch: epoch(3),
     }));
-    assert_eq!(reset_of(&actions), Some(ResetKind::Fenced), "{actions:?}");
+    assert_eq!(reset_of(&actions), Some(ResetKind::Stale), "{actions:?}");
 }
 
 /// The pre-check finds another owner's claim after the log's acknowledged offset: it resets
@@ -1062,4 +1063,38 @@ fn a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry() {
     }));
     assert_eq!(reset_of(&actions), None, "{actions:?}");
     assert_eq!(claim_of(&actions), Some((4, ACTIVATION)));
+}
+
+/// A restore while the owner streams idle: the `synced()` probe's read under the old token gets
+/// the `410` (it comes before the `412`), and the HEAD it sends takes the history path. A history
+/// that keeps every byte acknowledged re-keys, one that lost some resets `rewound`, never
+/// `fenced`.
+#[test]
+fn a_410_on_a_probe_after_a_history_event_takes_the_history_path() {
+    for (inherited, rewound) in [(CLAIM, false), (0, true)] {
+        let mut h = Harness::activate(
+            ClaimKind::Takeover {
+                round: 1,
+                rekeyed: false,
+            },
+            local(Vec::new(), 0),
+        )
+        .0;
+        h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, CLAIM, None)));
+        h.on(Event::Sync {
+            ticket: 1,
+            target: Position(0),
+        });
+        assert_eq!(h.last_request().method, Method::Get);
+        let actions = h.answer(&RawAnswer::new(410));
+        assert_eq!(reset_of(&actions), None, "{actions:?}");
+        assert_eq!(h.last_request().method, Method::Head);
+        let actions = h.answer(&head(new_token(), CLAIM, Some((token(), inherited))));
+        if rewound {
+            assert_eq!(reset_of(&actions), Some(ResetKind::Rewound), "{actions:?}");
+        } else {
+            assert_eq!(reset_of(&actions), None, "{actions:?}");
+            assert_eq!(rekey_of(&actions), Some((new_token(), 2)), "{actions:?}");
+        }
+    }
 }

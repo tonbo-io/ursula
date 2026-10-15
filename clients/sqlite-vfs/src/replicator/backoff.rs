@@ -342,6 +342,8 @@ impl Link {
                     }
                     // No re-cut in M1, whatever the advertised limit.
                     HeadReason::TooLarge => Policy::block(BlockedReason::RequestTooLarge, now_ms),
+                    // Our token unchanged: retention passed our tail, another owner moved on.
+                    HeadReason::Gone => return HeadOutcome::Reset(ResetKind::Fenced),
                 };
                 self.carry(next, ctx, actions).into()
             }

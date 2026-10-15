@@ -6,10 +6,11 @@
 //! nothing, and restores of checkpoints), requests misrouted to another deployment, foreign
 //! appends and claims, retention (and with it `410`s), clones, restarts (through the open table of
 //! design §5.5: a restart whose history does not inherit the log, or may have lost commits it
-//! holds after its latest ACK, salvages it and continues as a fresh takeover), provisional restarts (the open's first HEAD unanswered: a continuation of the
-//! log's latest claim, bound before it applies), owners cut off from the network, power losses
-//! that drop a log's unsynced trailing commits, takeovers by new owners and `synced()` calls, then
-//! a `Heal` phase with a perfect network and the route restored.
+//! holds after its latest ACK, salvages it and continues as a fresh takeover), provisional
+//! restarts (the open's first HEAD unanswered: a continuation of the log's latest claim, bound
+//! before it applies), owners cut off from the network, power losses that drop a log's unsynced
+//! trailing commits, takeovers by new owners and `synced()` calls, then a `Heal` phase with a
+//! perfect network and the route restored.
 //!
 //! The monitors check, as the run goes:
 //!
@@ -33,9 +34,9 @@
 //! 12. no append carries a frame the owner caught up;
 //! 13. an owner resets `fenced` or `stale` only when another writer, owner or clone was on the
 //!     stream, or `stale` at the first claim of a provisional instance after a power loss dropped
-//!     commits from its log that may have reached the stream (design §8.3), or `fenced` when a
-//!     provisional instance's claim met `producer-expired` or its log holds no claim that ever
-//!     applied;
+//!     commits from its log that may have reached the stream (design §8.3), `stale` when a claim
+//!     sent again after a pre-check met `producer-expired`, or `fenced` when a provisional
+//!     instance's log holds no claim that ever applied;
 //! 14. a boundary's receipt names the end of its record's frame in the stream with only claims
 //!     after it, and a receipt without an offset publishes no snapshot;
 //! 15. a re-key happens only when the history inherits the generation: every record the owner
@@ -44,7 +45,8 @@
 //! 17. a misrouted answer never resets an owner, and after `Heal` no owner ends blocked
 //!     `wrong_cluster`;
 //! 18. a rebuild that discards pending records of a log re-keyed at open (and not bound since,
-//!     across restarts) carries `salvage: true`;
+//!     across restarts) carries `salvage: true`, records a provisional open logged after its open
+//!     apart (never sent under the old token);
 //! 19. after `Heal`, every commit an owner was told is acknowledged is in the stream, in a log,
 //!     or in a salvage: none is lost, whatever history changes came (clones apart, whose copies
 //!     commit at one commit id, and commits a power loss dropped from a log before an fsync);
@@ -358,6 +360,8 @@ struct Instance {
     claims_sent: Vec<Epoch>,
     /// Opened provisionally, and no claim of it has bound yet.
     provisional: bool,
+    /// The last position a provisional instance's log held at its open (property 18).
+    opened_through: Option<u64>,
     /// The claims its log held when it started: a claim sent with one of their bodies is sent
     /// again, not new (property 4).
     inherited: Vec<(Epoch, Activation)>,
@@ -698,6 +702,7 @@ impl World {
             claim_applied: None,
             claims_sent: Vec::new(),
             provisional: false,
+            opened_through: None,
             inherited: Vec::new(),
             checked_tail: None,
             expired: false,
@@ -963,9 +968,11 @@ impl World {
         } else {
             self.started(local, |local| Replicator::provisional(local, claim))
         };
+        let opened_through = Some(self.owners[index].log.last_logged().0);
         self.owners[index].inst = Instance {
             claim_applied: applied,
             provisional: true,
+            opened_through,
             ..inst
         };
         self.process(index, actions, Before::default());
@@ -1112,94 +1119,6 @@ impl World {
     }
 
     fn process_in(&mut self, index: usize, actions: Vec<Action>, before: Before) {
-        if std::env::var("WDEBUG").is_ok() {
-            let names: Vec<String> = actions
-                .iter()
-                .map(|a| match a {
-                    Action::Send { request, .. } => format!(
-                        "Send({:?} {:?} {:?})",
-                        request.method,
-                        request.target,
-                        request
-                            .keys
-                            .producer
-                            .as_ref()
-                            .map(|p| (p.epoch.get(), p.seq.get()))
-                    ),
-                    other => format!("{:.140}", format!("{other:?}")),
-                })
-                .collect();
-            eprintln!(
-                "DBG owner {index} uid {} acked_offset {} {:?}",
-                self.owners[index].inst.uid, self.owners[index].inst.acked_offset, names
-            );
-        }
-        if std::env::var("WDEBUG").is_ok() {
-            let names: Vec<String> = actions
-                .iter()
-                .map(|a| match a {
-                    Action::Send { request, .. } => format!(
-                        "Send({:?} {:?} {:?})",
-                        request.method,
-                        request.target,
-                        request
-                            .keys
-                            .producer
-                            .as_ref()
-                            .map(|p| (p.epoch.get(), p.seq.get()))
-                    ),
-                    other => format!("{:.140}", format!("{other:?}")),
-                })
-                .collect();
-            eprintln!(
-                "DBG owner {index} uid {} acked_offset {} {:?}",
-                self.owners[index].inst.uid, self.owners[index].inst.acked_offset, names
-            );
-        }
-        if std::env::var("WDEBUG").is_ok() {
-            let names: Vec<String> = actions
-                .iter()
-                .map(|a| match a {
-                    Action::Send { request, .. } => format!(
-                        "Send({:?} {:?} {:?})",
-                        request.method,
-                        request.target,
-                        request
-                            .keys
-                            .producer
-                            .as_ref()
-                            .map(|p| (p.epoch.get(), p.seq.get()))
-                    ),
-                    other => format!("{:.140}", format!("{other:?}")),
-                })
-                .collect();
-            eprintln!(
-                "DBG owner {index} uid {} acked_offset {} {:?}",
-                self.owners[index].inst.uid, self.owners[index].inst.acked_offset, names
-            );
-        }
-        if std::env::var("WDEBUG").is_ok() {
-            let names: Vec<String> = actions
-                .iter()
-                .map(|a| match a {
-                    Action::Send { request, .. } => format!(
-                        "Send({:?} {:?} {:?})",
-                        request.method,
-                        request.target,
-                        request
-                            .keys
-                            .producer
-                            .as_ref()
-                            .map(|p| (p.epoch.get(), p.seq.get()))
-                    ),
-                    other => format!("{:.140}", format!("{other:?}")),
-                })
-                .collect();
-            eprintln!(
-                "DBG owner {index} uid {} acked_offset {} {:?}",
-                self.owners[index].inst.uid, self.owners[index].inst.acked_offset, names
-            );
-        }
         let takeover = before.takeover;
         // A claim this sends is a continuation's (property 4).
         let continuation = matches!(
@@ -1356,10 +1275,9 @@ impl World {
                     // A power loss dropped commits the stream may hold (design §8.3).
                     let lost =
                         kind == ResetKind::Stale && owner.power_lost && owner.inst.provisional;
-                    // A provisional claim at or below the floor meets `producer-expired`, which
-                    // proves nothing about whose record retired.
-                    let expired =
-                        kind == ResetKind::Fenced && owner.inst.provisional && owner.inst.expired;
+                    // A claim a pre-check sent again met `producer-expired` without its frame found:
+                    // the retired record may be another claimant's, and it resets `stale`.
+                    let expired = kind == ResetKind::Stale && owner.inst.expired;
                     // A generation whose takeover never bound (a fresh owner's, after a salvage)
                     // has no claim to continue: its provisional claim loses to its own earlier
                     // generation's.
@@ -1454,13 +1372,15 @@ impl World {
                 }
             }
         }
+        let opened_through = self.owners[index].inst.opened_through;
         let log = &mut self.owners[index].log;
         log.incarnation = incarnation;
         if !log.claims.contains(&claim) {
             log.claims.push(claim);
         }
         if at_open {
-            let through = log.last_logged().0;
+            // A provisional open's own commits, logged after its open, were never sent.
+            let through = opened_through.unwrap_or(log.last_logged().0);
             log.rekeyed_at_open = Some(log.rekeyed_at_open.map_or(through, |t| t.max(through)));
         }
         log.sync();
@@ -3311,8 +3231,8 @@ fn the_proptests_shrunk_counterexamples_pass() {
 
 /// A restore, a re-key at open, a clone and a history event, then retention moved to the
 /// acknowledged offset of an owner left on the first history (found at a million cases): that
-/// owner's snapshot publish carries its old token and gets a `412`, so it never hides foreign frames
-/// behind a snapshot of the current history.
+/// owner's snapshot publish carries its old token and gets a `412`, so it never hides foreign
+/// frames behind a snapshot of the current history.
 #[test]
 fn an_owner_on_another_history_publishes_no_snapshot() {
     use Op::Clone;
@@ -3503,6 +3423,84 @@ fn a_provisional_restart_goes_live_once_the_partition_heals() {
     ));
     assert!(world.owners[0].inst.calls.is_empty());
     assert_eq!(world.coverage.provisional_live.load(Ordering::Relaxed), 1);
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+}
+
+/// Owner 0 streams idle while a checkpoint is restored, then restarts and a second restore
+/// follows: its `synced()` probe reads under the old token and gets the `410` (it comes before the
+/// `412`). The probe sends a HEAD and takes the history path, never `fenced` with no other writer
+/// (property 13; this reproduced on main on seed 0).
+#[test]
+fn a_probe_answered_410_after_a_restore_takes_the_history_path() {
+    use Op::Commit;
+    use Op::Deliver;
+    let mut ops = vec![
+        Deliver(0),
+        Deliver(0),
+        Commit(0),
+        Deliver(0),
+        Deliver(0),
+        Op::Retain(0),
+        Op::Checkpoint,
+        Op::Restore(1),
+        Op::Restart(0, 0),
+        Deliver(0),
+        Op::Restore(2),
+        Deliver(0),
+        Op::Sync(0),
+        Commit(0),
+        Op::Flush,
+    ];
+    ops.extend(std::iter::repeat_n(Commit(0), 5));
+    assert_eq!(run(Knobs::default(), 0, &ops), Vec::<String>::new());
+}
+
+/// Owner 0, cut off, restarts provisionally and commits once offline; a history that loses
+/// nothing replaces the stream meanwhile (a single voter's unclean restart). That commit was never
+/// sent, so it does not hold the re-key back (B2 counts the log's commits at the open, none after
+/// its ACK): once the partition heals the owner re-keys, its offline commit replicates under the
+/// new token, and nothing is salvaged or reset.
+#[test]
+fn an_offline_commit_survives_a_history_that_keeps_everything() {
+    let ops = vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::Partition(0, true),
+        Op::Restart(0, 0),
+        Op::Commit(0),
+        Op::NewHistory,
+        Op::Sync(0),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    assert!(world.owners[0].inst.provisional);
+    let token = world.token();
+    for op in &[
+        Op::Partition(0, false),
+        Op::Advance(10_000),
+        Op::Tick(0),
+        Op::Flush,
+    ] {
+        world.step(op);
+    }
+    assert!(matches!(
+        world.owners[0].inst.replicator,
+        Replicator::Streaming { .. }
+    ));
+    assert!(world.owners[0].inst.calls.is_empty(), "synced() resolved");
+    let log = &world.owners[0].log;
+    assert_eq!(log.acks.last().map(|ack| ack.0), Some(log.last_logged()));
+    assert_eq!(log.incarnation, token);
+    let counted = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    let rekeys = counted(&world.coverage.rekeys_open) + counted(&world.coverage.rekeys_claiming);
+    assert_eq!(rekeys, 1);
+    assert_eq!(counted(&world.coverage.salvages), 0);
+    assert_eq!(counted(&world.coverage.rewound), 0);
     world.heal();
     assert_eq!(world.violations, Vec::<String>::new());
 }

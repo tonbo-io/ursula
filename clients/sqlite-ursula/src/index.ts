@@ -92,8 +92,11 @@ const byAbort = new WeakSet<object>();
  * extension checks it from the cache's acknowledged state to its tail, claims it only when no
  * other owner wrote or claimed there, and the database is `live`. If another owner took the
  * stream meanwhile, the database resets (`fenced` or `stale`) with nothing sent, and no
- * `synced()` ever resolved on the provisional state. Without such a cache the open waits for the
- * stream until its signal fires.
+ * `synced()` ever resolved on the provisional state. A stream left idle past producer expiry,
+ * whose claim the check could not see, resets `stale` too: reopen, and the new open takes over
+ * with the pending commits. Commits made while provisional survive a history change that lost
+ * nothing (such as a restart of a single node) and replicate once the stream answers. Without such
+ * a cache the open waits for the stream until its signal fires.
  *
  * Errors say what to do through `action`: {@link UrsulaSetupError} (`fix`, or `retry` for `in_use` and
  * `claim_races`), and {@link UrsulaUnavailableError} when the signal fired first: the last condition
