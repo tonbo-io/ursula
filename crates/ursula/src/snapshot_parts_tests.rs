@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::body::to_bytes;
@@ -128,8 +129,17 @@ fn digest_of(body: &[u8]) -> DigestHeader {
 }
 
 fn commit_request(uri: &str, parts: &[PartId], digest: DigestHeader) -> Request<Body> {
+    commit_request_at(uri, 3, parts, digest)
+}
+
+fn commit_request_at(
+    uri: &str,
+    offset: u64,
+    parts: &[PartId],
+    digest: DigestHeader,
+) -> Request<Body> {
     let manifest = PartsManifest::new(parts.to_vec()).expect("manifest");
-    let mut request = Request::put(format!("{uri}/snapshot/3")).header(CONTENT_TYPE, OCTET);
+    let mut request = Request::put(format!("{uri}/snapshot/{offset}")).header(CONTENT_TYPE, OCTET);
     let commit = PartsCommit::for_manifest(&manifest, digest);
     let mut headers = Vec::new();
     commit.render(|name, value| headers.push((name, value.to_owned())));
@@ -251,9 +261,10 @@ async fn parts_commit_a_snapshot_above_the_request_limit() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-/// A commit that names a part it cannot use, or whose parts do not
-/// assemble to its digest, is refused with `400` and publishes nothing; its
-/// parts stay for a corrected commit.
+/// A commit that names a part it cannot use is refused with `400` before
+/// anything is copied, and its parts stay for a corrected commit. One whose
+/// parts do not assemble to its digest is refused with `400` too, and its
+/// copy consumed the parts: they are gone (m1 of the step 4 re-review).
 #[tokio::test]
 async fn a_commit_is_refused_for_unknown_foreign_or_mismatched_parts() {
     let (app, cold_store) = cold_app();
@@ -269,18 +280,12 @@ async fn a_commit_is_refused_for_unknown_foreign_or_mismatched_parts() {
     let missing = PartId::new(format!("{:032x}-{:016x}.part", 1, 2)).unwrap();
     let good = digest_of(b"firstsecond");
 
-    for (case, parts, digest) in [
-        (
-            "digest mismatch",
-            vec![a.clone(), b.clone()],
-            digest_of(b"other"),
-        ),
-        ("order", vec![b.clone(), a.clone()], good),
-        ("unknown part", vec![a.clone(), missing], good),
-        ("another stream's part", vec![a.clone(), foreign], good),
-        ("a payload that is no part", vec![a.clone(), payload], good),
+    for (case, parts) in [
+        ("unknown part", vec![a.clone(), missing]),
+        ("another stream's part", vec![a.clone(), foreign]),
+        ("a payload that is no part", vec![a.clone(), payload]),
     ] {
-        let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+        let response = send(&app, commit_request("/parts/s", &parts, good)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
     }
     // A manifest that lists another number of parts than its header.
@@ -289,7 +294,22 @@ async fn a_commit_is_refused_for_unknown_foreign_or_mismatched_parts() {
         .headers_mut()
         .insert(names::STREAM_SNAPSHOT_PARTS, HeaderValue::from_static("3"));
     assert_eq!(send(&app, request).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        part_names(&cold_store).await.len(),
+        3,
+        "nothing copied, all kept"
+    );
 
+    let response = send(
+        &app,
+        commit_request("/parts/s", &[b.clone(), a.clone()], good),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "order: a digest mismatch"
+    );
     let response = send(&app, Request::head("/parts/s").body(Body::empty()).unwrap()).await;
     assert_eq!(
         StreamHead::parse(pairs(&response))
@@ -301,8 +321,13 @@ async fn a_commit_is_refused_for_unknown_foreign_or_mismatched_parts() {
     let response = send(&app, commit_request("/parts/s", &[a, b], good)).await;
     assert_eq!(
         response.status(),
-        StatusCode::NO_CONTENT,
-        "the parts stayed"
+        StatusCode::BAD_REQUEST,
+        "the mismatched copy consumed the parts"
+    );
+    assert_eq!(
+        part_names(&cold_store).await.len(),
+        1,
+        "only the other stream's"
     );
 }
 
@@ -785,4 +810,343 @@ async fn a_superseded_or_conflicting_commit_answers_409_from_its_key() {
         .expect("typed")
         .expect("names the latest");
     assert!(answer.supersedes(ursula_headers::value::Offset::from_u64(3)));
+}
+
+/// Holds every read of a staged part until [`Gate::open`], counting the
+/// reads that wait, so a test acts while a commit copies.
+struct Gate {
+    permits: Arc<tokio::sync::Semaphore>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Gate {
+    fn on_part_reads(cold_store: &ColdStore) -> Self {
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        cold_store.set_fault_policy(|context| {
+            (context.operation == ursula_runtime::ColdStoreOperation::ReadObjectRange
+                && context.path.contains("/_parts/"))
+            .then(|| ursula_runtime::ColdStoreFaultEffect::delay(Duration::from_millis(1)))
+        });
+        let (gate, count) = (Arc::clone(&permits), Arc::clone(&waiting));
+        cold_store.set_delay_fn(move |_| {
+            let (gate, count) = (Arc::clone(&gate), Arc::clone(&count));
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                if let Ok(permit) = gate.acquire().await {
+                    permit.forget();
+                }
+            }
+        });
+        Self { permits, waiting }
+    }
+
+    /// Waits until `reads` part reads wait at the gate.
+    async fn reached(&self, reads: usize) {
+        while self.waiting.load(Ordering::SeqCst) < reads {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn open(&self) {
+        self.permits.add_permits(1 << 20);
+    }
+}
+
+async fn latest_snapshot(app: &Router, uri: &str) -> Option<ursula_headers::SnapshotRef> {
+    let response = send(app, Request::head(uri).body(Body::empty()).unwrap()).await;
+    StreamHead::parse(pairs(&response))
+        .expect("head")
+        .snapshot()
+}
+
+/// MB of the step 4 re-review: the node owns a commit, so a client that goes
+/// away mid-copy (a gateway timing out) cancels nothing. A repeat while it
+/// runs answers `503 SnapshotCommitInProgress`; once it ends, `204` from the
+/// key, and its parts are gone.
+#[tokio::test]
+async fn a_commit_finishes_after_its_client_goes_away() {
+    let (app, cold_store) = cold_app();
+    create(&app, "/parts/s").await;
+    let parts = vec![
+        stage(&app, "/parts/s", b"first".to_vec()).await,
+        stage(&app, "/parts/s", b"second".to_vec()).await,
+    ];
+    let digest = digest_of(b"firstsecond");
+    let gate = Gate::on_part_reads(&cold_store);
+    let gone = tokio::time::timeout(
+        Duration::from_millis(50),
+        send(&app, commit_request("/parts/s", &parts, digest)),
+    )
+    .await;
+    assert!(gone.is_err(), "the commit waits at the gate");
+    gate.reached(1).await;
+    let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key(RETRY_AFTER));
+    assert_eq!(
+        body_of(response).await,
+        br#"{"error":"SnapshotCommitInProgress"}"#
+    );
+
+    gate.open();
+    while latest_snapshot(&app, "/parts/s").await.is_none() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    while !part_names(&cold_store).await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "the repeat");
+}
+
+/// m4: a node copies two commits at once; a third answers `503
+/// SnapshotCommitsBusy`, which the metrics count.
+#[tokio::test]
+async fn a_third_concurrent_commit_is_busy() {
+    let (app, cold_store) = cold_app();
+    let mut pending = Vec::new();
+    for stream in ["a", "b", "c"] {
+        create(&app, &format!("/parts/{stream}")).await;
+    }
+    let commits = {
+        let mut commits = Vec::new();
+        for stream in ["a", "b", "c"] {
+            let uri = format!("/parts/{stream}");
+            let part = stage(&app, &uri, stream.as_bytes().to_vec()).await;
+            commits.push(commit_request(&uri, &[part], digest_of(stream.as_bytes())));
+        }
+        commits
+    };
+    let gate = Gate::on_part_reads(&cold_store);
+    let mut commits = commits.into_iter();
+    for _ in 0..2 {
+        let request = commits.next().unwrap();
+        pending.push(tokio::spawn(app.clone().oneshot(request)));
+    }
+    gate.reached(2).await;
+    let response = send(&app, commits.next().unwrap()).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key(RETRY_AFTER));
+    assert_eq!(
+        body_of(response).await,
+        br#"{"error":"SnapshotCommitsBusy"}"#
+    );
+    let metrics = send(
+        &app,
+        Request::get("/__ursula/metrics")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let metrics: serde_json::Value = serde_json::from_slice(&body_of(metrics).await).unwrap();
+    assert_eq!(metrics["snapshot_commits_busy"], 1, "{metrics}");
+    gate.open();
+    for commit in pending {
+        assert_eq!(
+            commit.await.unwrap().unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+/// MA of the step 4 re-review: on a 64 MiB budget (the tiny and small
+/// presets) a commit's copy is charged 32 MiB once it holds its slot, so a
+/// request of up to 32 MiB still fits beside it; and a manifest without
+/// `Content-Length` is charged its own bound, not the request limit.
+#[tokio::test]
+async fn a_commit_fits_beside_a_large_write_on_the_smallest_budget() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    let server = ursula_config::ServerConfig {
+        http_inflight_body_size: ursula_config::HumanSize::mib(64),
+        ..ursula_config::ServerConfig::default()
+    };
+    let app = client_router_with_admission(HttpState::new(runtime), IngressAdmission::new(&server));
+    create(&app, "/parts/s").await;
+    let part = stage(&app, "/parts/s", b"part".to_vec()).await;
+    let gate = Gate::on_part_reads(&cold_store);
+    let mut request = commit_request("/parts/s", &[part], digest_of(b"part"));
+    // A manifest without `Content-Length`.
+    let manifest = std::mem::replace(request.body_mut(), Body::empty());
+    *request.body_mut() = Body::from_stream(manifest.into_data_stream());
+    let pending = tokio::spawn(app.clone().oneshot(request));
+    gate.reached(1).await;
+    let response = send(
+        &app,
+        Request::post("/parts/s")
+            .header(CONTENT_TYPE, OCTET)
+            .header(CONTENT_LENGTH, 30 * MIB)
+            .body(Body::from(vec![7_u8; 30 * MIB]))
+            .unwrap(),
+    )
+    .await;
+    assert!(response.status().is_success(), "{:?}", response.status());
+    gate.open();
+    assert_eq!(
+        pending.await.unwrap().unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// m4: a part that goes away during the copy re-checks the key: a later
+/// snapshot published meanwhile answers `409` naming it.
+#[tokio::test]
+async fn a_part_gone_mid_copy_rechecks_the_key() {
+    let (app, cold_store) = cold_app();
+    create(&app, "/parts/s").await;
+    let parts = vec![
+        stage(&app, "/parts/s", b"first".to_vec()).await,
+        stage(&app, "/parts/s", b"second".to_vec()).await,
+    ];
+    let gate = Gate::on_part_reads(&cold_store);
+    let pending = tokio::spawn(app.clone().oneshot(commit_request(
+        "/parts/s",
+        &parts,
+        digest_of(b"firstsecond"),
+    )));
+    gate.reached(2).await;
+    let response = send(
+        &app,
+        Request::post("/parts/s")
+            .header(CONTENT_TYPE, OCTET)
+            .body(Body::from("def"))
+            .unwrap(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let response = send(
+        &app,
+        Request::put("/parts/s/snapshot/6")
+            .header(CONTENT_TYPE, OCTET)
+            .body(Body::from("six"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for name in part_names(&cold_store).await {
+        cold_store
+            .delete_chunk(&format!("{}{name}", snapshot_part_dir("parts", 0)))
+            .await
+            .unwrap();
+    }
+    gate.open();
+    let response = pending.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(matches!(
+        SnapshotPublishAnswer::parse(409, pairs(&response)),
+        Ok(Some(SnapshotPublishAnswer::Conflict { .. }))
+    ));
+}
+
+/// m3: a stream recreated during the copy is not published to. A client
+/// that named no token gets the typed `400` a commit after the recreate
+/// gets; one that named the token gets `412`.
+#[tokio::test]
+async fn a_stream_recreated_mid_copy_is_not_published_to() {
+    for sent_token in [false, true] {
+        let (app, cold_store) = cold_app();
+        create(&app, "/parts/s").await;
+        let response = send(&app, Request::head("/parts/s").body(Body::empty()).unwrap()).await;
+        let token = StreamHead::parse(pairs(&response))
+            .expect("head")
+            .incarnation();
+        let part = stage(&app, "/parts/s", b"part".to_vec()).await;
+        let gate = Gate::on_part_reads(&cold_store);
+        let mut request = commit_request("/parts/s", &[part], digest_of(b"part"));
+        if sent_token {
+            request.headers_mut().insert(
+                names::STREAM_INCARNATION,
+                HeaderValue::from_str(&token.to_string()).unwrap(),
+            );
+        }
+        let pending = tokio::spawn(app.clone().oneshot(request));
+        gate.reached(1).await;
+        let response = send(
+            &app,
+            Request::delete("/parts/s").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        create(&app, "/parts/s").await;
+        gate.open();
+        let response = pending.await.unwrap().unwrap();
+        let expected = if sent_token {
+            StatusCode::PRECONDITION_FAILED
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        assert_eq!(response.status(), expected, "token sent: {sent_token}");
+        assert_eq!(latest_snapshot(&app, "/parts/s").await, None);
+    }
+}
+
+/// m4: a manifest longer than any valid one is refused with `400`.
+#[tokio::test]
+async fn an_oversized_manifest_is_refused() {
+    let (app, _cold_store) = cold_app();
+    create(&app, "/parts/s").await;
+    let response = send(
+        &app,
+        Request::put("/parts/s/snapshot/3")
+            .header(CONTENT_TYPE, OCTET)
+            .header(names::STREAM_SNAPSHOT_PARTS, "1")
+            .header(names::STREAM_SNAPSHOT_DIGEST, digest_of(b"x").to_string())
+            .body(Body::from(vec![
+                b'a';
+                ursula_headers::MAX_MANIFEST_BYTES + 1
+            ]))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// m2: a commit beyond the tail, or below the retained offset, is answered
+/// from its key alone, as its first answer was. Below retention the latest
+/// snapshot always lies at or above the commit's offset (retention never
+/// passes it), so the answer is the superseding `409`, before `410`.
+#[tokio::test]
+async fn out_of_range_commits_answer_from_their_key() {
+    let (app, _cold_store) = cold_app();
+    create(&app, "/parts/s").await;
+    let unknown = vec![PartId::new(format!("{:032x}-{:016x}.part", 1, 2)).unwrap()];
+    let response = send(
+        &app,
+        commit_request_at("/parts/s", 9, &unknown, digest_of(b"x")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT, "beyond the tail");
+    let response = send(
+        &app,
+        Request::put("/parts/s/snapshot/3")
+            .header(CONTENT_TYPE, OCTET)
+            .body(Body::from("three"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = send(
+        &app,
+        Request::put("/parts/s/retention/3")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = send(
+        &app,
+        commit_request_at("/parts/s", 1, &unknown, digest_of(b"x")),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "superseded: 409 before 410"
+    );
 }

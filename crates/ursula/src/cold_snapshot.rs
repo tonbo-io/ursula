@@ -213,9 +213,7 @@ async fn object_stream(
     len: u64,
 ) -> io::Result<impl futures_util::Stream<Item = io::Result<Bytes>> + Send + 'static> {
     let end = start.saturating_add(len).min(object.payload_len);
-    let first_len = end
-        .saturating_sub(start)
-        .min(COLD_SNAPSHOT_READ_PIECE_BYTES);
+    let first_len = piece_len(end.saturating_sub(start));
     let first = read_piece(
         &cold_store,
         &object.s3_path,
@@ -224,7 +222,8 @@ async fn object_stream(
         first_len,
     )
     .await?;
-    let rest = stream::try_unfold(start.saturating_add(first_len), move |offset| {
+    let read = u64::try_from(first_len).unwrap_or(u64::MAX);
+    let rest = stream::try_unfold(start.saturating_add(read), move |offset| {
         let cold_store = cold_store.clone();
         let object = object.clone();
         async move {
@@ -232,7 +231,7 @@ async fn object_stream(
             if remaining == 0 {
                 return Ok(None);
             }
-            let len = remaining.min(COLD_SNAPSHOT_READ_PIECE_BYTES);
+            let len = piece_len(remaining);
             let piece = read_piece(
                 &cold_store,
                 &object.s3_path,
@@ -242,25 +241,36 @@ async fn object_stream(
             )
             .await?;
             // `len <= remaining`, so `offset + len <= end` and never saturates.
-            Ok(Some((piece, offset.saturating_add(len))))
+            Ok(Some((
+                piece,
+                offset.saturating_add(u64::try_from(len).unwrap_or(u64::MAX)),
+            )))
         }
     });
     Ok(stream::once(async move { Ok(first) }).chain(rest))
 }
 
-/// Reads `len` bytes, at most one piece of
-/// [`COLD_SNAPSHOT_READ_PIECE_BYTES`], at `start` of the object at `path`,
-/// whose body is `size` bytes. The one piece reader of snapshot reads,
-/// `/bootstrap` and the copy of a parts commit.
+/// The length of the next piece of a body with `remaining` bytes left:
+/// at most [`COLD_SNAPSHOT_READ_PIECE_BYTES`].
+pub(crate) fn piece_len(remaining: u64) -> usize {
+    let piece = usize::try_from(COLD_SNAPSHOT_READ_PIECE_BYTES).unwrap_or(usize::MAX);
+    usize::try_from(remaining).map_or(piece, |remaining| remaining.min(piece))
+}
+
+/// Reads `len` bytes, at most one piece (see [`piece_len`]), at `start` of
+/// the object at `path`, whose body is `size` bytes. The one piece reader of
+/// snapshot reads, `/bootstrap` and the copy of a parts commit.
 pub(crate) async fn read_piece(
     cold_store: &ColdStoreHandle,
     path: &str,
     size: u64,
     start: u64,
-    len: u64,
+    len: usize,
 ) -> io::Result<Bytes> {
-    // A piece is at most 8 MiB, which every `usize` holds.
-    let len = usize::try_from(len.min(COLD_SNAPSHOT_READ_PIECE_BYTES)).unwrap_or(usize::MAX);
+    debug_assert!(
+        u64::try_from(len).is_ok_and(|len| len <= COLD_SNAPSHOT_READ_PIECE_BYTES),
+        "a piece is at most {COLD_SNAPSHOT_READ_PIECE_BYTES} bytes"
+    );
     cold_store
         .read_whole_object_range(path, size, start, len)
         .await

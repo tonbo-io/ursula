@@ -29,7 +29,12 @@
 //! its grace (a day by default), the parts of a deleted stream included.
 //! Without a cold store, a part or a commit answers `501`.
 
+use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::body::Bytes;
@@ -37,10 +42,8 @@ use axum::extract::OriginalUri;
 use axum::extract::Path;
 use axum::extract::State;
 use axum::http::HeaderMap;
-use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::Version;
-use axum::http::header::RETRY_AFTER;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::StreamExt;
@@ -59,6 +62,7 @@ use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::SnapshotDigest;
 use ursula_runtime::is_snapshot_part_id;
@@ -70,10 +74,13 @@ use ursula_shard::BucketStreamId;
 use crate::HttpState;
 use crate::PublishTarget;
 use crate::SnapshotPath;
+use crate::admission::BodyBudget;
 use crate::admission::PendingAdmission;
+use crate::admission::retry_after_json;
 use crate::cold_snapshot::COLD_SNAPSHOT_READ_PIECE_BYTES;
 use crate::cold_snapshot::SnapshotUpload;
 use crate::cold_snapshot::StreamIntoObjectError;
+use crate::cold_snapshot::piece_len;
 use crate::cold_snapshot::read_piece;
 use crate::cold_snapshot::stream_into_object;
 use crate::front_door;
@@ -81,24 +88,114 @@ use crate::front_door::HeadDecision;
 use crate::limits;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
+use crate::render::insert_offset;
 use crate::render::snapshot_published_response;
 use crate::render::snapshot_ref;
 
 /// Parts commits a node copies at once. A commit past them answers `503`
-/// with `Retry-After`.
+/// with `Retry-After` and the code `SnapshotCommitsBusy`.
 pub(crate) const SNAPSHOT_ASSEMBLIES: usize = 2;
 
-/// Pieces a commit reads ahead of the one it hashes and writes.
-const PIECES_IN_FLIGHT: usize = 4;
+/// The most pieces a commit reads ahead of the one it hashes and writes.
+const MAX_PIECES_IN_FLIGHT: u64 = 4;
+
+/// The fewest: a small node still overlaps one read with the write.
+const MIN_PIECES_IN_FLIGHT: u64 = 1;
 
 /// Part sizes a commit checks at once.
 const STATS_IN_FLIGHT: usize = 16;
 
-/// What one commit's copy holds in memory at most, which it charges against
-/// the in-flight body budget: the pieces read ahead, the one it writes, and
-/// the writer's upload parts in flight.
-pub(crate) const ASSEMBLY_BUFFER_BYTES: u64 = COLD_SNAPSHOT_READ_PIECE_BYTES
-    * (PIECES_IN_FLIGHT as u64 + 1 + COLD_OBJECT_WRITE_CONCURRENCY as u64);
+/// Parts a commit deletes at once, after its answer.
+const DELETES_IN_FLIGHT: usize = 16;
+
+/// What a copy holds besides the pieces it reads ahead: the piece it
+/// writes and the writer's upload parts in flight.
+const COPY_FIXED_PIECES: u64 = 1 + COLD_OBJECT_WRITE_CONCURRENCY as u64;
+
+/// The charge of a copy at the fewest pieces in flight: what the in-flight
+/// body budget must hold besides one request, which configuration checks
+/// (`ursula_config::ServerConfig::MIN_INFLIGHT_BODY_SIZE_WITH_COLD`).
+pub(crate) const MIN_COPY_BYTES: u64 =
+    COLD_SNAPSHOT_READ_PIECE_BYTES * (MIN_PIECES_IN_FLIGHT + COPY_FIXED_PIECES);
+
+const _: () = assert!(
+    limits::MAX_REQUEST_BYTES + MIN_COPY_BYTES
+        <= ursula_config::ServerConfig::MIN_INFLIGHT_BODY_SIZE_WITH_COLD,
+    "the smallest budget configuration admits must hold a request and a copy"
+);
+
+/// The copies a node runs at once take at most half its budget: each takes
+/// a share of `budget / (2 * SNAPSHOT_ASSEMBLIES)`.
+const COPIES_SHARE_DIVISOR: u64 = 2 * SNAPSHOT_ASSEMBLIES as u64;
+
+/// How a copy runs on a node whose in-flight body budget is `capacity`:
+/// the pieces it reads ahead and what it charges the budget. Both copies a
+/// node runs at once take at most half the budget together, and never less
+/// than [`MIN_COPY_BYTES`].
+fn copy_plan(capacity: u64) -> (usize, u64) {
+    let share = capacity.checked_div(COPIES_SHARE_DIVISOR).unwrap_or(0);
+    let pieces = share
+        .checked_div(COLD_SNAPSHOT_READ_PIECE_BYTES)
+        .unwrap_or(0)
+        .saturating_sub(COPY_FIXED_PIECES)
+        .clamp(MIN_PIECES_IN_FLIGHT, MAX_PIECES_IN_FLIGHT);
+    // At most 7 pieces of 8 MiB.
+    let charge =
+        COLD_SNAPSHOT_READ_PIECE_BYTES.saturating_mul(pieces.saturating_add(COPY_FIXED_PIECES));
+    (usize::try_from(pieces).unwrap_or(1), charge)
+}
+
+/// The commits a node runs: its copy slots, and the keys of the commits it
+/// runs now, so that a repeat of a running commit is answered instead of
+/// copied again.
+#[derive(Clone)]
+pub(crate) struct SnapshotCommits {
+    slots: Arc<tokio::sync::Semaphore>,
+    running: Arc<Mutex<HashSet<CommitKey>>>,
+}
+
+impl Default for SnapshotCommits {
+    fn default() -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(SNAPSHOT_ASSEMBLIES)),
+            running: Arc::default(),
+        }
+    }
+}
+
+/// A commit's key: its stream, offset and digest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CommitKey {
+    stream_id: BucketStreamId,
+    snapshot_offset: u64,
+    digest: String,
+}
+
+impl SnapshotCommits {
+    /// Marks the commit of `key` as running, or `None` when it runs already.
+    fn claim(&self, key: CommitKey) -> Option<RunningCommit> {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.insert(key.clone()).then(|| RunningCommit {
+            running: Arc::clone(&self.running),
+            key,
+        })
+    }
+}
+
+/// A running commit, until it ends: its parts are deleted or kept.
+struct RunningCommit {
+    running: Arc<Mutex<HashSet<CommitKey>>>,
+    key: CommitKey,
+}
+
+impl Drop for RunningCommit {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
 
 /// Why a part upload or a parts commit was refused before it proposed
 /// anything.
@@ -131,9 +228,14 @@ pub(crate) enum PartsRefusal {
     /// A part's body could not be read (`400`).
     #[error("read part body: {0}")]
     Body(#[source] axum::Error),
-    /// The node copies as many commits as it may (`503`).
+    /// The node copies as many commits as it may (`503`,
+    /// `SnapshotCommitsBusy`).
     #[error("this node copies as many snapshot commits as it may; retry")]
     Busy,
+    /// The node runs this commit already (`503`, `SnapshotCommitInProgress`):
+    /// its repeat answers once it ends.
+    #[error("this commit is running; repeat it")]
+    InProgress,
     /// The cold store failed (`502`).
     #[error("snapshot parts in the cold store: {0}")]
     ColdStore(#[source] io::Error),
@@ -156,10 +258,8 @@ impl IntoResponse for PartsRefusal {
             | Self::UnknownPart { .. }
             | Self::DigestMismatch { .. }
             | Self::Body(_) => StatusCode::BAD_REQUEST,
-            Self::Busy => {
-                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::Busy => return retry_after_json("SnapshotCommitsBusy"),
+            Self::InProgress => return retry_after_json("SnapshotCommitInProgress"),
             Self::ColdStore(err) => {
                 tracing::warn!(error = %err, "snapshot parts in the cold store failed");
                 StatusCode::BAD_GATEWAY
@@ -257,11 +357,10 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
         return KeyCheck::Answered(refused);
     }
     let digest = commit.digest.to_string();
-    let Some((latest_offset, latest_digest)) = head.snapshot_offset.zip(head.snapshot_digest)
+    let Some((latest_offset, latest_digest)) =
+        head.snapshot_offset.zip(head.snapshot_digest.clone())
     else {
-        return KeyCheck::Open {
-            incarnation: head.incarnation,
-        };
+        return open_unless_out_of_range(target, &head);
     };
     if latest_offset == target.snapshot_offset && latest_digest == digest {
         return KeyCheck::Answered(snapshot_published_response(
@@ -271,9 +370,7 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
         ));
     }
     if latest_offset < target.snapshot_offset {
-        return KeyCheck::Open {
-            incarnation: head.incarnation,
-        };
+        return open_unless_out_of_range(target, &head);
     }
     KeyCheck::Answered(match snapshot_ref(latest_offset, &latest_digest) {
         Ok(latest) => {
@@ -292,18 +389,57 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
     })
 }
 
+/// The publish's own range refusals, from the same `HEAD`, so that a repeat
+/// of one of these final answers gets it again with no part left: `410`
+/// below the earliest retained offset, `409` beyond the tail. Each carries
+/// `Stream-Next-Offset` as the publish's refusal does. Otherwise the key is
+/// open.
+fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -> KeyCheck {
+    let (status, next_offset, message) = if target.snapshot_offset < head.retained_offset {
+        (
+            StatusCode::GONE,
+            head.retained_offset,
+            "snapshot offset is older than the stream's retained offset",
+        )
+    } else if target.snapshot_offset > head.tail_offset {
+        (
+            StatusCode::CONFLICT,
+            head.tail_offset,
+            "snapshot offset is beyond the stream's tail",
+        )
+    } else {
+        return KeyCheck::Open {
+            incarnation: head.incarnation,
+        };
+    };
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_offset(&mut headers, next_offset);
+    KeyCheck::Answered((status, headers, message).into_response())
+}
+
 /// Commits a snapshot uploaded in parts, staged for the stream's
-/// incarnation `incarnation`: reads the manifest, assembles the parts, and
-/// publishes the assembled object. The leader routed the commit, found its
-/// key open, and admitted its copy buffers. The publish carries the
-/// incarnation the parts were found for as its precondition, so a stream
-/// recreated meanwhile is answered `412`.
+/// incarnation `incarnation`: reads the manifest, then hands the commit to a
+/// task the node owns, which holds a copy slot and runs the copy, the
+/// publish and the deletion of the parts. The answer goes out as soon as
+/// the publish answers, before the parts are deleted. A client that goes
+/// away, or a gateway that times out, cancels none of it: the repeat finds
+/// the snapshot published and answers `204` from its key, and a repeat
+/// while the commit runs answers `503` with `SnapshotCommitInProgress`.
+///
+/// The leader routed the commit and found its key open. `budget` is the
+/// node's in-flight body budget, which the copy is charged against once it
+/// holds its slot, until the copy ends. The publish carries the incarnation
+/// the parts were found for as its precondition, so a stream recreated
+/// meanwhile is not published to.
 pub(crate) async fn commit(
     mut target: PublishTarget,
     commit: PartsCommit,
     incarnation: u64,
+    budget: Option<BodyBudget>,
     body: Body,
 ) -> Response {
+    let sent_token = target.if_incarnation.is_some();
     target.if_incarnation = Some(incarnation);
     let manifest = match axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await {
         Ok(manifest) => manifest,
@@ -325,9 +461,80 @@ pub(crate) async fn commit(
     let Some(cold_store) = target.state.runtime.cold_store() else {
         return PartsRefusal::NoColdStore.into_response();
     };
-    let Ok(copying) = target.state.snapshot_assemblies.clone().try_acquire_owned() else {
+    let commits = target.state.snapshot_commits.clone();
+    let Some(running) = commits.claim(CommitKey {
+        stream_id: target.stream_id.clone(),
+        snapshot_offset: target.snapshot_offset,
+        digest: commit.digest.to_string(),
+    }) else {
+        target
+            .state
+            .http_metrics
+            .snapshot_commits_in_progress
+            .fetch_add(1, Ordering::Relaxed);
+        return PartsRefusal::InProgress.into_response();
+    };
+    let Ok(slot) = commits.slots.clone().try_acquire_owned() else {
+        target
+            .state
+            .http_metrics
+            .snapshot_commits_busy
+            .fetch_add(1, Ordering::Relaxed);
         return PartsRefusal::Busy.into_response();
     };
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    // The node owns the commit from here, as it owns an admitted admin
+    // mutation: dropping the request does not cancel it.
+    let task = tokio::spawn(async move {
+        let _running = running;
+        let _slot = slot;
+        let (response, spent) = run_commit(
+            &cold_store,
+            &target,
+            &commit,
+            &manifest,
+            budget.as_ref(),
+            sent_token,
+        )
+        .await;
+        if answer.send(response).is_err() {
+            tracing::debug!(
+                stream = %target.stream_id,
+                "the client of a snapshot commit went away; the commit ran to its end"
+            );
+        }
+        if let Some(parts) = spent {
+            delete_parts(&cold_store, &parts).await;
+        }
+    });
+    match answered.await {
+        Ok(response) => response,
+        Err(_closed) => {
+            if let Err(err) = task.await {
+                tracing::error!(error = %err, "a snapshot commit task failed");
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the snapshot commit failed",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Runs a commit: resolves its parts, copies them under its budget charge,
+/// and publishes. Returns the answer and the parts to delete after it: the
+/// parts of an answer final for the key, and of a digest mismatch, whose
+/// copy consumed them. The parts of a refusal that copied nothing, or of a
+/// retryable answer, stay for the repeat.
+async fn run_commit(
+    cold_store: &ColdStoreHandle,
+    target: &PublishTarget,
+    commit: &PartsCommit,
+    manifest: &PartsManifest,
+    budget: Option<&BodyBudget>,
+    sent_token: bool,
+) -> (Response, Option<Vec<ResolvedPart>>) {
     let owner = PartOwner {
         stream_id: &target.stream_id,
         raft_group_id: target
@@ -336,32 +543,52 @@ pub(crate) async fn commit(
             .locate(&target.stream_id)
             .raft_group_id
             .0,
-        incarnation,
+        incarnation: target.if_incarnation.unwrap_or(0),
     };
-    let assembled = match resolve(&cold_store, owner, &manifest, MAX_COLD_SNAPSHOT_BYTES).await {
-        Ok(parts) => assemble(&cold_store, &target, &parts, &commit)
-            .await
-            .map(|assembled| (parts, assembled)),
-        Err(refusal) => Err(refusal),
+    let parts = match resolve(cold_store, owner, manifest, MAX_COLD_SNAPSHOT_BYTES).await {
+        Ok(parts) => parts,
+        Err(refusal) => return (refusal.into_response(), None),
     };
-    drop(copying);
-    let (parts, assembled) = match assembled {
+    let (pieces, charge) = copy_plan(budget.map_or(u64::MAX, BodyBudget::capacity));
+    let charged = match budget.map(|budget| budget.reserve(charge)).transpose() {
+        Ok(charged) => charged,
+        Err(refusal) => return (refusal.into_response(), None),
+    };
+    let assembled = assemble(cold_store, target, &parts, commit, pieces).await;
+    drop(charged);
+    let assembled = match assembled {
         Ok(assembled) => assembled,
         // A part went away during the copy: a concurrent identical commit
         // may have published the snapshot and deleted it.
         Err(PartsRefusal::UnknownPart { part }) => {
-            return match key_check(&target, &commit).await {
-                KeyCheck::Answered(answer) => answer,
-                KeyCheck::Open { .. } => PartsRefusal::UnknownPart { part }.into_response(),
-            };
+            return (
+                match key_check(target, commit).await {
+                    KeyCheck::Answered(answer) => answer,
+                    KeyCheck::Open { .. } => PartsRefusal::UnknownPart { part }.into_response(),
+                },
+                None,
+            );
         }
-        Err(refusal) => return refusal.into_response(),
+        Err(refusal @ PartsRefusal::DigestMismatch { .. }) => {
+            return (refusal.into_response(), Some(parts));
+        }
+        Err(refusal) => return (refusal.into_response(), None),
     };
-    let response = target.publish(SnapshotUpload::Cold(assembled)).await;
-    if final_for_key(response.status()) {
-        delete_parts(&cold_store, &parts).await;
+    let mut response = target.publish(SnapshotUpload::Cold(assembled)).await;
+    // The stream was recreated during the copy. A client that named no
+    // token gets the answer a commit arriving after the recreate gets: its
+    // parts belong to no live stream.
+    if response.status() == StatusCode::PRECONDITION_FAILED
+        && !sent_token
+        && let Some(part) = parts.first()
+    {
+        response = PartsRefusal::UnknownPart {
+            part: part.id.clone(),
+        }
+        .into_response();
     }
-    response
+    let spent = final_for_key(response.status()).then_some(parts);
+    (response, spent)
 }
 
 /// The incarnation of a stream that parts are staged for.
@@ -437,7 +664,7 @@ async fn resolve(
 
 /// Copies `parts` in order into one new object under the stream's external
 /// prefix while computing the snapshot digest, and keeps the object only
-/// when the digest is the one the commit names. Up to [`PIECES_IN_FLIGHT`]
+/// when the digest is the one the commit names. Up to `pieces_in_flight`
 /// pieces are read ahead of the one hashed and written, which stay in
 /// order. A part that is gone answers [`PartsRefusal::UnknownPart`].
 async fn assemble(
@@ -445,6 +672,7 @@ async fn assemble(
     target: &PublishTarget,
     parts: &[ResolvedPart],
     commit: &PartsCommit,
+    pieces_in_flight: usize,
 ) -> Result<ColdSnapshotBody, PartsRefusal> {
     let path = new_external_payload_path(&target.stream_id);
     let mut digest = SnapshotDigest::new(&target.content_type);
@@ -458,9 +686,7 @@ async fn assemble(
                     part.path.clone(),
                     part.size,
                     start,
-                    part.size
-                        .saturating_sub(start)
-                        .min(COLD_SNAPSHOT_READ_PIECE_BYTES),
+                    piece_len(part.size.saturating_sub(start)),
                 )
             })
         })
@@ -477,7 +703,7 @@ async fn assemble(
                     })
             }
         })
-        .buffered(PIECES_IN_FLIGHT);
+        .buffered(pieces_in_flight);
     let (size, object_size) = match stream_into_object(
         cold_store,
         &path,
@@ -510,12 +736,14 @@ async fn assemble(
     })
 }
 
-/// Deletes the parts of a commit whose answer is final for its key, best
-/// effort: a part left behind is swept as an orphan.
+/// Deletes the parts a commit spent, a few at once, best effort: a part
+/// left behind is swept as an orphan.
 async fn delete_parts(cold_store: &ColdStoreHandle, parts: &[ResolvedPart]) {
-    for part in parts {
-        delete_object(cold_store, &part.path).await;
-    }
+    stream::iter(parts)
+        .for_each_concurrent(DELETES_IN_FLIGHT, |part| {
+            delete_object(cold_store, &part.path)
+        })
+        .await;
 }
 
 async fn delete_object(cold_store: &ColdStoreHandle, path: &str) {
@@ -580,7 +808,7 @@ pub(crate) async fn stage_snapshot_part(
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: state.unix_time_ms(),
-            linearizable: false,
+            linearizable: true,
             read_index: None,
         })
         .await;
@@ -657,9 +885,25 @@ mod tests {
     use ursula_runtime::new_snapshot_part_id;
     use ursula_shard::BucketStreamId;
 
+    use super::MIN_COPY_BYTES;
     use super::PartOwner;
     use super::PartsRefusal;
+    use super::copy_plan;
     use super::resolve;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The copy's read-ahead follows the budget: a 64 MiB node (the tiny and
+    /// small presets) reads one piece ahead and charges 32 MiB, leaving room
+    /// for one request; the default 256 MiB reads four ahead.
+    #[test]
+    fn the_read_ahead_follows_the_budget() {
+        assert_eq!(copy_plan(64 * MIB), (1, MIN_COPY_BYTES));
+        assert_eq!(MIN_COPY_BYTES, 32 * MIB);
+        assert_eq!(copy_plan(128 * MIB), (1, 32 * MIB));
+        assert_eq!(copy_plan(256 * MIB), (4, 56 * MIB));
+        assert_eq!(copy_plan(u64::MAX), (4, 56 * MIB));
+    }
 
     /// The snapshot limit is checked from the parts' sizes, before anything
     /// is copied, and its refusal names the snapshot limit. A limit of a few

@@ -327,8 +327,8 @@ pub struct HttpState {
     /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
     /// drawn for this process when the node runs without a WAL.
     cluster_id: Arc<ClusterId>,
-    /// Parts commits copying at once on this node (#581 section 3.1).
-    snapshot_assemblies: Arc<tokio::sync::Semaphore>,
+    /// The parts commits this node runs (#581 section 3.1).
+    snapshot_commits: snapshot_parts::SnapshotCommits,
 }
 
 impl HttpState {
@@ -410,9 +410,7 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
-            snapshot_assemblies: Arc::new(tokio::sync::Semaphore::new(
-                snapshot_parts::SNAPSHOT_ASSEMBLIES,
-            )),
+            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -435,9 +433,7 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
-            snapshot_assemblies: Arc::new(tokio::sync::Semaphore::new(
-                snapshot_parts::SNAPSHOT_ASSEMBLIES,
-            )),
+            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -481,9 +477,7 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
-            snapshot_assemblies: Arc::new(tokio::sync::Semaphore::new(
-                snapshot_parts::SNAPSHOT_ASSEMBLIES,
-            )),
+            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -593,6 +587,12 @@ struct HttpMetrics {
     /// Producer writes answered `producer-expired` (the stream's epoch
     /// floor refused them).
     producer_expired_answers: AtomicU64,
+    /// Parts commits answered `503 SnapshotCommitsBusy`: every copy slot
+    /// was taken.
+    snapshot_commits_busy: AtomicU64,
+    /// Repeats of a running parts commit, answered `503
+    /// SnapshotCommitInProgress`.
+    snapshot_commits_in_progress: AtomicU64,
 }
 
 impl HttpMetrics {
@@ -604,6 +604,8 @@ impl HttpMetrics {
             sse_control_events: self.sse_control_events.load(Ordering::Relaxed),
             sse_error_events: self.sse_error_events.load(Ordering::Relaxed),
             producer_expired_answers: self.producer_expired_answers.load(Ordering::Relaxed),
+            snapshot_commits_busy: self.snapshot_commits_busy.load(Ordering::Relaxed),
+            snapshot_commits_in_progress: self.snapshot_commits_in_progress.load(Ordering::Relaxed),
         }
     }
 }
@@ -616,6 +618,8 @@ struct HttpMetricsSnapshot {
     sse_control_events: u64,
     sse_error_events: u64,
     producer_expired_answers: u64,
+    snapshot_commits_busy: u64,
+    snapshot_commits_in_progress: u64,
 }
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
@@ -3686,17 +3690,23 @@ pub(crate) async fn publish_snapshot(
         }
         snapshot_parts::KeyCheck::Open { incarnation } => incarnation,
     };
-    // The commit's copy buffers are charged with its manifest.
+    // The manifest is charged at most its own bound; the copy is charged
+    // once it holds a copy slot.
+    let budget = admission
+        .0
+        .as_ref()
+        .map(admission::DeferredAdmission::budget);
+    let manifest_bytes = u64::try_from(ursula_headers::MAX_MANIFEST_BYTES).unwrap_or(u64::MAX);
     let admission = admission
         .0
-        .map(|admission| admission.with_buffers(snapshot_parts::ASSEMBLY_BUFFER_BYTES));
+        .map(|admission| admission.capped(manifest_bytes));
     let _permit = match front_door::admit(admission) {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
         HeadDecision::Read(permit) => permit,
     };
-    snapshot_parts::commit(snapshot, commit, incarnation, body).await
+    snapshot_parts::commit(snapshot, commit, incarnation, budget, body).await
 }
 
 /// The bare `{stream}/snapshot` path (the removed latest-snapshot redirect

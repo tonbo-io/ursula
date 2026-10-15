@@ -38,7 +38,7 @@ const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
 /// Configurable via `ServerConfig.http_inflight_body_size`.
 #[derive(Clone)]
 pub struct IngressAdmission {
-    body_bytes: Arc<tokio::sync::Semaphore>,
+    body_bytes: BodyBudget,
     wal_disk: WalDiskMonitor,
     /// The node's Raft log-pressure flag (set by the snapshot driver's
     /// monitor while the unsnapshotted log is over its hard limit).
@@ -48,9 +48,7 @@ pub struct IngressAdmission {
 impl Default for IngressAdmission {
     fn default() -> Self {
         Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(
-                DEFAULT_HTTP_INFLIGHT_BODY_BYTES,
-            )),
+            body_bytes: BodyBudget::new(DEFAULT_HTTP_INFLIGHT_BODY_BYTES),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
         }
@@ -61,7 +59,7 @@ impl IngressAdmission {
     pub fn new(cfg: &ursula_config::ServerConfig) -> Self {
         let body_budget = cfg.http_inflight_body_size.as_bytes() as usize;
         Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
+            body_bytes: BodyBudget::new(body_budget),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
         }
@@ -69,7 +67,7 @@ impl IngressAdmission {
 
     pub fn disabled() -> Self {
         Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
+            body_bytes: BodyBudget::new(tokio::sync::Semaphore::MAX_PERMITS),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
         }
@@ -184,15 +182,42 @@ impl IngressAdmission {
         self.reserve(body_bytes)
     }
 
-    /// `bytes` of the in-flight body budget, held until the answer.
     fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionRefusal> {
+        self.body_bytes.reserve(bytes)
+    }
+}
+
+/// The node's in-flight body budget (`server.http_inflight_body_size`):
+/// the bytes of write bodies, and of a parts commit's copy buffers, that
+/// the node holds at once.
+#[derive(Clone)]
+pub(crate) struct BodyBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    capacity: u64,
+}
+
+impl BodyBudget {
+    fn new(capacity: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity: u64::try_from(capacity).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The whole budget.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// `bytes` of the budget, held until the permit drops.
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionRefusal> {
         if bytes == 0 {
             return Ok(AdmissionPermit { _held: None });
         }
-        // A body of at most the request limit, with a parts commit's copy
-        // buffers, fits.
+        // A body of at most the request limit, or a commit's copy buffers,
+        // fits.
         let permits = u32::try_from(bytes).unwrap_or(u32::MAX);
-        match self.body_bytes.clone().try_acquire_many_owned(permits) {
+        match self.permits.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Ok(AdmissionPermit {
                 _held: Some(permit),
             }),
@@ -238,11 +263,18 @@ impl DeferredAdmission {
         self.admission.admit(self.body_bytes)
     }
 
-    /// Charges `bytes` more than the body against the in-flight budget: the
-    /// copy buffers a parts commit holds (#581 section 3.1).
-    pub(crate) fn with_buffers(mut self, bytes: u64) -> Self {
-        self.body_bytes = self.body_bytes.saturating_add(bytes);
+    /// Charges at most `bytes` for the body: a parts commit's manifest,
+    /// which the handler reads no further, is never charged the request
+    /// limit of a body without `Content-Length`.
+    pub(crate) fn capped(mut self, bytes: u64) -> Self {
+        self.body_bytes = self.body_bytes.min(bytes);
         self
+    }
+
+    /// The node's in-flight body budget, for a charge the handler makes
+    /// later: a parts commit's copy buffers, once its copy slot is held.
+    pub(crate) fn budget(&self) -> BodyBudget {
+        self.admission.body_bytes.clone()
     }
 
     /// The in-flight budget alone, without the WAL and Raft-log pressure
@@ -275,7 +307,7 @@ fn is_write_method(method: &Method) -> bool {
     )
 }
 
-fn retry_after_json(error: &'static str) -> Response {
+pub(crate) fn retry_after_json(error: &'static str) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     headers.insert(
