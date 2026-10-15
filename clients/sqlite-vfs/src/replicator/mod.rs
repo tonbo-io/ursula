@@ -203,6 +203,8 @@ pub(crate) enum Action {
         acked: Position,
         offset: Offset,
     },
+    /// The ticket resolved (design §8.2). Only a streaming replicator resolves one, after the
+    /// [`Action::Wake`] that covers its target.
     Synced {
         ticket: u64,
     },
@@ -713,10 +715,11 @@ fn common_event(
             }
             Ok(None)
         }
+        // Only the streaming state settles: a claim's reconcile acknowledges records before it
+        // announces them, and outputs wait for the claim and its reconcile (design §5.5, §7).
         Event::Sync { ticket, target } => {
             let after = ctx.upcoming_id();
             ctx.tickets.add(ticket, target, after);
-            ctx.settle(actions);
             Ok(None)
         }
         Event::Stop => Err(Terminal::Stopped),
@@ -1404,6 +1407,7 @@ fn streaming(
     match common_event(&mut stream.ctx, event, actions) {
         Err(terminal) => terminal.into(),
         Ok(None) => {
+            stream.ctx.settle(actions);
             stream.kick(now_ms, actions);
             stream.into()
         }

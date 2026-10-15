@@ -242,6 +242,11 @@ struct Instance {
     /// The clock passed idle expiry while this owner's continuation claim was outstanding and
     /// already in the stream: the floor rose past its own claim, and it loses by design.
     claim_expired: bool,
+    /// A rebuild's generation, published when its `CaughtUp` is delivered: only then do the
+    /// discarded tail (from this position) and the new lineage replace the old generation. A
+    /// restart before that finds the old generation whole, as a crash before the publishing
+    /// rename does (design §5.1, §5.6).
+    unpublished: Option<Option<Position>>,
 }
 
 /// What the scripts of one [`check`] run reached, beyond the properties.
@@ -411,6 +416,7 @@ impl World {
             applies: 0,
             caught_up_due: None,
             claim_expired: false,
+            unpublished: None,
         };
         (inst, actions)
     }
@@ -548,8 +554,19 @@ impl World {
         self.owners[index].inst.replicator.ctx().is_some()
     }
 
+    /// Whether a connection can commit or call `synced()`. A takeover runs inside `open()`,
+    /// before any connection opens the generation (design §5.5), so the driver logs no commit
+    /// and takes no `synced()` call for a binding still opening.
+    fn bound(&self, index: usize) -> bool {
+        self.live(index)
+            && !matches!(self.owners[index].inst.replicator, Replicator::Activating {
+                kind: ClaimKind::Takeover { .. },
+                ..
+            })
+    }
+
     fn commit(&mut self, index: usize) {
-        if !self.live(index) {
+        if !self.bound(index) {
             return;
         }
         let owner = &mut self.owners[index];
@@ -574,7 +591,7 @@ impl World {
     }
 
     fn sync(&mut self, index: usize) {
-        if !self.live(index) {
+        if !self.bound(index) {
             return;
         }
         let ticket = self.next_ticket;
@@ -621,7 +638,6 @@ impl World {
         takeover: bool,
     ) {
         let mut caught_up = false;
-        let mut applied_chunk = false;
         let fenced = actions.contains(&Action::Reset(ResetKind::Fenced));
         let discarded = actions.iter().any(|a| {
             matches!(a, Action::Rebuild {
@@ -694,8 +710,8 @@ impl World {
                         log.acks.push((last, end, 0));
                         log.durable_acks = log.acks.len();
                     }
+                    log.catching_up = false;
                     caught_up = true;
-                    applied_chunk = true;
                 }
                 Action::Rebuild { discard_from, .. } => {
                     if !takeover {
@@ -708,15 +724,10 @@ impl World {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some(from) = discard_from {
-                        owner.log.commits.retain(|p, _| *p < from.0);
                         owner.inst.discards.push(from);
                     }
                     owner.inst.rebuilt = true;
-                    // The generation is rebuilt with a new random lineage.
-                    let mut lineage = [0x7a; 16];
-                    lineage[..8].copy_from_slice(&self.next_uid.to_le_bytes());
-                    owner.log.lineage = Lineage(lineage);
-                    self.next_uid += 1;
+                    owner.inst.unpublished = Some(discard_from);
                     caught_up = true;
                 }
                 Action::Reset(kind @ (ResetKind::Fenced | ResetKind::Stale))
@@ -732,10 +743,8 @@ impl World {
             }
         }
         if caught_up {
-            let log = &mut self.owners[index].log;
-            // A chunk's ACK is durable already; a rebuild's comes with the bind.
-            log.catching_up = !applied_chunk;
-            let last = log.last_logged();
+            // A rebuild's positions continue above the last one logged.
+            let last = self.owners[index].log.last_logged();
             self.owners[index].inst.caught_up_due = Some(last);
         }
     }
@@ -1065,8 +1074,25 @@ impl World {
             return;
         };
         if let Some(last) = self.owners[index].inst.caught_up_due.take() {
+            if let Some(discard_from) = self.owners[index].inst.unpublished.take() {
+                self.publish(index, discard_from);
+            }
             self.event(index, Event::CaughtUp { last, log_bytes: 0 });
         }
+    }
+
+    /// The rebuilt generation replaces the old one: the discarded tail goes, the lineage is new
+    /// and random, and the ACK of the bind that follows is durable (a chunk's is already).
+    fn publish(&mut self, index: usize, discard_from: Option<Position>) {
+        let mut lineage = [0x7a; 16];
+        lineage[..8].copy_from_slice(&self.next_uid.to_le_bytes());
+        self.next_uid += 1;
+        let log = &mut self.owners[index].log;
+        if let Some(from) = discard_from {
+            log.commits.retain(|p, _| *p < from.0);
+        }
+        log.lineage = Lineage(lineage);
+        log.catching_up = true;
     }
 
     fn apply_op(&mut self, op: &Op) {
@@ -1537,4 +1563,144 @@ fn a_lagging_takeover_below_retention_rebuilds() {
         world.owners[1].inst.replicator,
         Replicator::Streaming { .. }
     ));
+}
+
+/// A takeover's reconcile meets a `410` below retention and rebuilds, discarding the record whose
+/// append was lost, and the process restarts before the rebuilt generation is published. The old
+/// generation stays whole until the publishing rename (design §5.1, §5.6), so the restart finds
+/// the record still pending, and a `synced()` call after it waits for that record.
+#[test]
+fn a_restart_before_a_rebuild_publishes_keeps_the_old_generation() {
+    let ops = vec![
+        Op::Flush,
+        Op::Retain(0),
+        Op::Commit(0),
+        Op::DropRequest(0),
+        Op::Restart(0, 1),
+        Op::Flush,
+        Op::Restart(0, 0),
+        Op::Flush,
+        Op::Sync(0),
+        Op::Flush,
+    ];
+    assert_eq!(run(Knobs::default(), 0, &ops), Vec::<String>::new());
+}
+
+/// The proptest's shrunk counterexamples, each a ticket resolved below its target (property 9).
+/// The first three commit while a takeover is still opening, then restart before a rebuild that
+/// discarded the commit is published. The last calls `synced()` while the takeover is opening,
+/// and the ticket resolved between two reads of a later continuation's reconcile. The world no
+/// longer commits or calls `synced()` during a takeover (the driver takes neither before the
+/// bind, design §5.5), so the scripts now pass without reaching those steps: the test above and
+/// `machine::a_ticket_waits_for_the_continuation_reconcile_to_finish` keep both rules.
+#[test]
+fn the_proptests_shrunk_counterexamples_pass() {
+    use Op::Checkpoint;
+    use Op::Commit;
+    use Op::Deliver;
+    use Op::DropAnswerAfterApply;
+    use Op::Duplicate;
+    use Op::ExpireIdle;
+    use Op::Fault;
+    use Op::Flush;
+    use Op::ForeignClaim;
+    use Op::Restart;
+    use Op::Retain;
+    use Op::Sync;
+    use Op::Takeover;
+    use Op::Tick;
+    let scripts: [(u64, Vec<Op>); 4] = [
+        (0, vec![
+            Deliver(0),
+            Deliver(0),
+            Restart(0, 0),
+            Deliver(0),
+            Retain(0),
+            Deliver(0),
+            Restart(0, 2),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Commit(0),
+            Deliver(0),
+            Restart(0, 0),
+            Sync(0),
+            ForeignClaim(false),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Commit(0),
+        ]),
+        (0, vec![
+            Flush,
+            Retain(0),
+            Restart(0, 1),
+            Deliver(0),
+            Deliver(0),
+            Commit(0),
+            Deliver(0),
+            Deliver(0),
+            Restart(0, 0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Sync(0),
+            Deliver(0),
+            Commit(0),
+            Commit(0),
+            Takeover(false),
+            Commit(0),
+            Duplicate(0),
+        ]),
+        (
+            0,
+            [
+                ForeignClaim(false),
+                Flush,
+                Retain(0),
+                Restart(0, 1),
+                Commit(0),
+                Flush,
+                Restart(0, 0),
+                Flush,
+                Sync(0),
+                Commit(0),
+                Flush,
+            ]
+            .into_iter()
+            .chain(std::iter::repeat_n(Commit(0), 9))
+            .collect(),
+        ),
+        (1_858_832_379_911_420_328, vec![
+            Fault(FaultKind::Unreachable, false, 2),
+            Deliver(0),
+            Commit(0),
+            Deliver(0),
+            Sync(0),
+            Tick(0),
+            Deliver(0),
+            Deliver(0),
+            Tick(0),
+            Deliver(0),
+            Commit(0),
+            Deliver(0),
+            DropAnswerAfterApply(0),
+            Deliver(0),
+            Checkpoint,
+            ExpireIdle,
+            Tick(0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Deliver(0),
+            Sync(0),
+        ]),
+    ];
+    for (seed, ops) in &scripts {
+        assert_eq!(run(Knobs::default(), *seed, ops), Vec::<String>::new());
+    }
 }
