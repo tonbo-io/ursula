@@ -2888,3 +2888,95 @@ fn a_runtime_cancel_racing_the_result_retires_the_binding() {
     let ticket = driver.sync(bound.binding, None, true).unwrap();
     assert_eq!(driver.wait(ticket, Duration::from_secs(10)), Some(Ok(())));
 }
+
+/// A closed owner's generation, a checkpoint of the stream, then another writer's commit of page
+/// 2 that a catch-up in place logged with its ACK lost to a crash: the db holds that page past
+/// the log's acknowledged offset. Returns the generation, the checkpoint and the frame.
+fn caught_up_after_the_ack(
+    w: &mut World,
+    dir: &Path,
+) -> (PathBuf, crate::model::CheckpointId, Vec<u8>) {
+    let c = w.core();
+    let bound = w.open(c, spec(dir, 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let now = w.now;
+    assert!(bound.handle.disconnect());
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    let checkpoint = w.server.checkpoint();
+    let frame = frame::encode_commit(
+        CommitId {
+            lineage: crate::ids::Lineage([0x6d; 16]),
+            position: Position(1),
+        },
+        &CommitRecord {
+            db_pages_after: 2,
+            pages: vec![(2, Box::new([0x5a; 4096]))],
+        },
+    )
+    .unwrap();
+    w.server.foreign_append(PATH, &frame).unwrap();
+    let (mut log, _) = crate::replog::Log::open(&generation.join("log")).unwrap();
+    log.append(&RecordBody::Commit {
+        frame: frame.clone(),
+    })
+    .unwrap();
+    log.sync().unwrap();
+    (generation, checkpoint, frame)
+}
+
+/// A caught-up record after the log's ACK, and a restore of a checkpoint from before it, which
+/// inherits by that ACK: the db holds a page the restored history lacks, so the open refuses and
+/// keeps the files.
+#[test]
+fn a_caught_up_record_after_the_ack_is_refused_at_open() {
+    let dir = TempDir::new("driver-foreign-after-ack");
+    let mut w = World::new();
+    let (generation, checkpoint, frame) = caught_up_after_the_ack(&mut w, dir.path());
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    assert!(
+        !w.server
+            .frames(PATH)
+            .unwrap()
+            .windows(frame.len())
+            .any(|x| x == frame.as_slice())
+    );
+    let before = segment_tokens(&generation);
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(
+        matches!(
+            &*e,
+            OpenError::StreamState(StreamState::TokenChanged { .. })
+        ),
+        "{e}"
+    );
+    assert!(w.claims(c2).is_empty());
+    assert_eq!(segment_tokens(&generation), before);
+}
+
+/// The same with the restore right after the open's HEAD: the open resumes, its takeover's claim
+/// meets the new token whose history inherits by the log's ACK, and it fails `rewound` before the
+/// log rolls instead of re-keying.
+#[test]
+fn a_caught_up_record_after_the_ack_fails_a_takeover_that_meets_a_restore() {
+    let dir = TempDir::new("driver-foreign-mid-open");
+    let mut w = World::new();
+    let (generation, checkpoint, _) = caught_up_after_the_ack(&mut w, dir.path());
+    let before = segment_tokens(&generation);
+    w.after_head = Some(Box::new(move |server: &mut ModelServer| {
+        server
+            .history_event(HistoryEvent::Restore(checkpoint))
+            .unwrap();
+    }));
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(matches!(&*e, OpenError::Reset(ResetKind::Rewound)), "{e}");
+    assert_eq!(segment_tokens(&generation), before);
+}

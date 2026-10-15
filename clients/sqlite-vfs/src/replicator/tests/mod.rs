@@ -114,6 +114,11 @@ pub(crate) fn local(pending: Vec<Pending>, acked_offset: u64) -> LocalState {
         configured_max_request_bytes: None,
         db_bytes: u64::MAX,
         rekey_from: None,
+        unacked: if logged > acked {
+            crate::replicator::answer::Unacked::Commits
+        } else {
+            crate::replicator::answer::Unacked::Nothing
+        },
     }
 }
 

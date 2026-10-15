@@ -874,11 +874,17 @@ fn summary(m: &Materialized) -> LocalSummary {
         cluster_id: r.header.cluster_id.clone(),
         incarnation: r.header.incarnation,
         acked_offset: r.acked_offset,
-        pending: if r.pending().is_empty() {
-            Unacked::Nothing
-        } else {
-            Unacked::Commits
-        },
+        pending: unacked(m),
+    }
+}
+
+/// Whether the log holds any COMMIT record after its latest ACK, own or caught up: a caught-up
+/// frame whose ACK a crash lost is applied to the db too, past the acknowledged offset.
+fn unacked(m: &Materialized) -> Unacked {
+    if m.recovered.commit_after_ack() {
+        Unacked::Commits
+    } else {
+        Unacked::Nothing
     }
 }
 
@@ -924,6 +930,7 @@ fn local_state(
         // A catch-up in place larger than the database rebuilds instead (design §5.6).
         db_bytes: m.db.metadata().map_or(u64::MAX, |meta| meta.len()),
         rekey_from,
+        unacked: unacked(m),
     }
 }
 

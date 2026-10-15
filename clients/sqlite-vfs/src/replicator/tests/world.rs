@@ -572,6 +572,7 @@ impl World {
             configured_max_request_bytes: None,
             db_bytes: db_bytes(family),
             rekey_from: None,
+            unacked: Unacked::Nothing,
         };
         let (inst, actions) = self.instance(local);
         self.owners.push(Owner {
@@ -620,15 +621,18 @@ impl World {
             other => panic!("a HEAD answers a HEAD, not {other:?}"),
         };
         let cluster = cluster();
+        // The world's log holds COMMIT records (own, and caught up) only up to its ACKs or in
+        // the pending tail.
+        let unacked = if pending.is_empty() {
+            Unacked::Nothing
+        } else {
+            Unacked::Commits
+        };
         let summary = LocalSummary {
             cluster_id: cluster.as_str().to_owned(),
             incarnation: log.incarnation,
             acked_offset,
-            pending: if pending.is_empty() {
-                Unacked::Nothing
-            } else {
-                Unacked::Commits
-            },
+            pending: unacked,
         };
         let seen = HeadSeen {
             identity: identity.as_ref(),
@@ -663,6 +667,7 @@ impl World {
             configured_max_request_bytes: None,
             db_bytes: db_bytes(family),
             rekey_from,
+            unacked,
         };
         let (inst, actions) = self.instance(local);
         self.owners[index].inst = inst;
@@ -2217,8 +2222,8 @@ fn negative_controls_fail_the_proptest_too() {
             ..ReplicatorKnobs::default()
         }),
         // `no_claim_after_repeat` is left to its fixed script: its false fence needs a claim
-        // applied with its answer lost, then a history event before the resend, which 200k
-        // random scripts never reach.
+        // applied with its answer lost, then a history event before the resend. Random seeds do
+        // reach it (one 300k run did), but this fixed seed does not within the CI budget.
         replicator_knobs(ReplicatorKnobs {
             misroute_as_deleted: true,
             ..ReplicatorKnobs::default()
@@ -2232,6 +2237,34 @@ fn negative_controls_fail_the_proptest_too() {
         // must not flake.
         assert!(check(knobs, 512, true).is_err(), "{knobs:?} passed");
     }
+}
+
+/// A clone commits at the next position with its own bytes, its snapshot of our shared lineage
+/// moves retention past the original's acknowledged offset, and the original's commit at the same
+/// position meets the `410`. The rule must not take the clone's snapshot as covering the
+/// original's own record above its acknowledged position: that would acknowledge a commit the
+/// stream never held (property 8) and append after another copy's state.
+#[test]
+fn a_clones_snapshot_never_covers_the_originals_commit() {
+    let ops = vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::Clone(0),
+        Op::Commit(1),
+        Op::Flush,
+        Op::Retain(1),
+        Op::Commit(0),
+        Op::Flush,
+        Op::Restart(0, 0),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
 }
 
 /// A host whose build lags reconciles from below retention: the `410` rebuilds, never skips the

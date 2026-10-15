@@ -360,6 +360,9 @@ pub(crate) struct LocalState {
     /// open's HEAD found inheriting: the replicator re-keys before it claims, and `incarnation`
     /// is the stream's new token.
     pub(crate) rekey_from: Option<Incarnation>,
+    /// Whether the log held a COMMIT record after its latest ACK when the open read it: a
+    /// takeover re-keys only without one ([`answer::takeover_may_rekey`]).
+    pub(crate) unacked: Unacked,
 }
 
 /// The request limit `L` (design §4.6): the latest HEAD's, any limit a typed `413` named since,
@@ -418,6 +421,8 @@ pub(crate) struct Ctx {
     reached: Vec<BoundaryReceipt>,
     /// The db file's size at the start.
     pub(crate) db_bytes: u64,
+    /// Whether the log held a COMMIT record after its latest ACK when the open read it.
+    unacked: Unacked,
     /// The token the generation re-keyed from, until a claim under the new one applies: a HEAD
     /// still inherits from it ([`HeadCheck::previous`]). Several re-keys with no write between
     /// them keep the first.
@@ -477,6 +482,7 @@ impl Ctx {
             reached: Vec::new(),
             db_bytes: local.db_bytes,
             rekey_from: local.rekey_from,
+            unacked: local.unacked,
             repeat_closed: None,
             producer,
             next_id: 0,
@@ -917,7 +923,7 @@ fn rekey(
     actions: &mut Vec<Action>,
 ) -> Replicator {
     let unacked = if ctx.pending.is_empty() {
-        Unacked::Nothing
+        ctx.unacked
     } else {
         Unacked::Commits
     };
