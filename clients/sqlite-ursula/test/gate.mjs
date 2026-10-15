@@ -5,7 +5,8 @@
 // - `refuse`: the port stops listening and every open connection is reset, so a request fails at
 //   once with ECONNREFUSED or a reset (a node or a gateway down).
 // `forward` heals it. Requests held by a blackhole stay unanswered after the heal, as a partition's
-// would, and time out on the client.
+// would, and time out on the client. For test/cluster.e2e.ts it also misroutes: the server it
+// forwards to changes with `PUT /target`, as a routing mistake in front of a deployment would.
 //
 // It also scripts faults for the next requests it forwards, as the model's `/__model/faults` does
 // (clients/sqlite-vfs/src/model/faults.rs), so the suites that hold an answer back run against a
@@ -15,13 +16,14 @@
 // argv: the server's URL. Prints {"port": n, "control": n} once it listens: the proxy's port and a
 // control port of its own, which no mode affects. Control requests:
 //   PUT /mode {"mode": "forward" | "blackhole" | "refuse"} -> 204
+//   PUT /target {"url": "<server URL>"} -> 204: later requests go to that server
 //   GET /stats -> {"mode", "forwarded", "held", "refused"}
 //   POST /faults[?times=<n>][&method=<METHOD>], body `delay <ms>` -> 204: the fault for the next
 //     `times` (1) forwarded requests with that method (any method when absent)
 // It exits when its stdin closes, so it never outlives the test process that started it.
 import { createServer, request } from "node:http";
 
-const target = new URL(process.argv[2]);
+let target = new URL(process.argv[2]);
 const state = { mode: "forward", forwarded: 0, held: 0, refused: 0 };
 const sockets = new Set();
 let port = 0;
@@ -122,6 +124,16 @@ const control = createServer((req, res) => {
 				return;
 			}
 			if (times > 0) faults.push({ method: url.searchParams.get("method") ?? undefined, delayMs: Number(delay[1]), times });
+			res.writeHead(204).end();
+			return;
+		}
+		if (req.method === "PUT" && url.pathname === "/target") {
+			try {
+				target = new URL(JSON.parse(body).url);
+			} catch {
+				res.writeHead(400).end(`not a JSON body with a URL: ${body}`);
+				return;
+			}
 			res.writeHead(204).end();
 			return;
 		}

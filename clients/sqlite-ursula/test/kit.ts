@@ -234,3 +234,37 @@ export async function fromStream(url: string, sql: string): Promise<unknown[]> {
 	await reader.stop();
 	return rows;
 }
+
+/** A process a test started that prints one JSON line once it listens and exits when its stdin closes. */
+async function listening(bin: string, args: readonly string[]): Promise<{ line: Record<string, unknown>; stop: () => Promise<void> }> {
+	const proc = spawn(bin, [...args], { stdio: ["pipe", "pipe", "inherit"] });
+	const exited = new Promise((r) => proc.once("exit", r));
+	// A binary that cannot start (missing, not executable) fails here instead of hanging.
+	const failed = new Promise<never>((_, reject) => proc.once("error", (error) => reject(new Error(`${bin} did not start: ${error.message}`))));
+	const lines = createInterface({ input: proc.stdout as NodeJS.ReadableStream })[Symbol.asyncIterator]();
+	const first = await Promise.race([lines.next(), failed]);
+	if (first.done === true) throw new Error(`${bin} exited before it listened`);
+	const stop = async (): Promise<void> => {
+		if (proc.exitCode === null && proc.signalCode === null) {
+			proc.stdin?.end();
+			await exited;
+		}
+	};
+	return { line: JSON.parse(first.value as string) as Record<string, unknown>, stop };
+}
+
+/**
+ * A model server of its own, of the deployment `clusterId`, drawing its history ids from `seed`:
+ * the binary test/stack.ts runs, from URSULA_VFS_MODEL or the crate's release build.
+ */
+export async function modelServer(clusterId: string, seed: number): Promise<{ url: string; stop: () => Promise<void> }> {
+	const bin = process.env.URSULA_VFS_MODEL ?? join(import.meta.dirname, "../../sqlite-vfs/target/release/ursula-vfs-model");
+	const { line, stop } = await listening(bin, ["--exit-with-stdin", "--cluster-id", clusterId, "--seed", String(seed)]);
+	return { url: `http://127.0.0.1:${line.port as number}`, stop };
+}
+
+/** test/gate.mjs in front of `url`: its proxy URL, its control URL and a stop. */
+export async function gate(url: string): Promise<{ url: string; control: string; stop: () => Promise<void> }> {
+	const { line, stop } = await listening(process.execPath, ["--no-warnings", join(import.meta.dirname, "gate.mjs"), url]);
+	return { url: `http://127.0.0.1:${line.port as number}`, control: `http://127.0.0.1:${line.control as number}`, stop };
+}
