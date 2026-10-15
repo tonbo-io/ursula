@@ -773,9 +773,26 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
     let store = backup::BackupStore::open(&args.location)?;
     let report = backup::restore(&client, &store).await?;
     println!(
-        "restore complete: {} groups, {} buckets, {} streams, {} cold objects present",
-        report.groups, report.buckets, report.streams, report.cold_objects
+        "restore complete: {} groups ({} imported by an earlier run), {} buckets, {} streams, \
+         {} cold objects present; every restored stream answers with a new Stream-Incarnation",
+        report.groups,
+        report.already(),
+        report.buckets,
+        report.streams,
+        report.cold_objects
     );
+    for import in &report.imports {
+        println!(
+            "group {}: history {:#018x}{}",
+            import.raft_group_id,
+            import.history,
+            if import.already {
+                " (imported by an earlier run)"
+            } else {
+                ""
+            }
+        );
+    }
     Ok(())
 }
 
