@@ -4597,6 +4597,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ursula-producer-headers"
+version = "0.7.5"
+
+[[package]]
 name = "ursula-proto"
 version = "0.7.5"
 dependencies = [

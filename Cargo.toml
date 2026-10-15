@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/ursula-proto",
+    "crates/ursula-producer-headers",
     "crates/ursula-control",
     "crates/ursula-config",
     "crates/ursula-runtime",
@@ -106,6 +107,7 @@ ursula-control = { path = "crates/ursula-control", version = "=0.7.5" }
 ursula-ctl = { path = "crates/ursula-ctl", version = "=0.7.5" }
 ursula-gateway = { path = "crates/ursula-gateway", version = "=0.7.5" }
 ursula-index = { path = "crates/ursula-index", version = "=0.7.5" }
+ursula-producer-headers = { path = "crates/ursula-producer-headers", version = "=0.7.5" }
 ursula-proto = { path = "crates/ursula-proto", version = "=0.7.5" }
 ursula-raft = { path = "crates/ursula-raft", version = "=0.7.5" }
 ursula-runtime = { path = "crates/ursula-runtime", version = "=0.7.5" }

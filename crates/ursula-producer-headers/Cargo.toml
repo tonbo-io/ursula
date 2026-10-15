@@ -1,0 +1,17 @@
+[package]
+name = "ursula-producer-headers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Typed producer request and response headers of Ursula's write keys, shared by the server and its clients."
+
+# Standard library only: the standalone client workspaces (clients/sqlite-vfs)
+# depend on this crate by path, so it must not pull the server's dependencies.
+[dependencies]
+
+[lints]
+workspace = true
