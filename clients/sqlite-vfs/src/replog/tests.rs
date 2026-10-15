@@ -330,6 +330,15 @@ fn a_failed_unlink_in_a_trim_keeps_the_log_contiguous() {
     }));
     assert_eq!(log.segment_paths(), segments);
     assert!(segments.iter().all(|s| s.exists()));
+    // The unlink succeeds but its fsync fails: the segment stays listed though it is gone, and
+    // the next trim takes it as removed.
+    log.fail_next_trim_fsync = true;
+    assert!(matches!(log.trim().unwrap_err(), LogError::Io {
+        op: "fsync",
+        ..
+    }));
+    assert_eq!(log.segment_paths(), segments);
+    assert!(!segments[0].exists());
     // Positions 1 to 3 lie at or below min(base, acked) = 3: their segments go.
     assert_eq!(log.trim().unwrap(), 3);
     assert_eq!(log.segment_paths(), segments[3..].to_vec());

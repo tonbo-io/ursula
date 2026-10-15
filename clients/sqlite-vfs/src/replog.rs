@@ -206,6 +206,9 @@ pub(crate) struct Log {
     /// Test hook: the next unlink in a trim fails.
     #[cfg(test)]
     pub(crate) fail_next_unlink: bool,
+    /// Test hook: the next directory fsync in a trim fails, after its unlink succeeded.
+    #[cfg(test)]
+    pub(crate) fail_next_trim_fsync: bool,
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> LogError {
@@ -312,6 +315,8 @@ impl Log {
             fail_next_append: None,
             #[cfg(test)]
             fail_next_unlink: false,
+            #[cfg(test)]
+            fail_next_trim_fsync: false,
         })
     }
 
@@ -506,6 +511,8 @@ impl Log {
             fail_next_append: None,
             #[cfg(test)]
             fail_next_unlink: false,
+            #[cfg(test)]
+            fail_next_trim_fsync: false,
         };
         Ok((log, recovered))
     }
@@ -642,7 +649,18 @@ impl Log {
                     "injected unlink failure",
                 )));
             }
-            fs::remove_file(&segment.path).map_err(io("remove", &segment.path))?;
+            // Gone already: an earlier trim unlinked it and then failed its fsync.
+            match fs::remove_file(&segment.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io("remove", &segment.path)(e)),
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_trim_fsync) {
+                return Err(io("fsync", &self.dir)(std::io::Error::other(
+                    "injected fsync failure",
+                )));
+            }
             sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
             self.segments.remove(0);
         }
