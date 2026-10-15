@@ -42,8 +42,9 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 
 | Config key | Default | Purpose |
 | ---------- | ------- | ------- |
-| `server.listen` | `127.0.0.1:4437` | Client/API listener |
-| `server.cluster_listen` | none | Optional separate Raft/cluster listener |
+| `server.listen` | `127.0.0.1:4437` | Client-plane listener: the stream API, metrics, readiness and usage |
+| `server.cluster_listen` | none | Separate cluster-plane listener for Raft gRPC between voters. Unset, the cluster plane shares `server.listen`. Set, every `[[raft.peers]]` entry needs a `client_url` |
+| `server.admin_listen` | `127.0.0.1:4438` | Admin-plane listener for the mutating operator routes, plus metrics, readiness and usage. Keep it on loopback and reach it through a tunnel |
 | `server.cluster_id` | none | The deployment's id, sent as `Ursula-Cluster-Id` on every `HEAD`: 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`. Required when `raft.peers` is set, the same on every node and different for every deployment a client can reach. A single node without it generates `u` followed by 32 hex digits at its first start and keeps it in its WAL. A single node without `raft.wal.path` gets a new one on every start. The WAL records the id, and a node whose configured id differs refuses to start |
 | `server.http_inflight_body_size` | `256MiB` (`64MiB` in the `tiny` and `small` presets) | Write body bytes the node holds at once. A write that would exceed it answers `503` with `IngressBodyBytesLimitReached`. A snapshot commit's copy of parts is charged against it too, from 32 MiB to 56 MiB depending on the budget, and starts only while 32 MiB stays free beside it. With a cold backend it must be at least `64MiB`, or the node refuses to start |
 | `runtime.cpu_affinity` | automatic | On Linux, `true` forces pinning and `false` disables it; omitted pins only when cpuset size equals core_count |
@@ -51,7 +52,20 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
 | `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature |
 
-Without `server.cluster_listen`, `server.listen` serves both client/API and Raft/cluster routes, and each `[[raft.peers]].url` should point at that address. With `server.cluster_listen` set, `server.listen` is client/API-only and peer URLs must point at the cluster listener instead. Note that the same peer URL is currently also used for HTTP leader redirects. A client that talks to a node directly follows it, so it must be reachable by such clients as well as by peers. `ursula gateway` follows a redirect to an upstream directly when its `--upstream` equals the peer URL, and searches its upstreams for the leader otherwise.
+Without `server.cluster_listen`, `server.listen` serves both the client and the cluster plane, and each `[[raft.peers]].url` points at that address. Leader redirects then name the same URL, so clients must be able to reach it too.
+
+With `server.cluster_listen` set, `server.listen` serves only the client plane. Each `[[raft.peers]].url` points at the peer's cluster listener, and each `[[raft.peers]].client_url` at its client listener. A follower redirects a client to the leader's `client_url`, so only peers need to reach the cluster listener. A node refuses to start when a peer lacks `client_url`. `ursula gateway` follows a redirect to an upstream directly when its `--upstream` equals the leader's `client_url`, and searches its upstreams for the leader otherwise. See [Security](/docs/security#network-planes) for what each plane serves.
+
+```toml
+[server]
+listen = "0.0.0.0:4437"
+cluster_listen = "0.0.0.0:4439"
+
+[[raft.peers]]
+node_id = 1
+url = "http://10.0.0.1:4439"
+client_url = "http://10.0.0.1:4437"
+```
 
 ## Raft
 
@@ -66,7 +80,7 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | `raft.wal.cache_size` | `256MiB` | Recent Raft entries kept in memory across the node, split evenly between its groups. Older entries, such as a lagging follower's catch-up, are read from disk |
 | `raft.wal.min_available_size` | `512MiB` | Reject writes and mark `/__ursula/ready` unavailable below this much free WAL-filesystem space. `0` disables the guard |
 | `raft.wal.resume_available_size` | `1GiB` | Free space required before disk-pressure admission clears. Must exceed the minimum |
-| `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node |
+| `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node. Each entry has `node_id`, `url` (the address peers dial for the cluster plane) and `client_url` (the client-plane address leader redirects name, required with `server.cluster_listen` and `url` by default) |
 | `raft.init_membership_per_group` | `false` | Per-group membership bootstrap. One voter per group initializes it once every configured voter reports the group empty and no leader. A replica that ever held its group never initializes it again, so keep it `true` across restarts. The Helm chart sets `true` |
 
 The Raft WAL is always the per-core disk journal. A node with `raft.peers` set
@@ -171,7 +185,7 @@ path = "./data"
 ursula --config ./ursula.toml
 ```
 
-Three-node durable cluster (same file on each host, override the node ID per host):
+Three-node durable cluster on a single port per node (same file on each host, override the node ID per host). [Deploy a Cluster](/docs/deploy-cluster#without-kubernetes-bare-metal--vms) shows the same cluster with the cluster plane on its own port, which keeps Raft off the client port:
 
 ```toml
 [server]

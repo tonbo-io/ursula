@@ -3,7 +3,7 @@ title: Security
 ---
 
 <Warning>
-Ursula does not terminate TLS, authenticate clients, or restrict admin endpoints. Treat the listening port as fully trusted. Run it on a private network behind a reverse proxy that owns TLS termination and request authentication.
+Ursula does not terminate TLS or authenticate clients or peers. Anyone who can reach a node's client port can read and write every stream. Anyone who can reach its cluster port can send it Raft traffic, and with a single port (no `server.cluster_listen`) that is the client port too. Run nodes on a private network. TLS termination belongs to a reverse proxy or ingress in front of them, since neither the nodes nor the gateway serve TLS. The gateway authenticates requests only when you enable its access control with `--auth-issuer` (see [Gateway access control](#gateway-access-control-opt-in)).
 </Warning>
 
 The current `v0.x` security model is deliberately narrow. Ursula is built to slot behind your existing edge layer, not to be one.
@@ -14,20 +14,36 @@ The current `v0.x` security model is deliberately narrow. Ursula is built to slo
 - **Per-group backpressure.** When a group's hot ring exceeds `storage.cold.max_hot_size_per_group`, appends to that group return `503` with `Retry-After` until cold flush catches up. Per-group, not global or per-client.
 - **Stream-level isolation.** Streams hash to disjoint Raft groups and disjoint owner cores. A hot stream on one group cannot starve writes on a different group on a different core.
 
+## Network planes
+
+A node serves three planes, each on its own listener:
+
+| Plane | Listener | Routes | Who connects |
+| ----- | -------- | ------ | ------------ |
+| Client | `server.listen` | The Durable Streams protocol, plus read-only `/__ursula/metrics`, `/__ursula/ready` and `/__ursula/usage` | Applications, the gateway, and clients following a leader redirect |
+| Cluster | `server.cluster_listen`, or `server.listen` when it is unset | Raft gRPC (append entries, votes, snapshots, leader-read checks, group reads and writes one node forwards to another, leadership transfer), `/__ursula/leadership-shed` and `/__ursula/cluster-probe` | Other voters and learners, at the `url` of their `[[raft.peers]]` entry |
+| Admin | `server.admin_listen`, loopback `127.0.0.1:4438` by default | The mutating operator routes (Raft group operations, maintenance fences and drains, cold flush, bucket purge, backups) plus metrics, readiness and usage | Operators and `ursulactl` through a tunnel such as `kubectl port-forward` |
+
+None of the three authenticates its caller. The admin plane is protected by its loopback bind, not by a credential, so bind it to a reachable address only for a trusted in-cluster operator.
+
+Set `server.cluster_listen` so the client plane serves no Raft route. Each `[[raft.peers]]` entry then names the peer's cluster listener in `url` and its client listener in `client_url`, which is where a follower redirects a client. A client that can reach only the client port then cannot send Raft traffic, as long as the network also keeps it off the cluster port. The Helm chart sets `server.cluster_listen` by default (see [Kubernetes NetworkPolicy](#kubernetes-networkpolicy)).
+
+Every node of a deployment carries the same `server.cluster_id`. A check that makes peers compare it on every Raft RPC and refuse a peer with another id is planned for 0.8 ([#601](https://github.com/tonbo-io/ursula/issues/601)). It stops two deployments wired to each other by mistake from exchanging Raft traffic. It is not authentication: the id is not a secret, and anyone who can reach a cluster port can still send it.
+
 ## What Ursula does not do
 
 Handle the following outside Ursula:
 
 - **TLS / HTTPS.** The public listener serves plain HTTP. No built-in `rustls`.
-- **Inter-node encryption.** Peer gRPC (Raft heartbeats, append-entries, snapshots, and leader-read checks) runs over h2c. Peers must share a private network. Non-leader HTTP writes return a `307` redirect to the current group leader rather than being forwarded over gRPC.
+- **Inter-node encryption and authentication.** Peer gRPC (Raft heartbeats, append-entries, snapshots, and leader-read checks) runs over h2c on the cluster plane, and a node accepts it from any caller. Peers must share a private network. A client's write to a non-leader gets a `307` redirect to the group leader's client URL rather than being forwarded over gRPC. Only node-internal calls are forwarded between nodes.
 - **API authentication on nodes.** Ursula nodes themselves accept any caller with network reach. Bearer-token validation is available as an opt-in feature of the gateway (see below); node listeners must stay on a private network either way.
 - **Authorization / multi-tenancy on nodes.** Nodes enforce no per-user, per-bucket, or per-scope ACLs. The gateway's opt-in access control provides a bucket-level tenant boundary; anything finer stays upstream.
-- **Admin endpoint isolation.** `/__ursula/metrics`, `/__ursula/flush-cold/*`, `/__ursula/raft/*`, and the public stream endpoints share the same listener with no auth gate.
+- **Admin authentication.** The admin plane has no auth gate. Its loopback bind is the only thing that keeps it private.
 - **Per-client rate limiting.** A single noisy client can saturate a core's mailbox or a group's hot ring.
 - **Health/readiness endpoints.** `GET /__ursula/ready` is unauthenticated on
   the client plane and reports only readiness plus WAL free-space guard state.
-  `/__ursula/metrics` contains substantially more operational detail; keep the
-  node listener private.
+  `/__ursula/metrics` on the same plane contains much more operational detail.
+  Keep the client listener private.
 - **At-rest encryption beyond the cold tier.** Cold-tier S3 writes (including Raft snapshots) request SSE-S3 by default (`storage.cold.s3.server_side_encryption`, switchable to `aws-kms` or `none`). The hot ring is in memory; WAL and Raft log directories live on disk in plaintext — use full-disk encryption at the host level. Per-tenant KMS keys and client-side encryption are out of scope.
 
 CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for browser traffic.
@@ -107,24 +123,48 @@ Three properties are deliberate:
                   └──────────┬──────────┘
                              │ plain HTTP, private network
                 ┌────────────┼────────────┐
-                v            v            v
+                v            v            v      client port (4437)
            ┌────────┐   ┌────────┐   ┌────────┐
            │ Ursula │   │ Ursula │   │ Ursula │
            │  node  │   │  node  │   │  node  │
            └────────┘   └────────┘   └────────┘
-                             ↕ gRPC h2c on private network
+                ↕ gRPC h2c between voters only, cluster port (4439)
                           (Raft replication)
 ```
 
 ### Checklist
 
 - **Bind to the private interface.** Set `server.listen = "10.0.0.X:4437"` or use a security group / firewall so the listener is unreachable from public networks.
+- **Split the cluster plane off.** Set `server.cluster_listen` and give every peer a `client_url`, then let only the voters reach the cluster port.
+- **Keep the admin plane on loopback.** Leave `server.admin_listen` at its loopback default and reach it through a tunnel.
 - **Terminate TLS at the proxy.** Ursula stays plain HTTP on the internal side.
 - **Authenticate at the proxy.** Validate the caller (OAuth2, mTLS, signed requests) and reject unauthenticated traffic before it reaches Ursula.
-- **Block admin paths from public traffic.** Deny `/__ursula/*` on the public listener and allow it only on an internal or ops network.
+- **Block internal paths from public traffic.** Deny `/__ursula/*` at the proxy. The client plane serves metrics, readiness and usage there. A gateway with access control answers `404` for them.
 - **Use IAM roles for S3.** Omit static `storage.cold.s3.access_key_id` / `storage.cold.s3.secret_access_key` values and let the AWS SDK credential chain discover credentials.
 - **Encrypt data volumes.** Apply full-disk encryption to `raft.wal.path`.
 - **Keep peer traffic private.** Never route gRPC peer traffic across the public internet.
+
+## Kubernetes NetworkPolicy
+
+The Helm chart serves the cluster plane on its own port by default (`server.clusterListen: true`, `server.ports.cluster: 4439`). Peers dial that port through the headless peer Service. The client Service exposes only the client port, and the admin plane stays on pod loopback. Without a NetworkPolicy, any pod can still dial a voter's pod IP on the cluster port.
+
+A Service only decides what gets a stable name. Any pod in the cluster can still dial a pod IP on any port. Set `server.networkPolicy.enabled: true` to render a NetworkPolicy for the server pods, on a CNI that enforces NetworkPolicy:
+
+- The client port admits the sources in `server.networkPolicy.clientIngressFrom`, a list of NetworkPolicy peers. Empty, the default, admits every source. The release's gateway, indexer and Helm test pods are always admitted when they are enabled. List every other client: applications, anything that polls `/__ursula/metrics`, and an `ipBlock` for traffic that arrives through a `LoadBalancer` or `NodePort` client Service.
+- The cluster port admits only the release's own server pods.
+- The admin port needs no rule, because it listens on loopback. The chart refuses to render the policy when `server.adminListen` is not on loopback.
+
+```yaml
+server:
+  networkPolicy:
+    enabled: true
+    clientIngressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: apps
+```
+
+The policy selects only ingress, so egress stays open. Kubelet probes reach the client port from the node, which most CNIs admit whatever the policy says. Check yours before you restrict `clientIngressFrom`.
 
 ## Reporting vulnerabilities
 
