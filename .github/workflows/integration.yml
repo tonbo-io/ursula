@@ -214,7 +214,7 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      - name: e2e (the core through its SQL functions)
+      - name: e2e (the core through its SQL functions, open, synced, resets, worker threads, Pi)
         timeout-minutes: 20
         run: |
           chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
@@ -223,3 +223,31 @@ jobs:
           npm run typecheck
           npm run build
           E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
+
+      # package.json declares the @earendil-works/pi-durable versions the `/pi` entry supports as an
+      # optional peer dependency, ">=oldest <first-unsupported", and the step above tests the version
+      # in the lockfile (a devDependency). This one installs the oldest without saving it, then runs
+      # the typecheck and the Pi suite: Pi's storage conformance in three modes, and the adapter's
+      # mapping of backlog_full and resets, which conformance never triggers.
+      - name: Pi suite on the oldest supported pi-durable
+        timeout-minutes: 10
+        run: |
+          cd clients/sqlite-ursula
+          range=$(node -p 'require("./package.json").peerDependencies["@earendil-works/pi-durable"]')
+          oldest=$(node -e '
+            const bounds = /^>=(\d+\.\d+\.\d+) <\d+\.\d+\.\d+$/.exec(process.argv[1]);
+            if (bounds === null) throw new Error("pi-durable range is not >=oldest <first-unsupported: " + process.argv[1]);
+            console.log(bounds[1]);
+          ' "$range")
+          # pi-durable, pi-ai and chord are released together: test the oldest version of all three,
+          # the set an application on that release has, not the oldest pi-durable with newer siblings.
+          pkgs=(@earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord)
+          npm install --no-save "${pkgs[@]/%/@$oldest}"
+          for pkg in "${pkgs[@]}"; do
+            # By path: pi-ai's exports map does not expose its package.json.
+            installed=$(node -p "require(\"./node_modules/$pkg/package.json\").version")
+            echo "Pi suite on $pkg $installed, the oldest of $range"
+            [ "$installed" = "$oldest" ]
+          done
+          npm run typecheck
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts
