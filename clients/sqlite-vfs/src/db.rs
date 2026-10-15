@@ -550,6 +550,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
             max_pending_bytes: 1 << 20,
             max_frame_bytes: 1 << 20,
             acked: Position(0),
+            attach: crate::driver::Attach::Resumed,
         },
         Arc::new(root),
     ));
