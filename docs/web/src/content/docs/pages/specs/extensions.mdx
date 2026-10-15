@@ -382,6 +382,8 @@ A server that keeps a floor MUST refuse, with `403 Forbidden`, `Producer-Epoch: 
 - a write that carries `Stream-Incarnation`, from a producer the server holds no state for, whose epoch is at or below the floor;
 - a write that carries `Stream-Incarnation` on producer state that a write without it opened at or below the floor, unless the write claims an epoch above the floor. Such a claim makes the state as good as one opened above the floor, and it reports no closure: no `Producer-Closed-Epoch` on its answer, and a later write of the epoch it replaced answers `stale-epoch`. That epoch may be one the server forgot, and its writes may be another writer's, so no answer reports which of them applied. A claim on such state that stays at or below the floor reports no closure either.
 
+A claim without `Stream-Incarnation` above the floor lifts such state too, and it also reports no closure: no `Producer-Closed-Epoch` on its answer, and a later write of the epoch it replaced answers `stale-epoch`. The state then counts as opened above the floor, so later writes that carry `Stream-Incarnation` are no longer refused for it.
+
 A producer's state opened above the floor holds epochs above every epoch the server discarded for that producer, so its claims of later epochs are never refused for the floor, even after the floor rose for other producers. A writer that carries `Stream-Incarnation` therefore never reaches an epoch the server forgot, and a stale writer that returns after its state expired cannot claim an old epoch. The floor is per stream: a new producer with `Stream-Incarnation` on a stream that discarded others' state claims above it.
 
 ### 5.5. Answers Before the Body
