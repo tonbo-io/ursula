@@ -14,21 +14,15 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use openraft::RaftMetrics;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
-use ursula_proto::admin::AcceptUnsyncedLossRequest;
-use ursula_raft::AcceptUnsyncedLossOutcome;
-use ursula_raft::AcceptUnsyncedLossReport;
 use ursula_raft::JournalTuning;
-use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaAppendEntriesRequest;
 use ursula_raft::UrsulaAppendEntriesResponse;
-use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::wal::diagnostics::GroupLogState;
 use ursula_raft::wal::diagnostics::JournalDisk;
 use ursula_raft::wal::diagnostics::JournalReplayMode;
@@ -42,65 +36,32 @@ use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::RaftGroupId;
 
-use super::disk_tests::JOURNAL_GROUPS;
-use super::disk_tests::JOURNAL_POWER_LOSS_SEEDS;
-use super::disk_tests::JournalCluster;
-use super::disk_tests::group_placement;
-use super::disk_tests::group_stream;
-use super::recovery_wiring::RECOVERY_STALL_AFTER;
 use super::seeds_from_env;
 use super::sim_test_guard;
+use crate::madsim_harness::journal_cluster::JOURNAL_GROUPS;
+use crate::madsim_harness::journal_cluster::JOURNAL_POWER_LOSS_SEEDS;
+use crate::madsim_harness::journal_cluster::JournalCluster;
+use crate::madsim_harness::journal_cluster::NODES;
+use crate::madsim_harness::journal_cluster::gate;
+use crate::madsim_harness::journal_cluster::group_placement;
+use crate::madsim_harness::journal_cluster::group_stream;
+use crate::madsim_harness::journal_cluster::lead_every_group;
+use crate::madsim_harness::journal_cluster::leader_by_state;
+use crate::madsim_harness::journal_cluster::log_state;
+use crate::madsim_harness::journal_cluster::member_view;
+use crate::madsim_harness::journal_cluster::metrics;
+use crate::madsim_harness::journal_cluster::recover_group;
+use crate::madsim_harness::journal_cluster::wait_leader;
+use crate::madsim_harness::journal_cluster::wait_plan_satisfied;
+use crate::madsim_harness::recovery_wiring::RECOVERY_STALL_AFTER;
 use crate::madsim_harness::run_with_madsim;
 use crate::madsim_harness::sim_wal::SimNodeWal;
 
 #[path = "recovery_regression_tests.rs"]
 mod regression;
 
-const NODES: [u64; 3] = [1, 2, 3];
-
-fn metrics(
-    cluster: &JournalCluster,
-    group: u32,
-    node_id: u64,
-) -> RaftMetrics<UrsulaRaftTypeConfig> {
-    openraft::rt::WatchReceiver::borrow_watched(
-        &cluster.engines[&(group, node_id)].raft_handle().metrics(),
-    )
-    .clone()
-}
-
-/// The replica of `group` that currently is in the leader state, if any.
-fn leader_by_state(cluster: &JournalCluster, group: u32) -> Option<u64> {
-    NODES.into_iter().find(|node_id| {
-        cluster.engines.contains_key(&(group, *node_id))
-            && metrics(cluster, group, *node_id).state == openraft::ServerState::Leader
-    })
-}
-
-async fn wait_leader(cluster: &JournalCluster, group: u32, context: &str) -> u64 {
-    let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(leader) = leader_by_state(cluster, group) {
-            return leader;
-        }
-        assert!(
-            madsim::time::Instant::now() < deadline,
-            "{context}: group {group} elected no leader"
-        );
-        madsim::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-fn gate(cluster: &JournalCluster, group: u32, node_id: u64) -> RecoveryGateStatus {
-    cluster.rejoins[&(group, node_id)].status()
-}
-
-fn log_state(cluster: &JournalCluster, group: u32, node_id: u64) -> GroupLogState {
-    cluster.wals[&node_id]
-        .store(RaftGroupId(group))
-        .expect("a running replica holds its store")
-        .log_state()
-}
+#[path = "foreign_entry_tests.rs"]
+mod foreign_entry;
 
 /// Every group of `node_id` is gated and durably recovering.
 fn assert_gated(cluster: &JournalCluster, node_id: u64, context: &str) {
@@ -163,48 +124,20 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
     }
 }
 
-/// The operator's acceptance of the unsynced loss on `node_id`'s replica of
-/// `group`, naming the log the group's metrics show there.
-async fn accept_observed_loss(
-    cluster: &JournalCluster,
-    group: u32,
-    node_id: u64,
-) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
-    let replica = metrics(cluster, group, node_id);
-    cluster.rejoins[&(group, node_id)]
-        .accept_unsynced_loss(&AcceptUnsyncedLossRequest {
-            expected_last_log_index: replica.last_log_index,
-            expected_current_term: replica.current_term,
-        })
-        .await
-}
-
-/// Moves the leadership of every group to `leader`.
-async fn lead_every_group(cluster: &JournalCluster, leader: u64, context: &str) {
-    for group in JOURNAL_GROUPS {
-        let current = wait_leader(cluster, group, context).await;
-        if current != leader {
-            cluster.engines[&(group, current)]
-                .raft_handle()
-                .trigger()
-                .transfer_leader(leader)
-                .await
-                .expect("transfer the leadership");
-        }
-        let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
-        while leader_by_state(cluster, group) != Some(leader) {
-            assert!(
-                madsim::time::Instant::now() < deadline,
-                "{context}: group {group} never moved to node {leader}"
-            );
-            madsim::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-}
-
 /// No vote was granted by a replica whose gate was closed.
 fn assert_no_vote_while_gated(cluster: &JournalCluster, context: &str) {
-    let granted = cluster.votes.granted_while_gated();
+    // A planned replica votes for its plan's leader (#581 section 4.5).
+    let granted = cluster
+        .votes
+        .granted_while_gated()
+        .into_iter()
+        .filter(|answer| {
+            answer.target_gate != Some(RecoveryGateStatus::Planned)
+                || !answer
+                    .source
+                    .is_some_and(|source| cluster.plan_leaders.contains(&source))
+        })
+        .collect::<Vec<_>>();
     assert!(
         granted.is_empty(),
         "{context}: gated replicas granted votes: {granted:?}"
@@ -711,32 +644,16 @@ fn a_majority_power_loss_stops_until_the_operator_accepts_the_loss() {
             }
             assert_no_vote_while_gated(&cluster, &context);
 
-            // The operator accepts the loss, longest log first, until the
-            // open replicas form a quorum.
+            // The operator runs the recovery tool: one plan per group, sent
+            // to every reachable member, the leader last (#581 section 4.5).
+            let mut points = BTreeMap::new();
             for group in JOURNAL_GROUPS {
-                let mut gated = Vec::new();
-                for node_id in &lost {
-                    let mut store = cluster.wals[node_id]
-                        .store(RaftGroupId(group))
-                        .expect("running store");
-                    let last = store.get_log_state().await.expect("log state").last_log_id;
-                    gated.push((last, *node_id));
-                }
-                gated.sort_unstable_by(|a, b| b.cmp(a));
-                let needed = 2_usize.saturating_sub(survivors.len());
-                for (_, node_id) in gated.into_iter().take(needed) {
-                    assert_eq!(
-                        accept_observed_loss(&cluster, group, node_id)
-                            .await
-                            .expect("accept the unsynced loss")
-                            .outcome,
-                        AcceptUnsyncedLossOutcome::GateOpened,
-                        "{context}: node {node_id} group {group}"
-                    );
-                }
+                let plan = recover_group(&mut cluster, group, &NODES, &context).await;
+                points.insert(group, plan.point);
             }
             for group in JOURNAL_GROUPS {
                 wait_leader(&cluster, group, &context).await;
+                wait_plan_satisfied(&cluster, group, &NODES, points[&group], &context).await;
             }
             wait_healed(&cluster, &context, Duration::from_secs(10)).await;
 
@@ -996,32 +913,12 @@ fn a_handoff_to_a_powered_off_follower_never_parks_the_survivor() {
                 madsim::time::sleep(Duration::from_millis(50)).await;
             }
             for group in JOURNAL_GROUPS {
-                let mut open = NODES
+                let open = NODES
                     .into_iter()
                     .filter(|node_id| cluster.rejoins[&(group, *node_id)].vote_gate_open())
                     .count();
-                let mut stalled = followers
-                    .iter()
-                    .copied()
-                    .filter(|node_id| {
-                        gate(&cluster, group, *node_id) == RecoveryGateStatus::Stalled
-                    })
-                    .map(|node_id| (metrics(&cluster, group, node_id).last_log_index, node_id))
-                    .collect::<Vec<_>>();
-                stalled.sort_unstable_by(|a, b| b.cmp(a));
-                for (_, node_id) in stalled {
-                    if open >= 2 {
-                        break;
-                    }
-                    assert_eq!(
-                        accept_observed_loss(&cluster, group, node_id)
-                            .await
-                            .expect("accept the unsynced loss")
-                            .outcome,
-                        AcceptUnsyncedLossOutcome::GateOpened,
-                        "{context}: node {node_id} group {group}"
-                    );
-                    open = open.saturating_add(1);
+                if open < 2 && leader_by_state(&cluster, group).is_none() {
+                    recover_group(&mut cluster, group, &NODES, &context).await;
                 }
             }
 
@@ -1426,5 +1323,394 @@ fn leader_process_crash_with_pending_tail_never_reuses_log_ids() {
                 cluster.verify_reads().await;
             });
         }
+    }
+}
+
+/// M1 and M3 (#581 review): a replica that crashes the moment it applied
+/// its plan's history event, before the removal of its record reached its
+/// disk, restarts with the record and never votes before a leader's barrier
+/// opens its gate; a plan's leader that crashes so restarts under the same
+/// history and starts no second one.
+#[test]
+fn a_crash_between_the_plans_event_and_its_record_removal_keeps_one_history() {
+    let _guard = sim_test_guard();
+    let mut windows_hit = 0_usize;
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        windows_hit = windows_hit.saturating_add(run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let mut cluster =
+                JournalCluster::start_with_fsync("plan-event-crash", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 4).await;
+            }
+            cluster.verify_reads().await;
+            for node_id in NODES {
+                cluster.stop_node(node_id).await;
+            }
+            for node_id in NODES {
+                cluster.wals[&node_id].power_loss().await;
+            }
+            for node_id in NODES {
+                cluster.start_node(node_id).await;
+            }
+            madsim::time::sleep(RECOVERY_STALL_AFTER * 2).await;
+            cluster.votes.clear();
+
+            // Group 1 recovers first; then group 0's member, or its plan's
+            // leader, crashes the moment it applied the event.
+            let plan = recover_group(&mut cluster, 1, &NODES, &context).await;
+            wait_plan_satisfied(&cluster, 1, &NODES, plan.point, &context).await;
+            let plan = recover_group(&mut cluster, 0, &NODES, &context).await;
+            let crashed = if seed % 2 == 0 {
+                NODES
+                    .into_iter()
+                    .find(|node_id| *node_id != plan.leader)
+                    .expect("a member")
+            } else {
+                plan.leader
+            };
+            let mut watch = cluster.engines[&(0, crashed)]
+                .history_watch()
+                .expect("a raft group publishes its history");
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(15);
+            let event = loop {
+                if let Some(event) = watch
+                    .current()
+                    .filter(|event| event.event_index > plan.point)
+                {
+                    break event;
+                }
+                madsim::time::timeout(Duration::from_millis(50), watch.changed())
+                    .await
+                    .ok();
+                assert!(
+                    madsim::time::Instant::now() < deadline,
+                    "{context}: node {crashed} never applied the plan's event"
+                );
+            };
+            // Process death right at the event: the record's removal, if
+            // queued, never reaches the disk.
+            let store = cluster.wals[&crashed]
+                .store(RaftGroupId(0))
+                .expect("a running replica holds its store");
+            store.abort_simulated_writer();
+            drop(store);
+            cluster.stop_node(crashed).await;
+            cluster.wals[&crashed].process_crash().await;
+            cluster.start_node(crashed).await;
+            let window_hit = cluster.engines[&(0, crashed)].history().plan().is_some();
+            if window_hit && crashed != plan.leader {
+                assert_eq!(
+                    gate(&cluster, 0, crashed),
+                    RecoveryGateStatus::Planned,
+                    "{context}: a member that restarts with its record votes only for its leader"
+                );
+            }
+            wait_plan_satisfied(&cluster, 0, &NODES, plan.point, &context).await;
+            for node_id in NODES {
+                assert_eq!(
+                    cluster.engines[&(0, node_id)].history().applied(),
+                    Some(event),
+                    "{context}: node {node_id}: a crash after the event started another history"
+                );
+            }
+            wait_healed(&cluster, &context, Duration::from_secs(10)).await;
+            assert_no_vote_while_gated(&cluster, &context);
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 2).await;
+            }
+            usize::from(window_hit)
+        }));
+    }
+    assert!(
+        windows_hit > 0,
+        "no seed crashed a replica between its plan's event and the record's removal"
+    );
+}
+
+/// The setup of the plan tests below: `voters` nodes whose every replica of
+/// both groups lost power and is gated, until the groups stall.
+async fn stalled_cluster(name: &str, voters: u64, survivors: &[u64]) -> JournalCluster {
+    let survivors = survivors.to_vec();
+    stalled_cluster_with(name, voters, move |_leaders| survivors).await
+}
+
+/// [`stalled_cluster`] whose survivors `survivors` picks from the groups'
+/// leaders.
+async fn stalled_cluster_with(
+    name: &str,
+    voters: u64,
+    survivors: impl FnOnce(&[u64]) -> Vec<u64>,
+) -> JournalCluster {
+    let mut cluster =
+        JournalCluster::start_voters(name, JournalTuning::new(WalFsync::Never), voters).await;
+    for group in JOURNAL_GROUPS {
+        cluster.append(group, 4).await;
+    }
+    cluster.verify_reads().await;
+    let mut leaders = Vec::new();
+    for group in JOURNAL_GROUPS {
+        leaders.push(cluster.leader(group).await);
+    }
+    let survivors = survivors(&leaders);
+    let lost = (1..=voters)
+        .filter(|node_id| !survivors.contains(node_id))
+        .collect::<Vec<_>>();
+    for node_id in &lost {
+        cluster.stop_node(*node_id).await;
+    }
+    for node_id in &lost {
+        cluster.wals[node_id].power_loss().await;
+    }
+    for node_id in &lost {
+        cluster.start_node(*node_id).await;
+    }
+    madsim::time::sleep(RECOVERY_STALL_AFTER * 2).await;
+    cluster.votes.clear();
+    cluster
+}
+
+/// Whether every replica of `group` in `nodes` applied a history event
+/// above `point` and dropped its plan.
+fn plan_satisfied_everywhere(
+    cluster: &JournalCluster,
+    group: u32,
+    nodes: &[u64],
+    point: u64,
+) -> bool {
+    nodes.iter().all(|node_id| {
+        cluster
+            .engines
+            .get(&(group, *node_id))
+            .is_some_and(|engine| {
+                engine
+                    .history()
+                    .applied()
+                    .is_some_and(|event| event.event_index > point)
+                    && engine.history().plan().is_none()
+            })
+    })
+}
+
+/// M3 (#581 review): a plan's leader that crashes once elected, before its
+/// history event committed. With its blank entry kept, it is elected again
+/// and starts exactly one new history. When the crash lost the blank entry
+/// its members hold, they refuse it (their logs are longer) and vote for no
+/// one else: the group waits for a second plan, which elects a member with
+/// the longest log. Either way every replica ends on one history.
+#[test]
+fn a_plan_leader_that_crashes_before_its_event_starts_one_history() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let mut cluster = stalled_cluster("plan-leader-crash", 3, &[]).await;
+            for (group, loses_its_blank) in [(0, false), (1, true)] {
+                // A crash of another group's leader restarted this group's
+                // replica too: it reports the group stalled again first.
+                madsim::time::sleep(RECOVERY_STALL_AFTER * 2).await;
+                let plan = recover_group(&mut cluster, group, &NODES, &context).await;
+                cluster.engines[&(group, plan.leader)]
+                    .raft_handle()
+                    .wait(Some(Duration::from_secs(10)))
+                    .metrics(
+                        |metrics| metrics.state == openraft::ServerState::Leader,
+                        "the plan's leader is elected",
+                    )
+                    .await
+                    .expect("the plan's leader is elected");
+                if loses_its_blank {
+                    // Process death that drops the writes still queued.
+                    let store = cluster.wals[&plan.leader]
+                        .store(RaftGroupId(group))
+                        .expect("a running replica holds its store");
+                    store.abort_simulated_writer();
+                    drop(store);
+                }
+                cluster.stop_node(plan.leader).await;
+                cluster.wals[&plan.leader].process_crash().await;
+                cluster.start_node(plan.leader).await;
+                let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
+                while !plan_satisfied_everywhere(&cluster, group, &NODES, plan.point)
+                    && madsim::time::Instant::now() < deadline
+                {
+                    madsim::time::sleep(Duration::from_millis(25)).await;
+                }
+                if !plan_satisfied_everywhere(&cluster, group, &NODES, plan.point) {
+                    assert!(
+                        loses_its_blank,
+                        "{context}: group {group}: a leader that kept its log was not elected again"
+                    );
+                    let again = recover_group(&mut cluster, group, &NODES, &context).await;
+                    wait_plan_satisfied(&cluster, group, &NODES, again.point, &context).await;
+                }
+                let event = cluster.engines[&(group, plan.leader)].history().applied();
+                assert!(event.is_some_and(|event| event.event_index > plan.point));
+                for node_id in NODES {
+                    assert_eq!(
+                        cluster.engines[&(group, node_id)].history().applied(),
+                        event,
+                        "{context}: group {group} node {node_id} holds another history"
+                    );
+                }
+            }
+            wait_healed(&cluster, &context, Duration::from_secs(10)).await;
+            assert_no_vote_while_gated(&cluster, &context);
+        });
+    }
+}
+
+/// M3 (#581 review): five voters, three of which lost power: the two
+/// survivors are no quorum, the group stalls, and a plan over all five
+/// recovers it with one history and no vote from a gated replica.
+#[test]
+fn a_five_voter_group_that_lost_three_voters_recovers_through_a_plan() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
+        run_with_madsim(seed, async move {
+            let context = format!("seed {seed}");
+            let voters = [1, 2, 3, 4, 5];
+            // Two followers of every group survive: a surviving leader
+            // rewinds the others without a plan.
+            let mut cluster = stalled_cluster_with("five-voters", 5, |leaders| {
+                let followers = (1..=5)
+                    .filter(|node_id| !leaders.contains(node_id))
+                    .collect::<Vec<_>>();
+                let first = usize::try_from(seed).unwrap_or(0) % followers.len();
+                vec![followers[first], followers[(first + 1) % followers.len()]]
+            })
+            .await;
+            for group in JOURNAL_GROUPS {
+                assert_eq!(
+                    leader_by_state(&cluster, group),
+                    None,
+                    "{context}: group {group} elected a leader without a quorum"
+                );
+            }
+            for group in JOURNAL_GROUPS {
+                let plan = recover_group(&mut cluster, group, &voters, &context).await;
+                wait_plan_satisfied(&cluster, group, &voters, plan.point, &context).await;
+                let event = cluster.engines[&(group, plan.leader)].history().applied();
+                for node_id in voters {
+                    assert_eq!(
+                        cluster.engines[&(group, node_id)].history().applied(),
+                        event,
+                        "{context}: group {group} node {node_id} holds another history"
+                    );
+                }
+            }
+            assert_no_vote_while_gated(&cluster, &context);
+            for group in JOURNAL_GROUPS {
+                wait_leader(&cluster, group, &context).await;
+                cluster.append(group, 2).await;
+            }
+        });
+    }
+}
+
+/// M2 of the third #581 review: the plan's leader takes `lead` while it is
+/// a stale leader (it lost its quorum but stays in OpenRaft's leader state)
+/// or a candidate. It restarts its group before it answers, so it drops that
+/// leadership or campaign: its durable vote for itself is uncommitted, it is
+/// elected only above the plan term, and the plan is satisfied. The plan is
+/// sent by hand, as the runbook does, over each replica's admin entry point.
+#[test]
+fn a_stale_leader_or_candidate_that_takes_a_plan_restarts_first() {
+    let _guard = sim_test_guard();
+    for (seed, stale_leader) in [(1_u64, true), (2, false), (3, true), (5, false)] {
+        run_with_madsim(seed, async move {
+            const P: u64 = 3;
+            let context = format!("seed {seed} stale leader {stale_leader}");
+            let mut cluster =
+                JournalCluster::start_with_fsync("demote-on-plan", WalFsync::Never).await;
+            for group in JOURNAL_GROUPS {
+                cluster.append(group, 3).await;
+            }
+            cluster.verify_reads().await;
+            lead_every_group(&cluster, if stale_leader { P } else { 1 }, &context).await;
+            for node_id in [1, 2] {
+                cluster.policy.partition_bidirectional(P, node_id);
+            }
+            if !stale_leader {
+                // P campaigns alone while the others still lead.
+                madsim::time::sleep(Duration::from_secs(1)).await;
+            }
+            for node_id in [1, 2] {
+                cluster.stop_node(node_id).await;
+            }
+            for node_id in [1, 2] {
+                cluster.wals[&node_id].power_loss().await;
+            }
+            for node_id in [1, 2] {
+                cluster.start_node(node_id).await;
+            }
+            // The others stall, and P's quorum acknowledgement grows old.
+            madsim::time::sleep(RECOVERY_STALL_AFTER * 2 + Duration::from_secs(4)).await;
+            cluster.votes.clear();
+            let mut sent_plans = Vec::new();
+            for group in JOURNAL_GROUPS {
+                let state = metrics(&cluster, group, P).state;
+                let expected = if stale_leader {
+                    openraft::ServerState::Leader
+                } else {
+                    openraft::ServerState::Candidate
+                };
+                assert_eq!(state, expected, "{context}: group {group}");
+                let mut members = Vec::new();
+                for node_id in NODES {
+                    members.push(member_view(&cluster, group, node_id).await);
+                }
+                let plan = ursula_ctl::recovery::plan_group(&members)
+                    .unwrap_or_else(|error| panic!("{context}: group {group}: {error}"));
+                assert_eq!(plan.leader, P, "{context}: group {group}: {plan:?}");
+                cluster.plan_leaders.insert(P);
+                let before = cluster.rejoins[&(group, P)].clone();
+                let sent = ursula_ctl::recovery::send_plan(
+                    &mut crate::madsim_harness::journal_cluster::SimPlanTransport {
+                        cluster: &mut cluster,
+                        group,
+                    },
+                    plan,
+                    &members,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{context}: group {group}: {error}"));
+                assert!(sent.refused.is_empty(), "{context}: {:?}", sent.refused);
+                // It restarted: a new replica, a follower, its vote for
+                // itself uncommitted.
+                assert!(
+                    !std::sync::Arc::ptr_eq(&before, &cluster.rejoins[&(group, P)]),
+                    "{context}: group {group}: P answered without restarting"
+                );
+                assert_ne!(
+                    metrics(&cluster, group, P).state,
+                    openraft::ServerState::Leader,
+                    "{context}: group {group}"
+                );
+                let vote = cluster.wals[&P]
+                    .store(RaftGroupId(group))
+                    .expect("a running replica holds its store")
+                    .read_vote()
+                    .await
+                    .expect("vote")
+                    .expect("a vote");
+                assert!(!vote.is_committed(), "{context}: group {group}: {vote:?}");
+                sent_plans.push((group, plan, sent.leader_term));
+            }
+            for node_id in [1, 2] {
+                cluster.policy.heal_bidirectional(P, node_id);
+            }
+            for (group, plan, leader_term) in sent_plans {
+                wait_plan_satisfied(&cluster, group, &NODES, plan.point, &context).await;
+                let leader = wait_leader(&cluster, group, &context).await;
+                assert_eq!(leader, P, "{context}: group {group}");
+                let term = metrics(&cluster, group, P).current_term;
+                assert!(
+                    term > leader_term,
+                    "{context}: group {group}: elected at {term}, plan term {leader_term}"
+                );
+            }
+            assert_no_vote_while_gated(&cluster, &context);
+        });
     }
 }

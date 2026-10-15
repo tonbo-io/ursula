@@ -13,6 +13,9 @@ use super::SimSchedule;
 use super::ThreeNodeRaftSim;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
+use super::accepted_loss::Controls as RecoveryPlanControls;
+use super::accepted_loss::Shape as RecoveryPlanShape;
+use super::accepted_loss::run_recovery_plan_inner;
 use super::cold_read_delay_ms_from_fault_plan;
 use super::cold_read_truncate_len_from_fault_plan;
 use super::cold_write_delay_ms_from_fault_plan;
@@ -34,6 +37,9 @@ use super::has_retry_cold_write_after_failure_in_fault_plan;
 use super::has_stop_current_leader_in_fault_plan;
 use super::has_stop_seeded_follower_in_fault_plan;
 use super::has_verify_runtime_cold_live_reads_in_fault_plan;
+use super::history::Controls as HistoryControls;
+use super::history::run_rewind_applies_exactly_once_inner;
+use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
 use super::leader_reads::run_leader_read_linearizability_inner;
 use super::run_cold_delete_fault_inner;
@@ -256,10 +262,66 @@ impl ThreeNodeRaftSim {
             | SimScenario::IdleExpiryCannotReopenAnEpoch => {
                 Self::run_write_keys_with_controls_report(config, scenario, Controls::default())
             }
+            SimScenario::HistoryRewindUnderLeaderChurn | SimScenario::StaleWritersAfterRestore => {
+                Self::run_history_report(config, scenario)
+            }
+            SimScenario::RecoveryPlanCutUnderRestarts
+            | SimScenario::RecoveryPlanSurvivorCampaigns => {
+                Self::run_recovery_plan_with_controls_report(
+                    config,
+                    scenario,
+                    RecoveryPlanControls::default(),
+                )
+            }
         }
     }
 
-    /// Runs a write-key scenario with its defences as `controls` leave them.
+    /// Runs a history-identity scenario (#581 section 10).
+    pub(super) fn run_history_report(
+        config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
+    ) -> SimReport {
+        Self::run_history_with_controls_report(config, scenario, HistoryControls::default())
+    }
+
+    /// Runs a recovery-plan scenario (#581 section 4.5) with `controls`.
+    pub(super) fn run_recovery_plan_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
+        controls: RecoveryPlanControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        let shape = match scenario {
+            SimScenario::RecoveryPlanSurvivorCampaigns => RecoveryPlanShape::SurvivorCampaigns,
+            _ => RecoveryPlanShape::CutUnderRestarts,
+        };
+        report_of(
+            scenario,
+            seed,
+            run_recovery_plan_inner(config, shape, controls),
+        )
+    }
+
+    pub(super) fn run_history_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
+        controls: HistoryControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        match scenario {
+            SimScenario::StaleWritersAfterRestore => report_of(
+                scenario,
+                seed,
+                run_stale_writers_never_apply_after_restore_inner(config, controls),
+            ),
+            _ => report_of(
+                SimScenario::HistoryRewindUnderLeaderChurn,
+                seed,
+                run_rewind_applies_exactly_once_inner(config, controls),
+            ),
+        }
+    }
+
     pub(super) fn run_write_keys_with_controls_report(
         config: ThreeNodeRaftSimConfig,
         scenario: SimScenario,

@@ -19,6 +19,10 @@ pub enum ErrorStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
+    /// The task that restarted one group's engine ended without finishing:
+    /// the group may be stopped on this node until a request creates it.
+    #[error("the restart of raft group {} did not finish", .raft_group_id.0)]
+    GroupRestartAborted { raft_group_id: RaftGroupId },
     #[error("invalid shard runtime config: {0}")]
     InvalidConfig(#[from] ShardMapError),
     #[error("raft group {} is outside configured range 0..{raft_group_count}", .raft_group_id.0)]
@@ -130,7 +134,11 @@ impl RuntimeError {
             Self::GroupEngine { error, .. } if error.leader_hint().is_some() => {
                 ErrorStatus::Temporary
             }
-            Self::GroupEngine { error, .. } if error.is_backpressure() => ErrorStatus::Temporary,
+            Self::GroupEngine { error, .. }
+                if error.is_backpressure() || error.is_history_pending() =>
+            {
+                ErrorStatus::Temporary
+            }
             Self::GroupEngine { error, .. } if error.code().is_some() => ErrorStatus::Permanent,
             Self::GroupEngine { .. } => ErrorStatus::Persistent,
             _ => ErrorStatus::Permanent,

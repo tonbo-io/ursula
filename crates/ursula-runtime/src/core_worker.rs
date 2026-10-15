@@ -410,9 +410,11 @@ impl CoreWorker {
             self.read_barriers
                 .install(placement.raft_group_id, engine.linearizable_read_barrier());
             let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
+            let history = engine.history_watch();
             let actor = GroupActor {
                 deferred: None,
                 placement,
+                history,
                 engine,
                 rx,
                 read_watchers: HashMap::new(),
@@ -490,9 +492,11 @@ impl CoreWorker {
         self.read_barriers
             .install(placement.raft_group_id, engine.linearizable_read_barrier());
         let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
+        let history = engine.history_watch();
         let actor = GroupActor {
             deferred: None,
             placement,
+            history,
             engine,
             rx,
             read_watchers: HashMap::new(),

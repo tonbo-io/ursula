@@ -88,6 +88,40 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
+    /// Accept the unsynced loss of one stalled group: plan it from every
+    /// reachable replica, send the plan to its leader first and then to the
+    /// other members, and wait until its history event applied. A plan that
+    /// wedges is planned again.
+    RecoverGroup(RecoverGroupArgs),
+}
+
+#[derive(Args, Debug)]
+struct RecoverGroupArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// The stalled raft group.
+    #[arg(long)]
+    group: u64,
+    /// Plans to send at most, the first included.
+    #[arg(long, default_value_t = 3)]
+    max_plans: usize,
+    /// Seconds one plan may take to be satisfied.
+    #[arg(long, default_value_t = 120)]
+    settle_timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Seconds one `accept-unsynced-loss` may take: a cut or a demotion
+    /// restarts the group before the answer.
+    #[arg(long, default_value_t = 120)]
+    accept_timeout_secs: u64,
+    /// Send the plan, accepting the loss of every write acknowledged after
+    /// the last `fsync` of the replicas it keeps. Without it the command
+    /// explains the plan it would send and sends nothing.
+    #[arg(long, default_value_t = false)]
+    accept_loss: bool,
 }
 
 #[derive(Args, Debug)]
@@ -673,6 +707,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
+        Command::RecoverGroup(args) => run_recover_group_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
@@ -773,9 +808,26 @@ async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
     let store = backup::BackupStore::open(&args.location)?;
     let report = backup::restore(&client, &store).await?;
     println!(
-        "restore complete: {} groups, {} buckets, {} streams, {} cold objects present",
-        report.groups, report.buckets, report.streams, report.cold_objects
+        "restore complete: {} groups ({} imported by an earlier run), {} buckets, {} streams, \
+         {} cold objects present; every restored stream answers with a new Stream-Incarnation",
+        report.groups,
+        report.already(),
+        report.buckets,
+        report.streams,
+        report.cold_objects
     );
+    for import in &report.imports {
+        println!(
+            "group {}: history {:#018x}{}",
+            import.raft_group_id,
+            import.history,
+            if import.already {
+                " (imported by an earlier run)"
+            } else {
+                ""
+            }
+        );
+    }
     Ok(())
 }
 
@@ -1080,6 +1132,87 @@ async fn run_drain_subcommand(args: DrainArgs) -> Result<()> {
     }
 }
 
+async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let options = ursula_ctl::recovery::RecoverOptions {
+        max_plans: args.max_plans,
+        settle_timeout: Duration::from_secs(args.settle_timeout_secs),
+        poll_interval: Duration::from_secs(args.poll_interval_secs),
+        accept_timeout: Duration::from_secs(args.accept_timeout_secs),
+        accept_loss: args.accept_loss,
+    };
+    match ursula_ctl::recovery::recover_group(&client, &nodes, args.group, &options).await? {
+        ursula_ctl::recovery::RecoverOutcome::Healthy => {
+            println!(
+                "group {}: it has a leader and no replica holds a plan",
+                args.group
+            );
+        }
+        ursula_ctl::recovery::RecoverOutcome::DryRun(explained) => {
+            print_plan_explanation(args.group, &explained);
+        }
+        ursula_ctl::recovery::RecoverOutcome::Satisfied { plan, plans_sent } => println!(
+            "group {}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
+            args.group, plan.leader, plan.point, plan.cut
+        ),
+    }
+    Ok(())
+}
+
+/// What `recover-group` would send, before `--accept-loss`.
+fn print_plan_explanation(group: u64, explained: &ursula_ctl::recovery::PlanExplanation) {
+    let plan = explained.plan;
+    println!(
+        "group {group}: would plan leader {} at point {} (cut: {}); nothing was sent",
+        plan.leader, plan.point, plan.cut
+    );
+    let longest = explained
+        .longest_last_log_term
+        .map_or("an empty log".to_owned(), |term| {
+            format!("last log term {term}")
+        });
+    if plan.cut {
+        println!(
+            "  cut: the longest voter log ends at {longest}, below the floor {}, the highest vote \
+             term a restricted replica holds; every replica keeps only what it knew was committed",
+            plan.floor
+        );
+    } else {
+        println!(
+            "  no cut: the longest voter log ends at {longest}, not below the floor {}",
+            plan.floor
+        );
+    }
+    println!(
+        "  plan term at least {}, the highest vote term read",
+        plan.highest_term
+    );
+    for member in &explained.members {
+        println!(
+            "  node {}: gate {:?}, expected last log index {:?}, last log term {:?}, current term {}, committed {:?}",
+            member.node_id,
+            member.gate,
+            member.log.last_log_index,
+            member.log.last_log_term,
+            member.log.current_term,
+            member.committed
+        );
+    }
+    if explained.unreached_voters.is_empty() {
+        println!("  every voter answered");
+    } else {
+        println!(
+            "  voters that did not answer, which the plan goes ahead without: {:?}",
+            explained.unreached_voters
+        );
+    }
+    println!(
+        "  to accept the loss of writes acknowledged after the last fsync and send it, run again \
+         with --accept-loss"
+    );
+}
+
 async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
@@ -1142,5 +1275,39 @@ mod cli_tests {
         ])
         .expect_err("a removed override must not authorize legacy identities");
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// Item 2 of the #612 review: `recover-group` sends nothing unless the
+    /// operator accepts the loss.
+    #[test]
+    fn recover_group_sends_only_with_accept_loss() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "ursulactl",
+                "recover-group",
+                "--config",
+                "cluster.toml",
+                "--group",
+                "4",
+            ];
+            args.extend_from_slice(extra);
+            match super::Cli::try_parse_from(args).expect("parses").command {
+                super::Command::RecoverGroup(args) => args,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(!parse(&[]).accept_loss);
+        assert!(parse(&["--accept-loss"]).accept_loss);
+        let removed = super::Cli::try_parse_from([
+            "ursulactl",
+            "recover-group",
+            "--config",
+            "cluster.toml",
+            "--group",
+            "4",
+            "--dry-run",
+        ])
+        .expect_err("--dry-run is gone: a run without --accept-loss is the dry run");
+        assert_eq!(removed.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

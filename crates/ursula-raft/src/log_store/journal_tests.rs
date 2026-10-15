@@ -1763,23 +1763,46 @@ async fn fsync_never_acknowledges_from_the_page_cache_and_close_syncs() {
     assert_eq!(log_ids(&core.store(&writer, 1)).await, [1, 2]);
 }
 
+/// A group opens once while its store lives; a closed store hands its
+/// recorded state back, so the group opens again in the same process (a
+/// recovery plan's cut restarts one group's replica).
 #[tokio::test]
-async fn a_group_opens_once_per_core_writer() {
+async fn a_group_opens_once_while_its_store_lives_and_again_after_it_closed() {
     let core = Core::small(WalFsync::Always);
     let writer = core.writer();
     let mut store = core.store(&writer, 1);
     append(&mut store, [blank_entry(1)]).await;
-    drop(store);
+    let vote = openraft::Vote::new_committed(5, 1);
+    store.save_vote(&vote).await.expect("vote");
+    let record = crate::log_store::RecoveryRecord {
+        leader: 2,
+        point: 1,
+        leader_term: 3,
+        cut: crate::log_store::PlanCut::NoCut,
+    };
+    store
+        .record_recovery(Some(record))
+        .await
+        .expect("record a plan");
     let err = RaftGroupFileLogStore::open(
         placement(1),
         core.metrics.group_engine_metrics(),
         writer.clone(),
     )
-    .expect_err("a group must not reopen while its core writer lives");
+    .expect_err("a group must not open twice while its store lives");
     assert!(matches!(err, CoreJournalError::GroupAlreadyOpen {
         raft_group_id: RaftGroupId(1),
         ..
     }));
+    drop(store);
+    let mut store = core.store(&writer, 1);
+    assert_eq!(
+        store.get_log_state().await.expect("log state").last_log_id,
+        Some(log_id(1))
+    );
+    assert_eq!(store.read_vote().await.expect("vote"), Some(vote));
+    assert_eq!(store.recovery_record(), Some(record));
+    drop(store);
     drop(core.store(&writer, 0));
     drop(writer);
 
@@ -2000,6 +2023,16 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .current_leader(1, "leader elected")
         .await
         .unwrap();
+    // The group's genesis history event commits before the pause, so the
+    // paused append is the last entry.
+    let started = std::time::Instant::now();
+    while engines
+        .iter()
+        .any(|engine| engine.history().applied().is_none())
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "no genesis");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     leader.runtime_config().tick(false);
     let response = leader
         .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {

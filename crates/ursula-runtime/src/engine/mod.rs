@@ -230,6 +230,8 @@ pub enum GroupWriteResponse {
     AckColdGc(AckColdGcResponse),
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
+    /// A history event applied (#581 section 4.3).
+    NewHistory(crate::request::NewHistoryResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
@@ -695,6 +697,97 @@ pub trait GroupEngine: Send + 'static {
     fn shutdown<'a>(&'a mut self) -> GroupShutdownFuture<'a> {
         Box::pin(async { Ok(()) })
     }
+
+    /// The group's applied history (#581 section 4.3), which changes at
+    /// every history event this replica applies, by a command, a snapshot
+    /// install or a startup replay. The group actor wakes every live read of
+    /// the group when it changes. `None` for an engine whose history never
+    /// changes.
+    fn history_watch(&self) -> Option<HistoryWatch> {
+        None
+    }
+}
+
+/// The shared state of a [`HistoryPublisher`] and its [`HistoryWatch`]es.
+#[derive(Debug, Default)]
+struct HistoryShared {
+    value: std::sync::Mutex<Option<ursula_stream::HistoryEvent>>,
+    /// Bumped by every change, under the value's lock.
+    version: std::sync::atomic::AtomicU64,
+    changed: crate::rt::sync::Notify,
+}
+
+/// The sending side of a group's applied history (#581 section 4.7), kept
+/// with the group's state. Clones publish to the same receivers.
+///
+/// Not a tokio `watch`: that wakes concurrent receivers in an order drawn
+/// from tokio's own thread RNG, which a simulation cannot replay. A
+/// `Notify` wakes its waiters in the order they began to wait.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryPublisher(std::sync::Arc<HistoryShared>);
+
+impl HistoryPublisher {
+    /// Publishes `history` when it differs from what was published.
+    pub fn publish(&self, history: Option<ursula_stream::HistoryEvent>) {
+        let mut value = self
+            .0
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *value == history {
+            return;
+        }
+        *value = history;
+        self.0
+            .version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(value);
+        self.0.changed.notify_waiters();
+    }
+
+    /// A receiver that has seen what was published so far.
+    pub fn subscribe(&self) -> HistoryWatch {
+        HistoryWatch {
+            seen: self.0.version.load(std::sync::atomic::Ordering::SeqCst),
+            shared: self.0.clone(),
+        }
+    }
+}
+
+/// A receiver of a group's applied history: `None` before its genesis.
+#[derive(Debug, Clone)]
+pub struct HistoryWatch {
+    shared: std::sync::Arc<HistoryShared>,
+    seen: u64,
+}
+
+impl HistoryWatch {
+    /// The history published last.
+    pub fn current(&self) -> Option<ursula_stream::HistoryEvent> {
+        *self
+            .shared
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits until a history this receiver has not seen is published.
+    pub async fn changed(&mut self) {
+        loop {
+            let notified = self.shared.changed.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            let version = self
+                .shared
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if version != self.seen {
+                self.seen = version;
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 pub trait GroupEngineFactory: Send + Sync + 'static {
@@ -832,6 +925,8 @@ pub struct StreamEngineError {
 pub enum UnproposableCommand {
     /// Stream commands create their bucket inside their own apply.
     CreateBucket,
+    /// Only a leader's history driver proposes a history event.
+    NewHistory,
 }
 
 /// Serializable startup classification. The WAL facade retains the native
@@ -892,6 +987,30 @@ pub enum GroupInfraError {
     },
     #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
     RecoveryVoteFloor { raft_group_id: RaftGroupId },
+    /// This replica restarts to run a recovery plan's cut (#581 section
+    /// 4.5): it takes no replication until it has. Retryable.
+    #[error("raft group {raft_group_id:?} restarts to cut its log for a recovery plan")]
+    RecoveryCutting { raft_group_id: RaftGroupId },
+    /// This replica holds a recovery plan and the sender leads at or below
+    /// the plan's term: a leader elected before the plan, whose entries it
+    /// takes no more (#581 section 4.5). Retryable for the sender, which a
+    /// leader under the plan replaces.
+    #[error(
+        "raft group {raft_group_id:?} holds a recovery plan with plan term {plan_term}; it takes \
+         no replication from a leader at or below it"
+    )]
+    RecoveryPlanFenced {
+        raft_group_id: RaftGroupId,
+        plan_term: u64,
+    },
+    /// This replica leads the group, and the group's history is pending: its
+    /// genesis, or the history event of a recovery plan, has not applied
+    /// (#581 sections 4.3 and 4.5). The leader serves and admits nothing but
+    /// the event until it does. Retryable.
+    #[error(
+        "raft group {raft_group_id:?} waits for its history event; its leader serves nothing before it"
+    )]
+    RecoveryPending { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]
     OwnerStopped,
     #[error("write outcome is unknown; the proposal may have committed")]
@@ -1189,7 +1308,15 @@ impl GroupEngineError {
                 Some(
                     GroupInfraError::RaftUncommittedBackpressure { .. }
                         | GroupInfraError::ColdBackpressure { .. }
+                        | GroupInfraError::RecoveryPending { .. }
                 )
             )
+    }
+
+    /// The group's leader waits for its history event (#581 section 4.5):
+    /// nothing was proposed, and a retry soon succeeds.
+    pub fn is_history_pending(&self) -> bool {
+        matches!(self.infra(), Some(GroupInfraError::RecoveryPending { .. }))
+            || self.code() == Some(StreamErrorCode::HistoryPending)
     }
 }

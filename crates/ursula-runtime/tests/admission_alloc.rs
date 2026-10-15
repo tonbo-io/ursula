@@ -43,6 +43,9 @@ fn admission_preview_does_not_copy_group_state() {
     // engine to preview admission (17.7 s for 30k appends).
     let stream_id = BucketStreamId::new("hygiene", "admission");
     let mut engine = InMemoryGroupEngine::default();
+    // A group serves nothing before its genesis history event (#581
+    // section 4.3).
+    engine.start_genesis(placement(), 0);
     let mut request = CreateStreamRequest::new(stream_id.clone(), "application/octet-stream");
     request.initial_payload = Bytes::from(vec![7u8; 4 << 20]);
     runtime

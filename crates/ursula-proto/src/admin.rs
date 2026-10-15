@@ -230,20 +230,160 @@ impl MaintenanceFenceState {
     }
 }
 
-/// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
-/// the replica's log as the operator saw it in `GET /__ursula/metrics`
-/// (`last_log_index` and `current_term` of the group) when deciding to
-/// accept its loss. The node refuses the request when the replica no longer
-/// holds that log, so the acceptance applies to what the operator saw.
+/// A replica's log as the recovery tool read it in `GET /__ursula/metrics`:
+/// what a recovery plan expects each member to still hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AcceptUnsyncedLossRequest {
-    /// The group's `last_log_index` on the replica, `null` for an empty log.
+pub struct ReplicaLogView {
+    /// The group's `last_log.index` on the replica, `null` for an empty log.
     /// Required, also when `null`.
     #[serde(deserialize_with = "required_option")]
-    pub expected_last_log_index: Option<u64>,
+    pub last_log_index: Option<u64>,
+    /// The group's `last_log.term` on the replica, `null` for an empty log.
+    /// Required, also when `null`.
+    #[serde(deserialize_with = "required_option")]
+    pub last_log_term: Option<u64>,
     /// The group's `current_term` on the replica.
-    pub expected_current_term: u64,
+    pub current_term: u64,
+}
+
+/// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
+/// a recovery plan that accepts the loss of the group's unsynced tail
+/// (#581 section 4.5). The tool reads every reachable member and refuses
+/// unless a majority of the voters answer. It sends the plan to the leader
+/// first ([`PlanStep::Lead`]), which answers its plan term, and then to every
+/// other reachable member ([`PlanStep::Follow`] with that term). A member
+/// that takes it votes only for `leader`, and only at a term above the plan
+/// term, until it applied a history event at a log index above `point`. The
+/// leader proposes that event first and serves nothing before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPlanRequest {
+    /// The member the plan elects: the greatest last log id, or with a cut
+    /// the greatest committed index.
+    pub leader: u64,
+    /// The leader's last log index after the plan (its committed index
+    /// with a cut).
+    pub point: u64,
+    /// Whether every member keeps only the entries it knew were committed:
+    /// the leader's last log term is below the highest vote term a gated
+    /// member holds, so its log may hold a stale entry.
+    pub cut: bool,
+    /// Whether this replica leads the plan or follows it.
+    pub step: PlanStep,
+    /// This replica's log as the tool read it.
+    pub expected: ReplicaLogView,
+}
+
+/// Which part of a recovery plan a request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum PlanStep {
+    /// To the plan's leader, first: it takes the plan and answers its plan
+    /// term ([`RecoveryPlanReport::leader_term`]). `highest_term` is the
+    /// highest `current_term` the tool read on any replica it reached. The
+    /// plan term is the higher of it and the leader's own vote term: a
+    /// leader at or below it gets nothing applied after the plan, and one
+    /// above it cannot make the plan's leader win, since every replica that
+    /// may vote for it either holds the plan or is open and unplanned and
+    /// refuses a log behind its own.
+    Lead { highest_term: u64 },
+    /// To every other member, after the leader took the plan: it votes for
+    /// the leader only at a term above `leader_term`, which only campaigns
+    /// the leader starts after it took the plan reach.
+    Follow { leader_term: u64 },
+}
+
+/// The body of a `409 Conflict` from `accept-unsynced-loss`: why the replica
+/// refused the plan. It changed nothing, except after `cut_refused`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPlanRefused {
+    pub raft_group_id: u64,
+    pub node_id: u64,
+    pub refusal: RecoveryPlanRefusal,
+    /// The refusal in words, for a person.
+    pub message: String,
+}
+
+/// Why a replica refused a recovery plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum RecoveryPlanRefusal {
+    /// The replica lost its vote and holds no vote floor yet.
+    MissingVoteFloor,
+    /// The replica leads the group with a live quorum.
+    LeadsLive,
+    /// The replica follows a live leader, `leader`.
+    FollowsLeader { leader: u64 },
+    /// The request's `step` is not this replica's.
+    StepMismatch,
+    /// The plan's leader is not a voter of the group.
+    LeaderNotVoter,
+    /// The replica's gate may still open without a plan, or runs a cut.
+    NotStalled { status: RecoveryGateStatus },
+    /// The replica no longer holds the log the plan's `expected` names.
+    ReplicaChanged,
+    /// The replica committed or applied an entry above the plan's point.
+    RecoveryPointBehind,
+    /// The plan's leader does not continue from the plan's point.
+    PointMismatch,
+    /// The plan cuts and the replica knows no committed entry.
+    NothingCommitted,
+    /// The plan cuts and the replica no longer holds the entry it keeps.
+    CommittedEntryMissing,
+    /// The plan's cut could not run at the group's restart: the plan was
+    /// dropped, the log recorded recovering and the gate stays closed. The
+    /// one refusal that changed the replica: it took the plan first.
+    CutRefused,
+    /// The replica's log store closed.
+    StoreClosed,
+    /// The replica is taking another recovery plan.
+    PlanInFlight,
+    /// The plan cuts a group with one voter: no other voter could have
+    /// overwritten an entry it holds, so its log is kept whole.
+    SingleVoterCut,
+    /// A `follow` names a plan term below the vote term the tool read on
+    /// this replica: the term did not come from the plan's leader.
+    PlanTermBelowVote,
+}
+
+impl RecoveryPlanRefusal {
+    /// Whether no plan can fix the refusal: a replica that lost its vote
+    /// needs a quorum's proof first, a plan naming a node outside the
+    /// membership the replica holds stays refused, and a step that is not
+    /// the replica's is a bug in the tool.
+    pub fn no_plan_fixes(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingVoteFloor | Self::LeaderNotVoter | Self::StepMismatch
+        )
+    }
+}
+
+/// What a recovery plan did on one replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPlanOutcome {
+    /// The replica is the plan's leader: it campaigns and proposes the
+    /// history event once elected.
+    Leads,
+    /// The replica votes only for the plan's leader until the event applies.
+    Follows,
+}
+
+/// The answer of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
+/// on one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPlanReport {
+    pub raft_group_id: u32,
+    pub node_id: u64,
+    pub outcome: RecoveryPlanOutcome,
+    /// The plan this replica holds.
+    pub leader: u64,
+    pub point: u64,
+    /// The plan term: the leader's vote term when it took the plan.
+    pub leader_term: u64,
 }
 
 /// Deserializes an `Option` field that must be present, so that a missing
@@ -292,7 +432,6 @@ impl From<ProcessIncarnation> for String {
 
 #[cfg(test)]
 mod tests {
-    use super::AcceptUnsyncedLossRequest;
     use super::ApplyFailure;
     use super::ApplyFailureKind;
     use super::MaintenanceFence;
@@ -338,37 +477,130 @@ mod tests {
         );
     }
 
-    /// The expected log must be stated, also when it is empty.
+    /// Golden JSON (#581 sections 4.4 and 4.5): the recovery plan, its
+    /// report and the import's answer are the admin API between `ursulactl`
+    /// and the server, so their wire form never changes within a minor.
     #[test]
-    fn an_accept_request_names_the_observed_log_explicitly() {
+    fn recovery_plans_and_import_answers_keep_their_wire_form() {
+        use super::BackupImportResponse;
+        use super::PlanStep;
+        use super::RecoveryPlanOutcome;
+        use super::RecoveryPlanReport;
+        use super::RecoveryPlanRequest;
+        use super::ReplicaLogView;
+        let plan = RecoveryPlanRequest {
+            leader: 2,
+            point: 12,
+            cut: true,
+            step: PlanStep::Follow { leader_term: 9 },
+            expected: ReplicaLogView {
+                last_log_index: Some(14),
+                last_log_term: Some(3),
+                current_term: 5,
+            },
+        };
         assert_eq!(
-            serde_json::from_str::<AcceptUnsyncedLossRequest>(
-                r#"{"expected_last_log_index": 12, "expected_current_term": 3}"#
+            serde_json::to_string(&plan).unwrap(),
+            r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+        );
+        let lead = RecoveryPlanRequest {
+            step: PlanStep::Lead { highest_term: 8 },
+            ..plan
+        };
+        assert_eq!(
+            serde_json::to_string(&lead).unwrap(),
+            r#"{"leader":2,"point":12,"cut":true,"step":{"lead":{"highest_term":8}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+        );
+        let refused = super::RecoveryPlanRefused {
+            raft_group_id: 4,
+            node_id: 3,
+            refusal: super::RecoveryPlanRefusal::FollowsLeader { leader: 2 },
+            message: "follows".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&refused).unwrap(),
+            r#"{"raft_group_id":4,"node_id":3,"refusal":{"reason":"follows_leader","leader":2},"message":"follows"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&super::RecoveryPlanRefusal::ReplicaChanged).unwrap(),
+            r#"{"reason":"replica_changed"}"#
+        );
+        let report = RecoveryPlanReport {
+            raft_group_id: 4,
+            node_id: 2,
+            outcome: RecoveryPlanOutcome::Follows,
+            leader: 2,
+            point: 12,
+            leader_term: 9,
+        };
+        assert_eq!(
+            serde_json::to_string(&report).unwrap(),
+            r#"{"raft_group_id":4,"node_id":2,"outcome":"follows","leader":2,"point":12,"leader_term":9}"#
+        );
+        let answer = BackupImportResponse {
+            buckets: 1,
+            streams: 3,
+            group_commit_index: 9,
+            history: std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).unwrap(),
+            already: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&answer).unwrap(),
+            r#"{"buckets":1,"streams":3,"group_commit_index":9,"history":81985529216486895,"already":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<BackupImportResponse>(&serde_json::to_string(&answer).unwrap())
+                .unwrap(),
+            answer
+        );
+    }
+
+    /// A recovery plan states every member's expected log, also when it is
+    /// empty, and nothing else.
+    #[test]
+    fn a_recovery_plan_names_the_observed_log_explicitly() {
+        use super::RecoveryPlanRequest;
+        use super::ReplicaLogView;
+        assert_eq!(
+            serde_json::from_str::<RecoveryPlanRequest>(
+                r#"{"leader": 2, "point": 12, "cut": false, "step": {"lead": {"highest_term": 4}},
+                    "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
             )
             .unwrap(),
-            AcceptUnsyncedLossRequest {
-                expected_last_log_index: Some(12),
-                expected_current_term: 3,
+            RecoveryPlanRequest {
+                leader: 2,
+                point: 12,
+                cut: false,
+                step: super::PlanStep::Lead { highest_term: 4 },
+                expected: ReplicaLogView {
+                    last_log_index: Some(12),
+                    last_log_term: Some(3),
+                    current_term: 4,
+                },
             }
         );
         assert_eq!(
-            serde_json::from_str::<AcceptUnsyncedLossRequest>(
-                r#"{"expected_last_log_index": null, "expected_current_term": 0}"#
+            serde_json::from_str::<ReplicaLogView>(
+                r#"{"last_log_index": null, "last_log_term": null, "current_term": 0}"#
             )
             .unwrap(),
-            AcceptUnsyncedLossRequest {
-                expected_last_log_index: None,
-                expected_current_term: 0,
+            ReplicaLogView {
+                last_log_index: None,
+                last_log_term: None,
+                current_term: 0,
             }
         );
         for invalid in [
-            r#"{"expected_current_term": 3}"#,
-            r#"{"expected_last_log_index": 12}"#,
-            r#"{"expected_last_log_index": 12, "expected_current_term": 3, "force": true}"#,
-            r#"{}"#,
+            r#"{"expected_last_log_index": 12, "expected_current_term": 3}"#,
+            r#"{"leader": 2, "point": 12, "expected":
+                {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
+            r#"{"leader": 2, "point": 12, "cut": false, "expected":
+                {"last_log_index": 12, "current_term": 4}}"#,
+            r#"{"leader": 2, "point": 12, "cut": false, "force": true, "expected":
+                {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
         ] {
-            serde_json::from_str::<AcceptUnsyncedLossRequest>(invalid)
-                .expect_err("an incomplete or unknown expectation must be rejected");
+            serde_json::from_str::<RecoveryPlanRequest>(invalid)
+                .expect_err("a 0.7 body, an incomplete plan or an unknown field is refused");
         }
     }
 
@@ -560,6 +792,15 @@ pub enum RecoveryGateStatus {
     Stalled,
     /// Gated; a leader confirmed a barrier and the replica catches up.
     CatchingUp,
+    /// A recovery plan holds the replica: it votes only for the plan's
+    /// leader until the plan's history event applies (#581 section 4.5).
+    Planned,
+    /// A recovery plan elects this replica: it campaigns and votes for no
+    /// other candidate until the plan's history event applies.
+    LeadsPlan,
+    /// The replica took a plan that cuts its log and its group restarts to
+    /// run the cut: it votes for no one and takes no replication.
+    Cutting,
 }
 
 impl RecoveryGateStatus {
@@ -596,6 +837,22 @@ pub struct LeadershipShedStatus {
     pub should_campaign: bool,
     pub recovery_barriers_ready: bool,
     pub should_shed_current_leaders: bool,
+}
+/// Answer of `POST /__ursula/backup/group/{group}/import`. The import is a
+/// history event keyed by the backup's BLAKE3 digest (#581 section 4.4): a
+/// repeat of an import the group already holds answers `already: true` and
+/// changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupImportResponse {
+    pub buckets: u64,
+    pub streams: u64,
+    pub group_commit_index: u64,
+    /// The id of the history the import started: every restored stream has
+    /// a new token, and every restored producer record is history-fenced.
+    pub history: std::num::NonZeroU64,
+    /// The group already held this import.
+    pub already: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupInfo {
@@ -710,6 +967,41 @@ pub struct RaftGroupMetrics {
     /// Set once a committed command failed to apply: the replica stopped.
     #[serde(deserialize_with = "Option::deserialize")]
     pub apply_failure: Option<ApplyFailure>,
+    /// The history event this replica applied last (#581 section 4.3),
+    /// `null` before the group's genesis.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub history: Option<RaftGroupHistory>,
+    /// The recovery plan this replica holds until its history event
+    /// applies (#581 section 4.5).
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub recovery: Option<RaftGroupRecovery>,
+    /// The replica's recovery gate for this group: `open` when it has none.
+    pub recovery_gate: RecoveryGateStatus,
+    /// The replica leads the group, and a quorum acknowledged it within the
+    /// last 3 seconds. A leader that lost its quorum stays a leader in its
+    /// own metrics; this says it is not live (m2, #581 review).
+    pub leads_live: bool,
+}
+
+/// The history event a replica applied last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftGroupHistory {
+    /// The log index of the entry that applied it. A recovery plan is
+    /// satisfied on a replica once this is above the plan's point.
+    pub event_index: u64,
+    /// The group was restored from a backup.
+    pub imported: bool,
+}
+
+/// A recovery plan a replica holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftGroupRecovery {
+    pub leader: u64,
+    pub point: u64,
+    /// The plan term members require on the leader's vote requests.
+    pub leader_term: u64,
+    /// The plan's cut has not run yet.
+    pub cut_pending: bool,
 }
 impl RaftGroupMetrics {
     pub fn participation_ready(&self) -> bool {
@@ -773,6 +1065,10 @@ mod metrics_contract_tests {
                 last_snapshot_bytes: 0,
                 has_snapshot: false,
                 apply_failure: None,
+                history: None,
+                recovery: None,
+                recovery_gate: RecoveryGateStatus::Open,
+                leads_live: false,
             }],
         }
     }

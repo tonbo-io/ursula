@@ -49,6 +49,8 @@ use std::io;
 
 pub use core_meta::GroupLogState;
 pub use core_meta::MarkRecoveringError;
+pub use core_meta::PlanCut;
+pub use core_meta::RecoveryRecord;
 #[cfg(madsim)]
 pub use disk::JournalDisk;
 #[cfg(madsim)]
@@ -56,6 +58,7 @@ pub use disk::JournalFile;
 #[cfg(madsim)]
 pub use disk::LockAttempt;
 pub use file::RaftGroupFileLogStore;
+pub use file::RecoveryCutError;
 pub use frozen::ArchiveDefect;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;

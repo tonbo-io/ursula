@@ -107,6 +107,9 @@ fn unrelated_stream_cardinality_benches(c: &mut Criterion) {
 
 fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemoryGroupEngine {
     let mut engine = InMemoryGroupEngine::default();
+    // A group serves nothing before its genesis history event (#581
+    // section 4.3).
+    engine.start_genesis(placement, 0);
     for stream_index in 0..stream_count {
         let response = engine
             .apply_committed_write(

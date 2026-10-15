@@ -189,6 +189,10 @@ fn normal_entry(
 async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
     let stream_id = bsid("raft-d1-install");
     let commands = vec![
+        StreamCommand::NewHistory {
+            history: std::num::NonZeroU64::new(1).expect("non-zero"),
+            now_ms: 0,
+        },
         StreamCommand::CreateStream {
             stream_id: stream_id.clone(),
             content_type: OCTET.to_owned(),

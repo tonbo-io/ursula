@@ -173,6 +173,10 @@ mod tests {
                 stopped_for_operator: false,
             },
             log: Default::default(),
+            history: None,
+            recovery: None,
+            recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
+            leads_live: false,
         }
     }
 

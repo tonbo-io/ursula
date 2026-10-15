@@ -27,7 +27,6 @@ use ursula_raft::RaftWalError;
 #[cfg(test)]
 use ursula_raft::WalOpening;
 use ursula_raft::wal::diagnostics::SimDisk;
-#[cfg(test)]
 use ursula_raft::wal::diagnostics::SimPowerLoss;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::RuntimeMetrics;
@@ -76,7 +75,6 @@ impl SimNodeWal {
     }
 
     /// Sets the number of groups before this simulated node first starts.
-    #[cfg(test)]
     pub(super) fn with_group_count(mut self, groups: usize) -> Self {
         self.topology = ursula_shard::StaticShardMap::new(1, groups).expect("valid topology");
         self
@@ -164,7 +162,6 @@ impl SimNodeWal {
 
     /// Cuts the node's power after its engines have stopped, and loses
     /// everything written since the last `fsync`.
-    #[cfg(test)]
     pub(super) async fn power_loss_losing_unsynced(&self) -> SimPowerLoss {
         self.stop().await;
         SimDisk::power_loss_losing_unsynced(&self.root)
@@ -186,7 +183,6 @@ impl SimNodeWal {
     /// A production writer that loses its last handle `fsync`s on its way
     /// out; a simulated one stops like a killed process. So the node's
     /// stores are held while the engines stop, and the writers close here.
-    #[cfg(test)]
     pub(super) async fn clean_shutdown(&self, stop_engines: impl Future<Output = ()>) {
         let held = self
             .stores
@@ -212,7 +208,6 @@ impl SimNodeWal {
 
     /// Ends the node's run without a clean shutdown, as a stopped process
     /// does.
-    #[cfg(test)]
     async fn stop(&self) {
         self.wait_stopped().await;
         drop(
@@ -223,7 +218,6 @@ impl SimNodeWal {
         );
     }
 
-    #[cfg(test)]
     async fn wait_stopped(&self) {
         let stores = self
             .stores

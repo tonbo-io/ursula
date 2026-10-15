@@ -10,7 +10,6 @@ use std::time::Duration;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdStore;
 use ursula_runtime::CreateStreamRequest;
-use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
@@ -153,15 +152,15 @@ async fn raft_orphan_sweep_reclaims_only_unreferenced_objects() {
     // C7/F14g: chunks live under the stream's incarnation generation, the
     // directory the sweep lists.
     let generation = runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: a.clone(),
-            now_ms: 0,
-            linearizable: false,
-            read_index: None,
-        })
+        .snapshot_group(runtime.locate(&a).raft_group_id)
         .await
-        .expect("head")
-        .created_at_ms;
+        .expect("snapshot group")
+        .stream_snapshot
+        .streams
+        .into_iter()
+        .find(|entry| entry.metadata.stream_id == a)
+        .map(|entry| entry.cold_index_generation)
+        .expect("stream in snapshot");
     let orphan_chunk = new_cold_chunk_path_in_generation(&a, generation, 0, 2);
     let orphan_external = new_external_payload_path(&b);
     for path in [&orphan_pack, &orphan_chunk, &orphan_external] {

@@ -4719,6 +4719,7 @@ dependencies = [
  "blake3",
  "madsim",
  "openraft",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tower 0.5.3",
@@ -4732,6 +4733,7 @@ dependencies = [
  "ursula-raft",
  "ursula-runtime",
  "ursula-shard",
+ "ursula-stream",
 ]
 
 [[package]]
@@ -4766,8 +4768,10 @@ dependencies = [
  "bytes",
  "criterion",
  "dhat",
+ "madsim",
  "memchr",
  "proptest",
+ "rand 0.10.1",
  "rmp-serde",
  "serde",
  "serde_json",

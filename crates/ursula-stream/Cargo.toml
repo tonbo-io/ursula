@@ -13,12 +13,16 @@ autobenches = false
 [dependencies]
 blake3 = { workspace = true }
 memchr = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
 bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 slotmap = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = { workspace = true }
 
 [dev-dependencies]
 dhat = { workspace = true }

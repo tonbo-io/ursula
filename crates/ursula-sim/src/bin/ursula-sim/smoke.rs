@@ -306,6 +306,22 @@ fn generate_idle_expiry_cannot_reopen_an_epoch(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::IdleExpiryCannotReopenAnEpoch)
 }
 
+fn generate_history_rewind_under_leader_churn(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::HistoryRewindUnderLeaderChurn)
+}
+
+fn generate_stale_writers_after_restore(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::StaleWritersAfterRestore)
+}
+
+fn generate_recovery_plan_cut_under_restarts(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanCutUnderRestarts)
+}
+
+fn generate_recovery_plan_survivor_campaigns(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanSurvivorCampaigns)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -320,6 +336,55 @@ struct SeedFamily {
 /// NOTE: `scripts/dst/audits.py` parses this table (the `name`, `start`, and
 /// `end` fields) for the seed-inventory audit; keep the field layout intact.
 const SEED_FAMILIES: &[SeedFamily] = &[
+    SeedFamily {
+        name: "history-rewind-under-leader-churn",
+        start: 375,
+        end: 379,
+        kind: "history-rewind-under-leader-churn",
+        generate: generate_history_rewind_under_leader_churn,
+    },
+    SeedFamily {
+        name: "stale-writers-after-restore",
+        start: 380,
+        end: 384,
+        kind: "stale-writers-after-restore",
+        generate: generate_stale_writers_after_restore,
+    },
+    SeedFamily {
+        name: "recovery-plan-cut-under-restarts",
+        start: 385,
+        end: 389,
+        kind: "recovery-plan-cut-under-restarts",
+        generate: generate_recovery_plan_cut_under_restarts,
+    },
+    SeedFamily {
+        name: "recovery-plan-cut-under-restarts-extended",
+        start: 880,
+        end: 899,
+        kind: "recovery-plan-cut-under-restarts",
+        generate: generate_recovery_plan_cut_under_restarts,
+    },
+    SeedFamily {
+        name: "recovery-plan-survivor-campaigns",
+        start: 390,
+        end: 394,
+        kind: "recovery-plan-survivor-campaigns",
+        generate: generate_recovery_plan_survivor_campaigns,
+    },
+    SeedFamily {
+        name: "recovery-plan-survivor-campaigns-extended",
+        start: 900,
+        end: 919,
+        kind: "recovery-plan-survivor-campaigns",
+        generate: generate_recovery_plan_survivor_campaigns,
+    },
+    SeedFamily {
+        name: "history-rewind-under-leader-churn-extended",
+        start: 850,
+        end: 879,
+        kind: "history-rewind-under-leader-churn",
+        generate: generate_history_rewind_under_leader_churn,
+    },
     SeedFamily {
         name: "producer-repeats-exactly-once",
         start: 365,

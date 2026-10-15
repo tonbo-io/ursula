@@ -112,5 +112,32 @@ mod tests {
         assert_eq!(meta.last_log_id, Some(log));
         assert_eq!(meta.last_membership, membership);
         assert_eq!(meta.snapshot_id, "group-7-T7-N2-19");
+        // A history event (#581 section 4.3), the entry every group starts
+        // with.
+        let history: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "new_history_entry");
+        assert_eq!(history.log_id, log);
+        assert!(matches!(
+            history.payload,
+            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::NewHistory { history, now_ms: 1_700_000_000_000 }
+            )) if history.get() == 0x0123_4567_89ab_cdef
+        ));
+        // An import is a history event keyed by its backup (#581 section
+        // 4.4): the history id and the backup's digest are in the entry.
+        let import: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "import_snapshot_entry");
+        assert_eq!(import.log_id, log);
+        assert!(matches!(
+            import.payload,
+            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::ImportSnapshot {
+                    ref snapshot,
+                    history,
+                    backup_digest,
+                    now_ms: 1_700_000_000_000,
+                }
+            )) if history.get() == 0x0123_4567_89ab_cdef
+                && backup_digest == [0xab; 32]
+                && snapshot.buckets == ["tenant"]
+        ));
     }
 }

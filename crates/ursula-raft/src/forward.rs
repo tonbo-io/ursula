@@ -530,18 +530,30 @@ pub(crate) fn validate_proposal(command: &GroupWriteCommand) -> Result<(), Group
     while let ursula_stream::StreamCommand::IfIncarnation { command: inner, .. } = command {
         command = inner;
     }
-    if matches!(command, ursula_stream::StreamCommand::CreateBucket { .. }) {
-        return Err(GroupEngineError::Infra(
-            ursula_runtime::GroupInfraError::InvalidRaftCommand {
-                command: ursula_runtime::UnproposableCommand::CreateBucket,
-            },
-        ));
-    }
-    Ok(())
+    let unproposable = match command {
+        ursula_stream::StreamCommand::CreateBucket { .. } => {
+            ursula_runtime::UnproposableCommand::CreateBucket
+        }
+        // Only a leader's history driver proposes a history event, straight
+        // to its Raft core (#581 section 4.3).
+        ursula_stream::StreamCommand::NewHistory { .. } => {
+            ursula_runtime::UnproposableCommand::NewHistory
+        }
+        _ => return Ok(()),
+    };
+    Err(GroupEngineError::Infra(
+        ursula_runtime::GroupInfraError::InvalidRaftCommand {
+            command: unproposable,
+        },
+    ))
 }
 
+/// Proposes `commands` as one batch. `history` is the group's history on
+/// this replica: a leader whose history is pending admits none of them
+/// (#581 section 4.5).
 pub(crate) async fn write_commands_on_raft(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    history: &crate::history::GroupHistory,
     commands: Vec<GroupWriteCommand>,
 ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
@@ -549,6 +561,7 @@ pub(crate) async fn write_commands_on_raft(
     }
     for command in &commands {
         validate_proposal(command)?;
+        history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
     let stream = raft.client_write_many(commands).await.map_err(|error| {

@@ -2,6 +2,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
+use crate::history::HistoryEvent;
+use crate::history::InheritedHistory;
 use crate::model::BucketUsageSnapshot;
 use crate::model::ColdChunkRef;
 use crate::model::ColdGcEntry;
@@ -28,6 +30,8 @@ pub struct StreamSnapshot {
     pub bucket_usage: Vec<BucketUsageSnapshot>,
     /// Largest `created_at_ms` this group assigned (C7, F14g).
     pub last_created_at_ms: u64,
+    /// The group's latest history event; `None` before its genesis.
+    pub history: Option<HistoryEvent>,
 }
 
 /// An empty snapshot of this binary's epoch. Fixtures restore from it.
@@ -42,6 +46,7 @@ impl Default for StreamSnapshot {
             next_cold_gc_seq: 0,
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
+            history: None,
         }
     }
 }
@@ -62,6 +67,11 @@ pub struct StreamSnapshotEntry {
     /// The stream's epoch floor: the highest epoch of any producer record it
     /// retired.
     pub retired_epoch_watermark: Option<u64>,
+    /// The group's history id when the stream was created or last written.
+    pub history: u64,
+    /// What the stream's current history began from, recorded by its first
+    /// write after a history event.
+    pub inherited: Option<InheritedHistory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

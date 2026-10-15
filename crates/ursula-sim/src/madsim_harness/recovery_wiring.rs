@@ -162,6 +162,7 @@ pub(super) struct VoteAnswer {
     pub(super) target_gate: Option<RecoveryGateStatus>,
 }
 
+#[cfg(test)]
 impl VoteAnswer {
     fn granted_while_gated(&self) -> bool {
         self.granted
@@ -183,6 +184,7 @@ impl VoteLog {
             .push(answer);
     }
 
+    #[cfg(test)]
     fn answers(&self) -> Vec<VoteAnswer> {
         self.0
             .lock()
@@ -200,6 +202,7 @@ impl VoteLog {
     }
 
     /// The votes a replica granted while its recovery gate was closed.
+    #[cfg(test)]
     pub(super) fn granted_while_gated(&self) -> Vec<VoteAnswer> {
         self.answers()
             .into_iter()
@@ -208,6 +211,7 @@ impl VoteLog {
     }
 
     /// How many vote requests `target` answered while its gate was closed.
+    #[cfg(test)]
     pub(super) fn answered_while_gated(&self, target: u64) -> usize {
         self.answers()
             .iter()

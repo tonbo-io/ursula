@@ -48,7 +48,7 @@ fn append(engine: &mut InMemoryGroupEngine, stream_id: &BucketStreamId, now_ms: 
 #[test]
 fn ttl_expiry_drops_append_count_and_recreate_matches_installed_replica() {
     let stream_id = BucketStreamId::new("hygiene", "ttl");
-    let mut long_lived = InMemoryGroupEngine::default();
+    let mut long_lived = InMemoryGroupEngine::started();
     create(&mut long_lived, &stream_id, Some(1), 0);
     assert_eq!(append(&mut long_lived, &stream_id, 1), 1);
     assert_eq!(append(&mut long_lived, &stream_id, 2), 2);
@@ -63,7 +63,7 @@ fn ttl_expiry_drops_append_count_and_recreate_matches_installed_replica() {
         )
         .expect("expire stream");
 
-    let mut installed = InMemoryGroupEngine::default();
+    let mut installed = InMemoryGroupEngine::started();
     installed
         .install_snapshot_inner(long_lived.build_snapshot(placement()))
         .expect("install snapshot");
@@ -78,7 +78,7 @@ fn ttl_expiry_drops_append_count_and_recreate_matches_installed_replica() {
 
 #[test]
 fn purge_bucket_drops_append_counts() {
-    let mut engine = InMemoryGroupEngine::default();
+    let mut engine = InMemoryGroupEngine::started();
     for index in 0..8 {
         let stream_id = BucketStreamId::new("purged", format!("s{index}"));
         create(&mut engine, &stream_id, None, 0);

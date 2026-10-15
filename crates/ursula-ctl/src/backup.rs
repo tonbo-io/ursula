@@ -389,7 +389,15 @@ impl BackupClient {
         best.ok_or_else(|| last_error.unwrap_or(BackupError::NoNodes))
     }
 
-    async fn import_group(&self, raft_group_id: u32, body: Vec<u8>) -> Result<(), BackupError> {
+    /// Imports one group. The import is keyed by the backup's BLAKE3
+    /// digest, which the request carries, so a repeat after an unknown
+    /// outcome answers `already` instead of a conflict.
+    async fn import_group(
+        &self,
+        raft_group_id: u32,
+        body: Vec<u8>,
+    ) -> Result<ursula_proto::admin::BackupImportResponse, BackupError> {
+        let digest = blake3::hash(&body).to_hex().to_string();
         let mut last_error = None;
         for node in &self.nodes {
             let url = node
@@ -405,11 +413,17 @@ impl BackupClient {
                 })?;
             match request
                 .header("content-type", "application/x-msgpack")
+                .header("x-ursula-backup-blake3", &digest)
                 .body(body.clone())
                 .send()
                 .await
             {
-                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().is_success() => {
+                    return response
+                        .json::<ursula_proto::admin::BackupImportResponse>()
+                        .await
+                        .map_err(|source| BackupError::Request { url, source });
+                }
                 Ok(response) => {
                     let status = response.status();
                     let detail = response.text().await.unwrap_or_default();
@@ -558,10 +572,30 @@ pub struct VerifyReport {
 #[derive(Debug)]
 pub struct RestoreReport {
     pub groups: u32,
+    /// Buckets and streams the target reports for its imported groups.
     pub buckets: u64,
     pub streams: u64,
     /// Cold objects the target confirmed it holds, index pages included.
     pub cold_objects: u64,
+    /// Each group's import: the history it started (every restored stream
+    /// answers with a new `Stream-Incarnation`) and whether an earlier run
+    /// had applied it already.
+    pub imports: Vec<RestoredGroup>,
+}
+
+/// What the target answered for one group's import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredGroup {
+    pub raft_group_id: u32,
+    pub history: std::num::NonZeroU64,
+    pub already: bool,
+}
+
+impl RestoreReport {
+    /// Groups an earlier, interrupted run had imported already.
+    pub fn already(&self) -> usize {
+        self.imports.iter().filter(|import| import.already).count()
+    }
 }
 
 pub async fn verify(store: &BackupStore) -> Result<VerifyReport, BackupError> {
@@ -641,8 +675,9 @@ pub async fn restore(
         });
     }
     // Every group's cold references must resolve in the target before the
-    // first import: an import cannot be taken back, and a restore that
-    // imported some groups refuses to run again on the now non-empty target.
+    // first import: an import cannot be taken back. A restore that was
+    // interrupted runs again: each import is keyed by its backup, and a group
+    // that holds it answers `already`.
     let mut referenced = 0u64;
     let mut missing = 0u64;
     let mut sample = Vec::new();
@@ -661,15 +696,26 @@ pub async fn restore(
             sample,
         });
     }
+    let mut buckets = 0u64;
+    let mut streams = 0u64;
+    let mut imports = Vec::with_capacity(manifest.groups.len());
     for group in &manifest.groups {
         let body = store.read(&group.object).await?;
-        client.import_group(group.raft_group_id, body).await?;
+        let imported = client.import_group(group.raft_group_id, body).await?;
+        buckets = buckets.saturating_add(imported.buckets);
+        streams = streams.saturating_add(imported.streams);
+        imports.push(RestoredGroup {
+            raft_group_id: group.raft_group_id,
+            history: imported.history,
+            already: imported.already,
+        });
     }
     Ok(RestoreReport {
         groups: report.groups,
-        buckets: report.buckets,
-        streams: report.streams,
+        buckets,
+        streams,
         cold_objects: referenced,
+        imports,
     })
 }
 
@@ -1000,6 +1046,117 @@ mod tests {
             "{err}"
         );
         assert_eq!(imports.load(Ordering::SeqCst), 0, "nothing imported");
+        server.abort();
+    }
+
+    /// Minor 5 (#581 review): restore reports what the target answered, a
+    /// group an earlier run imported included.
+    #[tokio::test]
+    async fn restore_reports_each_imports_history_and_an_earlier_runs_imports() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::get;
+        use axum::routing::post;
+        use ursula_proto::admin::BackupImportResponse;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_in(dir.path()).await;
+        let first = snapshot_bytes(vec!["tenant-a".to_owned()]);
+        let second = snapshot_bytes(vec!["tenant-b".to_owned()]);
+        for (id, body) in [(0, &first), (1, &second)] {
+            store
+                .write(&group_object_name(id), body.clone())
+                .await
+                .expect("write group");
+        }
+        let manifest = manifest_for(&[(0, &first), (1, &second)]);
+        store
+            .write(
+                MANIFEST_OBJECT,
+                serde_json::to_vec(&manifest).expect("encode"),
+            )
+            .await
+            .expect("write manifest");
+        let app = Router::new()
+            .route(
+                "/__ursula/backup/info",
+                get(|| async {
+                    Json(BackupInfo {
+                        format_version: BACKUP_FORMAT_VERSION,
+                        raft_group_count: 2,
+                    })
+                }),
+            )
+            .route(
+                "/__ursula/metrics",
+                get(|| async {
+                    Json(crate::metrics::test_metrics(
+                        1,
+                        Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                    ))
+                }),
+            )
+            .route(
+                "/__ursula/backup/group/{group}/import",
+                post(
+                    |axum::extract::Path(group): axum::extract::Path<u32>| async move {
+                        Json(BackupImportResponse {
+                            buckets: 1,
+                            streams: u64::from(group).saturating_add(2),
+                            group_commit_index: 3,
+                            history: std::num::NonZeroU64::new(u64::from(group) + 40)
+                                .expect("non-zero"),
+                            already: group == 0,
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/__ursula/backup/group/{group}/cold-check",
+                post(
+                    |axum::extract::Path(group): axum::extract::Path<u32>| async move {
+                        Json(BackupColdCheck {
+                            raft_group_id: group,
+                            referenced_objects: 1,
+                            missing_objects: 0,
+                            missing_sample: Vec::new(),
+                        })
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = BackupClient::new(
+            MetricsClient::new(std::time::Duration::from_secs(1)).unwrap(),
+            vec![NodeInfo {
+                id: 1,
+                admin_url: format!("http://{address}").parse().unwrap(),
+                host: address.to_string(),
+                http_url: None,
+                metrics_url: None,
+                expected_process_incarnation: None,
+                expected_maintenance_fence: None,
+            }],
+        )
+        .unwrap();
+        let report = restore(&client, &store).await.expect("restore");
+        assert_eq!((report.buckets, report.streams), (2, 5));
+        assert_eq!(report.already(), 1);
+        assert_eq!(report.imports, vec![
+            RestoredGroup {
+                raft_group_id: 0,
+                history: std::num::NonZeroU64::new(40).unwrap(),
+                already: true,
+            },
+            RestoredGroup {
+                raft_group_id: 1,
+                history: std::num::NonZeroU64::new(41).unwrap(),
+                already: false,
+            },
+        ]);
         server.abort();
     }
 

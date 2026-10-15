@@ -238,6 +238,15 @@ impl RollingRestartValidator {
                             last_snapshot_bytes: 0,
                             has_snapshot: metrics.snapshot.is_some(),
                             apply_failure: None,
+                            history: None,
+                            recovery: None,
+                            leads_live: false,
+                            recovery_gate: self
+                                .registry
+                                .rejoin(node_id)
+                                .map_or(ursula_raft::RecoveryGateStatus::Open, |rejoin| {
+                                    rejoin.status()
+                                }),
                         }
                     }],
                     raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {

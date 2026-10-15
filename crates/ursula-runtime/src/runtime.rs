@@ -1623,6 +1623,29 @@ impl ShardRuntime {
         .await
     }
 
+    /// Stops one hosted group's engine, waiting for its durable resources to
+    /// be released, and starts it again from its durable state through the
+    /// engine factory. A recovery plan's cut runs in between (#581 section
+    /// 4.5).
+    ///
+    /// The restart runs in a task of its own (m3, #581 review): a caller that
+    /// stops waiting, such as an HTTP request whose client went away, never
+    /// leaves the group stopped between the two steps.
+    pub async fn restart_group_engine(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<(), RuntimeError> {
+        let placement = self.placement_for_group(raft_group_id)?;
+        let runtime = self.clone();
+        let restart = crate::rt::spawn(async move {
+            runtime.shutdown_group_engine(placement).await?;
+            runtime.warm_group(raft_group_id).await.map(|_placement| ())
+        });
+        restart
+            .await
+            .map_err(|_join| RuntimeError::GroupRestartAborted { raft_group_id })?
+    }
+
     /// Shuts down every hosted group engine, one per group concurrently,
     /// waiting for each to release its durable resources. A group that was
     /// never created is skipped. Returns the first failure after every group
@@ -1838,7 +1861,7 @@ async fn list_cold_index_page_ids(
 }
 
 #[cfg(not(madsim))]
-pub(crate) fn unix_time_ms() -> u64 {
+pub fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -1846,7 +1869,7 @@ pub(crate) fn unix_time_ms() -> u64 {
 }
 
 #[cfg(madsim)]
-pub(crate) fn unix_time_ms() -> u64 {
+pub fn unix_time_ms() -> u64 {
     0
 }
 

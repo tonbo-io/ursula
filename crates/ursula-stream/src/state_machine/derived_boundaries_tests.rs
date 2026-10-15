@@ -144,7 +144,7 @@ fn retain(machine: &mut StreamStateMachine, id: &str, offset: u64) -> StreamResp
 }
 
 fn incarnation(machine: &StreamStateMachine, id: &str) -> Option<u64> {
-    machine.head(&stream(id)).map(|head| head.created_at_ms)
+    machine.stream_incarnation(&stream(id))
 }
 
 fn entry(machine: &StreamStateMachine, id: &str) -> StreamSnapshotEntry {

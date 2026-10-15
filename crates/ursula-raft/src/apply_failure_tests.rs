@@ -471,11 +471,22 @@ async fn partially_mutated_apply_does_not_advance_and_cannot_build_a_snapshot() 
     use ursula_runtime::GroupEngineError;
     use ursula_runtime::GroupInfraError;
     let mut state = crate::RaftGroupStateMachine::new(placement(0));
-    state.apply_fault = Some(crate::apply_failure::ApplyFault::PanicAfterMutation { index: 1 });
-    let entry = openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
+    state.apply_fault = Some(crate::apply_failure::ApplyFault::PanicAfterMutation { index: 2 });
+    let genesis = openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
         log_id: openraft::LogId::new(
             openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
             1,
+        ),
+        payload: openraft::EntryPayload::Normal(crate::tests::genesis_command()),
+    };
+    state
+        .apply(futures_util::stream::iter([Ok((genesis.clone(), None))]))
+        .await
+        .expect("the group's genesis");
+    let entry = openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
+        log_id: openraft::LogId::new(
+            openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+            2,
         ),
         payload: openraft::EntryPayload::Normal(create_stream("partially-mutated")),
     };
@@ -502,7 +513,7 @@ async fn partially_mutated_apply_does_not_advance_and_cannot_build_a_snapshot() 
             .len(),
         1
     );
-    assert_eq!(state.last_applied_log_id, None);
+    assert_eq!(state.last_applied_log_id, Some(genesis.log_id));
     let mut builder = state.get_snapshot_builder().await;
     assert!(matches!(
         builder

@@ -580,6 +580,14 @@ impl GroupLog {
         plan
     }
 
+    /// The id of the entry at `index`, held or the last purged one.
+    pub(crate) fn log_id_at(&self, index: u64) -> Option<LogId> {
+        self.key_log_ids(index, index)
+            .into_iter()
+            .next()
+            .or(self.last_purged.filter(|purged| purged.index == index))
+    }
+
     /// The last log id of each leader's run of entries within
     /// `first..=last`, as OpenRaft's key log ids are.
     pub(crate) fn key_log_ids(&self, first: u64, last: u64) -> Vec<LogId> {

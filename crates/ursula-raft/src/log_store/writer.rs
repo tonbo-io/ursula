@@ -82,6 +82,7 @@ use super::RaftGroupLogRecord;
 use super::core_meta::CoreMetadata;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::RecoveryRecord;
 use super::core_meta::core_metadata_path;
 use super::disk::Disk;
 use super::disk::DiskFile;
@@ -415,6 +416,7 @@ pub(crate) struct OpenedGroup {
     pub(crate) log: Arc<Mutex<GroupLog>>,
     pub(crate) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
     pub(crate) state: GroupLogState,
+    pub(crate) recovery: Option<RecoveryRecord>,
 }
 
 /// Closes once a core writer's worker has stopped. The last handle's drop
@@ -495,6 +497,25 @@ pub(crate) enum CoreWriteOp {
     /// An initialized group entering or leaving recovery, kept in the
     /// metadata file.
     LogState { group_id: u32, state: GroupLogState },
+    /// A group's recovery plan, kept in the metadata file, or its removal.
+    /// The journal is synced before the metadata file is replaced, so a
+    /// truncation that preceded it is durable first.
+    Recovery {
+        group_id: u32,
+        record: Option<RecoveryRecord>,
+    },
+    /// A group takes a recovery plan: the plan, and its log accepted as it
+    /// is (a recovering group recorded initialized), in one replacement of
+    /// the metadata file, so a crash keeps both or neither.
+    TakePlan {
+        group_id: u32,
+        record: RecoveryRecord,
+    },
+    /// A group drops a recovery plan whose cut could not run, and records
+    /// its log recovering, in one replacement of the metadata file: the
+    /// gate stays closed across restarts until a leader's barrier or a new
+    /// plan (m2, #581 review).
+    DropPlan { group_id: u32 },
 }
 
 /// What one request's write cost, as reported to its group's metrics.
@@ -796,7 +817,21 @@ impl CoreFileLogWriter {
             log,
             vote: recorded.vote,
             state: recorded.log,
+            recovery: recorded.recovery,
         })
+    }
+
+    /// Takes back a group whose store closed, with what that store recorded
+    /// last, so the group opens again in this process (a recovery plan's cut
+    /// restarts one group's replica, #581 section 4.5).
+    pub(crate) fn close_group(&self, raft_group_id: RaftGroupId, recorded: GroupMetadata) {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if groups.opened.remove(&raft_group_id.0) {
+            groups.recorded.insert(raft_group_id.0, recorded);
+        }
     }
 
     fn stopped(&self) -> CoreJournalError {
@@ -1835,6 +1870,32 @@ fn write_core_log_batch(
             CoreWriteOp::LogState { group_id, state } => {
                 metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= journal.metadata.set_log_state(*group_id, *state);
+                None
+            }
+            CoreWriteOp::Recovery { group_id, record } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.set_recovery(*group_id, *record);
+                requires_sync = true;
+                None
+            }
+            CoreWriteOp::DropPlan { group_id } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.set_recovery(*group_id, None);
+                metadata_changed |= journal
+                    .metadata
+                    .set_log_state(*group_id, GroupLogState::Recovering);
+                requires_sync = true;
+                None
+            }
+            CoreWriteOp::TakePlan { group_id, record } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.set_recovery(*group_id, Some(*record));
+                if journal.metadata.group(*group_id).log == GroupLogState::Recovering {
+                    metadata_changed |= journal
+                        .metadata
+                        .set_log_state(*group_id, GroupLogState::Initialized);
+                }
+                requires_sync = true;
                 None
             }
             CoreWriteOp::Record { record, first, log } => {

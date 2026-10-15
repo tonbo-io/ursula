@@ -38,6 +38,9 @@
 //!   the per-group log gauges the snapshot driver reads.
 //! - [`snapshot_references`]: prepared external-pointer pins and recoverable
 //!   current-reference publication outside RaftCore.
+//! - [`history`]: history identity on a group: the leader's fence while
+//!   the group's history is pending and its obligation to propose the
+//!   history event (genesis, recovery plans).
 //! - [`rejoin`]: the recovery gate of a replica that may be missing entries
 //!   it acknowledged, the leader-side heal driver, and the bootstrap probe.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
@@ -63,6 +66,7 @@ mod engine;
 mod format_epoch;
 mod forward;
 mod grpc;
+mod history;
 #[cfg(any(test, madsim))]
 mod in_process;
 mod log_store;
@@ -112,6 +116,7 @@ pub use grpc::RaftGrpcService;
 pub(crate) use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
+pub use history::GroupHistory;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRaftFaultAction;
 #[cfg(any(test, madsim))]
@@ -134,9 +139,11 @@ pub use in_process::InProcessRaftRegistry;
 pub use in_process::InProcessRaftRpcKind;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;
+pub use log_store::PlanCut;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftWal;
 pub use log_store::RaftWalError;
+pub use log_store::RecoveryRecord;
 pub use log_store::RecoveryState;
 pub use log_store::WalOpening;
 pub use log_store::generate_cluster_id;
@@ -163,18 +170,19 @@ pub use registry::SelfElectionError;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
 pub use registry::SnapshotInstallError;
-pub use rejoin::AcceptUnsyncedLossOutcome;
-pub use rejoin::AcceptUnsyncedLossReport;
 pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
 pub use rejoin::PeerGroupLog;
+pub use rejoin::PlanAnswer;
 pub use rejoin::RECOVERY_STALL_AFTER;
 pub use rejoin::RecoveryConfig;
 pub use rejoin::RecoveryGate;
 pub use rejoin::RecoveryGateError;
 pub use rejoin::RecoveryGateStatus;
 pub use rejoin::RecoveryTransport;
+pub use rejoin::ReplicaRestart;
 pub use rejoin::bootstrap_probe_vote;
+pub use rejoin::leads_live;
 pub use rejoin::run_group_bootstrap;
 pub use rejoin::run_rejoin_heal;
 pub use rejoin::run_rejoin_vote_barrier;

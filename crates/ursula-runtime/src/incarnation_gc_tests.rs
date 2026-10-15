@@ -146,16 +146,7 @@ async fn d4_recreate_with_gc_pending_keeps_new_incarnation_objects() {
     append(&runtime, &stream, b"new!").await;
     flush(&runtime, &stream, 4).await;
     // C7/F14g: the new incarnation's pages live under its own generation.
-    let generation = runtime
-        .head_stream(crate::HeadStreamRequest {
-            stream_id: stream.clone(),
-            now_ms: 0,
-            linearizable: false,
-            read_index: None,
-        })
-        .await
-        .expect("head")
-        .created_at_ms;
+    let generation = generation(&runtime, &stream).await;
     let new_chunks = page_chunks(&cold_store, &stream, generation).await;
     assert_eq!(new_chunks.len(), 1);
 
@@ -194,7 +185,7 @@ async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old
     flush(&runtime, &stream, 4).await;
     let new_generation = generation(&runtime, &stream).await;
     assert!(new_generation > old_generation);
-    // HEAD exposes the unique incarnation (C7).
+    // HEAD exposes the unique incarnation's token (C7, #581 section 4.2).
     let head = runtime
         .head_stream(HeadStreamRequest {
             stream_id: stream.clone(),
@@ -204,7 +195,20 @@ async fn incarnation_scoped_recreate_reads_its_own_pages_and_gc_reclaims_the_old
         })
         .await
         .expect("head stream");
-    assert_eq!(head.created_at_ms, new_generation);
+    let group = runtime.locate(&stream).raft_group_id;
+    let history = runtime
+        .snapshot_group(group)
+        .await
+        .expect("snapshot group")
+        .stream_snapshot
+        .history
+        .expect("the group's genesis applied")
+        .id
+        .get();
+    assert_eq!(
+        head.incarnation,
+        ursula_stream::incarnation_token(new_generation, history)
+    );
     let new_chunks = page_chunks(&cold_store, &stream, new_generation).await;
     assert_eq!(new_chunks.len(), 1);
     assert!(

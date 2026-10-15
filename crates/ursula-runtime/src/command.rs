@@ -53,6 +53,9 @@ impl From<crate::request::ImportGroupStateRequest> for StreamCommand {
     fn from(request: crate::request::ImportGroupStateRequest) -> Self {
         Self::ImportSnapshot {
             snapshot: request.snapshot,
+            history: request.history,
+            backup_digest: request.backup_digest,
+            now_ms: request.now_ms,
         }
     }
 }

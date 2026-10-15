@@ -8,7 +8,10 @@
 //! - [`lifecycle`]: bucket/stream create, close, delete, and TTL expiry.
 //! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
-//! - [`persist`]: snapshot / restore serialization.
+//! - [`persist`]: snapshot / restore serialization, and the import that
+//!   restores a backup as a history event.
+//! - [`history`]: history events (`NewHistory`), the token every response
+//!   renders, and what a stream inherited from the history before (W5).
 //! - [`producer_record`]: the producer record and the evaluation of a producer
 //!   write (#581 section 2.3).
 //! - [`producers`]: F3 producer bounds (idle expiry, the producer cap, the
@@ -39,6 +42,8 @@ use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
 use self::ttl::TtlIndex;
 use crate::command::StreamCommand;
+use crate::history::HistoryEvent;
+use crate::history::InheritedHistory;
 use crate::json_records::canonical_json_record_ends;
 use crate::json_records::is_json_record_content_type;
 use crate::json_records::record_ends_valid;
@@ -99,6 +104,7 @@ mod cold_state;
 mod external_locators;
 mod flush_planner;
 mod gauges;
+mod history;
 mod hot_buffer;
 
 pub use self::cold::RETENTION_COLD_GC_GRACE_MS;
@@ -166,6 +172,9 @@ pub struct StreamStateMachine {
     /// incarnations are unique per group even under a frozen or skewed
     /// clock.
     last_created_at_ms: u64,
+    /// The group's latest history event (#581 section 4.2); `None` until
+    /// its genesis applies, while the group serves nothing.
+    history: Option<HistoryEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +188,13 @@ struct StreamSlot {
     /// The highest epoch of any producer record the stream retired: its
     /// epoch floor (#581 section 2.3). `None` when it never retired one.
     retired_epoch_watermark: Option<u64>,
+    /// The group's history id when the stream was created or last changed
+    /// its bytes or closure (W5). While it differs from the group's, no
+    /// byte changed since the history event.
+    history: u64,
+    /// What the stream's current history began from: set by the first
+    /// write after a history event (W5).
+    inherited: Option<InheritedHistory>,
     /// Runtime append count for this incarnation (F9). Kept by the group
     /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
     /// the stream on every removal path (delete, TTL expiry, bucket purge).
@@ -350,8 +366,20 @@ impl StreamStateMachine {
     /// `max(now_ms, last_created_at_ms + 1)`, unique and strictly increasing
     /// per group. The create records it with [`Self::record_created_at_ms`]
     /// once the stream is inserted.
-    fn next_created_at_ms(&self, now_ms: u64) -> u64 {
-        now_ms.max(self.last_created_at_ms.saturating_add(1))
+    /// A `created_at_ms` at or above 2^52 is refused
+    /// ([`crate::MAX_CREATED_AT_MS`]), so a token never drops a bit of it.
+    fn next_created_at_ms(&self, now_ms: u64) -> Result<u64, StreamResponse> {
+        let created_at_ms = now_ms.max(self.last_created_at_ms.saturating_add(1));
+        if created_at_ms > crate::history::MAX_CREATED_AT_MS {
+            return Err(StreamResponse::error(
+                StreamErrorCode::CreatedAtOutOfRange,
+                format!(
+                    "stream creation time {created_at_ms} ms is at or above 2^52 ms; the \
+                     proposer's clock is far ahead"
+                ),
+            ));
+        }
+        Ok(created_at_ms)
     }
 
     fn record_created_at_ms(&mut self, created_at_ms: u64) {
@@ -377,17 +405,26 @@ impl StreamStateMachine {
         self.registry.refresh_ttl(stream_id);
     }
 
-    /// Applies one command of a request without a `Stream-Incarnation`
-    /// precondition, or a wrapped [`StreamCommand::IfIncarnation`].
+    /// Applies one command for a caller without a log (tests, benchmarks,
+    /// probes): the entry's index is 0. See [`Self::apply_entry`].
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
-        self.apply_checked(command, IncarnationCheck::Absent)
+        self.apply_entry(0, command)
     }
 
-    /// Applies one command. `check` says whether the request's
-    /// `Stream-Incarnation` precondition matched; the epoch floor binds
-    /// tokened producer writes.
+    /// Applies the command of the log entry at `index`: a command of a
+    /// request without a `Stream-Incarnation` precondition, or a wrapped
+    /// [`StreamCommand::IfIncarnation`]. A history event records `index`
+    /// (#581 section 4.3), as a command carries its `now_ms`.
+    pub fn apply_entry(&mut self, index: u64, command: StreamCommand) -> StreamResponse {
+        self.apply_checked(index, command, IncarnationCheck::Absent)
+    }
+
+    /// Applies one command of the log entry at `index`. `check` says
+    /// whether the request's `Stream-Incarnation` precondition matched; the
+    /// epoch floor binds tokened producer writes.
     pub fn apply_checked(
         &mut self,
+        index: u64,
         command: StreamCommand,
         check: IncarnationCheck,
     ) -> StreamResponse {
@@ -585,7 +622,15 @@ impl StreamStateMachine {
             StreamCommand::DeferColdGc { seq, not_before_ms } => {
                 self.defer_cold_gc(seq, not_before_ms)
             }
-            StreamCommand::ImportSnapshot { snapshot } => self.import_snapshot(*snapshot),
+            StreamCommand::ImportSnapshot {
+                snapshot,
+                history,
+                backup_digest,
+                now_ms,
+            } => self.import_snapshot(index, *snapshot, history, backup_digest, now_ms),
+            StreamCommand::NewHistory { history, now_ms } => {
+                self.new_history(index, history, now_ms)
+            }
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)
@@ -595,7 +640,7 @@ impl StreamStateMachine {
                 command,
             } => match self.incarnation_precondition(&command, incarnation) {
                 Some(refusal) => refusal,
-                None => self.apply_checked(*command, IncarnationCheck::Matched),
+                None => self.apply_checked(index, *command, IncarnationCheck::Matched),
             },
         }
     }
@@ -821,6 +866,8 @@ mod derived_boundaries_tests;
 mod derived_cold_tests;
 #[cfg(test)]
 mod external_locators_tests;
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod hygiene_tests;
 #[cfg(test)]

@@ -679,6 +679,7 @@ fn a_record_keeps_one_receipt_however_many_writes_applied() {
         },
         closed_epoch: None,
         opened: Opened::AboveFloor,
+        history: machine.history_id(),
         last_seen_ms: 1,
     }]]);
 }

@@ -12,6 +12,10 @@
 //! or purge is acknowledged and never returns to it. A replica whose log is
 //! empty but whose state is not knows it once held the group's log.
 //!
+//! It also holds a group's recovery plan ([`RecoveryRecord`]) while the
+//! replica waits for the history event that satisfies it (#581 section
+//! 4.5).
+//!
 //! The file also records the recovery epoch in which the journal was last
 //! read back in full (see `run_state`), so a journal that a crash interrupted
 //! before it was read is still read as a verified prefix.
@@ -20,6 +24,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -53,11 +58,43 @@ impl GroupLogState {
     }
 }
 
+/// A recovery plan this replica holds (#581 section 4.5): it votes only for
+/// `leader`, at a term above `leader_term`, and the plan is satisfied once
+/// the replica applied a history event at a log index above `point`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryRecord {
+    /// The node the plan elects.
+    pub leader: u64,
+    /// The plan's leader's last log index after the plan.
+    pub point: u64,
+    /// The plan term: the leader's vote term when it took the plan. Every
+    /// campaign the leader starts after taking it is above.
+    pub leader_term: u64,
+    /// Whether the plan cuts this replica's log, and how far it got.
+    pub cut: PlanCut,
+}
+
+/// The cut of a recovery plan on one replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanCut {
+    /// The plan keeps every entry.
+    NoCut,
+    /// The log keeps entries up to `keep`, the committed entry the replica
+    /// recorded. The cut runs while the group restarts, before its new Raft
+    /// core.
+    Pending { keep: LogIdOf<UrsulaRaftTypeConfig> },
+    /// The cut ran.
+    Done,
+}
+
 /// What a core's metadata file holds for one raft group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GroupMetadata {
     pub(crate) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
     pub(crate) log: GroupLogState,
+    /// The recovery plan the replica holds, until it is satisfied.
+    pub(crate) recovery: Option<RecoveryRecord>,
 }
 
 /// The metadata of one core journal and of every raft group on the core.
@@ -108,7 +145,6 @@ impl CoreMetadata {
         changed
     }
 
-    #[cfg(all(test, not(madsim)))]
     pub(crate) fn group(&self, group_id: u32) -> GroupMetadata {
         self.groups.get(&group_id).copied().unwrap_or_default()
     }
@@ -124,6 +160,15 @@ impl CoreMetadata {
         let group = self.groups.entry(group_id).or_default();
         let changed = group.vote != Some(vote);
         group.vote = Some(vote);
+        changed
+    }
+
+    /// Records `recovery` as `group_id`'s recovery plan, or removes it;
+    /// whether anything changed.
+    pub(crate) fn set_recovery(&mut self, group_id: u32, recovery: Option<RecoveryRecord>) -> bool {
+        let group = self.groups.entry(group_id).or_default();
+        let changed = group.recovery != recovery;
+        group.recovery = recovery;
         changed
     }
 
@@ -189,6 +234,7 @@ mod tests {
     use super::CoreMetadata;
     use super::GroupLogState;
     use super::GroupMetadata;
+    use super::RecoveryRecord;
     use super::core_metadata_path;
     use super::mark_core_recovering;
 
@@ -222,6 +268,7 @@ mod tests {
         assert_eq!(loaded.group(3), GroupMetadata {
             vote: Some(vote),
             log: GroupLogState::Empty,
+            recovery: None,
         });
         assert_eq!(loaded.group(7).log, GroupLogState::Initialized);
         assert_eq!(loaded.group(8).log, GroupLogState::Recovering);
@@ -265,5 +312,36 @@ mod tests {
         let loaded = CoreMetadata::load(&path).expect("load");
         assert_eq!(loaded.group(1).log, GroupLogState::Recovering);
         assert_eq!(loaded.group(2).log, GroupLogState::Empty);
+    }
+
+    /// Golden bytes: a recovery record in a core metadata file (#581 section
+    /// 4.5) is part of the epoch-4 format, so its encoding never changes.
+    #[test]
+    fn a_recovery_record_matches_the_golden_metadata_file() {
+        const GOLDEN: &str = "555253574d45544104000000ab00000082ae76657269666965645f65706f636800a667726f757073810383a4766f746582a96c65616465725f696482a47465726d07a76e6f64655f696402a9636f6d6d6974746564c3a36c6f67a5656d707479a87265636f7665727984a66c656164657202a5706f696e7413ab6c65616465725f7465726d06a363757481a770656e64696e6781a46b65657082a96c65616465725f696482a47465726d05a76e6f64655f696401a5696e64657811a61ddb17";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = core_metadata_path(dir.path());
+        let mut metadata = CoreMetadata::default();
+        metadata.set_vote(3, openraft::Vote::new_committed(7, 2));
+        let record = RecoveryRecord {
+            leader: 2,
+            point: 19,
+            leader_term: 6,
+            cut: super::PlanCut::Pending {
+                keep: openraft::LogId::new(openraft::vote::RaftLeaderId::new(5, 1), 17),
+            },
+        };
+        metadata.set_recovery(3, Some(record));
+        metadata.store(&path).expect("store");
+        let bytes = std::fs::read(&path).expect("read");
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, GOLDEN);
+        assert_eq!(
+            CoreMetadata::load(&path).expect("load").group(3).recovery,
+            Some(record)
+        );
     }
 }

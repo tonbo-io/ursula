@@ -808,6 +808,10 @@ mod tests {
             learner_ids: Vec::new(),
             maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
             log: Default::default(),
+            history: None,
+            recovery: None,
+            recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
+            leads_live: false,
         }
     }
 

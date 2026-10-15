@@ -87,19 +87,33 @@ impl InProcessRaftRegistry {
             .cloned()
     }
 
+    /// The barrier RPC's server side on `node_id`, through the node's
+    /// production registry: a leader whose history is pending confirms none.
     pub async fn confirm_recovery_barrier(
         &self,
         node_id: u64,
         group: ursula_shard::RaftGroupId,
     ) -> Result<(crate::UrsulaVote, u64), crate::QuorumProofError> {
-        let barrier = self
-            .barriers
-            .lock()
-            .expect("in-process barrier mutex")
-            .get(&node_id)
-            .cloned()
+        let (_, endpoint) = self
+            .endpoint(node_id)
             .ok_or(crate::QuorumProofError::NotRegistered { group })?;
-        crate::registry::confirm_recovery_barrier(group, barrier.owner(), barrier.as_ref()).await
+        endpoint.confirm_recovery_barrier(group).await
+    }
+
+    /// The `accept-unsynced-loss` admin route on `node_id`, through the
+    /// node's production registry: the replica takes the recovery plan.
+    pub async fn accept_recovery_plan(
+        &self,
+        node_id: u64,
+        plan: &ursula_proto::admin::RecoveryPlanRequest,
+        restart: &mut dyn crate::ReplicaRestart,
+    ) -> Result<ursula_proto::admin::RecoveryPlanReport, crate::RecoveryGateError> {
+        let (group, endpoint) =
+            self.endpoint(node_id)
+                .ok_or(crate::RecoveryGateError::NotRegistered {
+                    raft_group_id: ursula_shard::RaftGroupId(0),
+                })?;
+        endpoint.accept_recovery_plan(group, plan, restart).await
     }
 
     fn endpoint(

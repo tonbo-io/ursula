@@ -98,6 +98,16 @@ pub struct RaftGroupMetricsSnapshot {
     /// Log applied since this replica's last snapshot (F12e).
     #[serde(default)]
     pub log: crate::snapshot_cadence::GroupLogProgress,
+    /// The history event this replica applied last (#581 section 4.3);
+    /// `None` before the group's genesis.
+    pub history: Option<ursula_proto::admin::RaftGroupHistory>,
+    /// The recovery plan this replica holds until its history event
+    /// applies (#581 section 4.5).
+    pub recovery: Option<ursula_proto::admin::RaftGroupRecovery>,
+    /// The replica's recovery gate for this group.
+    pub recovery_gate: ursula_proto::admin::RecoveryGateStatus,
+    /// The replica leads with a quorum that acknowledged it lately.
+    pub leads_live: bool,
 }
 
 pub use ursula_proto::admin::RaftGroupMaintenanceState;

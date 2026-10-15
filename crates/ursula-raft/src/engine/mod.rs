@@ -138,10 +138,18 @@ pub struct RaftGroupEngineOptions {
     pub snapshot_build: Option<SnapshotBuildCoordinator>,
     pub snapshot_install: Option<SnapshotInstallCoordinator>,
     pub snapshot_metadata_path: Option<PathBuf>,
+    /// The replica's recovery gate. Its recovery plan fences the history
+    /// before the Raft core starts, so a plan's leader that restarts never
+    /// leads without it (N1, #581 review). The gate is bound later by
+    /// [`RaftGroupEngine::publish_recovery`].
+    pub recovery: Option<Arc<crate::GroupRejoin>>,
 }
 
 pub struct RaftGroupEngine {
     pub(crate) rejoin: std::sync::Mutex<Option<Arc<crate::GroupRejoin>>>,
+    /// The group's history on this replica, and the leader's fence while it
+    /// is pending (#581 sections 4.3 and 4.5).
+    pub(crate) history: Arc<crate::history::GroupHistory>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
     pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
     pub(crate) metadata_serial:
@@ -389,6 +397,7 @@ impl RaftGroupEngine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
+            recovery,
         } = options;
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
@@ -416,6 +425,13 @@ impl RaftGroupEngine {
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.
         let cold_index_cache = state_machine.engine.cold_index_cache();
+        let history = crate::history::GroupHistory::new(
+            placement.raft_group_id,
+            state_machine.engine.subscribe_history(),
+        );
+        if let Some(gate) = &recovery {
+            history.set_plan(gate.recovery_record());
+        }
         let metadata_serial = state_machine.metadata_serial.clone();
         let apply_health = state_machine.apply_health.clone();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
@@ -434,10 +450,18 @@ impl RaftGroupEngine {
                 .unwrap_or_else(|| GroupEngineError::new(format!("create OpenRaft group: {err}")))
         })?;
 
+        // Every replica runs the history driver: a leader proposes the
+        // event it owes, and every replica retires a satisfied plan.
+        let recovery_tasks = crate::rejoin::RecoveryGate::default();
+        recovery_tasks.push(crate::rt::spawn(crate::history::run_history_driver(
+            raft.clone(),
+            history.clone(),
+        )));
         Ok(Self {
             rejoin: Default::default(),
+            history,
             apply_health,
-            recovery_tasks: crate::rejoin::RecoveryGate::default(),
+            recovery_tasks,
             snapshot_installs: Arc::default(),
             metadata_serial,
             read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
@@ -481,6 +505,11 @@ impl RaftGroupEngine {
         self.raft.clone()
     }
 
+    /// The group's history on this replica (#581 section 4.3).
+    pub fn history(&self) -> &crate::GroupHistory {
+        &self.history
+    }
+
     /// Bind one recovery gate to this exact engine and publish its complete
     /// resources. Re-publication preserves that gate; another gate is refused.
     pub fn publish_recovery(
@@ -510,6 +539,7 @@ impl RaftGroupEngine {
             }
         } else {
             gate.bind(&self.raft_handle())?;
+            self.history.bind_rejoin(&gate);
             *binding = Some(gate);
         }
         drop(binding);
@@ -552,7 +582,7 @@ impl RaftGroupEngine {
     pub async fn sim_local_group_snapshot(
         &self,
     ) -> Result<ursula_runtime::GroupSnapshot, GroupEngineError> {
-        self.with_state_machine(move |state_machine| {
+        self.with_applied_state(move |state_machine| {
             Box::pin(async move {
                 state_machine
                     .group_snapshot()
@@ -598,6 +628,7 @@ impl RaftGroupEngine {
         // Refused before proposal: nothing was written.
         self.apply_health.check(self.placement.raft_group_id)?;
         crate::forward::validate_proposal(&command)?;
+        self.history.admit_proposal(&self.raft, &command).await?;
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             // Once submitted, a group that stops may already have committed
@@ -630,6 +661,24 @@ impl RaftGroupEngine {
     }
 
     pub(crate) async fn with_state_machine<V>(
+        &self,
+        f: impl FnOnce(&mut RaftGroupStateMachine) -> openraft::base::BoxFuture<V>
+        + OptionalSend
+        + 'static,
+    ) -> Result<V, GroupEngineError>
+    where
+        V: OptionalSend + 'static,
+    {
+        self.apply_health.check(self.placement.raft_group_id)?;
+        // A leader whose history is pending serves nothing (#581 section
+        // 4.5); this covers every engine read and the early answers.
+        self.history.admit(&self.raft).await?;
+        self.with_applied_state(f).await
+    }
+
+    /// The applied state, without the leader's history fence: replica
+    /// introspection only, never a client answer.
+    pub(crate) async fn with_applied_state<V>(
         &self,
         f: impl FnOnce(&mut RaftGroupStateMachine) -> openraft::base::BoxFuture<V>
         + OptionalSend
@@ -830,6 +879,10 @@ fn leader_read(
 impl GroupEngine for RaftGroupEngine {
     fn accepts_local_writes(&self) -> bool {
         self.raft.is_leader()
+    }
+
+    fn history_watch(&self) -> Option<ursula_runtime::HistoryWatch> {
+        Some(self.history.subscribe())
     }
 
     fn linearizable_read_barrier(&self) -> Option<Arc<dyn LinearizableReadBarrier>> {
@@ -1756,7 +1809,8 @@ impl GroupEngine for RaftGroupEngine {
                 Err(error) => return vec![Err(error); count],
             };
             let responses =
-                crate::forward::write_commands_on_raft(self.raft.clone(), commands).await;
+                crate::forward::write_commands_on_raft(self.raft.clone(), &self.history, commands)
+                    .await;
             let mut responses = match responses {
                 Ok(responses) => responses.into_iter(),
                 Err(error) => {

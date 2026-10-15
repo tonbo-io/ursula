@@ -6057,13 +6057,14 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     engine.shutdown().await.unwrap();
 }
 
-/// `accept-unsynced-loss` is an incarnation-bound admin mutation: it opens
-/// the recovery gate of this node's replica once the gate reports its group
-/// stalled, and only for the log the operator saw in the metrics. It
-/// reports the replica's log and clears the readiness reason the closed gate
-/// gave.
+/// `accept-unsynced-loss` is an incarnation-bound admin mutation that takes
+/// a recovery plan (#581 section 4.5), only for the log the tool saw in the
+/// metrics. A plan electing this replica opens its gate, records the plan
+/// durably, reports it in the metrics, and clears the readiness reason the
+/// closed gate gave.
 #[tokio::test]
-async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
+async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
+    use openraft::entry::RaftEntry;
     use openraft::storage::RaftLogReader;
     use openraft::storage::RaftLogStorage;
 
@@ -6098,6 +6099,38 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
                 .await
                 .expect("open the gate"),
         );
+        // The log kept the group's membership: a plan elects one of its
+        // voters. The gate is closed, so the entry records it recovering.
+        let (flushed, appended) =
+            <ursula_raft::UrsulaRaftTypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
+        store
+            .append(
+                [
+                    openraft::alias::EntryOf::<ursula_raft::UrsulaRaftTypeConfig>::new(
+                        openraft::LogId::new(openraft::vote::RaftLeaderId::new(0, 0), 0),
+                        openraft::EntryPayload::Membership(
+                            openraft::Membership::new(
+                                // Three voters, so that a plan may cut; only
+                                // this one runs.
+                                vec![std::collections::BTreeSet::from([1, 2, 3])],
+                                BTreeMap::from([
+                                    (1, openraft::BasicNode::new("local")),
+                                    (2, openraft::BasicNode::new("absent")),
+                                    (3, openraft::BasicNode::new("absent")),
+                                ]),
+                            )
+                            .expect("membership"),
+                        ),
+                    ),
+                ],
+                openraft::storage::IOFlushed::signal(flushed),
+            )
+            .await
+            .expect("submit the membership entry");
+        appended
+            .await
+            .expect("flush callback")
+            .expect("append the membership entry");
         let engine = ursula_raft::RaftGroupEngine::new_node(
             placement,
             1,
@@ -6158,12 +6191,24 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
             serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
                 .expect("metrics JSON");
         let group = &metrics["raft_groups"][0];
-        let seen = ursula_proto::admin::AcceptUnsyncedLossRequest {
-            expected_last_log_index: group["last_log_index"].as_u64(),
-            expected_current_term: group["current_term"].as_u64().expect("current term"),
+        let seen = ursula_proto::admin::ReplicaLogView {
+            last_log_index: group["last_log_index"].as_u64(),
+            last_log_term: group["last_log_term"].as_u64(),
+            current_term: group["current_term"].as_u64().expect("current term"),
         };
-        let accept = |expected: ursula_proto::admin::AcceptUnsyncedLossRequest| {
-            Body::from(serde_json::to_vec(&expected).expect("request JSON"))
+        let plan = |expected: ursula_proto::admin::ReplicaLogView| {
+            ursula_proto::admin::RecoveryPlanRequest {
+                leader: 1,
+                point: expected.last_log_index.unwrap_or(0),
+                cut: false,
+                step: ursula_proto::admin::PlanStep::Lead {
+                    highest_term: expected.current_term,
+                },
+                expected,
+            }
+        };
+        let accept = |expected: ursula_proto::admin::ReplicaLogView| {
+            Body::from(serde_json::to_vec(&plan(expected)).expect("request JSON"))
         };
 
         let unbound = admin
@@ -6181,6 +6226,15 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         assert_eq!(unbound.status(), StatusCode::PRECONDITION_REQUIRED);
         let unnamed = http_post(&admin, path, json_body, Body::from("{}")).await;
         assert_eq!(unnamed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // A 0.7 body is no plan.
+        let old = http_post(
+            &admin,
+            path,
+            json_body,
+            Body::from(r#"{"expected_last_log_index": null, "expected_current_term": 0}"#),
+        )
+        .await;
+        assert_eq!(old.status(), StatusCode::UNPROCESSABLE_ENTITY);
         // The gate awaits a barrier: it may still open without losing anything.
         let awaiting = http_post(&admin, path, json_body, accept(seen)).await;
         assert_eq!(awaiting.status(), StatusCode::CONFLICT);
@@ -6208,7 +6262,6 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         if !retained_vote {
             let rejected = http_post(&admin, path, json_body, accept(seen)).await;
             assert_eq!(rejected.status(), StatusCode::CONFLICT);
-            assert_eq!(gate.status(), ursula_raft::RecoveryGateStatus::Stalled);
             assert!(!gate.vote_gate_open());
             assert_eq!(store.read_vote().await.expect("unchanged lost vote"), None);
             assert!(!registry.recovery_barriers_ready());
@@ -6222,9 +6275,9 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
             engine.shutdown().await.expect("stop unknown-history group");
             continue;
         }
-        let other_log = ursula_proto::admin::AcceptUnsyncedLossRequest {
-            expected_last_log_index: Some(
-                seen.expected_last_log_index
+        let other_log = ursula_proto::admin::ReplicaLogView {
+            last_log_index: Some(
+                seen.last_log_index
                     .map_or(0, |index| index.saturating_add(1)),
             ),
             ..seen
@@ -6233,10 +6286,166 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         assert_eq!(changed.status(), StatusCode::CONFLICT);
         assert!(!gate.vote_gate_open(), "a refused request opened the gate");
 
-        for expected in [
-            ursula_raft::AcceptUnsyncedLossOutcome::GateOpened,
-            ursula_raft::AcceptUnsyncedLossOutcome::AlreadyOpen,
-        ] {
+        // A refusal after the gate changed, here a cutting plan on a replica
+        // that knows no committed entry, puts the gate, the elections and
+        // the leader's fence back as they were.
+        let before = gate.status();
+        let cutting = ursula_proto::admin::RecoveryPlanRequest {
+            point: 0,
+            cut: true,
+            ..plan(seen)
+        };
+        let refused = http_post(
+            &admin,
+            path,
+            json_body,
+            Body::from(serde_json::to_vec(&cutting).expect("request JSON")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        // m3 (#581 review): the refusal is typed.
+        let refused: ursula_proto::admin::RecoveryPlanRefused =
+            serde_json::from_slice(&body_bytes(refused).await).expect("typed refusal");
+        assert_eq!(
+            refused.refusal,
+            ursula_proto::admin::RecoveryPlanRefusal::NothingCommitted
+        );
+        assert_eq!((refused.raft_group_id, refused.node_id), (0, 1));
+        assert_eq!(gate.status(), before);
+        assert_eq!(engine.history().plan(), None);
+
+        // m1 (#581 review): a request whose client goes away mid-plan does
+        // not cancel it. The job runs to its end in a task of its own: here
+        // it takes the plan, durably and in memory alike.
+        /// A plan without a cut restarts nothing.
+        struct NoRestart;
+        impl ursula_raft::ReplicaRestart for NoRestart {
+            fn restart_replica(
+                &mut self,
+                raft_group_id: RaftGroupId,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Option<Arc<ursula_raft::GroupRejoin>>, ursula_runtime::RuntimeError>,
+            > {
+                panic!("a plan without a cut restarted group {raft_group_id:?}")
+            }
+        }
+        let pause = gate.pause_plans_after_the_fence();
+        {
+            let mut no_restart = NoRestart;
+            let taking = plan(seen);
+            let mut call = std::pin::pin!(registry.accept_recovery_plan(
+                RaftGroupId(0),
+                &taking,
+                &mut no_restart
+            ));
+            // Poll the caller until the job set the leader's fence and
+            // waits, then drop the caller.
+            while engine.history().plan().is_none() {
+                assert!(
+                    futures_util::poll!(call.as_mut()).is_pending(),
+                    "the plan answered before its caller went away"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+        pause.add_permits(1 << 20);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let metrics: ursula_proto::admin::NodeMetrics = serde_json::from_slice(
+                &body_bytes(http_get(&admin, "/__ursula/metrics").await).await,
+            )
+            .expect("metrics JSON");
+            // The record on disk, and the leader's fence in memory.
+            if let Some(recovery) = metrics.groups[0].recovery
+                && engine
+                    .history()
+                    .plan()
+                    .is_some_and(|plan| plan.leader_term == recovery.leader_term)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a dropped caller cancelled the plan: {:?}",
+                gate.status()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Item 6 of the #612 review: a `follow` whose plan term is below
+        // the vote term the tool read on the replica did not come from the
+        // plan's leader, and is refused, typed.
+        let low_term = ursula_proto::admin::RecoveryPlanRequest {
+            leader: 2,
+            step: ursula_proto::admin::PlanStep::Follow {
+                leader_term: seen.current_term.saturating_add(4),
+            },
+            expected: ursula_proto::admin::ReplicaLogView {
+                current_term: seen.current_term.saturating_add(5),
+                ..seen
+            },
+            ..plan(seen)
+        };
+        let refused = http_post(
+            &admin,
+            path,
+            json_body,
+            Body::from(serde_json::to_vec(&low_term).expect("request JSON")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let refused: ursula_proto::admin::RecoveryPlanRefused =
+            serde_json::from_slice(&body_bytes(refused).await).expect("typed refusal");
+        assert_eq!(
+            refused.refusal,
+            ursula_proto::admin::RecoveryPlanRefusal::PlanTermBelowVote
+        );
+
+        // m4 (#581 review): one accept job at a time. A second accept while
+        // the first one runs is refused, typed, and changes nothing; the
+        // first one then takes its plan.
+        {
+            let pause = gate.pause_plans_after_the_fence();
+            let taking = plan(seen);
+            let mut first_restart = NoRestart;
+            let mut first = std::pin::pin!(registry.accept_recovery_plan(
+                RaftGroupId(0),
+                &taking,
+                &mut first_restart
+            ));
+            while !gate.plan_job_running() {
+                assert!(futures_util::poll!(first.as_mut()).is_pending());
+                tokio::task::yield_now().await;
+            }
+            let mut second_restart = NoRestart;
+            let second = registry
+                .accept_recovery_plan(RaftGroupId(0), &taking, &mut second_restart)
+                .await
+                .expect_err("a second accept while one runs");
+            assert!(
+                matches!(second, ursula_raft::RecoveryGateError::PlanInFlight { .. }),
+                "{second:?}"
+            );
+            assert_eq!(
+                second.refusal(),
+                Some(ursula_proto::admin::RecoveryPlanRefusal::PlanInFlight)
+            );
+            pause.add_permits(1 << 20);
+            let report = first.await.expect("the first accept takes its plan");
+            assert_eq!(
+                report.outcome,
+                ursula_proto::admin::RecoveryPlanOutcome::Leads
+            );
+            assert!(!gate.plan_job_running());
+        }
+
+        // The plan elects this replica: its gate campaigns but votes for no
+        // one else, and it answers its plan term: the highest vote term the
+        // tool read, or its own when higher (M1, #581 review). Nothing votes
+        // for it (M2), so a repeat of the plan is taken at the same term.
+        let mut terms = Vec::new();
+        for _ in 0..2 {
             let response = http_post(&admin, path, json_body, accept(seen)).await;
             let status = response.status();
             let response_body = body_bytes(response).await;
@@ -6246,23 +6455,43 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
                 "{}",
                 String::from_utf8_lossy(&response_body)
             );
-            let report: ursula_raft::AcceptUnsyncedLossReport =
+            let report: ursula_proto::admin::RecoveryPlanReport =
                 serde_json::from_slice(&response_body).expect("typed report");
             assert_eq!(report.raft_group_id, 0);
             assert_eq!(report.node_id, 1);
-            assert_eq!(report.outcome, expected);
-            assert_eq!(report.last_log_index, seen.expected_last_log_index);
-            assert_eq!(report.current_term, seen.expected_current_term);
+            assert_eq!(
+                report.outcome,
+                ursula_proto::admin::RecoveryPlanOutcome::Leads
+            );
+            assert_eq!(report.leader, 1);
+            terms.push(report.leader_term);
         }
-        assert!(gate.vote_gate_open());
-        barrier
-            .await
-            .expect("the barrier driver ends once the gate opens");
-        assert!(registry.recovery_barriers_ready());
-        let ready = http_get(&client, READINESS_PATH).await;
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
-        assert_eq!(body["recovery_barriers_ready"], json!(true));
-        assert_eq!(body["recovery_stalled_groups"], json!([]));
+        assert_eq!(terms, [seen.current_term; 2]);
+        // It campaigns; with no election here (ticks are off) it soon
+        // reports the plan stalled, as a wedged plan does.
+        assert!(matches!(
+            gate.status(),
+            ursula_raft::RecoveryGateStatus::LeadsPlan | ursula_raft::RecoveryGateStatus::Stalled
+        ));
+        assert!(!gate.vote_gate_open());
+        barrier.abort();
+        let metrics: ursula_proto::admin::NodeMetrics =
+            serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
+                .expect("metrics JSON");
+        assert_eq!(
+            metrics.groups[0].recovery,
+            Some(ursula_proto::admin::RaftGroupRecovery {
+                leader: 1,
+                point: seen.last_log_index.unwrap_or(0),
+                leader_term: terms[1],
+                cut_pending: false,
+            })
+        );
+        assert!(matches!(
+            metrics.groups[0].recovery_gate,
+            ursula_proto::admin::RecoveryGateStatus::LeadsPlan
+                | ursula_proto::admin::RecoveryGateStatus::Stalled
+        ));
 
         let missing = http_post(
             &admin,
@@ -6521,6 +6750,10 @@ fn raft_metrics_snapshot(
         learner_ids: vec![],
         maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
         log: Default::default(),
+        history: None,
+        recovery: None,
+        recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
+        leads_live: false,
     }
 }
 
@@ -9758,10 +9991,14 @@ async fn backup_import_refuses_groups_without_this_format_epoch() {
         (without_epoch, "has no format_epoch"),
         (other_epoch, "unsupported format_epoch"),
     ] {
+        let digest = blake3::hash(&body).to_hex().to_string();
         let response = http_post(
             &app,
             "/__ursula/backup/group/0/import",
-            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
             Body::from(body),
         )
         .await;
@@ -9956,14 +10193,21 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     let restored = test_router();
 
     for (group, body) in exports.iter().enumerate() {
+        let digest = blake3::hash(body).to_hex().to_string();
         let response = http_post(
             &restored,
             &format!("/__ursula/backup/group/{group}/import"),
-            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
             Body::from(body.clone()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK, "import group {group}");
+        let imported: ursula_proto::admin::BackupImportResponse =
+            serde_json::from_slice(&body_bytes(response).await).expect("typed import answer");
+        assert!(!imported.already, "group {group}");
     }
 
     // Retention floor survived: reads below offset 18 are GONE, the app
@@ -10028,7 +10272,9 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
             .contains("\"id\":4")
     );
 
-    // Re-importing into a group that now owns a bucket fails closed.
+    // The import is keyed by the backup's digest: repeating it answers
+    // `already`, and another backup into a group that now owns a bucket
+    // fails closed.
     let mut conflicted = false;
     for (group, body) in exports.iter().enumerate() {
         let snapshot: ursula_runtime::StreamSnapshot =
@@ -10036,11 +10282,34 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
         if snapshot.buckets.is_empty() {
             continue;
         }
+        let digest = blake3::hash(body).to_hex().to_string();
         let response = http_post(
             &restored,
             &format!("/__ursula/backup/group/{group}/import"),
-            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
             Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "group {group}");
+        let repeat: ursula_proto::admin::BackupImportResponse =
+            serde_json::from_slice(&body_bytes(response).await).expect("typed import answer");
+        assert!(repeat.already, "group {group}");
+
+        let mut other = snapshot.clone();
+        other.buckets.push("tenant-z".to_owned());
+        let other = rmp_serde::to_vec_named(&other).expect("encode another backup");
+        let digest = blake3::hash(&other).to_hex().to_string();
+        let response = http_post(
+            &restored,
+            &format!("/__ursula/backup/group/{group}/import"),
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
+            Body::from(other),
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT, "group {group}");

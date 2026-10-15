@@ -633,6 +633,36 @@ pub enum SimEvent {
         tidied: bool,
         leader_kills: u64,
     },
+    /// `rewind_applies_exactly_once` held: a restore started one history,
+    /// which `answers` import answers named, across `leader_kills` kills.
+    HistoryRewindVerified {
+        stream: BucketStreamId,
+        answers: u64,
+        leader_kills: u64,
+    },
+    /// `stale_writers_never_apply_after_restore` held: `refused` writes of
+    /// the source's history were refused; `boundary_claims` claims of a
+    /// producer whose record did not survive applied, as documented.
+    StaleWritersVerified {
+        stream: BucketStreamId,
+        refused: u64,
+        boundary_claims: u64,
+        leader_kills: u64,
+    },
+    /// `accepted_loss_never_applies_a_stale_entry` held: after a quorum
+    /// loss, a recovery plan elected `leader`, cutting every log when `cut`;
+    /// no replica applied the `stale_writes` writes the cut-off leader held
+    /// uncommitted, and every replica applied the plan's history event
+    /// across `restarts` member restarts. `uncut_leader` when the plan's
+    /// leader still held the stale suffix after the plan was sent: the
+    /// members' log guard, not the cut, kept it from winning.
+    RecoveryPlanVerified {
+        leader: u64,
+        cut: bool,
+        stale_writes: u64,
+        restarts: u64,
+        uncut_leader: bool,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

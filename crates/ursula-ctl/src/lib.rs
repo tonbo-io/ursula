@@ -17,6 +17,7 @@
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait).
 //! - [`provider`]: cluster manifest loading and node addressing.
 //! - [`quorum`]: fresh fixed-prefix verification with explicit configured inventory.
+//! - [`recovery`]: recovery plans for a group stalled after an accepted loss.
 //! - [`startup`]: pre-transport Kubernetes startup binding through the shared CAS.
 //! - [`reservation`]: pure shared maintenance ownership and ConfigMap CAS proposals.
 
@@ -27,6 +28,7 @@ pub mod observe;
 pub mod plan;
 pub mod provider;
 pub mod quorum;
+pub mod recovery;
 pub mod reservation;
 pub mod startup;
 

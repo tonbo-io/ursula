@@ -133,7 +133,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         values[1] = "another-namespace"
 
         result = subprocess.run(
-            ["helm", "template", "test", "charts/ursula", *values],
+            ["helm", "template", "test", "charts/ursula", *NAMED, *values],
             check=False,
             capture_output=True,
             text=True,
@@ -151,7 +151,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         values[role_index] = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/wrong"
 
         result = subprocess.run(
-            ["helm", "template", "test", "charts/ursula", *values],
+            ["helm", "template", "test", "charts/ursula", *NAMED, *values],
             check=False,
             capture_output=True,
             text=True,
@@ -348,7 +348,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
                         "serviceAccount.create=false,serviceAccount.name=default",
                         "server.extraEnv[0].name=URSULA_STARTUP_RESERVATION,server.extraEnv[0].value=false"):
             with self.subTest(invalid=invalid):
-                result = subprocess.run(["helm", "template", "test", "charts/ursula", *values, "--set", invalid], text=True, capture_output=True)
+                result = subprocess.run(["helm", "template", "test", "charts/ursula", *NAMED, *values, "--set", invalid], text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
 
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
@@ -401,7 +401,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
         # The gateway refuses 0, so the chart does too.
         result = subprocess.run(
-            ["helm", "template", "test", "charts/ursula", "--set", "s3.bucket=bkt",
+            ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
              "--set", "gateway.upstreamTcpUserTimeoutSeconds=0"],
             text=True,
             capture_output=True,
