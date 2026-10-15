@@ -447,21 +447,19 @@ impl CacheDir {
     fn new(path: &Path) -> Self {
         let absolute = std::path::absolute(path).unwrap_or_else(|_no_cwd| path.to_owned());
         let mut resolved = PathBuf::new();
-        let mut exists = true;
         for part in absolute.components() {
             match part {
                 Component::CurDir => {}
-                // `resolved` has no symlink left in it: its parent is the one `..` reaches.
+                // Every existing prefix of `resolved` is resolved: the parent `..` reaches is the
+                // one the file system reaches, and a missing one is lexical.
                 Component::ParentDir => {
                     resolved.pop();
                 }
                 other => {
                     resolved.push(other);
-                    if exists {
-                        match std::fs::canonicalize(&resolved) {
-                            Ok(real) => resolved = real,
-                            Err(_missing) => exists = false,
-                        }
+                    // Missing, it stays as spelled; `..` may lead back to existing ones.
+                    if let Ok(real) = std::fs::canonicalize(&resolved) {
+                        resolved = real;
                     }
                 }
             }
@@ -785,6 +783,8 @@ mod tests {
             form(&dir.join("missing").join("x").join("..").join("y")),
             dir.join("missing").join("y")
         );
+        // A missing component, `..` back to existing ones, then a symlink: resolved.
+        assert_eq!(form(&dir.join("nope").join("..").join("link")), root);
         // Relative to the working directory.
         let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(

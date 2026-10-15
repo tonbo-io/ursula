@@ -4424,9 +4424,11 @@ fn a_hand_out_given_back_by_a_failed_open_waits_again() {
     let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
     let connected = bound.handle.connect(Holder::Host).unwrap();
     // A tick while it is live ends the hand-out's wait.
-    w.run_for(1_000);
-    assert_eq!(bound.handle.unconnect(connected), Undone::WaitsAgain);
     let now = w.now;
+    let ios = w.c(c).tick(now);
+    w.queue_ios(c, ios);
+    assert_eq!(bound.handle.unconnect(connected), Undone::WaitsAgain);
+    // What `Binding::unconnect` tells the driver.
     w.c(c).unconnected(bound.binding, now);
     w.run_for(UNCONNECTED_MS / 2);
     assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
