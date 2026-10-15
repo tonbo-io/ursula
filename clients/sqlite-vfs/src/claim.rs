@@ -1,7 +1,6 @@
 //! Claiming a stream for an owner (a new producer epoch that fences every earlier one) and
 //! taking it back after the server expired the producer.
 
-use std::fs::{self};
 use std::sync::atomic::Ordering;
 
 use crate::client::Append;
@@ -17,19 +16,7 @@ use crate::error::Fence;
 use crate::frame;
 use crate::frame::Decoded;
 use crate::frame::Record;
-
-pub(crate) fn nonce() -> Result<[u8; 16], Error> {
-    const URANDOM: &str = "/dev/urandom";
-    let mut n = [0u8; 16];
-    fs::File::open(URANDOM)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut n))
-        .map_err(|source| Error::Io {
-            op: "read",
-            path: URANDOM.to_owned(),
-            source,
-        })?;
-    Ok(n)
-}
+use crate::ids;
 
 pub(crate) enum Claimed {
     /// Our claim ends at `next`: this owner alone writes at `epoch` from here on. `first`: it is
@@ -60,7 +47,11 @@ pub(crate) fn claim_once(
     epoch: u64,
     from: &str,
 ) -> Result<Claimed, Error> {
-    let nonce = nonce()?;
+    let nonce = ids::random16().map_err(|source| Error::Io {
+        op: "read",
+        path: ids::URANDOM.to_owned(),
+        source,
+    })?;
     let frame = frame::encode_claim(epoch, &nonce).map_err(Error::EncodeFrame)?;
     let next = match append(url, incarnation, producer, &frame, epoch, 0) {
         Append::Acked {

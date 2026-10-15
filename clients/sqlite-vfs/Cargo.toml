@@ -18,6 +18,11 @@ zstd = { version = "0.13", default-features = false }
 crc32c = "0.6"
 libc = "0.2"
 thiserror = "1"
+blake3 = "1"
+ursula-headers = { path = "../../crates/ursula-headers" }
+
+[dev-dependencies]
+proptest = "1.11"
 
 [lints]
 workspace = true
