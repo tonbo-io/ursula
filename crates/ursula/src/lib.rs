@@ -2726,8 +2726,9 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
 /// the point refuses with `409 Conflict` and changes nothing; a 0.7 body is
 /// refused with `422`. A plan that cuts the logs restarts the group's
 /// replica to run the cut before it answers. The operator computes the plan
-/// and sends it to every reachable member, the leader last (operations
-/// docs, "Recovering after a host crash").
+/// and sends it to the plan's leader first, then to every other reachable
+/// member with the leader's plan term (operations docs, "Recovering after a
+/// host crash").
 pub(crate) async fn accept_unsynced_loss(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
@@ -2744,45 +2745,42 @@ pub(crate) async fn accept_unsynced_loss(
         )
             .into_response();
     };
+    // The admin fence runs this handler in a task of its own, so a client
+    // that goes away cancels neither the plan nor the group's restart, and
+    // the registry runs the plan's job in its own task too (m1, #581
+    // review).
     let mut restart = RuntimeReplicaRestart {
         runtime: state.runtime.clone(),
         registry: registry.clone(),
     };
-    match registry
+    let accepted = registry
         .accept_recovery_plan(raft_group_id, &plan, &mut restart)
-        .await
-    {
+        .await;
+    match accepted {
         Ok(report) => (StatusCode::OK, axum::Json(report)).into_response(),
         Err(err @ ursula_raft::RecoveryGateError::NotRegistered { .. }) => {
             (StatusCode::NOT_FOUND, err.to_string()).into_response()
         }
-        Err(
-            err @ (ursula_raft::RecoveryGateError::StoreClosed { .. }
-            | ursula_raft::RecoveryGateError::FollowsLeader { .. }
-            | ursula_raft::RecoveryGateError::LeadsLive { .. }
-            | ursula_raft::RecoveryGateError::StepMismatch { .. }
-            | ursula_raft::RecoveryGateError::SelfVoteRefused { .. }
-            | ursula_raft::RecoveryGateError::CutRefused { .. }
-            | ursula_raft::RecoveryGateError::NotStalled { .. }
-            | ursula_raft::RecoveryGateError::RecoveryPointBehind { .. }
-            | ursula_raft::RecoveryGateError::NothingCommitted { .. }
-            | ursula_raft::RecoveryGateError::CommittedEntryMissing { .. }
-            | ursula_raft::RecoveryGateError::LeaderNotVoter { .. }
-            | ursula_raft::RecoveryGateError::PointMismatch { .. }
-            | ursula_raft::RecoveryGateError::MissingVoteFloor { .. }
-            | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
-        ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
+        // m3 (#581 review): a refusal answers its typed reason.
+        Err(err) if let Some(refusal) = err.refusal() => (
+            StatusCode::CONFLICT,
+            axum::Json(ursula_proto::admin::RecoveryPlanRefused {
+                raft_group_id: u64::from(raft_group_id.0),
+                node_id: registry
+                    .rejoin(raft_group_id)
+                    .map_or(0, |rejoin| rejoin.node_id()),
+                refusal,
+                message: err.to_string(),
+            }),
+        )
+            .into_response(),
         Err(
             err @ (ursula_raft::RecoveryGateError::Record { .. }
             | ursula_raft::RecoveryGateError::Cut { .. }
             | ursula_raft::RecoveryGateError::Restart { .. }
-            | ursula_raft::RecoveryGateError::Core { .. }
             | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
         ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-        Err(
-            err @ (ursula_raft::RecoveryGateError::OwnerStopped { .. }
-            | ursula_raft::RecoveryGateError::NotStarted { .. }),
-        ) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
+        Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
     }
 }
 
@@ -2803,7 +2801,7 @@ impl ursula_raft::ReplicaRestart for RuntimeReplicaRestart {
     > {
         Box::pin(async move {
             self.runtime.restart_group_engine(raft_group_id).await?;
-            Ok(self.registry.recovery_gate(raft_group_id))
+            Ok(self.registry.rejoin(raft_group_id))
         })
     }
 }

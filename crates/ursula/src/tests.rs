@@ -6185,7 +6185,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
                 .expect("metrics JSON");
         let group = &metrics["raft_groups"][0];
-        let mut seen = ursula_proto::admin::ReplicaLogView {
+        let seen = ursula_proto::admin::ReplicaLogView {
             last_log_index: group["last_log_index"].as_u64(),
             last_log_term: group["last_log_term"].as_u64(),
             current_term: group["current_term"].as_u64().expect("current term"),
@@ -6195,7 +6195,9 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 leader: 1,
                 point: expected.last_log_index.unwrap_or(0),
                 cut: false,
-                step: ursula_proto::admin::PlanStep::Lead,
+                step: ursula_proto::admin::PlanStep::Lead {
+                    highest_term: expected.current_term,
+                },
                 expected,
             }
         };
@@ -6295,12 +6297,80 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         )
         .await;
         assert_eq!(refused.status(), StatusCode::CONFLICT);
+        // m3 (#581 review): the refusal is typed.
+        let refused: ursula_proto::admin::RecoveryPlanRefused =
+            serde_json::from_slice(&body_bytes(refused).await).expect("typed refusal");
+        assert_eq!(
+            refused.refusal,
+            ursula_proto::admin::RecoveryPlanRefusal::NothingCommitted
+        );
+        assert_eq!((refused.raft_group_id, refused.node_id), (0, 1));
         assert_eq!(gate.status(), before);
         assert_eq!(engine.history().plan(), None);
 
+        // m1 (#581 review): a request whose client goes away mid-plan does
+        // not cancel it. The job runs to its end in a task of its own: here
+        // it takes the plan, durably and in memory alike.
+        let pause = gate.pause_plans_after_the_fence();
+        {
+            /// A plan without a cut restarts nothing.
+            struct NoRestart;
+            impl ursula_raft::ReplicaRestart for NoRestart {
+                fn restart_replica(
+                    &mut self,
+                    raft_group_id: RaftGroupId,
+                ) -> futures_util::future::BoxFuture<
+                    '_,
+                    Result<Option<Arc<ursula_raft::GroupRejoin>>, ursula_runtime::RuntimeError>,
+                > {
+                    panic!("a plan without a cut restarted group {raft_group_id:?}")
+                }
+            }
+            let mut no_restart = NoRestart;
+            let taking = plan(seen);
+            let mut call = std::pin::pin!(registry.accept_recovery_plan(
+                RaftGroupId(0),
+                &taking,
+                &mut no_restart
+            ));
+            // Poll the caller until the job set the leader's fence and
+            // waits, then drop the caller.
+            while engine.history().plan().is_none() {
+                assert!(
+                    futures_util::poll!(call.as_mut()).is_pending(),
+                    "the plan answered before its caller went away"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+        pause.add_permits(1 << 20);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let metrics: ursula_proto::admin::NodeMetrics = serde_json::from_slice(
+                &body_bytes(http_get(&admin, "/__ursula/metrics").await).await,
+            )
+            .expect("metrics JSON");
+            // The record on disk, and the leader's fence in memory.
+            if let Some(recovery) = metrics.groups[0].recovery
+                && engine
+                    .history()
+                    .plan()
+                    .is_some_and(|plan| plan.leader_term == recovery.leader_term)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a dropped caller cancelled the plan: {:?}",
+                gate.status()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         // The plan elects this replica: its gate campaigns but votes for no
-        // one else, and it answers its plan term. A repeat of the plan is
-        // taken again, at a later plan term.
+        // one else, and it answers its plan term: the highest vote term the
+        // tool read, or its own when higher (M1, #581 review). Nothing votes
+        // for it (M2), so a repeat of the plan is taken at the same term.
         let mut terms = Vec::new();
         for _ in 0..2 {
             let response = http_post(&admin, path, json_body, accept(seen)).await;
@@ -6322,11 +6392,8 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             );
             assert_eq!(report.leader, 1);
             terms.push(report.leader_term);
-            // The leader voted for itself at the plan term: a repeat names
-            // the log as the metrics now show it.
-            seen.current_term = report.leader_term;
         }
-        assert!(terms[1] > terms[0], "{terms:?}");
+        assert_eq!(terms, [seen.current_term; 2]);
         // It campaigns; with no election here (ticks are off) it soon
         // reports the plan stalled, as a wedged plan does.
         assert!(matches!(

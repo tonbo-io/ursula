@@ -198,12 +198,11 @@ impl ActiveGroup {
         let Some(rejoin) = &self.recovery else {
             return Ok(None);
         };
-        if rejoin.cutting() {
-            return Err(GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::RecoveryCutting {
-                    raft_group_id: group,
-                },
-            ));
+        // A replica restarting for a plan takes no replication, and one
+        // holding a plan none from a leader elected before it (M1, #581
+        // review).
+        if let Some(refusal) = rejoin.replication_refusal(&vote) {
+            return Err(GroupEngineError::Infra(refusal));
         }
         let floor = rejoin.recovery_vote().ok_or(GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::RecoveryVoteFloor {
@@ -635,20 +634,32 @@ impl RaftGroupHandleRegistry {
         let plan = *plan;
         let job = rejoin.clone();
         let history = entry.history.clone();
-        let taken = owner
-            .call(move |raft| async move {
-                let core = crate::rejoin::RaftPlanCore {
-                    raft: &raft,
+        // m1 (#581 review): the job, with its rollback, runs in a task of
+        // its own. A caller that stops waiting, such as an HTTP request
+        // whose client went away, never cancels it half way.
+        let job = crate::rt::spawn(async move {
+            owner
+                .call(move |raft| async move {
+                    let core = crate::rejoin::RaftPlanCore {
+                        raft: &raft,
+                        raft_group_id,
+                    };
+                    job.accept_recovery_plan(&plan, &core, &history).await
+                })
+                .await
+                .map_err(|source| RecoveryGateError::OwnerStopped {
                     raft_group_id,
-                };
-                job.accept_recovery_plan(&plan, &core, &history).await
-            })
+                    source,
+                })?
+        });
+        let taken = job
             .await
-            .map_err(|source| RecoveryGateError::OwnerStopped {
-                raft_group_id,
-                source,
-            })??;
-        let report = match taken {
+            .map_err(|_aborted| RecoveryGateError::JobAborted { raft_group_id })
+            .and_then(|taken| taken);
+        // m6 (#581 review): the job stopped the core campaigning; the
+        // node's election policy decides again, taken or refused.
+        self.refresh_group_elections(raft_group_id);
+        let report = match taken? {
             crate::rejoin::PlanTaken::Holds(report) => report,
             // B1 (#581 review): the cut runs before the plan answers. The
             // group's engine stops, its log store closes, and the new
@@ -678,14 +689,6 @@ impl RaftGroupHandleRegistry {
         };
         self.refresh_group_elections(raft_group_id);
         Ok(report)
-    }
-
-    /// The recovery gate of `raft_group_id` on this node, if it has one.
-    pub fn recovery_gate(&self, raft_group_id: RaftGroupId) -> Option<Arc<GroupRejoin>> {
-        self.groups
-            .load()
-            .get(&raft_group_id.0)
-            .and_then(|entry| entry.active()?.recovery.clone())
     }
 
     /// The recovery gate of every group that has one on this node.
@@ -1037,20 +1040,19 @@ impl RaftGroupHandleRegistry {
         let rejoin = entry.recovery.clone();
         raft.call(move |raft| async move {
             if let Some(rejoin) = rejoin {
-                // A recovery cut may have closed the replica since the check
-                // above: an entry it acknowledged now would be cut.
-                if rejoin.cutting() {
-                    return None;
+                // A recovery plan may have closed the replica since the
+                // check above: an entry it acknowledged now would be cut, or
+                // come from a leader elected before the plan.
+                if let Some(refusal) = rejoin.replication_refusal(&request.vote) {
+                    return Err(refusal);
                 }
                 rejoin.observe_inbound_append(&request);
             }
-            Some(raft.append_entries(request).await)
+            Ok(raft.append_entries(request).await)
         })
         .await
         .map_err(crate::owner::owner_stopped)?
-        .ok_or(GroupEngineError::Infra(
-            ursula_runtime::GroupInfraError::RecoveryCutting { raft_group_id },
-        ))?
+        .map_err(GroupEngineError::Infra)?
         .map_err(crate::owner::owner_raft_error)
     }
 
@@ -1131,21 +1133,21 @@ impl RaftGroupHandleRegistry {
             let snapshot = prefetched.snapshot;
             let result = raft
                 .call(move |raft| async move {
-                    // A recovery cut may have closed the replica while the
-                    // install waited: it takes no replication until it has
-                    // restarted.
-                    if rejoin.as_ref().is_some_and(|rejoin| rejoin.cutting()) {
-                        return None;
+                    // A recovery plan may have closed the replica while the
+                    // install waited.
+                    if let Some(refusal) = rejoin
+                        .as_ref()
+                        .and_then(|rejoin| rejoin.replication_refusal(&vote))
+                    {
+                        return Err(refusal);
                     }
-                    Some(raft.install_full_snapshot(vote, snapshot).await)
+                    Ok(raft.install_full_snapshot(vote, snapshot).await)
                 })
                 .await
                 .map_err(crate::owner::owner_stopped)
                 .and_then(|installed| {
                     installed
-                        .ok_or(GroupEngineError::Infra(
-                            ursula_runtime::GroupInfraError::RecoveryCutting { raft_group_id },
-                        ))?
+                        .map_err(GroupEngineError::Infra)?
                         .map_err(crate::owner::owner_stopped)
                 })
                 .map_err(SnapshotInstallError::Group);

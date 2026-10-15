@@ -1778,7 +1778,7 @@ async fn a_group_opens_once_while_its_store_lives_and_again_after_it_closed() {
         leader: 2,
         point: 1,
         leader_term: 3,
-        cut: crate::log_store::PlanCut::None,
+        cut: crate::log_store::PlanCut::NoCut,
     };
     store
         .record_recovery(Some(record))

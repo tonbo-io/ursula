@@ -352,8 +352,15 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
             .borrow_watched()
             .last_applied
             .map(|applied| applied.index);
-        // A plan's stall timeout runs from when the replica took it.
+        // A plan's stall timeout runs from when the replica took it, or
+        // last applied something under it. Only applied progress clears a
+        // stall (m9, #581 review).
         if applied_now != progress.0 || plan != progress.1 {
+            if applied_now != progress.0
+                && let Some(rejoin) = &rejoin
+            {
+                rejoin.unstall_plan();
+            }
             progress = (applied_now, plan, crate::rt::time::Instant::now());
         }
         let wait = rejoin.as_ref().map(|rejoin| {

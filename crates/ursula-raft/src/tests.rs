@@ -3190,7 +3190,7 @@ async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
             leader: 1,
             point: u64::MAX,
             leader_term: 0,
-            cut: crate::log_store::PlanCut::None,
+            cut: crate::log_store::PlanCut::NoCut,
         }));
     let before = engine.snapshot(placement()).await;
     assert!(
@@ -3241,7 +3241,7 @@ fn a_pending_history_fences_only_its_leader() {
         leader: 1,
         point: 10,
         leader_term: 0,
-        cut: crate::log_store::PlanCut::None,
+        cut: crate::log_store::PlanCut::NoCut,
     };
     // Genesis: no history yet.
     assert!(history_pending(None, None));
@@ -3431,7 +3431,7 @@ async fn a_history_event_ends_a_live_read_pinned_to_the_old_token() {
         leader: 1,
         point,
         leader_term: 0,
-        cut: crate::log_store::PlanCut::None,
+        cut: crate::log_store::PlanCut::NoCut,
     }));
     let woken = tokio::time::timeout(Duration::from_secs(5), waiter)
         .await

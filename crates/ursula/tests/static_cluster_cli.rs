@@ -849,7 +849,9 @@ async fn single_voter_recovery_plan(cut: bool) {
         leader: 1,
         point,
         cut,
-        step: ursula_proto::admin::PlanStep::Lead,
+        step: ursula_proto::admin::PlanStep::Lead {
+            highest_term: expected.current_term,
+        },
         expected,
     };
     let response = admin_test_post(&client, accept_url)

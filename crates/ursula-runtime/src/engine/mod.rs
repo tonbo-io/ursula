@@ -991,6 +991,18 @@ pub enum GroupInfraError {
     /// 4.5): it takes no replication until it has. Retryable.
     #[error("raft group {raft_group_id:?} restarts to cut its log for a recovery plan")]
     RecoveryCutting { raft_group_id: RaftGroupId },
+    /// This replica holds a recovery plan and the sender leads at or below
+    /// the plan's term: a leader elected before the plan, whose entries it
+    /// takes no more (#581 section 4.5). Retryable for the sender, which a
+    /// leader under the plan replaces.
+    #[error(
+        "raft group {raft_group_id:?} holds a recovery plan with plan term {plan_term}; it takes \
+         no replication from a leader at or below it"
+    )]
+    RecoveryPlanFenced {
+        raft_group_id: RaftGroupId,
+        plan_term: u64,
+    },
     /// This replica leads the group, and the group's history is pending: its
     /// genesis, or the history event of a recovery plan, has not applied
     /// (#581 sections 4.3 and 4.5). The leader serves and admits nothing but

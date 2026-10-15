@@ -280,12 +280,60 @@ pub struct RecoveryPlanRequest {
 #[serde(rename_all = "snake_case")]
 pub enum PlanStep {
     /// To the plan's leader, first: it takes the plan and answers its plan
-    /// term ([`RecoveryPlanReport::leader_term`]).
-    Lead,
+    /// term ([`RecoveryPlanReport::leader_term`]). `highest_term` is the
+    /// highest `current_term` the tool read on any replica it reached: no
+    /// leader elected before the plan had a higher term, since every quorum
+    /// meets those replicas. The plan term is the higher of it and the
+    /// leader's own vote term.
+    Lead { highest_term: u64 },
     /// To every other member, after the leader took the plan: it votes for
     /// the leader only at a term above `leader_term`, which only campaigns
     /// the leader starts after it took the plan reach.
     Follow { leader_term: u64 },
+}
+
+/// The body of a `409 Conflict` from `accept-unsynced-loss`: why the replica
+/// refused the plan. It changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPlanRefused {
+    pub raft_group_id: u64,
+    pub node_id: u64,
+    pub refusal: RecoveryPlanRefusal,
+    /// The refusal in words, for a person.
+    pub message: String,
+}
+
+/// Why a replica refused a recovery plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum RecoveryPlanRefusal {
+    /// The replica lost its vote and holds no vote floor yet.
+    MissingVoteFloor,
+    /// The replica leads the group with a live quorum.
+    LeadsLive,
+    /// The replica follows a live leader, `leader`.
+    FollowsLeader { leader: u64 },
+    /// The request's `step` is not this replica's.
+    StepMismatch,
+    /// The plan's leader is not a voter of the group.
+    LeaderNotVoter,
+    /// The replica's gate may still open without a plan, or runs a cut.
+    NotStalled { status: RecoveryGateStatus },
+    /// The replica no longer holds the log the plan's `expected` names.
+    ReplicaChanged,
+    /// The replica committed or applied an entry above the plan's point.
+    RecoveryPointBehind,
+    /// The plan's leader does not continue from the plan's point.
+    PointMismatch,
+    /// The plan cuts and the replica knows no committed entry.
+    NothingCommitted,
+    /// The plan cuts and the replica no longer holds the entry it keeps.
+    CommittedEntryMissing,
+    /// The plan's cut could not run at the group's restart: the plan was
+    /// dropped and the gate stays closed.
+    CutRefused,
+    /// The replica's log store closed.
+    StoreClosed,
 }
 
 /// What a recovery plan did on one replica.
@@ -431,12 +479,26 @@ mod tests {
             r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
         );
         let lead = RecoveryPlanRequest {
-            step: PlanStep::Lead,
+            step: PlanStep::Lead { highest_term: 8 },
             ..plan
         };
         assert_eq!(
             serde_json::to_string(&lead).unwrap(),
-            r#"{"leader":2,"point":12,"cut":true,"step":"lead","expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+            r#"{"leader":2,"point":12,"cut":true,"step":{"lead":{"highest_term":8}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+        );
+        let refused = super::RecoveryPlanRefused {
+            raft_group_id: 4,
+            node_id: 3,
+            refusal: super::RecoveryPlanRefusal::FollowsLeader { leader: 2 },
+            message: "follows".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&refused).unwrap(),
+            r#"{"raft_group_id":4,"node_id":3,"refusal":{"reason":"follows_leader","leader":2},"message":"follows"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&super::RecoveryPlanRefusal::ReplicaChanged).unwrap(),
+            r#"{"reason":"replica_changed"}"#
         );
         let report = RecoveryPlanReport {
             raft_group_id: 4,
@@ -476,7 +538,7 @@ mod tests {
         use super::ReplicaLogView;
         assert_eq!(
             serde_json::from_str::<RecoveryPlanRequest>(
-                r#"{"leader": 2, "point": 12, "cut": false, "step": "lead",
+                r#"{"leader": 2, "point": 12, "cut": false, "step": {"lead": {"highest_term": 4}},
                     "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
             )
             .unwrap(),
@@ -484,7 +546,7 @@ mod tests {
                 leader: 2,
                 point: 12,
                 cut: false,
-                step: super::PlanStep::Lead,
+                step: super::PlanStep::Lead { highest_term: 4 },
                 expected: ReplicaLogView {
                     last_log_index: Some(12),
                     last_log_term: Some(3),

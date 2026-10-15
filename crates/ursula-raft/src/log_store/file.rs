@@ -388,6 +388,23 @@ impl RaftGroupFileLogStore {
         Ok(())
     }
 
+    /// Drops the replica's recovery plan, whose cut could not run, and
+    /// records its log recovering, in one synced metadata write (m2, #581
+    /// review): a restart keeps the gate closed.
+    pub(crate) async fn drop_unrunnable_plan(&self) -> Result<(), CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        let timing = self
+            .core_writer
+            .write(CoreWriteOp::DropPlan {
+                group_id: self.placement.raft_group_id.0,
+            })
+            .await?;
+        self.record_timing(1, timing);
+        *lock(&self.recovery) = None;
+        self.set_store_log(StoreLog::Recovering);
+        Ok(())
+    }
+
     /// Removes `record` when it is still the replica's recovery plan, under
     /// the store's write order, so a plan recorded meanwhile stays (m1,
     /// #581 review). Returns whether it removed it.

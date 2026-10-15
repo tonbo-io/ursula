@@ -79,7 +79,7 @@ pub struct RecoveryRecord {
 #[serde(rename_all = "snake_case")]
 pub enum PlanCut {
     /// The plan keeps every entry.
-    None,
+    NoCut,
     /// The log keeps entries up to `keep`, the committed entry the replica
     /// recorded. The cut runs while the group restarts, before its new Raft
     /// core.

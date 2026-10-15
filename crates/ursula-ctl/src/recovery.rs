@@ -2,14 +2,17 @@
 //! 4.5), over `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`.
 //!
 //! The tool reads every reachable replica of the group, computes the plan
-//! ([`plan_group`]), and sends it to the plan's leader first. The leader
-//! answers its plan term, and every other member takes the plan with it: a
-//! member then votes for the leader only in a campaign the leader started
-//! after it took the plan. The tool waits until the plan's history event
-//! applied on every replica it reached. A plan whose leader lost entries it
-//! had replicated wedges (its members' logs are longer than its own), and
-//! the tool plans again ([`plan_wedged`]).
+//! ([`plan_group`]), and sends it to the plan's leader first with the
+//! highest vote term it read ([`send_plan`]). The leader answers its plan
+//! term, and every other member takes the plan with it: a member then votes
+//! for the leader only in a campaign above the plan term. The tool waits
+//! until the plan's history event applied on every replica it reached. A
+//! plan whose leader lost entries it had replicated wedges (its members'
+//! logs are longer than its own), and the tool plans again
+//! ([`plan_wedged`]). The deterministic simulation runs the same planner and
+//! sender over its own [`PlanTransport`].
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -20,6 +23,8 @@ use tokio::time::Instant;
 use ursula_proto::admin::PlanStep;
 use ursula_proto::admin::RaftGroupMetrics;
 use ursula_proto::admin::RecoveryGateStatus;
+use ursula_proto::admin::RecoveryPlanRefusal;
+use ursula_proto::admin::RecoveryPlanRefused;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_proto::admin::ReplicaLogView;
@@ -81,6 +86,10 @@ pub struct GroupPlan {
     pub leader: u64,
     pub point: u64,
     pub cut: bool,
+    /// The highest vote term among the replicas the tool reached: no leader
+    /// elected before the plan had a higher one (every quorum meets them).
+    /// The leader's plan term is at least this.
+    pub highest_term: u64,
 }
 
 /// Why the tool does not plan a group now.
@@ -150,6 +159,11 @@ pub fn plan_group(members: &[PlanMember]) -> Result<GroupPlan, PlanError> {
         .map(|member| member.log.current_term)
         .max()
         .unwrap_or(0);
+    let highest_term = members
+        .iter()
+        .map(|member| member.log.current_term)
+        .max()
+        .unwrap_or(0);
     let longest = members
         .iter()
         .max_by_key(|member| (member.last_log_id(), member.node_id))
@@ -163,12 +177,14 @@ pub fn plan_group(members: &[PlanMember]) -> Result<GroupPlan, PlanError> {
             leader: leader.node_id,
             point: leader.committed.unwrap_or(0),
             cut: true,
+            highest_term,
         })
     } else {
         Ok(GroupPlan {
             leader: longest.node_id,
             point: longest.log.last_log_index.unwrap_or(0),
             cut: false,
+            highest_term,
         })
     }
 }
@@ -185,7 +201,8 @@ pub enum Wedge {
 }
 
 /// Whether the plan electing `leader` is wedged, from the replicas the tool
-/// reached.
+/// reached. One observation reads the replicas one after another, so a
+/// caller acts only on a wedge it saw in two observations in a row.
 pub fn plan_wedged(leader: u64, members: &[PlanMember]) -> Option<Wedge> {
     let planned = |member: &&PlanMember| member.plan_leader == Some(leader);
     if let Some(lead) = members
@@ -225,12 +242,129 @@ pub fn plan_satisfied(point: u64, members: &[PlanMember]) -> bool {
         })
 }
 
+/// Why one replica did not take its part of a plan.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    /// The replica refused it and changed nothing.
+    #[error("node {node_id} refused the recovery plan: {}", .refused.message)]
+    Refused {
+        node_id: u64,
+        refused: RecoveryPlanRefused,
+    },
+    /// The replica could not be asked, or its answer could not be read.
+    #[error("node {node_id} did not answer the recovery plan: {source}")]
+    Transport {
+        node_id: u64,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl SendError {
+    /// The refusal, when the replica refused.
+    pub fn refusal(&self) -> Option<RecoveryPlanRefusal> {
+        match self {
+            Self::Refused { refused, .. } => Some(refused.refusal),
+            Self::Transport { .. } => None,
+        }
+    }
+}
+
+/// How the tool reaches one replica's `accept-unsynced-loss`.
+pub trait PlanTransport {
+    fn send(
+        &mut self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> impl Future<Output = Result<RecoveryPlanReport, SendError>>;
+}
+
+/// What [`send_plan`] did.
+#[derive(Debug)]
+pub struct PlanSent {
+    /// The plan term the leader answered.
+    pub leader_term: u64,
+    /// The members that refused for another reason than following the
+    /// plan's leader, which it elected meanwhile: the plan is planned again.
+    pub refused: Vec<SendError>,
+}
+
+/// Sends `plan` to its leader first, with the highest vote term the tool
+/// read, then to every other member with the leader's plan term. A refusal
+/// of the leader fails the round, and nothing changed. A member's refusal
+/// does not undo the leader's plan. A member that follows the plan's leader
+/// refuses because the members that took the plan elected it, and rejoins
+/// through it (m3, #581 review). Any other refusal is returned, and the
+/// caller plans again.
+pub async fn send_plan<T: PlanTransport>(
+    transport: &mut T,
+    plan: GroupPlan,
+    members: &[PlanMember],
+) -> Result<PlanSent, SendError> {
+    let request = |member: &PlanMember, step: PlanStep| RecoveryPlanRequest {
+        leader: plan.leader,
+        point: plan.point,
+        cut: plan.cut,
+        step,
+        expected: member.log,
+    };
+    let leader = members
+        .iter()
+        .find(|member| member.node_id == plan.leader)
+        .ok_or(SendError::Transport {
+            node_id: plan.leader,
+            source: "the plan's leader did not answer the observation".into(),
+        })?;
+    let report = transport
+        .send(
+            plan.leader,
+            &request(leader, PlanStep::Lead {
+                highest_term: plan.highest_term,
+            }),
+        )
+        .await?;
+    let leader_term = report.leader_term;
+    let mut refused = Vec::new();
+    for member in members
+        .iter()
+        .filter(|member| member.node_id != plan.leader)
+    {
+        match transport
+            .send(
+                member.node_id,
+                &request(member, PlanStep::Follow { leader_term }),
+            )
+            .await
+        {
+            Ok(_report) => {}
+            Err(error)
+                if error.refusal()
+                    == Some(RecoveryPlanRefusal::FollowsLeader {
+                        leader: plan.leader,
+                    }) =>
+            {
+                tracing::info!(
+                    node_id = member.node_id,
+                    leader = plan.leader,
+                    "recovery: a member follows the plan's leader already"
+                );
+            }
+            Err(error) => refused.push(error),
+        }
+    }
+    Ok(PlanSent {
+        leader_term,
+        refused,
+    })
+}
+
 /// How [`recover_group`] runs.
 #[derive(Debug, Clone)]
 pub struct RecoverOptions {
     /// How many plans the tool sends at most, the first included.
     pub max_plans: usize,
-    /// How long one plan may take to be satisfied before the tool gives up.
+    /// How long the tool waits for a stalled group, or for one plan to be
+    /// satisfied, before it gives up.
     pub settle_timeout: Duration,
     pub poll_interval: Duration,
     /// Compute and print the plan, and send nothing.
@@ -253,13 +387,13 @@ async fn observe(
     client: &MetricsClient,
     nodes: &[NodeInfo],
     raft_group_id: u64,
-) -> Vec<(NodeInfo, PlanMember)> {
+) -> Vec<PlanMember> {
     let mut members = Vec::new();
     for node in nodes {
         match client.fetch_node(node).await {
             Ok(view) => {
                 if let Some(group) = view.group(raft_group_id) {
-                    members.push((node.clone(), PlanMember::from_metrics(group)));
+                    members.push(PlanMember::from_metrics(group));
                 }
             }
             Err(error) => {
@@ -270,119 +404,155 @@ async fn observe(
     members
 }
 
-/// Sends one replica its part of the plan.
-async fn send(
-    client: &MetricsClient,
-    node: &NodeInfo,
+/// [`PlanTransport`] over the nodes' admin planes.
+struct HttpTransport<'a> {
+    client: &'a MetricsClient,
+    nodes: &'a [NodeInfo],
     raft_group_id: u64,
-    request: &RecoveryPlanRequest,
-) -> Result<RecoveryPlanReport> {
-    let url = node
-        .admin_url
-        .join(&format!(
-            "/__ursula/raft/{raft_group_id}/recovery/accept-unsynced-loss"
-        ))
-        .with_context(|| format!("compose recovery url at node {}", node.id))?;
-    let response = client
-        .admin_request(node, Method::POST, url.clone())
-        .await?
-        .json(request)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "node {} refused the recovery plan for group {raft_group_id} ({status}): {body}",
-            node.id
-        );
-    }
-    serde_json::from_str(&body).with_context(|| format!("decode recovery report: {body}"))
 }
 
-/// Sends `plan` to the leader first, then to every other member with the
-/// leader's plan term. A refusal of the leader fails the round. A member's
-/// refusal does not: the members that took the plan vote only for its
-/// leader, which holds it, and a member it reached once elected refuses and
-/// rejoins through it. Whether the plan then holds is up to the wait.
-async fn send_plan(
-    client: &MetricsClient,
-    raft_group_id: u64,
-    plan: GroupPlan,
-    members: &[(NodeInfo, PlanMember)],
-) -> Result<u64> {
-    let request = |member: &PlanMember, step: PlanStep| RecoveryPlanRequest {
-        leader: plan.leader,
-        point: plan.point,
-        cut: plan.cut,
-        step,
-        expected: member.log,
-    };
-    let (leader_node, leader) = members
-        .iter()
-        .find(|(_, member)| member.node_id == plan.leader)
-        .context("the plan's leader did not answer")?;
-    let report = send(
-        client,
-        leader_node,
-        raft_group_id,
-        &request(leader, PlanStep::Lead),
-    )
-    .await?;
-    let leader_term = report.leader_term;
-    for (node, member) in members
-        .iter()
-        .filter(|(_, member)| member.node_id != plan.leader)
-    {
-        if let Err(error) = send(
-            client,
-            node,
-            raft_group_id,
-            &request(member, PlanStep::Follow { leader_term }),
-        )
-        .await
-        {
-            tracing::warn!(
-                raft_group_id,
-                node_id = node.id,
-                %error,
-                "recovery: a member refused the plan; its leader holds it"
-            );
+impl HttpTransport<'_> {
+    async fn post(
+        &self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> Result<RecoveryPlanReport, SendError> {
+        let transport = |source: Box<dyn std::error::Error + Send + Sync>| SendError::Transport {
+            node_id,
+            source,
+        };
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| transport("the node is not in the manifest".into()))?;
+        let url = node
+            .admin_url
+            .join(&format!(
+                "/__ursula/raft/{}/recovery/accept-unsynced-loss",
+                self.raft_group_id
+            ))
+            .map_err(|source| transport(source.into()))?;
+        let response = self
+            .client
+            .admin_request(node, Method::POST, url)
+            .await
+            .map_err(|source| transport(source.into()))?
+            .json(request)
+            .send()
+            .await
+            .map_err(|source| transport(source.into()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|source| transport(source.into()))?;
+        if status == reqwest::StatusCode::CONFLICT {
+            let refused: RecoveryPlanRefused =
+                serde_json::from_slice(&body).map_err(|source| transport(source.into()))?;
+            return Err(SendError::Refused { node_id, refused });
         }
+        if !status.is_success() {
+            return Err(transport(
+                format!("{status}: {}", String::from_utf8_lossy(&body)).into(),
+            ));
+        }
+        serde_json::from_slice(&body).map_err(|source| transport(source.into()))
     }
-    Ok(leader_term)
+}
+
+impl PlanTransport for HttpTransport<'_> {
+    fn send(
+        &mut self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> impl Future<Output = Result<RecoveryPlanReport, SendError>> {
+        self.post(node_id, request)
+    }
 }
 
 /// Plans `raft_group_id` and waits until the plan is satisfied, planning
-/// again when a plan wedges or a member refuses, up to
-/// [`RecoverOptions::max_plans`] plans.
+/// again when a plan wedges in two observations in a row, or when its
+/// leader or a member refuses it for another reason than following the
+/// plan's leader, up to [`RecoverOptions::max_plans`] plans. While a replica
+/// may still open without a plan, or a plan's leader leads, it waits (m4,
+/// #581 review).
 pub async fn recover_group(
     client: &MetricsClient,
     nodes: &[NodeInfo],
     raft_group_id: u64,
     options: &RecoverOptions,
 ) -> Result<RecoverOutcome> {
+    let mut transport = HttpTransport {
+        client,
+        nodes,
+        raft_group_id,
+    };
     let mut plans_sent = 0_usize;
+    // The last plan whose leader took it, and whether a member refused it.
+    let mut sent: Option<GroupPlan> = None;
+    let mut refused = false;
+    let mut wedged_before = false;
+    let mut deadline = Instant::now()
+        .checked_add(options.settle_timeout)
+        .context("settle timeout overflows the clock")?;
     loop {
-        let observed = observe(client, nodes, raft_group_id).await;
-        let members = observed
-            .iter()
-            .map(|(_, member)| member.clone())
-            .collect::<Vec<_>>();
-        if members.iter().all(|member| member.plan_leader.is_none())
-            && let Some(leader) = members.iter().find_map(|member| {
-                member
-                    .current_leader
-                    .filter(|leader| *leader == member.node_id)
-            })
+        let members = observe(client, nodes, raft_group_id).await;
+        if let Some(plan) = sent
+            && plan_satisfied(plan.point, &members)
         {
-            if plans_sent == 0 {
-                return Err(PlanError::HasLeader { leader }.into());
-            }
-            return Ok(RecoverOutcome::Healthy);
+            return Ok(RecoverOutcome::Satisfied { plan, plans_sent });
         }
-        let plan = plan_group(&members)?;
+        let holds_plan = members.iter().any(|member| member.plan_leader.is_some());
+        let leading = members.iter().find_map(|member| {
+            member
+                .current_leader
+                .filter(|leader| *leader == member.node_id)
+        });
+        // A group with a leader is planned no more: it is healthy, or a
+        // plan's leader brings its members along.
+        let wedge = sent.and_then(|plan| plan_wedged(plan.leader, &members));
+        let replan = match (wedge, leading) {
+            (Some(wedge), _) if wedged_before => {
+                tracing::warn!(raft_group_id, ?wedge, "recovery: the plan is wedged");
+                true
+            }
+            (wedge, Some(leader)) => {
+                wedged_before = wedge.is_some();
+                if sent.is_none() && !holds_plan {
+                    return Err(PlanError::HasLeader { leader }.into());
+                }
+                if sent.is_some() && !holds_plan {
+                    return Ok(RecoverOutcome::Healthy);
+                }
+                false
+            }
+            (wedge, None) => {
+                wedged_before = wedge.is_some();
+                sent.is_none() || refused
+            }
+        };
+        if !replan {
+            if Instant::now() >= deadline {
+                bail!(
+                    "group {raft_group_id}: no plan was satisfied within {:?}",
+                    options.settle_timeout
+                );
+            }
+            tokio::time::sleep(options.poll_interval).await;
+            continue;
+        }
+        wedged_before = false;
+        refused = false;
+        let plan = match plan_group(&members) {
+            Ok(plan) => plan,
+            Err(error @ PlanError::NotStalled { .. }) if Instant::now() < deadline => {
+                tracing::info!(raft_group_id, %error, "recovery: waiting for the group to stall");
+                tokio::time::sleep(options.poll_interval).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if options.dry_run {
             return Ok(RecoverOutcome::DryRun(plan));
         }
@@ -395,48 +565,32 @@ pub async fn recover_group(
             leader = plan.leader,
             point = plan.point,
             cut = plan.cut,
+            highest_term = plan.highest_term,
             plans_sent,
             "recovery: sending the plan, the leader first"
         );
-        if let Err(error) = send_plan(client, raft_group_id, plan, &observed).await {
-            tracing::warn!(
-                raft_group_id,
-                %error,
-                "recovery: the plan's leader refused the plan; observing again"
-            );
-            tokio::time::sleep(options.poll_interval).await;
-            continue;
-        }
-        let deadline = Instant::now()
+        deadline = Instant::now()
             .checked_add(options.settle_timeout)
             .context("settle timeout overflows the clock")?;
-        loop {
-            tokio::time::sleep(options.poll_interval).await;
-            let members = observe(client, nodes, raft_group_id)
-                .await
-                .into_iter()
-                .map(|(_, member)| member)
-                .collect::<Vec<_>>();
-            if plan_satisfied(plan.point, &members) {
-                return Ok(RecoverOutcome::Satisfied { plan, plans_sent });
+        match send_plan(&mut transport, plan, &members).await {
+            Ok(taken) => {
+                sent = Some(plan);
+                for error in &taken.refused {
+                    tracing::warn!(raft_group_id, %error, "recovery: a member refused the plan");
+                }
+                // Planned again unless the plan's leader leads meanwhile.
+                refused = !taken.refused.is_empty();
             }
-            if let Some(wedge) = plan_wedged(plan.leader, &members) {
+            Err(error) => {
                 tracing::warn!(
                     raft_group_id,
-                    ?wedge,
-                    "recovery: the plan is wedged; planning again"
+                    %error,
+                    "recovery: the plan's leader refused the plan; observing again"
                 );
-                break;
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "group {raft_group_id}: the recovery plan electing node {} was not satisfied \
-                     within {:?}",
-                    plan.leader,
-                    options.settle_timeout
-                );
+                refused = true;
             }
         }
+        tokio::time::sleep(options.poll_interval).await;
     }
 }
 
@@ -490,7 +644,8 @@ mod tests {
             Ok(GroupPlan {
                 leader: 1,
                 point: 12,
-                cut: false
+                cut: false,
+                highest_term: 9
             })
         );
     }
@@ -507,7 +662,8 @@ mod tests {
             Ok(GroupPlan {
                 leader: 2,
                 point: 12,
-                cut: true
+                cut: true,
+                highest_term: 5
             })
         );
     }
@@ -572,7 +728,8 @@ mod tests {
             Ok(GroupPlan {
                 leader: 3,
                 point: 12,
-                cut: true
+                cut: true,
+                highest_term: 8
             })
         );
     }
@@ -605,5 +762,85 @@ mod tests {
         assert!(plan_satisfied(12, &members));
         members[1].plan_leader = Some(1);
         assert!(!plan_satisfied(12, &members), "a replica still holds it");
+    }
+
+    /// A transport whose replicas answer from a table.
+    struct Table(std::collections::BTreeMap<u64, Option<ursula_proto::admin::RecoveryPlanRefusal>>);
+
+    impl super::PlanTransport for Table {
+        fn send(
+            &mut self,
+            node_id: u64,
+            request: &ursula_proto::admin::RecoveryPlanRequest,
+        ) -> impl std::future::Future<
+            Output = Result<ursula_proto::admin::RecoveryPlanReport, super::SendError>,
+        > {
+            let answer = match self.0.get(&node_id).copied().flatten() {
+                None => Ok(ursula_proto::admin::RecoveryPlanReport {
+                    raft_group_id: 0,
+                    node_id,
+                    outcome: ursula_proto::admin::RecoveryPlanOutcome::Follows,
+                    leader: request.leader,
+                    point: request.point,
+                    leader_term: match request.step {
+                        ursula_proto::admin::PlanStep::Lead { highest_term } => highest_term,
+                        ursula_proto::admin::PlanStep::Follow { leader_term } => leader_term,
+                    },
+                }),
+                Some(refusal) => Err(super::SendError::Refused {
+                    node_id,
+                    refused: ursula_proto::admin::RecoveryPlanRefused {
+                        raft_group_id: 0,
+                        node_id,
+                        refusal,
+                        message: String::new(),
+                    },
+                }),
+            };
+            std::future::ready(answer)
+        }
+    }
+
+    /// m3 (#581 review): only a member that follows the plan's leader is
+    /// skipped; any other refusal is returned so the tool plans again, and
+    /// the leader's refusal fails the round.
+    #[tokio::test]
+    async fn only_a_member_following_the_plans_leader_is_skipped() {
+        use ursula_proto::admin::RecoveryPlanRefusal;
+        let members = [
+            member(1, Some((12, 3)), 9, Some(12), RecoveryGateStatus::Open),
+            member(2, Some((10, 3)), 3, Some(10), RecoveryGateStatus::Stalled),
+            member(3, Some((9, 3)), 3, Some(9), RecoveryGateStatus::Stalled),
+        ];
+        let plan = plan_group(&members).expect("a plan");
+        let mut table = Table(
+            [
+                (2, Some(RecoveryPlanRefusal::FollowsLeader { leader: 1 })),
+                (3, Some(RecoveryPlanRefusal::ReplicaChanged)),
+            ]
+            .into(),
+        );
+        let sent = super::send_plan(&mut table, plan, &members)
+            .await
+            .expect("the leader took it");
+        assert_eq!(sent.leader_term, 9);
+        assert_eq!(sent.refused.len(), 1);
+        assert_eq!(
+            sent.refused[0].refusal(),
+            Some(RecoveryPlanRefusal::ReplicaChanged)
+        );
+        // A member following another leader is not skipped.
+        table
+            .0
+            .insert(3, Some(RecoveryPlanRefusal::FollowsLeader { leader: 2 }));
+        let sent = super::send_plan(&mut table, plan, &members)
+            .await
+            .expect("the leader took it");
+        assert_eq!(sent.refused.len(), 1);
+        table.0.insert(1, Some(RecoveryPlanRefusal::LeadsLive));
+        let refused = super::send_plan(&mut table, plan, &members)
+            .await
+            .expect_err("the leader refused");
+        assert_eq!(refused.refusal(), Some(RecoveryPlanRefusal::LeadsLive));
     }
 }

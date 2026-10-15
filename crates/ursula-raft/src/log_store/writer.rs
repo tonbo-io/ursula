@@ -511,6 +511,11 @@ pub(crate) enum CoreWriteOp {
         group_id: u32,
         record: RecoveryRecord,
     },
+    /// A group drops a recovery plan whose cut could not run, and records
+    /// its log recovering, in one replacement of the metadata file: the
+    /// gate stays closed across restarts until a leader's barrier or a new
+    /// plan (m2, #581 review).
+    DropPlan { group_id: u32 },
 }
 
 /// What one request's write cost, as reported to its group's metrics.
@@ -1870,6 +1875,15 @@ fn write_core_log_batch(
             CoreWriteOp::Recovery { group_id, record } => {
                 metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= journal.metadata.set_recovery(*group_id, *record);
+                requires_sync = true;
+                None
+            }
+            CoreWriteOp::DropPlan { group_id } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.set_recovery(*group_id, None);
+                metadata_changed |= journal
+                    .metadata
+                    .set_log_state(*group_id, GroupLogState::Recovering);
                 requires_sync = true;
                 None
             }

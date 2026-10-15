@@ -17,10 +17,19 @@ pub enum Defence {
     /// An import of a backup the group was already restored from answers
     /// `already` instead of rewinding again.
     ImportKey,
-    /// A recovery plan that cuts the logs cuts them inside its accept job.
-    /// Off, the cut waits for the member's next start, as before the #581
-    /// review (B1).
+    /// A recovery plan that cuts the logs cuts them inside its accept job,
+    /// through an in-process restart of the group, which also demotes a
+    /// replica that leads or campaigns. Off, there is no such restart and
+    /// the cut waits for the member's next start, as before the #581 review
+    /// (B1).
     RecoveryCut,
+    /// A member of a recovery plan refuses the plan's leader while its log
+    /// holds an entry above the point at or below the plan term (M1 of the
+    /// second #581 review).
+    PlanLogGuard,
+    /// A replica holding a recovery plan takes replication only from a
+    /// leader above the plan term (M1 of the second #581 review).
+    PlanReplicationFence,
 }
 
 #[cfg(madsim)]
@@ -30,7 +39,7 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 4]> = const { Cell::new([false; 4]) };
+        static OFF: Cell<[bool; 6]> = const { Cell::new([false; 6]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -39,6 +48,8 @@ mod switches {
             Defence::IncarnationCheck => 1,
             Defence::ImportKey => 2,
             Defence::RecoveryCut => 3,
+            Defence::PlanLogGuard => 4,
+            Defence::PlanReplicationFence => 5,
         }
     }
 
