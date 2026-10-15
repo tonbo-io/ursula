@@ -98,6 +98,9 @@ pub enum HeaderError {
     UnexpectedHeader { name: &'static str, status: u16 },
     /// The latest snapshot's offset is above the stream's tail.
     SnapshotPastNext { snapshot: Offset, next: Offset },
+    /// `Content-Range` is not `bytes first-last/total` with `first <= last <
+    /// total` on a `206`, or `bytes */total` on a `416`.
+    InvalidContentRange,
 }
 
 impl fmt::Display for HeaderError {
@@ -223,6 +226,12 @@ impl fmt::Display for HeaderError {
                 f,
                 "line {line} of a parts manifest is not a part id of 1 to {PART_ID_MAX_BYTES} \
                  visible ASCII characters"
+            ),
+            Self::InvalidContentRange => write!(
+                f,
+                "{} must be `bytes first-last/total` within the body on a 206, or \
+                 `bytes */total` on a 416",
+                names::CONTENT_RANGE
             ),
             Self::ManifestPartCount { declared } => write!(
                 f,
