@@ -17,6 +17,14 @@
 //!   time in the process: `ursula_open` under another one waits for a binding nothing of the host
 //!   holds to retire, and is refused `bound_elsewhere` otherwise (`in_use` when it has commits not
 //!   acknowledged, or does not retire in time).
+//! * With `read_only` in `options_json`, `ursula_open` claims nothing. In a process that owns the
+//!   stream it returns the owner's binding. Otherwise it binds a reader: the stream as of the open,
+//!   built or caught up in a `reader-<n>/` directory of the root, whose connections open read-only
+//!   (writes fail with `SQLITE_READONLY`), whose `ursula_synced` resolves at once, and which
+//!   retires as soon as its last connection closes. On the owner's binding the extension does not
+//!   make a connection read-only: a write there is the owning process's own. A host of the SQL
+//!   functions opens the path `ursula_open` returned for `read_only` with
+//!   `SQLITE_OPEN_READONLY`, as the TypeScript package does.
 //! * Outside the extension a database file is not a database: on disk its bytes 0..16 hold a
 //!   marker in place of SQLite's magic (the VFS translates them for a bound file), from the moment
 //!   its generation is published, since a generation without a commit is published with the page
@@ -63,8 +71,8 @@
 //! - `error`: the kinds and actions callers outside the extension see (`ErrorKind`, `Action`), and
 //!   the SQL functions' error type.
 //! - `extension`: the entry point, the SQLite version gate and the SQL functions.
-//! - `generation`: the canonical stream path, a stream's locked root directory and the
-//!   generations in it (`gen-<id32>` directories).
+//! - `generation`: the canonical stream path, a stream's locked root directory and its reader
+//!   directories, and the generations in them (`gen-<id32>` directories).
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
 //! - [`ids`]: lineages, generation directory ids, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and a private connection.
@@ -75,7 +83,8 @@
 //! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
 //!   the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
-//! - `open`: opening a stream (design §5.5) up to its takeover, run by the driver.
+//! - `open`: opening a stream (design §5.5) up to its takeover, or a reader's bind, run by the
+//!   driver.
 //! - `options`: `ursula_open`'s `options_json`.
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle.
 //! - `replicator`: the replicator state machine of one bound database.

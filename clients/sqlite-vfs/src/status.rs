@@ -107,6 +107,10 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
     let attach = match h.attach {
         Attach::Resumed => object(&[("local", json_str("resumed")), ("snapshot_offset", null())]),
         Attach::ReKeyed => object(&[("local", json_str("rekeyed")), ("snapshot_offset", null())]),
+        Attach::CaughtUp => object(&[
+            ("local", json_str("caught_up")),
+            ("snapshot_offset", null()),
+        ]),
         Attach::Built { snapshot, salvaged } => object(&[
             (
                 "local",
@@ -146,7 +150,8 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
     Ok(object(&[
         ("name", json_str(h.name.as_str())),
         ("path", json_str(&b.path)),
-        ("role", json_str("owner")),
+        ("role", json_str(h.role.as_str())),
+        ("closed", h.closed.to_string()),
         (
             "state",
             json_str(state(reset.is_some(), h.life(), h.provisional())),

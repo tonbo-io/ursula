@@ -23,7 +23,7 @@
 //!
 //! `supersedes` is the id of the generation directory (`gen-<id32>`) a new generation replaces:
 //! directories are named by a random id, not by the lineage, since a copy of a generation keeps its
-//! lineage.
+//! lineage. Every segment of a generation names it, a rolled one too, so a trim never removes it.
 //!
 //! Positions start at 1, so a `base` or `acked` of 0 means nothing yet. The valid log is the
 //! longest prefix whose chain verifies and whose positions grow by one from the header's

@@ -52,7 +52,6 @@ export interface UrsulaStatus {
 	readonly name: string;
 	/** The local database file the extension bound. */
 	readonly path: string;
-	readonly role: "owner";
 	/**
 	 * `provisional` when the open found the stream unreachable and opened the trusted local cache
 	 * with its claim deferred: reads come from local files of unverified freshness, commits wait,
@@ -60,6 +59,17 @@ export interface UrsulaStatus {
 	 * applies.
 	 */
 	readonly state: "provisional" | "live" | "retiring" | "retired" | "reset";
+	/**
+	 * `reader` for a read-only open's own reader cache, which claims nothing (its `epoch` is `null` and
+	 * its `replication.state` is `none`). A read-only connection on the binding its process owns reports
+	 * the owner's status.
+	 */
+	readonly role: "owner" | "reader";
+	/**
+	 * Whether the stream was closed when the open read it. Only a reader opens a closed stream, and a
+	 * reader that opened its cache with the stream unreachable reports `false`.
+	 */
+	readonly closed: boolean;
 	/** The epoch this owner claimed, `null` before its claim is acknowledged. */
 	readonly epoch: number | null;
 	readonly cluster_id: string;
@@ -81,9 +91,9 @@ export interface UrsulaStatus {
 	 * kept across a history change of the stream that inherits it (`rekeyed`), or a build from the
 	 * stream (`built`), from the snapshot at `snapshot_offset` and the tail after it, or from the
 	 * stream's start when it is `null`. A build that moved the local cache aside into `salvage` first
-	 * is `salvaged`.
+	 * is `salvaged`. A reader cache read up to the stream's tail at the open is `caught_up`.
 	 */
-	readonly attach: { readonly local: "resumed" | "rekeyed" | "built" | "salvaged"; readonly snapshot_offset: number | null };
+	readonly attach: { readonly local: "resumed" | "rekeyed" | "caught_up" | "built" | "salvaged"; readonly snapshot_offset: number | null };
 	/** The last write refused with nothing committed. */
 	readonly refused: { readonly kind: string; readonly action: string; readonly message: string } | null;
 	/**
@@ -162,7 +172,8 @@ export class UrsulaDatabase extends DatabaseSync implements ResetTarget {
 	 * before anything outside the process acts on what you wrote or read. It does not block the event
 	 * loop, and it keeps the process alive while it waits. It rejects with an {@link UrsulaResetError}
 	 * on a reset, and with `signal.reason` when `signal` fires (the commits keep replicating).
-	 * Network failures never reject it: it waits.
+	 * Network failures never reject it: it waits. On a reader cache (`readOnly`, `role: "reader"`) it
+	 * resolves at once: the reader holds no commit.
 	 */
 	synced(options: { signal?: AbortSignal | undefined } = {}): Promise<void> {
 		const { signal } = options;

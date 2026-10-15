@@ -128,6 +128,121 @@ fn a_second_lock_on_the_root_is_in_use() {
     Root::lock(dir.path(), &p).unwrap();
 }
 
+// A reader locks the first free `reader-<n>/` of the root, beside the owner's lock, and its
+// generations stay there: the owner's open never sees them.
+#[test]
+fn readers_lock_the_first_free_reader_directory_beside_the_owner() {
+    let dir = TempDir::new("gen-reader");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let owner = Root::lock(dir.path(), &p).unwrap();
+    let r0 = Root::reader(dir.path(), &p).unwrap();
+    let r1 = Root::reader(dir.path(), &p).unwrap();
+    assert_eq!(r0.path(), owner.path().join("reader-0"));
+    assert_eq!(r1.path(), owner.path().join("reader-1"));
+    let g = r0.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    assert!(g.dir.starts_with(r0.path()));
+    owner.finish_leftovers().unwrap();
+    assert_eq!(owner.current().unwrap(), None);
+    // A freed directory is taken again first, its generation kept.
+    drop(r0);
+    let again = Root::reader(dir.path(), &p).unwrap();
+    assert_eq!(again.path(), owner.path().join("reader-0"));
+    again.finish_leftovers().unwrap();
+    assert_eq!(again.current().unwrap(), Some(g));
+    drop(r1);
+}
+
+// Readers taking and letting go of reader directories on many threads, each taking one cleaning
+// the others up: no two ever hold one directory at once, and no cleanup deletes a file in a held
+// one.
+#[test]
+fn concurrent_readers_and_cleanups_never_share_or_delete_a_held_directory() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let dir = TempDir::new("gen-reader-stress");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let held = Arc::new(Mutex::new(HashSet::new()));
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let (dir, p, held) = (dir.path().to_owned(), p.clone(), Arc::clone(&held));
+            std::thread::spawn(move || {
+                for i in 0..150 {
+                    let root = Root::reader(&dir, &p).unwrap();
+                    let path = root.path().to_owned();
+                    assert!(
+                        held.lock().unwrap().insert(path.clone()),
+                        "{} held twice",
+                        path.display()
+                    );
+                    let mine = path.join(format!("mine-{t}-{i}"));
+                    fs::write(&mine, b"x").unwrap();
+                    std::thread::yield_now();
+                    assert!(mine.exists(), "{} deleted under its holder", mine.display());
+                    fs::remove_file(&mine).unwrap();
+                    assert!(held.lock().unwrap().remove(&path));
+                    drop(root);
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    // The last cleanup leaves at most the directories still in use, and no trash.
+    let last = Root::reader(dir.path(), &p).unwrap();
+    let root = last.path().parent().unwrap().to_owned();
+    let left: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("reader-"))
+        .collect();
+    assert_eq!(left, ["reader-0"]);
+}
+
+// A reader deletes the reader directories nobody holds, and leaves the held ones alone.
+#[test]
+fn a_reader_deletes_the_reader_directories_nobody_holds() {
+    let dir = TempDir::new("gen-reader-clean");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let readers: Vec<Root> = (0..4)
+        .map(|_| Root::reader(dir.path(), &p).unwrap())
+        .collect();
+    let root = readers[0].path().parent().unwrap().to_owned();
+    for r in &readers[1..] {
+        r.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    }
+    let mut readers = readers.into_iter();
+    let r0 = readers.next().unwrap();
+    let (r1, r2, r3) = (
+        readers.next().unwrap(),
+        readers.next().unwrap(),
+        readers.next().unwrap(),
+    );
+    drop((r0, r1, r3));
+    // A cleanup a crash cut short left a renamed directory: the next one deletes it.
+    fs::create_dir_all(root.join("reader-trash-0123").join("log")).unwrap();
+    let again = Root::reader(dir.path(), &p).unwrap();
+    assert_eq!(again.path(), root.join("reader-0"));
+    let mut left: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("reader-"))
+        .collect();
+    left.sort();
+    assert_eq!(left, ["reader-0", "reader-2"]);
+    // The held one keeps working, its generation whole.
+    r2.finish_leftovers().unwrap();
+    assert!(r2.current().unwrap().is_some());
+    // Once it is let go, the next reader deletes it too.
+    drop(r2);
+    drop(again);
+    let next = Root::reader(dir.path(), &p).unwrap();
+    assert_eq!(next.path(), root.join("reader-0"));
+    assert!(!root.join("reader-2").exists());
+}
+
 #[test]
 fn a_built_generation_becomes_current_once_published() {
     let dir = TempDir::new("gen-build");
@@ -186,6 +301,75 @@ fn a_crash_after_each_publish_step_converges_to_one_generation() {
             old.lineage
         };
         assert_eq!(current.lineage, want, "after {steps} steps");
+        if done < steps {
+            break;
+        }
+        steps += 1;
+    }
+    assert_eq!(steps, 10);
+}
+
+// A build whose log rolled and was trimmed before its publish (its first segment gone) still names
+// what it supersedes in every segment left: a crash after any publish step converges to one
+// generation.
+#[test]
+fn a_rolled_and_trimmed_build_converges_after_a_crash_at_each_publish_step() {
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let mut steps = 0;
+    loop {
+        let dir = TempDir::new("gen-crash-trimmed");
+        let root = Root::lock(dir.path(), &p).unwrap();
+        let old = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+        let mut building = root.build(header(2)).unwrap();
+        building.log.set_roll_bytes(256);
+        for n in 0..12u8 {
+            building
+                .log
+                .append(&RecordBody::Commit {
+                    frame: vec![n; 200],
+                })
+                .unwrap();
+        }
+        let last = Position(building.log.next_position().0 - 1);
+        building
+            .log
+            .append(&RecordBody::Ack {
+                acked: last,
+                acked_offset: Offset::from_u64(1),
+                log_bytes: 0,
+            })
+            .unwrap();
+        building
+            .log
+            .append(&RecordBody::Base { position: last })
+            .unwrap();
+        building
+            .log
+            .append(&RecordBody::Commit {
+                frame: vec![99; 200],
+            })
+            .unwrap();
+        assert!(building.log.trim().unwrap() > 0);
+        let done = building.crash_after(Fate::Trash, steps).unwrap();
+        drop(root);
+        let root = Root::lock(dir.path(), &p).unwrap();
+        root.finish_leftovers().unwrap();
+        let current = root.current().unwrap().unwrap();
+        let entries: Vec<String> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n != "lock")
+            .collect();
+        assert_eq!(entries.len(), 1, "after {steps} steps: {entries:?}");
+        let want = if steps >= 4 {
+            Lineage([2; 16])
+        } else {
+            old.lineage
+        };
+        assert_eq!(current.lineage, want, "after {steps} steps");
+        if steps >= 4 {
+            assert_eq!(current.first_header().unwrap().supersedes, Some(old.id));
+        }
         if done < steps {
             break;
         }

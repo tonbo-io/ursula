@@ -38,6 +38,10 @@
 //! every write fails (`SQLITE_IOERR_WRITE`), db-file writes included, so no checkpoint moves pages
 //! of a commit that may be discarded. A panic in a file method resets `internal`.
 //!
+//! A reader binding's db file opens read-only whatever the connection asked (design D6), so SQLite
+//! refuses its writes with `SQLITE_READONLY`, and a write or truncate that reaches one of its files
+//! anyway is refused the same way: a reader logs no commit.
+//!
 //! SQLite calls these methods with pointers it owns, under the VFS contract every unsafe block here
 //! relies on: each `file` is one this VFS opened and has not closed, laid out as [`File`] in the
 //! `szOsFile` bytes SQLite allocated for it (`x_open` fills it in), and buffers and out-parameters
@@ -397,6 +401,15 @@ unsafe fn x_open(
             .zip(connected)
             .map(|(e, connected)| (Arc::clone(&e.binding), connected)),
     );
+    // A reader binding's db file opens read-only, so SQLite refuses every write on it with
+    // `SQLITE_READONLY` before one reaches the file (design D6).
+    let flags = match &ext {
+        Some(e) if e.is_main() && e.binding.handle.role == crate::driver::Role::Reader => {
+            (flags & !(ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE))
+                | ffi::SQLITE_OPEN_READONLY
+        }
+        _ => flags,
+    };
     // A bound db's WAL opens as `db-uwal`, under a name the file owns until it closes ("unix"
     // keeps it as its path). Without URI parameters: the WAL takes none of its own.
     let (zname, flags) = match (&ext, name) {
@@ -651,6 +664,9 @@ unsafe fn x_write(
     let b = &ext.binding;
     if b.reset_kind().is_some() {
         return ffi::SQLITE_IOERR_WRITE;
+    }
+    if b.handle.role == crate::driver::Role::Reader {
+        return ffi::SQLITE_READONLY;
     }
     let Ok(len) = usize::try_from(amt) else {
         return ffi::SQLITE_IOERR_WRITE;
@@ -998,6 +1014,9 @@ unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> 
     let b = &ext.binding;
     if b.reset_kind().is_some() {
         return ffi::SQLITE_IOERR_TRUNCATE;
+    }
+    if b.handle.role == crate::driver::Role::Reader {
+        return ffi::SQLITE_READONLY;
     }
     let mut c = b.lock();
     if ext.is_main() {

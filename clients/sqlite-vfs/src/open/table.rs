@@ -36,6 +36,27 @@
 //! | trusted, with a CLAIM record | open provisionally, the claim deferred behind a pre-check |
 //! | trusted, without one | wait: retry until the open's signal fires |
 //! | none | wait |
+//!
+//! A reader's open (design D6) decides by [`decide_reader`] instead, after the same checks of the
+//! HEAD ([`check_head`]). A reader generation holds no commit of its own, only what it read, so it
+//! is never salvaged and never re-keyed: anything the stream no longer extends is built anew. A
+//! trusted reader generation of another cluster is refused as an owner's is (the stream it reads
+//! is not the one it caught up with), and a reader with none builds, having nothing to compare. A
+//! closed stream is read like any other: a reader writes nothing to it.
+//!
+//! | reader generation | HEAD | row |
+//! | --- | --- | --- |
+//! | any | no `Ursula-Protocol: 2` | refuse `server_too_old` |
+//! | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
+//! | any | `404` | refuse `not_found` |
+//! | any | another content type | refuse `stream_format` |
+//! | none, replaced | `200`, closed or not | build, the replaced one trashed |
+//! | trusted, same token | `200`, closed or not | catch up in place |
+//! | trusted, other token | `200`, closed or not | build, the generation trashed |
+//!
+//! When the reader's first HEAD got no answer with nothing sent (the stream is unreachable),
+//! [`decide_reader_unreachable`] opens a trusted reader generation as it is, and otherwise waits:
+//! the open retries until its signal fires.
 
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
@@ -174,7 +195,7 @@ pub(crate) enum Refused {
         local: String,
         stream: ClusterId,
     },
-    /// The stream is missing and the trusted generation holds data.
+    /// The stream is missing and the trusted generation holds data, or a reader opens it.
     NotFound,
     ContentType {
         found: Option<String>,
@@ -233,8 +254,6 @@ pub(crate) fn rekeys(summary: &LocalSummary, head: &StreamHead) -> bool {
     inherits(head, summary.incarnation, summary.acked_offset) && takeover_may_rekey(summary.pending)
 }
 
-/// The table of design §5.5 for an owner's open, on the local generation it found, what was
-/// asked, and the HEAD it got.
 /// The identity a HEAD named, checked (design §6.3): protocol 2, and the cluster id `ours` when a
 /// generation names one. The open table and a build's HEADs share it.
 pub(crate) fn check_identity<'a>(
@@ -257,36 +276,116 @@ pub(crate) fn check_identity<'a>(
     }
 }
 
-pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>) -> OpenRow<L, R> {
-    let refuse = |refused, local| OpenRow::Refuse { refused, local };
-    let ours = match &local {
+/// Whether an open takes a closed stream: an owner's cannot write to it, a reader's reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnClosed {
+    Refuse,
+    Read,
+}
+
+/// The checks of a HEAD every open makes, in the table's order, before the local generation
+/// decides anything: the protocol and the trusted generation's cluster id, then a `404` (`None`),
+/// then the content type, then a closed stream when `on_closed` refuses it. The owner's table and
+/// the reader rows share them.
+fn check_head<L, R>(
+    local: &Local<L, R>,
+    head: HeadSeen<'_>,
+    on_closed: OnClosed,
+) -> Result<Option<(ClusterId, StreamHead)>, Refused> {
+    let ours = match local {
         Local::Trusted(summary, _) => Some(summary.cluster_id.as_str()),
         Local::None | Local::Replaced(_) => None,
     };
-    let identity = match check_identity(head.identity, ours) {
-        Ok(identity) => identity,
-        Err(refused) => return refuse(refused, local),
-    };
+    let identity = check_identity(head.identity, ours)?;
     let Some(stream) = head.stream else {
-        let not_found = matches!(
-            &local,
-            Local::Trusted(summary, _) if summary.holds_data && !asked.recreate
-        );
-        return if not_found {
-            refuse(Refused::NotFound, local)
-        } else {
-            OpenRow::Create { local }
-        };
+        return Ok(None);
     };
     if head.content_type != Some(CONTENT_TYPE) {
         let found = head.content_type.map(str::to_owned);
-        return refuse(Refused::ContentType { found }, local);
+        return Err(Refused::ContentType { found });
     }
-    if stream.closed() {
-        return refuse(Refused::Closed, local);
+    if stream.closed() && on_closed == OnClosed::Refuse {
+        return Err(Refused::Closed);
     }
-    let cluster_id = identity.cluster_id.clone();
-    let head = *stream;
+    Ok(Some((identity.cluster_id.clone(), *stream)))
+}
+
+/// What a reader's open does (design D6), carrying the trusted reader generation when a row uses
+/// it. Every other local generation is dropped: a build replaces it, trashed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReaderRow<L> {
+    /// Build a reader generation from the stream, the local one trashed.
+    Build {
+        cluster_id: ClusterId,
+        head: StreamHead,
+    },
+    /// The reader generation has the stream's token: read the stream from its acknowledged offset
+    /// to the tail `head` names into it.
+    CatchUp {
+        local: L,
+        cluster_id: ClusterId,
+        head: StreamHead,
+    },
+    Refuse(Refused),
+}
+
+/// The reader rows of design D6, on the reader generation the open found and the HEAD it got.
+pub(crate) fn decide_reader<L, R>(local: Local<L, R>, head: HeadSeen<'_>) -> ReaderRow<L> {
+    let (cluster_id, head) = match check_head(&local, head, OnClosed::Read) {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return ReaderRow::Refuse(Refused::NotFound),
+        Err(refused) => return ReaderRow::Refuse(refused),
+    };
+    match local {
+        Local::Trusted(summary, local) if summary.incarnation == head.incarnation() => {
+            ReaderRow::CatchUp {
+                local,
+                cluster_id,
+                head,
+            }
+        }
+        Local::None | Local::Replaced(_) | Local::Trusted(..) => {
+            ReaderRow::Build { cluster_id, head }
+        }
+    }
+}
+
+/// What a reader's open does when its first HEAD got no answer and nothing went out (design D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReaderUnreachableRow<L, R> {
+    /// Open the trusted reader generation `local` as it is: the stream as of its last open.
+    Open { local: L },
+    /// Retry until the open's signal fires, the local generation as it was found.
+    Wait { local: Local<L, R> },
+}
+
+/// The unreachable reader rows of design D6, on the reader generation the open found.
+pub(crate) fn decide_reader_unreachable<L, R>(local: Local<L, R>) -> ReaderUnreachableRow<L, R> {
+    match local {
+        Local::Trusted(_, local) => ReaderUnreachableRow::Open { local },
+        local @ (Local::None | Local::Replaced(_)) => ReaderUnreachableRow::Wait { local },
+    }
+}
+
+/// The table of design §5.5 for an owner's open, on the local generation it found, what was
+/// asked, and the HEAD it got.
+pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>) -> OpenRow<L, R> {
+    let refuse = |refused, local| OpenRow::Refuse { refused, local };
+    let (cluster_id, head) = match check_head(&local, head, OnClosed::Refuse) {
+        Ok(Some(stream)) => stream,
+        Ok(None) => {
+            let not_found = matches!(
+                &local,
+                Local::Trusted(summary, _) if summary.holds_data && !asked.recreate
+            );
+            return if not_found {
+                refuse(Refused::NotFound, local)
+            } else {
+                OpenRow::Create { local }
+            };
+        }
+        Err(refused) => return refuse(refused, local),
+    };
     let (summary, value) = match local {
         Local::None => {
             return OpenRow::Build {
@@ -351,11 +450,15 @@ mod tests {
     use super::Local;
     use super::LocalSummary;
     use super::OpenRow;
+    use super::ReaderRow;
+    use super::ReaderUnreachableRow;
     use super::Refused;
     use super::Superseded;
     use super::UnreachableRow;
     use super::Why;
     use super::decide;
+    use super::decide_reader;
+    use super::decide_reader_unreachable;
     use super::decide_unreachable;
     use crate::codec::frame::CONTENT_TYPE;
     use crate::ids::Activation;
@@ -676,5 +779,144 @@ mod tests {
             decide_unreachable(unclaimed.clone()),
             UnreachableRow::Wait { local: unclaimed }
         );
+    }
+
+    type ReadRow = ReaderRow<&'static str>;
+
+    fn reader_build(head: StreamHead) -> ReadRow {
+        ReaderRow::Build {
+            cluster_id: cluster("cluster-a"),
+            head,
+        }
+    }
+
+    // A reader refuses what an owner refuses before any stream is read, and a missing stream
+    // whatever it holds locally: it never creates one.
+    #[test]
+    fn a_reader_refuses_an_old_server_another_cluster_and_a_missing_stream() {
+        let head = stream(1, 0, None);
+        let no_identity = HeadSeen {
+            identity: None,
+            stream: Some(&head),
+            content_type: Some(CONTENT_TYPE),
+        };
+        assert_eq!(
+            decide_reader(local(1, 0), no_identity),
+            ReaderRow::Refuse(Refused::ServerTooOld { protocol: None })
+        );
+        let b = identity("cluster-b");
+        assert_eq!(
+            decide_reader(local(1, 0), seen(&b, Some(&head))),
+            ReaderRow::Refuse(Refused::WrongCluster {
+                local: "cluster-a".to_owned(),
+                stream: cluster("cluster-b"),
+            })
+        );
+        let a = identity("cluster-a");
+        for found in [
+            NONE,
+            REPLACED,
+            local(1, 0),
+            trusted(1, 0, Unacked::Nothing, false),
+        ] {
+            assert_eq!(
+                decide_reader(found, seen(&a, None)),
+                ReaderRow::Refuse(Refused::NotFound)
+            );
+        }
+        let other = HeadSeen {
+            content_type: Some("text/plain"),
+            ..seen(&a, Some(&head))
+        };
+        assert_eq!(
+            decide_reader(NONE, other),
+            ReaderRow::Refuse(Refused::ContentType {
+                found: Some("text/plain".to_owned())
+            })
+        );
+    }
+
+    // The same token catches up in place. Anything else builds anew, an inheriting history too: a
+    // reader generation holds nothing of its own to keep.
+    #[test]
+    fn a_reader_catches_up_the_same_token_and_builds_over_anything_else() {
+        let id = identity("cluster-a");
+        let head = stream(1, 40, None);
+        assert_eq!(
+            decide_reader(local(1, 12), seen(&id, Some(&head))),
+            ReaderRow::CatchUp {
+                local: "gen",
+                cluster_id: cluster("cluster-a"),
+                head
+            }
+        );
+        for found in [NONE, REPLACED] {
+            assert_eq!(
+                decide_reader(found, seen(&id, Some(&head))),
+                reader_build(head)
+            );
+        }
+        let inheriting = stream(2, 50, Some((1, 40)));
+        assert_eq!(
+            decide_reader(local(1, 40), seen(&id, Some(&inheriting))),
+            reader_build(inheriting)
+        );
+        let lossy = stream(2, 50, Some((1, 39)));
+        assert_eq!(
+            decide_reader(local(1, 40), seen(&id, Some(&lossy))),
+            reader_build(lossy)
+        );
+    }
+
+    // A reader reads a closed stream, which an owner refuses: it writes nothing to it.
+    #[test]
+    fn a_reader_reads_a_closed_stream() {
+        let id = identity("cluster-a");
+        let closed = stream(1, 40, None).with_closed(true);
+        assert_eq!(
+            decide_reader(NONE, seen(&id, Some(&closed))),
+            reader_build(closed)
+        );
+        assert_eq!(
+            decide_reader(local(1, 12), seen(&id, Some(&closed))),
+            ReaderRow::CatchUp {
+                local: "gen",
+                cluster_id: cluster("cluster-a"),
+                head: closed
+            }
+        );
+        assert_eq!(
+            decide(NONE, ask(), seen(&id, Some(&closed))),
+            refused(Refused::Closed, NONE)
+        );
+    }
+
+    // A reader with no local generation has nothing to compare a cluster id with: it builds from
+    // whatever deployment answers, as an owner does.
+    #[test]
+    fn a_reader_with_no_generation_builds_from_any_cluster() {
+        let b = identity("cluster-b");
+        let head = stream(1, 40, None);
+        assert_eq!(
+            decide_reader(NONE, seen(&b, Some(&head))),
+            ReaderRow::Build {
+                cluster_id: cluster("cluster-b"),
+                head
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreachable_reader_opens_a_trusted_generation_and_waits_without_one() {
+        assert_eq!(
+            decide_reader_unreachable(local(1, 40)),
+            ReaderUnreachableRow::Open { local: "gen" }
+        );
+        for found in [NONE, REPLACED] {
+            assert_eq!(
+                decide_reader_unreachable(found.clone()),
+                ReaderUnreachableRow::Wait { local: found }
+            );
+        }
     }
 }

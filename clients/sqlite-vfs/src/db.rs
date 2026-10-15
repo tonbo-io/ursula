@@ -15,6 +15,16 @@
 //! process: an open under another root gives the binding up when nothing of the host holds it
 //! ([`BindingHandle::give_up`]), waits for it to retire and binds anew, and is refused `in_use`
 //! otherwise.
+//!
+//! A read-only open (design D6) in a process that owns the stream under the same cache root gets
+//! the owner's binding, so its read-only connection sees the owner's latest commits. Nothing in the
+//! VFS makes that connection read-only: a write on the owner's binding is the owning process's own,
+//! so a host opens the returned path with `SQLITE_OPEN_READONLY`. Under another cache root it meets
+//! the owner's binding as an owner's open would: given up when nothing of the host holds it, and
+//! refused otherwise. Only a process with no binding of the stream opens a reader binding, in a
+//! reader directory of its own, which later read-only opens of the process share while it is
+//! bound: a reader sees the stream as of the open that bound it, and the first read-only open
+//! after it retired catches up again.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -40,6 +50,7 @@ use crate::driver::Holder;
 use crate::driver::Kept;
 use crate::driver::LogPoisoned;
 use crate::driver::OpenId;
+use crate::driver::Role;
 use crate::driver::Undone;
 use crate::driver::runtime::driver;
 use crate::error::Error;
@@ -51,6 +62,7 @@ use crate::ids::Position;
 use crate::log;
 use crate::log::Level;
 use crate::open::OpenSpec;
+use crate::options::Access;
 use crate::options::OpenOptions;
 use crate::replicator::ResetKind;
 use crate::replog::Log;
@@ -223,17 +235,42 @@ impl Binding {
     }
 }
 
+/// An open's stream and role: the registry keeps owners' and readers' opens apart.
+type OpenKey = (String, Role);
+
 #[derive(Default)]
 struct Registry {
-    /// By canonical stream name.
+    /// Owners' bindings, by canonical stream name.
     names: HashMap<String, Arc<Binding>>,
-    /// By db file path.
+    /// Reader bindings, by canonical stream name.
+    readers: HashMap<String, Arc<Binding>>,
+    /// By db file path, both roles.
     paths: HashMap<String, Arc<Binding>>,
-    /// Opens in progress, by canonical stream name.
-    opens: HashMap<String, OpenEntry>,
-    /// Streams whose open resolved and whose binding one caller is registering ([`register`]):
-    /// another open of one waits on [`registered`] until it is in `names`.
-    registering: HashSet<String>,
+    /// Opens in progress, by canonical stream name and role.
+    opens: HashMap<OpenKey, OpenEntry>,
+    /// Opens that resolved and whose binding one caller is registering ([`register`]): another
+    /// open of one waits on [`registered`] until it is registered.
+    registering: HashSet<OpenKey>,
+}
+
+impl Registry {
+    /// The bound databases of `role`, by canonical stream name.
+    fn bindings(&mut self, role: Role) -> &mut HashMap<String, Arc<Binding>> {
+        match role {
+            Role::Owner => &mut self.names,
+            Role::Reader => &mut self.readers,
+        }
+    }
+
+    /// Whether `name` is registering for an open of `role`: a reader's open waits for the owner's
+    /// registration too, whose binding it would share.
+    fn registering(&self, name: &str, role: Role) -> bool {
+        let of = |role| self.registering.contains(&(name.to_owned(), role));
+        match role {
+            Role::Owner => of(Role::Owner),
+            Role::Reader => of(Role::Owner) || of(Role::Reader),
+        }
+    }
 }
 
 /// An open in progress, and who asked for it.
@@ -250,8 +287,8 @@ struct OpenEntry {
     returned: bool,
 }
 
-/// Marks a stream registering until dropped, a panic in [`register`] included.
-struct Registering<'a>(&'a str);
+/// Marks an open registering until dropped, a panic in [`register`] included.
+struct Registering<'a>(&'a OpenKey);
 
 impl Drop for Registering<'_> {
     fn drop(&mut self) {
@@ -325,12 +362,17 @@ pub(crate) fn open(
     };
     // Resolved before the registry's lock is taken.
     let requested = CacheDir::new(&dir.map_or_else(default_dir, PathBuf::from));
+    let role = match options.access {
+        Access::Owner { .. } => Role::Owner,
+        Access::Reader => Role::Reader,
+    };
+    let key: OpenKey = (name.as_str().to_owned(), role);
     loop {
         let open = {
             let mut reg = registry();
             // Another caller registers the binding of this stream: it is local work.
             let deadline = Instant::now().checked_add(Duration::from_millis(REGISTERING_MS));
-            while reg.registering.contains(name.as_str()) {
+            while reg.registering(name.as_str(), role) {
                 let left = deadline
                     .and_then(|d| d.checked_duration_since(Instant::now()))
                     .unwrap_or_default();
@@ -344,7 +386,7 @@ pub(crate) fn open(
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
-            match claim(&mut reg, name.as_str(), &requested, timeout_ms > 0)? {
+            match claim(&mut reg, &key, &requested, timeout_ms > 0)? {
                 Claim::Bound(b) => {
                     handed_out(&b);
                     return Ok(Opened::Bound(b));
@@ -357,11 +399,11 @@ pub(crate) fn open(
                         activation: options.activation.unwrap_or_else(process_activation),
                         max_pending_bytes: options.max_pending_bytes,
                         max_request_bytes: crate::config::max_request_bytes(),
-                        recreate: options.recreate,
+                        access: options.access,
                         timeout_ms: open_ms,
                     };
                     let open = driver().open(spec)?;
-                    reg.opens.insert(name.as_str().to_owned(), OpenEntry {
+                    reg.opens.insert(key.clone(), OpenEntry {
                         open,
                         url: url.to_owned(),
                         dir: requested.clone(),
@@ -372,7 +414,7 @@ pub(crate) fn open(
                 }
             }
         };
-        if let Some(opened) = take(name.as_str(), open, timeout_ms)? {
+        if let Some(opened) = take(&key, open, timeout_ms)? {
             return Ok(opened);
         }
         // Another caller took the open's result: its registration, or a new open, is next.
@@ -398,31 +440,42 @@ enum Claim {
 /// the new open once it retired. A reset or retired binding leaves the registry for a new open,
 /// which beside a reset binding's open connections shares their root and builds from a copy of
 /// their generation (design §5.6).
+///
+/// A reader's open first meets the owner's binding of the stream by the same rule (design D6):
+/// under the same root it shares it, under another one it gives it up or is refused. Only with no
+/// owner's binding left does it go to its own reader binding or open.
 fn claim(
     reg: &mut Registry,
-    name: &str,
+    key: &OpenKey,
     requested: &CacheDir,
     blocking: bool,
 ) -> Result<Claim, Error> {
-    if let Some(entry) = reg.opens.get(name)
+    let (name, role) = (key.0.as_str(), key.1);
+    if let Some(entry) = reg.opens.get(key)
         && entry.dir != *requested
     {
         return Err(elsewhere(&entry.dir, requested, Kept::Opening));
     }
-    if let Some(b) = reg.names.get(name).cloned() {
-        if b.reset_kind().is_none() {
-            if b.dir != *requested {
-                b.handle
-                    .give_up()
-                    .map_err(|kept| elsewhere(&b.dir, requested, kept))?;
-            } else if b.handle.revive() {
-                return Ok(Claim::Bound(b));
+    let roles: &[Role] = match role {
+        Role::Owner => &[Role::Owner],
+        Role::Reader => &[Role::Owner, Role::Reader],
+    };
+    for &of in roles {
+        if let Some(b) = reg.bindings(of).get(name).cloned() {
+            if b.reset_kind().is_none() {
+                if b.dir != *requested {
+                    b.handle
+                        .give_up()
+                        .map_err(|kept| elsewhere(&b.dir, requested, kept))?;
+                } else if b.handle.revive() {
+                    return Ok(Claim::Bound(b));
+                }
             }
+            reg.bindings(of).remove(name);
+            reg.paths.remove(&b.path);
         }
-        reg.names.remove(name);
-        reg.paths.remove(&b.path);
     }
-    match reg.opens.get_mut(name) {
+    match reg.opens.get_mut(key) {
         Some(entry) => {
             if blocking {
                 entry.waiting = entry.waiting.saturating_add(1);
@@ -486,7 +539,7 @@ const DEADLINE_GRACE_MS: u64 = 1_000;
 /// registered. The result is taken under the registry lock, which marks the stream registering,
 /// so a concurrent open of it waits for the registration instead of opening again. `None` when
 /// another caller took the result.
-fn take(name: &str, open: OpenId, timeout_ms: u64) -> Result<Option<Opened>, Error> {
+fn take(name: &OpenKey, open: OpenId, timeout_ms: u64) -> Result<Option<Opened>, Error> {
     if timeout_ms > 0 {
         let wait = Duration::from_millis(timeout_ms.saturating_add(DEADLINE_GRACE_MS));
         if !driver().wait_resolved(open, wait) {
@@ -525,7 +578,7 @@ fn take(name: &str, open: OpenId, timeout_ms: u64) -> Result<Option<Opened>, Err
         Ok(bound) => bound,
         Err(e) => return Err(Error::Open(e)),
     };
-    reg.registering.insert(name.to_owned());
+    reg.registering.insert(name.clone());
     drop(reg);
     let _registering = Registering(name);
     register(bound, url).map(|b| Some(Opened::Bound(b)))
@@ -563,15 +616,19 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
         decided: Condvar::new(),
     });
     let mut reg = registry();
-    reg.names
+    reg.bindings(handle.role)
         .insert(handle.name.as_str().to_owned(), Arc::clone(&b));
     reg.paths.insert(path, Arc::clone(&b));
     drop(reg);
     log::emit(Level::Info, "open", &[
         ("file", &b.path),
         ("stream", &b.url),
+        ("role", &handle.role.as_str()),
     ]);
-    crate::snapshotter::spawn(&b);
+    // A reader publishes no snapshot: it claims nothing.
+    if handle.role == Role::Owner {
+        crate::snapshotter::spawn(&b);
+    }
     handed_out(&b);
     Ok(b)
 }
@@ -687,6 +744,8 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
             attach: crate::driver::Attach::Resumed,
             provisional: false,
             dir: dir.to_owned(),
+            role: crate::driver::Role::Owner,
+            closed: false,
         },
         Arc::new(root),
     ));
@@ -744,6 +803,7 @@ mod tests {
     use crate::driver::Kept;
     use crate::driver::Life;
     use crate::driver::OpenId;
+    use crate::driver::Role;
     use crate::error::Action;
     use crate::error::Error;
     use crate::error::ErrorKind;
@@ -814,13 +874,15 @@ mod tests {
         let second = TempDir::new("db-claim-second");
         let b = for_tests(first.path());
         let name = b.handle.name.as_str().to_owned();
+        let key = (name.clone(), Role::Owner);
+        let reader = (name.clone(), Role::Reader);
         let mut reg = Registry::default();
         reg.names.insert(name.clone(), Arc::clone(&b));
         reg.paths.insert(b.path.clone(), Arc::clone(&b));
         let here = CacheDir::new(first.path());
         let there = CacheDir::new(second.path());
         // Handed out, not connected yet.
-        let e = claim(&mut reg, &name, &there, true).unwrap_err();
+        let e = claim(&mut reg, &key, &there, true).unwrap_err();
         assert_eq!(
             kept(&e),
             (Kept::HandedOut, ErrorKind::BoundElsewhere, Action::Fix)
@@ -832,10 +894,20 @@ mod tests {
         )));
         // A connection opens: refused; under its own root it is handed out again.
         assert!(b.handle.connect(Holder::Host).is_some());
-        let e = claim(&mut reg, &name, &there, true).unwrap_err();
+        let e = claim(&mut reg, &key, &there, true).unwrap_err();
+        assert_eq!(kept(&e).0, Kept::Connections(1));
+        // A read-only open meets the owner's binding by the same rule: refused under another root
+        // while the host holds it, the owner's binding handed out under its own.
+        let e = claim(&mut reg, &reader, &there, true).unwrap_err();
         assert_eq!(kept(&e).0, Kept::Connections(1));
         assert!(matches!(
-            claim(&mut reg, &name, &here, true),
+            claim(&mut reg, &reader, &here, true),
+            Ok(Claim::Bound(shared)) if Arc::ptr_eq(&shared, &b)
+        ));
+        assert!(b.handle.connect(Holder::Host).is_some());
+        assert!(!b.handle.disconnect(Holder::Host));
+        assert!(matches!(
+            claim(&mut reg, &key, &here, true),
             Ok(Claim::Bound(_))
         ));
         assert!(b.handle.connect(Holder::Host).is_some());
@@ -843,13 +915,13 @@ mod tests {
         assert!(!b.handle.disconnect(Holder::Host));
         assert!(b.handle.disconnect(Holder::Host));
         assert!(matches!(
-            claim(&mut reg, &name, &there, true),
+            claim(&mut reg, &key, &there, true),
             Ok(Claim::Start)
         ));
         assert_eq!(b.handle.life(), Life::GivenUp);
         assert!(reg.names.is_empty() && reg.paths.is_empty());
         // The open in progress under the second root.
-        reg.opens.insert(name.clone(), OpenEntry {
+        reg.opens.insert(key.clone(), OpenEntry {
             open: OpenId(7),
             url: b.url.clone(),
             dir: there.clone(),
@@ -857,11 +929,11 @@ mod tests {
             returned: false,
         });
         assert!(matches!(
-            claim(&mut reg, &name, &there, false),
+            claim(&mut reg, &key, &there, false),
             Ok(Claim::Join(OpenId(7)))
         ));
-        assert!(reg.opens.get(&name).is_some_and(|entry| entry.returned));
-        let e = claim(&mut reg, &name, &here, true).unwrap_err();
+        assert!(reg.opens.get(&key).is_some_and(|entry| entry.returned));
+        let e = claim(&mut reg, &key, &here, true).unwrap_err();
         assert_eq!(
             kept(&e),
             (Kept::Opening, ErrorKind::BoundElsewhere, Action::Fix)

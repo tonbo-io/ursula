@@ -230,7 +230,7 @@ pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
 }
 
 /// Logs the foreign `frames` (COMMITs, then one ACK at the last), fsyncs the log, applies them,
-/// fsyncs the db and appends a BASE, so a crash midway replays. Refused while this generation has
+/// fsyncs the db and appends a BASE, so a crash midway replays, then trims the log (F3). Refused while this generation has
 /// pending commits: commits after both the log's latest ACK and `acked`, the position the caller
 /// knows acknowledged (a takeover's reconcile acknowledges commits before any ACK names them).
 #[cfg(test)]
@@ -247,12 +247,37 @@ pub(crate) fn catch_up(
     if let Some(&(first, _)) = m.recovered.pending().iter().find(|(p, _)| *p > acked) {
         return Err(LocalError::OwnPending { first });
     }
+    catch_up_in_place(m, frames)
+}
+
+/// [`catch_up_files`] into a published generation, then the log trimmed by the one policy owners
+/// trim by after an ACK ([`Log::trim`], F3: segments wholly at or below `min(base, acked)`), so a
+/// reader that only ever catches up keeps one segment and the records since its base instead of
+/// every frame it read. Never inside a build, as a second guard: every segment names the
+/// generation a build supersedes, which a crash after the publish rename needs
+/// ([`Building::publish`]), and a build's log is trimmed only once published
+/// ([`trim_published`]).
+///
+/// [`Building::publish`]: crate::generation::Building::publish
+pub(crate) fn catch_up_in_place(
+    m: &mut Materialized,
+    frames: &[ForeignFrame],
+) -> Result<(), LocalError> {
     let db_path = m.generation.db();
-    catch_up_files(&mut m.log, &m.db, &db_path, frames)
+    catch_up_files(&mut m.log, &m.db, &db_path, frames)?;
+    trim_published(m)
+}
+
+/// Trims the log of a published generation (F3): the generation it superseded is gone, so its
+/// first segment, which names it, is no longer needed.
+pub(crate) fn trim_published(m: &mut Materialized) -> Result<(), LocalError> {
+    m.log.trim()?;
+    Ok(())
 }
 
 /// [`catch_up`] into a log and db file of any generation, a published one or one being built,
-/// with no check of pending commits: the caller knows there are none.
+/// with no check of pending commits: the caller knows there are none. It trims nothing: a build's
+/// log keeps its first segment until the build is published ([`catch_up_in_place`]).
 pub(crate) fn catch_up_files(
     log: &mut Log,
     db: &File,

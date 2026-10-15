@@ -470,6 +470,103 @@ fn catching_up_logs_applies_and_survives_a_reopen() {
     ));
 }
 
+// Catch-ups alone (a reader's, a build's reads) trim the log as an owner's ACK does: however many
+// frames went through, the log keeps the segments above its base, and the db stays whole.
+#[test]
+fn catching_up_trims_the_segments_below_its_base() {
+    let dir = TempDir::new("catch-up-trim");
+    let (_root, g) = generation(&dir);
+    let mut m = materialize(&g).unwrap();
+    m.log.set_roll_bytes(4096);
+    let first = m.log.segment_paths();
+    let foreign = Lineage([9; 16]);
+    for n in 1..=40u64 {
+        let record = CommitRecord {
+            db_pages_after: 1,
+            pages: vec![(1, image(1, n as u8))],
+        };
+        let id = CommitId {
+            lineage: foreign,
+            position: Position(n),
+        };
+        let crate::codec::frame::Decoded::Frame { frame, .. } =
+            crate::codec::frame::decode(&encode_commit(id, &record).unwrap(), u64::MAX).unwrap()
+        else {
+            panic!("partial");
+        };
+        let frames = [ForeignFrame {
+            frame,
+            end_offset: Offset::from_u64(100 * n),
+        }];
+        catch_up(&mut m, Position(0), &frames).unwrap();
+        assert!(
+            m.log.segment_paths().len() <= 2,
+            "{} segments after {n} catch-ups",
+            m.log.segment_paths().len()
+        );
+    }
+    // The log rolled, and the segments it rolled past are gone.
+    assert!(!first[0].exists());
+    drop(m);
+    let m = materialize(&g).unwrap();
+    assert_eq!(read(&g.db())[16..], image(1, 40)[16..]);
+    assert_eq!(m.recovered.acked_offset, Offset::from_u64(4_000));
+}
+
+// A build reads a tail long enough to roll its log many times, then crashes after the publish
+// rename and before the generation it supersedes goes: its log kept the first segment, which names
+// that generation, so the next open finishes the publish instead of finding two generations.
+#[test]
+fn a_build_that_rolls_keeps_the_segment_naming_what_it_supersedes() {
+    let dir = TempDir::new("catch-up-build-roll");
+    let (root, old) = generation(&dir);
+    let mut building = root
+        .build(SegmentHeader {
+            lineage: Lineage([4; 16]),
+            ..header()
+        })
+        .unwrap();
+    building.log.set_roll_bytes(256);
+    let foreign = Lineage([9; 16]);
+    let db_path = building.db_path();
+    for n in 1..=40u64 {
+        let frames = [ForeignFrame {
+            frame: foreign_commit(foreign, n),
+            end_offset: Offset::from_u64(100 * n),
+        }];
+        super::catch_up_files(&mut building.log, &building.db, &db_path, &frames).unwrap();
+    }
+    assert!(building.log.segment_paths().len() > 2);
+    // FsyncDb, FsyncLog, FsyncDir, Rename, FsyncRoot: the old generation is still there.
+    assert_eq!(building.crash_after(Fate::Trash, 5).unwrap(), 5);
+    assert!(old.dir.exists());
+    drop(root);
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    root.finish_leftovers().unwrap();
+    let current = root.current().unwrap().unwrap();
+    assert_eq!(current.lineage, Lineage([4; 16]));
+    assert!(!old.dir.exists());
+}
+
+/// A one-page COMMIT frame of `lineage` at `position`, its page filled with the position.
+fn foreign_commit(lineage: Lineage, position: u64) -> Frame {
+    let record = CommitRecord {
+        db_pages_after: 1,
+        pages: vec![(1, image(1, position as u8))],
+    };
+    let id = CommitId {
+        lineage,
+        position: Position(position),
+    };
+    let crate::codec::frame::Decoded::Frame { frame, .. } =
+        crate::codec::frame::decode(&encode_commit(id, &record).unwrap(), u64::MAX).unwrap()
+    else {
+        panic!("partial");
+    };
+    frame
+}
+
 #[test]
 fn catching_up_is_refused_while_our_commits_are_pending() {
     let dir = TempDir::new("catch-up-pending");

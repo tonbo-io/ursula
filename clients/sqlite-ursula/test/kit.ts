@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { expect, inject } from "vitest";
+import { call } from "../src/control.ts";
 
 /** The base URL of the server the suite runs against (test/stack.ts). */
 export const ursulaUrl = (): string => inject("ursulaUrl");
@@ -90,6 +91,30 @@ export async function foreignAppend(path: string, body: string): Promise<void> {
 	const r = onModel()
 		? await fetch(`${directUrl()}/__model/foreign?path=${path}`, { method: "POST", body })
 		: await fetch(`${directUrl()}${path}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body });
+	expect(r.ok, `${r.status} ${await r.text()}`).toBe(true);
+}
+
+/**
+ * Waits until the binding of the db file at `path` retired: after its last connection closed it
+ * drains first, and an open of its stream before then takes it back, files as they were.
+ */
+export async function retired(path: string): Promise<void> {
+	const deadline = Date.now() + 10_000;
+	while (call<{ state: string }>("SELECT ursula_status(?)", path).state !== "retired") {
+		expect(Date.now(), `${path} never retired`).toBeLessThan(deadline);
+		await new Promise((r) => setTimeout(r, 20));
+	}
+}
+
+/** Closes the stream at `path`: the model's `/__model/close`, or a close-only append. */
+export async function closeStream(path: string): Promise<void> {
+	const r = onModel()
+		? await fetch(`${directUrl()}/__model/close?path=${path}`, { method: "POST" })
+		: await fetch(`${directUrl()}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/vnd.ursula.sqlite-vfs.v2", "stream-closed": "true" },
+				body: "",
+			});
 	expect(r.ok, `${r.status} ${await r.text()}`).toBe(true);
 }
 

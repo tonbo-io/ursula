@@ -16,7 +16,7 @@ pub struct Lineage(pub [u8; 16]);
 
 /// 16 random bytes per generation directory (`gen-<id32>`): a copy of a generation keeps its
 /// lineage in a directory of its own, so the directory is named by this id, and a generation's
-/// first log segment names the directory it supersedes by it.
+/// log segments each name the directory it supersedes by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GenId(pub [u8; 16]);
 

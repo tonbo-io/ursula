@@ -7,6 +7,8 @@
 //!   gen-<id32>/               the current generation: db, db-uwal, db-shm, log/
 //!   gen-<id32>.tmp/           a generation being built
 //!   gen-<id32>.trash/         a superseded generation being deleted
+//!   reader-<n>/               a reader's own lock and generations, laid out as the root's
+//!   reader-trash-<id32>/      a reader directory nobody held, being deleted
 //!   salvage/<UTC>-<reason>/   generations moved aside, with manifest.json ([`crate::salvage`])
 //! ```
 //!
@@ -17,9 +19,10 @@
 //!
 //! The database is its canonical stream path ([`canonical_path`]): scheme, host, port and userinfo
 //! are transport, so every host alias of a deployment shares one root. A generation is built in
-//! `gen-<id32>.tmp`, fsynced, and published by one rename, and its first log segment names the
-//! generation directory it supersedes by id, so a crash that leaves two is finished at the next
-//! open ([`Root::finish_leftovers`]). A superseded generation is renamed to `gen-<id32>.trash`
+//! `gen-<id32>.tmp`, fsynced, and published by one rename, and every one of its log segments
+//! names the generation directory it supersedes by id (a roll carries it over, so no trim loses
+//! it), so a crash that leaves two is finished at the next open ([`Root::finish_leftovers`]). Once
+//! the superseded directory is gone, the id names nothing and is never acted on. A superseded generation is renamed to `gen-<id32>.trash`
 //! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory. A
 //! generation is published with page 1 written and marked, the page 1 of an empty database when
 //! nothing was applied ([`marker::empty_page_one`]), so no published db file is ever empty or
@@ -36,10 +39,17 @@
 //! gets `in_use`. An open in this process shares the root and copies a held generation
 //! ([`Root::copy`]): db then log into a `.tmp`, published like a build, so the old connections keep
 //! their files and never share a WAL or wal-index with the copy (design §5.6).
+//!
+//! A read-only open with no binding of the stream in its process locks the first free
+//! `reader-<n>/` ([`Root::reader`]) and keeps its generations there, apart from the owner's, so a
+//! reader never takes the owner's lock and any number of reader processes run beside it. A reader
+//! generation is built and published as an owner's is, its page 1 marked, and never salvaged: it
+//! holds no commit of its own.
 
 use std::fs::File;
 use std::fs::{self};
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +75,14 @@ use crate::salvage::SalvageError;
 
 /// The lock file in a root.
 const LOCK: &str = "lock";
+/// A reader directory's name before its number.
+const READER: &str = "reader-";
+/// How often [`Root::open_lock`] tries a directory a cleanup keeps moving.
+const OPEN_LOCK_TRIES: u32 = 16;
+/// After [`READER`], the name of a reader directory renamed to be deleted, before its id.
+const READER_TRASH: &str = "trash-";
+/// The reader directories of a root: a read-only open that finds every one locked is `in_use`.
+const MAX_READERS: u32 = 64;
 const GEN: &str = "gen-";
 const TMP: &str = ".tmp";
 const TRASH: &str = ".trash";
@@ -322,6 +340,73 @@ fn first_header(dir: &Path) -> Result<SegmentHeader, GenerationError> {
         })
 }
 
+/// Deletes every `reader-<m>/` of the stream root `root` but `keep` whose lock nobody holds, and
+/// every reader trash directory a crash left. Each reader directory is taken by a try-lock on its
+/// `lock`, checked to still be the file its name holds, and renamed to `reader-trash-<id32>` while
+/// the lock is held: only then is it deleted. A reader that takes `reader-<m>` meanwhile gets a
+/// fresh directory under the name (or the lock it opened refused, [`Root::lock_dir`]), so no
+/// deletion ever walks a directory a reader holds. A failure is logged and leaves the directory:
+/// the open goes on.
+fn clean_readers(root: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut trash = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(READER)) else {
+            continue;
+        };
+        if rest.starts_with(READER_TRASH) {
+            trash.push(path);
+            continue;
+        }
+        if rest.parse::<u32>().is_err() || path == keep {
+            continue;
+        }
+        let lock_path = path.join(LOCK);
+        let Ok(lock) = File::open(&lock_path) else {
+            continue;
+        };
+        if lock.try_lock().is_err() || !names(&lock, &lock_path) {
+            continue;
+        }
+        let Ok(id) = GenId::random() else {
+            continue;
+        };
+        let renamed = root.join(format!("{READER}{READER_TRASH}{}", id.hex()));
+        match fs::rename(&path, &renamed) {
+            Ok(()) => trash.push(renamed),
+            Err(e) => leftover(&path, &e),
+        }
+        drop(lock);
+    }
+    for path in trash {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            // Another reader's cleanup deleted it first.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => leftover(&path, &e),
+        }
+    }
+}
+
+/// Whether `file` is the file at `path` now: not deleted or replaced since it was opened.
+fn names(file: &File, path: &Path) -> bool {
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+fn leftover(path: &Path, e: &std::io::Error) {
+    crate::log::emit(crate::log::Level::Warn, "reader_leftover", &[
+        ("dir", &path.display()),
+        ("error", e),
+    ]);
+}
+
 /// A generation directory in a root, its log not read yet.
 #[derive(Debug)]
 struct Dir {
@@ -368,16 +453,36 @@ impl Root {
     /// Creates `<dir>/<root_name>/` when missing and takes its `lock` (`InUse` if another process,
     /// or another open file of this one, holds it).
     pub(crate) fn lock(dir: &Path, p: &CanonicalPath) -> Result<Root, GenerationError> {
+        Self::lock_dir(root_dir(dir, p))
+    }
+
+    /// Locks the first free reader directory of stream `p` under `dir`, `reader-0` up: one another
+    /// process, or another open file of this one, holds is skipped. `InUse` when every one of the
+    /// [`MAX_READERS`] is locked.
+    ///
+    /// The reader then deletes every other reader directory nobody holds ([`clean_readers`]), so a
+    /// burst of concurrent readers leaves no directories behind once they are gone.
+    pub(crate) fn reader(dir: &Path, p: &CanonicalPath) -> Result<Root, GenerationError> {
         let root = root_dir(dir, p);
-        fs::create_dir_all(&root).map_err(io("create", &root))?;
+        for n in 0..MAX_READERS {
+            match Self::lock_dir(root.join(format!("{READER}{n}"))) {
+                Err(GenerationError::InUse { .. }) => {}
+                Ok(locked) => {
+                    clean_readers(&root, locked.path());
+                    return Ok(locked);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(GenerationError::InUse { root })
+    }
+
+    /// Creates the directory `root` when missing and takes its `lock`. A lock taken on a file that
+    /// another process deleted meanwhile (with its directory, [`clean_readers`]) is no lock: the
+    /// directory counts as in use, and the caller moves on.
+    fn lock_dir(root: PathBuf) -> Result<Root, GenerationError> {
         let path = root.join(LOCK);
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(io("open", &path))?;
+        let lock = Self::open_lock(&root, &path)?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -391,10 +496,55 @@ impl Root {
                 });
             }
         }
+        let held = lock.metadata().map_err(io("stat", &path))?;
+        match fs::metadata(&path) {
+            Ok(named) if named.dev() == held.dev() && named.ino() == held.ino() => {}
+            Ok(_) => return Err(GenerationError::InUse { root }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GenerationError::InUse { root });
+            }
+            Err(e) => return Err(io("stat", &path)(e)),
+        }
         Ok(Root {
             dir: root,
             _lock: lock,
             holds: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Opens (creating) the lock file `path` in `root`, creating `root` when missing. A reader
+    /// cleanup may rename or delete `root` at any moment ([`clean_readers`]), so a failure that
+    /// shows it moving (gone, there and then gone, or deleted while the file was opened in it) is
+    /// tried again, a few times, and then counts as in use: the caller moves on.
+    fn open_lock(root: &Path, path: &Path) -> Result<File, GenerationError> {
+        let moving = |e: &std::io::Error| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::InvalidInput
+            )
+        };
+        for _ in 0..OPEN_LOCK_TRIES {
+            match fs::create_dir_all(root) {
+                Ok(()) => {}
+                Err(e) if moving(&e) => continue,
+                Err(e) => return Err(io("create", root)(e)),
+            }
+            match File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+            {
+                Ok(lock) => return Ok(lock),
+                Err(e) if moving(&e) => {}
+                Err(e) => return Err(io("open", path)(e)),
+            }
+        }
+        Err(GenerationError::InUse {
+            root: root.to_owned(),
         })
     }
 
@@ -599,8 +749,8 @@ impl Root {
     /// beside the connections of a reset binding that still hold it (design §5.6): its db file
     /// first, then its log ([`replog::copy`]), so every page the copied db holds comes from a
     /// record the copied log holds (F1). The copy keeps the lineage, so its pending commits keep
-    /// their ids and the page-1 marker stays valid, and its first log segment names `from` as the
-    /// generation it supersedes. Its WAL and wal-index stay behind: the WAL's commits are in the
+    /// their ids and the page-1 marker stays valid, and every segment of its log names `from` as
+    /// the generation it supersedes. Its WAL and wal-index stay behind: the WAL's commits are in the
     /// log, which materializing the copy re-applies. The copy is published like a build
     /// ([`Building::publish`], `from` trashed), and a crash before the rename leaves only a
     /// `.tmp` that the next open deletes. A failed copy deletes its `.tmp`. On a filesystem that

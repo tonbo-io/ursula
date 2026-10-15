@@ -13,12 +13,16 @@
 //   connection on what it bound -> {"ok": true, "opened"}.
 // `"conn": 2` runs `exec` or `all` on a second connection to the database, `"conn": 3` on the
 // reopened one, and `status` and `synced` with `"conn": 3` ask about the reopened database.
+// argv[5], when given, is `ursula_open`'s options JSON (`{}` otherwise): with `read_only` the
+// connections open read-only, as the package's `open` opens them, except `"conn": 4`, a
+// connection that asks for read-write whatever the options say.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 
-const [ext, url, dir] = process.argv.slice(2);
+const [ext, url, dir, options = "{}"] = process.argv.slice(2);
+const readOnly = JSON.parse(options).read_only === true;
 const say = (m) => process.stdout.write(`${JSON.stringify(m)}\n`);
 const control = new DatabaseSync(":memory:", { allowExtension: true });
 control.loadExtension(ext);
@@ -27,16 +31,24 @@ const failure = (error) => ({ ok: false, error: String(error), errcode: error.er
 
 let opened;
 try {
-	opened = call("SELECT ursula_open(?, ?, '{}', 20000)", url, dir);
+	opened = call("SELECT ursula_open(?, ?, ?, 20000)", url, dir, options);
 } catch (error) {
 	say(failure(error));
 	process.exit(1);
 }
-const db = new DatabaseSync(opened.path);
+const db = new DatabaseSync(opened.path, { readOnly });
 let second;
 let reopened;
 let third;
-const conn = (cmd) => (cmd.conn === 3 ? third : cmd.conn === 2 ? (second ??= new DatabaseSync(opened.path)) : db);
+let fourth;
+const conn = (cmd) =>
+	cmd.conn === 4
+		? (fourth ??= new DatabaseSync(opened.path))
+		: cmd.conn === 3
+			? third
+			: cmd.conn === 2
+				? (second ??= new DatabaseSync(opened.path, { readOnly }))
+				: db;
 const pathOf = (cmd) => (cmd.conn === 3 ? reopened.path : opened.path);
 say({ ok: true, opened });
 
@@ -54,8 +66,8 @@ for await (const line of createInterface({ input: process.stdin })) {
 		} else if (cmd.synced !== undefined) {
 			say({ ok: true, synced: call("SELECT ursula_synced(?, ?)", pathOf(cmd), cmd.synced) });
 		} else if (cmd.reopen) {
-			reopened = call("SELECT ursula_open(?, ?, '{}', 20000)", url, dir);
-			third = new DatabaseSync(reopened.path);
+			reopened = call("SELECT ursula_open(?, ?, ?, 20000)", url, dir, options);
+			third = new DatabaseSync(reopened.path, { readOnly });
 			say({ ok: true, opened: reopened });
 		} else if (cmd.events) {
 			const got = call("SELECT ursula_events(?, 0)", cursor);
@@ -80,6 +92,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 			other.close();
 			say({ ok: true, uri, results });
 		} else if (cmd.close) {
+			fourth?.close();
 			third?.close();
 			second?.close();
 			db.close();

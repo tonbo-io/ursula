@@ -10,6 +10,19 @@ use crate::json::whole;
 /// The default backlog bound: 64 MiB of compressed frames (design §4.4).
 pub(crate) const DEFAULT_MAX_PENDING_BYTES: u64 = 64 << 20;
 
+/// Whether an open makes this process the stream's owner or opens a read-only snapshot of it
+/// (design §5.5, D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// Claims the stream. With `recreate`, a missing stream whose trusted local generation holds
+    /// data is created again, the generation salvaged (`recreated`), instead of refusing
+    /// `not_found`.
+    Owner { recreate: bool },
+    /// `read_only`: the stream as of the open, from a reader directory or the binding this process
+    /// owns, claiming nothing.
+    Reader,
+}
+
 /// What `options_json` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenOptions {
@@ -23,9 +36,8 @@ pub(crate) struct OpenOptions {
     /// How long an open started with `timeout_ms` 0 may take: the caller's deadline, 30 s when
     /// absent.
     pub(crate) timeout_ms: Option<u64>,
-    /// A missing stream whose trusted local generation holds data is created again, the
-    /// generation salvaged (`recreated`), instead of refusing `not_found` (design §5.5).
-    pub(crate) recreate: bool,
+    /// Owner or reader: `read_only` and `recreate` together are refused.
+    pub(crate) access: Access,
 }
 
 impl Default for OpenOptions {
@@ -36,7 +48,7 @@ impl Default for OpenOptions {
             token: None,
             agent: None,
             timeout_ms: None,
-            recreate: false,
+            access: Access::Owner { recreate: false },
         }
     }
 }
@@ -52,8 +64,8 @@ pub(crate) enum OptionsError {
         name: &'static str,
         expected: &'static str,
     },
-    #[error("options_json: {0} is not supported yet")]
-    NotYet(&'static str),
+    #[error("options_json: read_only opens claim nothing, so recreate cannot go with it")]
+    ReadOnlyRecreate,
 }
 
 impl TryFrom<&str> for OpenOptions {
@@ -62,6 +74,7 @@ impl TryFrom<&str> for OpenOptions {
     /// An empty text, `null` or `{}` asks for the defaults.
     fn try_from(text: &str) -> Result<Self, OptionsError> {
         let mut options = OpenOptions::default();
+        let (mut read_only, mut recreate) = (false, false);
         let text = text.trim();
         if text.is_empty() || text == "null" {
             return Ok(options);
@@ -90,9 +103,8 @@ impl TryFrom<&str> for OpenOptions {
                 }
                 ("token", Value::Text(token)) => options.token = Some(token),
                 ("agent", Value::Text(agent)) => options.agent = Some(agent),
-                ("read_only", Value::Bool(false)) => {}
-                ("read_only", Value::Bool(true)) => return Err(OptionsError::NotYet("read_only")),
-                ("recreate", Value::Bool(recreate)) => options.recreate = recreate,
+                ("read_only", Value::Bool(value)) => read_only = value,
+                ("recreate", Value::Bool(value)) => recreate = value,
                 (
                     name @ ("max_pending_bytes" | "timeout_ms" | "activation" | "token" | "agent"),
                     _,
@@ -115,6 +127,11 @@ impl TryFrom<&str> for OpenOptions {
                 (other, _) => return Err(OptionsError::Unknown(other.to_owned())),
             }
         }
+        options.access = match (read_only, recreate) {
+            (true, true) => return Err(OptionsError::ReadOnlyRecreate),
+            (true, false) => Access::Reader,
+            (false, recreate) => Access::Owner { recreate },
+        };
         Ok(options)
     }
 }
@@ -148,6 +165,7 @@ fn activation(hex: &str) -> Option<Activation> {
 
 #[cfg(test)]
 mod tests {
+    use super::Access;
     use super::DEFAULT_MAX_PENDING_BYTES;
     use super::OpenOptions;
     use super::OptionsError;
@@ -183,11 +201,18 @@ mod tests {
         assert_eq!(o.token.as_deref(), Some("t1\"x"));
         assert_eq!(o.agent.as_deref(), Some("sdk/1"));
         assert_eq!(o.timeout_ms, Some(60_000));
-        assert!(!o.recreate);
-        assert!(
+        assert_eq!(o.access, Access::Owner { recreate: false });
+        assert_eq!(
             OpenOptions::try_from(r#"{"recreate": true}"#)
                 .unwrap()
-                .recreate
+                .access,
+            Access::Owner { recreate: true }
+        );
+        assert_eq!(
+            OpenOptions::try_from(r#"{"read_only": true, "recreate": false}"#)
+                .unwrap()
+                .access,
+            Access::Reader
         );
     }
 
@@ -230,10 +255,15 @@ mod tests {
                 ..
             }
         ));
+        // A reader claims nothing, so it cannot create the stream again.
         assert_eq!(
-            err(r#"{"read_only": true}"#),
-            OptionsError::NotYet("read_only")
+            err(r#"{"read_only": true, "recreate": true}"#),
+            OptionsError::ReadOnlyRecreate
         );
+        assert!(matches!(err(r#"{"read_only": 1}"#), OptionsError::Type {
+            name: "read_only",
+            ..
+        }));
         assert!(matches!(err(r#"{"recreate": 1}"#), OptionsError::Type {
             name: "recreate",
             ..

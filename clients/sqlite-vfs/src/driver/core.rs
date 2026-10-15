@@ -33,6 +33,9 @@
 //! `synced()` waits for every commit at or below its target, at most the last commit the commit
 //! path recorded on the handle; a target the core has not been told is logged yet waits for that
 //! `Logged` before the replicator sees it.
+//!
+//! A reader binding (design D6) has no claim and no replicator: it binds as soon as its open is
+//! done, its `synced()` resolves at once, and it retires as soon as its last connection closes.
 //! Randomness (backoff jitter, lineages) comes from a seeded [`Rng`], so a run is reproducible.
 //!
 //! [`Action::Bound`]: crate::replicator::Action::Bound
@@ -66,6 +69,7 @@ use super::LogPoisoned;
 use super::OpenId;
 use super::Replication;
 use super::Rng;
+use super::Role;
 use super::SyncError;
 use super::Ticket;
 use super::UNCONNECTED_MS;
@@ -97,7 +101,9 @@ use crate::open::Opening;
 use crate::open::Published;
 use crate::open::Ready;
 use crate::open::Unavailable;
+use crate::open::reader::ReaderReady;
 use crate::open::salvage_manifest;
+use crate::options::Access;
 use crate::replicator::Action;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
@@ -241,10 +247,8 @@ struct Binding {
     /// `synced()` calls whose target is past `last_commit`, waiting for its `Logged`.
     held: Vec<(Ticket, Position)>,
     max_pending_bytes: u64,
-    /// Since when `ursula_open` handed the binding out ([`Life::HandedOut`]): it retires
-    /// [`UNCONNECTED_MS`] later if no connection of the host opened it meanwhile.
-    /// With the hand-outs the handle had counted then.
-    unconnected_since: Option<(u64, u64)>,
+    /// The hand-out it waits on a connection for.
+    unconnected: Unconnected,
     /// The open failed while a disk job held the generation: the binding stays, its root locked
     /// and its replicator ignored, until the job returns, and the open resolves then.
     failing: Option<OpenError>,
@@ -322,10 +326,10 @@ impl Binding {
         if self.failing.is_some() {
             return None;
         }
-        let unconnected = self
-            .unconnected_since
-            .map(|(since, _)| since.saturating_add(UNCONNECTED_MS));
-        let mut at = [min(self.wake_at, unconnected), self.acks.flush_at];
+        let mut at = [
+            min(self.wake_at, self.unconnected.deadline()),
+            self.acks.flush_at,
+        ];
         if let Stage::Opening {
             deadline_ms, local, ..
         } = &self.stage
@@ -336,6 +340,48 @@ impl Binding {
             }
         }
         at.into_iter().flatten().min()
+    }
+}
+
+/// A reader binding (design D6): its files, and the hand-out it waits on a connection for. No
+/// claim, no replicator, no commit.
+#[derive(Debug)]
+struct Reader {
+    handle: Arc<BindingHandle>,
+    unconnected: Unconnected,
+}
+
+/// Since when `ursula_open` handed a binding out (an owner's or a reader's) with no connection
+/// open, and the hand-outs its handle had counted then: it retires [`UNCONNECTED_MS`] later
+/// unless a connection opened meanwhile, or `ursula_open` handed it out again (whose own timer
+/// runs then).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Unconnected(Option<(u64, u64)>);
+
+impl Unconnected {
+    fn since(now_ms: u64, handouts: u64) -> Self {
+        Self(Some((now_ms, handouts)))
+    }
+
+    fn deadline(self) -> Option<u64> {
+        self.0
+            .map(|(since, _)| since.saturating_add(UNCONNECTED_MS))
+    }
+
+    /// Whether the hand-out is decided at `now_ms`: a connection of the host opened (the binding
+    /// is no longer [`Life::HandedOut`]), or its time passed. Once decided it is cleared, and the
+    /// binding retires unless a connection or a later hand-out keeps it
+    /// ([`BindingHandle::idle_retire`]). True when it was decided now.
+    fn settle(&mut self, handle: &BindingHandle, now_ms: u64) -> bool {
+        let Some((since, handouts)) = self.0 else {
+            return false;
+        };
+        if handle.handed_out() && now_ms < since.saturating_add(UNCONNECTED_MS) {
+            return false;
+        }
+        self.0 = None;
+        handle.idle_retire(handouts);
+        true
     }
 }
 
@@ -354,6 +400,8 @@ pub(crate) struct Core {
     next_id: u64,
     opens: BTreeMap<OpenId, OpenSlot>,
     bindings: BTreeMap<BindingId, Binding>,
+    /// The reader bindings, by the same ids.
+    readers: BTreeMap<BindingId, Reader>,
     ios: BTreeMap<IoId, Owner>,
     events: EventLog,
     /// Resolved opens not yet taken.
@@ -377,6 +425,7 @@ impl Core {
             next_id: 1,
             opens: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            readers: BTreeMap::new(),
             ios: BTreeMap::new(),
             events: EventLog::default(),
             opened: BTreeMap::new(),
@@ -439,7 +488,13 @@ impl Core {
                 0
             })
         });
-        opens.chain(bindings).chain(deferred).flatten().min()
+        let readers = self.readers.values().map(|r| r.unconnected.deadline());
+        opens
+            .chain(bindings)
+            .chain(deferred)
+            .chain(readers)
+            .flatten()
+            .min()
     }
 
     /// The binding of the stream at `url` given up for an open under another cache root
@@ -515,13 +570,15 @@ impl Core {
     /// open shares the stream's root when only reset bindings' connections still hold it: with
     /// any other binding or open of the stream left in the core (one still draining, or a
     /// tombstone whose disk job is out), it locks the root anew and is refused `in_use`, so it
-    /// never runs beside a replicator or a job that writes the stream's files.
+    /// never runs beside a replicator or a job that writes the stream's files. A reader's open
+    /// locks a reader directory of its own and shares nothing.
     pub(crate) fn open(&mut self, open: OpenId, spec: OpenSpec, now_ms: u64) -> Vec<Io> {
         if let Some(given_up) = self.given_up(&spec.url) {
             return self.defer(open, spec, given_up, now_ms);
         }
         let mut ios = Vec::new();
         let root = match canonical_path(&spec.url) {
+            Ok(_) if spec.access == Access::Reader => None,
             Ok(name) => {
                 let reset: Vec<(BindingId, ResetKind)> = self
                     .bindings
@@ -532,8 +589,13 @@ impl Core {
                 for (binding, kind) in reset {
                     self.reset(binding, kind, now_ms);
                 }
+                // A reader's open in progress works in a reader directory of its own: it never
+                // keeps an owner's open from sharing the root.
                 let busy = self.bindings.values().any(|b| b.name == name)
-                    || self.opens.values().any(|slot| *slot.opening.name() == name);
+                    || self.opens.values().any(|slot| {
+                        *slot.opening.name() == name
+                            && matches!(slot.opening.access(), Access::Owner { .. })
+                    });
                 if busy {
                     None
                 } else {
@@ -603,8 +665,76 @@ impl Core {
             OpenStep::Provisional { ready, claim } => {
                 self.provisional(open, *ready, claim, now_ms, ios)
             }
+            OpenStep::Reader(ready) => self.bind_reader(open, *ready, now_ms),
             OpenStep::Fail(e) => self.opened(open, Err(e)),
         }
+    }
+
+    /// A reader's open is done: it binds at once, with no claim and no replicator, and holds its
+    /// reader directory's lock until it retires.
+    fn bind_reader(&mut self, open: OpenId, ready: ReaderReady, now_ms: u64) {
+        let ReaderReady {
+            name,
+            dir,
+            root,
+            m,
+            cluster_id,
+            incarnation,
+            closed,
+            attach,
+        } = ready;
+        let (last, _) = caught_up(&m);
+        let Materialized {
+            generation, log, ..
+        } = *m;
+        let bind = Bind {
+            generation,
+            name,
+            cluster_id,
+            incarnation,
+            log,
+            pending_bytes: 0,
+            max_pending_bytes: 0,
+            max_frame_bytes: MAX_BATCH_BYTES,
+            acked: last,
+            attach,
+            role: Role::Reader,
+            closed,
+            dir,
+            // A reader claims nothing, so it has no claim to defer.
+            provisional: false,
+        };
+        let handle = Arc::new(BindingHandle::new(bind, root));
+        handle.record_commit(last);
+        handle.set_replication(
+            Replication {
+                state: "none",
+                request_limit: MAX_BATCH_BYTES,
+                ..Replication::default()
+            },
+            None,
+        );
+        let binding = BindingId(self.id());
+        self.readers.insert(binding, Reader {
+            handle: Arc::clone(&handle),
+            // A result nobody takes or cancels retires too.
+            unconnected: Unconnected::since(now_ms, 0),
+        });
+        self.opened(open, Ok(Bound { binding, handle }));
+    }
+
+    /// A reader binding whose last connection closed, or that nobody connected to, retires now:
+    /// it has nothing to drain. False when a connection or an open took it back meanwhile.
+    fn retire_reader(&mut self, binding: BindingId) -> bool {
+        let retired = self
+            .readers
+            .get(&binding)
+            .is_some_and(|r| r.handle.try_retire());
+        if retired && let Some(reader) = self.readers.remove(&binding) {
+            reader.handle.release_root();
+            self.events.push(DriverEvent::Retired { binding });
+        }
+        retired
     }
 
     fn opened(&mut self, open: OpenId, result: Result<Bound, OpenError>) {
@@ -712,7 +842,7 @@ impl Core {
             resolved_max: Ticket(0),
             held: Vec::new(),
             max_pending_bytes: spec.max_pending_bytes,
-            unconnected_since: None,
+            unconnected: Unconnected::default(),
             failing: None,
             attach,
         });
@@ -1118,22 +1248,27 @@ impl Core {
         b.tickets.clear();
         match b.stage {
             Stage::Opening { open, .. } => self.opened(open, Err(OpenError::Reset(kind))),
-            Stage::Bound { handle } => {
-                handle.mark_reset(kind);
-                // A barrier for the connections, which check the reset under the log's lock
-                // (`Binding::log_unless_reset`): a COMMIT, ACK or BASE record whose append took the
-                // lock before the mark is written, and every later one is refused. The core itself
-                // appends nothing more, so the log is final once an open may copy it (G8).
-                drop(handle.log());
-                handle.reset_retired();
-                handle.snapshots.snapper.stop();
-                self.events.push(DriverEvent::Reset {
-                    binding,
-                    cause: kind,
-                });
-                self.events.push(DriverEvent::Retired { binding });
-            }
+            Stage::Bound { handle } => self.reset_bound(binding, &handle, kind),
         }
+    }
+
+    /// A bound binding, an owner's or a reader's, gone from the core, resets: marked, its log
+    /// final, retired, and reported.
+    fn reset_bound(&mut self, binding: BindingId, handle: &BindingHandle, kind: ResetKind) {
+        handle.mark_reset(kind);
+        // A barrier for the connections, which check the reset under the log's lock
+        // (`Binding::log_unless_reset`): a COMMIT, ACK or BASE record whose append took the lock
+        // before the mark is written, and every later one is refused. The core itself appends
+        // nothing more, so the log is final once an open may copy it (G8).
+        drop(handle.log());
+        // Its connections hold its generation, and the root, until the last one closes.
+        handle.reset_retired();
+        handle.snapshots.snapper.stop();
+        self.events.push(DriverEvent::Reset {
+            binding,
+            cause: kind,
+        });
+        self.events.push(DriverEvent::Retired { binding });
     }
 
     /// An opening binding fails its open and goes. While a disk job holds its generation it stays
@@ -1220,7 +1355,7 @@ impl Core {
             return self.fail_open(binding, OpenError::Panicked);
         };
         // A result nobody takes or cancels retires too.
-        b.unconnected_since = Some((now_ms, 0));
+        b.unconnected = Unconnected::since(now_ms, 0);
         let Stage::Opening {
             open,
             root,
@@ -1252,6 +1387,9 @@ impl Core {
             attach: b.attach,
             provisional,
             dir: b.dir.clone(),
+            role: Role::Owner,
+            // An owner's open refuses a closed stream.
+            closed: false,
         };
         let handle = Arc::new(BindingHandle::new(bind, root));
         handle.record_commit(b.last_commit);
@@ -1481,6 +1619,15 @@ impl Core {
                 core.tick_binding(binding, now_ms, &mut ios);
             });
         }
+        let readers: Vec<BindingId> = self.readers.keys().copied().collect();
+        for binding in readers {
+            let Some(reader) = self.readers.get_mut(&binding) else {
+                continue;
+            };
+            if reader.unconnected.settle(&reader.handle, now_ms) {
+                self.retire_reader(binding);
+            }
+        }
         ios
     }
 
@@ -1492,13 +1639,9 @@ impl Core {
         else {
             return;
         };
-        if let (Some((since, handouts)), Stage::Bound { handle }) = (b.unconnected_since, &b.stage)
-            && (!handle.handed_out() || now_ms >= since.saturating_add(UNCONNECTED_MS))
+        if let Stage::Bound { handle } = &b.stage
+            && b.unconnected.settle(handle, now_ms)
         {
-            b.unconnected_since = None;
-            // Leaves alone a binding a connection opened, or that `ursula_open` handed out again
-            // since (its own timer runs). One the host still holds stays live.
-            handle.idle_retire(handouts);
             self.settle(binding, now_ms);
             let Some(b) = self.bindings.get_mut(&binding) else {
                 return;
@@ -1594,6 +1737,18 @@ impl Core {
         now_ms: u64,
     ) -> Vec<Io> {
         let mut ios = Vec::new();
+        // A reader holds no commit to wait for: its tickets resolve at once, in ticket order.
+        if let Some(reader) = self.readers.get(&binding) {
+            if reader.handle.life() == Life::Retired {
+                self.resolve(binding, ticket, Err(SyncError::NotBound));
+            } else {
+                self.events.push(DriverEvent::Synced {
+                    binding,
+                    through: ticket,
+                });
+            }
+            return ios;
+        }
         let live = self
             .bindings
             .get_mut(&binding)
@@ -1654,6 +1809,10 @@ impl Core {
     /// drains, then retires, unless a connection or an open takes it back first. A stale call, after
     /// one did, changes nothing.
     pub(crate) fn retire(&mut self, binding: BindingId, now_ms: u64) -> Vec<Io> {
+        if self.readers.contains_key(&binding) {
+            self.retire_reader(binding);
+            return Vec::new();
+        }
         if let Some(b) = self.bindings.get(&binding) {
             match &b.stage {
                 Stage::Opening { .. } => {
@@ -1673,9 +1832,12 @@ impl Core {
     /// connection opens it meanwhile, so an open whose caller never connects does not hold the
     /// root for good.
     pub(crate) fn unconnected(&mut self, binding: BindingId, now_ms: u64) {
+        if let Some(r) = self.readers.get_mut(&binding) {
+            r.unconnected = Unconnected::since(now_ms, r.handle.handouts());
+        }
         if let Some(b) = self.bindings.get_mut(&binding) {
             let handouts = b.handle().map_or(0, |h| h.handouts());
-            b.unconnected_since = Some((now_ms, handouts));
+            b.unconnected = Unconnected::since(now_ms, handouts);
         }
     }
 
@@ -1684,12 +1846,18 @@ impl Core {
         if let Some(Stage::Bound { handle }) = self.bindings.get(&binding).map(|b| &b.stage) {
             handle.retiring();
         }
+        if let Some(reader) = self.readers.get(&binding) {
+            reader.handle.retiring();
+        }
         self.retire(binding, now_ms)
     }
 
     /// The binding's connections found it damaged (an unconfirmed commit, a failed fsync, a panic):
     /// it resets.
     pub(crate) fn reset_binding(&mut self, binding: BindingId, kind: ResetKind, now_ms: u64) {
+        if let Some(reader) = self.readers.remove(&binding) {
+            return self.reset_bound(binding, &reader.handle, kind);
+        }
         self.reset(binding, kind, now_ms);
     }
 

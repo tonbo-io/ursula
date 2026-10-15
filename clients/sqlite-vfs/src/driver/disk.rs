@@ -148,7 +148,6 @@ impl DiskJob {
 /// after the log (its reconcile may have acknowledged commits no ACK names yet, which the
 /// pending check of [`materialize::catch_up`] cannot know).
 fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<(Position, u64), LocalError> {
-    let db_path = m.generation.db();
-    materialize::catch_up_files(&mut m.log, &m.db, &db_path, frames)?;
+    materialize::catch_up_in_place(m, frames)?;
     Ok(caught_up(m))
 }
