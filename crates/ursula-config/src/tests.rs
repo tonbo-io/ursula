@@ -404,6 +404,62 @@ listen = "127.0.0.1:4437"
         assert_eq!(config.raft.wal.path, None); // a single node may run without a path
     }
 
+    /// The tiny and small presets give a cold-backed node the smallest
+    /// in-flight body budget that holds a request and a snapshot commit's
+    /// copy; a smaller one is refused at load.
+    #[test]
+    fn a_cold_backed_node_needs_room_for_a_request_and_a_copy() {
+        for preset in [Preset::Tiny, Preset::Small] {
+            let tmp = temp_config(
+                ".toml",
+                r#"
+[server]
+listen = "127.0.0.1:4437"
+
+[storage.cold]
+backend = "memory"
+"#,
+            );
+            let config = load_config(Some(tmp.path()), Some(preset), Some(1)).unwrap();
+            assert_eq!(
+                config.server.http_inflight_body_size.as_bytes(),
+                crate::config::ServerConfig::MIN_INFLIGHT_BODY_SIZE_WITH_COLD,
+                "{preset:?}"
+            );
+        }
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[server]
+listen = "127.0.0.1:4437"
+http_inflight_body_size = "63MiB"
+
+[storage.cold]
+backend = "memory"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::load::ConfigError::Validation(
+                    crate::validate::ValidationError::InflightBodyBudgetTooSmall { .. }
+                )
+            ),
+            "{err}"
+        );
+        // Without a cold backend nothing copies, and the budget may be smaller.
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[server]
+listen = "127.0.0.1:4437"
+http_inflight_body_size = "33MiB"
+"#,
+        );
+        load_config(Some(tmp.path()), None, Some(1)).unwrap();
+    }
+
     #[test]
     fn user_config_overrides_preset() {
         let tmp = temp_config(

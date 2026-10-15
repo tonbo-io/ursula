@@ -43,6 +43,14 @@ pub enum ValidationError {
         RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY
     )]
     SnapshotBuildConcurrency { value: usize },
+    /// A node with a cold backend copies the parts of a snapshot commit
+    /// under its in-flight body budget, which must hold that copy and one
+    /// request.
+    #[error(
+        "server.http_inflight_body_size ({budget} bytes) must be at least {minimum} bytes with a \
+         cold backend"
+    )]
+    InflightBodyBudgetTooSmall { budget: u64, minimum: u64 },
     #[error("{0}")]
     Other(String),
 }
@@ -114,6 +122,11 @@ impl UrsulaConfig {
             if bucket.is_none_or(|bucket| bucket.trim().is_empty()) {
                 return Err(ValidationError::ColdS3BucketRequired);
             }
+        }
+        let budget = self.server.http_inflight_body_size.as_bytes();
+        let minimum = crate::config::ServerConfig::MIN_INFLIGHT_BODY_SIZE_WITH_COLD;
+        if self.storage.cold.backend != ColdBackend::None && budget < minimum {
+            return Err(ValidationError::InflightBodyBudgetTooSmall { budget, minimum });
         }
         self.validate_s3_health_gate()?;
         if self
