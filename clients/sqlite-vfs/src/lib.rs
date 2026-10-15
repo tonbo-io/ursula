@@ -179,6 +179,7 @@
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle
 //!   (0.8, not yet wired).
+//! - `replicator`: the replicator state machine of one bound database (0.8).
 //! - `replog`: the commit log, `USL1` segments in a generation's `log/` (0.8, not yet wired).
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
@@ -215,6 +216,11 @@ pub mod model;
 mod net;
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 mod publication;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "unwired until the 0.8 driver (PR5) runs it")
+)]
+mod replicator;
 #[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 mod replog;
 pub mod snapshot;
