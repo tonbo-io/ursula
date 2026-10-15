@@ -113,6 +113,10 @@ struct RecoverGroupArgs {
     poll_interval_secs: u64,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
+    /// Seconds one `accept-unsynced-loss` may take: a cut or a demotion
+    /// restarts the group before the answer.
+    #[arg(long, default_value_t = 120)]
+    accept_timeout_secs: u64,
     /// Print the plan and send nothing.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -1133,6 +1137,7 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
         max_plans: args.max_plans,
         settle_timeout: Duration::from_secs(args.settle_timeout_secs),
         poll_interval: Duration::from_secs(args.poll_interval_secs),
+        accept_timeout: Duration::from_secs(args.accept_timeout_secs),
         dry_run: args.dry_run,
     };
     match ursula_ctl::recovery::recover_group(&client, &nodes, args.group, &options).await? {
