@@ -668,3 +668,76 @@ fn a_commit_logged_while_catching_up_resets_internal() {
     let actions = h.on(Event::Logged(commit(LINEAGE, 1, 1)));
     assert_eq!(reset_of(&actions), Some(ResetKind::Internal));
 }
+
+/// The world's counterexample: a continuation's reconcile acknowledges a record read by read, and
+/// a `synced()` call between two reads must not resolve a ticket on that record before the
+/// replicator announces it. Outputs wait for the claim and its reconcile (design §5.5, §7), so
+/// the ticket resolves at the bind, after the `Wake` that covers it.
+#[test]
+fn a_ticket_waits_for_the_continuation_reconcile_to_finish() {
+    let mut h = streaming(2);
+    let first = u64::try_from(commit(LINEAGE, 1, 1).frame.len()).unwrap();
+    let len = u64::try_from(h.last_request().body.len()).unwrap();
+    // Ticket 1 waits for record 1; the batch of records 1 and 2 applies, but a layer answers
+    // 503.
+    h.on(Event::Sync {
+        ticket: 1,
+        target: Position(1),
+    });
+    let actions = h.answer(&RawAnswer::new(503));
+    let (at, jitter) = timer_of(&actions).unwrap();
+    // Ticket 2 waits only for a round trip: its probe, which started after ticket 1's call,
+    // proves the tail.
+    h.on(Event::Sync {
+        ticket: 2,
+        target: Position(0),
+    });
+    assert_eq!(h.last_request().method, Method::Get);
+    let actions = h.answer(&read(&[], 37));
+    assert!(
+        actions.contains(&Action::Synced { ticket: 2 }),
+        "{actions:?}"
+    );
+    // The resend meets idle expiry, and the continuation claim lands after the batch.
+    h.tick_at(at + jitter);
+    h.answer(&producer(&ProducerAnswer::ProducerExpired {
+        epoch: epoch(1),
+    }));
+    let claim_end = 37 + len + 37;
+    h.answer(&producer(&receipt(
+        Delivery::Applied,
+        2,
+        0,
+        37 + len,
+        claim_end,
+        None,
+    )));
+    // The first read holds record 1 only.
+    let actions = h.answer(&read(&commit(LINEAGE, 1, 1).frame, 37 + first));
+    assert!(
+        !actions.contains(&Action::Synced { ticket: 1 }),
+        "{actions:?}"
+    );
+    let actions = h.on(Event::Sync {
+        ticket: 3,
+        target: Position(2),
+    });
+    assert!(
+        !actions.contains(&Action::Synced { ticket: 1 }),
+        "{actions:?}"
+    );
+    let actions = h.answer(&read(&commit(LINEAGE, 2, 1).frame, 37 + len));
+    let wake = actions.iter().position(|a| {
+        *a == Action::Wake {
+            acked: Position(2),
+            offset: off(claim_end),
+        }
+    });
+    let synced = actions
+        .iter()
+        .position(|a| *a == Action::Synced { ticket: 1 });
+    assert!(
+        matches!((wake, synced), (Some(w), Some(s)) if w < s),
+        "{actions:?}"
+    );
+}
