@@ -495,21 +495,22 @@ fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
 fn producer_from_proto(
     producer: proto::ProducerSnapshotV1,
 ) -> Result<ProducerSnapshot, SnapshotStoreError> {
-    let last_seen_ms = producer.last_seen_ms.ok_or_else(|| {
-        SnapshotStoreError::Deserialize(format!(
-            "snapshot producer '{}' has no last_seen_ms",
-            producer.producer_id
-        ))
-    })?;
-    let digest = |bytes: Option<Bytes>, field: &str| {
+    let last_seen_ms =
+        producer
+            .last_seen_ms
+            .ok_or_else(|| SnapshotStoreError::ProducerFieldMissing {
+                producer_id: producer.producer_id.clone(),
+                field: "last_seen_ms",
+            })?;
+    let digest = |bytes: Option<Bytes>, field: &'static str| {
         bytes
             .map(|bytes| {
                 WriteDigest::try_from(bytes.as_ref()).map_err(|_wrong_length| {
-                    SnapshotStoreError::Deserialize(format!(
-                        "snapshot producer '{}' {field} is {} bytes, not 32",
-                        producer.producer_id,
-                        bytes.len()
-                    ))
+                    SnapshotStoreError::ProducerDigestLength {
+                        producer_id: producer.producer_id.clone(),
+                        field,
+                        len: bytes.len(),
+                    }
                 })
             })
             .transpose()
@@ -602,8 +603,8 @@ fn placement_from_proto(placement: proto::ShardPlacementV1) -> ShardPlacement {
     }
 }
 
-fn required<T>(value: Option<T>, field: &str) -> Result<T, SnapshotStoreError> {
-    value.ok_or_else(|| SnapshotStoreError::Deserialize(format!("missing {field}")))
+fn required<T>(value: Option<T>, field: &'static str) -> Result<T, SnapshotStoreError> {
+    value.ok_or(SnapshotStoreError::MissingField { field })
 }
 
 #[cfg(test)]
@@ -773,17 +774,35 @@ mod tests {
             stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
         proto_entry.producer_states[0].claim_digest = Some(Bytes::from_static(b"short"));
         let error = stream_from_proto(proto_entry).expect_err("a short digest");
-        assert!(error.to_string().contains("claim_digest"), "{error}");
+        assert!(
+            matches!(error, SnapshotStoreError::ProducerDigestLength {
+                field: "claim_digest",
+                len: 5,
+                ..
+            }),
+            "{error}"
+        );
         // Field 9 stays optional on the wire; an absent value is refused.
         let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
         entry.producer_states[0].last_seen_ms = None;
         let error = stream_from_proto(entry).expect_err("absent last_seen_ms");
-        assert!(error.to_string().contains("last_seen_ms"), "{error}");
+        assert!(
+            matches!(error, SnapshotStoreError::ProducerFieldMissing {
+                field: "last_seen_ms",
+                ..
+            }),
+            "{error}"
+        );
         // So does entry field 16.
         let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
         entry.retained_offset = None;
         let error = stream_from_proto(entry).expect_err("absent retained_offset");
-        assert!(error.to_string().contains("retained_offset"), "{error}");
+        assert!(
+            matches!(error, SnapshotStoreError::MissingField {
+                field: "snapshot stream retained_offset"
+            }),
+            "{error}"
+        );
         let snapshot = GroupSnapshot {
             placement: ShardPlacement {
                 core_id: CoreId(0),

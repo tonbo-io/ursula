@@ -608,44 +608,31 @@ fn refusal_response(producer_id: &str, key: WriteKey, refusal: Refusal) -> Strea
         }
         Refusal::Producer(refusal) => refusal,
     };
-    let (code, message) = match refusal {
-        ProducerRefusal::EpochClosed { epoch, closed, .. } => (
-            StreamErrorCode::ProducerEpochClosed,
-            format!(
-                "producer '{producer_id}' epoch {} is closed after sequence {}; current epoch is {epoch}",
-                closed.epoch, closed.seq
-            ),
+    let message = match refusal {
+        ProducerRefusal::EpochClosed { epoch, closed, .. } => format!(
+            "producer '{producer_id}' epoch {} is closed after sequence {}; current epoch is {epoch}",
+            closed.epoch, closed.seq
         ),
-        ProducerRefusal::Expired { epoch } => (
-            StreamErrorCode::ProducerExpired,
-            format!(
-                "producer '{producer_id}' epoch {} is not remembered; claim an epoch above {epoch}",
-                key.epoch
-            ),
+        ProducerRefusal::Expired { epoch } => format!(
+            "producer '{producer_id}' epoch {} is not remembered; claim an epoch above {epoch}",
+            key.epoch
         ),
-        ProducerRefusal::StaleEpoch { epoch } => (
-            StreamErrorCode::ProducerEpochStale,
-            format!(
-                "producer '{producer_id}' epoch {} is stale; current epoch is {epoch}",
-                key.epoch
-            ),
+        ProducerRefusal::StaleEpoch { epoch } => format!(
+            "producer '{producer_id}' epoch {} is stale; current epoch is {epoch}",
+            key.epoch
         ),
-        ProducerRefusal::KeyConflict { epoch } => (
-            StreamErrorCode::ProducerKeyConflict,
-            format!(
-                "producer '{producer_id}' epoch {epoch} sequence {} holds a write with another identity",
-                key.seq
-            ),
+        ProducerRefusal::KeyConflict { epoch } => format!(
+            "producer '{producer_id}' epoch {epoch} sequence {} holds a write with another identity",
+            key.seq
         ),
-        ProducerRefusal::EpochNotClaimed => (
-            StreamErrorCode::InvalidProducer,
-            format!(
-                "producer '{producer_id}' new epoch {} must start at sequence 0",
-                key.epoch
-            ),
+        ProducerRefusal::EpochNotClaimed => format!(
+            "producer '{producer_id}' new epoch {} must start at sequence 0",
+            key.epoch
         ),
     };
-    StreamResponse::error_with_context(code, message, vec![StreamErrorContext::Producer(refusal)])
+    StreamResponse::error_with_context(refusal.code(), message, vec![StreamErrorContext::Producer(
+        refusal,
+    )])
 }
 
 fn check_stream_seq(stream: &StreamMetadata, incoming: Option<&str>) -> Result<(), StreamResponse> {

@@ -739,6 +739,9 @@ fn producer_write_key(
             ),
         ));
     }
+    // `ursula-headers` already parsed an HTTP digest into 32 bytes, so this
+    // refusal cannot be reached from HTTP. The replicated command carries the
+    // digest as bytes, though, and apply checks every command it is given.
     let digest = match producer.digest.as_deref() {
         None => None,
         Some(bytes) => Some(WriteDigest::try_from(bytes).map_err(|_wrong_length| {

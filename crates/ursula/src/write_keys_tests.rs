@@ -415,6 +415,31 @@ async fn every_answer_of_the_evaluation_table_is_typed_on_the_wire() {
     });
     let (response, _) = self::send(&app, &Write::new(4, 0, "e").tokened(&token)).await;
     assert_eq!(answer(&response).status(), 200);
+    // Operators see the floor and its refusals.
+    let metrics = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/__ursula/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let metrics: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .expect("metrics body"),
+    )
+    .expect("metrics json");
+    assert_eq!(metrics["producer_expired_answers"], 1, "{metrics}");
+    let floored: u64 = metrics["group_state_gauges"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .filter_map(|group| group["floored_streams"].as_u64())
+        .sum();
+    assert_eq!(floored, 1, "{metrics}");
 }
 
 /// A write by another producer id, untokened.

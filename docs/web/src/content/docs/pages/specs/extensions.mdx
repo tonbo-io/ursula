@@ -385,7 +385,7 @@ A producer's state opened above the floor holds epochs above every epoch the ser
 
 ### 5.5. Answers Before the Body
 
-A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). It follows the order of Section 5.3: step 1 runs before any early answer, and the early answers are steps 2 and 3, which never read the body. The content checks of step 5 apply only to a write that would apply, so an early answer and an answer after the body are the same for every request. A client that sent `Expect: 100-continue` then sends no body.
+A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). It follows the order of Section 5.3: step 1 runs before any early answer, and the early answers are steps 2 and 3, which never read the body. An early answer is decided by the request's headers alone: the producer headers, `Producer-Digest` when present, and `Stream-Incarnation`. The body takes no part in it, not even through its length, its digest or its JSON. The content checks of step 5 apply only to a write that would apply, so a repeat or a key conflict gets the same answer before and after the body, whatever the body holds. A client that sent `Expect: 100-continue` then sends no body.
 
 A server MAY refuse a request for load (`503` with `Retry-After`) before it looks for an early answer. The refusal is retryable, and the retry gets the answer.
 

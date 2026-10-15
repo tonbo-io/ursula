@@ -216,6 +216,20 @@ pub enum ProducerRefusal {
     EpochNotClaimed,
 }
 
+impl ProducerRefusal {
+    /// The error code of the refusal: the one source the late path's status
+    /// comes from.
+    pub fn code(&self) -> StreamErrorCode {
+        match self {
+            Self::EpochClosed { .. } => StreamErrorCode::ProducerEpochClosed,
+            Self::Expired { .. } => StreamErrorCode::ProducerExpired,
+            Self::StaleEpoch { .. } => StreamErrorCode::ProducerEpochStale,
+            Self::KeyConflict { .. } => StreamErrorCode::ProducerKeyConflict,
+            Self::EpochNotClaimed => StreamErrorCode::InvalidProducer,
+        }
+    }
+}
+
 /// The answer to a tokened producer write that does not depend on its body
 /// (#581 section 2.5, W7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -32,6 +32,8 @@ pub struct GroupStateGauges {
     pub producers: u64,
     /// Largest producer map held by one stream.
     pub max_producers_per_stream: u64,
+    /// Streams with an epoch floor: streams that retired a producer record.
+    pub floored_streams: u64,
     /// Length-based producer state bytes across streams (F3 `Prod(s)`).
     pub producer_bytes: u64,
     /// Largest length-based producer state of one stream.
@@ -101,6 +103,9 @@ impl StreamStateMachine {
             let producers = as_u64(slot.producers.len());
             gauges.producers = gauges.producers.saturating_add(producers);
             gauges.max_producers_per_stream = gauges.max_producers_per_stream.max(producers);
+            if slot.retired_epoch_watermark.is_some() {
+                gauges.floored_streams = gauges.floored_streams.saturating_add(1);
+            }
             let stream_producer_bytes = slot
                 .producers
                 .keys()

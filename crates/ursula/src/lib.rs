@@ -529,6 +529,9 @@ struct HttpMetrics {
     sse_data_events: AtomicU64,
     sse_control_events: AtomicU64,
     sse_error_events: AtomicU64,
+    /// Producer writes answered `producer-expired` (the stream's epoch
+    /// floor refused them).
+    producer_expired_answers: AtomicU64,
 }
 
 impl HttpMetrics {
@@ -539,6 +542,7 @@ impl HttpMetrics {
             sse_data_events: self.sse_data_events.load(Ordering::Relaxed),
             sse_control_events: self.sse_control_events.load(Ordering::Relaxed),
             sse_error_events: self.sse_error_events.load(Ordering::Relaxed),
+            producer_expired_answers: self.producer_expired_answers.load(Ordering::Relaxed),
         }
     }
 }
@@ -550,6 +554,7 @@ struct HttpMetricsSnapshot {
     sse_data_events: u64,
     sse_control_events: u64,
     sse_error_events: u64,
+    producer_expired_answers: u64,
 }
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
@@ -4281,6 +4286,12 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     err: RuntimeError,
     request_target: &str,
 ) -> Response {
+    if err.stream_error_code() == Some(StreamErrorCode::ProducerExpired) {
+        state
+            .http_metrics
+            .producer_expired_answers
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };

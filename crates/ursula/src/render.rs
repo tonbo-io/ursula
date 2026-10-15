@@ -910,11 +910,43 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::StatusCode;
     use axum::http::header::CACHE_CONTROL;
+    use ursula_runtime::ClosedBy;
+    use ursula_runtime::ClosedEpoch;
+    use ursula_runtime::ProducerRefusal;
     use ursula_runtime::RuntimeError;
+    use ursula_runtime::StreamErrorContext;
 
     use super::insert_cache_control;
     use super::insert_default_response_headers;
+    use super::producer_refusal_answer;
     use super::runtime_error_status;
+    use super::stream_error_code_status;
+
+    /// The late path's status comes from the refusal's error code, the
+    /// answer's from `ProducerAnswer::status`: they agree for every refusal.
+    #[test]
+    fn a_refusal_code_and_its_answer_name_one_status() {
+        for refusal in [
+            ProducerRefusal::EpochClosed {
+                epoch: 3,
+                by: ClosedBy::Claim,
+                closed: ClosedEpoch { epoch: 2, seq: 1 },
+            },
+            ProducerRefusal::Expired { epoch: 3 },
+            ProducerRefusal::StaleEpoch { epoch: 3 },
+            ProducerRefusal::KeyConflict { epoch: 3 },
+            ProducerRefusal::EpochNotClaimed,
+        ] {
+            let answer = producer_refusal_answer(&[StreamErrorContext::Producer(refusal)])
+                .expect("a producer context")
+                .expect("an answer");
+            assert_eq!(
+                stream_error_code_status(refusal.code()).as_u16(),
+                answer.status(),
+                "{refusal:?}"
+            );
+        }
+    }
 
     /// Every response path calls this helper, so pinning the set here is what
     /// makes a newly added path inherit the defaults rather than quietly ship
