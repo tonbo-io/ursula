@@ -271,7 +271,10 @@ fn routing_answer() -> impl Strategy<Value = RoutingAnswer> {
                 term: RaftTerm::from_u64(term),
             }
         }),
-        group.prop_map(|group| RoutingAnswer::NoLeader { group }),
+        group
+            .clone()
+            .prop_map(|group| RoutingAnswer::NoLeader { group }),
+        group.prop_map(|group| RoutingAnswer::NotHosted { group }),
     ]
 }
 

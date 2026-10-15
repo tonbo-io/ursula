@@ -59,7 +59,8 @@
 //!   stream's successful HEAD.
 //! - [`snapshot`]: [`SnapshotRead`], [`SnapshotPublishAnswer`], and the parts
 //!   upload: [`PartStaged`], [`PartsCommit`] and [`PartsManifest`].
-//! - [`limit`]: [`SizeLimit`], the limit a `413` applied.
+//! - [`limit`]: [`SizeLimit`], the limit a `413` applied, and
+//!   [`lowered_request_limit`], the request limit an intermediary forwards.
 //! - [`routing`]: [`RoutingAnswer`], the `307` or `503` of a node that does
 //!   not lead the stream's group.
 //! - [`refusal`]: [`IncarnationMismatch`] (`412`) and
@@ -98,6 +99,7 @@ pub use head::PROTOCOL_VERSION;
 pub use head::ServerIdentity;
 pub use head::StreamHead;
 pub use limit::SizeLimit;
+pub use limit::lowered_request_limit;
 pub use refusal::IncarnationMismatch;
 pub use refusal::StreamClosedConflict;
 pub use request::IncarnationPrecondition;

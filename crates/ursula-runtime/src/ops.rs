@@ -201,12 +201,12 @@ macro_rules! runtime_operations {
                 handle { call open_live_read(engine, metrics, request, placement) }
                 client { stream fn queue_open_live_read }
             }
-            op ProducerEarlyAnswer {
-                fields { request: ProducerEarlyAnswerRequest }
-                reply { response_tx: Option<ursula_stream::ProducerEarlyAnswer> }
+            op RouteWrite {
+                fields { request: RouteWriteRequest }
+                reply { response_tx: RoutedWrite }
                 guard { none }
-                handle { call producer_early_answer(engine, request, placement) }
-                client { pub stream fn producer_early_answer }
+                handle { call route_write(engine, request, placement) }
+                client { pub stream fn route_write }
             }
             op AcceptsLocalWrites {
                 fields {}

@@ -55,6 +55,7 @@ use ursula_runtime::ColdWriteAdmission;
 #[cfg(not(madsim))]
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::EarlyAnswerQuery;
 #[cfg(not(madsim))]
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::GroupEngine;
@@ -66,12 +67,12 @@ use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ProducerEarlyAnswer;
-use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::RouteWriteRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::RuntimeConfig;
 #[cfg(not(madsim))]
@@ -80,6 +81,7 @@ use ursula_runtime::RuntimeThreading;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::StreamErrorContext;
+use ursula_runtime::WriteRoute;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
@@ -2012,17 +2014,26 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
             checked.is_forward_before_proposal(),
             "{write:?}: {checked:?}"
         );
+        // The hint names the new leader with the term this node knows it
+        // in, from one view, so the front door can redirect typed.
+        let hint = checked.leader_hint().expect("a leader hint");
+        assert_eq!(hint.node_id, Some(new_leader), "{write:?}: {checked:?}");
+        assert!(
+            hint.term.is_some_and(|term| term > 0),
+            "{write:?}: {checked:?}"
+        );
         leader_id = new_leader;
     }
 
     shutdown_all(&engines).await;
 }
 
-/// Only the leader answers a producer write before its body (#581 section
-/// 2.5): a follower answers nothing, and the write takes its usual path.
+/// A write is routed before its body (#581 sections 2.5 and 6.1): the leader
+/// answers a producer write early, and a follower names the leader and its
+/// term instead.
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn only_the_leader_answers_a_producer_write_early() {
+async fn writes_are_routed_before_their_body() {
     let (_registry, mut engines, leader_id, _wal_roots) =
         build_three_node_cluster("early-answer", None).await;
     let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
@@ -2055,24 +2066,33 @@ async fn only_the_leader_answers_a_producer_write_early() {
             .await
             .expect("wait for apply");
     }
-    let request = ProducerEarlyAnswerRequest {
+    let request = RouteWriteRequest {
         stream_id,
-        producer,
-        incarnation,
-        now_ms: 0,
+        early_answer: Some(EarlyAnswerQuery {
+            producer,
+            incarnation,
+            now_ms: 0,
+        }),
     };
     for (index, engine) in engines.iter_mut().enumerate() {
-        let answer = engine
-            .producer_early_answer(request.clone(), placement())
+        let route = engine
+            .route_write(request.clone(), placement())
             .await
-            .expect("early answer lookup");
+            .expect("route lookup");
         if index == leader_index {
             assert!(
-                matches!(answer, Some(ProducerEarlyAnswer::Repeat(_))),
-                "{answer:?}"
+                matches!(route, WriteRoute::Leader {
+                    early_answer: Some(ProducerEarlyAnswer::Repeat(_))
+                }),
+                "{route:?}"
             );
         } else {
-            assert_eq!(answer, None, "a follower answers nothing early");
+            // A follower answers nothing early: it names the leader.
+            assert!(
+                matches!(route, WriteRoute::Follower { leader_id: id, term, .. }
+                    if id == leader_id && term > 0),
+                "{route:?}"
+            );
         }
     }
     shutdown_all(&engines).await;

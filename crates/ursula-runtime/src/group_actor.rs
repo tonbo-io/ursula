@@ -49,7 +49,6 @@ use crate::request::ImportGroupStateResponse;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
-use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -57,6 +56,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::RouteWriteRequest;
+use crate::request::RoutedWrite;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
@@ -637,28 +638,25 @@ impl GroupActor {
         let mut batch_bytes = request.payload_len();
         let mut requests = vec![request];
         let mut replies = vec![(response_tx, guard)];
-        // Early answers between appends are read-only lookups of applied
-        // state: serve them inline so they do not end the batch (#581
-        // section 2.5). Bounded like the batch itself.
+        // Write routes between appends, with their early answers, are
+        // read-only lookups of applied state: serve them inline so they do
+        // not end the batch (#581 sections 2.5 and 6.1). Bounded like the
+        // batch itself.
         let mut early_answers = 0usize;
         while requests.len() < MAX_BATCH && early_answers < MAX_BATCH {
             let Ok(command) = self.rx.try_recv() else {
                 break;
             };
             match command.value {
-                GroupCommand::ProducerEarlyAnswer {
+                GroupCommand::RouteWrite {
                     request,
                     response_tx,
                 } => {
                     self.metrics
                         .record_group_mailbox_dequeued(self.placement.raft_group_id);
                     early_answers = early_answers.saturating_add(1);
-                    let answer = CoreWorker::producer_early_answer(
-                        &mut self.engine,
-                        request,
-                        self.placement,
-                    )
-                    .await;
+                    let answer =
+                        CoreWorker::route_write(&mut self.engine, request, self.placement).await;
                     reply(response_tx, answer);
                 }
                 GroupCommand::Append { ref request, .. }

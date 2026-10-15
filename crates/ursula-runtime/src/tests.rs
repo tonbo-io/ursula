@@ -3772,6 +3772,14 @@ struct BlockingReadEngine {
 }
 
 impl GroupEngine for BlockingReadEngine {
+    fn route_write<'a>(
+        &'a mut self,
+        request: RouteWriteRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a> {
+        self.inner.route_write(request, placement)
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
@@ -3963,6 +3971,14 @@ impl GroupEngine for BlockingReadEngine {
 }
 
 impl GroupEngine for RecordingEngine {
+    fn route_write<'a>(
+        &'a mut self,
+        _request: RouteWriteRequest,
+        _placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a> {
+        Box::pin(async { Ok(WriteRoute::Leader { early_answer: None }) })
+    }
+
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -4205,6 +4221,14 @@ struct BlockingFirstCreateEngine {
 }
 
 impl GroupEngine for BlockingFirstCreateEngine {
+    fn route_write<'a>(
+        &'a mut self,
+        request: RouteWriteRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a> {
+        self.inner.route_write(request, placement)
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
@@ -4346,6 +4370,14 @@ impl GroupEngineFactory for FailingFactory {
 struct FailingEngine;
 
 impl GroupEngine for FailingEngine {
+    fn route_write<'a>(
+        &'a mut self,
+        _request: RouteWriteRequest,
+        _placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a> {
+        Box::pin(async { Ok(WriteRoute::Leader { early_answer: None }) })
+    }
+
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(async { Ok(Vec::new()) })
     }

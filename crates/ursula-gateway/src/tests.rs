@@ -1213,7 +1213,76 @@ async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
     let resp = gateway.handle(req).await;
 
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(named_limit(&resp), Some(SizeLimit::Request(4)));
     assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+/// The limit a `413` names, as clients parse it.
+fn named_limit(response: &AxumResponse) -> Option<SizeLimit> {
+    SizeLimit::parse(
+        response.status().as_u16(),
+        response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("well-formed limit")
+}
+
+/// The gateway replaces `Ursula-Max-Request-Bytes` on every forwarded answer
+/// that carries it with the smaller of the node's value and its own limit,
+/// a `413` of the node included, and adds it to no answer without it.
+#[tokio::test]
+async fn gateway_lowers_the_request_limit_a_node_advertises() {
+    let upstream = spawn_upstream(
+        Router::new()
+            .route(
+                "/bucket/head",
+                any(|| async { ([("ursula-max-request-bytes", "33554432")], "") }),
+            )
+            .route(
+                "/bucket/small",
+                any(|| async { ([("ursula-max-request-bytes", "2")], "") }),
+            )
+            .route(
+                "/bucket/refused",
+                any(|| async {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        [("ursula-max-request-bytes", "33554432")],
+                        "",
+                    )
+                }),
+            )
+            .route(
+                "/bucket/malformed",
+                any(|| async { ([("ursula-max-request-bytes", "lots")], "") }),
+            )
+            .route("/bucket/plain", any(|| async { "" })),
+    )
+    .await;
+    let mut config = test_config(vec![upstream.url.clone()]);
+    config.max_request_body_bytes = 1_048_576;
+    let gateway = Gateway::new(config);
+    for (path, expected) in [
+        ("/bucket/head", Some("1048576")),
+        ("/bucket/small", Some("2")),
+        ("/bucket/refused", Some("1048576")),
+        ("/bucket/malformed", Some("1048576")),
+        ("/bucket/plain", None),
+    ] {
+        let response = gateway.handle(post_path(path)).await;
+        assert_eq!(
+            response
+                .headers()
+                .get("ursula-max-request-bytes")
+                .map(|value| value.to_str().expect("ascii")),
+            expected,
+            "{path}"
+        );
+    }
+    let refused = gateway.handle(post_path("/bucket/refused")).await;
+    assert_eq!(named_limit(&refused), Some(SizeLimit::Request(1_048_576)));
 }
 
 /// A request body that fails while the gateway buffers it, as when the
@@ -1320,7 +1389,10 @@ fn raft_redirect(location: &str, mut headers: HeaderMap) -> (StatusCode, HeaderM
         LOCATION,
         HeaderValue::from_str(location).expect("redirect target"),
     );
-    headers.insert(HEADER_URSULA_RAFT_LEADER_ID, HeaderValue::from_static("1"));
+    headers.insert(
+        names::X_URSULA_RAFT_LEADER_ID,
+        HeaderValue::from_static("1"),
+    );
     (StatusCode::TEMPORARY_REDIRECT, headers)
 }
 
@@ -1568,6 +1640,29 @@ async fn a_chain_of_redirects_reaches_the_answering_node() {
         let learned = status.is_success().then(|| leader.url());
         assert_eq!(cached_route(&gateway), learned, "{name}");
     }
+}
+
+/// A redirect from a node that hosts no replica of the group names the
+/// group alone (#581 section 5.7). The gateway follows it as a leader
+/// redirect, and the client never sees it.
+#[tokio::test]
+async fn the_gateway_follows_a_redirect_from_a_node_that_hosts_no_replica() {
+    let (outsider, replica) = (Scripted::spawn().await, Scripted::spawn().await);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("{}/bucket/stream", replica.url())).unwrap(),
+    );
+    headers.insert(names::X_URSULA_RAFT_GROUP, HeaderValue::from_static("3"));
+    outsider.answers((StatusCode::TEMPORARY_REDIRECT, headers));
+    replica.answers((StatusCode::OK, HeaderMap::new()));
+    let gateway = gateway_starting_at(&[&outsider, &replica]);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!((outsider.hits(), replica.hits()), (1, 1));
+    assert_eq!(gateway.metrics_snapshot().leader_redirects, 1);
 }
 
 /// A redirect whose `Location` is not one of the upstreams (`--upstream`
@@ -2737,6 +2832,11 @@ mod admission_and_usage {
 
         let oversized = send(&gateway, "POST", "/tenant-a/orders", "123456789").await;
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            super::named_limit(&oversized),
+            Some(SizeLimit::Request(8)),
+            "the tenant's limit, below the gateway's"
+        );
         assert_eq!(
             hits.load(Ordering::Relaxed),
             0,

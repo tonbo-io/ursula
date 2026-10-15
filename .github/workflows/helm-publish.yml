@@ -53,7 +53,7 @@ jobs:
         run: helm lint "$CHART_DIR" --strict
 
       - name: Render chart
-        run: helm template ursula "$CHART_DIR" >/tmp/ursula-chart-rendered.yaml
+        run: helm template ursula "$CHART_DIR" --set server.clusterId=ci-render >/tmp/ursula-chart-rendered.yaml
 
       - name: Test chart guardrails
         run: python3 scripts/helm_template_test.py

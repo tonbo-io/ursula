@@ -14,6 +14,8 @@ pub enum ValidationError {
     AppendTransportBudget,
     #[error("raft.wal.path is required when raft.peers is set")]
     RaftWalPathRequired,
+    #[error("server.cluster_id is required when raft.peers is set")]
+    ClusterIdRequired,
     #[error("storage.cold.s3.bucket is required when cold backend is 's3'")]
     ColdS3BucketRequired,
     #[error("raft.node_id {0} must be present in raft.peers")]
@@ -82,6 +84,11 @@ impl UrsulaConfig {
         // single node may run on a temporary one.
         if !self.raft.peers.is_empty() && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
+        }
+        // Every node of a cluster names the same deployment, so none may
+        // draw its own.
+        if !self.raft.peers.is_empty() && self.server.cluster_id.is_none() {
+            return Err(ValidationError::ClusterIdRequired);
         }
         let minimum = self.raft.wal.min_available_size.as_bytes();
         let resume = self.raft.wal.resume_available_size.as_bytes();

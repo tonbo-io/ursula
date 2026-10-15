@@ -41,7 +41,7 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
 | `409` | Stale publish (a newer snapshot exists) or offset out of range. |
 | `410` | Snapshot offset is older than the retained stream history. |
 | `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. Nothing was published; the response's `Stream-Incarnation` is the current token. |
-| `413` | Snapshot body exceeds the maximum allowed size (32 MiB inline, 1 GiB in the cold tier). |
+| `413` | Snapshot body exceeds the maximum allowed size: 32 MiB without a cold backend, named by `Ursula-Max-Request-Bytes`, and 1 GiB with one, named by `Ursula-Max-Snapshot-Bytes`. |
 | `502` | The cold backend failed while storing the body. |
 | `503` | JSON stream only: Ursula could not read the byte before the offset to check the boundary. Nothing was published; retry. |
 

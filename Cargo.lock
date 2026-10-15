@@ -4489,6 +4489,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+ "ursula-headers",
 ]
 
 [[package]]
@@ -4550,6 +4551,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tracing",
+ "ursula-headers",
  "ursula-observability",
  "ursula-proto",
  "ursula-shard",
@@ -4661,6 +4663,7 @@ dependencies = [
  "tracing-opentelemetry",
  "ursula-config",
  "ursula-control",
+ "ursula-headers",
  "ursula-observability",
  "ursula-proto",
  "ursula-runtime",

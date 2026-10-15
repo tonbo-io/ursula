@@ -14,7 +14,8 @@
 //! - `frozen`: immutable payload archives and validated journal references for stopped groups.
 //! - `core_meta`: each core's metadata file: every group's vote and log
 //!   state (empty, initialized or recovering).
-//! - `topology`: immutable core and group counts of the WAL root.
+//! - `topology`: immutable core and group counts and cluster id of the WAL
+//!   root.
 //! - `run_state`: the node's run-state file and how the journals open after
 //!   the previous run (the replay-mode decision and the recovery state).
 //! - `state_file`: the atomically replaced, checksummed state-file format.
@@ -103,6 +104,7 @@ pub use state_file::StateFileDefect;
 pub use state_file::StateFileError;
 pub use state_file::StateFileKind;
 pub(crate) use state_file::replace_file;
+pub use topology::generate_cluster_id;
 pub use wal::RaftWal;
 pub(crate) use writer::CoreFileLogWriter;
 pub use writer::CoreJournalError;

@@ -27,17 +27,21 @@ use ursula_headers::EpochClosure;
 use ursula_headers::HeaderError;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
+use ursula_headers::SnapshotRef;
+use ursula_headers::StreamHead;
 use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
 use ursula_headers::value::Offset;
 use ursula_headers::value::Seq;
+use ursula_headers::value::SnapshotDigest;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::raft_grpc_metrics_snapshot;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ClosedBy;
 use ursula_runtime::ClosedEpoch as StreamClosedEpoch;
 use ursula_runtime::ColdStoreInfo;
+use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::ProducerAck;
 use ursula_runtime::ProducerDelivery;
 use ursula_runtime::ProducerRefusal;
@@ -57,6 +61,7 @@ use crate::HEADER_STREAM_EXPIRES_AT;
 use crate::HEADER_STREAM_TTL;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
+use crate::limits;
 
 const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
 
@@ -151,6 +156,38 @@ pub(crate) fn insert_incarnation(headers: &mut HeaderMap, incarnation: u64) {
     if incarnation != 0 {
         insert_u64_header(headers, names::STREAM_INCARNATION, incarnation);
     }
+}
+
+/// The stream metadata of a successful HEAD (extensions Section 10), with
+/// the node's limits. `Err` only when a value is outside what the protocol
+/// carries, which the state machine never produces: a stream's incarnation
+/// is never `0`, its retained offset and snapshot lie at or below its tail,
+/// and a snapshot digest is BLAKE3 hex.
+pub(crate) fn stream_head(
+    response: &HeadStreamResponse,
+    max_snapshot_bytes: Option<u64>,
+) -> Result<StreamHead, HeaderError> {
+    let snapshot = match (response.snapshot_offset, &response.snapshot_digest) {
+        (Some(offset), Some(digest)) => Some(SnapshotRef {
+            offset: Offset::from_u64(offset),
+            digest: SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest)?,
+        }),
+        _ => None,
+    };
+    Ok(StreamHead::new(
+        Incarnation::try_from(response.created_at_ms)?,
+        Offset::from_u64(response.tail_offset),
+        Offset::from_u64(response.retained_offset),
+        limits::MAX_REQUEST_BYTES,
+    )?
+    .with_closed(response.closed)
+    .with_snapshot(snapshot)?
+    .with_max_snapshot_bytes(max_snapshot_bytes))
+}
+
+/// Renders a HEAD's stream metadata with the shared header crate.
+pub(crate) fn insert_stream_head(headers: &mut HeaderMap, head: &StreamHead) {
+    head.render(|name, value| insert_header_str(headers, name, value));
 }
 
 pub(crate) fn insert_padded_offset(headers: &mut HeaderMap, name: &'static str, value: u64) {

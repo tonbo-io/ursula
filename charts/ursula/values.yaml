@@ -119,6 +119,14 @@ server:
   # in-cluster operator or chaos controller may opt in to a pod-reachable bind
   # such as 0.0.0.0:4438; the chart never adds it to a Service.
   adminListen: 127.0.0.1:4438
+  # The deployment's id (server.cluster_id), sent as Ursula-Cluster-Id on
+  # every HEAD: 1 to 64 characters from A-Z, a-z, 0-9, ".", "_" and "-".
+  # Required for every install, a single replica included, because the
+  # chart always renders the peer list: name the environment and the region,
+  # such as prod-us-east-1, and give every deployment one client can reach
+  # its own. A node refuses to start when its WAL holds another id, so keep
+  # the old id when a restore replaces a deployment.
+  clusterId: ""
   service:
     # Render the internal client Service.
     enabled: true

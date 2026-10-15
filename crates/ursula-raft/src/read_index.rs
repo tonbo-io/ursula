@@ -30,6 +30,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::ReadIndexFuture;
 
+use crate::GroupLeadership;
 use crate::forward::group_engine_leader_read_unavailable;
 use crate::forward::group_engine_linearizable_read_error;
 use crate::registry::RaftGroupHandle;
@@ -133,7 +134,7 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
     let budget = Duration::from_millis(config.election_timeout_min);
     let round = Duration::from_millis(config.heartbeat_interval);
     let began = UrsulaRaftTypeConfig::now();
-    let self_id = || raft.metrics().borrow_watched().id;
+    let leadership = || GroupLeadership::of(&raft.metrics().borrow_watched());
     let linearizer = loop {
         let started = UrsulaRaftTypeConfig::now();
         match raft.get_read_linearizer(ReadPolicy::ReadIndex).await {
@@ -156,7 +157,7 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
                 return Err(group_engine_linearizable_read_error(
                     err,
                     OPERATION,
-                    self_id(),
+                    &leadership(),
                 ));
             }
         }
@@ -168,10 +169,9 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
             tracing::debug!(
                 "OpenRaft {OPERATION} timed out waiting to apply the read index: {state:?}"
             );
-            Err(group_engine_leader_read_unavailable(
-                format!("OpenRaft {OPERATION} did not apply the read index in time"),
-                self_id(),
-            ))
+            Err(group_engine_leader_read_unavailable(format!(
+                "OpenRaft {OPERATION} did not apply the read index in time"
+            )))
         }
         Err(fatal) => Err(GroupEngineError::new(format!(
             "OpenRaft {OPERATION} could not apply the read index: {fatal}"

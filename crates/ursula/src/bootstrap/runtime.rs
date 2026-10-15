@@ -74,12 +74,13 @@ impl GroupStorage {
         persistence: Persistence,
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
+        cluster_id: Option<&ursula_headers::ClusterId>,
     ) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
-            Persistence::Raft { log_dir } => {
-                Self::Raft(RaftWal::start_with(log_dir, tuning, topology)?)
-            }
+            Persistence::Raft { log_dir } => Self::Raft(RaftWal::start_in_cluster(
+                log_dir, tuning, topology, cluster_id,
+            )?),
         })
     }
 
@@ -205,6 +206,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
         },
         &shard_map,
+        config.server.cluster_id.as_ref(),
     )?;
     let spawned = spawn_runtime_core(
         runtime_config,

@@ -47,13 +47,13 @@ use super::GroupPlanColdGcFuture;
 use super::GroupPlanColdOrphanSweepFuture;
 use super::GroupPlanNextColdFlushBatchFuture;
 use super::GroupPlanSharedRefCompactionFuture;
-use super::GroupProducerEarlyAnswerFuture;
 use super::GroupPublishSnapshotFuture;
 use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
 use super::GroupRepairColdIndexFuture;
+use super::GroupRouteWriteFuture;
 use super::GroupSnapshotFuture;
 use super::GroupStateGaugesFuture;
 use super::GroupTidyStreamFuture;
@@ -117,11 +117,13 @@ use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
+use crate::request::RouteWriteRequest;
 use crate::request::StreamAppendCount;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::WriteHotBacklog;
+use crate::request::WriteRoute;
 use crate::retention_gc::RetentionGcTarget;
 use crate::retention_gc::RetentionGcTracker;
 use crate::retention_gc::collect_retained_cold_objects;
@@ -668,8 +670,8 @@ impl InMemoryGroupEngine {
         Ok(response)
     }
 
-    /// [`GroupEngine::producer_early_answer`] from this engine's applied
-    /// state.
+    /// The early answer of [`GroupEngine::route_write`], from this
+    /// engine's applied state.
     pub fn producer_early_answer_now(
         &self,
         request: &ProducerEarlyAnswerRequest,
@@ -1719,12 +1721,18 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
-    fn producer_early_answer<'a>(
+    fn route_write<'a>(
         &'a mut self,
-        request: ProducerEarlyAnswerRequest,
+        request: RouteWriteRequest,
         _placement: ShardPlacement,
-    ) -> GroupProducerEarlyAnswerFuture<'a> {
-        Box::pin(async move { Ok(self.producer_early_answer_now(&request)) })
+    ) -> GroupRouteWriteFuture<'a> {
+        Box::pin(async move {
+            Ok(WriteRoute::Leader {
+                early_answer: request
+                    .early_answer_request()
+                    .and_then(|request| self.producer_early_answer_now(&request)),
+            })
+        })
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {

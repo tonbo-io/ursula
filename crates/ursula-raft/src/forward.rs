@@ -22,6 +22,7 @@ use ursula_runtime::ReadStreamResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
+use crate::GroupLeadership;
 use crate::codec::decode_wire;
 use crate::codec::encode_wire;
 use crate::format_epoch::observe_outbound_status;
@@ -560,7 +561,7 @@ pub(crate) async fn write_commands_on_raft(
             format!("OpenRaft client_write_many forwarded to leader: {err}"),
             err.leader_id,
             err.leader_node.as_ref(),
-            raft.metrics().borrow_watched().id,
+            &GroupLeadership::of(&raft.metrics().borrow_watched()),
             false,
         )),
     });
@@ -608,14 +609,14 @@ pub(crate) fn group_engine_client_write_error(
         UrsulaRaftTypeConfig,
         openraft::error::ClientWriteError<UrsulaRaftTypeConfig>,
     >,
-    self_id: u64,
+    leadership: &GroupLeadership,
 ) -> GroupEngineError {
     if let Some(forward) = err.forward_to_leader() {
         return group_engine_forward_to_leader_error(
             format!("OpenRaft client_write forwarded to leader: {err}"),
             forward.leader_id,
             forward.leader_node.as_ref(),
-            self_id,
+            leadership,
             false,
         );
     }
@@ -638,7 +639,7 @@ pub(crate) fn group_engine_linearizable_read_error(
         openraft::error::LinearizableReadError<UrsulaRaftTypeConfig>,
     >,
     operation: &str,
-    self_id: u64,
+    leadership: &GroupLeadership,
 ) -> GroupEngineError {
     tracing::debug!("OpenRaft {operation} could not confirm leadership: {err}");
     match err.api_error() {
@@ -647,15 +648,14 @@ pub(crate) fn group_engine_linearizable_read_error(
                 format!("OpenRaft {operation} has to forward request to leader"),
                 forward.leader_id,
                 forward.leader_node.as_ref(),
-                self_id,
+                leadership,
                 true,
             )
         }
         Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
-            group_engine_leader_read_unavailable(
-                format!("OpenRaft {operation} could not confirm leadership with a quorum"),
-                self_id,
-            )
+            group_engine_leader_read_unavailable(format!(
+                "OpenRaft {operation} could not confirm leadership with a quorum"
+            ))
         }
         None => GroupEngineError::new(format!(
             "OpenRaft {operation} could not confirm leadership: {err}"
@@ -667,11 +667,8 @@ pub(crate) fn group_engine_linearizable_read_error(
 /// could not be linearized in time: no quorum confirmed leadership, or the
 /// local state machine did not reach the read index. `message` (the 503
 /// body) names which, without internal addresses.
-pub(crate) fn group_engine_leader_read_unavailable(
-    message: String,
-    self_id: u64,
-) -> GroupEngineError {
-    group_engine_forward_to_leader_error(message, None, None, self_id, true)
+pub(crate) fn group_engine_leader_read_unavailable(message: String) -> GroupEngineError {
+    GroupEngineError::forward_to_leader_before_proposal(message, None, None)
 }
 
 /// `before_proposal` is true only for a local leadership check that runs
@@ -681,7 +678,7 @@ pub(crate) fn group_engine_forward_to_leader_error(
     message: impl Into<String>,
     leader_id: Option<u64>,
     leader_node: Option<&BasicNode>,
-    self_id: u64,
+    leadership: &GroupLeadership,
     before_proposal: bool,
 ) -> GroupEngineError {
     let build = if before_proposal {
@@ -693,14 +690,17 @@ pub(crate) fn group_engine_forward_to_leader_error(
     // leader is *this* node, leadership is in a transient step-down/election
     // window: redirecting the client back to ourselves would just loop, so
     // report leader-unknown and let the HTTP layer answer with a retryable 503.
-    if leader_id == Some(self_id) {
+    if leader_id == Some(leadership.node_id) {
         return build(message, None, None);
     }
+    // The hint names the leader's term only when this replica's view names
+    // the same leader: a redirect carries the leader and its term together.
     build(
         message,
         leader_id,
         leader_node.map(|node| node.addr.clone()),
     )
+    .with_leader_term(leader_id.and_then(|leader| leadership.term_of(leader)))
 }
 #[cfg(test)]
 mod batch_response_tests {

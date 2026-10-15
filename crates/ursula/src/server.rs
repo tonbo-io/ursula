@@ -349,6 +349,7 @@ async fn init_state(
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
+        .with_configured_cluster_id(config.server.cluster_id.clone())
         .with_raft_wal(raft_wal);
     if let Some(wal_path) = log_dir {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(
@@ -723,6 +724,33 @@ mod tests {
                 .unwrap();
         assert_eq!(metrics["process_node_id"], 7);
         assert_eq!(metrics["process_incarnation"].as_str().unwrap().len(), 32);
+    }
+
+    /// A node without a WAL (in-memory mode) names the configured cluster
+    /// on every HEAD answer, as one with a WAL does.
+    #[tokio::test]
+    async fn an_in_memory_node_names_the_configured_cluster() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.server.cluster_id = Some(ursula_headers::ClusterId::new("dev-local").unwrap());
+        let state = super::init_state(&config, crate::Persistence::InMemory, false)
+            .await
+            .unwrap();
+        let response =
+            crate::client_router_with_admission(state, crate::IngressAdmission::default())
+                .oneshot(
+                    Request::head("/benchcmp/missing")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["ursula-cluster-id"], "dev-local");
     }
 
     /// A node reports how the WAL opened: a new WAL root is read strictly

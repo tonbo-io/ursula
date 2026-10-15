@@ -30,6 +30,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
 - [9. Read Path](#9-read-path)
+- [10. Server Metadata](#10-server-metadata)
 
 ---
 
@@ -111,10 +112,10 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 - `404 Not Found`: Stream does not exist.
 - `409 Conflict`: `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
-- `413 Payload Too Large`: Snapshot exceeds the server's size limit.
+- `413 Payload Too Large`: Snapshot exceeds the server's size limit. The response names the limit it applied (Section 10).
 - `503 Service Unavailable`: For a JSON stream, the server could not verify that `snapshot_offset` is a message boundary. It MUST NOT publish an unverified offset; the client MAY retry.
 
-> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB; only the reference is replicated, and the digest is the same as for an inline body.
+> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB in one request. Only the reference is replicated, and the digest is the same as for an inline body. A body above 32 MiB without a cold backend answers `413` with `Ursula-Max-Request-Bytes`, and one above 1 GiB with a cold backend answers `413` with `Ursula-Max-Snapshot-Bytes`.
 
 **Idempotency:**
 
@@ -381,13 +382,13 @@ A server that keeps a floor MUST refuse, with `403 Forbidden`, `Producer-Epoch: 
 - a write that carries `Stream-Incarnation`, from a producer the server holds no state for, whose epoch is at or below the floor;
 - a write that carries `Stream-Incarnation` on producer state that a write without it opened at or below the floor, unless the write claims an epoch above the floor. Such a claim makes the state as good as one opened above the floor, and it reports no closure: no `Producer-Closed-Epoch` on its answer, and a later write of the epoch it replaced answers `stale-epoch`. That epoch may be one the server forgot, and its writes may be another writer's, so no answer reports which of them applied. A claim on such state that stays at or below the floor reports no closure either.
 
+A claim without `Stream-Incarnation` above the floor lifts such state too, and it also reports no closure: no `Producer-Closed-Epoch` on its answer, and a later write of the epoch it replaced answers `stale-epoch`. The state then counts as opened above the floor, so later writes that carry `Stream-Incarnation` are no longer refused for it.
+
 A producer's state opened above the floor holds epochs above every epoch the server discarded for that producer, so its claims of later epochs are never refused for the floor, even after the floor rose for other producers. A writer that carries `Stream-Incarnation` therefore never reaches an epoch the server forgot, and a stale writer that returns after its state expired cannot claim an old epoch. The floor is per stream: a new producer with `Stream-Incarnation` on a stream that discarded others' state claims above it.
 
 ### 5.5. Answers Before the Body
 
-A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). It follows the order of Section 5.3: step 1 runs before any early answer, and the early answers are steps 2 and 3, which never read the body. An early answer is decided by the request's headers alone: the producer headers, `Producer-Digest` when present, and `Stream-Incarnation`. The body takes no part in it, not even through its length, its digest or its JSON. The content checks of step 5 apply only to a write that would apply, so a repeat or a key conflict gets the same answer before and after the body, whatever the body holds. A client that sent `Expect: 100-continue` then sends no body.
-
-A server MAY refuse a request for load (`503` with `Retry-After`) before it looks for an early answer. The refusal is retryable, and the retry gets the answer.
+A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). It follows the order of Section 5.3: step 1 runs before any early answer, and the early answers are steps 2 and 3, which never read the body. An early answer is decided by the request's headers alone: the producer headers, `Producer-Digest` when present, and `Stream-Incarnation`. The body takes no part in it, not even through its length, its digest or its JSON. The content checks of step 5 apply only to a write that would apply, so a repeat or a key conflict gets the same answer before and after the body, whatever the body holds. The other answers that may come before the body are routing (Section 5.7) and size (Section 10). A client that sent `Expect: 100-continue` then sends no body.
 
 ### 5.6. Client Rules
 
@@ -395,7 +396,13 @@ A server MAY refuse a request for load (`503` with `Retry-After`) before it look
 - A client MUST NOT resend the bytes of a write under a new epoch until it knows that the write's epoch is closed above its last applied write (from `Producer-Closed-Seq` on an `epoch-closed` answer or on its own claim's response), or until it has read the stream after its claim applied and found the write absent. It then resends only the writes that did not apply, in order, after the claim.
 - When the outcome of a write is unknown, the client repeats the same write: the same key, body and `Producer-Digest`. A client MUST NOT conclude from a refusal's status or headers that a write did not apply, except from the answers of Section 5.3.
 
-> **Note (informative).** Ursula keeps a producer's state while the producer wrote within 7 days, and for at least 1 hour when the stream holds more than 4,096 producers. It keeps the range and identity of each producer's newest write and the identity of the claim of its current epoch. It answers a write of the epoch the current one replaced with `epoch-closed;by=claim`, and of older epochs with `stale-epoch`. Its epoch floor rises whenever it discards a producer's state: after 7 idle days, to admit a producer past the 4,096 cap, or when it tidies an idle stream. It marks each producer's state as opened above or below the floor, one byte. The leader answers a repeat or a key conflict before the body when the request's `Stream-Incarnation` equals the stream's current one after `Expect: 100-continue`, or for a declared body of at least 64 KiB on any HTTP version. Its write admission runs first, so under load a repeat can get `503` instead. On HTTP/2 it does not read the rest of the body. On HTTP/1.1 without `Expect: 100-continue` it reads and discards the body, up to 32 MiB, 5 seconds without data and 30 seconds in all, and closes the connection past those bounds, so the early answer saves the staging and the proposal, not the upload.
+> **Note (informative).** Ursula keeps a producer's state while the producer wrote within 7 days, and for at least 1 hour when the stream holds more than 4,096 producers. It keeps the range and identity of each producer's newest write and the identity of the claim of its current epoch. It answers a write of the epoch the current one replaced with `epoch-closed;by=claim`, and of older epochs with `stale-epoch`. Its epoch floor rises whenever it discards a producer's state: after 7 idle days, to admit a producer past the 4,096 cap, or when it tidies an idle stream. It marks each producer's state as opened above or below the floor, one byte. The leader answers a repeat or a key conflict before the body when the request's `Stream-Incarnation` equals the stream's current one after `Expect: 100-continue`, or for a declared body of at least 64 KiB on any HTTP version. It decides a write from its head in this order: size (`413`), which its admission checks before anything else, malformed headers (`400`), routing (Section 5.7), the early answer, and then load (`503` with `Retry-After`), so a repeat gets its answer under load. On HTTP/2 it does not read the rest of the body. On HTTP/1.1 without `Expect: 100-continue` it reads and discards the body, up to 32 MiB, 5 seconds without data and 30 seconds in all, and closes the connection past those bounds, so the early answer saves the staging and the proposal, not the upload.
+
+### 5.7. Routing Answers
+
+A server that does not lead a stream's writes answers a write `307 Temporary Redirect` to the server that does, or `503 Service Unavailable` with `Retry-After` when it knows none, before it reads any of the request body, so that a proxy that sent `Expect: 100-continue` can send the unread body elsewhere. Once it has read any of the body, a server MUST NOT answer with a redirect. The client resolves the outcome of a request it could not complete by repeating it (Section 5.6).
+
+> **Note (informative).** Ursula routes a create, an append or close, and a snapshot publish before its body. The redirect carries `x-ursula-raft-leader-id`, `x-ursula-raft-group` and `x-ursula-raft-term`, so a router can cache the leader per group and discard a hint of an older term. The `503` carries `x-ursula-raft-group`. A node that hosts no replica of the group redirects to a node that does and names only the group, in `x-ursula-raft-group`, since it knows no leader and no term. A `307` that carries `x-ursula-raft-group` without `x-ursula-raft-leader-id` and `x-ursula-raft-term` is such a redirect, and its target answers as any replica does. Every other redirect, of a read as of a write, carries the leader, the group and the term. A node that knows a leader but not its term answers `503` with `Retry-After` and `x-ursula-raft-group` instead, so every `307` it sends parses as one of these two shapes. A node that loses the group's leadership while it reads a body answers `503` with `Retry-After`.
 
 ---
 
@@ -429,7 +436,7 @@ This section collects read parameters and read representations that apply to eve
 - `leader`: the read MUST be linearizable. It MUST reflect every append acknowledged before the request was received, including appends acknowledged by a newer leader.
 - Any other value MUST be rejected with `400 Bad Request`. `consistency=leader` combined with `live` MUST be rejected with `400 Bad Request`; live reads follow the leader's watchers already.
 
-A server that cannot prove the read is linearizable MUST NOT serve it. It answers `307 Temporary Redirect` to the current leader when it knows one, and otherwise `503 Service Unavailable` with `Retry-After`. Clients SHOULD follow the redirect and retry the `503` after the advertised delay.
+A server that cannot prove the read is linearizable MUST NOT serve it. It answers `307 Temporary Redirect` to the current leader when it knows one, and otherwise `503 Service Unavailable` with `Retry-After`. Clients SHOULD follow the redirect and retry the `503` after the advertised delay. Routing answers to writes follow Section 5.7.
 
 > **Note (informative).** Ursula forwards a `consistency=leader` read from a follower to the group's leader. The leader confirms with a majority of voters that it still leads (Raft ReadIndex) and waits until it has applied everything committed up to that point. Concurrent reads to the same Raft group share confirmation rounds. A leader cut off from the majority, or one that cannot confirm in time, answers `307` or `503` rather than its own state. Ursula applies the same confirmation to `HEAD`, `/bootstrap`, snapshot reads and the registration of a long-poll or SSE reader.
 
@@ -456,3 +463,27 @@ A `live=sse` read of a stream whose content type is neither `text/*` nor `applic
 - Each data event is followed by an `event: control` event whose `streamNextOffset` is the offset just past the decoded bytes.
 
 There is no client opt-in or opt-out: the stream's content type decides the encoding.
+
+---
+
+## 10. Server Metadata
+
+A server implementing this extension sends on every answer to a `HEAD`, `404`, redirects and `503` included:
+
+- `Ursula-Protocol: 2`, the version of the contract that Sections 2.4, 5 and 10 define. A later breaking change to them raises it. A server that sends none speaks version 1. A client MAY refuse a server that sends a lower version or none.
+- `Ursula-Cluster-Id: <id>`: 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, naming the deployment that serves the request. It does not change across restarts, upgrades, leader changes or history events, and an operator keeps it when a restore replaces a deployment. Two deployments that one client can reach MUST NOT share an id. A client that keeps state across requests SHOULD keep the id with it, and treat a different id as a different deployment, not as a new history of the same stream.
+
+These two headers are route-level, so a client tells a host alias routed to another deployment from a deleted stream. Intermediaries pass them through. They come on answers from a server: an answer an intermediary sends itself, such as a gateway's `401`, `403`, `429` or `503`, carries neither, and a client judges the protocol and the deployment only from answers that carry them.
+
+On every successful `HEAD` of a stream it also sends:
+
+- `Ursula-Max-Request-Bytes: <bytes>`: the largest request body that any request to the stream may carry, as far as the server and the intermediaries that implement this section know.
+- `Ursula-Max-Snapshot-Bytes: <bytes>`, when the server accepts snapshots larger than `Ursula-Max-Request-Bytes`: the largest snapshot it accepts.
+
+Both values are canonical decimal integers: no sign and no leading zero.
+
+**Size refusals.** A server that refuses a request for its size MUST answer `413 Payload Too Large` with the header of the limit it applied, set to that limit: `Ursula-Max-Request-Bytes` for a request body, `Ursula-Max-Snapshot-Bytes` for a snapshot. It SHOULD decide the refusal from `Content-Length` before reading the body. A body without `Content-Length` is refused once it crosses the limit, after the server read that much, and the client may then see a reset instead of the `413`. Clients that want the typed answer send `Content-Length`.
+
+**Intermediaries.** An intermediary that limits request bodies and implements this section MUST replace `Ursula-Max-Request-Bytes` on every response that carries it with the smaller of the received value and its own limit for that request, and MUST answer its own size refusals as above. It leaves `Ursula-Max-Snapshot-Bytes` alone. A `413` without either header comes from a layer that does not implement this section, such as a proxy with its own body limit. It tells the client only that some layer refused the size.
+
+> **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes). With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in one request and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit. An Ursula cluster's id is set by its operator (`server.cluster_id`). A single node without one generates one at its first start and keeps it in its WAL.

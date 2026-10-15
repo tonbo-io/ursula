@@ -62,7 +62,6 @@ use crate::request::ImportGroupStateResponse;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
-use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -70,6 +69,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::RouteWriteRequest;
+use crate::request::RoutedWrite;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
@@ -928,19 +929,23 @@ impl CoreWorker {
         response
     }
 
-    /// The answer to a tokened producer write that its head alone decides
-    /// (#581 section 2.5), from the group's applied state. A read-only
-    /// lookup, so it stays out of the engine execution histogram, which
-    /// times commands that apply.
-    pub(crate) async fn producer_early_answer(
+    /// Routes a write before its body is read (#581 section 6.1), with the
+    /// early answer of a tokened producer write that the leader's applied
+    /// state decides (section 2.5). A read-only lookup, so it stays out of
+    /// the engine execution histogram, which times commands that apply.
+    pub(crate) async fn route_write(
         group: &mut Box<dyn GroupEngine>,
-        request: ProducerEarlyAnswerRequest,
+        request: RouteWriteRequest,
         placement: ShardPlacement,
-    ) -> Result<Option<ursula_stream::ProducerEarlyAnswer>, RuntimeError> {
-        group
-            .producer_early_answer(request, placement)
+    ) -> Result<RoutedWrite, RuntimeError> {
+        let route = group
+            .route_write(request, placement)
             .await
-            .map_err(|err| RuntimeError::group_engine(placement, err))
+            .map_err(|err| RuntimeError::group_engine(placement, err))?;
+        Ok(RoutedWrite {
+            raft_group_id: placement.raft_group_id,
+            route,
+        })
     }
 
     /// Plain leadership check with no quorum round trip, for background

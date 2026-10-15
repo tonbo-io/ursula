@@ -54,16 +54,19 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | `FORMAT_EPOCH` | Format-epoch marker of the data directory. |
 | `wal.lock` | Advisory lock held by the node for the whole run. |
 | `run-state.bin` | Boot id, `fsync` policy and status of the last run, and the recovery epoch. |
-| `topology.bin` | Core count and group count the root was created with. |
+| `topology.bin` | Core count, group count and cluster id the root was created with. |
 | `core-N/journal-<seq>.seg` | Journal segments, 20-digit consecutive sequences starting at 1. |
 | `core-N/journal.meta` | Every group's vote and log state, and the core's verified recovery epoch. |
 | `core-N/journal.lock` | Advisory lock held by the core's writer. |
 | `core-N/frozen-<group>-<seg>-<offset>-<first>-<last>-<hash>.seg` | Entry archives of apply-stopped groups (see Reclaim). |
 
 A second process that tries to take either lock fails with an error naming the
-lock path and the owner PID. `topology.bin` binds the root to its routing:
-counts that differ from the stored ones refuse startup, and so does prior state
-(a run state or a core directory) without a topology file.
+lock path and the owner PID. `topology.bin` binds the root to its routing and
+its cluster: counts that differ from the stored ones refuse startup, a
+configured `server.cluster_id` that differs from the stored one refuses startup
+too, and so does prior state (a run state or a core directory) without a
+topology file. A root created without a configured id stores the id the node
+generated.
 
 Every segment starts with a 32-byte header, and every record is a frame:
 

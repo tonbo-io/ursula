@@ -31,6 +31,14 @@ listen = "127.0.0.1:4437"
 # for HTTP leader redirects, so clients and gateways must be able to reach it.
 # cluster_listen = "10.0.0.1:4438"
 
+# The deployment's id, sent as Ursula-Cluster-Id on every HEAD: 1 to 64
+# characters from A-Z, a-z, 0-9, ".", "_" and "-". Required when raft.peers
+# is set, the same on every node and different for every deployment a client
+# can reach. A single node without it generates one at its first start and
+# keeps it in its WAL. The WAL records the id, and a node whose configured id
+# differs refuses to start.
+# cluster_id = "prod-us-east-1"
+
 # Process-wide cap on accepted write body bytes held by the HTTP layer.
 # A request must reserve its body bytes before axum drains the body into
 # Bytes, and the reservation lives until the response is produced.  This

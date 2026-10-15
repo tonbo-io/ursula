@@ -129,6 +129,7 @@ fn assert_leader_unknown(what: &str, err: &GroupEngineError, url: &str) {
             leader_hint: GroupLeaderHint {
                 node_id: None,
                 address: None,
+                term: None,
             },
             ..
         }),

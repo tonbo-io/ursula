@@ -63,7 +63,6 @@ use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanColdOrphanSweepFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPlanSharedRefCompactionFuture;
-use ursula_runtime::GroupProducerEarlyAnswerFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadRoute;
@@ -74,6 +73,7 @@ use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRepairColdIndexFuture;
 use ursula_runtime::GroupRouteHeadStreamFuture;
 use ursula_runtime::GroupRouteReadStreamFuture;
+use ursula_runtime::GroupRouteWriteFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
@@ -86,17 +86,18 @@ use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
-use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RepairColdIndexRequest;
 use ursula_runtime::RepairColdIndexResponse;
+use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TidyStreamsRequest;
 use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
+use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::collect_retained_cold_objects;
 use ursula_runtime::default_snapshot_store;
@@ -110,6 +111,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::StreamCommand;
 
+use crate::GroupLeadership;
 use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
@@ -601,8 +603,8 @@ impl RaftGroupEngine {
             // Once submitted, a group that stops may already have committed
             // the command and applies it after repair: the outcome is unknown.
             Err(err) => {
-                let self_id = self.raft.metrics().borrow_watched().id;
-                return Err(group_engine_client_write_error(err, self_id));
+                let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
+                return Err(group_engine_client_write_error(err, &leadership));
             }
         };
         write_result_from_raft_response(response.data)?
@@ -617,12 +619,12 @@ impl RaftGroupEngine {
         }
         let leader_id = self.raft.current_leader().await;
         let leader_node = self.current_leader_node().await;
-        let self_id = self.raft.metrics().borrow_watched().id;
+        let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
         Err(group_engine_forward_to_leader_error(
             "OpenRaft group write has to run on the local leader runtime",
             leader_id,
             leader_node.as_ref(),
-            self_id,
+            &leadership,
             true,
         ))
     }
@@ -740,12 +742,12 @@ impl RaftGroupEngine {
     }
 
     async fn not_leader_for_read(&self, operation: &str) -> GroupEngineError {
-        let self_id = self.raft.metrics().borrow_watched().id;
+        let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
         group_engine_forward_to_leader_error(
             format!("OpenRaft {operation} has to forward request to leader"),
             self.raft.current_leader().await,
             None,
-            self_id,
+            &leadership,
             true,
         )
     }
@@ -910,24 +912,29 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn producer_early_answer<'a>(
+    fn route_write<'a>(
         &'a mut self,
-        request: ProducerEarlyAnswerRequest,
+        request: RouteWriteRequest,
         _placement: ShardPlacement,
-    ) -> GroupProducerEarlyAnswerFuture<'a> {
+    ) -> GroupRouteWriteFuture<'a> {
         Box::pin(async move {
-            // Only the leader answers early (#581 section 2.5). A follower
-            // answers nothing and the write takes its usual path, which
-            // forwards it. Applied entries are committed, so a leader that was
-            // deposed a moment ago still answers truly under the request's
-            // token.
-            if !self.raft.is_leader() {
-                return Ok(None);
+            // The one leadership policy the front door routes by too.
+            let route = GroupLeadership::of(&self.raft.metrics().borrow_watched()).write_route();
+            if !matches!(route, WriteRoute::Leader { .. }) {
+                return Ok(route);
             }
-            self.with_state_machine(move |state_machine| {
-                Box::pin(async move { state_machine.engine.producer_early_answer_now(&request) })
-            })
-            .await
+            // Only the leader answers early (#581 section 2.5). Applied
+            // entries are committed, so a leader that was deposed a moment
+            // ago still answers truly under the request's token.
+            let Some(early) = request.early_answer_request() else {
+                return Ok(WriteRoute::Leader { early_answer: None });
+            };
+            let early_answer = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move { state_machine.engine.producer_early_answer_now(&early) })
+                })
+                .await?;
+            Ok(WriteRoute::Leader { early_answer })
         })
     }
 
@@ -1513,13 +1520,13 @@ impl GroupEngine for RaftGroupEngine {
             if !self.raft.is_leader() {
                 let leader_id = self.raft.current_leader().await;
                 let leader_node = self.current_leader_node().await;
-                let self_id = self.raft.metrics().borrow_watched().id;
+                let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
                 let Some(leader_node) = leader_node else {
                     return Err(group_engine_forward_to_leader_error(
                         "OpenRaft bucket purge has no known group leader",
                         leader_id,
                         None,
-                        self_id,
+                        &leadership,
                         true,
                     ));
                 };

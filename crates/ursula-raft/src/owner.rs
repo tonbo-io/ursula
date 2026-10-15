@@ -28,6 +28,7 @@ use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
 
+use crate::leadership::GroupLeadership;
 use crate::registry::RaftGroupHandle;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -228,6 +229,12 @@ impl OwnerRaftHandle {
 
     pub fn metrics(&self) -> WatchReceiverOf<C, RaftMetrics<C>> {
         self.metrics.clone()
+    }
+
+    /// This replica's view of the group's leadership, from one borrow of
+    /// its Raft metrics, without a trip through the group's core.
+    pub fn leadership(&self) -> GroupLeadership {
+        GroupLeadership::of(&self.metrics.borrow_watched())
     }
 
     /// OpenRaft's data metrics, which carry the full last log id. Its

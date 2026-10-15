@@ -38,6 +38,8 @@ ursula-control = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-config = { workspace = true }
+ursula-headers = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
 arc-swap = { workspace = true }

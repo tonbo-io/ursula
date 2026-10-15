@@ -10,6 +10,9 @@ serviceAccount:
 
 server:
   replicaCount: 3
+  # Name the deployment: one id per environment and region, kept when a
+  # restore replaces it.
+  clusterId: prod-us-east-1
   coreCount: 4
   resources:
     requests:

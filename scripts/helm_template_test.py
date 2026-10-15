@@ -5,12 +5,27 @@ import tomllib
 import unittest
 
 
+# Every install names its deployment: the chart refuses to render without it.
+NAMED = ("--set", "server.clusterId=test")
+
+
 def render_config(*values: str) -> str:
     rendered = render_chart(*values)
     match = re.search(r"cat > \"\$\{config_path\}\" <<EOF\n(?P<config>.*?)\n    EOF", rendered, re.S)
     if not match:
         raise AssertionError("could not find generated Ursula config in helm output")
-    return match.group("config")
+    config = match.group("config")
+    assert_server_accepts(config)
+    return config
+
+
+def assert_server_accepts(config: str) -> None:
+    """The server's rule (`ursula-config` validation): a config with
+    `[[raft.peers]]` must set `server.cluster_id`."""
+    parsed = tomllib.loads(config)
+    if parsed.get("raft", {}).get("peers"):
+        if not parsed.get("server", {}).get("cluster_id"):
+            raise AssertionError("a config with [[raft.peers]] renders no server.cluster_id")
 
 
 def render_chart(*values: str) -> str:
@@ -87,7 +102,7 @@ def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
 
 class HelmTemplateConfigTest(unittest.TestCase):
     def test_rollout_target_starts_maintenance_drained(self) -> None:
-        rendered = render_chart("--set", "s3.bucket=bkt")
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
 
         self.assertIn(
             'if [ -r "${rollout_state_dir}/phase" ] && [ -r "${rollout_state_dir}/node-id" ]; then',
@@ -100,7 +115,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
             'export URSULA_START_MAINTENANCE_DRAINED="${start_maintenance_drained}"',
             rendered,
         )
-        self.assertNotIn("start_maintenance_drained =", render_config("--set", "s3.bucket=bkt"))
+        self.assertNotIn("start_maintenance_drained =", render_config(*NAMED, "--set", "s3.bucket=bkt"))
         self.assertIn(
             "- name: rollout-state\n              mountPath: /var/run/ursula-rollout-state\n              readOnly: true",
             rendered,
@@ -111,7 +126,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
     def test_matching_deployment_contract_renders(self) -> None:
-        render_chart(*deployment_contract_values())
+        render_chart(*NAMED, *deployment_contract_values())
 
     def test_deployment_contract_rejects_namespace_drift(self) -> None:
         values = list(deployment_contract_values())
@@ -149,7 +164,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
     def test_server_update_strategy_defaults_to_rolling_update(self) -> None:
-        rendered = render_chart("--set", "s3.bucket=bkt")
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
 
         self.assertIn(
             "podManagementPolicy: Parallel\n  updateStrategy:\n    type: RollingUpdate",
@@ -158,7 +173,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
 
     def test_server_update_strategy_stages_on_delete_with_migration_hook(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             "--set",
             "s3.bucket=bkt",
             "--set",
@@ -208,7 +223,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
 
     def test_gitops_can_disable_the_duplicate_on_delete_migration(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             "--set",
             "s3.bucket=bkt",
             "--set",
@@ -221,7 +236,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
 
     def test_graceful_rollout_hook_does_not_match_the_server_pdb(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             "--set",
             "s3.bucket=bkt",
             "--set",
@@ -271,7 +286,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
     def test_rollout_rbac_has_no_schema_one_controller_revision_permission(self) -> None:
         for reserved in ("true", "false"):
             with self.subTest(maintenance_reservation=reserved):
-                rendered = render_chart(
+                rendered = render_chart(*NAMED, 
                     "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
                     "--set", "server.gracefulRollout.enabled=true", "--set",
                     f"server.gracefulRollout.maintenanceReservation={reserved}",
@@ -286,7 +301,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
             "--set", "server.gracefulRollout.maintenanceReservation=true",
             "--set", "server.coreCount=2", "--set", "raft.groupCount=256",
         )
-        rendered = render_chart(*values)
+        rendered = render_chart(*NAMED, *values)
         self.assertIn("exec /bin/sh /opt/rollout/maintenance-rollout.sh", rendered)
         self.assertIn('name: CORE_COUNT\n              value: "2"', rendered)
         self.assertIn('name: EXPECTED_GROUPS\n              value: "256"', rendered)
@@ -299,14 +314,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         # not a disposable hook or an ordinary Helm resource that resets data.
         names = re.findall(r"kind: ConfigMap\nmetadata:\n  name: ([^\n]+)", rendered)
         self.assertNotIn("test-ursula-maintenance", names)
-        other = render_chart(*values, "--namespace", "other")
+        other = render_chart(*NAMED, *values, "--namespace", "other")
         other_role = re.search(r"kind: ClusterRole\nmetadata:\n  name: ([^\n]+)", other).group(1)
         this_role = re.search(r"kind: ClusterRole\nmetadata:\n  name: ([^\n]+)", rendered).group(1)
         self.assertNotEqual(this_role, other_role)
         for invalid in ("server.replicaCount=2", "server.gracefulRollout.expectedGroups=1"):
             with self.subTest(invalid=invalid):
-                run = subprocess.run(["helm", "template", "test", "charts/ursula", *values,
-                                      "--set", invalid], text=True, capture_output=True)
+                run = subprocess.run(["helm", "template", "test", "charts/ursula", *NAMED,
+                                      *values, "--set", invalid], text=True, capture_output=True)
                 self.assertNotEqual(run.returncode, 0)
 
     def test_startup_ownership_is_explicit_and_has_only_exact_store_mutation(self) -> None:
@@ -314,7 +329,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
                   "server.updateStrategy=OnDelete", "--set", "server.gracefulRollout.enabled=true",
                   "--set", "server.gracefulRollout.maintenanceReservation=true",
                   "--set", "server.startupOwnership.enabled=true")
-        rendered = render_chart(*values)
+        rendered = render_chart(*NAMED, *values)
         self.assertIn('name: URSULA_STARTUP_RESERVATION\n              value: "true"', rendered)
         self.assertIn('fieldPath: metadata.uid', rendered)
         self.assertIn('mountPath: /var/run/ursula-startup\n              readOnly: true', rendered)
@@ -327,7 +342,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn('"delete"', startup_role)
         self.assertNotIn('"create"', startup_role)
         self.assertNotIn('"patch"', startup_role)
-        self.assertNotIn('URSULA_STARTUP_RESERVATION', render_chart("--set", "s3.bucket=bkt"))
+        self.assertNotIn('URSULA_STARTUP_RESERVATION', render_chart(*NAMED, "--set", "s3.bucket=bkt"))
         for invalid in ("server.replicaCount=2", "server.updateStrategy=RollingUpdate",
                         "server.gracefulRollout.maintenanceReservation=false",
                         "serviceAccount.create=false,serviceAccount.name=default",
@@ -337,7 +352,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             *indexer_values(),
             "--set",
             "gateway.enabled=true",
@@ -353,7 +368,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
     def test_gateway_can_prefer_same_zone_service_endpoints(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             "--set",
             "s3.bucket=bkt",
             "--set",
@@ -373,16 +388,16 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
     def test_gateway_omits_empty_traffic_distribution(self) -> None:
-        rendered = render_chart("--set", "s3.bucket=bkt")
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
 
         self.assertNotIn("trafficDistribution:", rendered)
 
     def test_gateway_passes_the_upstream_tcp_user_timeout(self) -> None:
         flag = '- --upstream-tcp-user-timeout\n            - "{}"'
-        self.assertIn(flag.format(5), render_chart("--set", "s3.bucket=bkt"))
+        self.assertIn(flag.format(5), render_chart(*NAMED, "--set", "s3.bucket=bkt"))
         self.assertIn(
             flag.format(30),
-            render_chart("--set", "s3.bucket=bkt", "--set", "gateway.upstreamTcpUserTimeoutSeconds=30"),
+            render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "gateway.upstreamTcpUserTimeoutSeconds=30"),
         )
         # The gateway refuses 0, so the chart does too.
         result = subprocess.run(
@@ -394,12 +409,12 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_admin_plane_defaults_to_loopback(self) -> None:
-        config = render_config("--set", "s3.bucket=bkt")
+        config = render_config(*NAMED, "--set", "s3.bucket=bkt")
 
         self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "127.0.0.1:4438")
 
     def test_admin_plane_can_bind_for_trusted_in_cluster_operator(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "s3.bucket=bkt",
             "--set",
@@ -408,8 +423,33 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "0.0.0.0:4438")
 
+    def test_cluster_id_is_required_for_every_replica_count(self) -> None:
+        # The chart renders [[raft.peers]] for every replica count, and a
+        # node with peers refuses to start without server.cluster_id.
+        for replicas in ("1", "3"):
+            with self.subTest(replicas=replicas):
+                unnamed = subprocess.run(
+                    ["helm", "template", "rel", "charts/ursula", "--set", "s3.bucket=bkt",
+                     "--set", f"server.replicaCount={replicas}"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(unnamed.returncode, 0)
+                self.assertIn("server.clusterId is required", unnamed.stderr)
+                config = tomllib.loads(render_config(
+                    *NAMED, "--set", "s3.bucket=bkt", "--set", f"server.replicaCount={replicas}"))
+                self.assertEqual(len(config["raft"]["peers"]), int(replicas))
+                self.assertEqual(config["server"]["cluster_id"], "test")
+
+    def test_cluster_id_can_be_set_and_is_validated(self) -> None:
+        config = render_config("--set", "s3.bucket=bkt", "--set", "server.clusterId=prod-eu-1")
+        self.assertEqual(tomllib.loads(config)["server"]["cluster_id"], "prod-eu-1")
+        for invalid in ("a/b", "x" * 65):
+            with self.assertRaises(subprocess.CalledProcessError):
+                render_chart("--set", "s3.bucket=bkt", "--set", f"server.clusterId={invalid}")
+
     def test_max_uncommitted_value_uses_single_raft_table(self) -> None:
-        config = render_config("--set", "raft.maxUncommittedBytesPerGroup=8388608", "--set", "s3.bucket=bkt")
+        config = render_config(*NAMED, "--set", "raft.maxUncommittedBytesPerGroup=8388608", "--set", "s3.bucket=bkt")
 
         raft_table_count = sum(line.strip() == "[raft]" for line in config.splitlines())
         self.assertEqual(raft_table_count, 1)
@@ -417,14 +457,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["raft"]["max_uncommitted_size_per_group"], "8388608")
 
     def test_max_uncommitted_zero_is_rendered(self) -> None:
-        config = render_config("--set", "raft.maxUncommittedBytesPerGroup=0", "--set", "s3.bucket=bkt")
+        config = render_config(*NAMED, "--set", "raft.maxUncommittedBytesPerGroup=0", "--set", "s3.bucket=bkt")
         parsed = tomllib.loads(config)
 
         self.assertEqual(parsed["raft"]["max_uncommitted_size_per_group"], "0")
 
     def test_wal_disk_watermarks_and_http_readiness_are_rendered(self) -> None:
-        rendered = render_chart("--set", "s3.bucket=bkt")
-        config = render_config("--set", "s3.bucket=bkt")
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
+        config = render_config(*NAMED, "--set", "s3.bucket=bkt")
         wal = tomllib.loads(config)["raft"]["wal"]
 
         self.assertEqual(wal["min_available_size"], "536870912")
@@ -438,7 +478,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
     def test_wal_segment_and_cache_sizes_are_rendered_and_validated(self) -> None:
         wal = tomllib.loads(
-            render_config(
+            render_config(*NAMED, 
                 "--set",
                 "s3.bucket=bkt",
                 "--set",
@@ -469,10 +509,10 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("walSegmentBytes", result.stderr)
 
     def test_wal_fsync_policy_is_rendered_and_validated(self) -> None:
-        wal = tomllib.loads(render_config("--set", "s3.bucket=bkt"))["raft"]["wal"]
+        wal = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))["raft"]["wal"]
         self.assertEqual(wal["fsync"], "never")
 
-        wal = tomllib.loads(render_config("--set", "s3.bucket=bkt", "--set", "raft.walFsync=always"))[
+        wal = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt", "--set", "raft.walFsync=always"))[
             "raft"
         ]["wal"]
         self.assertEqual(wal["fsync"], "always")
@@ -516,7 +556,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         }
         for name, values in cases.items():
             with self.subTest(name=name):
-                rendered = render_chart("--set", "s3.bucket=bkt", *values)
+                rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", *values)
                 statefulset = re.search(
                     r"kind: StatefulSet\n.*?(?=\n---|\Z)", rendered, re.S
                 ).group(0)
@@ -530,7 +570,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 )
                 self.assertIn('storage: "20Gi"', statefulset)
                 self.assertNotIn("- name: raft-data\n          emptyDir", statefulset)
-                wal = tomllib.loads(render_config("--set", "s3.bucket=bkt", *values))["raft"]["wal"]
+                wal = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt", *values))["raft"]["wal"]
                 self.assertEqual(wal["path"], "/var/lib/ursula/raft")
                 self.assertNotIn("backend", wal)
                 self.assertNotIn("allow_volatile_multi_peer", wal)
@@ -562,7 +602,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 self.assertIn(removed.split("=", 1)[0].rsplit(".", 1)[1], result.stderr)
 
     def test_cold_max_hot_bytes_zero_is_rendered(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "coldStorage.enabled=true",
             "--set",
@@ -575,7 +615,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["storage"]["cold"]["max_hot_size_per_group"], "0")
 
     def test_cold_pressure_hot_bytes_are_rendered(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "coldStorage.enabled=true",
             "--set",
@@ -588,7 +628,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["storage"]["cold"]["flush_pressure_hot_size"], "33554432")
 
     def test_snapshot_pressure_limits_are_rendered(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "raft.snapshotPressureMaxGroupsPerTick=8",
             "--set",
@@ -604,7 +644,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
     def test_snapshot_build_concurrency_defaults_to_the_server_default(self) -> None:
         # Unset, the key is not rendered, so each server keeps its own
         # default: a pod that still runs an older image too.
-        parsed = tomllib.loads(render_config("--set", "s3.bucket=bkt"))
+        parsed = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))
 
         self.assertNotIn("snapshot_build_max_concurrency", parsed["raft"])
 
@@ -629,14 +669,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("snapshotBuildMaxConcurrency", result.stderr)
 
     def test_snapshot_s3_renders_complete_config(self) -> None:
-        config = render_config("--set", "snapshotStore.backend=s3", "--set", "s3.bucket=bkt")
+        config = render_config(*NAMED, "--set", "snapshotStore.backend=s3", "--set", "s3.bucket=bkt")
         parsed = tomllib.loads(config)
 
         self.assertEqual(parsed["storage"]["snapshot"]["backend"], "s3")
         self.assertEqual(parsed["storage"]["cold"]["s3"]["bucket"], "bkt")
 
     def test_snapshot_drive_interval_zero_is_rendered(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "snapshotStore.driveIntervalMs=0",
             "--set",
@@ -647,7 +687,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["storage"]["snapshot"]["drive_interval"], "0ms")
 
     def test_cold_cache_zero_can_disable_default_cache(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "coldStorage.enabled=true",
             "--set",
@@ -660,7 +700,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["storage"]["cold"]["cache"]["max_size"], "0")
 
     def test_cold_cache_null_renders_no_cache_section(self) -> None:
-        config = render_config(
+        config = render_config(*NAMED, 
             "--set",
             "coldStorage.enabled=true",
             "--set",
@@ -673,7 +713,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotIn("cache", parsed["storage"]["cold"])
 
     def test_indexer_renders_inherited_s3_and_health_probes(self) -> None:
-        rendered = render_chart(*indexer_values())
+        rendered = render_chart(*NAMED, *indexer_values())
 
         self.assertIn("- --s3-bucket\n            - \"index-bucket\"", rendered)
         self.assertIn("- --s3-prefix\n            - \"event-index\"", rendered)
@@ -684,7 +724,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("name: test-ursula-indexer\n", rendered)
 
     def test_indexer_multiple_replicas_render_one_shared_worker_pool(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             *indexer_values(),
             "--set",
             "indexer.replicaCount=3",
@@ -694,7 +734,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(rendered.count("kind: Deployment\nmetadata:\n  name: test-ursula-indexer"), 1)
 
     def test_indexer_worker_pool_renders_pdb_and_spread(self) -> None:
-        rendered = render_chart(
+        rendered = render_chart(*NAMED, 
             *indexer_values(),
             "--set",
             "indexer.replicaCount=2",
@@ -728,7 +768,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
 
     def test_defaults_enable_compaction_and_follow_the_runtime_snapshot_default(self) -> None:
-        parsed = tomllib.loads(render_config("--set", "coldStorage.enabled=true", "--set", "s3.bucket=bkt"))
+        parsed = tomllib.loads(render_config(*NAMED, "--set", "coldStorage.enabled=true", "--set", "s3.bucket=bkt"))
 
         self.assertIs(parsed["storage"]["cold"]["compaction_enabled"], True)
         # "auto" is Ursula's own default: S3 snapshots with an S3 cold store,
@@ -737,7 +777,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["storage"]["snapshot"]["s3_prefix"], "snapshots")
 
     def test_default_snapshot_backend_without_cold_storage_needs_no_bucket(self) -> None:
-        parsed = tomllib.loads(render_config())
+        parsed = tomllib.loads(render_config(*NAMED, ))
 
         self.assertEqual(parsed["storage"]["cold"]["backend"], "none")
         self.assertEqual(parsed["storage"]["snapshot"]["backend"], "auto")
@@ -745,7 +785,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
     def test_explicit_inline_snapshots_and_disabled_compaction_still_render(self) -> None:
         parsed = tomllib.loads(
-            render_config(
+            render_config(*NAMED, 
                 "--set",
                 "coldStorage.enabled=true",
                 "--set",
@@ -763,7 +803,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
     def test_compaction_defaults_on_when_values_omit_the_key(self) -> None:
         parsed = tomllib.loads(
-            render_config(
+            render_config(*NAMED, 
                 "--set",
                 "coldStorage.enabled=true",
                 "--set",

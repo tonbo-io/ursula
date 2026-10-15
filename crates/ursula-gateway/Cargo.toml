@@ -24,6 +24,7 @@ toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+ursula-headers = { workspace = true }
 ursula-observability = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-shard = { workspace = true }
