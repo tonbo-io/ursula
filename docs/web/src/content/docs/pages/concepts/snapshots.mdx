@@ -6,10 +6,11 @@ sidebarTitle: Snapshots
 As a stream grows, replaying it from `offset=-1` becomes expensive. Snapshots solve this by storing a compacted representation of all data up to a given offset.
 
 ```
-PUT    /{bucket}/{stream}/snapshot/{offset}    publish a snapshot
-PUT    /{bucket}/{stream}/retention/{offset}   advance retained history
-GET    /{bucket}/{stream}/snapshot/{offset}    read a specific snapshot
-HEAD   /{bucket}/{stream}                      Stream-Snapshot-Offset names the latest snapshot
+PUT    /{bucket}/{stream}/snapshot/{offset}        publish a snapshot, or commit its parts
+POST   /{bucket}/{stream}/snapshot/{offset}/parts  stage one part of a large snapshot
+PUT    /{bucket}/{stream}/retention/{offset}       advance retained history
+GET    /{bucket}/{stream}/snapshot/{offset}        read a specific snapshot, or a byte range of it
+HEAD   /{bucket}/{stream}                          Stream-Snapshot-Offset names the latest snapshot
 ```
 
 ## Who publishes
@@ -20,17 +21,19 @@ Application snapshots are separate from the Raft-internal snapshots Ursula takes
 
 ## Size and content type
 
-Snapshot bodies of up to **32 MiB** are kept inline in the stream's replicated state. On a cluster with a cold backend, bodies of at least `runtime.external_payload_min_size` (1 MiB by default) are stored as cold-tier objects instead, up to **1 GiB**: replicated state keeps only the offset, content type, digest and object reference, and reads and `/bootstrap` stream the body from the cold tier. A superseded cold body is deleted five minutes after the publish that replaced it, so a read that started before still completes. Through `ursulagw`, bodies above its `--max-request-body-bytes` (32 MiB by default) are refused; publish large snapshots directly to a node or raise that limit. The snapshot has its own content type (separate from the stream's), stored as `snapshot_content_type` and defaulting to `application/octet-stream`. A binary CRDT document can be snapshotted under `application/octet-stream` even when the stream itself carries `application/json` deltas.
+Every request body is at most `Ursula-Max-Request-Bytes`: 32 MiB from a node, lower through a gateway with a smaller `--max-request-body-bytes`. A snapshot up to that size is published in one request and kept inline in the stream's replicated state. On a cluster with a cold backend, bodies of at least `runtime.external_payload_min_size` (1 MiB by default) are stored as cold-tier objects instead: replicated state keeps only the offset, content type, digest and object reference, and reads and `/bootstrap` stream the body from the cold tier. With a cold backend, a larger snapshot of up to **1 GiB** (`Ursula-Max-Snapshot-Bytes`) goes up [in parts](/docs/api/publish-snapshot#upload-in-parts), each one request, which Ursula copies into one cold-tier object when the parts are committed. A superseded cold body is deleted five minutes after the publish that replaced it, so a read that started before still completes. The snapshot has its own content type (separate from the stream's), stored as `snapshot_content_type` and defaulting to `application/octet-stream`. A binary CRDT document can be snapshotted under `application/octet-stream` even when the stream itself carries `application/json` deltas.
 
 ## Checkpoint and retention
 
 Publishing a snapshot is safe on its own: it creates a replay checkpoint but leaves all stream history readable. After the application has verified the checkpoint, it may explicitly advance retention to the same or an older checkpoint boundary with `PUT /{bucket}/{stream}/retention/{offset}`. Only that operation makes earlier reads return `410 Gone` and makes old cold-tier data eligible for GC.
 
-On a JSON stream, snapshot and retention offsets must be message boundaries: an offset just after a message's LF, such as a `Stream-Next-Offset` Ursula returned. An offset inside a message answers `400`; when Ursula cannot read the byte before the offset to check it, it publishes nothing and answers `503`. Retention is exact.
+On a JSON stream, snapshot and retention offsets must be message boundaries: an offset just after a message's LF, such as a `Stream-Next-Offset` Ursula returned. An offset inside a message answers `400`. When Ursula cannot read the byte before the offset to check it, it publishes nothing and answers `503`. Retention is exact, and it only moves forward: a boundary at or below the current one succeeds and changes nothing, so a repeated request is safe.
 
 ## Immutability
 
-Snapshots are immutable at an offset. Retrying the same body and content type is idempotent and returns the same `Stream-Snapshot-Digest`; different content at the same offset returns `409`. Snapshots cannot be deleted. To replace a snapshot, publish a new one at a higher offset.
+Snapshots are immutable at an offset. A publish is keyed by its offset and digest: retrying the same body and content type returns the same `Stream-Snapshot-Digest` while that snapshot is the latest. A refused publish answers `409` naming the latest snapshot's offset and digest. A later offset there means the publish was superseded, the same offset means different content is published there. Snapshots cannot be deleted. To replace a snapshot, publish a new one at a higher offset.
+
+A snapshot read honors one byte range (`Range: bytes=a-b`), so a client can check a snapshot's header before it reads the whole body. The digest and the other snapshot headers always describe the whole snapshot.
 
 ## Related
 

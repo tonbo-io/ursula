@@ -21,20 +21,31 @@ api: "GET /{bucket}/{stream}/snapshot/{offset}"
  Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The read is answered only if the stream that serves it is still that incarnation; otherwise it answers `412`. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
 </ParamField>
 
+<ParamField header="Range" type="string">
+ Optional: one byte range of the snapshot, `bytes=a-b`, `bytes=a-` or `bytes=-n`. The answer is `206` with only those bytes and `Content-Range: bytes a-b/total`. Several ranges, a value that does not parse, or a request that also carries `If-Range` get the whole snapshot as `200`. A body in the cold tier is read only where the range needs it.
+</ParamField>
+
 | Status | Meaning |
 | ------ | -------------------------------------- |
 | `200` | Snapshot blob returned. |
+| `206` | The requested byte range returned. |
 | `307` | In a cluster, this node is not the stream's group leader. `Location` is the same request on the leader. |
 | `404` | Stream, snapshot, or offset not found. |
 | `412` | `Stream-Incarnation` did not match. The response's `Stream-Incarnation` is the current token. |
+| `416` | The range starts at or past the end of the snapshot. `Content-Range: bytes */total` names its size. |
 | `502` | The snapshot body is in the cold tier and could not be read. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
-Response headers include `Content-Type`, `Content-Length`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. A body stored in the cold tier is streamed from it.
+Response headers include `Content-Type`, `Content-Length`, `Accept-Ranges: bytes`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. They describe the whole snapshot on a `206` too: the digest always covers the whole body. A `404`, `410` or `412` comes before the range is looked at. A body stored in the cold tier is streamed from it. Snapshot answers are never compressed.
 
 <RequestExample>
 ```bash Read specific offset
 curl 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042'
+```
+
+```bash Read the first 56 bytes
+curl -H 'Range: bytes=0-55' \
+  'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042'
 ```
 </RequestExample>
 

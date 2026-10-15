@@ -24,7 +24,7 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
 </ParamField>
 
 <ParamField body="body" type="binary" required>
- The snapshot blob bytes. Bodies of up to **32 MiB** are stored inline in the stream's replicated state. On a node with a cold backend, a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead, and bodies of up to **1 GiB** are accepted. Larger bodies return `413`.
+ The snapshot blob bytes, at most `Ursula-Max-Request-Bytes` (**32 MiB** from a node). Bodies are stored inline in the stream's replicated state. On a node with a cold backend, a body of at least `runtime.external_payload_min_size` (1 MiB by default) is streamed into the cold tier instead. A larger snapshot goes up [in parts](#upload-in-parts).
 </ParamField>
 
 <ParamField header="Stream-Incarnation" type="string">
@@ -38,14 +38,14 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
 | `204` | Snapshot published successfully. |
 | `400` | Invalid offset or content type, or, on a JSON stream, an offset inside a message. |
 | `404` | Stream not found or expired. |
-| `409` | Stale publish (a newer snapshot exists) or offset out of range. |
+| `409` | Another snapshot is the latest: a newer one (this publish is superseded) or a different one at the same offset. The response names it in `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. A `409` without them means the offset is beyond the stream's tail. |
 | `410` | Snapshot offset is older than the retained stream history. |
 | `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. Nothing was published; the response's `Stream-Incarnation` is the current token. |
-| `413` | Snapshot body exceeds the maximum allowed size: 32 MiB without a cold backend, named by `Ursula-Max-Request-Bytes`, and 1 GiB with one, named by `Ursula-Max-Snapshot-Bytes`. |
+| `413` | The body is above `Ursula-Max-Request-Bytes`, which the response names. For a commit of parts, the assembled snapshot is above `Ursula-Max-Snapshot-Bytes`, which the response names instead. |
 | `502` | The cold backend failed while storing the body. |
 | `503` | JSON stream only: Ursula could not read the byte before the offset to check the boundary. Nothing was published; retry. |
 
-Response headers include `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Incarnation`. Repeating the same offset, content type, and body is idempotent and returns the same digest. Reusing an offset with different content returns `409`.
+A `204` carries `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Incarnation`. A publish is keyed by its offset and digest. Repeating the same offset, content type, and body returns the same digest while that snapshot is the latest. Reusing an offset with different content returns `409`.
 
 <RequestExample>
 ```bash Example
@@ -55,9 +55,30 @@ curl -X PUT 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
 ```
 </RequestExample>
 
+## Upload in parts
+
+On a node with a cold backend, a snapshot above `Ursula-Max-Request-Bytes` goes up in parts, up to `Ursula-Max-Snapshot-Bytes` (**1 GiB**) in at most 4,096 parts. `HEAD` advertises both limits.
+
+1. Stage each part with `POST /{bucket}/{stream}/snapshot/{offset}/parts`. Its body is the part's bytes, at most `Ursula-Max-Request-Bytes`. The answer is `201` with the part's id in `Stream-Snapshot-Part`. Staging changes nothing a reader sees, and repeating it stages another part. The stream must exist (`404` otherwise), and the request may carry `Stream-Incarnation`.
+2. Commit with `PUT /{bucket}/{stream}/snapshot/{offset}`, `Stream-Snapshot-Parts: <count>` and `Stream-Snapshot-Digest: <digest of the whole snapshot>`. The body lists the part ids in order, each followed by a line feed. `Content-Type` is the snapshot's.
+
+Ursula copies the parts into one snapshot, checks its digest, and publishes it like any other snapshot, with the same answers. It answers `400` when a part is unknown or belongs to another stream, the manifest does not match `Stream-Snapshot-Parts`, or the digest differs. A commit checks its key first: a repeat of a published snapshot answers `204` with its digest, even after its parts are gone. Ursula deletes the parts after the commit and reclaims a part that no commit used after a day. Commit within a day of staging the first part. Without a cold backend, parts and commits answer `501`.
+
+```bash Example
+curl -X POST 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042/parts' \
+  --data-binary @part-1.bin
+# 201, Stream-Snapshot-Part: 0000000000000000186f2b3a1c0d9e00-0000000000000007.part
+printf '%s\n%s\n' "$PART_1" "$PART_2" | curl -X PUT \
+  'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'Stream-Snapshot-Parts: 2' \
+  -H "Stream-Snapshot-Digest: $DIGEST" \
+  --data-binary @-
+```
+
 ## Advance retention
 
-`PUT /{bucket}/{stream}/retention/{offset}` explicitly discards history before a published checkpoint. The boundary must be monotonic, no newer than the visible checkpoint, and, on a JSON stream, a message boundary (`400` otherwise, `503` when it cannot be checked). Retention is exact: the response's `Stream-Retained-Offset` is the requested offset.
+`PUT /{bucket}/{stream}/retention/{offset}` explicitly discards history before a published checkpoint. The boundary must be no newer than the visible checkpoint and, on a JSON stream, a message boundary (`400` otherwise, `503` when it cannot be checked). Retention only moves forward: a boundary at or below the current one succeeds, changes nothing and reports the current boundary, so a repeated request is safe. Otherwise retention is exact: the response's `Stream-Retained-Offset` is the requested offset.
 
 After a successful `204`, reads before the retained offset return `410 Gone`. This separate step lets clients publish and verify a checkpoint before making history unreachable.
 
