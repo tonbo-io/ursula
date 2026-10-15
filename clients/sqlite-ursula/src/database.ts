@@ -48,6 +48,12 @@ export interface UrsulaStatus {
 		readonly pending_bytes: number;
 	};
 	readonly replication: { readonly state: string; readonly condition: string | null };
+	/**
+	 * Where the open got the local database: a trusted local cache (`resumed`), or a build from the
+	 * stream (`built`), from the snapshot at `snapshot_offset` and the tail after it, or from the
+	 * stream's start when it is `null`.
+	 */
+	readonly attach: { readonly local: "resumed" | "built"; readonly snapshot_offset: number | null };
 	/** The last write refused with nothing committed. */
 	readonly refused: { readonly kind: string; readonly action: string; readonly message: string } | null;
 	readonly reset: { readonly kind: string; readonly action: string } | null;

@@ -5,6 +5,11 @@ name: Memory soak
 # must stay bounded — overload has to reach clients as 503/429 pushback, not as server memory
 # growth (the EKS OOM of 2026-10: ~0.7 GB/min per node at 128 owners; here, before the fix,
 # ~4 GB/min to 6 GB in 80 s).
+#
+# The vfs-outage job holds the SQLite VFS's M1 exit criterion: a ten-minute outage in front of the
+# model server, as a blackhole and as refused connections, ends with no reset and a full catch-up
+# (clients/sqlite-ursula/test/outage.e2e.ts, 60 s on every PR in integration.yml). It also runs
+# weekly and on pushes to main that change the extension. The S3 soak runs on PRs and by hand only.
 
 on:
   pull_request:
@@ -12,9 +17,18 @@ on:
       - "crates/**"
       - "Cargo.lock"
       - "clients/sqlite-ursula/**"
+      - "clients/sqlite-vfs/**"
       - ".github/workflows/memory-soak.yml"
       - ".github/actions/ci-s3/**"
       - "scripts/minio_ci.sh"
+  push:
+    branches:
+      - main
+    paths:
+      - "clients/sqlite-vfs/**"
+  schedule:
+    # Mondays, 04:17 UTC: the outage job only.
+    - cron: "17 4 * * 1"
   workflow_dispatch:
     inputs:
       seconds:
@@ -23,13 +37,16 @@ on:
       owners:
         description: Concurrent owners
         default: "128"
+      outage_seconds:
+        description: SQLite VFS outage duration in seconds, per mode
+        default: "600"
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,6 +54,7 @@ env:
 jobs:
   build-ursula:
     name: Build release ursula
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     # Fork PRs run on GitHub-hosted runners: RunsOn runners run inside our AWS account.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     steps:
@@ -208,3 +226,47 @@ jobs:
         run: |
           case "$URSULA_S3_PREFIX" in ci/*/*) ;; *) echo "::error::refusing to delete '$URSULA_S3_PREFIX'"; exit 1 ;; esac
           aws s3 rm "s3://$URSULA_S3_BUCKET/$URSULA_S3_PREFIX/" --recursive --only-show-errors
+
+  vfs-outage:
+    name: sqlite-vfs outage (${{ github.event.inputs.outage_seconds || '600' }} s per mode, model server)
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 60
+    env:
+      # Keeps libsqlite3-sys from probing (and linking) a system libsqlite3.
+      SQLITE3_LIB_DIR: /nonexistent
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+          cache-workspaces: clients/sqlite-vfs
+
+      - name: Build the extension and the model server
+        run: |
+          cd clients/sqlite-vfs
+          cargo build --locked --release
+          cargo build --locked --release --features model --bin ursula-vfs-model
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Outage
+        timeout-minutes: 45
+        env:
+          OUTAGE_SECONDS: ${{ github.event.inputs.outage_seconds || '600' }}
+        run: |
+          cd clients/sqlite-ursula
+          npm ci --ignore-scripts
+          OUTAGE_MS=$((OUTAGE_SECONDS * 1000)) E2E_SERVER=model \
+            URSULA_VFS_MODEL="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/ursula-vfs-model" \
+            SQLITE_URSULA_VFS="$GITHUB_WORKSPACE/clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so" \
+            npx vitest --run test/outage.e2e.ts

@@ -214,7 +214,9 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      - name: e2e (the core through its SQL functions, open, synced, resets, worker threads, Pi)
+      # Includes the M1 exit criteria: the crash matrix, a 60 s outage in two modes (600 s runs in
+      # memory-soak.yml) and Pi's conformance on synced() in three modes.
+      - name: e2e (the core through its SQL functions, open, synced, resets, worker threads, Pi, crashes, outages)
         timeout-minutes: 20
         run: |
           chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
@@ -227,7 +229,7 @@ jobs:
       # package.json declares the @earendil-works/pi-durable versions the `/pi` entry supports as an
       # optional peer dependency, ">=oldest <first-unsupported", and the step above tests the version
       # in the lockfile (a devDependency). This one installs the oldest without saving it, then runs
-      # the typecheck and the Pi suite: Pi's storage conformance in three modes, and the adapter's
+      # the typecheck and the Pi suites: Pi's storage conformance in three modes, and the adapter's
       # mapping of backlog_full and resets, which conformance never triggers.
       - name: Pi suite on the oldest supported pi-durable
         timeout-minutes: 10
@@ -250,4 +252,40 @@ jobs:
             [ "$installed" = "$oldest" ]
           done
           npm run typecheck
-          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts test/conformance.e2e.ts
+
+  # M1 exit criterion: a commit's p50 on the VFS within 0.5 ms of B1, plain node:sqlite with WAL and
+  # synchronous=NORMAL, on the same workload (clients/sqlite-ursula/bench/commit.ts). Latency on a
+  # shared runner is noisy, so this job is not a required check: it reports both values in the job
+  # summary and fails when the criterion is not met.
+  sqlite-vfs-perf:
+    name: sqlite-vfs perf (commit p50 against B1)
+    needs: [sqlite-vfs]
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    timeout-minutes: 15
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download the extension and the model server
+        uses: actions/download-artifact@v7
+        with:
+          name: sqlite-ursula-vfs
+          path: ${{ runner.temp }}/vfs
+
+      - name: Commit p50, VFS against B1
+        timeout-minutes: 10
+        run: |
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
+          cd clients/sqlite-ursula
+          npm ci
+          URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" node bench/commit.ts

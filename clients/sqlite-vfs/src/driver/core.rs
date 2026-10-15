@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::ACK_INTERVAL_MS;
+use super::Attach;
 use super::Bind;
 use super::BindingHandle;
 use super::BindingId;
@@ -204,6 +205,8 @@ struct Binding {
     /// The open failed while a disk job held the generation: the binding stays, its root locked
     /// and its replicator ignored, until the job returns, and the open resolves then.
     failing: Option<OpenError>,
+    /// Where the open got the local database, for status.
+    attach: Attach,
 }
 
 impl Binding {
@@ -459,6 +462,7 @@ impl Core {
             m,
             local,
             deadline_ms,
+            attach,
         } = takeover;
         let unacked = local
             .pending
@@ -495,6 +499,7 @@ impl Core {
             max_pending_bytes: spec.max_pending_bytes,
             unconnected_since: None,
             failing: None,
+            attach,
         });
         self.contained(binding, now_ms, |core| {
             core.execute(binding, actions, now_ms, ios);
@@ -947,6 +952,7 @@ impl Core {
             max_pending_bytes: b.max_pending_bytes,
             max_frame_bytes: ctx.map_or(MAX_BATCH_BYTES, |c| c.limits.batch()),
             acked: ctx.map_or(Position(0), |c| c.acked),
+            attach: b.attach,
         };
         let handle = Arc::new(BindingHandle::new(bind, root));
         handle.record_commit(b.last_commit);
@@ -1083,7 +1089,8 @@ impl Core {
                 let step = build.next();
                 self.build_step(binding, build, step, ios);
             }
-            DiskDone::Published(Ok((m, _highest))) => {
+            DiskDone::Published(Ok((m, _highest, attach))) => {
+                b.attach = attach;
                 let (last, log_bytes) = caught_up(&m);
                 let lineage = m.generation.lineage;
                 *local = Local::Ready(m);

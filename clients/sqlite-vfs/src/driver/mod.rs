@@ -35,6 +35,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use ursula_headers::Incarnation;
+use ursula_headers::Offset;
 
 use self::disk::DiskJob;
 use crate::generation::CanonicalPath;
@@ -151,6 +152,8 @@ pub(crate) struct BindingHandle {
     root: Mutex<Option<Arc<Root>>>,
     /// The snapshot thread's wake-up, the receipts of its boundaries and its status.
     pub(crate) snapshots: Snapshots,
+    /// Where the open got the local database.
+    pub(crate) attach: Attach,
 }
 
 /// Where a binding stands between its connections and the driver.
@@ -232,6 +235,7 @@ impl BindingHandle {
             last_commit: AtomicU64::new(0),
             root: Mutex::new(Some(root)),
             snapshots: Snapshots::default(),
+            attach: bind.attach,
         }
     }
 
@@ -487,6 +491,17 @@ pub(crate) struct Bind {
     pub(crate) max_pending_bytes: u64,
     pub(crate) max_frame_bytes: u64,
     pub(crate) acked: Position,
+    pub(crate) attach: Attach,
+}
+
+/// Where an open got its local database, as status reports it (design §9, `attach`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attach {
+    /// A trusted local generation, materialized.
+    Resumed,
+    /// A generation built from the stream: from its latest snapshot at `snapshot` and the tail
+    /// after it, or from its start when `snapshot` is `None`.
+    Built { snapshot: Option<Offset> },
 }
 
 /// A database bound by an open.

@@ -109,8 +109,10 @@ impl Step {
     }
 }
 
-/// Test hook `URSULA_VFS_ABORT_AT=<step>[:<n>]`: aborts the process the `n`-th time (1 by default)
-/// it reaches `step` ([`Step`], by its name), as a crash there would stop it.
+/// Test hook `URSULA_VFS_ABORT_AT=<step>[:<n>]`: kills the process with SIGKILL the `n`-th time (1
+/// by default) it reaches `step` ([`Step`], by its name), as a crash there would stop it (design
+/// §12). SIGKILL rather than `abort()`: nothing of the process runs after it, and no crash report
+/// or core is written.
 pub(crate) fn abort_at(step: Step) {
     static V: OnceLock<Option<(String, u64)>> = OnceLock::new();
     static SEEN: Mutex<u64> = Mutex::new(0);
@@ -132,8 +134,16 @@ pub(crate) fn abort_at(step: Step) {
             ("step", &step.name()),
             ("n", n),
         ]);
-        std::process::abort();
+        kill_self();
     }
+}
+
+/// SIGKILLs this process. `abort()` if that fails, which it cannot for a process signalling itself.
+#[expect(unsafe_code, reason = "raising a signal has no safe std API")]
+fn kill_self() -> ! {
+    // SAFETY: `raise` takes a signal number and touches no memory of ours.
+    unsafe { libc::raise(libc::SIGKILL) };
+    std::process::abort()
 }
 
 /// `URSULA_VFS_MAX_REQUEST_BYTES`: a request limit below the server's, for a layer in front of it

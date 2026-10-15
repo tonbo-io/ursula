@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use crate::db::Binding;
 use crate::db::Opened;
 use crate::db::by_id;
+use crate::driver::Attach;
 use crate::driver::DriverEvent;
 use crate::driver::Life;
 use crate::driver::SyncError;
@@ -117,6 +118,16 @@ pub(crate) fn status_json(b: &Binding) -> String {
         ("log_bytes", replication.log_bytes.to_string()),
         ("due_bytes", h.snapshots.due_bytes().to_string()),
     ]);
+    let attach = match h.attach {
+        Attach::Resumed => object(&[("local", json_str("resumed")), ("snapshot_offset", null())]),
+        Attach::Built { snapshot } => object(&[
+            ("local", json_str("built")),
+            (
+                "snapshot_offset",
+                snapshot.map_or_else(null, |offset| offset.get().to_string()),
+            ),
+        ]),
+    };
     let refused = refused.map_or_else(null, |r| {
         object(&[
             ("kind", json_str(r.kind().as_str())),
@@ -159,6 +170,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
         ("lineage", json_str(&lineage)),
         ("commits", commits),
         ("replication", repl),
+        ("attach", attach),
         ("snapshot", snapshot),
         ("refused", refused),
         ("reset", reset_json),

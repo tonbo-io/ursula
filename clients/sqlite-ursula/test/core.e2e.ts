@@ -1,29 +1,17 @@
 // The 0.8 core through its SQL functions on plain node:sqlite, against the model server
 // (E2E_SERVER=model): commits are local and replicate in the background, `ursula_synced` is the
 // output gate, PHASETWO confirms each commit, and a reset fails every statement after it.
-import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface, type Interface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, inject, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
-import { ursulaUrl } from "./kit.ts";
+import { Child, fromStream, frames, freshDir, killChildren, type Opened, stream, ursulaUrl } from "./kit.ts";
 
 const SQLITE_IOERR_READ = 266;
 const SQLITE_IOERR_WRITE = 778;
 const SQLITE_IOERR_AUTH = 7178;
 
 const ext = process.env.SQLITE_URSULA_VFS ?? "";
-const child = join(import.meta.dirname, "core-child.mjs");
-
-interface Opened {
-	done: boolean;
-	path: string;
-	name: string;
-	state: string;
-}
 
 interface Status {
 	name: string;
@@ -46,14 +34,6 @@ const open = (url: string, dir: string): Opened => call<Opened>("SELECT ursula_o
 const status = (path: string): Status => call<Status>("SELECT ursula_status(?)", path);
 const synced = (path: string, ms = 10_000): { synced: boolean; target: number; acknowledged: number } => call("SELECT ursula_synced(?, ?)", path, ms);
 
-let n = 0;
-/** A stream of its own for each test, and its path on the model. */
-function stream(label: string): { url: string; path: string } {
-	n += 1;
-	const path = `/core/${label}-${process.pid}-${Date.now()}-${n}`;
-	return { url: `${ursulaUrl()}${path}`, path };
-}
-
 let cursor = 0;
 /** Waits for an event of this process that `matches`, for at most 20 s. */
 function waitEvent(matches: (event: Record<string, unknown>) => boolean): Record<string, unknown> {
@@ -67,101 +47,7 @@ function waitEvent(matches: (event: Record<string, unknown>) => boolean): Record
 	throw new Error("no such event within 20 s");
 }
 
-const freshDir = (): string => mkdtempSync(join(tmpdir(), "sqlite-ursula-core-"));
-
-/** The `USQ2` frames the model holds for `path`, by kind (1 claim, 2 commit). */
-async function frames(path: string): Promise<{ claims: number; commits: number }> {
-	const r = await fetch(`${ursulaUrl()}/__model/frames?path=${path}`);
-	const bytes = new Uint8Array(await r.arrayBuffer());
-	const view = new DataView(bytes.buffer);
-	const count = { claims: 0, commits: 0 };
-	for (let at = 0; at < bytes.length; ) {
-		expect(new TextDecoder().decode(bytes.subarray(at, at + 4))).toBe("USQ2");
-		const kind = bytes[at + 4];
-		const len = view.getUint32(at + 5, true);
-		if (kind === 1) count.claims += 1;
-		if (kind === 2) count.commits += 1;
-		at += 13 + len;
-	}
-	return count;
-}
-
-/** A second process (test/core-child.mjs) bound to `url` in `dir`, driven one command at a time. */
-class Child {
-	private readonly proc: ChildProcess;
-	private readonly lines: Interface;
-	private readonly queue: string[] = [];
-	private waiting: ((line: string) => void) | undefined;
-
-	constructor(url: string, dir: string, env: NodeJS.ProcessEnv = {}) {
-		this.proc = spawn(process.execPath, [child, ext, url, dir], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, ...env } });
-		// A child that exited on its own closed its stdin: a later write fails, harmlessly.
-		this.proc.stdin?.on("error", () => {});
-		this.lines = createInterface({ input: this.proc.stdout as NodeJS.ReadableStream });
-		this.lines.on("line", (line) => {
-			const waiting = this.waiting;
-			this.waiting = undefined;
-			if (waiting === undefined) this.queue.push(line);
-			else waiting(line);
-		});
-		children.add(this);
-	}
-
-	private next(): Promise<Record<string, unknown>> {
-		const line = this.queue.shift();
-		if (line !== undefined) return Promise.resolve(JSON.parse(line) as Record<string, unknown>);
-		return new Promise((res, rej) => {
-			const timer = setTimeout(() => rej(new Error("the child did not answer")), 60_000);
-			this.waiting = (l) => {
-				clearTimeout(timer);
-				res(JSON.parse(l) as Record<string, unknown>);
-			};
-		});
-	}
-
-	/** The open's outcome, the first line, as it came. */
-	first(): Promise<Record<string, unknown>> {
-		return this.next();
-	}
-
-	/** The open's outcome, the first line. */
-	async opened(): Promise<Opened> {
-		const reply = await this.next();
-		expect(reply.ok, JSON.stringify(reply)).toBe(true);
-		return reply.opened as Opened;
-	}
-
-	async send(cmd: Record<string, unknown>): Promise<Record<string, unknown>> {
-		this.proc.stdin?.write(`${JSON.stringify(cmd)}\n`);
-		return this.next();
-	}
-
-	async exec(sql: string): Promise<void> {
-		const reply = await this.send({ exec: sql });
-		expect(reply.ok, JSON.stringify(reply)).toBe(true);
-	}
-
-	async rows(sql: string): Promise<unknown[]> {
-		const reply = await this.send({ all: sql });
-		expect(reply.ok, JSON.stringify(reply)).toBe(true);
-		return reply.rows as unknown[];
-	}
-
-	/** Exits, cleanly (`exit`) or killed (`SIGKILL`). */
-	async stop(how: "exit" | "SIGKILL" = "exit"): Promise<void> {
-		if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
-		const exited = new Promise((r) => this.proc.once("exit", r));
-		if (how === "exit") this.proc.stdin?.write(`${JSON.stringify({ exit: true })}\n`);
-		else this.proc.kill("SIGKILL");
-		await exited;
-		children.delete(this);
-	}
-}
-
-const children = new Set<Child>();
-afterEach(async () => {
-	for (const c of [...children]) await c.stop("SIGKILL");
-});
+afterEach(killChildren);
 
 /** The stream's latest snapshot offset and retained offset, from a HEAD. */
 async function retention(path: string): Promise<{ snapshot: number | null; retained: number }> {
@@ -180,15 +66,6 @@ async function waitStatus(c: Child, ready: (s: Status) => boolean): Promise<Stat
 		await new Promise((r) => setTimeout(r, 50));
 	}
 	throw new Error(`status never got there: ${JSON.stringify(last)}`);
-}
-
-/** The rows of `table` in a fresh build from the stream: a new process with a new cache root. */
-async function fromStream(url: string, sql: string): Promise<unknown[]> {
-	const reader = new Child(url, freshDir());
-	await reader.opened();
-	const rows = await reader.rows(sql);
-	await reader.stop();
-	return rows;
 }
 
 describe.skipIf(inject("ursulaServer") !== "model")("the 0.8 core on node:sqlite", () => {

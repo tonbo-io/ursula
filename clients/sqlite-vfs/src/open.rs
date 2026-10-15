@@ -47,6 +47,7 @@ use crate::codec::snapshot::check_body;
 use crate::codec::snapshot::read_image;
 use crate::codec::stream::FrameStream;
 use crate::codec::stream::StreamError;
+use crate::driver::Attach;
 use crate::driver::disk::DiskDone;
 use crate::driver::disk::DiskJob;
 use crate::driver::disk::NewBuild;
@@ -469,6 +470,8 @@ pub(crate) struct Build {
     attempt: Attempt,
     /// Restarts after a `410` so far, at most [`MAX_BUILD_RESTARTS`].
     restarts: u32,
+    /// The offset of the snapshot this build installed, if any.
+    installed: Option<Offset>,
 }
 
 /// The restarts a build makes after a `410` before it gives up.
@@ -527,6 +530,7 @@ impl Build {
             retry: Retry::default(),
             attempt: Attempt::default(),
             restarts: 0,
+            installed: None,
         }
     }
 
@@ -681,6 +685,7 @@ impl Build {
             highest,
         );
         self.stage = BuildStage::Tail;
+        self.installed = Some(snapshot.offset);
         Ok(())
     }
 
@@ -749,12 +754,15 @@ impl Build {
 
     /// Disk job: publishes the complete generation by one rename (the one it supersedes goes then)
     /// and materializes it. Returns it with the highest epoch a CLAIM read named.
-    pub(crate) fn publish(self) -> Result<(Materialized, Option<Epoch>), OpenError> {
+    pub(crate) fn publish(self) -> Result<(Materialized, Option<Epoch>, Attach), OpenError> {
         let highest = self.fetch.highest_epoch;
+        let attach = Attach::Built {
+            snapshot: self.installed,
+        };
         let generation = self.building.publish().map_err(local)?;
         let m = materialize::materialize(&generation).map_err(local)?;
         drop(self.root);
-        Ok((m, highest))
+        Ok((m, highest, attach))
     }
 }
 
@@ -893,6 +901,7 @@ pub(crate) struct Takeover {
     pub(crate) m: Box<Materialized>,
     pub(crate) local: LocalState,
     pub(crate) deadline_ms: u64,
+    pub(crate) attach: Attach,
 }
 
 /// What the open waits for.
@@ -1067,9 +1076,10 @@ impl Opening {
                 let step = build.next();
                 self.build_step(build, step, cluster_id, head)
             }
-            (Phase::Building { cluster_id, head }, DiskDone::Published(Ok((m, highest)))) => {
-                self.takeover(m, cluster_id, &head, highest)
-            }
+            (
+                Phase::Building { cluster_id, head },
+                DiskDone::Published(Ok((m, highest, attach))),
+            ) => self.takeover(m, cluster_id, &head, highest, attach),
             (
                 _,
                 DiskDone::Prepared(Err(e)) | DiskDone::Built(Err(e)) | DiskDone::Published(Err(e)),
@@ -1283,7 +1293,7 @@ impl Opening {
                         stream: head.incarnation(),
                     }));
                 }
-                self.takeover(m, identity.cluster_id, &head, None)
+                self.takeover(m, identity.cluster_id, &head, None, Attach::Resumed)
             }
             None => {
                 let job = DiskJob::NewBuild(NewBuild {
@@ -1311,6 +1321,7 @@ impl Opening {
         cluster_id: ClusterId,
         head: &StreamHead,
         highest_epoch: Option<Epoch>,
+        attach: Attach,
     ) -> OpenStep {
         let this = *self;
         let Some(prepared) = this.prepared else {
@@ -1324,6 +1335,7 @@ impl Opening {
             m,
             local,
             deadline_ms: this.deadline_ms,
+            attach,
         }))
     }
 }

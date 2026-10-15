@@ -134,10 +134,13 @@ interface Stack {
 	stop(): Promise<void>;
 }
 
-/** The model server: it prints `{"port": n}` once it accepts connections. */
+/**
+ * The model server: it prints `{"port": n}` once it accepts connections. It exits when its stdin
+ * closes, so it never outlives the vitest process, even one killed before its teardown ran.
+ */
 async function startModel(): Promise<Stack> {
 	const bin = resolve(process.env.URSULA_VFS_MODEL ?? join(import.meta.dirname, "../../sqlite-vfs/target/release/ursula-vfs-model"));
-	const child = spawn(bin, [], { stdio: ["ignore", "pipe", "inherit"] });
+	const child = spawn(bin, ["--exit-with-stdin"], { stdio: ["pipe", "pipe", "inherit"] });
 	const port = await new Promise<number>((res, rej) => {
 		let out = "";
 		child.once("error", rej);

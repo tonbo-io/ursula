@@ -12,6 +12,7 @@ use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
+use super::Attach;
 use crate::generation::CanonicalPath;
 use crate::generation::Root;
 use crate::ids::Activation;
@@ -79,7 +80,7 @@ pub(crate) enum DiskDone {
         build: Box<Build>,
         result: Result<(), OpenError>,
     },
-    Published(Result<(Box<Materialized>, Option<Epoch>), OpenError>),
+    Published(Result<(Box<Materialized>, Option<Epoch>, Attach), OpenError>),
     /// The last position the frames took and the log's bytes.
     CaughtUp {
         m: Box<Materialized>,
@@ -111,9 +112,11 @@ impl DiskJob {
                 let result = build.apply(&frames);
                 DiskDone::Chunk { build, result }
             }
-            Self::Publish(build) => {
-                DiskDone::Published(build.publish().map(|(m, highest)| (Box::new(m), highest)))
-            }
+            Self::Publish(build) => DiskDone::Published(
+                build
+                    .publish()
+                    .map(|(m, highest, attach)| (Box::new(m), highest, attach)),
+            ),
             Self::CatchUp {
                 mut m,
                 frames,
