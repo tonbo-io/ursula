@@ -53,6 +53,7 @@ First-principles thinking and the elegance of the implementation come before com
 | `ursula-stream`        | Deterministic stream state machine: bucket/stream commands, responses, snapshots, payload metadata, validation.                               |
 | `ursula-shard`         | Bucket/stream routing, core ownership, Raft group placement, shared shard identifiers (`CoreId`, `ShardId`, `RaftGroupId`, `BucketStreamId`). |
 | `ursula-proto`         | Shared protobuf schemas (model value types and snapshot frames) reused across crates; replicated commands/responses travel as serde MessagePack. |
+| `ursula-headers`       | Typed HTTP headers of the protocol (producer write keys and answers, HEAD metadata, snapshot and parts headers, typed `413`), std-only so the server and `clients/sqlite-vfs` share one implementation. |
 | `ursula-config`        | Configuration types and TOML loading for Ursula server.                                                                                       |
 | `ursula-observability` | Shared tracing/OpenTelemetry initialization for Ursula binaries.                                                                              |
 | `ursula-gateway`       | Gateway binary (`ursulagw`) that routes client HTTP traffic while hiding internal leader redirects.                                           |
