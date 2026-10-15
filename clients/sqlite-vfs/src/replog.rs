@@ -163,8 +163,6 @@ pub(crate) struct Recovered {
 }
 
 impl Recovered {
-    /// This generation's COMMIT records after the latest ACK: logged, not acknowledged. Stream
-    /// frames a catch-up logged carry another lineage and are never pending.
     /// Whether a COMMIT record, the generation's own or a caught-up one, follows the latest ACK:
     /// materialize applied it, so the db may hold pages past the acknowledged offset.
     pub(crate) fn commit_after_ack(&self) -> bool {
@@ -173,6 +171,8 @@ impl Recovered {
             .any(|r| r.position > self.acked && matches!(r.body, RecordBody::Commit { .. }))
     }
 
+    /// This generation's COMMIT records after the latest ACK: logged, not acknowledged. Stream
+    /// frames a catch-up logged carry another lineage and are never pending.
     pub(crate) fn pending(&self) -> Vec<(Position, Arc<[u8]>)> {
         self.records
             .iter()
