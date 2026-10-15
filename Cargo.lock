@@ -4713,6 +4713,7 @@ name = "ursula-sim"
 version = "0.7.5"
 dependencies = [
  "axum 0.8.9",
+ "blake3",
  "madsim",
  "openraft",
  "serde",
@@ -4722,6 +4723,7 @@ dependencies = [
  "ursula",
  "ursula-config",
  "ursula-ctl",
+ "ursula-headers",
  "ursula-observability",
  "ursula-proto",
  "ursula-raft",

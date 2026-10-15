@@ -47,7 +47,10 @@ jobs:
             --seed-family runtime-raft-network-cold-live-write-recovery \
             --seed-family runtime-interleaving \
             --seed-family leader-read-linearizability \
-            --seed-family leader-read-linearizability-extended
+            --seed-family leader-read-linearizability-extended \
+            --seed-family producer-repeats-exactly-once \
+            --seed-family producer-repeats-exactly-once-extended \
+            --seed-family idle-expiry-cannot-reopen-an-epoch
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

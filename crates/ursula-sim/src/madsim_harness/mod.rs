@@ -155,6 +155,8 @@ pub enum SimScenario {
     HttpProducerProtocolSurface,
     HttpProtocolSurface,
     LeaderReadLinearizability,
+    ProducerRepeatsExactlyOnce,
+    IdleExpiryCannotReopenAnEpoch,
 }
 
 #[derive(Clone)]
@@ -196,6 +198,8 @@ impl SimScenario {
             Self::HttpProducerProtocolSurface => "http-producer-protocol-surface",
             Self::HttpProtocolSurface => "http-protocol-surface",
             Self::LeaderReadLinearizability => "leader-read-linearizability",
+            Self::ProducerRepeatsExactlyOnce => "producer-repeats-exactly-once",
+            Self::IdleExpiryCannotReopenAnEpoch => "idle-expiry-cannot-reopen-an-epoch",
         }
     }
 }
@@ -532,6 +536,7 @@ use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
 mod http;
 mod leader_reads;
+mod write_keys;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;
 use http::run_http_producer_protocol_surface_inner;

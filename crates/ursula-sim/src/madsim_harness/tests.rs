@@ -20,7 +20,7 @@ mod strict_replay_tests;
 
 static SIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn sim_test_guard() -> MutexGuard<'static, ()> {
+pub(super) fn sim_test_guard() -> MutexGuard<'static, ()> {
     SIM_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())

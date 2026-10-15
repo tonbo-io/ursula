@@ -63,6 +63,9 @@ use super::run_snapshot_catch_up_inner;
 use super::run_with_madsim;
 use super::runtime_interleaving_plan_from_fault_plan;
 use super::runtime_raft_network_workload_plan_from_fault_plan;
+use super::write_keys::Controls;
+use super::write_keys::run_idle_expiry_cannot_reopen_an_epoch_inner;
+use super::write_keys::run_producer_repeats_are_exactly_once_inner;
 
 /// Runs one scenario workload under a fresh madsim runtime for `seed` and
 /// wraps the outcome into a `SimReport`.
@@ -249,6 +252,31 @@ impl ThreeNodeRaftSim {
             SimScenario::LeaderReadLinearizability => {
                 Self::run_leader_read_linearizability_report(config)
             }
+            SimScenario::ProducerRepeatsExactlyOnce
+            | SimScenario::IdleExpiryCannotReopenAnEpoch => {
+                Self::run_write_keys_with_controls_report(config, scenario, Controls::default())
+            }
+        }
+    }
+
+    /// Runs a write-key scenario with its defences as `controls` leave them.
+    pub(super) fn run_write_keys_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        scenario: SimScenario,
+        controls: Controls,
+    ) -> SimReport {
+        let seed = config.seed;
+        match scenario {
+            SimScenario::IdleExpiryCannotReopenAnEpoch => report_of(
+                scenario,
+                seed,
+                run_idle_expiry_cannot_reopen_an_epoch_inner(config, controls),
+            ),
+            _ => report_of(
+                SimScenario::ProducerRepeatsExactlyOnce,
+                seed,
+                run_producer_repeats_are_exactly_once_inner(config, controls),
+            ),
         }
     }
 
