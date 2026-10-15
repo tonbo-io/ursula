@@ -350,11 +350,9 @@ pub enum RaftWalError {
     #[error("the WAL at '{}' belongs to cluster '{stored}', but server.cluster_id is '{configured}'. A disk does not move between clusters: set server.cluster_id to '{stored}', or start this node on an empty WAL", .root.display())]
     ClusterIdMismatch {
         root: PathBuf,
-        stored: String,
+        stored: ursula_headers::ClusterId,
         configured: ursula_headers::ClusterId,
     },
-    #[error("the WAL topology at '{}' has no cluster id: an earlier 0.8 development build wrote it. Start this node on an empty WAL", .root.display())]
-    TopologyWithoutClusterId { root: PathBuf },
     #[error("the WAL topology at '{}' holds an invalid cluster id '{stored}'", .root.display())]
     InvalidStoredClusterId { root: PathBuf, stored: String },
     #[error("read the Raft WAL topology: {0}")]

@@ -813,7 +813,6 @@ pub struct GroupLeaderHint {
     pub address: Option<String>,
     /// The term in which the replica that refused knew `node_id` to lead,
     /// read with it from one view. `None` when it did not know.
-    #[serde(default)]
     pub term: Option<u64>,
 }
 

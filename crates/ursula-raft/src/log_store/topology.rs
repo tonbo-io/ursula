@@ -15,7 +15,6 @@ use ursula_shard::StaticShardMap;
 
 use super::RaftWalError;
 use super::state_file;
-use super::state_file::StateFileError;
 use super::state_file::StateFileKind;
 
 const TOPOLOGY_FILE: &str = "topology.bin";
@@ -36,11 +35,18 @@ impl From<&StaticShardMap> for WalTopology {
     }
 }
 
-/// The topology file: the routing counts and the cluster id.
+/// The topology file's encoding: the routing counts and the cluster id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredTopology {
+struct TopologyFile {
     routing: WalTopology,
     cluster_id: String,
+}
+
+/// The topology a root holds, its cluster id parsed when the file is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredTopology {
+    routing: WalTopology,
+    cluster_id: ClusterId,
 }
 
 /// A cluster id for a node that configures none: `u` followed by 32 hex
@@ -55,13 +61,13 @@ pub fn generate_cluster_id() -> ClusterId {
 enum TopologyDecision {
     Create,
     Match {
-        cluster_id: String,
+        cluster_id: ClusterId,
     },
     Mismatch {
         stored: WalTopology,
     },
     ClusterIdMismatch {
-        stored: String,
+        stored: ClusterId,
         configured: ClusterId,
     },
     Missing,
@@ -79,12 +85,10 @@ impl TopologyDecision {
                 stored: stored.routing,
             },
             Some(stored) => match configured_cluster_id {
-                Some(configured) if configured.as_str() != stored.cluster_id => {
-                    Self::ClusterIdMismatch {
-                        stored: stored.cluster_id.clone(),
-                        configured: configured.clone(),
-                    }
-                }
+                Some(configured) if *configured != stored.cluster_id => Self::ClusterIdMismatch {
+                    stored: stored.cluster_id.clone(),
+                    configured: configured.clone(),
+                },
                 _ => Self::Match {
                     cluster_id: stored.cluster_id.clone(),
                 },
@@ -105,20 +109,20 @@ pub(super) fn check_or_create(
 ) -> Result<ClusterId, RaftWalError> {
     let configured = WalTopology::from(map);
     let path = root.join(TOPOLOGY_FILE);
-    let stored = match state_file::read::<StoredTopology>(StateFileKind::Topology, &path) {
-        Ok(stored) => stored,
-        // A topology an earlier 0.8 development build wrote, before the
-        // cluster id: incompatible, not corrupt.
-        Err(StateFileError::Undecodable { .. })
-            if state_file::read::<WalTopology>(StateFileKind::Topology, &path)
-                .is_ok_and(|legacy| legacy.is_some()) =>
-        {
-            return Err(RaftWalError::TopologyWithoutClusterId {
-                root: root.to_owned(),
-            });
-        }
-        Err(error) => return Err(RaftWalError::ReadTopology(error)),
-    };
+    let stored = state_file::read::<TopologyFile>(StateFileKind::Topology, &path)
+        .map_err(RaftWalError::ReadTopology)?
+        .map(|file| {
+            ClusterId::new(file.cluster_id.clone())
+                .map(|cluster_id| StoredTopology {
+                    routing: file.routing,
+                    cluster_id,
+                })
+                .map_err(|_invalid| RaftWalError::InvalidStoredClusterId {
+                    root: root.to_owned(),
+                    stored: file.cluster_id,
+                })
+        })
+        .transpose()?;
     match TopologyDecision::decide(
         stored.as_ref(),
         configured,
@@ -133,7 +137,7 @@ pub(super) fn check_or_create(
                 StateFileKind::Topology,
                 &path,
                 &path.with_extension("tmp"),
-                &StoredTopology {
+                &TopologyFile {
                     routing: configured,
                     cluster_id: cluster_id.as_str().to_owned(),
                 },
@@ -141,14 +145,7 @@ pub(super) fn check_or_create(
             .map_err(RaftWalError::RecordTopology)?;
             Ok(cluster_id)
         }
-        TopologyDecision::Match { cluster_id } => {
-            ClusterId::new(cluster_id.clone()).map_err(|_invalid| {
-                RaftWalError::InvalidStoredClusterId {
-                    root: root.to_owned(),
-                    stored: cluster_id,
-                }
-            })
-        }
+        TopologyDecision::Match { cluster_id } => Ok(cluster_id),
         TopologyDecision::Mismatch { stored } => Err(RaftWalError::TopologyMismatch {
             root: root.to_owned(),
             stored_core_count: stored.core_count,
@@ -183,7 +180,7 @@ mod decision_tests {
         let other = ClusterId::new("prod-b").unwrap();
         let stored_as = |routing: WalTopology| StoredTopology {
             routing,
-            cluster_id: "prod-a".to_owned(),
+            cluster_id: id.clone(),
         };
         for has_prior_state in [false, true] {
             for configured_id in [None, Some(&id), Some(&other)] {
@@ -205,7 +202,7 @@ mod decision_tests {
                         has_prior_state
                     ),
                     TopologyDecision::Match {
-                        cluster_id: "prod-a".to_owned()
+                        cluster_id: id.clone()
                     },
                 );
             }
@@ -217,7 +214,7 @@ mod decision_tests {
                     has_prior_state
                 ),
                 TopologyDecision::ClusterIdMismatch {
-                    stored: "prod-a".to_owned(),
+                    stored: id.clone(),
                     configured: other.clone(),
                 },
             );
@@ -409,7 +406,7 @@ mod tests {
         assert!(matches!(
             &error,
             RaftWalError::ClusterIdMismatch { stored, configured, .. }
-                if stored == "prod-eu-1" && configured == &other
+                if *stored == prod && configured == &other
         ));
         assert_eq!(
             std::fs::read(dir.path().join(RUN_STATE_FILE)).unwrap(),
@@ -422,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_topology_without_a_cluster_id_is_incompatible() {
+    async fn a_stored_cluster_id_is_parsed_when_it_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let topology = StaticShardMap::new(2, 4).unwrap();
         let path = dir.path().join(TOPOLOGY_FILE);
@@ -430,12 +427,28 @@ mod tests {
             StateFileKind::Topology,
             &path,
             &path.with_extension("tmp"),
-            &WalTopology::from(&topology),
+            &TopologyFile {
+                routing: WalTopology::from(&topology),
+                cluster_id: "not a/valid id".to_owned(),
+            },
         )
         .unwrap();
-        assert!(matches!(
-            RaftWal::start(dir.path(), WalFsync::Never, &topology),
-            Err(RaftWalError::TopologyWithoutClusterId { .. })
-        ));
+        // Configured or not, an invalid stored id is reported as itself,
+        // never as a mismatch with the configured one.
+        let configured = ClusterId::new("prod-eu-1").unwrap();
+        for configured in [None, Some(&configured)] {
+            let error = RaftWal::start_in_cluster(
+                dir.path(),
+                crate::JournalTuning::new(WalFsync::Never),
+                &topology,
+                configured,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, RaftWalError::InvalidStoredClusterId { stored, .. }
+                    if stored == "not a/valid id"),
+                "{error}"
+            );
+        }
     }
 }
