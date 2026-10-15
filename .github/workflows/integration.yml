@@ -255,7 +255,8 @@ jobs:
           E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/pi.e2e.ts test/conformance.e2e.ts
 
   # The release `ursula` for the e2e against the real server, cached by the inputs that build it so
-  # a PR that touches only the extension or the package does not rebuild it.
+  # a PR that touches only the extension or the package does not rebuild it. Bump the key's version
+  # (v1) when the build command below changes.
   build-ursula:
     name: Build release ursula
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
@@ -270,10 +271,10 @@ jobs:
 
       - name: Cached ursula
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ursula-bin/ursula
-          key: ursula-release-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'third_party/**') }}
+          key: ursula-release-v1-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', 'third_party/**') }}
 
       - name: Install Rust toolchain
         if: steps.cache.outputs.cache-hit != 'true'
@@ -338,6 +339,8 @@ jobs:
         timeout-minutes: 35
         env:
           E2E_NODES: ${{ matrix.nodes }}
+          # No S3 here: one node keeps an in-memory cold store, three run with no cold tier.
+          URSULA_COLD: ${{ matrix.nodes == '3' && 'none' || 'memory' }}
         run: |
           chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
           cd clients/sqlite-ursula
