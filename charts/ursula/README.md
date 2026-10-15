@@ -164,11 +164,44 @@ nodes may resend a request or answer `401`, `402` or `429`, as a local rate
 limit does, so set `gateway.upstreams` only to URLs that reach the nodes
 themselves.
 
-The internal server Service and headless peer Service expose the same
-`server.ports.client` process port. Ursula's current static peer URL is used
-both for Raft/gRPC traffic and for leader redirects, so the chart keeps those
-addresses on the client-reachable port until Ursula has separate peer and
-redirect URL configuration.
+## Network Planes
+
+Each voter serves three planes. The client plane (`server.ports.client`,
+`4437`) serves the stream API, and the client Service exposes only that port.
+The cluster plane (`server.ports.cluster`, `4439`) carries Raft gRPC between
+voters. The chart renders it as `server.cluster_listen`, and only the headless
+peer Service names it. Each generated `[[raft.peers]]` entry has a `url` on the
+cluster port, which peers dial, and a `client_url` on the client port, which
+leader redirects name. The admin plane stays on pod loopback
+(`server.adminListen`).
+
+Set `server.clusterListen=false` to serve the client and cluster planes on the
+client port, as charts before 0.8 did. Anyone who reaches the client Service can
+then send Raft traffic. Choose before the first install and keep it: groups
+record each peer's Raft URL when they initialize, and a voter whose URL changed
+afterwards refuses to start.
+
+A Service does not stop a pod from dialing another pod's IP. To restrict that,
+enable the NetworkPolicy on a CNI that enforces it:
+
+```yaml
+server:
+  networkPolicy:
+    enabled: true
+    # Empty admits every source to the client port.
+    clientIngressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: apps
+```
+
+The policy admits only this release's server pods to the cluster port. The
+client port admits `clientIngressFrom`, plus this release's gateway, indexer
+and Helm test pods. List every other client there, including metrics pollers
+and an `ipBlock` for traffic through a `LoadBalancer` or `NodePort` Service.
+The chart refuses to render the policy while `server.adminListen` is off
+loopback, since the policy would cut that admin plane off. It selects only ingress, so egress stays open. Kubelet probes reach
+the client port from the node, which most CNIs admit whatever the policy says.
 
 ## Bootstrap Behavior
 
@@ -420,14 +453,18 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.gracefulRollout.activeDeadlineSeconds` | `7200` | Ceiling for the whole rollout, not one node. Cutting it short leaves the cluster on mixed versions. |
 | `server.gracefulRollout.kubectlImage` | `alpine/k8s:1.33.3` | Kubectl copied in beside `ursulactl`, so the server image every node runs does not have to carry one. |
 | `server.onDeleteMigration.image` | `registry.k8s.io/kubectl:v1.33.3` | Kubectl image used by the Helm pre-upgrade migration when switching an existing StatefulSet to `OnDelete`. |
-| `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, headless peer Service, generated Raft peer URLs, and leader redirects target this port. |
+| `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, the headless peer Service, the gateway upstreams and leader redirects (each peer's `client_url`) target this port. With `server.clusterListen=false` the generated Raft peer URLs target it too. |
+| `server.ports.cluster` | `4439` | Cluster-plane (Raft gRPC) process port, used when `server.clusterListen=true`. The generated Raft peer URLs and the headless peer Service target it. The client Service never exposes it. Must differ from `server.ports.client` and the `server.adminListen` port. |
+| `server.clusterListen` | `true` | Serve the cluster plane on `server.ports.cluster` (`server.cluster_listen`) instead of sharing the client port. With `false`, anyone who reaches the client Service reaches Raft. Choose it before the first install: groups record each peer's Raft URL when they initialize, and a voter whose URL changed afterwards refuses to start. |
 | `server.adminListen` | `127.0.0.1:4438` | Mutating admin-plane listen address. Keep the loopback default for normal deployments and use `kubectl port-forward`; a trusted in-cluster operator may opt in to `0.0.0.0:4438`. The chart never exposes this port through a Service. |
 | `server.clusterId` | `""` | The deployment's id (`server.cluster_id`), sent as `Ursula-Cluster-Id` on every `HEAD`. Required for every install, a single replica included, since the chart always renders the peer list, and rendering fails without it: name the environment and the region, such as `prod-us-east-1`, and give every deployment one client can reach its own. A node refuses to start when its WAL holds another id, so keep the old id when a restore replaces a deployment. |
 | `server.service.enabled` | `true` | Render the internal client Service. |
 | `server.service.type` | `ClusterIP` | Client Service type. Allowed values are `ClusterIP`, `NodePort`, and `LoadBalancer`. |
 | `server.service.port` | `4437` | Client Service port. |
 | `server.service.annotations` | `{}` | Client Service annotations. |
-| `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
+| `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and, with `server.clusterListen=true`, `server.ports.cluster`. It uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
+| `server.networkPolicy.enabled` | `false` | Render an ingress NetworkPolicy for the server pods. The cluster port admits only this release's server pods. The admin plane stays on loopback and needs no rule, and rendering fails when `server.adminListen` is off loopback. Needs a CNI that enforces NetworkPolicy. |
+| `server.networkPolicy.clientIngressFrom` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector`, `ipBlock`) admitted to the client port. Empty admits every source. This release's gateway, indexer and Helm test pods are always admitted when enabled. List every other client, including metrics pollers and an `ipBlock` for `LoadBalancer` or `NodePort` traffic. |
 | `server.podAnnotations` | `{}` | Extra annotations applied to Ursula server pods. |
 | `server.podLabels` | `{}` | Extra labels applied to Ursula server pods. Must not set selector labels `app.kubernetes.io/name` or `app.kubernetes.io/instance`; the chart fails rendering if those keys are used. |
 | `server.rustLog` | `ursula=info,ursula_runtime=info,ursula_raft=info` | `RUST_LOG` tracing filter. |

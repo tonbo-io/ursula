@@ -61,6 +61,11 @@ spec:
             - name: client
               containerPort: {{ .Values.server.ports.client }}
               protocol: TCP
+            {{- if .Values.server.clusterListen }}
+            - name: cluster
+              containerPort: {{ .Values.server.ports.cluster }}
+              protocol: TCP
+            {{- end }}
           env:
             {{- if .Values.server.startupOwnership.enabled }}
             - name: URSULA_STARTUP_PROVIDER

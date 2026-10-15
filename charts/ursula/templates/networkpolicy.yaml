@@ -1,0 +1,47 @@
+{{- if .Values.server.networkPolicy.enabled -}}
+{{- $clusterPort := include "ursula.clusterPort" . | int -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ursula.fullname" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ursula.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Client plane: the configured sources, or every source when none is set.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.server.ports.client }}
+      {{- with .Values.server.networkPolicy.clientIngressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+        {{- if $.Values.gateway.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "ursula.gatewaySelectorLabels" $ | nindent 14 }}
+        {{- end }}
+        {{- if $.Values.indexer.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "ursula.indexerSelectorLabels" $ | nindent 14 }}
+        {{- end }}
+        {{- if $.Values.tests.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "ursula.testSelectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+    # Cluster plane: only this release's server pods.
+    - ports:
+        - protocol: TCP
+          port: {{ $clusterPort }}
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "ursula.selectorLabels" . | nindent 14 }}
+{{- end }}

@@ -260,8 +260,8 @@ spec:
               value: {{ include "ursula.image" . | quote }}
             - name: CTL
               value: /usr/local/bin/ursulactl
-            - name: CLIENT_PORT
-              value: {{ .Values.server.ports.client | quote }}
+            - name: CLUSTER_PORT
+              value: {{ include "ursula.clusterPort" . | quote }}
             - name: ADMIN_PORT
               value: {{ $adminPort | quote }}
           resources:

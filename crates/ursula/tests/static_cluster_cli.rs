@@ -83,7 +83,8 @@ async fn cli_wait_ready_uses_the_chart_generated_admin_tunnel_through_startup() 
         .env("REPLICAS", "1")
         .env("EXPECTED_GROUPS", "1")
         .env("TARGET_IMAGE", "local-readiness-test")
-        .env("CLIENT_PORT", port.to_string())
+        // The node shares one port between its client and cluster planes.
+        .env("CLUSTER_PORT", port.to_string())
         .env("FORWARD_PORT_BASE", admin_port.to_string())
         .output()
         .unwrap();

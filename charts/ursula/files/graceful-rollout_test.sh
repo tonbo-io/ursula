@@ -449,7 +449,7 @@ for replicas in 1 3 5; do
   last_ordinal=$((replicas - 1))
   grep -q "\"id\": ${replicas}," "${MANIFEST}"
   grep -q "127.0.0.1:$((15438 + last_ordinal))" "${MANIFEST}"
-  grep -q "${STATEFULSET}-${last_ordinal}.${STATEFULSET}-headless.${NAMESPACE}.svc.cluster.local:4437" "${MANIFEST}"
+  grep -q "${STATEFULSET}-${last_ordinal}.${STATEFULSET}-headless.${NAMESPACE}.svc.cluster.local:4439" "${MANIFEST}"
   python3 -c 'import json,sys; nodes=json.load(open(sys.argv[1]))["nodes"]; assert all(n["metrics_url"] == n["admin_url"] and "svc.cluster.local" in n["http_url"] for n in nodes)' "${MANIFEST}"
   rm -f "${MANIFEST}"
 done

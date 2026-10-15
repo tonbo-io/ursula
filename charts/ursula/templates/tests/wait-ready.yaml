@@ -6,10 +6,9 @@ metadata:
   name: {{ $testName }}
   labels:
     helm.sh/chart: {{ include "ursula.chart" . }}
-    app.kubernetes.io/name: {{ include "ursula.name" . }}
+    {{- include "ursula.testSelectorLabels" . | nindent 4 }}
     app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/component: helm-test
   annotations:
     "helm.sh/hook": test
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
