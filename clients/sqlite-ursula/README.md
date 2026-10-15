@@ -7,7 +7,7 @@ SQLite databases replicated through [Ursula](https://ursula.tonbo.io) streams, f
 Start a single Ursula node in a terminal of its own. It keeps nothing across restarts.
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.5
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.6
 ```
 
 Install the package, which needs Node.js 22.19 or later, and run:
