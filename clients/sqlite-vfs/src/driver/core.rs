@@ -19,6 +19,10 @@
 //!   replicator reads on.
 //! - A failed log write or fsync resets the binding `local_damage`, and a panic inside a
 //!   binding's step resets it `internal`.
+//! - A reset takes the log's lock once it is marked, so no commit lands in the log after it (G8).
+//!   An open of a stream first carries out a reset its connections marked that the core has not
+//!   heard of yet, then shares the stream's root while a reset binding's connections hold it, and
+//!   its first disk job copies the generation they hold (design §5.6).
 //!
 //! `synced()` waits for every commit at or below its target, at most the last commit the commit
 //! path recorded on the handle; a target the core has not been told is logged yet waits for that
@@ -29,8 +33,11 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Weak;
 
 use ursula_headers::Incarnation;
 
@@ -62,6 +69,8 @@ use crate::codec::segment::RecordBody;
 use crate::generation::CanonicalPath;
 use crate::generation::Fate;
 use crate::generation::Root;
+use crate::generation::canonical_path;
+use crate::generation::root_dir;
 use crate::guard;
 use crate::ids::Lineage;
 use crate::ids::Position;
@@ -324,6 +333,11 @@ pub(crate) struct Core {
     events: EventLog,
     /// Resolved opens not yet taken.
     opened: BTreeMap<OpenId, Result<Bound, Arc<OpenError>>>,
+    /// The roots this core's opens locked, by directory: a root stays locked while a binding, an
+    /// open or a reset binding's connections hold it. An open of the stream shares it only when
+    /// nothing but reset bindings' connections hold it, and otherwise locks it anew (`in_use`).
+    /// Per core, so tests that run several cores as several processes keep them apart.
+    roots: HashMap<PathBuf, Weak<Root>>,
     /// Test hook: the next CLAIM record's write fails.
     #[cfg(test)]
     pub(crate) fail_next_claim: bool,
@@ -339,6 +353,7 @@ impl Core {
             ios: BTreeMap::new(),
             events: EventLog::default(),
             opened: BTreeMap::new(),
+            roots: HashMap::new(),
             #[cfg(test)]
             fail_next_claim: false,
         }
@@ -392,15 +407,53 @@ impl Core {
     }
 
     /// Starts open `open` (design §5.5). Its outcome comes as [`DriverEvent::Opened`].
+    ///
+    /// A binding of the stream that its connections reset, and whose reset has not reached the
+    /// core yet, resets first, so its log takes no append once the open may copy it (G8). Then the
+    /// open shares the stream's root when only reset bindings' connections still hold it: with
+    /// any other binding or open of the stream left in the core (one still draining, or a
+    /// tombstone whose disk job is out), it locks the root anew and is refused `in_use`, so it
+    /// never runs beside a replicator or a job that writes the stream's files.
     pub(crate) fn open(&mut self, open: OpenId, spec: OpenSpec, now_ms: u64) -> Vec<Io> {
         let mut ios = Vec::new();
+        let root = match canonical_path(&spec.url) {
+            Ok(name) => {
+                let reset: Vec<(BindingId, ResetKind)> = self
+                    .bindings
+                    .iter()
+                    .filter(|(_, b)| b.name == name)
+                    .filter_map(|(id, b)| Some((*id, b.handle()?.reset()?)))
+                    .collect();
+                for (binding, kind) in reset {
+                    self.reset(binding, kind, now_ms);
+                }
+                let busy = self.bindings.values().any(|b| b.name == name)
+                    || self.opens.values().any(|slot| *slot.opening.name() == name);
+                if busy {
+                    None
+                } else {
+                    self.roots
+                        .get(&root_dir(&spec.dir, &name))
+                        .and_then(Weak::upgrade)
+                }
+            }
+            // The open fails on the URL itself.
+            Err(_invalid) => None,
+        };
         let step = guard::contain(
             "driver_open",
             || OpenStep::Fail(OpenError::Panicked),
-            || Opening::start(spec, now_ms),
+            || Opening::start(spec, root, now_ms),
         );
         self.open_step(open, step, now_ms, &mut ios);
         ios
+    }
+
+    /// The root an open locked, or shares.
+    fn remember_root(&mut self, root: &Arc<Root>) {
+        self.roots.retain(|_, held| held.strong_count() > 0);
+        self.roots
+            .insert(root.path().to_owned(), Arc::downgrade(root));
     }
 
     fn open_step(&mut self, open: OpenId, step: OpenStep, now_ms: u64, ios: &mut Vec<Io>) {
@@ -921,6 +974,11 @@ impl Core {
             Stage::Opening { open, .. } => self.opened(open, Err(OpenError::Reset(kind))),
             Stage::Bound { handle } => {
                 handle.mark_reset(kind);
+                // A barrier for the connections, which check the reset under the log's lock
+                // (`Binding::log_unless_reset`): a COMMIT, ACK or BASE record whose append took the
+                // lock before the mark is written, and every later one is refused. The core itself
+                // appends nothing more, so the log is final once an open may copy it (G8).
+                drop(handle.log());
                 handle.reset_retired();
                 handle.snapshots.snapper.stop();
                 self.events.push(DriverEvent::Reset {
@@ -1115,6 +1173,9 @@ impl Core {
                         drop((slot.opening, done));
                         self.opened(open, Err(e));
                         return ios;
+                    }
+                    if let DiskDone::Prepared(Ok(prepared)) = &done {
+                        self.remember_root(prepared.root());
                     }
                     let step = guard::contain(
                         "driver_open",

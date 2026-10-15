@@ -30,12 +30,22 @@
 //! `salvage/` after the rename. A crash at any step leaves either the old generation current
 //! (its manifest deleted at the next open) or the new one current and the old one on its way into
 //! `salvage/` (finished at the next open).
+//!
+//! A reset binding's connections may keep reading their generation after the binding retired. They
+//! hold it ([`Root::hold`]) until the last of them closes, and the root with it, so another process
+//! gets `in_use`. An open in this process shares the root and copies a held generation
+//! ([`Root::copy`]): db then log into a `.tmp`, published like a build, so the old connections keep
+//! their files and never share a WAL or wal-index with the copy (design §5.6).
 
 use std::fs::File;
 use std::fs::{self};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::Weak;
 
 use crate::codec::marker;
 use crate::codec::segment::SegmentError;
@@ -48,6 +58,7 @@ use crate::ids::Lineage;
 use crate::replog::Log;
 use crate::replog::LogError;
 use crate::replog::sync_dir;
+use crate::replog::{self};
 use crate::salvage;
 use crate::salvage::Manifest;
 use crate::salvage::SalvageError;
@@ -183,6 +194,11 @@ pub(crate) fn root_name(p: &CanonicalPath) -> String {
         label.push_str("stream");
     }
     format!("{label}-{}", hash.as_str().get(..32).unwrap_or_default())
+}
+
+/// The root directory of stream `p` under the cache root `dir`.
+pub(crate) fn root_dir(dir: &Path, p: &CanonicalPath) -> PathBuf {
+    dir.join(root_name(p))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -326,18 +342,33 @@ impl Dir {
 }
 
 /// A stream's root directory, locked.
+///
+/// One `Root` serves every binding and open of the stream in the process, so its flock is held
+/// while any of them lives: another process gets `in_use`, and an open beside a reset binding's
+/// connections shares the lock. The generations those connections still use are held
+/// ([`Root::hold`]), and an open copies a held generation ([`Root::copy`]) instead of
+/// materializing it under them.
 #[derive(Debug)]
 pub(crate) struct Root {
     dir: PathBuf,
     /// Holds the flock until the root drops.
     _lock: File,
+    /// The generations bindings of this process hold, by id.
+    holds: Mutex<Vec<Weak<GenId>>>,
+}
+
+/// A binding's hold on its generation, released when dropped: while one lives, [`Root::held`]
+/// says so.
+#[derive(Debug)]
+pub(crate) struct Hold {
+    _id: Arc<GenId>,
 }
 
 impl Root {
     /// Creates `<dir>/<root_name>/` when missing and takes its `lock` (`InUse` if another process,
     /// or another open file of this one, holds it).
     pub(crate) fn lock(dir: &Path, p: &CanonicalPath) -> Result<Root, GenerationError> {
-        let root = dir.join(root_name(p));
+        let root = root_dir(dir, p);
         fs::create_dir_all(&root).map_err(io("create", &root))?;
         let path = root.join(LOCK);
         let lock = File::options()
@@ -363,7 +394,37 @@ impl Root {
         Ok(Root {
             dir: root,
             _lock: lock,
+            holds: Mutex::new(Vec::new()),
         })
+    }
+
+    fn holds(&self) -> std::sync::MutexGuard<'_, Vec<Weak<GenId>>> {
+        self.holds.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A hold on generation `g`, for the binding that serves it.
+    pub(crate) fn hold(&self, g: &Generation) -> Hold {
+        let mut holds = self.holds();
+        holds.retain(|held| held.strong_count() > 0);
+        if let Some(id) = holds
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|id| **id == g.id)
+        {
+            return Hold { _id: id };
+        }
+        let id = Arc::new(g.id);
+        holds.push(Arc::downgrade(&id));
+        Hold { _id: id }
+    }
+
+    /// Whether a binding of this process still holds generation `g`: a reset binding whose
+    /// connections are open (the only one that takes a hold).
+    pub(crate) fn held(&self, g: &Generation) -> bool {
+        self.holds()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|id| *id == g.id)
     }
 
     /// The generation directories, temporary ones apart, by id.
@@ -387,7 +448,7 @@ impl Root {
         Ok(gens)
     }
 
-    #[cfg(test)]
+    /// The root directory.
     pub(crate) fn path(&self) -> &Path {
         &self.dir
     }
@@ -529,6 +590,73 @@ impl Root {
             log,
             db,
             supersedes,
+        })
+    }
+}
+
+impl Root {
+    /// Starts a copy of the current generation `from` in a fresh `gen-<id32>.tmp`, for an open
+    /// beside the connections of a reset binding that still hold it (design §5.6): its db file
+    /// first, then its log ([`replog::copy`]), so every page the copied db holds comes from a
+    /// record the copied log holds (F1). The copy keeps the lineage, so its pending commits keep
+    /// their ids and the page-1 marker stays valid, and its first log segment names `from` as the
+    /// generation it supersedes. Its WAL and wal-index stay behind: the WAL's commits are in the
+    /// log, which materializing the copy re-applies. The copy is published like a build
+    /// ([`Building::publish`], `from` trashed), and a crash before the rename leaves only a
+    /// `.tmp` that the next open deletes. A failed copy deletes its `.tmp`. On a filesystem that
+    /// cannot clone files, the copy reads and writes the whole db file.
+    pub(crate) fn copy(&self, from: &Generation) -> Result<Building, GenerationError> {
+        let id = GenId::random().map_err(|source| GenerationError::Random { source })?;
+        let name = format!("{GEN}{}", id.hex());
+        let target = self.dir.join(&name);
+        let tmp = self.dir.join(format!("{name}{TMP}"));
+        if target.exists() {
+            return Err(GenerationError::Exists { path: target });
+        }
+        fs::create_dir(&tmp).map_err(io("create", &tmp))?;
+        let files = || -> Result<(Log, File), GenerationError> {
+            let generation = Generation {
+                dir: tmp.clone(),
+                id,
+                lineage: from.lineage,
+            };
+            let db_path = generation.db();
+            fs::copy(from.db(), &db_path).map_err(io("copy", &from.db()))?;
+            abort_at(AbortStep::CopyDb);
+            replog::copy(&from.log_dir(), &generation.log_dir(), from.id)?;
+            abort_at(AbortStep::CopyLog);
+            let (log, _) = Log::open(&generation.log_dir())?;
+            let db = File::options()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .map_err(io("open", &db_path))?;
+            Ok((log, db))
+        };
+        let (log, db) = match files() {
+            Ok(files) => files,
+            Err(e) => {
+                if let Err(left) = fs::remove_dir_all(&tmp) {
+                    crate::log::emit(crate::log::Level::Warn, "copy_leftover", &[
+                        ("dir", &tmp.display()),
+                        ("error", &left),
+                    ]);
+                }
+                return Err(e);
+            }
+        };
+        Ok(Building {
+            root: self.dir.clone(),
+            tmp,
+            target,
+            id,
+            lineage: from.lineage,
+            log,
+            db,
+            supersedes: Some(Dir {
+                path: from.dir.clone(),
+                id: from.id,
+            }),
         })
     }
 }

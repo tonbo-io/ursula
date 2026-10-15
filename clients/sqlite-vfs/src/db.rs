@@ -6,7 +6,9 @@
 //! whose logged commits are undecided, the last logged, confirmed and based positions, the
 //! WAL-write bookkeeping and the measurements. The reset lives in the driver's
 //! [`BindingHandle`], read without the mutex. After its last connection closes the binding drains
-//! and retires, unless an open takes it back first ([`BindingHandle::revive`]).
+//! and retires, unless an open takes it back first ([`BindingHandle::revive`]). A reset binding
+//! leaves the registry at the next open of its stream, which binds anew beside the connections
+//! still open on it: they keep their generation's files, and the new binding works on a copy.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -25,6 +27,7 @@ use crate::capture::WriteTxn;
 use crate::driver::BindingHandle;
 use crate::driver::BindingId;
 use crate::driver::Bound;
+use crate::driver::LogPoisoned;
 use crate::driver::OpenId;
 use crate::driver::runtime::driver;
 use crate::error::Error;
@@ -38,6 +41,7 @@ use crate::log::Level;
 use crate::open::OpenSpec;
 use crate::options::OpenOptions;
 use crate::replicator::ResetKind;
+use crate::replog::Log;
 use crate::stats::Stats;
 
 /// How long a driver-side open may take when `ursula_open` returns at once (`timeout_ms` 0).
@@ -58,6 +62,15 @@ pub(crate) struct Binding {
     pub(crate) wal_written: Mutex<BTreeMap<i64, u32>>,
     /// Signalled whenever an undecided commit is decided, or the binding resets.
     decided: Condvar,
+}
+
+/// Why [`Binding::log_unless_reset`] gave no log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum LogRefused {
+    #[error("the binding reset ({0:?})")]
+    Reset(ResetKind),
+    #[error(transparent)]
+    Poisoned(#[from] LogPoisoned),
 }
 
 /// The commit path's state of a binding.
@@ -138,6 +151,18 @@ impl Binding {
 
     pub(crate) fn reset_kind(&self) -> Option<ResetKind> {
         self.handle.reset()
+    }
+
+    /// The log, for a connection's append (a COMMIT, an ACK or a BASE record), unless the binding
+    /// reset. The reset is checked under the log's lock (G8), and the driver takes that lock once it
+    /// marks a reset, so no connection appends to the log after the reset: an open may copy it
+    /// (design §5.6).
+    pub(crate) fn log_unless_reset(&self) -> Result<MutexGuard<'_, Log>, LogRefused> {
+        let log = self.handle.log()?;
+        match self.reset_kind() {
+            Some(kind) => Err(LogRefused::Reset(kind)),
+            None => Ok(log),
+        }
     }
 
     /// The binding's connections found it damaged: it resets (the first reset stays), the driver
@@ -293,7 +318,8 @@ pub(crate) fn open(
                     handed_out(&b);
                     return Ok(Opened::Bound(b));
                 }
-                // Reset, or retired: a new open (refused `in_use` while old handles hold its root).
+                // Reset, or retired: a new open. Beside a reset binding's open connections it shares
+                // their root and builds from a copy of their generation (design §5.6).
                 reg.names.remove(name.as_str());
                 reg.paths.remove(&b.path);
             }
@@ -406,10 +432,9 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
     };
     let db = handle.generation.db();
     let path = full_pathname(&db.to_string_lossy()).map_err(|e| refuse(e.into()))?;
-    let at_bind = match handle.log() {
-        Ok(log) => Position(log.next_position().0.saturating_sub(1)),
-        Err(_poisoned) => return Err(refuse(Error::Reset(ResetKind::Internal))),
-    };
+    // Every commit the log holds at bind is published: `confirmed` starts at the last one, as
+    // `logged` does, not at the log's last record (an ACK, a CLAIM or a BASE may follow it).
+    let at_bind = handle.last_commit();
     let b = Arc::new(Binding {
         id: binding,
         handle: Arc::clone(&handle),

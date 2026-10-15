@@ -83,6 +83,7 @@ use crate::config::abort_at;
 use crate::config::fail_sync;
 use crate::db::Binding;
 use crate::db::Commit;
+use crate::db::LogRefused;
 use crate::db::Window;
 use crate::db::lookup;
 use crate::driver::runtime::driver;
@@ -99,6 +100,7 @@ use crate::publication::Verdict;
 use crate::publication::phase_two_reply;
 use crate::replicator::Pending;
 use crate::replicator::ResetKind;
+use crate::replog::Log;
 use crate::replog::LogError;
 use crate::stats::CommitStat;
 
@@ -771,9 +773,10 @@ unsafe fn base(b: &Binding, c: &mut Commit, before: &'static str) -> c_int {
     abort_at(Step::BaseSynced);
     if c.confirmed > c.based {
         let position = c.confirmed;
-        let appended = match b.handle.log() {
+        let appended = match b.log_unless_reset() {
             Ok(mut log) => log.append(&RecordBody::Base { position }).map(drop),
-            Err(_poisoned) => Err(LogError::Broken {
+            Err(LogRefused::Reset(_)) => return ffi::SQLITE_IOERR_WRITE,
+            Err(LogRefused::Poisoned(_)) => Err(LogError::Broken {
                 dir: b.handle.generation.log_dir(),
             }),
         };
@@ -788,6 +791,17 @@ unsafe fn base(b: &Binding, c: &mut Commit, before: &'static str) -> c_int {
     }
     abort_at(Step::Based);
     OK
+}
+
+/// The binding's log, for the commit point to append to: refused once the binding reset
+/// ([`Binding::log_unless_reset`]).
+fn commit_log(b: &Binding) -> Result<MutexGuard<'_, Log>, c_int> {
+    b.log_unless_reset().map_err(|refused| {
+        if let LogRefused::Poisoned(e) = refused {
+            b.reset(ResetKind::Internal, &e);
+        }
+        ffi::SQLITE_IOERR_WRITE
+    })
 }
 
 /// The commit point (design §4.1): capture, encode, log, hand to the driver, forward.
@@ -860,12 +874,9 @@ unsafe fn commit(
     };
     let raw = record.pages.len().saturating_mul(PAGE);
     let pages = record.pages.len();
-    let mut log = match b.handle.log() {
+    let mut log = match commit_log(b) {
         Ok(log) => log,
-        Err(e) => {
-            b.reset(ResetKind::Internal, &e);
-            return ffi::SQLITE_IOERR_WRITE;
-        }
+        Err(rc) => return rc,
     };
     let id = CommitId {
         lineage: b.handle.generation.lineage,

@@ -9,7 +9,10 @@
 //   outside the extension, and runs each statement -> {"ok": true, "uri", "results"}, `results`
 //   holding {"sql", "ok"[, "error", "errcode"]} per statement, and `uri` saying whether this Node
 //   honours URI file names (a probe file opened as one).
-// `"conn": 2` runs `exec` or `all` on a second connection to the database.
+//   {"reopen": true} calls `ursula_open` again, with every connection kept, and opens a third
+//   connection on what it bound -> {"ok": true, "opened"}.
+// `"conn": 2` runs `exec` or `all` on a second connection to the database, `"conn": 3` on the
+// reopened one, and `status` and `synced` with `"conn": 3` ask about the reopened database.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -31,7 +34,10 @@ try {
 }
 const db = new DatabaseSync(opened.path);
 let second;
-const conn = (cmd) => (cmd.conn === 2 ? (second ??= new DatabaseSync(opened.path)) : db);
+let reopened;
+let third;
+const conn = (cmd) => (cmd.conn === 3 ? third : cmd.conn === 2 ? (second ??= new DatabaseSync(opened.path)) : db);
+const pathOf = (cmd) => (cmd.conn === 3 ? reopened.path : opened.path);
 say({ ok: true, opened });
 
 let cursor = 0;
@@ -44,9 +50,13 @@ for await (const line of createInterface({ input: process.stdin })) {
 		} else if (cmd.all !== undefined) {
 			say({ ok: true, rows: conn(cmd).prepare(cmd.all).all() });
 		} else if (cmd.status) {
-			say({ ok: true, status: call("SELECT ursula_status(?)", opened.path) });
+			say({ ok: true, status: call("SELECT ursula_status(?)", pathOf(cmd)) });
 		} else if (cmd.synced !== undefined) {
-			say({ ok: true, synced: call("SELECT ursula_synced(?, ?)", opened.path, cmd.synced) });
+			say({ ok: true, synced: call("SELECT ursula_synced(?, ?)", pathOf(cmd), cmd.synced) });
+		} else if (cmd.reopen) {
+			reopened = call("SELECT ursula_open(?, ?, '{}', 20000)", url, dir);
+			third = new DatabaseSync(reopened.path);
+			say({ ok: true, opened: reopened });
 		} else if (cmd.events) {
 			const got = call("SELECT ursula_events(?, 0)", cursor);
 			cursor = got.cursor;
@@ -70,6 +80,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 			other.close();
 			say({ ok: true, uri, results });
 		} else if (cmd.close) {
+			third?.close();
 			second?.close();
 			db.close();
 			say({ ok: true });

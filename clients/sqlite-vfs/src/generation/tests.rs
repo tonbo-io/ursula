@@ -12,9 +12,12 @@ use super::canonical_path;
 use super::root_name;
 use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::marker::empty_page_one;
+use crate::codec::marker::is_marked;
+use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
 use crate::ids::Lineage;
 use crate::ids::Position;
+use crate::replog::Log;
 use crate::salvage;
 use crate::salvage::Manifest;
 use crate::salvage::Reason;
@@ -394,4 +397,163 @@ fn leftover_temporary_manifests_are_deleted() {
     }
     assert_eq!(root.current().unwrap().unwrap().dir, g.dir);
     assert_eq!(salvage::list(root.path()).unwrap().len(), 1);
+}
+
+/// A published generation of lineage 1 whose log holds `commits` records over several segments,
+/// a WAL and a wal-index beside its db.
+fn with_records(root: &Root, commits: u8) -> super::Generation {
+    let g = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    let (mut log, _) = Log::open(&g.log_dir()).unwrap();
+    log.set_roll_bytes(256);
+    for n in 1..=commits {
+        log.append(&RecordBody::Commit {
+            frame: vec![n; 100],
+        })
+        .unwrap();
+    }
+    log.append(&RecordBody::Base {
+        position: Position(2),
+    })
+    .unwrap();
+    log.sync().unwrap();
+    fs::write(g.wal(), b"wal").unwrap();
+    fs::write(g.shm(), b"shm").unwrap();
+    g
+}
+
+/// The records of the log in `dir`.
+fn records(dir: &std::path::Path) -> Vec<(Position, RecordBody)> {
+    Log::open(dir)
+        .unwrap()
+        .1
+        .records
+        .into_iter()
+        .map(|r| (r.position, r.body))
+        .collect()
+}
+
+// A hold on a generation lasts until it drops, and holds that generation only.
+#[test]
+fn a_generation_is_held_while_a_hold_lives() {
+    let dir = TempDir::new("gen-hold");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let g = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    assert!(!root.held(&g));
+    let hold = root.hold(&g);
+    let again = root.hold(&g);
+    assert!(root.held(&g));
+    let other = root.build(header(2)).unwrap().publish(Fate::Trash).unwrap();
+    assert!(!root.held(&other));
+    drop(hold);
+    assert!(root.held(&g), "the second hold still holds it");
+    drop(again);
+    assert!(!root.held(&g));
+}
+
+// The copy of a generation keeps its lineage, its db (page-1 marker included) and every log record,
+// over several segments. Its first segment names the original as the generation it supersedes, and
+// the WAL and wal-index stay behind. Published, it replaces the original.
+#[test]
+fn a_copy_keeps_the_lineage_the_marker_and_the_log() {
+    let dir = TempDir::new("gen-copy");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let old = with_records(&root, 6);
+    let segments = fs::read_dir(old.log_dir()).unwrap().count();
+    assert!(segments > 2, "{segments} segments");
+    let want = records(&old.log_dir());
+    let db = fs::read(old.db()).unwrap();
+    assert!(is_marked(&db[..16], old.lineage));
+    let _hold = root.hold(&old);
+    let copy = root.copy(&old).unwrap().publish(Fate::Trash).unwrap();
+    assert_ne!(copy.id, old.id);
+    assert_eq!(copy.lineage, old.lineage);
+    assert_eq!(fs::read(copy.db()).unwrap(), db);
+    assert_eq!(fs::read_dir(copy.log_dir()).unwrap().count(), segments);
+    assert_eq!(records(&copy.log_dir()), want);
+    let first = copy.first_header().unwrap();
+    assert_eq!(first.supersedes, Some(old.id));
+    assert_eq!(first.lineage, old.lineage);
+    assert!(!copy.wal().exists());
+    assert!(!copy.shm().exists());
+    assert_eq!(root.current().unwrap(), Some(copy.clone()));
+    assert!(!old.dir.exists());
+    assert!(!root.held(&copy));
+}
+
+// A crash at any step of a copy and its publish leaves either the original generation current or
+// the copy, never both or neither: before the rename only a `.tmp` exists (after the db was copied,
+// or the log too), which the next open deletes.
+#[test]
+fn a_crash_during_a_copy_leaves_one_generation_current() {
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let converge = |dir: &TempDir, old: &super::Generation, want: &[(Position, RecordBody)]| {
+        let root = Root::lock(dir.path(), &p).unwrap();
+        root.finish_leftovers().unwrap();
+        let current = root.current().unwrap().unwrap();
+        let entries: Vec<String> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n != "lock")
+            .collect();
+        assert_eq!(entries, vec![format!("gen-{}", current.id.hex())]);
+        assert_eq!(current.lineage, old.lineage);
+        assert_eq!(records(&current.log_dir()), want);
+        current
+    };
+    // The crash after the db was copied, and after the log was too (`copy_db`, `copy_log`).
+    for log_copied in [false, true] {
+        let dir = TempDir::new("gen-copy-crash");
+        let root = Root::lock(dir.path(), &p).unwrap();
+        let old = with_records(&root, 3);
+        let want = records(&old.log_dir());
+        let building = root.copy(&old).unwrap();
+        let tmp = building.tmp.clone();
+        drop(building);
+        if !log_copied {
+            fs::remove_dir_all(tmp.join("log")).unwrap();
+        }
+        drop(root);
+        assert_eq!(converge(&dir, &old, &want).id, old.id);
+    }
+    // Each step of the publish: the original until the rename (step 4), the copy after it.
+    let mut steps = 0;
+    loop {
+        let dir = TempDir::new("gen-copy-crash");
+        let root = Root::lock(dir.path(), &p).unwrap();
+        let old = with_records(&root, 3);
+        let want = records(&old.log_dir());
+        let building = root.copy(&old).unwrap();
+        let id = building.id;
+        let done = building.crash_after(Fate::Trash, steps).unwrap();
+        drop(root);
+        let current = converge(&dir, &old, &want);
+        let want = if steps >= 4 { id } else { old.id };
+        assert_eq!(current.id, want, "after {steps} steps");
+        if done < steps {
+            break;
+        }
+        steps += 1;
+    }
+}
+
+// A copy that fails deletes its `.tmp`: here the original's log is gone.
+#[test]
+fn a_failed_copy_leaves_no_tmp() {
+    let dir = TempDir::new("gen-copy-fail");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let old = with_records(&root, 2);
+    fs::remove_dir_all(old.log_dir()).unwrap();
+    assert!(matches!(
+        root.copy(&old),
+        Err(GenerationError::Log(_) | GenerationError::Io { .. })
+    ));
+    let entries: Vec<String> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n != "lock")
+        .collect();
+    assert_eq!(entries, vec![format!("gen-{}", old.id.hex())]);
 }

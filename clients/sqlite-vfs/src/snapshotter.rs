@@ -73,6 +73,7 @@ use crate::codec::snapshot::SnapshotError;
 use crate::codec::snapshot::SnapshotFields;
 use crate::codec::snapshot::write_body;
 use crate::db::Binding;
+use crate::db::LogRefused;
 use crate::db::Window;
 use crate::driver::runtime::DriverGone;
 use crate::driver::runtime::driver;
@@ -714,7 +715,9 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
 }
 
 /// Appends ACK(`k`, `offset`) and fsyncs the log, before the snapshot of `k` is published. A
-/// failure resets the binding `local_damage`.
+/// failure resets the binding `local_damage`. The reset is checked under the log's lock
+/// ([`Binding::log_unless_reset`]): an open that copies the generation after a reset finds every
+/// ACK a published snapshot relies on in the copy.
 fn durable_ack(
     b: &Binding,
     k: Position,
@@ -722,10 +725,8 @@ fn durable_ack(
     log_bytes: u64,
 ) -> Result<(), SnapshotFailure> {
     let commits = b.lock();
-    if b.reset_kind().is_some() {
-        return Err(SnapshotFailure::Reset);
-    }
-    let written = match b.handle.log() {
+    let written = match b.log_unless_reset() {
+        Err(LogRefused::Reset(_)) => return Err(SnapshotFailure::Reset),
         // Never lower the log's ACK: one at or past `k` only needs its fsync.
         Ok(mut log) if log.acked() >= k => log.sync(),
         Ok(mut log) => log
@@ -735,7 +736,7 @@ fn durable_ack(
                 log_bytes,
             })
             .and_then(|_position| log.sync()),
-        Err(_poisoned) => {
+        Err(LogRefused::Poisoned(_)) => {
             drop(commits);
             b.reset(
                 ResetKind::Internal,
@@ -765,9 +766,10 @@ fn base(b: &Binding, k: Position) -> Result<(), SnapshotFailure> {
     if c.based >= k {
         return Ok(());
     }
-    let appended = match b.handle.log() {
+    let appended = match b.log_unless_reset() {
         Ok(mut log) => log.append(&RecordBody::Base { position: k }).map(drop),
-        Err(_poisoned) => {
+        Err(LogRefused::Reset(_)) => return Err(SnapshotFailure::Reset),
+        Err(LogRefused::Poisoned(_)) => {
             drop(c);
             b.reset(
                 ResetKind::Internal,
