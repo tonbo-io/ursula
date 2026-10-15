@@ -35,6 +35,9 @@ pub struct ColdOrphanSweepPlan {
     /// Pack directories (`{bucket}/_packs/{group:08x}/`) to sweep. Only set
     /// at the start of a cycle.
     pub pack_dirs: Vec<String>,
+    /// Snapshot part directories (`{bucket}/_parts/{group:08x}/`) to sweep,
+    /// with the pack directories.
+    pub part_dirs: Vec<String>,
     /// Group-wide referenced paths: live shared objects and pending cold-GC
     /// targets.
     pub group_referenced: BTreeSet<String>,
@@ -185,17 +188,22 @@ impl SharedRefCompactionReport {
 /// objects it writes, or `None` for any other name:
 ///
 /// - exclusive chunks: `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`;
-/// - packs and staged external payloads: `{nanos:032x}-{seq:016x}.bin`.
+/// - packs and staged external payloads: `{nanos:032x}-{seq:016x}.bin`;
+/// - staged snapshot parts: `{owner:016x}-{nanos:032x}-{seq:016x}.part`.
 ///
 /// A zero timestamp (the simulator's clock) also yields `None`, so the
 /// orphan sweep never deletes an object whose age it cannot tell.
 pub fn cold_object_written_unix_ms(file_name: &str) -> Option<u64> {
-    let stem = file_name.strip_suffix(".bin")?;
+    let (stem, part) = match file_name.strip_suffix(".part") {
+        Some(stem) => (stem, true),
+        None => (file_name.strip_suffix(".bin")?, false),
+    };
     let fields = stem.split('-').collect::<Vec<_>>();
     let widths = fields.iter().map(|field| field.len()).collect::<Vec<_>>();
-    let nanos_hex = match widths.as_slice() {
-        [16, 16, 32, 16] => fields.get(2)?,
-        [32, 16] => fields.first()?,
+    let nanos_hex = match (part, widths.as_slice()) {
+        (false, [16, 16, 32, 16]) => fields.get(2)?,
+        (false, [32, 16]) => fields.first()?,
+        (true, [16, 32, 16]) => fields.get(1)?,
         _ => return None,
     };
     if !fields
@@ -319,6 +327,13 @@ mod tests {
         let pack = format!("{nanos:032x}-{:016x}.bin", 9);
         assert_eq!(cold_object_written_unix_ms(&chunk), Some(1_700_000_000_123));
         assert_eq!(cold_object_written_unix_ms(&pack), Some(1_700_000_000_123));
+        let part = format!("{:016x}-{nanos:032x}-{:016x}.part", 3, 9);
+        assert_eq!(cold_object_written_unix_ms(&part), Some(1_700_000_000_123));
+        assert_eq!(
+            cold_object_written_unix_ms(&format!("{nanos:032x}-{:016x}.part", 9)),
+            None,
+            "a part object names its owner"
+        );
         assert_eq!(
             cold_object_written_unix_ms(&format!("{:032x}-{:016x}.bin", 0, 1)),
             None,

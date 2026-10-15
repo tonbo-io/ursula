@@ -30,6 +30,8 @@ use crate::cold_store::cold_pack_dir;
 use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::cold_store::new_cold_pack_path;
 use crate::cold_store::new_external_payload_path;
+use crate::cold_store::new_snapshot_part_id;
+use crate::cold_store::snapshot_part_path;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
 const BUCKET: &str = "benchcmp";
@@ -474,10 +476,13 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
     let orphan_pack = new_cold_pack_path(BUCKET, GROUP.0);
     let orphan_chunk = new_cold_chunk_path_in_generation(&a, generation(&runtime, &a).await, 0, 2);
     let orphan_external = new_external_payload_path(&b);
+    // A snapshot part no commit used (#581 section 3.1).
+    let orphan_part = snapshot_part_path(&a, GROUP.0, 1, &new_snapshot_part_id());
     for (path, payload) in [
         (&orphan_pack, b"orphan-pack".as_slice()),
         (&orphan_chunk, b"oc".as_slice()),
         (&orphan_external, b"orphan-external".as_slice()),
+        (&orphan_part, b"part".as_slice()),
     ] {
         cold_store
             .write_chunk(path, payload)
@@ -510,20 +515,23 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
         .expect("sweep within the grace");
     assert!(young.cycle_completed);
     assert_eq!(young.orphans_deleted, 0, "nothing is older than the grace");
-    assert!(young.objects_scanned >= 7);
+    assert!(young.objects_scanned >= 8);
 
     tokio::time::sleep(Duration::from_millis(5)).await;
     let swept = runtime
         .sweep_cold_orphans_group_once(GROUP, 16, 0)
         .await
         .expect("sweep after the grace");
-    assert_eq!(swept.orphans_deleted, 3);
+    assert_eq!(swept.orphans_deleted, 4);
     assert_eq!(swept.delete_errors, 0);
     assert_eq!(
         swept.orphan_bytes,
-        u64::try_from(b"orphan-pack".len() + b"oc".len() + b"orphan-external".len()).unwrap()
+        u64::try_from(
+            b"orphan-pack".len() + b"oc".len() + b"orphan-external".len() + b"part".len()
+        )
+        .unwrap()
     );
-    for orphan in [&orphan_pack, &orphan_chunk, &orphan_external] {
+    for orphan in [&orphan_pack, &orphan_chunk, &orphan_external, &orphan_part] {
         assert!(!exists(&cold_store, orphan).await, "{orphan} is reclaimed");
     }
     for referenced in referenced_packs
@@ -539,7 +547,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
     assert_eq!(read_all(&runtime, &a).await, b"a1a2EXTERNAL".to_vec());
     assert_eq!(read_all(&runtime, &b).await, b"b1b2".to_vec());
     let metrics = runtime.metrics().snapshot();
-    assert_eq!(metrics.cold_orphan_cleanup_attempts, 3);
+    assert_eq!(metrics.cold_orphan_cleanup_attempts, 4);
     assert_eq!(metrics.cold_orphan_cleanup_errors, 0);
     assert_eq!(metrics.cold_orphan_bytes, swept.orphan_bytes);
 
@@ -548,6 +556,89 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
         .await
         .expect("second sweep");
     assert_eq!(again.orphans_deleted, 0, "a second sweep finds nothing");
+}
+
+/// #581 section 3.1: the parts of a stream that was deleted are reclaimed
+/// too, though the sweep walks live streams only and no GC entry names them.
+#[tokio::test]
+async fn orphan_sweep_reclaims_the_parts_of_a_deleted_stream() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    let (gone, kept) = (stream("parts-gone"), stream("parts-kept"));
+    create(&runtime, &gone).await;
+    create(&runtime, &kept).await;
+    let part = snapshot_part_path(&gone, GROUP.0, 1, &new_snapshot_part_id());
+    cold_store
+        .write_chunk(&part, b"part")
+        .await
+        .expect("stage part");
+    runtime
+        .delete_stream(crate::DeleteStreamRequest {
+            stream_id: gone.clone(),
+            if_incarnation: None,
+        })
+        .await
+        .expect("delete stream");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let young = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, 60 * 60 * 1_000)
+        .await
+        .expect("sweep within the grace");
+    assert_eq!(young.orphans_deleted, 0);
+    assert!(exists(&cold_store, &part).await, "kept within the grace");
+    let swept = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, 0)
+        .await
+        .expect("sweep after the grace");
+    assert_eq!(swept.orphans_deleted, 1);
+    assert!(!exists(&cold_store, &part).await, "the part is reclaimed");
+}
+
+/// #581 section 3.1, M3 of the #618 review: a cycle lists at most 4096
+/// parts of a part directory, and the next cycle resumes after them, so
+/// young parts early in key order never hide an old one behind them.
+#[tokio::test]
+async fn orphan_sweep_reaches_old_parts_behind_young_ones() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    create(&runtime, &stream("parts-walk")).await;
+    let dir = crate::cold_store::snapshot_part_dir(BUCKET, GROUP.0);
+    let now_nanos = u128::from(crate::runtime::unix_time_ms()) * 1_000_000;
+    let day_nanos = 24 * 60 * 60 * 1_000 * 1_000_000_u128;
+    let young = crate::runtime::COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR + 1;
+    for seq in 0..young {
+        let name = format!("{:016x}-{now_nanos:032x}-{seq:016x}.part", 0);
+        cold_store
+            .write_chunk(&format!("{dir}{name}"), b"y")
+            .await
+            .expect("young part");
+    }
+    let old = format!(
+        "{dir}{:016x}-{:032x}-{:016x}.part",
+        u64::MAX,
+        now_nanos - 2 * day_nanos,
+        0
+    );
+    cold_store.write_chunk(&old, b"o").await.expect("old part");
+    let grace_ms = 24 * 60 * 60 * 1_000;
+    let first = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, grace_ms)
+        .await
+        .expect("first cycle");
+    assert_eq!(
+        first.orphans_deleted, 0,
+        "the first page holds young parts only"
+    );
+    assert!(exists(&cold_store, &old).await);
+    let second = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, grace_ms)
+        .await
+        .expect("second cycle");
+    assert_eq!(
+        second.orphans_deleted, 1,
+        "the next page holds the old part"
+    );
+    assert!(!exists(&cold_store, &old).await);
 }
 
 /// RT6: a page read-modify-write by a deposed leader can drop the entry of

@@ -633,9 +633,10 @@ answers `412`, and the thread publishes nothing there, moves no retention, and f
 
 ### 4.4 Snapshot bodies on the server, and failed attempts
 
-Bodies of at least `runtime.external_payload_min_size` (1 MiB) are stored in the cold tier when a
-cold backend is configured, up to 1 GiB, and inline otherwise (up to 32 MiB). A superseded cold
-body stays readable for 5 minutes.
+Every request body is at most 32 MiB. Bodies of at least `runtime.external_payload_min_size`
+(1 MiB) are stored in the cold tier when a cold backend is configured, and inline otherwise. A
+larger snapshot, up to 1 GiB, goes up in parts, which the extension does not send. A
+superseded cold body stays readable for 5 minutes.
 
 Through `ursulagw` a body above its `--max-request-body-bytes` (32 MiB by default) is refused, and so
 is one above a proxy's limit, but the client does not always see the `413`. The gateway stops
@@ -960,7 +961,7 @@ The crate refuses to build with `panic = "abort"`.
   the default frame limit, which the setting cannot raise, so no frame the extension sends is over
   it.
 - Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
-  by the server at 1 GiB compressed (32 MiB inline or through the gateway). `snapshot_bytes` in
+  by the request limit, 32 MiB compressed: the extension does not send snapshots in parts. `snapshot_bytes` in
   `ursula_status` is the latest body's compressed size.
 - Producer expiry after 7 idle days. The owner reclaims only if nobody wrote meanwhile.
 - Redirects are never followed (§2), so the stream URL must reach the stream's leader by itself:

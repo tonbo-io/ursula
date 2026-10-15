@@ -1308,15 +1308,19 @@ impl InMemoryGroupEngine {
         let next_after = (stream_ids.len() >= max_streams)
             .then(|| stream_ids.last().cloned())
             .flatten();
-        let pack_dirs = if request.after.is_none() {
-            self.state_machine
-                .bucket_ids()
-                .into_iter()
-                .map(|bucket_id| cold_pack_dir(&bucket_id, raft_group_id))
-                .collect()
+        let buckets = if request.after.is_none() {
+            self.state_machine.bucket_ids()
         } else {
             Vec::new()
         };
+        let pack_dirs = buckets
+            .iter()
+            .map(|bucket_id| cold_pack_dir(bucket_id, raft_group_id))
+            .collect();
+        let part_dirs = buckets
+            .iter()
+            .map(|bucket_id| crate::cold_store::snapshot_part_dir(bucket_id, raft_group_id))
+            .collect();
         let streams = stream_ids
             .into_iter()
             .map(|stream_id| ColdOrphanSweepStream {
@@ -1357,6 +1361,7 @@ impl InMemoryGroupEngine {
         ColdOrphanSweepPlan {
             leader: true,
             pack_dirs,
+            part_dirs,
             group_referenced: self.state_machine.group_referenced_cold_paths(),
             streams,
             next_after,

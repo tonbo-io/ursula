@@ -129,6 +129,14 @@ mod cluster_id_serde {
     }
 }
 
+impl ServerConfig {
+    /// The smallest `http_inflight_body_size` a node with a cold backend
+    /// accepts: one request of the 32 MiB limit, plus the copy of one
+    /// snapshot commit at its least read-ahead (32 MiB), so that a commit
+    /// is never refused forever for the budget.
+    pub const MIN_INFLIGHT_BODY_SIZE_WITH_COLD: u64 = 64 * 1024 * 1024;
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {

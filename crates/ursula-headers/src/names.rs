@@ -73,3 +73,13 @@ pub const X_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 pub const X_URSULA_RAFT_GROUP: &str = "x-ursula-raft-group";
 /// The term of the leader that [`X_URSULA_RAFT_LEADER_ID`] names. `307`.
 pub const X_URSULA_RAFT_TERM: &str = "x-ursula-raft-term";
+
+/// The byte range a snapshot read asks for. Request.
+pub const RANGE: &str = "range";
+/// A `Range` condition. A snapshot read that carries it answers the whole
+/// body. Request.
+pub const IF_RANGE: &str = "if-range";
+/// The bytes a `206` holds, or the body's size on a `416`.
+pub const CONTENT_RANGE: &str = "content-range";
+/// `bytes` on every snapshot answer: snapshot reads honor `Range`.
+pub const ACCEPT_RANGES: &str = "accept-ranges";

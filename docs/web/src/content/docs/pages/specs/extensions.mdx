@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, write keys with typed answers, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, snapshot upload in parts, byte ranges on snapshot reads, multipart bootstrap delivery, write keys with typed answers, server metadata, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -110,16 +110,36 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 - `204 No Content`: Snapshot published successfully.
 - `400 Bad Request`: `snapshot_offset` is invalid or, for a JSON stream, not a message boundary.
 - `404 Not Found`: Stream does not exist.
-- `409 Conflict`: `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
+- `409 Conflict`: another snapshot is the latest (below), `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
-- `413 Payload Too Large`: Snapshot exceeds the server's size limit. The response names the limit it applied (Section 10).
+- `413 Payload Too Large`: the request body or the snapshot exceeds the server's size limit. The response names the limit (Section 10).
 - `503 Service Unavailable`: For a JSON stream, the server could not verify that `snapshot_offset` is a message boundary. It MUST NOT publish an unverified offset; the client MAY retry.
 
-> **Note (informative).** Ursula keeps snapshot bodies of up to 32 MiB in replicated state. With a cold backend, it stores bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects instead and accepts up to 1 GiB in one request. Only the reference is replicated, and the digest is the same as for an inline body. A body above 32 MiB without a cold backend answers `413` with `Ursula-Max-Request-Bytes`, and one above 1 GiB with a cold backend answers `413` with `Ursula-Max-Snapshot-Bytes`.
+> **Note (informative).** Ursula accepts request bodies of up to 32 MiB. With a cold backend it stores snapshot bodies of at least its external-payload threshold (1 MiB by default) as cold-tier objects, and accepts snapshots of up to 1 GiB in parts (below); only the reference is replicated, and the digest is the same as for an inline body. Without one, every body stays inline, up to 32 MiB.
 
 **Idempotency:**
 
-The server MUST return `Stream-Snapshot-Digest` for a successful publish. Repeating a publish at the same offset with the same content type and body MUST succeed and return the same digest. Publishing different content at an already-published offset MUST return `409 Conflict`.
+The server MUST return `Stream-Snapshot-Digest` for a successful publish. Repeating a publish at the same offset with the same content type and body MUST succeed and return the same digest while that snapshot is the latest. Publishing different content at an already-published offset, or publishing at an offset below the latest snapshot's, MUST return `409 Conflict` with the latest snapshot's `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`, so that a client tells a superseded publish (a later offset) from a conflicting one (the same offset). A `409` that names no snapshot refuses the publish for another reason, such as an offset beyond the tail.
+
+**Upload in Parts:**
+
+A server MAY accept a snapshot larger than one request in parts. It then sends `Ursula-Max-Snapshot-Bytes` on `HEAD` (Section 10).
+
+```
+POST {stream_url}/snapshot/{snapshot_offset}/parts
+```
+
+stages one part, whose body is at most `Ursula-Max-Request-Bytes`. The response is `201 Created` with `Stream-Snapshot-Part`, an opaque part id of 1 to 64 visible ASCII characters. Staging a part changes nothing a reader can see. Repeating it stages another part. A part MAY carry the `Stream-Incarnation` precondition (Section 2.4), and a part for a stream that does not exist answers `404 Not Found`. A part belongs to the incarnation of the stream it was staged for, not to an offset: `{snapshot_offset}` in its path is checked as an offset and otherwise ignored, so a part staged under one offset MAY be committed at another.
+
+```
+PUT {stream_url}/snapshot/{snapshot_offset}
+Stream-Snapshot-Parts: <count>
+Stream-Snapshot-Digest: <digest>
+```
+
+publishes the snapshot made of the listed parts, in order. `Stream-Snapshot-Parts` is a canonical decimal from 1 to 4096: a commit names at most 4096 parts (`MAX_SNAPSHOT_PARTS`), and no part id more than once. The body lists the part ids, each followed by one LF and nothing else; `Content-Type` is the snapshot's. The server MUST compute the digest of the assembled snapshot and refuse with `400 Bad Request` when it differs from `Stream-Snapshot-Digest`, when a part is unknown or staged for another stream, when the body does not list exactly `Stream-Snapshot-Parts` distinct ids, or when it is longer than any such list, and with `413` naming `Ursula-Max-Snapshot-Bytes` when the assembled snapshot exceeds it. Otherwise the request is a publish of the assembled snapshot, with the same answers and the same idempotency. A server SHOULD check the commit's key, its offset and digest, against the latest snapshot before it resolves the parts: a repeat of a published snapshot succeeds, and a commit whose offset holds another snapshot, or that a later snapshot supersedes, answers `409 Conflict` naming the latest, even after its parts are gone. Such a `409` comes before the retention check, so a superseded commit below the earliest retained offset answers `409`, where a single-request publish answers `410`. A server SHOULD keep the parts until the commit's answer is final for its key (`204`, `400`, `404`, `409`, `410` or `412`), so that a commit refused with a retryable answer such as `503` can be repeated. A server MAY discard a part that no publish used after a bounded time.
+
+> **Note (informative).** Ursula stages parts in its cold backend for the incarnation of the stream, and copies them into one object at the commit, reading a few pieces ahead while it writes. It deletes the parts once the commit's answer is final, and after a digest mismatch, whose copy used them up; it keeps them after a `400` that copied nothing. Its orphan sweep reclaims any part, of a live stream or of one since deleted or expired, once it is older than the sweep's grace, a day by default. The node owns a commit once it copies: a client that goes away cancels nothing, a repeat while the commit runs answers `503` with `Retry-After`, and a repeat after it answers from the key. A node copies at most two commits at once and answers another with `503` and `Retry-After`. A stream recreated during the copy is not published to: a commit without `Stream-Incarnation` then answers `400` for an unknown part, and one with it `412`. Without a cold backend Ursula answers parts and commits with `501 Not Implemented` and sends no `Ursula-Max-Snapshot-Bytes`.
 
 **Retention Effect:**
 
@@ -129,7 +149,7 @@ Publishing a snapshot MUST NOT change the earliest retained offset. Retention is
 PUT {stream_url}/retention/{retained_offset}
 ```
 
-Like every request that addresses a stream, a retention request MAY carry the `Stream-Incarnation` precondition (Section 2.4); its success response carries `Stream-Incarnation`. The server MUST reject a retention boundary that is not aligned to committed data (for a JSON stream, not a message boundary: `400 Bad Request`), moves backward, or is newer than the latest published snapshot. As for a snapshot, a JSON retention boundary the server cannot verify MUST NOT be applied (`503 Service Unavailable`). After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset`; the success response's `Stream-Retained-Offset` then reports the effective boundary, and offsets below it MUST return `410 Gone`. Ursula retains exactly the requested offset.
+Like every request that addresses a stream, a retention request MAY carry the `Stream-Incarnation` precondition (Section 2.4); its success response carries `Stream-Incarnation`. The server MUST reject a retention boundary that is not aligned to committed data (for a JSON stream, not a message boundary: `400 Bad Request`) or is newer than the latest published snapshot. A boundary at or below the current earliest retained offset succeeds and changes nothing, and the response reports the current `Stream-Retained-Offset`: retention only moves forward, so a repeated request is safe. As for a snapshot, a JSON retention boundary the server cannot verify MUST NOT be applied (`503 Service Unavailable`). After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset`; the success response's `Stream-Retained-Offset` then reports the effective boundary, and offsets below it MUST return `410 Gone`. Ursula retains exactly the requested offset.
 
 > **Note (informative).** Ursula checks a JSON boundary at apply time when the byte before the offset is still in memory. Otherwise it reads that byte from the leader (as a `consistency=leader` read), and applies the operation only if the stream was not deleted and recreated in between; a failed read answers `503`.
 
@@ -203,10 +223,26 @@ Returns the snapshot blob at the specified offset.
 - `Stream-Next-Offset`: The next offset after the snapshot.
 - `Stream-Up-To-Date: true`: Present when no update follows the snapshot (the snapshot offset is the stream's tail); absent otherwise. Clients then read on from `Stream-Next-Offset`.
 
+**Byte Ranges:**
+
+A server MAY honor a single byte range [RFC9110] on a snapshot read: `Range: bytes=first-last`, `bytes=first-` or `bytes=-length`. A server that honors it:
+
+- MUST send `Accept-Ranges: bytes` on every snapshot answer, and answers `206 Partial Content` with only the selected bytes and `Content-Range: bytes first-last/total`;
+- MUST answer a range that starts at or past the end of the snapshot with `416 Range Not Satisfiable` and `Content-Range: bytes */total`;
+- answers a request with several ranges, a range it cannot parse, or `If-Range` with the whole snapshot as `200`;
+- decides `404`, `410` and `412` before it looks at the range;
+- sends the same `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Next-Offset` and `Stream-Incarnation` as for the whole body. The digest always covers the whole snapshot, never the range.
+
+Stream reads keep their offset protocol and ignore `Range`.
+
+> **Note (informative).** Ursula honors a single range and reads only the part of a cold-tier body that the range covers. A client can read a snapshot's header, such as its first 56 bytes, without the rest of the body. Ursula does not compress snapshot answers.
+
 **Response Codes:**
 
 - `200 OK`: Snapshot exists.
+- `206 Partial Content`: The requested byte range of the snapshot.
 - `404 Not Found`: Snapshot does not exist or has been garbage-collected.
+- `416 Range Not Satisfiable`: The requested byte range starts at or past the end of the snapshot.
 
 ---
 
@@ -492,12 +528,12 @@ These two headers are route-level, so a client tells a host alias routed to anot
 On every successful `HEAD` of a stream it also sends:
 
 - `Ursula-Max-Request-Bytes: <bytes>`: the largest request body that any request to the stream may carry, as far as the server and the intermediaries that implement this section know.
-- `Ursula-Max-Snapshot-Bytes: <bytes>`, when the server accepts snapshots larger than `Ursula-Max-Request-Bytes`: the largest snapshot it accepts.
+- `Ursula-Max-Snapshot-Bytes: <bytes>`, when the server accepts snapshots in parts (Section 2.2): the largest snapshot it accepts. A commit names at most 4096 parts (`MAX_SNAPSHOT_PARTS`), each at most `Ursula-Max-Request-Bytes`.
 
 Both values are canonical decimal integers: no sign and no leading zero.
 
-**Size refusals.** A server that refuses a request for its size MUST answer `413 Payload Too Large` with the header of the limit it applied, set to that limit: `Ursula-Max-Request-Bytes` for a request body, `Ursula-Max-Snapshot-Bytes` for a snapshot. It SHOULD decide the refusal from `Content-Length` before reading the body. A body without `Content-Length` is refused once it crosses the limit, after the server read that much, and the client may then see a reset instead of the `413`. Clients that want the typed answer send `Content-Length`.
+**Size refusals.** A server that refuses a request for its size MUST answer `413 Payload Too Large` with the header of the limit it applied, set to that limit: `Ursula-Max-Request-Bytes` for a request body, `Ursula-Max-Snapshot-Bytes` for a snapshot assembled from parts. It SHOULD decide the refusal from `Content-Length` before reading the body. A body without `Content-Length` is refused once it crosses the limit, after the server read that much, and the client may then see a reset instead of the `413`. Clients that want the typed answer send `Content-Length`.
 
 **Intermediaries.** An intermediary that limits request bodies and implements this section MUST replace `Ursula-Max-Request-Bytes` on every response that carries it with the smaller of the received value and its own limit for that request, and MUST answer its own size refusals as above. It leaves `Ursula-Max-Snapshot-Bytes` alone. A `413` without either header comes from a layer that does not implement this section, such as a proxy with its own body limit. It tells the client only that some layer refused the size.
 
-> **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes). With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in one request and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit. An Ursula cluster's id is set by its operator (`server.cluster_id`). A single node without one generates one at its first start and keeps it in its WAL.
+> **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes) on every route. With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in parts and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit. An Ursula cluster's id is set by its operator (`server.cluster_id`). A single node without one generates one at its first start and keeps it in its WAL.

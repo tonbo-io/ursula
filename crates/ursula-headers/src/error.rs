@@ -88,6 +88,8 @@ pub enum HeaderError {
     ManifestUnterminated,
     /// Line `line` (from 1) of a parts manifest is not a part id.
     InvalidManifestLine { line: usize },
+    /// Line `line` (from 1) of a parts manifest repeats an earlier id.
+    DuplicateManifestPart { line: usize },
     /// A parts manifest lists another number of parts than its commit's
     /// `Stream-Snapshot-Parts`.
     ManifestPartCount { declared: PartCount },
@@ -98,6 +100,9 @@ pub enum HeaderError {
     UnexpectedHeader { name: &'static str, status: u16 },
     /// The latest snapshot's offset is above the stream's tail.
     SnapshotPastNext { snapshot: Offset, next: Offset },
+    /// `Content-Range` is not `bytes first-last/total` with `first <= last <
+    /// total` on a `206`, or `bytes */total` on a `416`.
+    InvalidContentRange,
 }
 
 impl fmt::Display for HeaderError {
@@ -224,6 +229,18 @@ impl fmt::Display for HeaderError {
                 "line {line} of a parts manifest is not a part id of 1 to {PART_ID_MAX_BYTES} \
                  visible ASCII characters"
             ),
+            Self::InvalidContentRange => write!(
+                f,
+                "{} must be `bytes first-last/total` within the body on a 206, or \
+                 `bytes */total` on a 416",
+                names::CONTENT_RANGE
+            ),
+            Self::DuplicateManifestPart { line } => {
+                write!(
+                    f,
+                    "line {line} of a parts manifest repeats an earlier part id"
+                )
+            }
             Self::ManifestPartCount { declared } => write!(
                 f,
                 "a parts manifest must list exactly {declared} parts, as {} says",

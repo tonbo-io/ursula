@@ -36,6 +36,11 @@ pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 /// minimum).
 pub const COLD_OBJECT_WRITE_PART_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upload parts of one [`ColdObjectWriter`] in flight at once, so a large
+/// object does not wait for each part in turn. A writer buffers at most this
+/// many parts.
+pub const COLD_OBJECT_WRITE_CONCURRENCY: usize = 2;
+
 /// A streaming upload of one cold object. Dropping it without
 /// [`Self::close`] leaves no object behind on S3 (the multipart upload is
 /// never completed); [`Self::abort`] also releases the parts.
@@ -679,6 +684,7 @@ impl ColdStore {
             .operator
             .writer_with(path)
             .chunk(COLD_OBJECT_WRITE_PART_BYTES)
+            .concurrent(COLD_OBJECT_WRITE_CONCURRENCY)
             .await
             .map_err(|err| cold_store_io_error(path, err))?;
         Ok(ColdObjectWriter {
@@ -744,6 +750,19 @@ impl ColdStore {
     }
 
     pub async fn delete_chunk(&self, path: &str) -> io::Result<()> {
+        self.begin_delete(path).await?;
+        self.operator
+            .delete(path)
+            .await
+            .map_err(|err| cold_store_io_error(path, err))?;
+        self.complete_delete(path);
+        Ok(())
+    }
+
+    /// The checks and events before an object is deleted, one policy for
+    /// [`Self::delete_chunk`] and [`Self::delete_objects`]: the empty-path
+    /// guard, `DeleteChunkBegin`, and the `DeleteChunk` fault policy.
+    async fn begin_delete(&self, path: &str) -> io::Result<()> {
         if path.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -766,17 +785,18 @@ impl ColdStore {
                 cached: None,
             })
             .await?;
-        self.operator
-            .delete(path)
-            .await
-            .map_err(|err| cold_store_io_error(path, err))?;
+        Ok(())
+    }
+
+    /// What follows a deleted object: its cached blocks go, and
+    /// `DeleteChunkComplete`.
+    fn complete_delete(&self, path: &str) {
         if let Some(cache) = &self.read_cache {
             cache.invalidate_path(path);
         }
         self.notify(ColdStoreEvent::DeleteChunkComplete {
             path: path.to_owned(),
         });
-        Ok(())
     }
 
     pub async fn remove_all(&self, path: &str) -> io::Result<()> {
@@ -813,17 +833,39 @@ impl ColdStore {
     /// in `/`), without recursing into subdirectories. Stream GC uses it so a
     /// sweep never reaches another stream's namespace (F14g).
     pub async fn list_file_names(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.list_file_names_up_to(dir, usize::MAX).await
+    }
+
+    /// The names of at most `max` files directly in `dir`, sorted. The
+    /// listing stops at `max`, page by page, so a directory a tenant can
+    /// grow costs a bounded listing.
+    pub async fn list_file_names_up_to(&self, dir: &str, max: usize) -> io::Result<Vec<String>> {
+        self.list_file_names_after(dir, None, max).await
+    }
+
+    /// The first `max` names of files directly in `dir` that sort after
+    /// `start_after`, sorted: one page of a walk that resumes where the last
+    /// one stopped. A backend that lists from a key (S3) starts there; any
+    /// other is listed whole and filtered.
+    pub async fn list_file_names_after(
+        &self,
+        dir: &str,
+        start_after: Option<&str>,
+        max: usize,
+    ) -> io::Result<Vec<String>> {
         self.count_list_request();
-        let mut lister = self
-            .operator
-            .lister_with(dir)
-            .await
-            .map_err(|err| cold_store_io_error(dir, err))?;
+        let ordered = self.operator.info().full_capability().list_with_start_after;
+        let mut lister = self.operator.lister_with(dir);
+        if ordered && let Some(after) = start_after {
+            lister = lister.start_after(&format!("{dir}{after}"));
+        }
+        let mut lister = lister.await.map_err(|err| cold_store_io_error(dir, err))?;
         let mut names = Vec::new();
-        while let Some(entry) = lister
-            .try_next()
-            .await
-            .map_err(|err| cold_store_io_error(dir, err))?
+        while (!ordered || names.len() < max)
+            && let Some(entry) = lister
+                .try_next()
+                .await
+                .map_err(|err| cold_store_io_error(dir, err))?
         {
             if entry.metadata().mode() != EntryMode::FILE {
                 continue;
@@ -831,12 +873,44 @@ impl ColdStore {
             let Some(name) = entry.path().strip_prefix(dir) else {
                 continue;
             };
-            if !name.is_empty() && !name.contains('/') {
+            if !name.is_empty()
+                && !name.contains('/')
+                && start_after.is_none_or(|after| name > after)
+            {
                 names.push(name.to_owned());
             }
         }
         names.sort();
+        names.truncate(max);
         Ok(names)
+    }
+
+    /// Deletes `paths` with the checks and events of
+    /// [`Self::delete_chunk`] for each, in one batched call where the
+    /// backend has one (S3's `DeleteObjects`). A path the checks refuse is
+    /// kept; the others are deleted all the same, and the first refusal is
+    /// returned. A missing object counts as deleted.
+    pub async fn delete_objects(&self, paths: Vec<String>) -> io::Result<()> {
+        let mut refused = None;
+        let mut admitted = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.begin_delete(&path).await {
+                Ok(()) => admitted.push(path),
+                Err(err) => {
+                    refused.get_or_insert(err);
+                }
+            }
+        }
+        if !admitted.is_empty() {
+            self.operator
+                .delete_iter(admitted.clone())
+                .await
+                .map_err(|err| cold_store_io_error("batch delete", err))?;
+            for path in &admitted {
+                self.complete_delete(path);
+            }
+        }
+        refused.map_or(Ok(()), Err)
     }
 
     /// Proves that the object store has no file below `path`. Tenant purge
@@ -1706,6 +1780,68 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
+}
+
+/// A new snapshot part id (#581 section 3.1), `{nanos:032x}-{seq:016x}.part`.
+/// The `.part` suffix keeps parts apart from the `.bin` objects that state
+/// references, so a commit can name only parts, and deleting a part after
+/// its commit can never remove data.
+pub fn new_snapshot_part_id() -> String {
+    let unix_nanos = cold_object_unix_nanos();
+    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{unix_nanos:032x}-{sequence:016x}{SNAPSHOT_PART_SUFFIX}")
+}
+
+const SNAPSHOT_PART_SUFFIX: &str = ".part";
+
+/// Whether `id` has the form of a part id a client got from
+/// [`new_snapshot_part_id`].
+pub fn is_snapshot_part_id(id: &str) -> bool {
+    hex_fields_with_suffix(id, SNAPSHOT_PART_SUFFIX, &[32, 16])
+}
+
+/// The directory of the snapshot parts staged for the streams of one Raft
+/// group in one bucket: `{bucket}/_parts/{group:08x}/`. It does not depend on
+/// any stream being live, so the orphan sweep lists it from the group's
+/// buckets, as it lists the pack directories, and reclaims the parts of a
+/// stream that was deleted or expired as well as the unused parts of a live
+/// one. A bucket purge removes it with the bucket's prefix.
+pub fn snapshot_part_dir(bucket_id: &str, raft_group_id: u32) -> String {
+    format!("{bucket_id}/_parts/{raft_group_id:08x}/")
+}
+
+/// The object of part `id` staged for the incarnation `incarnation` of
+/// `stream_id`, in [`snapshot_part_dir`]: `{owner:016x}-{id}`, where `owner`
+/// is a hash of the stream and its token. A commit resolves an id only with
+/// its own stream's owner, so a manifest cannot name another stream's part,
+/// nor one staged for an earlier incarnation or history of its own stream.
+pub fn snapshot_part_path(
+    stream_id: &BucketStreamId,
+    raft_group_id: u32,
+    incarnation: u64,
+    id: &str,
+) -> String {
+    let mut owner = blake3::Hasher::new();
+    owner.update(b"ursula snapshot part owner\0");
+    owner.update(stream_id.to_string().as_bytes());
+    owner.update(b"\0");
+    owner.update(&incarnation.to_le_bytes());
+    let digest = owner.finalize();
+    let owner = digest
+        .as_bytes()
+        .first_chunk::<8>()
+        .map_or(0, |prefix| u64::from_be_bytes(*prefix));
+    format!(
+        "{}{owner:016x}-{id}",
+        snapshot_part_dir(&stream_id.bucket_id, raft_group_id),
+    )
+}
+
+/// Whether `name` (a file name in a [`snapshot_part_dir`]) has the form of
+/// a staged part object, `{owner:016x}-{nanos:032x}-{seq:016x}.part`. No
+/// replicated state ever references one.
+pub fn is_snapshot_part_object_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[16, 32, 16])
 }
 
 /// Reset the global cold-object sequence counter. Only available under

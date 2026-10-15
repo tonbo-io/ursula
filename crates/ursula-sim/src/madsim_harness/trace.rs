@@ -655,13 +655,18 @@ pub enum SimEvent {
     /// uncommitted, and every replica applied the plan's history event
     /// across `restarts` member restarts. `uncut_leader` when the plan's
     /// leader still held the stale suffix after the plan was sent: the
-    /// members' log guard, not the cut, kept it from winning.
+    /// members' log guard, not the cut, kept it from winning. In the
+    /// survivor scenario, `leader_first` when every group's plan reached its
+    /// leader before any other member. `guard_refusals` counts the votes the
+    /// members' log guard alone refused the plan's leader.
     RecoveryPlanVerified {
         leader: u64,
         cut: bool,
         stale_writes: u64,
         restarts: u64,
         uncut_leader: bool,
+        leader_first: bool,
+        guard_refusals: u64,
     },
     LeaderReadObserved {
         phase: String,

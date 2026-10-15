@@ -161,14 +161,23 @@ impl StreamStateMachine {
             .stream_slot(&stream_id)
             .and_then(|slot| slot.visible_snapshot.as_ref());
         if let Some(current) = current_snapshot {
+            // A refused publish names the latest snapshot, so the client
+            // tells a superseded publish from a conflicting one.
+            let latest = || {
+                vec![StreamErrorContext::LatestSnapshot {
+                    offset: current.offset,
+                    digest: current.digest.clone(),
+                }]
+            };
             if snapshot_offset < current.offset {
-                return StreamResponse::error_with_next_offset(
+                return StreamResponse::error_with_next_offset_and_context(
                     StreamErrorCode::SnapshotConflict,
                     format!(
                         "snapshot offset {snapshot_offset} is older than latest snapshot offset {}",
                         current.offset
                     ),
                     tail_offset,
+                    latest(),
                 );
             }
             if snapshot_offset == current.offset {
@@ -191,12 +200,13 @@ impl StreamStateMachine {
                         snapshot_digest: digest,
                     };
                 }
-                return StreamResponse::error_with_next_offset(
+                return StreamResponse::error_with_next_offset_and_context(
                     StreamErrorCode::SnapshotConflict,
                     format!(
                         "snapshot offset {snapshot_offset} already has a different payload digest"
                     ),
                     tail_offset,
+                    latest(),
                 );
             }
         }
@@ -259,14 +269,13 @@ impl StreamStateMachine {
             );
         }
         let current = self.earliest_retained_offset(&stream_id);
-        if retained_offset < current {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::SnapshotConflict,
-                format!(
-                    "retention offset {retained_offset} is older than current retained offset {current}"
-                ),
-                stream.tail_offset,
-            );
+        // Retention only moves forward, so a boundary at or below the
+        // current one is a repeat: it changes nothing and reports the
+        // current boundary (#581 section 3).
+        if retained_offset <= current {
+            return StreamResponse::RetentionAdvanced {
+                retained_offset: current,
+            };
         }
         let Some(snapshot) = self
             .stream_slot(&stream_id)
@@ -287,9 +296,6 @@ impl StreamStateMachine {
                 ),
                 stream.tail_offset,
             );
-        }
-        if retained_offset == current {
-            return StreamResponse::RetentionAdvanced { retained_offset };
         }
         if let Err(response) =
             self.check_json_boundary(&stream_id, retained_offset, current, expected_incarnation)

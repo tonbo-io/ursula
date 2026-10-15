@@ -40,6 +40,7 @@ mod switches {
 
     std::thread_local! {
         static OFF: Cell<[bool; 6]> = const { Cell::new([false; 6]) };
+        static FIRED: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -55,6 +56,24 @@ mod switches {
 
     pub(super) fn is_off(defence: Defence) -> bool {
         OFF.with(|off| off.get().get(slot(defence)).copied().unwrap_or(false))
+    }
+
+    pub(super) fn note_fired(defence: Defence) {
+        FIRED.with(|fired| {
+            let mut all = fired.get();
+            if let Some(entry) = all.get_mut(slot(defence)) {
+                *entry = entry.saturating_add(1);
+            }
+            fired.set(all);
+        });
+    }
+
+    pub(super) fn fired(defence: Defence) -> u64 {
+        FIRED.with(|fired| fired.get().get(slot(defence)).copied().unwrap_or(0))
+    }
+
+    pub(super) fn reset_fired() {
+        FIRED.with(|fired| fired.set([0; 6]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {
@@ -86,4 +105,31 @@ pub fn off(defence: Defence) -> bool {
 #[cfg(madsim)]
 pub fn set_off(defence: Defence, value: bool) {
     switches::set_off(defence, value);
+}
+
+/// Records that `defence` decided an outcome on this thread: a negative
+/// control's sibling test reads it to show which defence fired.
+#[inline]
+pub fn note_fired(defence: Defence) {
+    #[cfg(madsim)]
+    {
+        switches::note_fired(defence);
+    }
+    #[cfg(not(madsim))]
+    {
+        let _ = defence;
+    }
+}
+
+/// How often `defence` decided an outcome on this thread since
+/// [`reset_fired`].
+#[cfg(madsim)]
+pub fn fired(defence: Defence) -> u64 {
+    switches::fired(defence)
+}
+
+/// Forgets what fired on this thread, before a simulation.
+#[cfg(madsim)]
+pub fn reset_fired() {
+    switches::reset_fired();
 }

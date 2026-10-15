@@ -38,25 +38,19 @@ const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
 /// Configurable via `ServerConfig.http_inflight_body_size`.
 #[derive(Clone)]
 pub struct IngressAdmission {
-    body_bytes: Arc<tokio::sync::Semaphore>,
+    body_bytes: BodyBudget,
     wal_disk: WalDiskMonitor,
     /// The node's Raft log-pressure flag (set by the snapshot driver's
     /// monitor while the unsnapshotted log is over its hard limit).
     raft_log: Option<ursula_raft::SnapshotBuildCoordinator>,
-    /// Whether the node stages snapshot bodies in a cold store, which sets
-    /// the body limit of a snapshot publish.
-    cold_snapshots: bool,
 }
 
 impl Default for IngressAdmission {
     fn default() -> Self {
         Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(
-                DEFAULT_HTTP_INFLIGHT_BODY_BYTES,
-            )),
+            body_bytes: BodyBudget::new(DEFAULT_HTTP_INFLIGHT_BODY_BYTES),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
-            cold_snapshots: false,
         }
     }
 }
@@ -65,26 +59,18 @@ impl IngressAdmission {
     pub fn new(cfg: &ursula_config::ServerConfig) -> Self {
         let body_budget = cfg.http_inflight_body_size.as_bytes() as usize;
         Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
+            body_bytes: BodyBudget::new(body_budget),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
-            cold_snapshots: false,
         }
     }
 
     pub fn disabled() -> Self {
         Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
+            body_bytes: BodyBudget::new(tokio::sync::Semaphore::MAX_PERMITS),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
-            cold_snapshots: false,
         }
-    }
-
-    /// Sets whether the node stages snapshot bodies in a cold store.
-    pub(crate) fn with_cold_snapshots(mut self, cold_snapshots: bool) -> Self {
-        self.cold_snapshots = cold_snapshots;
-        self
     }
 
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
@@ -106,8 +92,7 @@ impl IngressAdmission {
 /// reaches a handler, so nothing of a refused request was proposed or applied.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AdmissionRefusal {
-    /// The body is larger than admission admits on the route (`413` naming
-    /// the limit).
+    /// The body is larger than the request limit (`413` naming it).
     BodyTooLarge(SizeLimit),
     /// The WAL filesystem is below its free-space floor, or its free-space
     /// check failed (`503`).
@@ -152,21 +137,18 @@ pub(crate) async fn ingress_admission_middleware(
     let Some(body_bytes) = request_write_body_bytes(&request) else {
         return next.run(request).await;
     };
-    // Size first: the head alone decides it (#581 section 6.1).
-    let body_write = front_door::BodyWrite::of(
-        request.method(),
-        request.extensions().get::<axum::extract::MatchedPath>(),
-    );
-    let limit = body_write.map_or(limits::REQUEST_LIMIT, |write| {
-        write.limit(admission.cold_snapshots)
-    });
-    if body_bytes > limit.bytes() {
-        return AdmissionRefusal::BodyTooLarge(limit).into_response();
+    // Size first: the head alone decides it (#581 section 6.1). One limit
+    // for every request (section 3.1).
+    if body_bytes > limits::MAX_REQUEST_BYTES {
+        return AdmissionRefusal::BodyTooLarge(limits::REQUEST_LIMIT).into_response();
     }
     // A write routed before its body meets pressure after routing and its
     // early answer: a follower redirects rather than refusing for its own
     // pressure, and a repeat of an applied write adds nothing to any log.
-    if body_write.is_some() {
+    if front_door::routed_before_body(
+        request.method(),
+        request.extensions().get::<axum::extract::MatchedPath>(),
+    ) {
         request.extensions_mut().insert(DeferredAdmission {
             admission,
             body_bytes,
@@ -197,15 +179,61 @@ impl IngressAdmission {
         {
             return Err(AdmissionRefusal::RaftLogPressure);
         }
-        // A snapshot body above the inline cap streams to the cold store in
-        // bounded parts (F16), so it holds at most the inline cap in memory.
-        let body_bytes = body_bytes.min(limits::MAX_REQUEST_BYTES);
-        if body_bytes == 0 {
+        self.reserve(body_bytes)
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionRefusal> {
+        self.body_bytes.reserve(bytes)
+    }
+}
+
+/// The node's in-flight body budget (`server.http_inflight_body_size`):
+/// the bytes of write bodies, and of a parts commit's copy buffers, that
+/// the node holds at once.
+#[derive(Clone)]
+pub(crate) struct BodyBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    capacity: u64,
+}
+
+impl BodyBudget {
+    fn new(capacity: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity: u64::try_from(capacity).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The whole budget.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// `bytes` of the budget, held until the permit drops, only while
+    /// `free` more bytes stay free beside them: the check and the
+    /// reservation are one acquisition.
+    pub(crate) fn reserve_leaving(
+        &self,
+        bytes: u64,
+        free: u64,
+    ) -> Result<AdmissionPermit, AdmissionRefusal> {
+        let mut held = self.reserve(bytes.saturating_add(free))?;
+        let free = usize::try_from(free).unwrap_or(usize::MAX);
+        if let Some(permit) = held._held.as_mut() {
+            drop(permit.split(free));
+        }
+        Ok(held)
+    }
+
+    /// `bytes` of the budget, held until the permit drops.
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionRefusal> {
+        if bytes == 0 {
             return Ok(AdmissionPermit { _held: None });
         }
-        // At most the request limit, which fits.
-        let permits = u32::try_from(body_bytes).unwrap_or(u32::MAX);
-        match self.body_bytes.clone().try_acquire_many_owned(permits) {
+        // A body of at most the request limit, or a commit's copy buffers,
+        // fits.
+        let permits = u32::try_from(bytes).unwrap_or(u32::MAX);
+        match self.permits.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Ok(AdmissionPermit {
                 _held: Some(permit),
             }),
@@ -250,6 +278,26 @@ impl DeferredAdmission {
     pub(crate) fn admit(self) -> Result<AdmissionPermit, AdmissionRefusal> {
         self.admission.admit(self.body_bytes)
     }
+
+    /// Charges at most `bytes` for the body: a parts commit's manifest,
+    /// which the handler reads no further, is never charged the request
+    /// limit of a body without `Content-Length`.
+    pub(crate) fn capped(mut self, bytes: u64) -> Self {
+        self.body_bytes = self.body_bytes.min(bytes);
+        self
+    }
+
+    /// The node's in-flight body budget, for a charge the handler makes
+    /// later: a parts commit's copy buffers, once its copy slot is held.
+    pub(crate) fn budget(&self) -> BodyBudget {
+        self.admission.body_bytes.clone()
+    }
+
+    /// The in-flight budget alone, without the WAL and Raft-log pressure
+    /// checks: a snapshot part touches neither until it is committed.
+    pub(crate) fn admit_budget(self) -> Result<AdmissionPermit, AdmissionRefusal> {
+        self.admission.reserve(self.body_bytes)
+    }
 }
 
 fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
@@ -275,7 +323,7 @@ fn is_write_method(method: &Method) -> bool {
     )
 }
 
-fn retry_after_json(error: &'static str) -> Response {
+pub(crate) fn retry_after_json(error: &'static str) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     headers.insert(

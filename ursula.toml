@@ -45,6 +45,9 @@ listen = "127.0.0.1:4437"
 # turns memory pressure into backpressure at the HTTP edge.
 # Use a human-readable size: "64MiB", "1GiB", etc. Omit to inherit the
 # built-in or preset default; the built-in default is 256MiB.
+# With a cold backend it must be at least 64MiB: a snapshot commit's copy
+# is charged against it (32MiB at the least) beside one request of the
+# 32MiB limit, and a node with less refuses to start.
 # http_inflight_body_size = "256MiB"   # default: 256 MiB
 
 # ------------------------------------------------------------------------------

@@ -126,6 +126,7 @@ const DEFAULT_COMPACTION_DEBT_CHUNK_BYTES: u64 = 8 << 20;
 const COMPACTION_DEBT_PAGES_PER_PASS: usize = 4_096;
 
 pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
+pub use orphan_sweep::COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR;
 
 /// Backoff before the cold GC retries an entry it deferred after its first
 /// failure (bounded-state F14b). Each further deferral
@@ -220,6 +221,9 @@ pub struct ShardRuntime {
     cold_index_repair: Arc<std::sync::Mutex<HashMap<RaftGroupId, ColdIndexRepairCursor>>>,
     /// Node-local cursor of each group's cold orphan sweep (F14h).
     cold_orphan_sweep: Arc<std::sync::Mutex<HashMap<RaftGroupId, Option<BucketStreamId>>>>,
+    /// Per snapshot part directory, the last part name the orphan sweep
+    /// listed, so the next cycle lists the page after it.
+    cold_part_sweep: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Cold-index pages that may hold compactable small chunks (F14d).
     compaction_debt: Arc<std::sync::Mutex<CompactionDebt>>,
     /// Exclusive chunks below this many bytes are compaction debt (F14d).
@@ -312,6 +316,7 @@ impl ShardRuntime {
             cold_store,
             cold_index_repair: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cold_orphan_sweep: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cold_part_sweep: Arc::new(std::sync::Mutex::new(HashMap::new())),
             compaction_debt: Arc::default(),
             compaction_debt_chunk_bytes: Arc::new(AtomicU64::new(
                 DEFAULT_COMPACTION_DEBT_CHUNK_BYTES,

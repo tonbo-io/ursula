@@ -1,10 +1,11 @@
 //! The front door's size limits (extensions Section 10): what HEAD
 //! advertises, and the limit every `413` names.
 //!
-//! A node has one request limit, [`MAX_REQUEST_BYTES`]. A snapshot publish
-//! with a cold store still accepts a body of up to [`MAX_COLD_SNAPSHOT_BYTES`]
-//! in one request until snapshots go up in parts, and its refusal names the
-//! snapshot limit.
+//! A node has one request limit, [`MAX_REQUEST_BYTES`], for every request.
+//! A node with a cold store also accepts snapshots of up to
+//! [`MAX_COLD_SNAPSHOT_BYTES`] uploaded in parts ([`crate::snapshot_parts`]),
+//! and a refusal of an assembled snapshot names that limit,
+//! [`SNAPSHOT_LIMIT`].
 
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
@@ -24,16 +25,13 @@ pub(crate) const MAX_REQUEST_BYTES: u64 = MAX_HTTP_BODY_BYTES as u64;
 /// The request limit, as a `413` names it.
 pub(crate) const REQUEST_LIMIT: SizeLimit = SizeLimit::Request(MAX_REQUEST_BYTES);
 
-/// `Ursula-Max-Snapshot-Bytes`: the largest snapshot a node accepts, which
-/// only a node with a cold store advertises.
+/// The snapshot limit, as the `413` of an assembled snapshot names it.
+pub(crate) const SNAPSHOT_LIMIT: SizeLimit = SizeLimit::Snapshot(MAX_COLD_SNAPSHOT_BYTES);
+
+/// `Ursula-Max-Snapshot-Bytes`: the largest snapshot a node accepts in
+/// parts, which only a node with a cold store advertises.
 pub(crate) fn max_snapshot_bytes(cold_store: bool) -> Option<u64> {
     cold_store.then_some(MAX_COLD_SNAPSHOT_BYTES)
-}
-
-/// The limit a snapshot publish applies: the snapshot limit with a cold
-/// store, the request limit without one.
-pub(crate) fn snapshot_publish_limit(cold_store: bool) -> SizeLimit {
-    max_snapshot_bytes(cold_store).map_or(REQUEST_LIMIT, SizeLimit::Snapshot)
 }
 
 /// A `413` that names `limit`.

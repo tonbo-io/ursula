@@ -157,6 +157,7 @@ pub(super) struct Switched;
 impl Switched {
     pub(super) fn apply(controls: Controls) -> Self {
         set_defences(controls);
+        ursula_stream::sim_controls::reset_fired();
         Self
     }
 }
@@ -287,6 +288,12 @@ struct SlowTransport<'a> {
     point: u64,
     pause: Duration,
     trace: &'a mut SimTrace,
+    /// The plan's leader.
+    leader: u64,
+    /// Whether the plan's leader held the plan, or had applied its history
+    /// event, whenever the plan went to another member: the leader-first
+    /// order held.
+    leader_first: bool,
 }
 
 impl SlowTransport<'_> {
@@ -304,8 +311,22 @@ impl SlowTransport<'_> {
             "recovery_plan_sending",
         )
         .await;
+        if node_id != self.leader {
+            let history = self.inner.cluster.engines[&(self.inner.group, self.leader)].history();
+            self.leader_first &= history.plan().is_some()
+                || history
+                    .applied()
+                    .is_some_and(|event| event.event_index > self.point);
+        }
         self.inner.accept(node_id, request).await
     }
+}
+
+/// Whether a slow send held the leader-first order (N1): the plan went to
+/// its leader before any other member.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SlowSend {
+    leader_first: bool,
 }
 
 impl PlanTransport for SlowTransport<'_> {
@@ -331,7 +352,7 @@ async fn recover_group_slowly(
     leader_last: bool,
     trace: &mut SimTrace,
     context: &str,
-) -> GroupPlan {
+) -> (GroupPlan, SlowSend) {
     let mut members = Vec::new();
     for node_id in NODES {
         members.push(member_view(cluster, group, node_id).await);
@@ -340,22 +361,23 @@ async fn recover_group_slowly(
         .unwrap_or_else(|error| panic!("{context}: group {group}: no plan: {error}"));
     cluster.plan_leaders.insert(plan.leader);
     if !leader_last {
-        let sent = send_plan(
-            &mut SlowTransport {
-                inner: SimPlanTransport { cluster, group },
-                point: plan.point,
-                pause,
-                trace,
-            },
-            plan,
-            &members,
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
+        let mut transport = SlowTransport {
+            inner: SimPlanTransport { cluster, group },
+            point: plan.point,
+            pause,
+            trace,
+            leader: plan.leader,
+            leader_first: true,
+        };
+        let sent = send_plan(&mut transport, plan, &members)
+            .await
+            .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
         for error in &sent.refused {
             tracing::info!(%error, "{context}: group {group}: a member refused the plan");
         }
-        return plan;
+        return (plan, SlowSend {
+            leader_first: transport.leader_first,
+        });
     }
     let request = |member: &PlanMember, step: PlanStep| RecoveryPlanRequest {
         leader: plan.leader,
@@ -397,7 +419,9 @@ async fn recover_group_slowly(
     {
         tracing::info!(%error, "{context}: group {group}: the plan's leader refused");
     }
-    plan
+    (plan, SlowSend {
+        leader_first: false,
+    })
 }
 
 /// Waits until every replica of `group` applied the plan's history event,
@@ -598,6 +622,8 @@ pub(super) async fn run_recovery_plan_inner(
     let mut leader = a;
     let mut cut = false;
     let mut uncut_leader = false;
+    // The survivor scenario's evidence of which defence held (N1).
+    let mut slow_sends = Vec::new();
     for group in JOURNAL_GROUPS {
         if leader_by_state(&cluster, group).is_some() {
             continue;
@@ -605,7 +631,7 @@ pub(super) async fn run_recovery_plan_inner(
         let taken = match shape {
             Shape::CutUnderRestarts => recover_group(&mut cluster, group, &NODES, &context).await,
             Shape::SurvivorCampaigns => {
-                recover_group_slowly(
+                let (taken, sent) = recover_group_slowly(
                     &mut cluster,
                     group,
                     plan.pause,
@@ -613,7 +639,9 @@ pub(super) async fn run_recovery_plan_inner(
                     &mut trace,
                     &context,
                 )
-                .await
+                .await;
+                slow_sends.push(sent);
+                taken
             }
         };
         let (plan_leader, point, plan_cut) = (taken.leader, taken.point, taken.cut);
@@ -663,6 +691,10 @@ pub(super) async fn run_recovery_plan_inner(
         stale_writes,
         restarts,
         uncut_leader,
+        leader_first: !slow_sends.is_empty() && slow_sends.iter().all(|sent| sent.leader_first),
+        guard_refusals: ursula_stream::sim_controls::fired(
+            ursula_stream::sim_controls::Defence::PlanLogGuard,
+        ),
     });
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
@@ -799,8 +831,13 @@ mod tests {
         );
     }
 
-    /// Either defence of N1 alone keeps the survivor scenario passing: the
-    /// leader-first order with its plan term, or the members' log guard.
+    /// Either defence of N1 alone keeps the survivor scenario passing, and
+    /// the runs show that the remaining one fired. Without the log guard,
+    /// every run sends the plan to its leader before every other member, so
+    /// no member holds the plan while its leader does not. With the plan
+    /// sent leader last, some run counts a vote that a member refused the
+    /// unplanned leader for its entry above the point at or below the plan
+    /// term, a refusal only the log guard makes.
     #[test]
     fn either_defence_against_an_unplanned_leader_alone_suffices() {
         let _guard = sim_test_guard();
@@ -809,15 +846,41 @@ mod tests {
             log_guard_off: false,
             ..Controls::LEADER_LAST
         };
-        for controls in [leader_last_only, Controls::NO_LOG_GUARD] {
-            for seed in 390..=394 {
-                ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
-                    config(seed, scenario),
-                    scenario,
-                    controls,
-                );
-            }
+        let verified = |controls: Controls, seed: u64| {
+            let report = ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
+                config(seed, scenario),
+                scenario,
+                controls,
+            );
+            report
+                .outcome
+                .trace
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    crate::madsim_harness::SimEvent::RecoveryPlanVerified {
+                        leader_first,
+                        guard_refusals,
+                        ..
+                    } => Some((*leader_first, *guard_refusals)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("seed {seed} {controls:?}: no plan verified"))
+        };
+        let mut guard_fired = false;
+        for seed in 390..=394 {
+            let (leader_first, _) = verified(Controls::NO_LOG_GUARD, seed);
+            assert!(
+                leader_first,
+                "seed {seed}: a member took the plan before its leader"
+            );
+            let (_, guard_refusals) = verified(leader_last_only, seed);
+            guard_fired |= guard_refusals > 0;
         }
+        assert!(
+            guard_fired,
+            "no seed counted a vote the log guard refused: the guard alone was never shown"
+        );
     }
 
     #[test]

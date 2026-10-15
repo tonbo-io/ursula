@@ -13,6 +13,10 @@
 //!   minification of `application/json` write bodies.
 //! - [`limits`]: the request and snapshot limits HEAD advertises and every
 //!   `413` names.
+//! - [`cold_snapshot`]: snapshot bodies in the cold tier: staging a publish
+//!   body, and streaming a read's body or byte range.
+//! - [`snapshot_parts`]: snapshots uploaded in parts: staging a part, and
+//!   the commit that assembles and publishes them.
 //! - [`response_metadata`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on
 //!   every HEAD answer, and the request limit on a `413` that names none.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
@@ -37,6 +41,7 @@ mod http_time {
 mod removed_surface;
 mod render;
 mod response_metadata;
+mod snapshot_parts;
 mod wal_disk;
 
 use std::collections::BTreeMap;
@@ -96,7 +101,9 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
+use ursula_headers::ByteRange;
 use ursula_headers::ClusterId;
+use ursula_headers::ContentRange;
 use ursula_headers::HeaderError as ProducerHeaderError;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::IncarnationPrecondition;
@@ -183,8 +190,6 @@ use crate::render::insert_offset;
 use crate::render::insert_padded_offset;
 use crate::render::insert_producer_answer;
 use crate::render::insert_producer_error_headers;
-use crate::render::insert_snapshot_digest;
-use crate::render::insert_snapshot_offset;
 use crate::render::insert_static;
 use crate::render::insert_stream_error_headers;
 use crate::render::insert_stream_error_offset;
@@ -200,7 +205,8 @@ use crate::render::render_sse_read;
 use crate::render::response_cursor;
 use crate::render::runtime_error_status;
 use crate::render::should_base64_encode_sse_data;
-use crate::render::snapshot_response;
+use crate::render::snapshot_head;
+use crate::render::snapshot_published_response;
 use crate::render::sse_safe_line;
 use crate::render::stream_head;
 use crate::response_metadata::IdentityHeaders;
@@ -321,6 +327,8 @@ pub struct HttpState {
     /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
     /// drawn for this process when the node runs without a WAL.
     cluster_id: Arc<ClusterId>,
+    /// The parts commits this node runs (#581 section 3.1).
+    snapshot_commits: snapshot_parts::SnapshotCommits,
 }
 
 impl HttpState {
@@ -402,6 +410,7 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
+            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -424,6 +433,7 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
+            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -467,6 +477,7 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
+            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -576,6 +587,12 @@ struct HttpMetrics {
     /// Producer writes answered `producer-expired` (the stream's epoch
     /// floor refused them).
     producer_expired_answers: AtomicU64,
+    /// Parts commits answered `503 SnapshotCommitsBusy`: every copy slot
+    /// was taken.
+    snapshot_commits_busy: AtomicU64,
+    /// Repeats of a running parts commit, answered `503
+    /// SnapshotCommitInProgress`.
+    snapshot_commits_in_progress: AtomicU64,
 }
 
 impl HttpMetrics {
@@ -587,6 +604,8 @@ impl HttpMetrics {
             sse_control_events: self.sse_control_events.load(Ordering::Relaxed),
             sse_error_events: self.sse_error_events.load(Ordering::Relaxed),
             producer_expired_answers: self.producer_expired_answers.load(Ordering::Relaxed),
+            snapshot_commits_busy: self.snapshot_commits_busy.load(Ordering::Relaxed),
+            snapshot_commits_in_progress: self.snapshot_commits_in_progress.load(Ordering::Relaxed),
         }
     }
 }
@@ -599,6 +618,8 @@ struct HttpMetricsSnapshot {
     sse_control_events: u64,
     sse_error_events: u64,
     producer_expired_answers: u64,
+    snapshot_commits_busy: u64,
+    snapshot_commits_in_progress: u64,
 }
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
@@ -1379,6 +1400,9 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                         .trim();
                     media_type == "application/json" || media_type == "application/x-ndjson"
                 })
+                // A snapshot answer offers byte ranges of its identity body,
+                // so it is never compressed.
+                && !headers.contains_key(names::ACCEPT_RANGES)
         };
     let response_compression = CompressionLayer::new()
         .gzip(true)
@@ -1403,6 +1427,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             put(publish_snapshot).get(read_snapshot),
         )
         .route(
+            front_door::SNAPSHOT_PARTS_ROUTE,
+            post(snapshot_parts::stage_snapshot_part),
+        )
+        .route(
             "/{bucket}/{stream}/retention/{retained_offset}",
             put(advance_retention),
         )
@@ -1417,7 +1445,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
-            admission.with_cold_snapshots(state.runtime.has_cold_store()),
+            admission,
             ingress_admission_middleware,
         ))
         .layer(ResponseMetadataLayer::new(Some(IdentityHeaders::new(
@@ -3598,25 +3626,87 @@ pub(crate) async fn publish_snapshot(
         Ok(if_incarnation) => if_incarnation,
         Err(response) => return answer_before_body(*response, version, &headers, body).await,
     };
+    // A publish with `Stream-Snapshot-Parts` commits a snapshot uploaded in
+    // parts: its body lists the parts (#581 section 3.1).
+    let parts = match snapshot_parts::parts_commit(&state, &headers) {
+        Ok(parts) => parts,
+        Err(refusal) => {
+            return answer_before_body(refusal.into_response(), version, &headers, body).await;
+        }
+    };
     let request_target = request_target(&uri);
-    let decision =
-        front_door::route_before_body(&state, &stream_id, &request_target, None, admission.0).await;
-    let _permit = match decision {
+    let snapshot = PublishTarget {
+        state,
+        request_target,
+        stream_id,
+        snapshot_offset,
+        content_type: request_content_type(&headers),
+        if_incarnation,
+    };
+    let Some(commit) = parts else {
+        let decision = front_door::route_before_body(
+            &snapshot.state,
+            &snapshot.stream_id,
+            &snapshot.request_target,
+            None,
+            admission.0,
+        )
+        .await;
+        let _permit = match decision {
+            HeadDecision::Answer(answer) => {
+                return answer_before_body(answer, version, &headers, body).await;
+            }
+            HeadDecision::Read(permit) => permit,
+        };
+        return match cold_snapshot::receive_snapshot_body(
+            &snapshot.state,
+            &snapshot.stream_id,
+            &snapshot.content_type,
+            body,
+        )
+        .await
+        {
+            Ok(upload) => snapshot.publish(upload).await,
+            Err(response) => response,
+        };
+    };
+    // A commit checks its key before its body: a repeat of a published
+    // snapshot answers from the key alone, even after its parts are gone
+    // (A2 of the #581 addendum on the VFS client asks).
+    let decision = front_door::route_before_body(
+        &snapshot.state,
+        &snapshot.stream_id,
+        &snapshot.request_target,
+        None,
+        None,
+    )
+    .await;
+    if let HeadDecision::Answer(answer) = decision {
+        return answer_before_body(answer, version, &headers, body).await;
+    }
+    let incarnation = match snapshot_parts::key_check(&snapshot, &commit).await {
+        snapshot_parts::KeyCheck::Answered(answer) => {
+            return answer_before_body(answer, version, &headers, body).await;
+        }
+        snapshot_parts::KeyCheck::Open { incarnation } => incarnation,
+    };
+    // The manifest is charged at most its own bound; the copy is charged
+    // once it holds a copy slot.
+    let budget = admission
+        .0
+        .as_ref()
+        .map(admission::DeferredAdmission::budget);
+    let manifest_bytes = u64::try_from(ursula_headers::MAX_MANIFEST_BYTES).unwrap_or(u64::MAX);
+    let admission = admission
+        .0
+        .map(|admission| admission.capped(manifest_bytes));
+    let manifest_permit = match front_door::admit(admission) {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
         HeadDecision::Read(permit) => permit,
     };
-    publish_snapshot_by_offset(
-        state,
-        request_target,
-        stream_id,
-        snapshot_offset,
-        request_content_type(&headers),
-        if_incarnation,
-        body,
-    )
-    .await
+    snapshot_parts::commit(snapshot, commit, incarnation, budget, manifest_permit, body).await
 }
 
 /// The bare `{stream}/snapshot` path (the removed latest-snapshot redirect
@@ -3705,70 +3795,73 @@ async fn verify_json_boundary(
     }
 }
 
-async fn publish_snapshot_by_offset(
-    state: HttpState,
-    request_target: String,
-    stream_id: BucketStreamId,
-    snapshot_offset: u64,
-    content_type: String,
-    if_incarnation: Option<u64>,
-    body: Body,
-) -> Response {
-    let (payload, cold_body) =
-        match cold_snapshot::receive_snapshot_body(&state, &stream_id, &content_type, body).await {
-            Ok(cold_snapshot::SnapshotUpload::Inline(payload)) => (payload, None),
-            Ok(cold_snapshot::SnapshotUpload::Cold(cold_body)) => (Bytes::new(), Some(cold_body)),
-            Err(response) => return response,
+/// A snapshot publish: where it goes and what it names.
+pub(crate) struct PublishTarget {
+    pub(crate) state: HttpState,
+    pub(crate) request_target: String,
+    pub(crate) stream_id: BucketStreamId,
+    pub(crate) snapshot_offset: u64,
+    pub(crate) content_type: String,
+    pub(crate) if_incarnation: Option<u64>,
+}
+
+impl PublishTarget {
+    /// Publishes a received body: proposes it, verifies a JSON boundary the
+    /// apply could not, and deletes a staged object after a definite
+    /// refusal (F5).
+    pub(crate) async fn publish(&self, upload: cold_snapshot::SnapshotUpload) -> Response {
+        let state = &self.state;
+        let (payload, cold_body) = match upload {
+            cold_snapshot::SnapshotUpload::Inline(payload) => (payload, None),
+            cold_snapshot::SnapshotUpload::Cold(cold_body) => (Bytes::new(), Some(cold_body)),
         };
-    let staged_path = cold_body
-        .as_ref()
-        .map(|cold_body| cold_body.object.s3_path.clone());
-    let mut request = PublishSnapshotRequest {
-        stream_id: stream_id.clone(),
-        snapshot_offset,
-        content_type,
-        payload,
-        cold_body,
-        now_ms: state.unix_time_ms(),
-        expected_incarnation: None,
-        if_incarnation,
-    };
-    let mut result = state.runtime.publish_snapshot(request.clone()).await;
-    if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
-        if let Err(response) = verify_json_boundary(
-            &state,
-            &stream_id,
-            snapshot_offset,
-            &request_target,
-            BodyState::Read,
-        )
-        .await
-        {
-            // Nothing references the staged body: apply refused it.
-            if let Some(staged_path) = staged_path.as_deref() {
-                delete_unreferenced_staged_payload(&state, staged_path).await;
+        let staged_path = cold_body
+            .as_ref()
+            .map(|cold_body| cold_body.object.s3_path.clone());
+        let mut request = PublishSnapshotRequest {
+            stream_id: self.stream_id.clone(),
+            snapshot_offset: self.snapshot_offset,
+            content_type: self.content_type.clone(),
+            payload,
+            cold_body,
+            now_ms: state.unix_time_ms(),
+            expected_incarnation: None,
+            if_incarnation: self.if_incarnation,
+        };
+        let mut result = state.runtime.publish_snapshot(request.clone()).await;
+        if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
+            if let Err(response) = verify_json_boundary(
+                state,
+                &self.stream_id,
+                self.snapshot_offset,
+                &self.request_target,
+                BodyState::Read,
+            )
+            .await
+            {
+                // Nothing references the staged body: apply refused it.
+                if let Some(staged_path) = staged_path.as_deref() {
+                    delete_unreferenced_staged_payload(state, staged_path).await;
+                }
+                return response;
             }
-            return response;
+            request.expected_incarnation = Some(incarnation);
+            request.now_ms = state.unix_time_ms();
+            result = state.runtime.publish_snapshot(request).await;
         }
-        request.expected_incarnation = Some(incarnation);
-        request.now_ms = state.unix_time_ms();
-        result = state.runtime.publish_snapshot(request).await;
-    }
-    if let (Err(err), Some(staged_path)) = (&result, staged_path.as_deref()) {
-        // F5 cleanup rule: delete the staged body only after a definite
-        // rejection; the orphan sweep reclaims it otherwise.
-        cleanup_external_payload(&state, staged_path, err).await;
-    }
-    match result {
-        Ok(response) => {
-            let mut headers = HeaderMap::new();
-            insert_default_response_headers(&mut headers);
-            insert_snapshot_offset(&mut headers, response.snapshot_offset);
-            insert_snapshot_digest(&mut headers, &response.snapshot_digest);
-            insert_incarnation(&mut headers, response.incarnation);
-            (StatusCode::NO_CONTENT, headers).into_response()
+        if let (Err(err), Some(staged_path)) = (&result, staged_path.as_deref()) {
+            // F5 cleanup rule: delete the staged body only after a definite
+            // rejection; the orphan sweep reclaims it otherwise.
+            cleanup_external_payload(state, staged_path, err).await;
         }
-        Err(err) => runtime_error_after_body(&state, err),
+        match result {
+            Ok(response) => snapshot_published_response(
+                response.snapshot_offset,
+                &response.snapshot_digest,
+                response.incarnation,
+            ),
+            Err(err) => runtime_error_after_body(state, err),
+        }
     }
 }
 
@@ -3859,24 +3952,55 @@ pub(crate) async fn read_snapshot(
         .await
     {
         Ok(mut response) => {
+            // `404`, `410` and `412` come before the range (addendum 7).
             if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
                 return refused;
             }
             let object = response.object.take();
-            let mut rendered = snapshot_response(response);
-            if let Some(object) = object {
-                let len = object.payload_len;
-                match cold_snapshot::cold_snapshot_body(&state, object).await {
-                    Ok(body) => {
-                        *rendered.body_mut() = body;
-                        rendered
-                            .headers_mut()
-                            .insert(CONTENT_LENGTH, HeaderValue::from(len));
+            let payload = Bytes::from(std::mem::take(&mut response.payload));
+            let total = object.as_ref().map_or_else(
+                || u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                |object| object.payload_len,
+            );
+            let range = ByteRange::parse(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            )
+            .and_then(|range| range.resolve(total));
+            let (status, mut response_headers) = snapshot_head(&response, range);
+            let (start, len) = match range {
+                None => (0, total),
+                Some(ContentRange::Partial(span)) => (span.first(), span.len()),
+                Some(ContentRange::Unsatisfied { .. }) => (0, 0),
+            };
+            let body = match object {
+                Some(object) if len > 0 => {
+                    match cold_snapshot::cold_snapshot_body(&state, object, start, len).await {
+                        Ok(body) => body,
+                        Err(response) => return response,
                     }
-                    Err(response) => return response,
                 }
-            }
-            rendered
+                _ => {
+                    let slice = usize::try_from(start)
+                        .ok()
+                        .zip(usize::try_from(start.saturating_add(len)).ok());
+                    match slice.and_then(|(start, end)| payload.get(start..end)) {
+                        Some(bytes) => Body::from(payload.slice_ref(bytes)),
+                        // A range resolved against this body lies inside it.
+                        None => {
+                            tracing::error!(start, len, total, "a snapshot range outside its body");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "snapshot range outside its body",
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            };
+            response_headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+            (status, response_headers, body).into_response()
         }
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
@@ -4664,6 +4788,8 @@ mod cold_snapshot_tests;
 mod history_tests;
 #[cfg(test)]
 mod server_metadata_tests;
+#[cfg(test)]
+mod snapshot_parts_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
 #[cfg(test)]

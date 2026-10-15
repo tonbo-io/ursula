@@ -19,6 +19,10 @@ pub const MAX_SNAPSHOT_PARTS: u32 = 4096;
 /// The longest part id, in bytes.
 pub const PART_ID_MAX_BYTES: usize = 64;
 
+/// The longest valid commit body: [`MAX_SNAPSHOT_PARTS`] ids of
+/// [`PART_ID_MAX_BYTES`], each with its LF. A server reads no more of one.
+pub const MAX_MANIFEST_BYTES: usize = (MAX_SNAPSHOT_PARTS as usize) * (PART_ID_MAX_BYTES + 1);
+
 /// A published snapshot: `Stream-Snapshot-Offset` and
 /// `Stream-Snapshot-Digest`, which always travel together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,15 +347,31 @@ impl PartsCommit {
 /// Grammar: `manifest = count( part-id LF )`, where `count` is the commit's
 /// `Stream-Snapshot-Parts` and `part-id` is a [`PartId`]. Every line ends
 /// with a single LF, the last one too; there is no CR, no empty line and
-/// nothing after the last LF. An id may repeat.
+/// nothing after the last LF. No id appears twice: a commit costs at most
+/// the bytes its client staged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartsManifest(Vec<PartId>);
 
 impl PartsManifest {
-    /// 1 to [`MAX_SNAPSHOT_PARTS`] part ids.
+    /// 1 to [`MAX_SNAPSHOT_PARTS`] distinct part ids.
     pub fn new(parts: Vec<PartId>) -> Result<Self, HeaderError> {
         PartCount::try_from(parts.len())?;
+        Self::check_distinct(&parts)?;
         Ok(Self(parts))
+    }
+
+    /// [`HeaderError::DuplicateManifestPart`] naming the first line whose id
+    /// an earlier line holds.
+    fn check_distinct(parts: &[PartId]) -> Result<(), HeaderError> {
+        let mut seen = std::collections::HashSet::with_capacity(parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            if !seen.insert(part.as_str()) {
+                return Err(HeaderError::DuplicateManifestPart {
+                    line: index.saturating_add(1),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn parts(&self) -> &[PartId] {
@@ -385,6 +405,7 @@ impl PartsManifest {
         if parts.len() != count.len()? {
             return Err(HeaderError::ManifestPartCount { declared: count });
         }
+        Self::check_distinct(&parts)?;
         Ok(Self(parts))
     }
 
@@ -724,7 +745,7 @@ mod tests {
         };
         for parts in [
             ids(&["p"]),
-            ids(&["a", "b", "a"]),
+            ids(&["a", "b", "c"]),
             ids(&[&"x".repeat(64), "~!"]),
             (0..MAX_SNAPSHOT_PARTS)
                 .map(|index| PartId::new(format!("part-{index}")).unwrap())
@@ -764,8 +785,18 @@ mod tests {
                 value: 4097
             })
         );
+        assert_eq!(
+            PartsManifest::new(
+                ["a", "b", "a"]
+                    .into_iter()
+                    .map(|id| PartId::new(id).unwrap())
+                    .collect()
+            ),
+            Err(HeaderError::DuplicateManifestPart { line: 3 })
+        );
         for (declared, body, expected) in [
             (2, &b"a\nb"[..], HeaderError::ManifestUnterminated),
+            (2, b"a\na\n", HeaderError::DuplicateManifestPart { line: 2 }),
             (1, b"", HeaderError::ManifestUnterminated),
             (1, b"\n", HeaderError::InvalidManifestLine { line: 1 }),
             (2, b"a\n\n", HeaderError::InvalidManifestLine { line: 2 }),

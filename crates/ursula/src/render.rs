@@ -20,7 +20,9 @@ use chrono::SecondsFormat;
 use chrono::Utc;
 #[cfg(test)]
 use serde_json::Value;
+use ursula_headers::ACCEPT_RANGES_BYTES;
 use ursula_headers::ClosedEpoch;
+use ursula_headers::ContentRange;
 use ursula_headers::CurrentEpoch;
 use ursula_headers::Delivery;
 use ursula_headers::EpochClosure;
@@ -29,6 +31,7 @@ use ursula_headers::IncarnationMismatch;
 use ursula_headers::Inherited;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
+use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 use ursula_headers::names;
@@ -178,10 +181,7 @@ pub(crate) fn stream_head(
     max_snapshot_bytes: Option<u64>,
 ) -> Result<StreamHead, HeaderError> {
     let snapshot = match (response.snapshot_offset, &response.snapshot_digest) {
-        (Some(offset), Some(digest)) => Some(SnapshotRef {
-            offset: Offset::from_u64(offset),
-            digest: SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest)?,
-        }),
+        (Some(offset), Some(digest)) => Some(snapshot_ref(offset, digest)?),
         _ => None,
     };
     let inherited = response
@@ -404,7 +404,8 @@ pub(crate) fn producer_refusal_answer(
         })()),
         StreamErrorContext::StreamClosed
         | StreamErrorContext::StaleColdFlushCandidate
-        | StreamErrorContext::StreamIncarnation { .. } => None,
+        | StreamErrorContext::StreamIncarnation { .. }
+        | StreamErrorContext::LatestSnapshot { .. } => None,
     })
 }
 
@@ -458,6 +459,59 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
                 _ => None,
             });
         insert_incarnation_mismatch(headers, IncarnationMismatch { current });
+    }
+    // A refused snapshot publish names the latest snapshot (#581 section 3).
+    if let Some(latest) = err
+        .stream_error_context()
+        .iter()
+        .find_map(|context| match context {
+            StreamErrorContext::LatestSnapshot { offset, digest } => Some((*offset, digest)),
+            _ => None,
+        })
+    {
+        match snapshot_ref(latest.0, latest.1) {
+            Ok(latest) => SnapshotPublishAnswer::Conflict { latest }
+                .render(|name, value| insert_header_str(headers, name, value)),
+            Err(err) => {
+                tracing::error!(error = %err, "a latest snapshot outside the protocol's range")
+            }
+        }
+    }
+}
+
+/// A published snapshot as the header crate types it. `Err` only for a
+/// digest that is not BLAKE3 hex, which the state machine never stores.
+pub(crate) fn snapshot_ref(offset: u64, digest: &str) -> Result<SnapshotRef, HeaderError> {
+    Ok(SnapshotRef {
+        offset: Offset::from_u64(offset),
+        digest: SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest)?,
+    })
+}
+
+/// The `204` of a published snapshot, by this request or an identical
+/// earlier one.
+pub(crate) fn snapshot_published_response(offset: u64, digest: &str, incarnation: u64) -> Response {
+    let answer = snapshot_ref(offset, digest).and_then(|snapshot| {
+        Ok(SnapshotPublishAnswer::Published {
+            snapshot,
+            incarnation: Incarnation::try_from(incarnation)?,
+        })
+    });
+    match answer {
+        Ok(answer) => {
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            answer.render(|name, value| insert_header_str(&mut headers, name, value));
+            (StatusCode::NO_CONTENT, headers).into_response()
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "a published snapshot outside the protocol's range");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot answer outside the protocol's range",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -729,7 +783,14 @@ pub(crate) fn read_response(
     (StatusCode::OK, headers, response.payload).into_response()
 }
 
-pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
+/// The status and headers of a snapshot read: `200`, or for a request with
+/// a byte range `206` or `416` with its `Content-Range`. The snapshot
+/// headers describe the whole snapshot either way: its digest covers the
+/// whole body, never the range (extensions Section 2.5).
+pub(crate) fn snapshot_head(
+    response: &ReadSnapshotResponse,
+    range: Option<ContentRange>,
+) -> (StatusCode, HeaderMap) {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, &response.content_type);
@@ -740,7 +801,16 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
     if response.up_to_date {
         insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     }
-    (StatusCode::OK, headers, response.payload).into_response()
+    insert_static(&mut headers, names::ACCEPT_RANGES, ACCEPT_RANGES_BYTES);
+    let Some(range) = range else {
+        return (StatusCode::OK, headers);
+    };
+    range.render(|name, value| insert_header_str(&mut headers, name, value));
+    let status = match range {
+        ContentRange::Partial(_) => StatusCode::PARTIAL_CONTENT,
+        ContentRange::Unsatisfied { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
+    };
+    (status, headers)
 }
 
 pub(crate) fn bootstrap_response(response: BootstrapStreamResponse) -> Response {

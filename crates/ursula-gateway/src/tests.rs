@@ -785,6 +785,12 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             Action::PublishSnapshot,
             Some("orders"),
         ),
+        (
+            "POST",
+            "/owner-a/orders/snapshot/42/parts",
+            Action::PublishSnapshot,
+            Some("orders"),
+        ),
     ];
 
     for (method, uri, expected_action, expected_stream) in cases {

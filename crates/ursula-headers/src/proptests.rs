@@ -468,8 +468,8 @@ proptest! {
     }
 
     #[test]
-    fn manifests_round_trip(parts in vec(part_id(), 1..64)) {
-        let manifest = PartsManifest::new(parts).unwrap();
+    fn manifests_round_trip(parts in proptest::collection::hash_set(part_id(), 1..64)) {
+        let manifest = PartsManifest::new(parts.into_iter().collect()).unwrap();
         let body = manifest.render();
         prop_assert_eq!(PartsManifest::parse(manifest.count(), body.as_bytes()), Ok(manifest));
     }

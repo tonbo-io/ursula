@@ -26,8 +26,9 @@ use crate::history::incarnation_token;
 /// was written since its group's latest history event, `group_history`. A
 /// stream not written since keeps naming the history it was last written
 /// in, through any number of events: its whole tail is inherited from that
-/// history (W5). The one rule `HEAD`, the first write after an event and an
-/// import all follow (#581 section 4.8, extensions section 2.4).
+/// history (W5). The one rule `HEAD` and the first write after an event
+/// follow, and an import keeps each stream's history so that it holds there
+/// too (#581 section 4.8, extensions section 2.4).
 pub(super) fn written_since_event(stream_history: u64, group_history: u64) -> bool {
     stream_history == group_history
 }

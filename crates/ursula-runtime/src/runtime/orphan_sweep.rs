@@ -31,6 +31,12 @@
 //! sweep logs an error and counts `cold_orphan_uncovered_chunks_kept` for an
 //! operator to repair the stream's cold index.
 //!
+//! Staged snapshot parts (#581 section 3.1) live in a group directory per
+//! bucket (`{bucket}/_parts/{group:08x}/`), which the cycle lists with the
+//! pack directories, so the parts of a deleted or expired stream are swept
+//! too. No state references a part and it holds no stream bytes, so the
+//! guards below do not apply to it.
+//!
 //! External payloads carry no range in their name, so the same guard works
 //! per stream: an unreferenced external payload of a stream is deleted only
 //! when the stream's retained bytes `[retained, tail)` are fully covered by
@@ -60,6 +66,7 @@ use crate::cold_store::cold_chunk_file_range;
 use crate::cold_store::cold_external_dir;
 use crate::cold_store::is_cold_chunk_file_name;
 use crate::cold_store::is_external_payload_file_name;
+use crate::cold_store::is_snapshot_part_object_name;
 use crate::error::RuntimeError;
 
 /// A live chunk directory, its stream's cold range and the byte ranges its
@@ -69,6 +76,14 @@ type ChunkGuard = (String, (u64, u64), Vec<(u64, u64)>);
 /// A stream's external directory and, when its retained bytes are not fully
 /// covered, the first uncovered range (RT6).
 type ExternalGuard = (String, Option<(u64, u64)>);
+
+/// The most snapshot parts a cycle lists in one part directory. A tenant
+/// can stage parts cheaply, so a cycle bounds what it lists and handles.
+/// The next cycle lists the page after it, from a cursor per directory, so
+/// young parts early in key order never hide older ones behind them: every
+/// part is visited within `parts / COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR + 1`
+/// cycles.
+pub const COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR: usize = 4096;
 
 /// Default age below which the sweep never deletes an object.
 pub const COLD_ORPHAN_SWEEP_GRACE_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -122,6 +137,17 @@ impl ShardRuntime {
         for dir in &listing_plan.pack_dirs {
             for name in cold_store.list_file_names(dir).await.map_err(cold_io)? {
                 if is_external_payload_file_name(&name) {
+                    aged.push((format!("{dir}{name}"), name));
+                }
+            }
+        }
+        // A staged snapshot part is garbage once its grace passed, whether
+        // its stream lives or not: no state ever references one (#581
+        // section 3.1).
+        for dir in &listing_plan.part_dirs {
+            let names = self.list_part_page(cold_store, dir).await?;
+            for name in names {
+                if is_snapshot_part_object_name(&name) {
                     aged.push((format!("{dir}{name}"), name));
                 }
             }
@@ -307,6 +333,42 @@ impl ShardRuntime {
             }
         }
         report
+    }
+
+    /// The next page of a part directory's walk: the names after its
+    /// cursor. A short page ends the walk, and the next cycle starts over.
+    async fn list_part_page(
+        &self,
+        cold_store: &ColdStoreHandle,
+        dir: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let after = self
+            .cold_part_sweep
+            .lock()
+            .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
+                message: "cold part sweep cursor lock poisoned".to_owned(),
+            })?
+            .get(dir)
+            .cloned();
+        let names = cold_store
+            .list_file_names_after(dir, after.as_deref(), COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR)
+            .await
+            .map_err(cold_io)?;
+        let mut cursors =
+            self.cold_part_sweep
+                .lock()
+                .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
+                    message: "cold part sweep cursor lock poisoned".to_owned(),
+                })?;
+        match names.last() {
+            Some(last) if names.len() >= COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR => {
+                cursors.insert(dir.to_owned(), last.clone());
+            }
+            _ => {
+                cursors.remove(dir);
+            }
+        }
+        Ok(names)
     }
 
     fn set_cold_orphan_sweep_cursor(
