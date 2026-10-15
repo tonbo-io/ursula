@@ -89,9 +89,7 @@ Simulation seams:
 
 | Family | Seeds | Layer | Faults | Invariant | CI |
 | --- | --- | --- | --- | --- | --- |
-| `leader-read-linearizability` | 360-364 | HTTP + runtime + 3-node Raft | brief partition, leader isolation, failover | `producer_repeats_are_exactly_once` | every key applies one body once: a resend after an unknown outcome or a client timeout is answered as a repeat, a clone with another `Producer-Digest` gets `key-conflict`, and the stream holds each key's body exactly once where its receipt says. Negative controls in `write_keys.rs` tests: writes without digests, a renumbering client | `producer-repeats-exactly-once*` |
-| `idle_expiry_cannot_reopen_an_epoch` | after a producer retires, a writer with `Stream-Incarnation` never applies a write of its retired epoch again, across a leader kill, and a claim above the floor applies. Negative control: the stale writer without the token | `idle-expiry-cannot-reopen-an-epoch` |
-| `leader_read_linearizable` | PR, nightly |
+| `leader-read-linearizability` | 360-364 | HTTP + runtime + 3-node Raft | brief partition, leader isolation, failover | `leader_read_linearizable` | PR, nightly |
 | `leader-read-linearizability-extended` | 700-799 | same | same | `leader_read_linearizable` | nightly |
 | `producer-repeats-exactly-once` | 365-369 | HTTP + runtime + 3-node Raft | leader deposed with a write in flight, client timeouts, duplicated and delayed resends, clones | `producer_repeats_are_exactly_once` | PR, nightly |
 | `producer-repeats-exactly-once-extended` | 800-849 | same | same | `producer_repeats_are_exactly_once` | nightly |
@@ -170,6 +168,8 @@ Each invariant helper records `SimEvent::InvariantFailed { invariant, ... }` in 
 | Invariant | Observes | Families |
 | --- | --- | --- |
 | `leader_read_linearizable` | a leader read that answers 200 reflects every append acknowledged before it, a leader cut off from quorum answers 503 | `leader-read-linearizability*` |
+| `producer_repeats_are_exactly_once` | every key applies one body once: a resend after an unknown outcome or a client timeout is answered as a repeat, a clone with another `Producer-Digest` gets `key-conflict`, and the stream holds each key's body exactly once where its receipt says. Negative controls in `write_keys.rs` tests: writes without digests, a renumbering client | `producer-repeats-exactly-once*` |
+| `idle_expiry_cannot_reopen_an_epoch` | after a producer retires, a writer with `Stream-Incarnation` never applies a write of its retired epoch again, across a leader kill, and a claim above the floor applies. Negative control: the stale writer without the token | `idle-expiry-cannot-reopen-an-epoch` |
 | `leader_failover_no_loss_or_dup` | all nodes read exactly the pre- and post-failover payload | `leader-failover` |
 | `raft_partition_follower_catchup` | an isolated follower catches up after heal | `raft-partition-failures` |
 | `cold_live_read_consistency` | cold plus hot reads equal the committed payload on every node | cold-path seeds |
