@@ -635,8 +635,9 @@ impl RaftGroupHandleRegistry {
         let job = rejoin.clone();
         let history = entry.history.clone();
         // m1 (#581 review): the job, with its rollback, runs in a task of
-        // its own. A caller that stops waiting, such as an HTTP request
-        // whose client went away, never cancels it half way.
+        // its own, so a caller that stops waiting never cancels it half
+        // way. The restart that follows a cut runs in the caller's future:
+        // the HTTP route runs in the admin fence's own task (n6).
         let job = crate::rt::spawn(async move {
             owner
                 .call(move |raft| async move {
@@ -925,6 +926,7 @@ impl RaftGroupHandleRegistry {
                         history: None,
                         recovery: None,
                         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
+                        leads_live: false,
                     });
                     continue;
                 }
@@ -993,6 +995,7 @@ impl RaftGroupHandleRegistry {
                             crate::log_store::PlanCut::Pending { .. }
                         ),
                     }),
+                leads_live: crate::rejoin::leads_live(&metrics),
                 recovery_gate: entry
                     .recovery
                     .as_ref()
@@ -1603,6 +1606,89 @@ mod tests {
                 .unwrap(),
             );
         snapshot
+    }
+
+    /// M1 of the third #581 review: a replica holding a recovery plan takes
+    /// no full snapshot and no append from a leader at or below the plan
+    /// term, a leader elected before the plan, and refuses it typed. A
+    /// leader above the plan term is not fenced.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_replica_holding_a_plan_takes_no_snapshot_from_a_leader_before_it() {
+        let store = Arc::new(FailingReferenceStore::default());
+        let (registry, engine, _root) = reference_failure_engine(store).await;
+        let gate_root = tempfile::tempdir().expect("gate WAL root");
+        let gate_store = crate::log_store::RaftWal::start(
+            gate_root.path(),
+            ursula_config::WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 8).expect("valid topology"),
+        )
+        .unwrap()
+        .open(
+            ShardPlacement {
+                core_id: ursula_shard::CoreId(0),
+                shard_id: ursula_shard::ShardId(0),
+                raft_group_id: RaftGroupId(7),
+            },
+            ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
+        )
+        .unwrap();
+        let gate = Arc::new(
+            crate::GroupRejoin::durable(1, RaftGroupId(7), &gate_store)
+                .await
+                .expect("open the gate"),
+        );
+        engine.publish_recovery(gate.clone(), &registry).unwrap();
+        gate.hold_plan(&crate::log_store::RecoveryRecord {
+            leader: 2,
+            point: 1,
+            leader_term: 7,
+            cut: crate::log_store::PlanCut::NoCut,
+        });
+        let fenced = |error: &GroupEngineError| {
+            matches!(
+                error,
+                GroupEngineError::Infra(ursula_runtime::GroupInfraError::RecoveryPlanFenced {
+                    raft_group_id: RaftGroupId(7),
+                    plan_term: 7,
+                })
+            )
+        };
+        for term in [5, 7] {
+            let installed = registry
+                .install_full_snapshot(
+                    RaftGroupId(7),
+                    crate::UrsulaVote::new_committed(term, 2),
+                    reference_failure_snapshot(),
+                )
+                .await;
+            assert!(
+                matches!(&installed, Err(SnapshotInstallError::Group(error)) if fenced(error)),
+                "term {term}: {installed:?}"
+            );
+            let appended = registry
+                .append_entries(RaftGroupId(7), openraft::raft::AppendEntriesRequest {
+                    vote: crate::UrsulaVote::new_committed(term, 2),
+                    prev_log_id: None,
+                    entries: Vec::new(),
+                    leader_commit: None,
+                })
+                .await;
+            assert!(
+                matches!(&appended, Err(error) if fenced(error)),
+                "term {term}: {appended:?}"
+            );
+        }
+        let above = registry
+            .append_entries(RaftGroupId(7), openraft::raft::AppendEntriesRequest {
+                vote: crate::UrsulaVote::new_committed(8, 2),
+                prev_log_id: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            })
+            .await;
+        assert!(!matches!(&above, Err(error) if fenced(error)), "{above:?}");
+        engine.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]

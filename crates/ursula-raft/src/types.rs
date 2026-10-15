@@ -106,6 +106,8 @@ pub struct RaftGroupMetricsSnapshot {
     pub recovery: Option<ursula_proto::admin::RaftGroupRecovery>,
     /// The replica's recovery gate for this group.
     pub recovery_gate: ursula_proto::admin::RecoveryGateStatus,
+    /// The replica leads with a quorum that acknowledged it lately.
+    pub leads_live: bool,
 }
 
 pub use ursula_proto::admin::RaftGroupMaintenanceState;

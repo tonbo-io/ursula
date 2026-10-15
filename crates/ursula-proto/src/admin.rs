@@ -281,10 +281,12 @@ pub struct RecoveryPlanRequest {
 pub enum PlanStep {
     /// To the plan's leader, first: it takes the plan and answers its plan
     /// term ([`RecoveryPlanReport::leader_term`]). `highest_term` is the
-    /// highest `current_term` the tool read on any replica it reached: no
-    /// leader elected before the plan had a higher term, since every quorum
-    /// meets those replicas. The plan term is the higher of it and the
-    /// leader's own vote term.
+    /// highest `current_term` the tool read on any replica it reached. The
+    /// plan term is the higher of it and the leader's own vote term: a
+    /// leader at or below it gets nothing applied after the plan, and one
+    /// above it cannot make the plan's leader win, since every replica that
+    /// may vote for it either holds the plan or is open and unplanned and
+    /// refuses a log behind its own.
     Lead { highest_term: u64 },
     /// To every other member, after the leader took the plan: it votes for
     /// the leader only at a term above `leader_term`, which only campaigns
@@ -334,6 +336,21 @@ pub enum RecoveryPlanRefusal {
     CutRefused,
     /// The replica's log store closed.
     StoreClosed,
+    /// The replica is taking another recovery plan.
+    PlanInFlight,
+}
+
+impl RecoveryPlanRefusal {
+    /// Whether no plan can fix the refusal: a replica that lost its vote
+    /// needs a quorum's proof first, a plan naming a node outside the
+    /// membership the replica holds stays refused, and a step that is not
+    /// the replica's is a bug in the tool.
+    pub fn no_plan_fixes(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingVoteFloor | Self::LeaderNotVoter | Self::StepMismatch
+        )
+    }
 }
 
 /// What a recovery plan did on one replica.
@@ -952,6 +969,10 @@ pub struct RaftGroupMetrics {
     pub recovery: Option<RaftGroupRecovery>,
     /// The replica's recovery gate for this group: `open` when it has none.
     pub recovery_gate: RecoveryGateStatus,
+    /// The replica leads the group, and a quorum acknowledged it within the
+    /// last 3 seconds. A leader that lost its quorum stays a leader in its
+    /// own metrics; this says it is not live (m2, #581 review).
+    pub leads_live: bool,
 }
 
 /// The history event a replica applied last.
@@ -1039,6 +1060,7 @@ mod metrics_contract_tests {
                 history: None,
                 recovery: None,
                 recovery_gate: RecoveryGateStatus::Open,
+                leads_live: false,
             }],
         }
     }

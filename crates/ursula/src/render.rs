@@ -659,6 +659,7 @@ pub(crate) fn raft_group_metrics(
         history: value.history,
         recovery: value.recovery,
         recovery_gate: value.recovery_gate,
+        leads_live: value.leads_live,
     }
 }
 

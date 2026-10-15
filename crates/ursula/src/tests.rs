@@ -6311,21 +6311,21 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         // m1 (#581 review): a request whose client goes away mid-plan does
         // not cancel it. The job runs to its end in a task of its own: here
         // it takes the plan, durably and in memory alike.
+        /// A plan without a cut restarts nothing.
+        struct NoRestart;
+        impl ursula_raft::ReplicaRestart for NoRestart {
+            fn restart_replica(
+                &mut self,
+                raft_group_id: RaftGroupId,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Option<Arc<ursula_raft::GroupRejoin>>, ursula_runtime::RuntimeError>,
+            > {
+                panic!("a plan without a cut restarted group {raft_group_id:?}")
+            }
+        }
         let pause = gate.pause_plans_after_the_fence();
         {
-            /// A plan without a cut restarts nothing.
-            struct NoRestart;
-            impl ursula_raft::ReplicaRestart for NoRestart {
-                fn restart_replica(
-                    &mut self,
-                    raft_group_id: RaftGroupId,
-                ) -> futures_util::future::BoxFuture<
-                    '_,
-                    Result<Option<Arc<ursula_raft::GroupRejoin>>, ursula_runtime::RuntimeError>,
-                > {
-                    panic!("a plan without a cut restarted group {raft_group_id:?}")
-                }
-            }
             let mut no_restart = NoRestart;
             let taking = plan(seen);
             let mut call = std::pin::pin!(registry.accept_recovery_plan(
@@ -6365,6 +6365,44 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 gate.status()
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // m4 (#581 review): one accept job at a time. A second accept while
+        // the first one runs is refused, typed, and changes nothing; the
+        // first one then takes its plan.
+        {
+            let pause = gate.pause_plans_after_the_fence();
+            let taking = plan(seen);
+            let mut first_restart = NoRestart;
+            let mut first = std::pin::pin!(registry.accept_recovery_plan(
+                RaftGroupId(0),
+                &taking,
+                &mut first_restart
+            ));
+            while !gate.plan_job_running() {
+                assert!(futures_util::poll!(first.as_mut()).is_pending());
+                tokio::task::yield_now().await;
+            }
+            let mut second_restart = NoRestart;
+            let second = registry
+                .accept_recovery_plan(RaftGroupId(0), &taking, &mut second_restart)
+                .await
+                .expect_err("a second accept while one runs");
+            assert!(
+                matches!(second, ursula_raft::RecoveryGateError::PlanInFlight { .. }),
+                "{second:?}"
+            );
+            assert_eq!(
+                second.refusal(),
+                Some(ursula_proto::admin::RecoveryPlanRefusal::PlanInFlight)
+            );
+            pause.add_permits(1 << 20);
+            let report = first.await.expect("the first accept takes its plan");
+            assert_eq!(
+                report.outcome,
+                ursula_proto::admin::RecoveryPlanOutcome::Leads
+            );
+            assert!(!gate.plan_job_running());
         }
 
         // The plan elects this replica: its gate campaigns but votes for no
@@ -6680,6 +6718,7 @@ fn raft_metrics_snapshot(
         history: None,
         recovery: None,
         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
+        leads_live: false,
     }
 }
 

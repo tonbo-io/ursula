@@ -82,13 +82,16 @@ enum Owed {
     /// The group's genesis.
     Genesis,
     /// The event of the recovery plan at `point`.
-    Plan { point: u64 },
+    Plan { point: u64, leader_term: u64 },
 }
 
 /// What a replica that applied `applied` and holds `plan` owes, if it leads.
 fn owed(applied: Option<HistoryEvent>, plan: Option<&RecoveryRecord>) -> Option<Owed> {
     match plan {
-        Some(plan) if !plan_satisfied(plan, applied) => Some(Owed::Plan { point: plan.point }),
+        Some(plan) if !plan_satisfied(plan, applied) => Some(Owed::Plan {
+            point: plan.point,
+            leader_term: plan.leader_term,
+        }),
         Some(_) => None,
         None => applied.is_none().then_some(Owed::Genesis),
     }
@@ -306,8 +309,17 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
                 }
             }
         }
+        // A plan's event comes only from a leader elected under the plan,
+        // above its term: a leader elected before it, such as a stale one
+        // whose restart for the plan is under way, never proposes it, since
+        // its entry above the point would make the members refuse the
+        // plan's leader (M2 of the third #581 review).
         let owed = leader_applied_own_term(&metrics.borrow_watched())
             .zip(owed(history.applied(), history.plan().as_ref()))
+            .filter(|(term, debt)| match debt {
+                Owed::Plan { leader_term, .. } => *term > *leader_term,
+                Owed::Genesis => true,
+            })
             .filter(|debt| proposed != Some(*debt));
         if let Some((term, debt)) = owed {
             proposed = Some((term, debt));

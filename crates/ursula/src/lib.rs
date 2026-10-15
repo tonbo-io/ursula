@@ -2745,6 +2745,15 @@ pub(crate) async fn accept_unsynced_loss(
         )
             .into_response();
     };
+    // The node's own id: the one its config names, or its replica's.
+    let Some(node_id) = state.configured_node_id.or_else(|| {
+        registry
+            .rejoin(raft_group_id)
+            .map(|rejoin| rejoin.node_id())
+    }) else {
+        let err = ursula_raft::RecoveryGateError::NotRegistered { raft_group_id };
+        return (StatusCode::NOT_FOUND, err.to_string()).into_response();
+    };
     // The admin fence runs this handler in a task of its own, so a client
     // that goes away cancels neither the plan nor the group's restart, and
     // the registry runs the plan's job in its own task too (m1, #581
@@ -2756,31 +2765,31 @@ pub(crate) async fn accept_unsynced_loss(
     let accepted = registry
         .accept_recovery_plan(raft_group_id, &plan, &mut restart)
         .await;
-    match accepted {
-        Ok(report) => (StatusCode::OK, axum::Json(report)).into_response(),
-        Err(err @ ursula_raft::RecoveryGateError::NotRegistered { .. }) => {
-            (StatusCode::NOT_FOUND, err.to_string()).into_response()
-        }
+    let err = match accepted {
+        Ok(report) => return (StatusCode::OK, axum::Json(report)).into_response(),
+        Err(err) => err,
+    };
+    match err.answer() {
         // m3 (#581 review): a refusal answers its typed reason.
-        Err(err) if let Some(refusal) = err.refusal() => (
+        ursula_raft::PlanAnswer::Refused(refusal) => (
             StatusCode::CONFLICT,
             axum::Json(ursula_proto::admin::RecoveryPlanRefused {
                 raft_group_id: u64::from(raft_group_id.0),
-                node_id: registry
-                    .rejoin(raft_group_id)
-                    .map_or(0, |rejoin| rejoin.node_id()),
+                node_id,
                 refusal,
                 message: err.to_string(),
             }),
         )
             .into_response(),
-        Err(
-            err @ (ursula_raft::RecoveryGateError::Record { .. }
-            | ursula_raft::RecoveryGateError::Cut { .. }
-            | ursula_raft::RecoveryGateError::Restart { .. }
-            | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
-        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-        Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response(),
+        ursula_raft::PlanAnswer::NotRegistered => {
+            (StatusCode::NOT_FOUND, err.to_string()).into_response()
+        }
+        ursula_raft::PlanAnswer::Failed => {
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+        ursula_raft::PlanAnswer::Unavailable => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
     }
 }
 

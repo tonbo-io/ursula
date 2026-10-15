@@ -87,6 +87,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::Instant as _;
@@ -131,6 +133,17 @@ pub const RECOVERY_STALL_AFTER: Duration = Duration::from_secs(30);
 /// A leader whose quorum acknowledged it within this long is live: a
 /// recovery plan refuses to fence its group (#577 N7).
 pub(crate) const LIVE_LEADER_QUORUM_ACK: Duration = Duration::from_secs(3);
+
+/// Whether the replica whose metrics are `metrics` leads with a quorum that
+/// acknowledged it within [`LIVE_LEADER_QUORUM_ACK`]. A leader that lost its
+/// quorum stays in OpenRaft's leader state.
+pub fn leads_live(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
+    metrics.state == openraft::ServerState::Leader
+        && metrics
+            .last_quorum_acked
+            .as_ref()
+            .is_some_and(|acked| acked.elapsed() < LIVE_LEADER_QUORUM_ACK)
+}
 
 /// How long one membership step of the heal driver may take.
 pub(crate) const RECOVERY_BARRIER_TIMEOUT: Duration = Duration::from_secs(3);
@@ -207,9 +220,8 @@ pub(crate) enum VoteGate {
     /// A recovery plan elects `leader`: the replica votes only for it, and
     /// does not campaign, until the plan's history event applies here.
     /// `leader_term` is the plan term: no lower than the vote term of every
-    /// replica the tool reached and of the leader when it took the plan, so
-    /// no leader elected before the plan had a higher term (any quorum
-    /// meets the replicas the tool reached). The vote goes to the leader
+    /// replica the tool reached, the plan's members included, and of the
+    /// leader when it took the plan. The vote goes to the leader
     /// only in an election above the plan term, one it started after it
     /// took the plan (N1, #581 review), and only while its log holds no
     /// entry above `point` at a term at or below the plan term: such an
@@ -733,6 +745,12 @@ pub enum RecoveryGateError {
         .raft_group_id.0
     )]
     JobAborted { raft_group_id: RaftGroupId },
+    #[error(
+        "raft group {}'s replica on this node is taking another recovery plan; observe the group \
+         again once it answered",
+        .raft_group_id.0
+    )]
+    PlanInFlight { raft_group_id: RaftGroupId },
     #[error("run the recovery cut of raft group {}: {source}", .raft_group_id.0)]
     Cut {
         raft_group_id: RaftGroupId,
@@ -751,8 +769,17 @@ impl RecoveryGateError {
     /// The refusal this error answers with a `409 Conflict`, when it is one:
     /// the replica changed nothing (m3, #581 review).
     pub fn refusal(&self) -> Option<ursula_proto::admin::RecoveryPlanRefusal> {
+        match self.answer() {
+            PlanAnswer::Refused(refusal) => Some(refusal),
+            PlanAnswer::NotRegistered | PlanAnswer::Failed | PlanAnswer::Unavailable => None,
+        }
+    }
+
+    /// How the node answers this error, decided for every variant here so
+    /// that a new one cannot fall into a default (n5, #581 review).
+    pub fn answer(&self) -> PlanAnswer {
         use ursula_proto::admin::RecoveryPlanRefusal;
-        Some(match self {
+        PlanAnswer::Refused(match self {
             Self::MissingVoteFloor { .. } => RecoveryPlanRefusal::MissingVoteFloor,
             Self::LeadsLive { .. } => RecoveryPlanRefusal::LeadsLive,
             Self::FollowsLeader { leader, .. } => {
@@ -768,16 +795,30 @@ impl RecoveryGateError {
             Self::CommittedEntryMissing { .. } => RecoveryPlanRefusal::CommittedEntryMissing,
             Self::CutRefused { .. } => RecoveryPlanRefusal::CutRefused,
             Self::StoreClosed { .. } => RecoveryPlanRefusal::StoreClosed,
+            Self::PlanInFlight { .. } => RecoveryPlanRefusal::PlanInFlight,
+            Self::NotRegistered { .. } => return PlanAnswer::NotRegistered,
             Self::Record { .. }
             | Self::Cut { .. }
             | Self::Restart { .. }
-            | Self::StartAsFollower { .. }
-            | Self::OwnerStopped { .. }
-            | Self::NotStarted { .. }
-            | Self::JobAborted { .. }
-            | Self::NotRegistered { .. } => return None,
+            | Self::StartAsFollower { .. } => return PlanAnswer::Failed,
+            Self::OwnerStopped { .. } | Self::NotStarted { .. } | Self::JobAborted { .. } => {
+                return PlanAnswer::Unavailable;
+            }
         })
     }
+}
+
+/// How a node answers a recovery plan it did not take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanAnswer {
+    /// `409 Conflict`: the replica refused it and changed nothing.
+    Refused(ursula_proto::admin::RecoveryPlanRefusal),
+    /// `404 Not Found`: the group has no replica here.
+    NotRegistered,
+    /// `500 Internal Server Error`: a write or the restart failed.
+    Failed,
+    /// `503 Service Unavailable`: the replica is not running.
+    Unavailable,
 }
 
 /// Restarts one group's replica on this node: stops its engine, so its Raft
@@ -811,6 +852,24 @@ impl fmt::Display for PointBasis {
             Self::LastLogIndex => "last log index",
             Self::CommittedIndex => "committed index",
         })
+    }
+}
+
+/// The claim of a replica's one accept job, released when dropped.
+struct PlanJob<'a>(&'a AtomicBool);
+
+impl<'a> PlanJob<'a> {
+    fn claim(in_flight: &'a AtomicBool) -> Option<Self> {
+        in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then_some(Self(in_flight))
+    }
+}
+
+impl Drop for PlanJob<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -904,6 +963,9 @@ pub struct GroupRejoin {
     /// the gate, so a test can drop its caller mid-job.
     #[cfg(any(test, feature = "fault-injection"))]
     plan_pause: Mutex<Option<Arc<crate::rt::sync::Semaphore>>>,
+    /// An accept job runs on this replica (m4, #581 review): a second one is
+    /// refused until it ends, so two never interleave.
+    plan_in_flight: AtomicBool,
 }
 
 impl fmt::Debug for GroupRejoin {
@@ -1071,6 +1133,7 @@ impl GroupRejoin {
             stall_after: OnceLock::new(),
             #[cfg(any(test, feature = "fault-injection"))]
             plan_pause: Mutex::new(None),
+            plan_in_flight: AtomicBool::new(false),
         })
     }
 
@@ -1086,6 +1149,12 @@ impl GroupRejoin {
         pause
     }
 
+    /// Test-only: whether an accept job runs on this replica.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn plan_job_running(&self) -> bool {
+        self.plan_in_flight.load(Ordering::SeqCst)
+    }
+
     /// The node this replica runs on.
     pub fn node_id(&self) -> u64 {
         self.node_id
@@ -1093,6 +1162,12 @@ impl GroupRejoin {
 
     pub fn raft_group_id(&self) -> RaftGroupId {
         self.raft_group_id
+    }
+
+    /// Test-only: the replica holds `record`'s gate, as after taking it.
+    #[cfg(test)]
+    pub(crate) fn hold_plan(&self, record: &RecoveryRecord) {
+        *self.gate() = VoteGate::planned(record, self.node_id);
     }
 
     fn gate(&self) -> std::sync::MutexGuard<'_, VoteGate> {
@@ -1368,6 +1443,10 @@ impl GroupRejoin {
         history: &crate::history::GroupHistory,
     ) -> Result<PlanTaken, RecoveryGateError> {
         let raft_group_id = self.raft_group_id;
+        // m4 (#581 review): one accept job at a time. A second one would
+        // read the first one's provisional gate as the state to restore.
+        let _job = PlanJob::claim(&self.plan_in_flight)
+            .ok_or(RecoveryGateError::PlanInFlight { raft_group_id })?;
         if self.needs_vote_floor() {
             return Err(RecoveryGateError::MissingVoteFloor { raft_group_id });
         }
@@ -1392,12 +1471,7 @@ impl GroupRejoin {
         // #577 N7 and M2 (#581 review): a plan never fences a group that
         // has a live leader, whether this replica leads it with a recent
         // quorum or follows it.
-        if metrics.state == openraft::ServerState::Leader
-            && metrics
-                .last_quorum_acked
-                .as_ref()
-                .is_some_and(|acked| acked.elapsed() < LIVE_LEADER_QUORUM_ACK)
-        {
+        if leads_live(&metrics) {
             return Err(RecoveryGateError::LeadsLive { raft_group_id });
         }
         if let Some(leader) = self.follows_live_leader() {
@@ -1489,8 +1563,12 @@ impl GroupRejoin {
         let provisional = RecoveryRecord {
             leader: plan.leader,
             point: plan.point,
+            // n3 (#581 review): the leader's vote term as its metrics show
+            // it bounds the plan term from below already.
             leader_term: match plan.step {
-                PlanStep::Lead { highest_term } => highest_term,
+                PlanStep::Lead { highest_term } => {
+                    highest_term.max(metrics.vote.leader_id().term())
+                }
                 PlanStep::Follow { leader_term } => leader_term,
             },
             cut: PlanCut::NoCut,
@@ -1598,11 +1676,14 @@ impl GroupRejoin {
             PlanCut::NoCut
         };
         let leader_term = match plan.step {
-            // M1 (#581 review): the plan term bounds every leader elected
-            // before the plan: the highest vote term the tool read on the
-            // replicas it reached (any quorum meets them), and this
-            // replica's own vote term, which covers every campaign it
-            // started before the plan. No vote is cast for it (M2).
+            // M1 (#581 review): the plan term is at least every vote term
+            // the tool read, a plan member's included, and this replica's
+            // own, which covers every campaign it started before the plan.
+            // A leader at or below it is fenced and guarded. One above it
+            // needed votes from replicas that hold no plan: open ones refuse
+            // a log behind their own, closed and wiped ones vote for no one,
+            // so it cannot get the plan's leader elected over its entries.
+            // No vote is cast for the plan term (M2).
             PlanStep::Lead { highest_term } => highest_term.max(state.vote_term),
             PlanStep::Follow { leader_term } => leader_term,
         };
