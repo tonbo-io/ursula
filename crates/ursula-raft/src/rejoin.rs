@@ -751,6 +751,22 @@ pub enum RecoveryGateError {
         .raft_group_id.0
     )]
     PlanInFlight { raft_group_id: RaftGroupId },
+    #[error(
+        "raft group {} has one voter: a recovery plan never cuts its log, since no other voter \
+         could have overwritten an entry it holds",
+        .raft_group_id.0
+    )]
+    SingleVoterCut { raft_group_id: RaftGroupId },
+    #[error(
+        "raft group {}'s recovery plan names plan term {leader_term}, below the vote term \
+         {current_term} the tool read on this replica: send the plan term the leader answered",
+        .raft_group_id.0
+    )]
+    PlanTermBelowVote {
+        raft_group_id: RaftGroupId,
+        leader_term: u64,
+        current_term: u64,
+    },
     #[error("run the recovery cut of raft group {}: {source}", .raft_group_id.0)]
     Cut {
         raft_group_id: RaftGroupId,
@@ -796,6 +812,8 @@ impl RecoveryGateError {
             Self::CutRefused { .. } => RecoveryPlanRefusal::CutRefused,
             Self::StoreClosed { .. } => RecoveryPlanRefusal::StoreClosed,
             Self::PlanInFlight { .. } => RecoveryPlanRefusal::PlanInFlight,
+            Self::SingleVoterCut { .. } => RecoveryPlanRefusal::SingleVoterCut,
+            Self::PlanTermBelowVote { .. } => RecoveryPlanRefusal::PlanTermBelowVote,
             Self::NotRegistered { .. } => return PlanAnswer::NotRegistered,
             Self::Record { .. }
             | Self::Cut { .. }
@@ -1459,6 +1477,17 @@ impl GroupRejoin {
             .ok_or(RecoveryGateError::NotStarted { raft_group_id })?;
         let leads = plan.leader == self.node_id;
         match (plan.step, leads) {
+            // Item 6 of the #612 review: a correct plan term is at least the
+            // highest vote term the tool read, this replica's included.
+            (PlanStep::Follow { leader_term }, false)
+                if leader_term < plan.expected.current_term =>
+            {
+                return Err(RecoveryGateError::PlanTermBelowVote {
+                    raft_group_id,
+                    leader_term,
+                    current_term: plan.expected.current_term,
+                });
+            }
             (PlanStep::Lead { .. }, true) | (PlanStep::Follow { .. }, false) => {}
             (step, _) => {
                 return Err(RecoveryGateError::StepMismatch {
@@ -1490,6 +1519,10 @@ impl GroupRejoin {
                 raft_group_id,
                 leader: plan.leader,
             });
+        }
+        // #581 section 4.5: a group with one voter never cuts.
+        if plan.cut && metrics.membership_config.membership().voter_ids().count() == 1 {
+            return Err(RecoveryGateError::SingleVoterCut { raft_group_id });
         }
         let status = self.status();
         if matches!(

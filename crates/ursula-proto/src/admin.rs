@@ -278,6 +278,7 @@ pub struct RecoveryPlanRequest {
 /// Which part of a recovery plan a request carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum PlanStep {
     /// To the plan's leader, first: it takes the plan and answers its plan
     /// term ([`RecoveryPlanReport::leader_term`]). `highest_term` is the
@@ -295,7 +296,7 @@ pub enum PlanStep {
 }
 
 /// The body of a `409 Conflict` from `accept-unsynced-loss`: why the replica
-/// refused the plan. It changed nothing.
+/// refused the plan. It changed nothing, except after `cut_refused`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryPlanRefused {
     pub raft_group_id: u64,
@@ -332,12 +333,19 @@ pub enum RecoveryPlanRefusal {
     /// The plan cuts and the replica no longer holds the entry it keeps.
     CommittedEntryMissing,
     /// The plan's cut could not run at the group's restart: the plan was
-    /// dropped and the gate stays closed.
+    /// dropped, the log recorded recovering and the gate stays closed. The
+    /// one refusal that changed the replica: it took the plan first.
     CutRefused,
     /// The replica's log store closed.
     StoreClosed,
     /// The replica is taking another recovery plan.
     PlanInFlight,
+    /// The plan cuts a group with one voter: no other voter could have
+    /// overwritten an entry it holds, so its log is kept whole.
+    SingleVoterCut,
+    /// A `follow` names a plan term below the vote term the tool read on
+    /// this replica: the term did not come from the plan's leader.
+    PlanTermBelowVote,
 }
 
 impl RecoveryPlanRefusal {

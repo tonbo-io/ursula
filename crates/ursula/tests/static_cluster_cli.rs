@@ -737,13 +737,235 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_a_recovery_plan()
     single_voter_recovery_plan(false).await;
 }
 
-/// m3 of the second #581 review: a plan that cuts runs its cut through the
+/// Item 3 of the #612 review (#581 section 4.5): a group with one voter
+/// never cuts. A cutting plan is refused, typed, and changes nothing; the
+/// plan without a cut then recovers the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_single_voter_refuses_a_cutting_plan() {
+    single_voter_recovery_plan(true).await;
+}
+
+/// m3 of the second #581 review: a plan that cuts runs its cut through each
 /// node's own in-process restart of the group (the runtime's restart task,
-/// the production engine factory and the shared registry). The group comes
+/// the production engine factory and the shared registry). Three voters lose
+/// their run state at once, come back gated and stall; the plan goes to its
+/// leader first and then to the others with its plan term. The group comes
 /// back under the plan, elects its leader and serves the kept log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_single_voter_runs_a_cutting_plan_through_its_in_process_restart() {
-    single_voter_recovery_plan(true).await;
+async fn cli_three_voters_run_a_cutting_plan_through_their_in_process_restarts() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI recovery plan test");
+        return;
+    };
+    let ports = [free_port(), free_port(), free_port()];
+    let peers: Vec<(u64, String)> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let root = tempfile::tempdir().expect("temp root");
+    let mut configs = Vec::new();
+    let mut admins = Vec::new();
+    for (index, (node_id, _)) in peers.iter().enumerate() {
+        let config_path = root.path().join(format!("node-{node_id}.toml"));
+        let log_dir = root.path().join(format!("node-{node_id}-log"));
+        let admin_port = write_cluster_config(
+            &config_path,
+            ports[index],
+            *node_id,
+            1,
+            &peers,
+            *node_id == 1,
+            &log_dir,
+        );
+        configs.push(config_path);
+        admins.push(format!("http://127.0.0.1:{admin_port}"));
+    }
+    let client = reqwest::Client::new();
+    let stream_url = format!("{}/benchcmp/cli-three-voter-cut", peers[0].1);
+    {
+        let mut children = configs
+            .iter()
+            .map(|config| spawn_node_with_cluster_config(binary, config))
+            .collect::<Vec<_>>();
+        for (_, base_url) in &peers {
+            wait_until_ready(&client, base_url, &mut children).await;
+        }
+        put_until_created(&client, &stream_url).await;
+        post_until_no_content(&client, &stream_url, "kept-by-every-voter").await;
+        read_until_replicated(
+            &client,
+            &format!(
+                "{}/benchcmp/cli-three-voter-cut?offset=0&max_bytes=64",
+                peers[2].1
+            ),
+        )
+        .await;
+        // Killed together: the page cache keeps every write, but no run
+        // state is left, so every voter comes back gated.
+    }
+    for (node_id, _) in &peers {
+        std::fs::remove_file(
+            root.path()
+                .join(format!("node-{node_id}-log"))
+                .join("raft-log")
+                .join("run-state.bin"),
+        )
+        .expect("remove the run state");
+    }
+    let mut children = configs
+        .iter()
+        .map(|config| spawn_node_with_cluster_config(binary, config))
+        .collect::<Vec<_>>();
+    for (_, base_url) in &peers {
+        wait_until_ready(&client, base_url, &mut children).await;
+    }
+    let stall_deadline = std::time::Instant::now()
+        .checked_add(ursula_raft::RECOVERY_STALL_AFTER.saturating_add(Duration::from_secs(30)))
+        .unwrap();
+    for (_, base_url) in &peers {
+        loop {
+            let ready: serde_json::Value = client
+                .get(format!("{base_url}/__ursula/ready"))
+                .send()
+                .await
+                .expect("readiness")
+                .json()
+                .await
+                .expect("readiness JSON");
+            if ready["reason"] == "recovery_stalled" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < stall_deadline,
+                "{base_url} never reported its group stalled: {ready}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    let mut views = Vec::new();
+    for admin in &admins {
+        let metrics: ursula_proto::admin::NodeMetrics = client
+            .get(format!("{admin}/__ursula/metrics"))
+            .send()
+            .await
+            .expect("metrics")
+            .json()
+            .await
+            .expect("metrics JSON");
+        let group = metrics.groups[0].clone();
+        views.push(group);
+    }
+    // The member with the greatest committed index leads, and every log is
+    // cut back to what it knew was committed.
+    let leader = views
+        .iter()
+        .max_by_key(|group| (group.committed_index, group.node_id))
+        .expect("a member")
+        .clone();
+    let point = leader
+        .committed_index
+        .expect("the leader knows its committed entry");
+    let highest_term = views
+        .iter()
+        .map(|group| group.current_term)
+        .max()
+        .unwrap_or(0);
+    let request = |group: &ursula_proto::admin::RaftGroupMetrics,
+                   step: ursula_proto::admin::PlanStep| {
+        ursula_proto::admin::RecoveryPlanRequest {
+            leader: leader.node_id,
+            point,
+            cut: true,
+            step,
+            expected: ursula_proto::admin::ReplicaLogView {
+                last_log_index: group.last_log_index,
+                last_log_term: group.last_log_term,
+                current_term: group.current_term,
+            },
+        }
+    };
+    let accept = |node_id: u64| {
+        format!(
+            "{}/__ursula/raft/0/recovery/accept-unsynced-loss",
+            admins[usize::try_from(node_id.saturating_sub(1)).expect("node index")]
+        )
+    };
+    let response = admin_test_post(&client, accept(leader.node_id))
+        .await
+        .json(&request(&leader, ursula_proto::admin::PlanStep::Lead {
+            highest_term,
+        }))
+        .send()
+        .await
+        .expect("send the plan to its leader");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let report: ursula_proto::admin::RecoveryPlanReport =
+        response.json().await.expect("typed report");
+    for member in views.iter().filter(|group| group.node_id != leader.node_id) {
+        let response = admin_test_post(&client, accept(member.node_id))
+            .await
+            .json(&request(member, ursula_proto::admin::PlanStep::Follow {
+                leader_term: report.leader_term,
+            }))
+            .send()
+            .await
+            .expect("send the plan to a member");
+        let status = response.status();
+        if status != reqwest::StatusCode::OK {
+            // The members that took it may have elected the leader already.
+            let refused: ursula_proto::admin::RecoveryPlanRefused =
+                response.json().await.expect("typed refusal");
+            assert_eq!(
+                refused.refusal,
+                ursula_proto::admin::RecoveryPlanRefusal::FollowsLeader {
+                    leader: leader.node_id
+                },
+                "{refused:?}"
+            );
+        }
+    }
+    let satisfied_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    for admin in &admins {
+        loop {
+            let metrics: ursula_proto::admin::NodeMetrics = client
+                .get(format!("{admin}/__ursula/metrics"))
+                .send()
+                .await
+                .expect("metrics")
+                .json()
+                .await
+                .expect("metrics JSON");
+            let group = &metrics.groups[0];
+            if group.recovery.is_none()
+                && group
+                    .history
+                    .is_some_and(|history| history.event_index > point)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < satisfied_deadline,
+                "{admin}: the recovery plan was never satisfied: {:?} {:?}",
+                group.history,
+                group.recovery
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let payload = read_until_replicated(
+        &client,
+        &format!(
+            "{}/benchcmp/cli-three-voter-cut?offset=0&max_bytes=64",
+            peers[0].1
+        ),
+    )
+    .await;
+    assert_eq!(payload, b"kept-by-every-voter");
+    drop(children);
 }
 
 async fn single_voter_recovery_plan(cut: bool) {
@@ -835,20 +1057,38 @@ async fn single_voter_recovery_plan(cut: bool) {
         last_log_term: group["last_log_term"].as_u64(),
         current_term: group["current_term"].as_u64().expect("current term"),
     };
-    // The tool never cuts a single voter's log, which is a prefix of the old
-    // one. A cut back to its committed entry keeps the same log, and runs
-    // through the node's in-process restart of the group.
-    let point = if cut {
-        group["committed_index"]
-            .as_u64()
-            .expect("the single voter knows its committed entry")
-    } else {
-        expected.last_log_index.unwrap_or(0)
-    };
+    // A single voter never cuts (#581 section 4.5): a cutting plan is
+    // refused, typed, and changes nothing.
+    if cut {
+        let cutting = ursula_proto::admin::RecoveryPlanRequest {
+            leader: 1,
+            point: group["committed_index"]
+                .as_u64()
+                .expect("the single voter knows its committed entry"),
+            cut: true,
+            step: ursula_proto::admin::PlanStep::Lead {
+                highest_term: expected.current_term,
+            },
+            expected,
+        };
+        let response = admin_test_post(&client, accept_url.clone())
+            .await
+            .json(&cutting)
+            .send()
+            .await
+            .expect("send the cutting plan");
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        let refused: ursula_proto::admin::RecoveryPlanRefused =
+            response.json().await.expect("typed refusal");
+        assert_eq!(
+            refused.refusal,
+            ursula_proto::admin::RecoveryPlanRefusal::SingleVoterCut
+        );
+    }
     let plan = ursula_proto::admin::RecoveryPlanRequest {
         leader: 1,
-        point,
-        cut,
+        point: expected.last_log_index.unwrap_or(0),
+        cut: false,
         step: ursula_proto::admin::PlanStep::Lead {
             highest_term: expected.current_term,
         },

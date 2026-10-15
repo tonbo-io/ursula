@@ -6110,8 +6110,14 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                         openraft::LogId::new(openraft::vote::RaftLeaderId::new(0, 0), 0),
                         openraft::EntryPayload::Membership(
                             openraft::Membership::new(
-                                vec![std::collections::BTreeSet::from([1])],
-                                BTreeMap::from([(1, openraft::BasicNode::new("local"))]),
+                                // Three voters, so that a plan may cut; only
+                                // this one runs.
+                                vec![std::collections::BTreeSet::from([1, 2, 3])],
+                                BTreeMap::from([
+                                    (1, openraft::BasicNode::new("local")),
+                                    (2, openraft::BasicNode::new("absent")),
+                                    (3, openraft::BasicNode::new("absent")),
+                                ]),
                             )
                             .expect("membership"),
                         ),
@@ -6366,6 +6372,35 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        // Item 6 of the #612 review: a `follow` whose plan term is below
+        // the vote term the tool read on the replica did not come from the
+        // plan's leader, and is refused, typed.
+        let low_term = ursula_proto::admin::RecoveryPlanRequest {
+            leader: 2,
+            step: ursula_proto::admin::PlanStep::Follow {
+                leader_term: seen.current_term.saturating_add(4),
+            },
+            expected: ursula_proto::admin::ReplicaLogView {
+                current_term: seen.current_term.saturating_add(5),
+                ..seen
+            },
+            ..plan(seen)
+        };
+        let refused = http_post(
+            &admin,
+            path,
+            json_body,
+            Body::from(serde_json::to_vec(&low_term).expect("request JSON")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let refused: ursula_proto::admin::RecoveryPlanRefused =
+            serde_json::from_slice(&body_bytes(refused).await).expect("typed refusal");
+        assert_eq!(
+            refused.refusal,
+            ursula_proto::admin::RecoveryPlanRefusal::PlanTermBelowVote
+        );
 
         // m4 (#581 review): one accept job at a time. A second accept while
         // the first one runs is refused, typed, and changes nothing; the
