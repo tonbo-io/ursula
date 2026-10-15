@@ -74,9 +74,10 @@
 //! ([`VoteGate::Cutting`]: no vote, no campaign, no replication), records
 //! the plan, and its group restarts ([`ReplicaRestart`]), cutting the log
 //! before the new Raft core starts. A member of a cutting plan grants the
-//! plan's leader its vote only once the leader shows it was cut. A planned
-//! member's satisfied plan closes its gate until a leader's barrier opens it,
-//! so a member that lost entries in a crash never votes with them missing.
+//! plan's leader its vote only once the leader shows it was cut. Taking a
+//! plan accepts the member's log; a member that crashed after that and
+//! lost entries keeps its vote restricted through restarts, and its
+//! satisfied plan closes its gate until a leader's barrier opens it.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -429,6 +430,9 @@ enum GateOpening {
     FreshBootstrap,
     /// A recovery plan elects this replica.
     PlanLeader,
+    /// The history event of this replica's recovery plan applied here, and
+    /// it lost nothing since it took the plan.
+    PlanSatisfied,
 }
 
 /// A replica's log: what a recovery plan expects each member to hold.
@@ -919,6 +923,11 @@ impl GroupRejoin {
                 raft_group_id = self.raft_group_id.0,
                 "recovery gate opened: every voter reported an empty group"
             ),
+            GateOpening::PlanSatisfied => tracing::info!(
+                node_id = self.node_id,
+                raft_group_id = self.raft_group_id.0,
+                "recovery gate opened: this replica applied its recovery plan's history event"
+            ),
             GateOpening::PlanLeader => tracing::warn!(
                 node_id = self.node_id,
                 raft_group_id = self.raft_group_id.0,
@@ -1139,17 +1148,17 @@ impl GroupRejoin {
         let restart = plan.cut
             && !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::RecoveryCut);
         let leads = plan.leader == self.node_id;
-        if restart && leads {
-            // The plan accepts the leader's log as the group's: its restart
-            // opens its gate. A later crash records it recovering again.
-            store
-                .record_recovered()
-                .await
-                .map_err(|source| RecoveryGateError::Record {
-                    raft_group_id,
-                    source,
-                })?;
-        }
+        // The plan accepts this replica's log as it is: the loss is
+        // accepted. A later crash records the log recovering again, and
+        // then the satisfied plan closes the gate until a leader's barrier
+        // (M1, #581 review).
+        store
+            .record_recovered()
+            .await
+            .map_err(|source| RecoveryGateError::Record {
+                raft_group_id,
+                source,
+            })?;
         if restart {
             // B1 (#581 review): the uncut log never votes, campaigns or
             // acknowledges an entry again: closed before the record names
@@ -1207,9 +1216,10 @@ impl GroupRejoin {
     }
 
     /// The history event of `record` applied here: the plan is satisfied.
-    /// The record is removed, and a planned gate closes until a leader's
-    /// barrier opens it (M1, #581 review): the event proves nothing about the
-    /// entries this replica acknowledged after it. Runs outside OpenRaft's
+    /// The record is removed, and a planned gate opens; on a log that a crash
+    /// since the plan left recovering it closes until a leader's barrier
+    /// opens it (M1, #581 review), since the event proves nothing about the
+    /// entries the replica acknowledged after it. Runs outside OpenRaft's
     /// state-machine worker. A record that a newer plan replaced stays.
     pub(crate) async fn retire_recovery_plan(
         &self,
@@ -1230,18 +1240,25 @@ impl GroupRejoin {
                 raft_group_id,
                 source,
             })?;
+        let recovering = store.log_state() == GroupLogState::Recovering;
         drop(store);
-        let mut gate = self.gate();
-        if matches!(*gate, VoteGate::Planned { .. }) {
-            *gate = VoteGate::closed(GroupEvidence::Initialized);
-            drop(gate);
+        if !matches!(*self.gate(), VoteGate::Planned { .. }) {
+            return Ok(());
+        }
+        if recovering {
+            // The replica may have lost entries it acknowledged after taking
+            // the plan: only a leader's barrier opens it.
+            *self.gate() = VoteGate::closed(GroupEvidence::Initialized);
             self.changes.send_if_modified(|()| true);
             tracing::info!(
                 node_id = self.node_id,
                 raft_group_id = raft_group_id.0,
-                "recovery plan satisfied: this replica applied the plan's history event; it \
-                 votes again once it has applied a fresh leader barrier"
+                "recovery plan satisfied: this replica applied the plan's history event, but \
+                 restarted after a crash since it took the plan; it votes again once it has \
+                 applied a fresh leader barrier"
             );
+        } else {
+            self.open(GateOpening::PlanSatisfied).await?;
         }
         Ok(())
     }
