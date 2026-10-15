@@ -1,9 +1,9 @@
-// The 0.8 core through its SQL functions on plain node:sqlite, against the model server
-// (E2E_SERVER=model): commits are local and replicate in the background, `ursula_synced` is the
-// output gate, PHASETWO confirms each commit, and a reset fails every statement after it.
+// The 0.8 core through its SQL functions on plain node:sqlite, against the e2e server
+// (test/stack.ts): commits are local and replicate in the background, `ursula_synced` is the output
+// gate, PHASETWO confirms each commit, and a reset fails every statement after it.
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, inject, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
 import { Child, fromStream, frames, freshDir, killChildren, type Opened, stream, ursulaUrl } from "./kit.ts";
 
@@ -68,7 +68,7 @@ async function waitStatus(c: Child, ready: (s: Status) => boolean): Promise<Stat
 	throw new Error(`status never got there: ${JSON.stringify(last)}`);
 }
 
-describe.skipIf(inject("ursulaServer") !== "model")("the 0.8 core on node:sqlite", () => {
+describe("the 0.8 core on node:sqlite", () => {
 	it("loads into the running SQLite and registers the 0.8 functions only", () => {
 		const control = loadUrsulaVfs(ext);
 		const names = control

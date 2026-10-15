@@ -5,12 +5,13 @@
 // alternating rounds so drift and noise fall on both alike:
 // - B1: plain node:sqlite on a local file, no extension (WAL, synchronous=NORMAL). It is opened
 //   before the extension loads, so it stays on SQLite's own unix VFS.
-// - VFS: the package's `open()` against the model server (ursula-vfs-model, started here), which
-//   replicates in the background meanwhile. Its commit is local, so `synced()` is not timed.
+// - VFS: the package's `open()` against the model server (ursula-vfs-model, started here), or the
+//   Ursula at BENCH_URL, which it replicates to in the background meanwhile. Its commit is local, so
+//   `synced()` is not timed.
 // A commit is a Pi-shaped transaction: BEGIN, an entry row of about 4.5 KB of text, its
 // conversation's head row, COMMIT, timed from BEGIN to COMMIT's return.
 //
-//   SQLITE_URSULA_VFS=<extension> [URSULA_VFS_MODEL=<model binary>] node bench/commit.ts
+//   SQLITE_URSULA_VFS=<extension> [URSULA_VFS_MODEL=<model binary> | BENCH_URL=<ursula URL>] node bench/commit.ts
 //
 // Settings: BENCH_ROUNDS (10), BENCH_COMMITS per round and arm (500), BENCH_WARMUP commits per arm
 // (300), BENCH_PACE_MS between commits (0, flat out), BENCH_MAX_DELTA_MS (0.5): the run fails when
@@ -113,9 +114,17 @@ const plain = new DatabaseSync(join(plainDir, "b1.db"));
 plain.exec("PRAGMA journal_mode=WAL");
 const b1 = new Arm("B1", plain);
 
-const model = await startModel();
+const benchUrl = process.env.BENCH_URL;
+const model = benchUrl === undefined || benchUrl.length === 0 ? await startModel() : undefined;
+let base = model?.url;
+if (base === undefined) {
+	// Ursula: the stream lives in a bucket, which must exist.
+	base = `${(benchUrl as string).replace(/\/+$/, "")}/sqlite-bench`;
+	const r = await fetch(base, { method: "PUT" });
+	if (!r.ok && r.status !== 409) throw new Error(`create the bucket ${base}: ${r.status} ${await r.text()}`);
+}
 const control = loadUrsulaVfs(ext);
-const vfsDb = await open(`${model.url}/bench/commit-${process.pid}`, { dir: mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-vfs-")) });
+const vfsDb = await open(`${base}/commit-${process.pid}`, { dir: mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-vfs-")) });
 const vfs = new Arm("VFS", vfsDb);
 const stats = (): { commits: { log_us: number; vfs_us: number; bytes: number; pages: number }[] } =>
 	JSON.parse(Object.values(control.prepare("SELECT ursula_stats(?)").get(vfsDb.boundPath) as Record<string, string>)[0] as string);
@@ -135,7 +144,7 @@ const { commits, reset } = vfsDb.status();
 if (reset !== null || commits.acknowledged !== commits.logged) throw new Error(`the VFS database did not end acknowledged: ${JSON.stringify(vfsDb.status())}`);
 vfsDb.close();
 plain.close();
-model.proc.stdin?.end();
+model?.proc.stdin?.end();
 
 const summary = {
 	commits_per_arm: b1.samples.length,
@@ -154,6 +163,7 @@ const summary = {
 		hook.map((c) => c.pages),
 		50,
 	),
+	server: model === undefined ? "ursula" : "model",
 	node: process.version,
 	platform: `${process.platform}-${process.arch}`,
 };
@@ -165,7 +175,7 @@ if (out !== undefined && out.length > 0) {
 	appendFileSync(
 		out,
 		[
-			`### Commit latency, VFS against B1 (${summary.commits_per_arm} commits per arm, ${summary.platform}, Node ${summary.node})`,
+			`### Commit latency, VFS against B1 (${summary.commits_per_arm} commits per arm, ${summary.server} server, ${summary.platform}, Node ${summary.node})`,
 			"",
 			"| arm | p50 ms | p90 ms | p99 ms | max ms |",
 			"| --- | --- | --- | --- | --- |",

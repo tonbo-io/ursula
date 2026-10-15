@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 // Every test runs node:sqlite (and Pi's official node driver) over the sqlite-ursula-vfs extension
 // (SQLITE_URSULA_VFS) against the server test/stack.ts starts: the model of the 0.8 server with
-// E2E_SERVER=model.
+// E2E_SERVER=model, a real Ursula (one node, or three with E2E_NODES=3) with E2E_SERVER=ursula.
 export default defineConfig({
 	test: {
 		include: ["test/**/*.e2e.ts"],

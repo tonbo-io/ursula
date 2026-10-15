@@ -1,7 +1,7 @@
-// Pi Durable on the replicated database (openUrsulaPiStorage), against the model server
-// (E2E_SERVER=model): the adapter's mapping, which Pi's conformance (test/conformance.e2e.ts) never
-// triggers: `backlog_full` is Pi's StorageRejected, a reset the UrsulaResetError itself, and `close`
-// gives up waiting at `closeTimeoutMs`.
+// Pi Durable on the replicated database (openUrsulaPiStorage), against the e2e server
+// (test/stack.ts): the adapter's mapping, which Pi's conformance (test/conformance.e2e.ts) never
+// triggers: `backlog_full` is Pi's StorageRejected, a reset the UrsulaResetError itself, and
+// `close` gives up waiting at `closeTimeoutMs`.
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type ConversationId, type Storage, StorageRejected } from "@earendil-works/pi-durable";
@@ -9,7 +9,7 @@ import type { SqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, UrsulaResetError, UrsulaWriteRefusedError } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
-import { Child, ext, fault, freshDir, killChildren, onModel, rejection, stream } from "./kit.ts";
+import { Child, ext, fault, freshDir, killChildren, rejection, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 const ctx: Context = BACKGROUND_CONTEXT;
@@ -18,7 +18,7 @@ afterEach(killChildren);
 /** The SQLite facade under a storage openUrsulaPiStorage made: the wrapped node driver. */
 const facade = (storage: Storage): SqliteDatabase => (storage as unknown as { db: SqliteDatabase }).db;
 
-describe.skipIf(!onModel())("openUrsulaPiStorage", () => {
+describe("openUrsulaPiStorage", () => {
 	it("throws backlog_full as Pi's StorageRejected, nothing committed, and the storage goes on", async () => {
 		const storage = await openUrsulaPiStorage(stream("pi-backlog").url, { dir: freshDir(), maxPendingBytes: 1 });
 		const db = facade(storage);

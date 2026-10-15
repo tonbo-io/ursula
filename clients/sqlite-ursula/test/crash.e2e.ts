@@ -1,13 +1,13 @@
-// The crash matrix (design §5.7 and §12, M1 exit criterion), against the model server
-// (E2E_SERVER=model): a process committing transactions of several rows each (test/crash-child.mjs)
-// is killed with SIGKILL by URSULA_VFS_ABORT_AT (config::Step) at every step of the commit path
+// The crash matrix (design §5.7 and §12, M1 exit criterion), against the e2e server
+// (test/stack.ts): a process committing transactions of several rows each (test/crash-child.mjs) is
+// killed with SIGKILL by URSULA_VFS_ABORT_AT (config::Step) at every step of the commit path
 // (§4.1), of F1 (a checkpoint, §4.3) and of F2 (a new WAL generation, and the WAL truncated to
 // nothing, §4.3). After each crash the next open of the same cache root must need no manual step,
 // resume the same generation (no salvage, no rebuild, no reset), hold every transaction up to the
 // last one the application saw commit, or that one plus the one the crash interrupted once it was
 // logged, whole, catch the stream up, and equal a fresh build from the stream.
 import { afterEach, describe, expect, it } from "vitest";
-import { Child, fromStream, freshDir, killChildren, onModel, stream } from "./kit.ts";
+import { Child, fromStream, freshDir, killChildren, stream } from "./kit.ts";
 
 afterEach(killChildren);
 
@@ -61,7 +61,7 @@ interface Status {
 	reset: unknown;
 }
 
-describe.skipIf(!onModel())("crash matrix (URSULA_VFS_ABORT_AT)", () => {
+describe("crash matrix (URSULA_VFS_ABORT_AT)", () => {
 	for (const [step, checkpoints, occurrences, expected] of MATRIX) {
 		for (const n of occurrences) {
 			it(`${step}:${n} (${checkpoints})`, async () => {

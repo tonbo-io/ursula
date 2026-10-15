@@ -1,20 +1,24 @@
 // Vitest global setup: the server the suite runs against.
 // - E2E_SERVER=model: the model of the 0.8 server (`ursula-vfs-model`, clients/sqlite-vfs with the
-//   `model` feature), from URSULA_VFS_MODEL or the crate's release build. The SQLite VFS suites run
-//   against it until the server speaks #581.
-// - Otherwise the Ursula from URSULA_BIN, in the default config except where noted. The per-group
-//   hot admission limit always stays at its default.
-// - Default: one `ursula server` node with its Raft WAL in its temporary directory and an
-//   in-memory cold store (URSULA_COLD=none for none).
-// - E2E_NODES=3: three nodes (each with its own Raft WAL directory) behind an `ursula gateway`,
-//   with S3 as the cold store (snapshot bodies in the cold tier). See `resolveS3` for the
-//   backends: an endpoint (MinIO) with static keys, or AWS S3 with the ambient AWS_* credentials
-//   (URSULA_S3_BUCKET).
+//   `model` feature), from URSULA_VFS_MODEL or the crate's release build.
+// - E2E_SERVER=ursula (the default): the Ursula from URSULA_BIN, in the default config except where
+//   noted, behind test/gate.mjs, a transparent proxy that scripts the answer delays the suites ask
+//   for (`fault` in test/kit.ts), as the model does. The per-group hot admission limit always stays
+//   at its default.
+//   - Default: one `ursula server` node with its Raft WAL in its temporary directory and an
+//     in-memory cold store (URSULA_COLD=none for none).
+//   - E2E_NODES=3: three nodes (each with its own Raft WAL directory, `server.cluster_id` set)
+//     behind an `ursula gateway`. With no S3 configured there is no cold tier (the nodes cannot
+//     share an in-memory one). With S3 configured (see `resolveS3`: an endpoint (MinIO) with static
+//     keys, or AWS S3 with the ambient AWS_* credentials), snapshot bodies go to the cold tier. A
+//     control server (`ursulaControl`) kills and restarts nodes for test/failover.e2e.ts.
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { TestProject } from "vitest/node";
@@ -64,6 +68,14 @@ class Proc {
 	}
 	logs(): string {
 		return this.tail;
+	}
+	/** Kills it with SIGKILL, as a crash would. */
+	async kill(): Promise<void> {
+		if (!this.exited) {
+			const exited = new Promise((r) => this.child.once("exit", r));
+			this.child.kill("SIGKILL");
+			await exited;
+		}
 	}
 	async stop(): Promise<void> {
 		if (!this.exited) {
@@ -131,7 +143,28 @@ export interface StackNode {
 interface Stack {
 	readonly url: string;
 	readonly nodes: readonly StackNode[];
+	/** The control server's URL (E2E_NODES=3). */
+	readonly control?: string;
 	stop(): Promise<void>;
+}
+
+/** test/gate.mjs in front of `target`: its proxy URL, its control URL, and a stop. */
+async function startGate(target: string): Promise<{ url: string; control: string; stop(): Promise<void> }> {
+	const proc = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, "gate.mjs"), target], { stdio: ["pipe", "pipe", "inherit"] });
+	const exited = new Promise((r) => proc.once("exit", r));
+	const lines = createInterface({ input: proc.stdout as NodeJS.ReadableStream })[Symbol.asyncIterator]();
+	const first = await lines.next();
+	if (first.done === true) throw new Error("test/gate.mjs exited before it printed its ports");
+	const { port, control } = JSON.parse(first.value as string) as { port: number; control: number };
+	return {
+		url: `http://127.0.0.1:${port}`,
+		control: `http://127.0.0.1:${control}`,
+		stop: async () => {
+			// It exits when its stdin closes.
+			proc.stdin?.end();
+			await exited;
+		},
+	};
 }
 
 /**
@@ -242,10 +275,10 @@ interface S3Target {
  *    that existing bucket under URSULA_S3_PREFIX; otherwise a new bucket per stack, root `ursula`.
  * 2. Otherwise URSULA_S3_BUCKET set (AWS): the existing bucket under URSULA_S3_PREFIX, no endpoint
  *    and no keys in the TOML (the nodes inherit AWS_*, and SSE-S3 applies, as in production).
- * 3. Otherwise there is no S3 to run against.
+ * 3. Otherwise there is no S3: the cluster runs without a cold tier.
  * A shared bucket gets a per-stack root `<prefix>/sqlite-<pid>-<ts36>-<8 hex>`.
  */
-async function resolveS3(): Promise<S3Target> {
+async function resolveS3(): Promise<S3Target | undefined> {
 	const endpoint = (process.env.URSULA_S3_ENDPOINT ?? "").replace(/\/+$/, "");
 	const shared = process.env.URSULA_S3_BUCKET ?? "";
 	const region = process.env.URSULA_S3_REGION ?? process.env.AWS_REGION ?? "us-east-1";
@@ -279,7 +312,17 @@ async function resolveS3(): Promise<S3Target> {
 		}
 		return { bucket: shared, root: sharedRoot, toml: [`bucket = "${shared}"`, `region = "${region}"`], env: {} };
 	}
-	throw new Error("E2E_NODES=3 needs S3: URSULA_S3_ENDPOINT (MinIO) or URSULA_S3_BUCKET (AWS)");
+	return undefined;
+}
+
+/** One node of the cluster: what restarting it needs, and its process while it runs. */
+interface ClusterNode {
+	readonly id: number;
+	readonly port: number;
+	readonly admin: string;
+	readonly dir: string;
+	readonly config: string;
+	proc: Proc;
 }
 
 async function startCluster(): Promise<Stack> {
@@ -289,16 +332,20 @@ async function startCluster(): Promise<Stack> {
 	// E2E_CORES.
 	const groups = Number(process.env.E2E_GROUPS ?? 4);
 	const cores = Number(process.env.E2E_CORES ?? 2);
-	const nodes: { id: number; port: number; admin: string }[] = [];
-	for (const id of [1, 2, 3]) nodes.push({ id, port: await freePort(), admin: `http://127.0.0.1:${await freePort()}` });
-	const procs: Proc[] = [];
-	const logs = (): string => procs.map((p, i) => `--- ${i < 3 ? `node${i + 1}` : "gateway"}\n${p.logs()}`).join("\n");
+	const shape: { id: number; port: number; admin: string }[] = [];
+	for (const id of [1, 2, 3]) shape.push({ id, port: await freePort(), admin: `http://127.0.0.1:${await freePort()}` });
+	const nodes: ClusterNode[] = [];
+	let gateway: Proc | undefined;
+	let control: ReturnType<typeof createHttpServer> | undefined;
+	const logs = (): string => [...nodes.map((n) => `--- node${n.id}\n${n.proc.logs()}`), `--- gateway\n${gateway?.logs() ?? ""}`].join("\n");
 	const stop = async (): Promise<void> => {
-		await Promise.all(procs.map((p) => p.stop()));
+		await new Promise<void>((r) => (control?.listening === true ? control.close(() => r()) : r()));
+		await Promise.all([...nodes.map((n) => n.proc.stop()), gateway?.stop()]);
 		rmSync(dir, { recursive: true, force: true });
 	};
+	const spawnNode = (node: { id: number; dir: string; config: string }): Proc => new Proc(ursulaBin(), ["server", "--config", node.config], node.dir, s3?.env ?? {}, `node${node.id}`);
 	try {
-		for (const node of nodes) {
+		for (const node of shape) {
 			const nodeDir = join(dir, `node${node.id}`);
 			mkdirSync(nodeDir, { recursive: true });
 			const config = join(nodeDir, "ursula.toml");
@@ -320,27 +367,50 @@ async function startCluster(): Promise<Stack> {
 				"[raft.wal]",
 				`path = "${join(nodeDir, "wal")}"`,
 			];
-			for (const peer of nodes) lines.push("", "[[raft.peers]]", `node_id = ${peer.id}`, `url = "http://127.0.0.1:${peer.port}"`);
-			lines.push(
-				"",
-				"[storage.cold]",
-				'backend = "s3"',
-				`root = "${s3.root}"`,
-				"",
-				"[storage.cold.s3]",
-				...s3.toml,
-			);
+			for (const peer of shape) lines.push("", "[[raft.peers]]", `node_id = ${peer.id}`, `url = "http://127.0.0.1:${peer.port}"`);
+			if (s3 !== undefined) lines.push("", "[storage.cold]", 'backend = "s3"', `root = "${s3.root}"`, "", "[storage.cold.s3]", ...s3.toml);
 			writeFileSync(config, `${lines.join("\n")}\n`);
-			procs.push(new Proc(ursulaBin(), ["server", "--config", config], nodeDir, s3.env, `node${node.id}`));
+			const spec = { ...node, dir: nodeDir, config };
+			nodes.push({ ...spec, proc: spawnNode(spec) });
 		}
-		await Promise.all(nodes.map((node, i) => waitReady(`http://127.0.0.1:${node.port}/__ursula/ready`, procs[i] as Proc)));
+		await Promise.all(nodes.map((node) => waitReady(`http://127.0.0.1:${node.port}/__ursula/ready`, node.proc)));
 		const gatewayPort = await freePort();
 		const args = ["gateway", "--listen", `127.0.0.1:${gatewayPort}`, "--raft-group-count", `${groups}`];
 		for (const node of nodes) args.push("--upstream", `http://127.0.0.1:${node.port}`);
-		procs.push(new Proc(ursulaBin(), args, dir, {}, "gateway"));
+		gateway = new Proc(ursulaBin(), args, dir, {}, "gateway");
 		const url = `http://127.0.0.1:${gatewayPort}`;
 		await waitWritable(url, logs);
-		return { url, nodes: nodes.map((node, i) => ({ id: node.id, url: `http://127.0.0.1:${node.port}`, admin: node.admin, pid: (procs[i] as Proc).pid })), stop };
+		// `GET /nodes` lists the nodes (id, url, admin, pid, running), `POST /nodes/<id>/kill` kills
+		// one with SIGKILL, `POST /nodes/<id>/start` starts it again on its config and WAL and answers
+		// once it is ready. Both answer the listing.
+		const listing = (): unknown => nodes.map((n) => ({ id: n.id, url: `http://127.0.0.1:${n.port}`, admin: n.admin, pid: n.proc.pid, running: !n.proc.exited }));
+		control = createHttpServer((req, res) => {
+			const answer = (status: number, body: unknown): void => {
+				res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+			};
+			if (req.method === "GET" && req.url === "/nodes") return answer(200, listing());
+			const route = /^\/nodes\/(\d+)\/(kill|start)$/.exec(req.url ?? "");
+			const node = route === null ? undefined : nodes.find((n) => n.id === Number(route[1]));
+			if (req.method !== "POST" || route === null || node === undefined) return answer(404, { error: `no route ${req.method} ${req.url}` });
+			const act = async (): Promise<void> => {
+				if (route[2] === "kill") return node.proc.kill();
+				if (!node.proc.exited) throw new Error(`node${node.id} is running`);
+				node.proc = spawnNode(node);
+				await waitReady(`http://127.0.0.1:${node.port}/__ursula/ready`, node.proc);
+			};
+			act().then(
+				() => answer(200, listing()),
+				(error: unknown) => answer(500, { error: String(error) }),
+			);
+		});
+		const controlPort = await freePort();
+		await new Promise<void>((r) => control?.listen(controlPort, "127.0.0.1", () => r()));
+		return {
+			url,
+			nodes: nodes.map((node) => ({ id: node.id, url: `http://127.0.0.1:${node.port}`, admin: node.admin, pid: node.proc.pid })),
+			control: `http://127.0.0.1:${controlPort}`,
+			stop,
+		};
 	} catch (error) {
 		await stop();
 		throw error;
@@ -349,18 +419,49 @@ async function startCluster(): Promise<Stack> {
 
 declare module "vitest" {
 	export interface ProvidedContext {
+		/** The URL the suites open streams at: the model, or the gate in front of Ursula. */
 		ursulaUrl: string;
+		/** The server itself, with no gate in front (the gateway with E2E_NODES=3). */
+		ursulaDirect: string;
+		/** Where `fault` (test/kit.ts) scripts a fault: the model's `/__model/faults` or the gate's `/faults`. */
+		ursulaFaults: string;
 		ursulaNodes: StackNode[];
+		/** The cluster's control server (E2E_NODES=3), or "". */
+		ursulaControl: string;
 		/** `model` for the model server, `ursula` otherwise. */
 		ursulaServer: "model" | "ursula";
 	}
 }
 
 export default async function setup(project: TestProject): Promise<() => Promise<void>> {
-	const model = process.env.E2E_SERVER === "model";
-	const stack = model ? await startModel() : process.env.E2E_NODES === "3" ? await startCluster() : await startSingle();
-	project.provide("ursulaServer", model ? "model" : "ursula");
-	project.provide("ursulaUrl", stack.url);
+	const server = process.env.E2E_SERVER ?? "ursula";
+	if (server !== "model" && server !== "ursula") throw new Error(`E2E_SERVER is model or ursula, not ${server}`);
+	if (server === "model") {
+		const stack = await startModel();
+		project.provide("ursulaServer", "model");
+		project.provide("ursulaUrl", stack.url);
+		project.provide("ursulaDirect", stack.url);
+		project.provide("ursulaFaults", `${stack.url}/__model/faults`);
+		project.provide("ursulaNodes", []);
+		project.provide("ursulaControl", "");
+		return () => stack.stop();
+	}
+	const stack = process.env.E2E_NODES === "3" ? await startCluster() : await startSingle();
+	let gate: Awaited<ReturnType<typeof startGate>>;
+	try {
+		gate = await startGate(stack.url);
+	} catch (error) {
+		await stack.stop();
+		throw error;
+	}
+	project.provide("ursulaServer", "ursula");
+	project.provide("ursulaUrl", gate.url);
+	project.provide("ursulaDirect", stack.url);
+	project.provide("ursulaFaults", `${gate.control}/faults`);
 	project.provide("ursulaNodes", [...stack.nodes]);
-	return () => stack.stop();
+	project.provide("ursulaControl", stack.control ?? "");
+	return async () => {
+		await gate.stop();
+		await stack.stop();
+	};
 }
