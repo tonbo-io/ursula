@@ -133,19 +133,13 @@ impl StreamStateMachine {
         }
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
-        let mut snapshot = snapshot;
-        // A source stream written since the source's latest history event
-        // inherits from the source's current history: its token there, with
-        // the restored tail. One not written since keeps naming the history
-        // it was last written in, so two rewrites with no write between them
-        // report the token from before both, as any other pair of events
-        // does (#581 section 4.8, extensions section 2.4).
-        let source_history = snapshot.history.map_or(0, |source| source.id.get());
-        for entry in &mut snapshot.streams {
-            if super::history::written_since_event(entry.history, source_history) {
-                entry.history = source_history;
-            }
-        }
+        // Each stream keeps the history it was last written in. One written
+        // since the source's latest history event names the source's
+        // current history, so it inherits its token there with the restored
+        // tail. One not written since names an earlier history, so two
+        // rewrites with no write between them report the token from before
+        // both, as any other pair of events does (#581 section 4.8,
+        // extensions section 2.4).
         match Self::restore(snapshot) {
             Ok(mut restored) => {
                 // C7: the counter never goes backwards, so a later create
