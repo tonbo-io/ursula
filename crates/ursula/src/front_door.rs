@@ -32,6 +32,7 @@ use ursula_headers::NodeId;
 use ursula_headers::RaftGroup;
 use ursula_headers::RaftTerm;
 use ursula_headers::RoutingAnswer;
+use ursula_raft::GroupLeadership;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RoutedWrite;
@@ -157,27 +158,9 @@ fn leadership_view(state: &HttpState, raft_group_id: RaftGroupId) -> Option<Writ
     let Some(registry) = state.raft_registry() else {
         return Some(WriteRoute::Leader { early_answer: None });
     };
-    let leadership = registry.leadership(raft_group_id)?;
-    Some(match leadership.leader_id {
-        Some(leader) if leader == leadership.node_id => WriteRoute::Leader { early_answer: None },
-        Some(leader_id) => WriteRoute::Follower {
-            leader_id,
-            leader_address: leadership.leader_address,
-            term: leadership.term,
-        },
-        None => WriteRoute::NoLeader,
-    })
-}
-
-/// The term in which this node knows `leader` leads `raft_group_id`, from
-/// its leadership view. `None` when the view names another leader or none.
-pub(crate) fn leader_term(
-    state: &HttpState,
-    raft_group_id: RaftGroupId,
-    leader: u64,
-) -> Option<u64> {
-    let leadership = state.raft_registry()?.leadership(raft_group_id)?;
-    (leadership.leader_id == Some(leader)).then_some(leadership.term)
+    registry
+        .leadership(raft_group_id)
+        .map(GroupLeadership::write_route)
 }
 
 /// Runs the deferred pressure checks, if admission runs.

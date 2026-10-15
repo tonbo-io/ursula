@@ -28,6 +28,7 @@ use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
 
+use crate::leadership::GroupLeadership;
 use crate::registry::RaftGroupHandle;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -53,19 +54,6 @@ impl Drop for Mailbox {
 }
 
 /// A cloneable command endpoint, with no cross-thread raw Raft handle.
-/// A replica's view of its group's leadership ([`OwnerRaftHandle::leadership`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupLeadership {
-    /// This replica's node.
-    pub node_id: u64,
-    /// The leader this replica knows, possibly itself.
-    pub leader_id: Option<u64>,
-    /// The term of this replica's view.
-    pub term: u64,
-    /// The leader's address in the group's membership.
-    pub leader_address: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct OwnerRaftHandle {
     mailbox: Arc<Mailbox>,
@@ -243,25 +231,10 @@ impl OwnerRaftHandle {
         self.metrics.clone()
     }
 
-    /// This replica's view of the group's leadership, read from the Raft
-    /// metrics without a trip through the group's core. It can lag an
-    /// election: a write routed by a stale view either fails after its body
-    /// (a replica that thinks it leads) or reaches a leader that answers it.
+    /// This replica's view of the group's leadership, from one borrow of
+    /// its Raft metrics, without a trip through the group's core.
     pub fn leadership(&self) -> GroupLeadership {
-        let metrics = self.metrics.borrow_watched();
-        let leader_address = metrics.current_leader.and_then(|leader| {
-            metrics
-                .membership_config
-                .membership()
-                .get_node(&leader)
-                .map(|node| node.addr.clone())
-        });
-        GroupLeadership {
-            node_id: metrics.id,
-            leader_id: metrics.current_leader,
-            term: metrics.current_term,
-            leader_address,
-        }
+        GroupLeadership::of(&self.metrics.borrow_watched())
     }
 
     /// OpenRaft's data metrics, which carry the full last log id. Its

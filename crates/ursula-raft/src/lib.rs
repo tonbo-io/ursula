@@ -22,6 +22,8 @@
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node network.
 //! - `in_process`: fault-injection network, compiled only for tests and madsim.
 //! - [`owner`]: mailbox dispatch onto each group owner runtime.
+//! - [`leadership`]: one replica's view of its group's leadership, which
+//!   routing and forward hints share.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
@@ -50,8 +52,10 @@ pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
 }
 
+mod leadership;
 mod owner;
-pub use owner::GroupLeadership;
+pub use leadership::GroupLeadership;
+pub use leadership::LeaderRole;
 pub use owner::OwnerRaftHandle;
 mod codec;
 mod election;

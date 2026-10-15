@@ -111,6 +111,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::StreamCommand;
 
+use crate::GroupLeadership;
 use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
@@ -602,8 +603,8 @@ impl RaftGroupEngine {
             // Once submitted, a group that stops may already have committed
             // the command and applies it after repair: the outcome is unknown.
             Err(err) => {
-                let self_id = self.raft.metrics().borrow_watched().id;
-                return Err(group_engine_client_write_error(err, self_id));
+                let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
+                return Err(group_engine_client_write_error(err, &leadership));
             }
         };
         write_result_from_raft_response(response.data)?
@@ -618,12 +619,12 @@ impl RaftGroupEngine {
         }
         let leader_id = self.raft.current_leader().await;
         let leader_node = self.current_leader_node().await;
-        let self_id = self.raft.metrics().borrow_watched().id;
+        let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
         Err(group_engine_forward_to_leader_error(
             "OpenRaft group write has to run on the local leader runtime",
             leader_id,
             leader_node.as_ref(),
-            self_id,
+            &leadership,
             true,
         ))
     }
@@ -741,12 +742,12 @@ impl RaftGroupEngine {
     }
 
     async fn not_leader_for_read(&self, operation: &str) -> GroupEngineError {
-        let self_id = self.raft.metrics().borrow_watched().id;
+        let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
         group_engine_forward_to_leader_error(
             format!("OpenRaft {operation} has to forward request to leader"),
             self.raft.current_leader().await,
             None,
-            self_id,
+            &leadership,
             true,
         )
     }
@@ -917,23 +918,10 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupRouteWriteFuture<'a> {
         Box::pin(async move {
-            if !self.raft.is_leader() {
-                // One metrics snapshot, so the leader and the term agree.
-                let (self_id, leader_id, term) = {
-                    let metrics = self.raft.metrics();
-                    let metrics = metrics.borrow_watched();
-                    (metrics.id, metrics.current_leader, metrics.current_term)
-                };
-                return Ok(match leader_id {
-                    Some(leader_id) if leader_id != self_id => WriteRoute::Follower {
-                        leader_id,
-                        leader_address: self.current_leader_node().await.map(|node| node.addr),
-                        term,
-                    },
-                    // This node is leaving or about to take leadership: no
-                    // leader to send the write to yet.
-                    _ => WriteRoute::NoLeader,
-                });
+            // The one leadership policy the front door routes by too.
+            let route = GroupLeadership::of(&self.raft.metrics().borrow_watched()).write_route();
+            if !matches!(route, WriteRoute::Leader { .. }) {
+                return Ok(route);
             }
             // Only the leader answers early (#581 section 2.5). Applied
             // entries are committed, so a leader that was deposed a moment
@@ -1532,13 +1520,13 @@ impl GroupEngine for RaftGroupEngine {
             if !self.raft.is_leader() {
                 let leader_id = self.raft.current_leader().await;
                 let leader_node = self.current_leader_node().await;
-                let self_id = self.raft.metrics().borrow_watched().id;
+                let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
                 let Some(leader_node) = leader_node else {
                     return Err(group_engine_forward_to_leader_error(
                         "OpenRaft bucket purge has no known group leader",
                         leader_id,
                         None,
-                        self_id,
+                        &leadership,
                         true,
                     ));
                 };

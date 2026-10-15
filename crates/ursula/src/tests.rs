@@ -276,8 +276,10 @@ fn group_engine_leader_hint_is_detected_without_matching_message() {
 }
 
 // A forward hinting this node (a read bounced back during a leadership
-// transfer) must not redirect the client to itself: no 307, so the caller
-// answers the leader-unknown 503. A hint naming a peer redirects there.
+// transfer) must not redirect the client to itself, and a hint without the
+// leader's term must not redirect half-typed: no 307, so the caller answers
+// the leader-unknown 503. A hint naming a peer in a known term redirects
+// there, typed.
 #[test]
 fn leader_redirect_never_points_at_this_node() {
     let router = ClientWriteLeaderRouter::with_static_topology(
@@ -288,26 +290,68 @@ fn leader_redirect_never_points_at_this_node() {
         ],
         BTreeMap::new(),
     );
-    let forward = |leader| RuntimeError::GroupEngine {
+    let forward = |leader, term| RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
-        raft_group_id: RaftGroupId(0),
+        raft_group_id: RaftGroupId(4),
         error: GroupEngineError::forward_to_leader_before_proposal(
             "not leader",
             Some(leader),
             None,
-        ),
+        )
+        .with_leader_term(term),
     };
 
     assert!(
         router
-            .redirect_response(&forward(2), "/b/s", |_, _| None)
+            .redirect_response(&forward(2, Some(7)), "/b/s")
+            .is_none()
+    );
+    assert!(
+        router
+            .redirect_response(&forward(1, None), "/b/s")
             .is_none()
     );
     let redirect = router
-        .redirect_response(&forward(1), "/b/s", |_, _| None)
-        .expect("a hint naming a peer redirects");
+        .redirect_response(&forward(1, Some(7)), "/b/s")
+        .expect("a hint naming a peer in a known term redirects");
     assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(redirect.headers()[LOCATION], "http://node-1/b/s");
+    assert_eq!(
+        typed_routing(&redirect),
+        ursula_headers::RoutingAnswer::NotLeader {
+            leader: ursula_headers::NodeId::from_u64(1),
+            group: ursula_headers::RaftGroup::from_u32(4),
+            term: ursula_headers::RaftTerm::from_u64(7),
+        }
+    );
+}
+
+/// The routing answer of a `307` or a routing `503`, as clients parse it.
+/// Every redirect a node sends parses (#581 section 5.7).
+#[track_caller]
+fn typed_routing<B>(response: &axum::http::Response<B>) -> ursula_headers::RoutingAnswer {
+    ursula_headers::RoutingAnswer::parse(
+        response.status().as_u16(),
+        response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("a well-formed routing answer")
+    .expect("a routing answer")
+}
+
+#[track_caller]
+fn typed_routing_reqwest(response: &reqwest::Response) -> ursula_headers::RoutingAnswer {
+    ursula_headers::RoutingAnswer::parse(
+        response.status().as_u16(),
+        response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("a well-formed routing answer")
+    .expect("a routing answer")
 }
 
 #[test]
@@ -2499,6 +2543,24 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
         .await
         .expect("HEAD on the non-voter");
     assert_eq!(head.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        typed_routing_reqwest(&head),
+        ursula_headers::RoutingAnswer::NotHosted {
+            group: ursula_headers::RaftGroup::from_u32(1)
+        }
+    );
+    let read = no_redirect_client
+        .get(format!("{target}?offset=0"))
+        .send()
+        .await
+        .expect("read on the non-voter");
+    assert_eq!(read.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        typed_routing_reqwest(&read),
+        ursula_headers::RoutingAnswer::NotHosted {
+            group: ursula_headers::RaftGroup::from_u32(1)
+        }
+    );
     let identity = ursula_headers::ServerIdentity::parse(
         head.headers()
             .iter()
@@ -2629,6 +2691,21 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
             "{write}: {answer:?}"
         );
     }
+
+    // A read the follower cannot serve redirects, typed the same way.
+    let read = send(
+        follower,
+        "GET",
+        "/benchcmp/routed?offset=now&live=sse",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(matches!(
+        typed_routing(&read),
+        ursula_headers::RoutingAnswer::NotLeader { leader, .. } if leader.get() == 1
+    ));
 
     // Pressure comes after routing: a follower whose WAL disk is under
     // pressure redirects a write, and the leader under the same pressure
@@ -3769,6 +3846,10 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .await
         .expect("send follower live read");
     assert_eq!(follower_sse.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(matches!(
+        typed_routing_reqwest(&follower_sse),
+        ursula_headers::RoutingAnswer::NotLeader { leader, .. } if leader.get() == 1
+    ));
     assert_eq!(
         follower_sse
             .headers()

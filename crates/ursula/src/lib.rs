@@ -186,7 +186,6 @@ use crate::render::insert_static;
 use crate::render::insert_stream_error_headers;
 use crate::render::insert_stream_error_offset;
 use crate::render::insert_stream_head;
-use crate::render::insert_u64_header;
 use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
@@ -626,16 +625,6 @@ impl ClientWriteLeaderRouter {
         }
     }
 
-    /// The hinted leader's base URL. A hint naming this node (a follower's
-    /// read bounced back during a leadership transfer) yields `None`, so the
-    /// client gets the leader-unknown 503 instead of a redirect to itself.
-    fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
-        let leader_hint = err.leader_hint()?;
-        let leader_id = leader_hint.node_id?;
-        self.peer_base(leader_id, leader_hint.address.as_deref())
-            .map(|base| (leader_id, base))
-    }
-
     /// The base URL of `leader_id`: its configured peer URL, else
     /// `address`. `None` for this node itself.
     fn peer_base(&self, leader_id: u64, address: Option<&str>) -> Option<String> {
@@ -672,52 +661,45 @@ impl ClientWriteLeaderRouter {
             })
     }
 
-    /// The redirect for `err`, typed through `ursula-headers`: to the leader
-    /// its hint names, or, from a node that hosts no replica of the group,
-    /// to one that does ([`RoutingAnswer::NotHosted`]). `term` gives the term
-    /// in which this node knows a leader of a group. A leader hint whose term
-    /// this node does not know names the leader alone.
-    fn redirect_response(
-        &self,
-        err: &RuntimeError,
-        request_target: &str,
-        term: impl FnOnce(RaftGroupId, u64) -> Option<u64>,
-    ) -> Option<Response> {
-        let group = match err {
-            RuntimeError::GroupEngine { raft_group_id, .. }
-            | RuntimeError::GroupNotHosted { raft_group_id, .. } => Some(*raft_group_id),
-            _ => None,
-        };
-        let (base, answer) = if let Some((leader_id, base)) = self.leader_base(err) {
-            let answer = group.and_then(|group| {
-                term(group, leader_id).map(|term| RoutingAnswer::NotLeader {
-                    leader: ursula_headers::NodeId::from_u64(leader_id),
-                    group: ursula_headers::RaftGroup::from_u32(group.0),
-                    term: ursula_headers::RaftTerm::from_u64(term),
-                })
-            });
-            (base, answer.ok_or(leader_id))
-        } else {
-            let RuntimeError::GroupNotHosted { raft_group_id, .. } = err else {
-                return None;
-            };
-            (
+    /// The redirect for `err`, typed through `ursula-headers`: to the
+    /// leader its hint names, in the term the hint names
+    /// ([`RoutingAnswer::NotLeader`]), or, from a node that hosts no replica
+    /// of the group, to one that does ([`RoutingAnswer::NotHosted`]). `None`
+    /// for a hint without a leader, its term or an address, and for a hint
+    /// naming this node: the caller answers a retryable `503` instead, so no
+    /// redirect lacks the group, or the leader and its term.
+    fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
+        let (base, answer) = match err {
+            RuntimeError::GroupNotHosted { raft_group_id, .. } => (
                 self.hosted_group_base(*raft_group_id)?,
-                Ok(RoutingAnswer::NotHosted {
+                RoutingAnswer::NotHosted {
                     group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
-                }),
-            )
+                },
+            ),
+            RuntimeError::GroupEngine {
+                raft_group_id,
+                error,
+                ..
+            } => {
+                let hint = error.leader_hint()?;
+                let leader_id = hint.node_id?;
+                let term = hint.term?;
+                (
+                    self.peer_base(leader_id, hint.address.as_deref())?,
+                    RoutingAnswer::NotLeader {
+                        leader: ursula_headers::NodeId::from_u64(leader_id),
+                        group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
+                        term: ursula_headers::RaftTerm::from_u64(term),
+                    },
+                )
+            }
+            _ => return None,
         };
         let mut headers = HeaderMap::new();
         insert_default_response_headers(&mut headers);
         let location = HeaderValue::from_str(&format!("{base}{request_target}")).ok()?;
         headers.insert(LOCATION, location);
-        match answer {
-            Ok(answer) => answer.render(|name, value| insert_header_str(&mut headers, name, value)),
-            Err(leader_id) => {
-                insert_u64_header(&mut headers, names::X_URSULA_RAFT_LEADER_ID, leader_id);
-            }
-        }
+        answer.render(|name, value| insert_header_str(&mut headers, name, value));
         Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
     }
 }
@@ -4461,14 +4443,13 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.
-    if let Some(redirect) = router.redirect_response(&err, request_target, |group, leader| {
-        front_door::leader_term(state, group, leader)
-    }) {
+    if let Some(redirect) = router.redirect_response(&err, request_target) {
         return redirect;
     }
-    // Forward-to-leader error whose leader is currently unknown (election in
-    // progress): tell the client to retry rather than failing hard.
-    if is_forward_to_leader(&err) {
+    // Forward-to-leader error whose leader or term is currently unknown
+    // (election in progress), or a group no known node hosts: tell the
+    // client to retry rather than failing hard.
+    if is_forward_to_leader(&err) || matches!(err, RuntimeError::GroupNotHosted { .. }) {
         return leader_unknown_retry_response(err);
     }
     runtime_error_response(err)
@@ -4524,6 +4505,17 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
+    let group = match &err {
+        RuntimeError::GroupEngine { raft_group_id, .. }
+        | RuntimeError::GroupNotHosted { raft_group_id, .. } => Some(*raft_group_id),
+        _ => None,
+    };
+    if let Some(group) = group {
+        RoutingAnswer::NoLeader {
+            group: ursula_headers::RaftGroup::from_u32(group.0),
+        }
+        .render(|name, value| insert_header_str(&mut headers, name, value));
+    }
     headers.insert(
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),

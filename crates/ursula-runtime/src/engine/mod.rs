@@ -814,6 +814,10 @@ impl GroupEngineMetrics {
 pub struct GroupLeaderHint {
     pub node_id: Option<u64>,
     pub address: Option<String>,
+    /// The term in which the replica that refused knew `node_id` to lead,
+    /// read with it from one view. `None` when it did not know.
+    #[serde(default)]
+    pub term: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1067,7 +1071,11 @@ impl GroupEngineError {
     ) -> Self {
         Self::ForwardToLeader {
             message: message.into(),
-            leader_hint: GroupLeaderHint { node_id, address },
+            leader_hint: GroupLeaderHint {
+                node_id,
+                address,
+                term: None,
+            },
             before_proposal: false,
         }
     }
@@ -1081,9 +1089,23 @@ impl GroupEngineError {
     ) -> Self {
         Self::ForwardToLeader {
             message: message.into(),
-            leader_hint: GroupLeaderHint { node_id, address },
+            leader_hint: GroupLeaderHint {
+                node_id,
+                address,
+                term: None,
+            },
             before_proposal: true,
         }
+    }
+
+    /// Names the term of a forward-to-leader error's leader. Other errors
+    /// are returned unchanged.
+    #[must_use]
+    pub fn with_leader_term(mut self, leader_term: Option<u64>) -> Self {
+        if let Self::ForwardToLeader { leader_hint, .. } = &mut self {
+            leader_hint.term = leader_term;
+        }
+        self
     }
 
     /// True when this is a forward-to-leader error raised before proposal.
