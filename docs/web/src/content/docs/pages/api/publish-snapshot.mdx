@@ -64,10 +64,21 @@ On a node with a cold backend, a snapshot above `Ursula-Max-Request-Bytes` goes 
 
 A commit checks its key first, before it reads its body. A repeat of a published snapshot answers `204` with its digest, and a commit whose offset holds another snapshot, or that a later snapshot supersedes, answers `409` naming the latest, both even after the parts are gone. Otherwise Ursula copies the parts into one snapshot, checks its digest, and publishes it like any other snapshot, with the same answers. It answers `400` when a part is unknown, belongs to another stream or to an earlier incarnation of this one, or is listed twice, when the manifest does not match `Stream-Snapshot-Parts`, or when the digest differs.
 
-Ursula deletes the parts once the commit's answer is final: `204`, `400`, `404`, `409`, `410` or `412`. After a `503` the parts stay, so repeat the same commit. A node copies at most two commits at once and answers another with `503` and `Retry-After`. The orphan sweep reclaims a part that no commit used once it is older than its grace, a day by default, whether its stream still exists or not, so commit within a day of staging the first part. Without a cold backend, parts and commits answer `501`.
+Whether Ursula deletes the parts depends on the answer:
+
+- After the publish's answer, when it is final for the commit's key (`204`, `400`, `404`, `409`, `410` or `412`), the parts are deleted, after the answer has gone out.
+- After a `400` for a digest that differs, the parts are deleted too: the copy that found the mismatch used them up. Upload them again.
+- After a `400` that copies nothing (an unknown part, another stream's part, a part listed twice, a malformed or oversized manifest), the parts stay, so a corrected commit can use them.
+- After a `503` or any other retryable answer, the parts stay. Repeat the same commit.
+
+The orphan sweep reclaims a part that no commit used once it is older than its grace, a day by default, whether its stream still exists or not, so commit within a day of staging the first part. Without a cold backend, parts and commits answer `501`.
+
+A stream deleted and created again while its commit copies is not published to. A commit that sent `Stream-Incarnation` then answers `412`. One that did not answers `400` for an unknown part, as a commit sent after the new create does.
+
+A node copies at most two commits at once. Another answers `503` with `Retry-After` and `{"error":"SnapshotCommitsBusy"}`. A copy is charged against `server.http_inflight_body_size` while it runs: 56 MiB at the default 256 MiB, 32 MiB on a node of 64 MiB, which reads fewer pieces ahead.
 
 <Note>
-A commit's copy takes time in proportion to the snapshot's size, all of it before the answer. Through `ursulagw`, whose `--response-header-timeout` is 30 seconds by default, a commit of a large snapshot can time out at the gateway while the node finishes it. Repeating the commit is safe: it answers `204` from its key once the snapshot is published. Raise the gateway's timeout for clients that commit snapshots of hundreds of MiB.
+The node owns a commit once it starts copying. A client that goes away, or a gateway that times out, cancels none of it: the copy, the publish and the deletion of the parts run to their end. A repeat while the commit runs answers `503` with `Retry-After` and `{"error":"SnapshotCommitInProgress"}`, and a repeat after it answers `204` from the key. A copy takes time in proportion to the snapshot's size and the number of parts. On S3, 256 MiB in eight 32 MiB parts took about 3 seconds. Through `ursulagw`, whose `--response-header-timeout` is 30 seconds by default, a commit of many small parts can outlast the timeout. Repeat it until it answers, or send larger parts.
 </Note>
 
 ```bash Example

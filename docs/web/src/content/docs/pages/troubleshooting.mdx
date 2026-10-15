@@ -263,6 +263,11 @@ groups. Set it to `1` to keep one build at a time, as before 0.7.4.
 `IngressBodyBytesLimitReached` means the write bodies in flight on the node
 leave too little of `server.http_inflight_body_size` for this one.
 
+`SnapshotCommitsBusy` means that the node copies as many snapshot commits from
+parts as it may, two at once. `SnapshotCommitInProgress` means that the node
+copies this same commit now: repeat it, and it answers once the commit ends.
+`snapshot_commits_busy` in `/__ursula/metrics` counts the first.
+
 `WalDiskPressure`, `RaftLogPressure` and `IngressBodyBytesLimitReached` are
 write admission refusals.
 
