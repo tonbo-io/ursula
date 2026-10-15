@@ -5,6 +5,7 @@
 //! Tests of the driver: [`Core`]s against the model server in a virtual-time world with real log
 //! and generation files in a temp dir, and the runtime over the model in process.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -152,6 +153,11 @@ struct World {
     next_id: u64,
     /// The binding of each ticket `sync_to` handed out.
     tickets: HashMap<Ticket, BindingId>,
+    /// How long a request of a core that is down waits for its connect to fail (0: at once), as
+    /// a connect to a host that does not answer times out.
+    connect_ms: u64,
+    /// Requests whose connect fails at the time each names.
+    connecting: Vec<(u64, usize, super::IoId)>,
 }
 
 impl World {
@@ -175,6 +181,8 @@ impl World {
             held: Vec::new(),
             next_id: 1,
             tickets: HashMap::new(),
+            connect_ms: 0,
+            connecting: Vec::new(),
         }
     }
 
@@ -264,6 +272,10 @@ impl World {
             }
             let now = self.now;
             let ios = match io {
+                Io::Http(io) if self.down[core] && self.connect_ms > 0 => {
+                    self.connecting.push((now + self.connect_ms, core, io.id));
+                    Vec::new()
+                }
                 Io::Http(io) => {
                     self.sent.push(Sent {
                         core,
@@ -295,12 +307,26 @@ impl World {
                 .iter()
                 .flatten()
                 .filter_map(Core::next_deadline)
+                .chain(self.connecting.iter().map(|(at, _, _)| *at))
                 .min();
             match next {
                 Some(at) if at <= until => {
                     let at = at.max(self.now);
                     self.server.advance(at - self.now);
                     self.now = at;
+                    let (failed, waiting) = std::mem::take(&mut self.connecting)
+                        .into_iter()
+                        .partition(|(when, _, _)| *when <= at);
+                    self.connecting = waiting;
+                    for (_, core, id) in failed {
+                        if let Some(c) = self.cores[core].as_mut() {
+                            let exchange = Exchange::NoAnswer(NoAnswer::NotSent {
+                                reason: "connect timed out".to_owned(),
+                            });
+                            let ios = c.completed(id, exchange, at);
+                            self.queue_ios(core, ios);
+                        }
+                    }
                     for core in 0..self.cores.len() {
                         if let Some(c) = self.cores[core].as_mut() {
                             let ios = c.tick(at);
@@ -3457,8 +3483,652 @@ fn reads_and_heads_that_disagree_end_the_build_after_backoffs() {
     let start = w.now;
     let e = kind(w.open_result(b, spec(dir.path(), 2)));
     w.misroute_reads = false;
-    assert!(matches!(&*e, OpenError::Unavailable(_)), "{e}");
+    assert!(
+        matches!(&*e, OpenError::GaveUp(crate::open::GaveUp::Rechecks)),
+        "{e}"
+    );
+    assert_eq!(e.error_kind().as_str(), "unavailable");
     let heads = heads(&w, b);
     assert!((3..=20).contains(&heads), "{heads} HEADs");
     assert!(w.now - start >= 1_000, "{} ms", w.now - start);
+}
+
+/// An owner that committed `salt` and crashed: the generation holding its CLAIM record, the
+/// epoch of that claim and the frame of its commit, acknowledged and its ACK written.
+fn crashed_owner(w: &mut World, dir: &Path, salt: u8) -> (PathBuf, Epoch, Vec<u8>) {
+    let c = w.core();
+    let bound = w.open(c, spec(dir, 1));
+    let frame = w.commit(c, &bound, salt).unwrap();
+    // Past the ACK interval: the commit's ACK is written.
+    w.run_for(2_000);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    let own = *w.claims(c).last().unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.crash(c);
+    (generation, own, frame)
+}
+
+/// Every file under `dir` with its bytes.
+fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// A provisional open on core `c` (the stream unreachable from it): it resolves within the 5 s
+/// connect limit, before any answer, and its binding is provisional.
+fn open_provisionally(w: &mut World, c: usize, dir: &Path) -> Bound {
+    w.down[c] = true;
+    let start = w.now;
+    let bound = w.open(c, spec(dir, 2));
+    assert!(w.now - start <= 5_000, "the open took {} ms", w.now - start);
+    assert!(bound.handle.provisional());
+    bound
+}
+
+/// The epochs of the claims core `c` sent, each attempt of one claim once.
+fn claimed(w: &World, c: usize) -> Vec<Epoch> {
+    let mut claims = w.claims(c);
+    claims.dedup();
+    claims
+}
+
+/// The stream is unreachable at the reopen (design §5.5): the trusted generation opens at once,
+/// provisional, and nothing is logged. Commits log and stay pending, `synced()` waits with the
+/// condition `retrying`. Once the stream answers, the pre-check (a HEAD, then the reads from the
+/// log's acknowledged offset) finds nothing foreign, the log's claim `own` goes out again, its
+/// repeat brings the claim of `own + 1`, the pending commit goes out, `synced()` resolves and the
+/// binding is live.
+#[test]
+fn a_provisional_open_waits_for_its_claim_then_goes_live() {
+    let dir = TempDir::new("driver-provisional");
+    let mut w = World::new();
+    let (generation, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    assert_eq!(bound.handle.generation.dir, generation);
+    assert_eq!(bound.handle.attach, super::Attach::Resumed);
+    let x = w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(60_000);
+    assert_eq!(w.outcome(c, ticket), None, "synced() waits for the claim");
+    assert!(bound.handle.provisional());
+    assert!(w.events(c).iter().any(|e| matches!(
+        e,
+        DriverEvent::Condition {
+            binding,
+            condition: Some(crate::replicator::Condition::Retrying),
+        } if *binding == bound.binding
+    )));
+    assert_eq!(w.stream_commits(), vec![first.clone()]);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(!bound.handle.provisional());
+    assert!(w.resets(c).is_empty());
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    assert_eq!(w.stream_commits(), vec![first, x]);
+    assert!(log_records(&generation).contains(&RecordBody::Claim {
+        epoch: next,
+        activation: Activation([2; 16]),
+    }));
+}
+
+/// A provisional binding with nothing pending retires once its last connection closes, its
+/// pre-check still out, and logged nothing: the next open, which reaches the stream, takes over
+/// the same generation, its claim above the log's.
+#[test]
+fn a_provisional_binding_with_nothing_pending_retires_while_its_pre_check_is_out() {
+    let dir = TempDir::new("driver-provisional-retire");
+    let mut w = World::new();
+    let (generation, own, _) = crashed_owner(&mut w, dir.path(), 1);
+    let records = log_records(&generation);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    w.retire(c, &bound);
+    assert!(
+        w.events(c)
+            .iter()
+            .any(|e| matches!(e, DriverEvent::Retired { binding } if *binding == bound.binding))
+    );
+    assert!(!bound.handle.holds_root());
+    drop(bound);
+    // No CLAIM record was logged.
+    let after = log_records(&generation);
+    assert!(
+        after
+            .iter()
+            .skip(records.len())
+            .all(|r| !matches!(r, RecordBody::Claim { .. })),
+        "{after:?}"
+    );
+    let c2 = w.core();
+    let bound = w.open(c2, spec(dir.path(), 3));
+    assert_eq!(bound.handle.generation.dir, generation);
+    assert!(!bound.handle.provisional());
+    assert!(w.claims(c2).iter().all(|e| *e > own), "{:?}", w.claims(c2));
+}
+
+/// Another owner took the stream over while it was out of reach: the pre-check finds its claim
+/// and the binding resets `fenced` with nothing sent, its `synced()` rejects, none of its
+/// provisional commits reaches the stream, and the other owner goes on.
+#[test]
+fn a_provisional_open_after_another_owners_takeover_is_fenced() {
+    let dir = TempDir::new("driver-provisional-fenced");
+    let other = TempDir::new("driver-provisional-other");
+    let mut w = World::new();
+    let (_, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let b = w.core();
+    let bound_b = w.open(b, spec(other.path(), 7));
+    let theirs = w.commit(b, &bound_b, 3).unwrap();
+    w.run_for(1_000);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    let x = w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![ResetKind::Fenced]);
+    assert_eq!(
+        w.outcome(c, ticket),
+        Some(Err(SyncError::Reset(ResetKind::Fenced)))
+    );
+    assert!(
+        claimed(&w, c).is_empty(),
+        "{:?} after {own}",
+        claimed(&w, c)
+    );
+    assert_eq!(w.stream_commits(), vec![first, theirs]);
+    assert!(!w.stream_commits().contains(&x));
+    let more = w.commit(b, &bound_b, 4).unwrap();
+    let ticket = w.sync(b, bound_b.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(b, ticket), Some(Ok(())));
+    assert!(w.resets(b).is_empty());
+    assert_eq!(w.stream_commits().last(), Some(&more));
+}
+
+/// A history event that loses nothing happened while the stream was out of reach: the
+/// pre-check's HEAD shows the history inherits the generation, the log rolls to the new token
+/// with the claim, which goes out again, same epoch and body, and the claim of `own + 1` follows
+/// it (its epoch may carry writes of the history before). No reset, and later commits replicate.
+#[test]
+fn a_provisional_claim_meeting_an_inheriting_history_re_keys() {
+    let dir = TempDir::new("driver-provisional-rekey");
+    let mut w = World::new();
+    let (generation, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let before = segment_tokens(&generation);
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    let ticket = w.sync(c, bound.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(w.resets(c).is_empty());
+    assert!(!bound.handle.provisional());
+    let token = w.server.token(PATH).unwrap();
+    assert_eq!(bound.handle.incarnation(), token);
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    let x = w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits(), vec![first, x]);
+    let mut tokens = before;
+    tokens.push(token);
+    assert_eq!(segment_tokens(&generation), tokens);
+}
+
+/// The same history event with a commit the provisional binding logged during the outage:
+/// that commit was never sent, so the B2 gate counts only what the log held at the open, and
+/// nothing. The binding re-keys, its commit replicates, and nothing is salvaged. On a single
+/// voter with `fsync=never` every unclean restart is such an event, and offline work must survive
+/// it.
+#[test]
+fn an_offline_commit_survives_a_history_that_keeps_everything() {
+    let dir = TempDir::new("driver-provisional-rekey-offline");
+    let mut w = World::new();
+    let (generation, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let before = segment_tokens(&generation);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    let x = w.commit(c, &bound, 2).unwrap();
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(w.resets(c).is_empty());
+    let token = w.server.token(PATH).unwrap();
+    assert_eq!(bound.handle.incarnation(), token);
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    assert_eq!(w.stream_commits(), vec![first, x]);
+    let mut tokens = before;
+    tokens.push(token);
+    assert_eq!(segment_tokens(&generation), tokens);
+    assert!(bound.handle.salvage().unwrap().is_empty());
+}
+
+/// The opposite case: a commit logged before this open, after the log's latest ACK, may have been
+/// sent and acknowledged, so the B2 gate holds. The binding resets `rewound` before its log rolls
+/// and sends nothing (its connections are live, it cannot salvage under them), and the next open,
+/// which reaches the stream, salvages the generation (`history_changed`). The manifest counts that
+/// commit and the provisional one as unacknowledged.
+#[test]
+fn a_commit_before_the_open_after_the_ack_resets_rewound_at_a_history_and_the_next_open_salvages() {
+    let dir = TempDir::new("driver-provisional-rekey-pending");
+    let mut w = World::new();
+    let first = w.core();
+    let bound = w.open(first, spec(dir.path(), 1));
+    w.commit(first, &bound, 1).unwrap();
+    w.run_for(2_000);
+    w.server.inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::DropRequest,
+        times: 1,
+    });
+    w.commit(first, &bound, 3).unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    let own = *w.claims(first).last().unwrap();
+    drop(bound);
+    w.crash(first);
+    let before = segment_tokens(&generation);
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![ResetKind::Rewound]);
+    assert_eq!(
+        w.outcome(c, ticket),
+        Some(Err(SyncError::Reset(ResetKind::Rewound)))
+    );
+    assert!(
+        claimed(&w, c).is_empty(),
+        "{:?} after {own}",
+        claimed(&w, c)
+    );
+    assert_eq!(segment_tokens(&generation), before);
+    drop(bound);
+    let c2 = w.core();
+    let bound = w.open(c2, spec(dir.path(), 3));
+    assert!(
+        matches!(bound.handle.attach, super::Attach::Built {
+            salvaged: Some(_),
+            ..
+        }),
+        "{:?}",
+        bound.handle.attach
+    );
+    let salvages = bound.handle.salvage().unwrap();
+    let [salvaged] = &salvages[..] else {
+        panic!("{salvages:?}");
+    };
+    assert_eq!(
+        salvaged
+            .manifest
+            .acknowledged
+            .as_ref()
+            .map(|a| a.unacknowledged),
+        Some(2)
+    );
+}
+
+/// A restore that lost an acknowledged commit happened while the stream was out of reach: the
+/// provisional claim meets the new token, whose history does not inherit the generation, and the
+/// binding resets `rewound`.
+#[test]
+fn a_provisional_claim_meeting_a_lossy_restore_resets_rewound() {
+    let dir = TempDir::new("driver-provisional-rewound");
+    let mut w = World::new();
+    let first = w.core();
+    let bound = w.open(first, spec(dir.path(), 1));
+    let checkpoint = w.server.checkpoint();
+    w.commit(first, &bound, 1).unwrap();
+    w.run_for(2_000);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    drop(bound);
+    w.crash(first);
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![ResetKind::Rewound]);
+    assert_eq!(
+        w.outcome(c, ticket),
+        Some(Err(SyncError::Reset(ResetKind::Rewound)))
+    );
+}
+
+/// A power loss dropped a commit the stream acknowledged, with its ACK, from the log (design
+/// §8.3): the generation is as it was before that commit. The provisional binding commits other
+/// bytes at the same position, and once the stream answers, its pre-check finds the lost commit
+/// in the stream with no pending record to match it: the binding resets `stale` with nothing sent,
+/// and its provisional commit never reaches the stream.
+#[test]
+fn a_provisional_open_whose_log_lost_acknowledged_commits_goes_stale() {
+    let dir = TempDir::new("driver-provisional-stale");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.run_for(2_000);
+    let generation = bound.handle.generation.dir.clone();
+    let before = files(&generation);
+    let lost = w.commit(c, &bound, 1).unwrap();
+    w.run_for(2_000);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    drop(bound);
+    w.crash(c);
+    // The power loss: the files as they were before the commit.
+    std::fs::remove_dir_all(&generation).unwrap();
+    for (path, bytes) in &before {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let c2 = w.core();
+    let bound = open_provisionally(&mut w, c2, dir.path());
+    let x = w.commit(c2, &bound, 2).unwrap();
+    let ticket = w.sync(c2, bound.binding);
+    w.down[c2] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(c2), vec![ResetKind::Stale]);
+    assert_eq!(
+        w.outcome(c2, ticket),
+        Some(Err(SyncError::Reset(ResetKind::Stale)))
+    );
+    assert_eq!(w.stream_commits(), vec![lost]);
+    assert!(!w.stream_commits().contains(&x));
+}
+
+/// With no local generation there is nothing to open provisionally: the open waits for the
+/// stream and fails at its deadline with `unreachable`.
+#[test]
+fn an_unreachable_stream_with_no_generation_waits_until_the_deadline() {
+    let dir = TempDir::new("driver-unreachable-fresh");
+    let mut w = World::new();
+    let c = w.core();
+    w.down[c] = true;
+    let start = w.now;
+    let e = kind(w.open_result(c, OpenSpec {
+        timeout_ms: 10_000,
+        ..spec(dir.path(), 1)
+    }));
+    assert!(w.now - start >= 10_000);
+    assert!(
+        matches!(*e, OpenError::Unavailable(Unavailable::Unreachable)),
+        "{e}"
+    );
+}
+
+/// A stream that answered the first HEAD, even with a `503`, is reachable: an open that loses it
+/// afterwards waits for the takeover until its deadline, never provisional.
+#[test]
+fn a_stream_that_answered_first_is_reachable_and_the_open_waits() {
+    let dir = TempDir::new("driver-reachable-then-down");
+    let mut w = World::new();
+    crashed_owner(&mut w, dir.path(), 1);
+    let c = w.core();
+    w.server.inject(Scripted {
+        method: Some(Method::Head),
+        fault: Fault::Status {
+            status: 503,
+            retry_after: None,
+        },
+        times: 1,
+    });
+    // The stream goes out of reach right after the first HEAD's answer.
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        server.inject(Scripted {
+            method: None,
+            fault: Fault::Unreachable,
+            times: 1_000,
+        });
+    }));
+    let e = kind(w.open_result(c, OpenSpec {
+        timeout_ms: 10_000,
+        ..spec(dir.path(), 2)
+    }));
+    assert!(matches!(*e, OpenError::Unavailable(_)), "{e}");
+    assert_ne!(e.error_kind().as_str(), "unreachable");
+}
+
+/// A connect to a host that does not answer fails after the 5 s connect limit: the reopen of a
+/// trusted generation with a CLAIM record resolves then, provisional, within the limit of the
+/// first request and before any answer.
+#[test]
+fn a_provisional_open_resolves_when_its_first_connect_times_out() {
+    let dir = TempDir::new("driver-provisional-connect");
+    let mut w = World::new();
+    crashed_owner(&mut w, dir.path(), 1);
+    let c = w.core();
+    w.down[c] = true;
+    w.connect_ms = 5_000;
+    let start = w.now;
+    let bound = w.open(c, spec(dir.path(), 2));
+    let took = w.now - start;
+    assert!((5_000..=5_100).contains(&took), "the open took {took} ms");
+    assert!(bound.handle.provisional());
+}
+
+/// A provisional binding reset with its connection still open (the generation held), as each
+/// of its resets comes: what a reopen beside it starts from.
+struct ResetProvisional {
+    w: World,
+    c: usize,
+    bound: Bound,
+    /// The commits it logged while provisional, which never reached the stream.
+    offline: Vec<Vec<u8>>,
+}
+
+/// `kind`'s scenario: `fenced` by another owner's takeover (from `other`), `stale` after a power
+/// loss of an acknowledged commit, `rewound` by a lossy restore. Two commits are logged while
+/// provisional, then the stream answers and the binding resets with its connection open.
+fn provisional_reset(kind: ResetKind, dir: &Path, other: &Path) -> ResetProvisional {
+    let mut w = World::new();
+    match kind {
+        ResetKind::Fenced => {
+            crashed_owner(&mut w, dir, 1);
+            let b = w.core();
+            let bound_b = w.open(b, spec(other, 7));
+            w.commit(b, &bound_b, 3).unwrap();
+            w.run_for(1_000);
+        }
+        ResetKind::Stale => {
+            let c = w.core();
+            let bound = w.open(c, spec(dir, 1));
+            w.run_for(2_000);
+            let generation = bound.handle.generation.dir.clone();
+            let before = files(&generation);
+            w.commit(c, &bound, 1).unwrap();
+            w.run_for(2_000);
+            drop(bound);
+            w.crash(c);
+            // The power loss: the files as they were before the acknowledged commit.
+            std::fs::remove_dir_all(&generation).unwrap();
+            for (path, bytes) in &before {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+        _ => {
+            let c = w.core();
+            let bound = w.open(c, spec(dir, 1));
+            let checkpoint = w.server.checkpoint();
+            w.commit(c, &bound, 1).unwrap();
+            w.run_for(2_000);
+            drop(bound);
+            w.crash(c);
+            w.server
+                .history_event(HistoryEvent::Restore(checkpoint))
+                .unwrap();
+        }
+    }
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir);
+    let offline = vec![
+        w.commit(c, &bound, 2).unwrap(),
+        w.commit(c, &bound, 4).unwrap(),
+    ];
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![kind]);
+    assert_eq!(bound.handle.reset(), Some(kind));
+    assert!(
+        bound.handle.holds_root(),
+        "{kind:?}: the connection holds it"
+    );
+    ResetProvisional {
+        w,
+        c,
+        bound,
+        offline,
+    }
+}
+
+/// The bytes of `dir`'s log segments, in order.
+fn log_bytes(dir: &Path) -> Vec<u8> {
+    files(&dir.join("log")).into_values().flatten().collect()
+}
+
+/// A provisional binding resets (`fenced`, `stale`, `rewound`) while its connection still holds
+/// its generation. Its connection's commits are refused under the log's lock from the reset on
+/// (G8), so the log stays as the reset left it. A reopen in the same core runs beside it from a
+/// copy of that generation (design §5.6), and the original is trashed. After `rewound`, the
+/// reopen's salvage (`history_changed`) takes the copy, whose log holds the original's, and its
+/// manifest counts the provisional commits as unacknowledged. After `fenced` or `stale` the
+/// reopen takes over and rebuilds from the stream, which never held the provisional commits.
+#[test]
+fn a_reset_provisional_binding_is_reopened_beside_its_connection_from_a_copy() {
+    for kind in [ResetKind::Fenced, ResetKind::Stale, ResetKind::Rewound] {
+        let (dir, other) = (
+            TempDir::new("driver-provisional-copy"),
+            TempDir::new("driver-provisional-copy-other"),
+        );
+        let ResetProvisional {
+            mut w,
+            c,
+            bound,
+            offline,
+        } = provisional_reset(kind, dir.path(), other.path());
+        let connection = crate::db::connection_for_tests(
+            bound.binding,
+            Arc::clone(&bound.handle),
+            String::new(),
+        );
+        let next = bound.handle.log().unwrap().next_position();
+        assert!(
+            matches!(connection.log_unless_reset(), Err(crate::db::LogRefused::Reset(k)) if k == kind),
+            "{kind:?}"
+        );
+        assert_eq!(bound.handle.log().unwrap().next_position(), next);
+        let old = bound.handle.generation.clone();
+        let copy = w.open(c, spec(dir.path(), 3));
+        assert_ne!(copy.handle.generation.id, old.id, "{kind:?}");
+        assert!(!old.dir.exists(), "{kind:?}: the original is trashed");
+        assert!(bound.handle.holds_root(), "{kind:?}");
+        let salvages = copy.handle.salvage().unwrap();
+        if kind == ResetKind::Rewound {
+            assert!(
+                matches!(copy.handle.attach, super::Attach::Built {
+                    salvaged: Some(Reason::HistoryChanged),
+                    ..
+                }),
+                "{:?}",
+                copy.handle.attach
+            );
+            let [salvaged] = &salvages[..] else {
+                panic!("{salvages:?}");
+            };
+            // The copy's log, with the provisional commits, superseding the original's.
+            let log = log_bytes(&salvaged.dir);
+            for frame in &offline {
+                assert!(log.windows(frame.len()).any(|w| w == &frame[..]));
+            }
+            assert_eq!(salvaged.manifest.lineage, Some(old.lineage));
+            assert_eq!(
+                salvaged
+                    .manifest
+                    .acknowledged
+                    .as_ref()
+                    .map(|a| a.unacknowledged),
+                Some(2)
+            );
+        } else {
+            assert!(
+                matches!(copy.handle.attach, super::Attach::Built {
+                    salvaged: None,
+                    ..
+                }),
+                "{kind:?}: {:?}",
+                copy.handle.attach
+            );
+            assert!(salvages.is_empty(), "{kind:?}: {salvages:?}");
+        }
+        let ticket = w.sync(c, copy.binding);
+        w.run_for(5_000);
+        assert_eq!(w.outcome(c, ticket), Some(Ok(())), "{kind:?}");
+        assert_eq!(w.resets(c), vec![kind], "the copy is live");
+        let stream = w.stream_commits();
+        assert!(offline.iter().all(|f| !stream.contains(f)), "{kind:?}");
+        drop(connection);
+        assert!(!bound.handle.disconnect());
+        assert!(!bound.handle.holds_root());
+    }
+}
+
+/// A provisional binding resets while the stream is still out of reach, its connection open. A
+/// reopen in the same core opens provisionally again, from a copy of the generation and its CLAIM
+/// records: nothing is logged and nothing sent. Once the stream answers, the copy claims as the
+/// original would have, and the commit both carried replicates.
+#[test]
+fn a_reopen_beside_a_reset_provisional_binding_while_unreachable_is_provisional_again() {
+    let dir = TempDir::new("driver-provisional-copy-offline");
+    let mut w = World::new();
+    let (_, own, first) = crashed_owner(&mut w, dir.path(), 1);
+    let c = w.core();
+    let bound = open_provisionally(&mut w, c, dir.path());
+    let x = w.commit(c, &bound, 2).unwrap();
+    w.run_for(1_000);
+    let now = w.now;
+    w.c(c)
+        .reset_binding(bound.binding, ResetKind::LocalDamage, now);
+    assert_eq!(bound.handle.reset(), Some(ResetKind::LocalDamage));
+    assert!(bound.handle.holds_root());
+    let old = bound.handle.generation.clone();
+    let copy = open_provisionally(&mut w, c, dir.path());
+    assert_eq!(copy.handle.generation.lineage, old.lineage);
+    assert_ne!(copy.handle.generation.id, old.id);
+    assert!(!old.dir.exists(), "the original is trashed");
+    assert_eq!(copy.handle.last_commit(), bound.handle.last_commit());
+    assert!(claimed(&w, c).is_empty(), "nothing sent while unreachable");
+    let ticket = w.sync(c, copy.binding);
+    w.down[c] = false;
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(!copy.handle.provisional());
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c), vec![own, next]);
+    assert_eq!(w.stream_commits(), vec![first, x]);
 }

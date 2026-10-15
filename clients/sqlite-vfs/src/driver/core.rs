@@ -23,6 +23,12 @@
 //!   An open of a stream first carries out a reset its connections marked that the core has not
 //!   heard of yet, then shares the stream's root while a reset binding's connections hold it, and
 //!   its first disk job copies the generation they hold (design §5.6).
+//! - A provisional open (design §5.5: the stream unreachable, a trusted generation with a CLAIM
+//!   record) binds at once and resolves before any answer. Its replicator claims only once the
+//!   stream answered and a pre-check found nothing foreign (design §7). Commits log and wait,
+//!   and so does `synced()`. The binding is live once its claim applies and its reconcile
+//!   completes ([`Action::Bound`]), and resets `fenced` or `stale` when another owner moved the
+//!   stream meanwhile.
 //!
 //! `synced()` waits for every commit at or below its target, at most the last commit the commit
 //! path recorded on the handle; a target the core has not been told is logged yet waits for that
@@ -39,6 +45,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 
+use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 
 use super::ACK_INTERVAL_MS;
@@ -72,6 +79,7 @@ use crate::generation::Root;
 use crate::generation::canonical_path;
 use crate::generation::root_dir;
 use crate::guard;
+use crate::ids::Activation;
 use crate::ids::Lineage;
 use crate::ids::Position;
 use crate::log;
@@ -86,12 +94,13 @@ use crate::open::OpenSpec;
 use crate::open::OpenStep;
 use crate::open::Opening;
 use crate::open::Published;
-use crate::open::Takeover;
+use crate::open::Ready;
 use crate::open::Unavailable;
 use crate::open::salvage_manifest;
 use crate::replicator::Action;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
+use crate::replicator::LocalState;
 use crate::replicator::MAX_BATCH_BYTES;
 use crate::replicator::Pending;
 use crate::replicator::Refusal;
@@ -495,6 +504,9 @@ impl Core {
                 });
             }
             OpenStep::Takeover(takeover) => self.takeover(open, *takeover, now_ms, ios),
+            OpenStep::Provisional { ready, claim } => {
+                self.provisional(open, *ready, claim, now_ms, ios)
+            }
             OpenStep::Fail(e) => self.opened(open, Err(e)),
         }
     }
@@ -516,8 +528,52 @@ impl Core {
         self.opened.remove(&open)
     }
 
-    fn takeover(&mut self, open: OpenId, takeover: Takeover, now_ms: u64, ios: &mut Vec<Io>) {
-        let Takeover {
+    fn takeover(&mut self, open: OpenId, ready: Ready, now_ms: u64, ios: &mut Vec<Io>) {
+        let kind = ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        };
+        let (binding, actions) =
+            self.insert(open, ready, |local| Replicator::activate(kind, local));
+        self.contained(binding, now_ms, |core| {
+            core.execute(binding, actions, now_ms, ios);
+            core.settle(binding, now_ms);
+        });
+    }
+
+    /// A provisional open (design §5.5): the binding binds now and the open resolves with it,
+    /// before any answer. Its replicator's pre-check (a HEAD, then reads up to the tail) goes out,
+    /// and nothing is logged until the stream answered: its claim, the log's latest `claim` sent
+    /// again, follows only a pre-check that found nothing foreign (design §7).
+    fn provisional(
+        &mut self,
+        open: OpenId,
+        ready: Ready,
+        claim: (Epoch, Activation),
+        now_ms: u64,
+        ios: &mut Vec<Io>,
+    ) {
+        let (binding, actions) =
+            self.insert(open, ready, |local| Replicator::provisional(local, claim));
+        log::emit(Level::Info, "provisional", &[
+            ("binding", &binding.0),
+            ("claim", &claim.0),
+        ]);
+        self.contained(binding, now_ms, |core| {
+            core.bind(binding, now_ms, true);
+            core.execute(binding, actions, now_ms, ios);
+            core.settle(binding, now_ms);
+        });
+    }
+
+    /// A binding of open `open`, its replicator started by `start`: the actions it starts with.
+    fn insert(
+        &mut self,
+        open: OpenId,
+        ready: Ready,
+        start: impl FnOnce(LocalState) -> (Replicator, Vec<Action>),
+    ) -> (BindingId, Vec<Action>) {
+        let Ready {
             spec,
             name,
             root,
@@ -525,7 +581,7 @@ impl Core {
             local,
             deadline_ms,
             attach,
-        } = takeover;
+        } = ready;
         let unacked = local
             .pending
             .iter()
@@ -537,11 +593,7 @@ impl Core {
         // Everything up to the acknowledged position is a commit or older; the pending commits
         // follow it.
         let last_commit = local.pending.last().map_or(local.acked, |p| p.id.position);
-        let kind = ClaimKind::Takeover {
-            round: 1,
-            rekeyed: false,
-        };
-        let (replicator, actions) = Replicator::activate(kind, local);
+        let (replicator, actions) = start(local);
         let binding = BindingId(self.id());
         self.bindings.insert(binding, Binding {
             url: Arc::from(spec.url.as_str()),
@@ -567,10 +619,7 @@ impl Core {
             failing: None,
             attach,
         });
-        self.contained(binding, now_ms, |core| {
-            core.execute(binding, actions, now_ms, ios);
-            core.settle(binding, now_ms);
-        });
+        (binding, actions)
     }
 
     /// Runs a step of `binding`: a panic in it resets the binding `internal`, which wakes its
@@ -743,7 +792,7 @@ impl Core {
             }
         }
         if bound {
-            self.bind(binding, now_ms);
+            self.bind(binding, now_ms, false);
         }
     }
 
@@ -1043,15 +1092,28 @@ impl Core {
             },
             ctx.map(|ctx| ctx.limits.batch()),
         );
-        let drained = b.unacked.is_empty() && matches!(b.replicator, Replicator::Streaming { .. });
+        // Nothing pending, even while a claim or a provisional pre-check is out: a claim's CLAIM
+        // record is logged before it goes out, so the next open knows the claim frame as its own.
+        let drained = b.unacked.is_empty()
+            && matches!(
+                b.replicator,
+                Replicator::Streaming { .. } | Replicator::Activating { .. }
+            );
         if drained && handle.life() == Life::Retiring && handle.try_retire() {
             self.retire_now(binding, now_ms);
         }
     }
 
-    /// The replicator bound ([`Action::Bound`]): the open resolves with a handle that now holds
-    /// the log and the root's lock.
-    fn bind(&mut self, binding: BindingId, now_ms: u64) {
+    /// The replicator bound ([`Action::Bound`]), or a provisional open binds before its claim
+    /// (`provisional`): the open resolves with a handle that now holds the log and the root's lock.
+    /// A binding bound already is live from now on.
+    fn bind(&mut self, binding: BindingId, now_ms: u64, provisional: bool) {
+        if let Some(Stage::Bound { handle }) = self.bindings.get(&binding).map(|b| &b.stage) {
+            if handle.set_live() {
+                log::emit(Level::Info, "live", &[("binding", &binding.0)]);
+            }
+            return;
+        }
         let Some(mut b) = self.bindings.remove(&binding) else {
             return;
         };
@@ -1091,6 +1153,7 @@ impl Core {
             max_frame_bytes: ctx.map_or(MAX_BATCH_BYTES, |c| c.limits.batch()),
             acked: ctx.map_or(Position(0), |c| c.acked),
             attach: b.attach,
+            provisional,
         };
         let handle = Arc::new(BindingHandle::new(bind, root));
         handle.record_commit(b.last_commit);

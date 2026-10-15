@@ -22,7 +22,15 @@
 //! answer is sent again under the replicator's retry [`Policy`] until the open's deadline, which
 //! then fails with the last condition (`unreachable` when nothing ever went out). A fresh build
 //! whose stream changes history while it reads starts over under the new token (design D8),
-//! bounded like its restarts after a `410`. Provisional opens and readers come later in M2.
+//! bounded like its restarts after a `410`.
+//!
+//! When the first HEAD gets no answer with nothing sent (the name lookup or the connect failed,
+//! or took longer than its 5 s limit) and the trusted generation holds a CLAIM record, the open
+//! resolves at once, provisionally ([`table::decide_unreachable`], [`OpenStep::Provisional`]):
+//! the binding takes commits and serves reads from its files, and its replicator defers its claim
+//! behind a HEAD and a pre-check of the stream from the log's acknowledged offset (design §7).
+//! Without a trusted generation, or without a claim to continue, the open retries until its
+//! deadline. Readers come later in M2.
 //!
 //! Module map:
 //!
@@ -52,6 +60,7 @@ use self::table::Local;
 use self::table::LocalSummary;
 use self::table::OpenRow;
 use self::table::Superseded;
+use self::table::UnreachableRow;
 use crate::applier::stamp_page_one;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::Frame;
@@ -271,10 +280,25 @@ pub(crate) enum OpenError {
     ClaimRaces,
     #[error("{}: the open ran out of time", .0.kind())]
     Unavailable(Unavailable),
+    /// The open gave up before its deadline: the stream kept contradicting it (`unavailable`).
+    #[error("unavailable: {0}")]
+    GaveUp(GaveUp),
     #[error("{}: the takeover reset", .0.kind())]
     Reset(ResetKind),
     #[error("cancelled")]
     Cancelled,
+}
+
+/// Why an open gave up before its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum GaveUp {
+    /// A build's reads met a `412` or `404` and its HEADs said otherwise, more than
+    /// [`MAX_BUILD_RECHECKS`] times.
+    #[error("the build gave up after {MAX_BUILD_RECHECKS} HEADs that disagreed with its reads")]
+    Rechecks,
+    /// The stream went missing under a build more than [`MAX_BUILD_RESTARTS`] times.
+    #[error("the stream went missing under the build {MAX_BUILD_RESTARTS} times")]
+    Missing,
 }
 
 /// A local failure: a gap or malformed record under valid checksums is the extension's own bug
@@ -731,7 +755,7 @@ impl Build {
             Failure::Restart => {
                 self.rechecks = self.rechecks.saturating_add(1);
                 if self.rechecks > MAX_BUILD_RECHECKS {
-                    return BuildStep::Fail(OpenError::Unavailable(Unavailable::Retrying));
+                    return BuildStep::Fail(OpenError::GaveUp(GaveUp::Rechecks));
                 }
                 self.stage = BuildStage::Head;
                 match self.recheck.backoff(None, Attempt::default(), now_ms) {
@@ -1076,7 +1100,20 @@ fn summary(m: &Materialized) -> LocalSummary {
         acked_offset: r.acked_offset,
         pending: unacked(m),
         holds_data: holds_data(m),
+        claim: m.recovered.claim,
     }
+}
+
+/// Every claim the generation logged: its CLAIM records, and its segment header's.
+fn claims(m: &Materialized) -> Vec<(Epoch, Activation)> {
+    let r = &m.recovered;
+    let mut claims = r.claims.clone();
+    if let Some(claim) = r.claim
+        && !claims.contains(&claim)
+    {
+        claims.push(claim);
+    }
+    claims
 }
 
 /// Whether the log holds any COMMIT record after its latest ACK, own or caught up. The log's open
@@ -1115,29 +1152,25 @@ pub(crate) fn salvage_manifest(
     }
 }
 
-/// What the replicator starts from: a trusted or freshly built generation, as its log says, and the
-/// token it re-keys from when the stream's history inherits it.
+/// What the replicator starts from: a trusted or freshly built generation, as its log says, the
+/// token and request limit of the open's HEAD (the log's token and the largest batch for a
+/// provisional open, which got none), and the token it re-keys from when the stream's history
+/// inherits it.
 fn local_state(
     spec: &OpenSpec,
     m: &Materialized,
     cluster_id: ClusterId,
-    head: &StreamHead,
+    (incarnation, max_request_bytes): (Incarnation, u64),
     highest_epoch: Option<Epoch>,
     rekey_from: Option<Incarnation>,
 ) -> LocalState {
     let r = &m.recovered;
     let lineage = r.header.lineage;
-    let mut claims = r.claims.clone();
-    if let Some(claim) = r.claim
-        && !claims.contains(&claim)
-    {
-        claims.push(claim);
-    }
     LocalState {
         lineage,
         activation: spec.activation,
         cluster_id,
-        incarnation: head.incarnation(),
+        incarnation,
         acked: r.acked,
         acked_offset: r.acked_offset,
         log_bytes: r.log_bytes,
@@ -1150,9 +1183,9 @@ fn local_state(
                 frame,
             })
             .collect(),
-        claims,
+        claims: claims(m),
         highest_epoch,
-        max_request_bytes: head.max_request_bytes(),
+        max_request_bytes,
         configured_max_request_bytes: spec.max_request_bytes,
         // A catch-up in place larger than the database rebuilds instead (design §5.6).
         db_bytes: m.db.metadata().map_or(u64::MAX, |meta| meta.len()),
@@ -1161,9 +1194,10 @@ fn local_state(
     }
 }
 
-/// An open ready to claim: the root locked, the generation materialized.
+/// An open ready to bind: the root locked, the generation materialized, and what its replicator
+/// starts from.
 #[derive(Debug)]
-pub(crate) struct Takeover {
+pub(crate) struct Ready {
     pub(crate) spec: OpenSpec,
     pub(crate) name: CanonicalPath,
     pub(crate) root: Arc<Root>,
@@ -1227,7 +1261,14 @@ pub(crate) enum OpenStep {
         opening: Box<Opening>,
         job: DiskJob,
     },
-    Takeover(Box<Takeover>),
+    Takeover(Box<Ready>),
+    /// The stream is unreachable and the trusted generation holds a CLAIM record: bind now, and
+    /// send the log's latest claim `claim` again once the stream answered and the pre-check found
+    /// nothing foreign (design §5.5, §7).
+    Provisional {
+        ready: Box<Ready>,
+        claim: (Epoch, Activation),
+    },
     Fail(OpenError),
 }
 
@@ -1445,7 +1486,7 @@ impl Opening {
             BuildStep::Missing => {
                 self.missing = self.missing.saturating_add(1);
                 if self.missing > MAX_BUILD_RESTARTS {
-                    return OpenStep::Fail(OpenError::Unavailable(Unavailable::Retrying));
+                    return OpenStep::Fail(OpenError::GaveUp(GaveUp::Missing));
                 }
                 self.prepared = None;
                 self.phase = Phase::Preparing;
@@ -1546,8 +1587,13 @@ impl Opening {
         lineage: Lineage,
         now_ms: u64,
     ) -> OpenStep {
-        let Exchange::Answered(answer) = exchange else {
-            return self.failed(exchange, now_ms);
+        let answer = match exchange {
+            Exchange::Answered(answer) => answer,
+            // The first request got no answer and nothing went out: the stream is unreachable.
+            Exchange::NoAnswer(NoAnswer::NotSent { .. }) if self.retry.seen().is_none() => {
+                return self.unreachable(exchange, now_ms);
+            }
+            Exchange::NoAnswer(_) => return self.failed(exchange, now_ms),
         };
         let (identity, stream) = match &answer.typed {
             Ok(Typed::Head { identity, stream }) if matches!(answer.status, 200 | 404) => {
@@ -1636,6 +1682,58 @@ impl Opening {
         }
     }
 
+    /// The first HEAD got no answer with nothing sent: the unreachable rows of design §5.5.
+    fn unreachable(mut self: Box<Self>, exchange: &Exchange, now_ms: u64) -> OpenStep {
+        let Some(prepared) = &mut self.prepared else {
+            return OpenStep::Fail(OpenError::Panicked);
+        };
+        let local = std::mem::replace(&mut prepared.found, Local::None);
+        let back = match table::decide_unreachable(local) {
+            // A cluster id the header holds is one the open wrote: one that does not parse leaves
+            // nothing a claim could be checked against, so the open waits.
+            UnreachableRow::Provisional { local: m, claim } => {
+                match ClusterId::new(&m.recovered.header.cluster_id) {
+                    Ok(cluster_id) => return self.provisional(m, cluster_id, claim),
+                    Err(_unparsed) => Local::Trusted(summary(&m), m),
+                }
+            }
+            UnreachableRow::Wait { local } => local,
+        };
+        if let Some(prepared) = &mut self.prepared {
+            prepared.found = back;
+        }
+        self.failed(exchange, now_ms)
+    }
+
+    /// Binds the trusted generation `m` now, under the log's token, its claim `claim` deferred
+    /// behind the pre-check.
+    fn provisional(
+        self: Box<Self>,
+        m: Box<Materialized>,
+        cluster_id: ClusterId,
+        claim: (Epoch, Activation),
+    ) -> OpenStep {
+        let this = *self;
+        let Some(prepared) = this.prepared else {
+            return OpenStep::Fail(OpenError::Panicked);
+        };
+        // No HEAD named a limit yet: the pre-check's HEAD names it before anything is sealed.
+        let start = (m.recovered.header.incarnation, MAX_BATCH_BYTES);
+        let local = local_state(&this.spec, &m, cluster_id, start, None, None);
+        OpenStep::Provisional {
+            ready: Box::new(Ready {
+                spec: this.spec,
+                name: this.name,
+                root: prepared.root,
+                m,
+                local,
+                deadline_ms: this.deadline_ms,
+                attach: Attach::Resumed,
+            }),
+            claim,
+        }
+    }
+
     fn takeover(
         self: Box<Self>,
         m: Box<Materialized>,
@@ -1649,8 +1747,9 @@ impl Opening {
         let Some(prepared) = this.prepared else {
             return OpenStep::Fail(OpenError::Panicked);
         };
-        let local = local_state(&this.spec, &m, cluster_id, head, highest_epoch, rekey_from);
-        OpenStep::Takeover(Box::new(Takeover {
+        let start = (head.incarnation(), head.max_request_bytes());
+        let local = local_state(&this.spec, &m, cluster_id, start, highest_epoch, rekey_from);
+        OpenStep::Takeover(Box::new(Ready {
             spec: this.spec,
             name: this.name,
             root: prepared.root,

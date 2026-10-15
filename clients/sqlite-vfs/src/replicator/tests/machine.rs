@@ -777,14 +777,19 @@ fn a_probe_that_succeeds_while_idle_clears_the_condition() {
     assert_eq!(condition(&actions), Some(None));
 }
 
+/// A `410` on a fresh probe sends a HEAD first: a read of another history gets its `410` before
+/// its `412`. With our token still there, retention passed our tail: `fenced`.
 #[test]
-fn a_410_on_a_fresh_probe_fences() {
+fn a_410_on_a_fresh_probe_fences_once_head_shows_our_token() {
     let mut h = streaming(0);
     h.on(Event::Sync {
         ticket: 1,
         target: Position(0),
     });
     let actions = h.answer(&RawAnswer::new(410));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(h.last_request().method, Method::Head);
+    let actions = h.answer(&super::head_naming(None, 37));
     assert_eq!(reset_of(&actions), Some(ResetKind::Fenced));
 }
 

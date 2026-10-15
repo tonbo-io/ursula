@@ -53,7 +53,13 @@ export interface UrsulaStatus {
 	/** The local database file the extension bound. */
 	readonly path: string;
 	readonly role: "owner";
-	readonly state: "live" | "retiring" | "retired" | "reset";
+	/**
+	 * `provisional` when the open found the stream unreachable and opened the trusted local cache
+	 * with its claim deferred: reads come from local files of unverified freshness, commits wait,
+	 * and `synced()` waits for the claim. It turns `live` once the stream answers and the claim
+	 * applies.
+	 */
+	readonly state: "provisional" | "live" | "retiring" | "retired" | "reset";
 	/** The epoch this owner claimed, `null` before its claim is acknowledged. */
 	readonly epoch: number | null;
 	readonly cluster_id: string;

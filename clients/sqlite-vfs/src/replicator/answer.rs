@@ -39,6 +39,10 @@ pub(crate) enum HeadReason {
     Precondition,
     /// A `413` that names no limit: a layer outside #581 §6.4.
     TooLarge,
+    /// A `410` on a read: retention passed our tail, or the read went to another history (a `410`
+    /// comes before a `412`). With our token unchanged the binding resets this kind: `fenced`
+    /// for a `synced()` probe (another owner moved on), `stale` for a provisional pre-check.
+    Gone(ResetKind),
 }
 
 /// What any answer without a producer outcome decides.
@@ -163,12 +167,13 @@ pub(crate) enum Unacked {
     Commits,
 }
 
-/// Whether a takeover may re-key a generation whose log holds `pending`: only with nothing
-/// pending. An ACK record trails the stream's acknowledgements, so a pending tail may hold
-/// acknowledged commits a history change lost, and a re-keyed log names the new token: a later
-/// open would resume it and discard that tail with no salvage. The open salvages such a
-/// generation instead, and a takeover resets `rewound` before its log rolls, so the next open
-/// salvages it.
+/// Whether a takeover, or a provisional open before its claim applied, may re-key a generation
+/// whose log holds `pending`: only with nothing pending. An ACK record trails the stream's
+/// acknowledgements, so a pending tail may hold acknowledged commits a history change lost, and a
+/// re-keyed log names the new token: a later open would resume it and discard that tail with no
+/// salvage. The open salvages such a generation instead. A takeover or a provisional binding
+/// resets `rewound` before its log rolls (a provisional one has live connections, so it cannot
+/// salvage under them), and the next open salvages it.
 pub(crate) fn takeover_may_rekey(pending: Unacked) -> bool {
     pending == Unacked::Nothing
 }

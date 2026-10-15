@@ -168,6 +168,7 @@ impl OpenError {
                 | Unavailable::Rejected { .. }
                 | Unavailable::RequestTooLarge => ErrorKind::Unavailable,
             },
+            OpenError::GaveUp(_) => ErrorKind::Unavailable,
             OpenError::Reset(kind) => ErrorKind::Reset(*kind),
             OpenError::Cancelled => ErrorKind::Cancelled,
         }
