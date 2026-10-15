@@ -7,7 +7,7 @@ SQLite databases replicated through [Ursula](https://ursula.tonbo.io) streams, f
 Start a single Ursula node in a terminal of its own. It keeps nothing across restarts.
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.4
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.5
 ```
 
 Install the package, which needs Node.js 22.19 or later, and run:
@@ -115,7 +115,7 @@ const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.
 
 Hand `storage` to the Pi harness, and close it with `storage.close(ctx)` on shutdown. `openUrsulaPiStorage` attaches the file to the stream, which claims the stream for this process, and then opens the file with Pi's node driver. The error classes, such as `UrsulaReplicationError` and `UrsulaFencedError`, come from `@tonbo/sqlite-ursula`.
 
-The package declares `@earendil-works/pi-durable` as an optional peer dependency in the range `>=1.0.0 <1.2.0`, and npm reports a mismatch when your version is outside it. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits.
+The package declares `@earendil-works/pi-durable` as an optional peer dependency in the range `>=1.0.0 <1.2.0`, and npm refuses the install with `ERESOLVE` when your version is outside it. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits.
 
 ## Versions
 

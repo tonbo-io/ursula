@@ -10,7 +10,7 @@ sidebarTitle: SQLite (VFS)
 Start a single node in a terminal of its own. It keeps nothing across restarts.
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.4
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.5
 ```
 
 Install the package, which needs Node.js 22.19 or later, and run:
@@ -339,7 +339,7 @@ const storage = await openUrsulaPiStorage("/data/harness-1.db", "https://ursula.
 // hand `storage` to the Pi harness, and storage.close(ctx) on shutdown
 ```
 
-`@tonbo/sqlite-ursula` declares `@earendil-works/pi-durable` as an optional peer dependency in the range `>=1.0.0 <1.2.0`, and npm reports a mismatch when your version is outside it. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits. Before 0.7.5, `openUrsulaPiStorage` came from `@tonbo/sqlite-ursula` itself.
+`@tonbo/sqlite-ursula` declares `@earendil-works/pi-durable` as an optional peer dependency in the range `>=1.0.0 <1.2.0`, and npm refuses the install with `ERESOLVE` when your version is outside it. On 1.0.0 and on 1.1.0, CI runs Pi's storage conformance suite through the extension, and the tests of how `openUrsulaPiStorage` reports fenced and refused commits. Before 0.7.5, `openUrsulaPiStorage` came from `@tonbo/sqlite-ursula` itself.
 
 The storage reports failures with the errors of [Errors](#errors), from the same mapping as `open`'s database. A commit the stream does not accept surfaces as `UrsulaReplicationError`, as before 0.7.5, and from 0.7.5 as one of its subclasses. `UrsulaFencedError` (`fenced: true`, `action` `stop`) means another host took the stream over, the stream was deleted and recreated (opening it again then rebuilds the file from the new stream, see [Rules](#rules)), or another writer appended to it with a higher `Stream-Seq`. From 0.7.5 a fenced storage's reads fail too, with the same error and a message that starts with `read refused`, since the file no longer holds what the stream does. Opening the storage again takes the stream back, so do that only for a deliberate takeover. `UrsulaReattachError` (`fenced: false`, `action` `reattach`) means the commit's outcome is unknown, or the local file failed: open the storage again. A poison whose cause must be fixed first stays a plain `UrsulaReplicationError`, whose `action` is `fix`.
 

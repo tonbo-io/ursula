@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-ursula-vfs"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 publish = false
 description = "A SQLite VFS (loadable extension) that replicates every WAL commit to an Ursula stream before it reaches the local WAL"
