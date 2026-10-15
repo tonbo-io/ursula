@@ -12,11 +12,11 @@
 //! At most one append or claim is outstanding at a time, beside at most one `synced()` probe, and
 //! an answer whose id is not an outstanding one (a late duplicate, an earlier attempt) is ignored.
 //!
-//! A `410` in a reconcile follows design §4.9's rule: a HEAD names the latest snapshot, its body is
-//! read and checked, and when its last commit is this generation's at or past the acknowledged
-//! position (and at most the last logged), the records it includes are acknowledged and the
-//! reconcile reads on from its offset. Otherwise a takeover diverges and rebuilds, and a
-//! continuation resets `stale`.
+//! A `410` in a reconcile follows design §4.9's rule: a HEAD names the latest snapshot, its header
+//! alone is read and its checksum verified, and when its last commit is of our lineage at or below
+//! the acknowledged position, the reconcile reads on from its offset. Clones share a lineage, so
+//! a snapshot above it is never trusted: a takeover diverges and rebuilds, and a continuation
+//! resets `stale`.
 //!
 //! A snapshot asks for a batch ending exactly at its `k` ([`Event::Boundary`]); once `k` is
 //! acknowledged, [`Action::Boundary`] hands back `W`, the end offset of that batch's receipt.
@@ -83,17 +83,20 @@ use crate::codec::digest::producer_digest;
 use crate::codec::frame;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::snapshot::SnapshotHeader;
-use crate::codec::snapshot::check_body;
+use crate::codec::snapshot::read_header;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
 use crate::ids::Position;
+use crate::log;
+use crate::log::Level;
 pub(crate) use crate::materialize::ForeignFrame;
 use crate::transport::Attempt;
 use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::PRODUCER_ID;
 use crate::wire::Request;
+use crate::wire::SnapshotPart;
 use crate::wire::Target;
 use crate::wire::Typed;
 
@@ -508,16 +511,9 @@ impl Ctx {
         }
     }
 
-    /// A read of the snapshot at `offset`, under the precondition: its body is at most the
-    /// request limit the snapshot was published under.
-    pub(crate) fn snapshot_request(&self, offset: Offset) -> Request {
-        Request {
-            keys: ProducerRequestHeaders {
-                producer: None,
-                precondition: self.precondition(),
-            },
-            ..Request::snapshot_read(offset, self.limits.head)
-        }
+    /// A read of the header of the snapshot at `offset`, under the precondition.
+    pub(crate) fn snapshot_header_request(&self, offset: Offset) -> Request {
+        Request::snapshot_read(offset, self.incarnation, SnapshotPart::Header)
     }
 
     /// The first position not acknowledged: tickets at or above it wait.
@@ -607,7 +603,7 @@ pub(crate) enum Step {
     /// header. `snapshot` is `None` while the HEAD that names it is out, then the snapshot read.
     Gone {
         reconcile: Box<Reconcile>,
-        link: Link,
+        link: Box<Link>,
         snapshot: Option<SnapshotRef>,
     },
 }
@@ -924,7 +920,7 @@ fn activating(
                     }
                     ReadDecision::Gone => {
                         ctx.set_condition(None, actions);
-                        let link = Link::send(head_request(), &mut ctx, actions);
+                        let link = Box::new(Link::send(head_request(), &mut ctx, actions));
                         Replicator::Activating {
                             kind,
                             step: Step::Gone {
@@ -1004,6 +1000,14 @@ fn activating(
                 if last < ctx.logged {
                     return reset(ResetKind::Internal, actions);
                 }
+                // A ticket added while catching up whose target lies in the discarded tail never
+                // resolves, like those the divergence abandoned.
+                if let CatchUp::Rebuild {
+                    discard_from: Some(from),
+                } = done.catch_up
+                {
+                    ctx.tickets.abandon_from(from, actions);
+                }
                 // The caught-up frames hold positions up to `last`, acknowledged.
                 ctx.lineage = lineage;
                 ctx.logged = last;
@@ -1073,7 +1077,7 @@ fn head_request() -> Request {
 struct Gone {
     kind: ClaimKind,
     reconcile: Box<Reconcile>,
-    link: Link,
+    link: Box<Link>,
     snapshot: Option<SnapshotRef>,
 }
 
@@ -1137,10 +1141,10 @@ impl Gone {
                     match latest.filter(|s| s.offset >= self.reconcile.at()) {
                         None => self.fails(ctx, now_ms, actions),
                         Some(latest) => {
-                            let request = ctx.snapshot_request(latest.offset);
+                            let request = ctx.snapshot_header_request(latest.offset);
                             let link = Link::send(request, &mut ctx, actions);
                             Self {
-                                link,
+                                link: Box::new(link),
                                 snapshot: Some(latest),
                                 ..self
                             }
@@ -1167,28 +1171,34 @@ impl Gone {
             };
         };
         match &answer.typed {
-            Ok(Typed::SnapshotRead(read)) if answer.status == 200 && read.snapshot == snapshot => {
+            Ok(Typed::SnapshotRead(read))
+                if matches!(answer.status, 200 | 206) && read.snapshot == snapshot =>
+            {
                 ctx.set_condition(None, actions);
-                let content_type = answer.content_type.as_deref().unwrap_or(CONTENT_TYPE);
-                let checked = check_body(
-                    content_type,
-                    &answer.body,
-                    snapshot.offset,
-                    &snapshot.digest,
-                );
-                match checked {
-                    Ok((header, _)) if self.covers(&ctx, &header) => {
+                // The header verifies without the body (design §4.11).
+                match read_header(&answer.body) {
+                    Ok((header, _))
+                        if header.fields.offset == snapshot.offset
+                            && self.covers(&ctx, &header) =>
+                    {
                         self.continue_from(&header, ctx, now_ms, actions)
                     }
-                    // Not ours, not covering, or not a snapshot this extension reads.
-                    Ok(_) | Err(_) => self.fails(ctx, now_ms, actions),
+                    // Not ours, or not at or below what this copy acknowledged.
+                    Ok(_) => self.fails(ctx, now_ms, actions),
+                    Err(e) => {
+                        log::emit(Level::Warn, "snapshot_unreadable", &[
+                            ("offset", &snapshot.offset),
+                            ("error", &e),
+                        ]);
+                        self.fails(ctx, now_ms, actions)
+                    }
                 }
             }
             // Superseded since the HEAD: the HEAD again names the latest.
             Ok(Typed::Untyped) if answer.status == 404 => {
                 let link = Link::send(head_request(), &mut ctx, actions);
                 Self {
-                    link,
+                    link: Box::new(link),
                     snapshot: None,
                     ..self
                 }
@@ -1201,15 +1211,17 @@ impl Gone {
         }
     }
 
-    /// Whether the snapshot of `header` holds every record this owner acknowledged and nothing
-    /// it did not log: its last commit is this generation's, at or past the acknowledged
-    /// position and at most the last logged, and its offset lies in what the reconcile reads.
+    /// Whether the snapshot of `header` is a state this copy knows the stream holds: its last
+    /// commit is of our lineage at or below the acknowledged position (durable, or matched by id
+    /// and bytes in this reconcile), and its offset lies in what the reconcile reads. Clones
+    /// share a lineage, so a position above our acknowledged one may be another copy's commit
+    /// with other bytes: never trusted, a divergence. Our own snapshot never runs ahead of the
+    /// durable acknowledged position (the snapshot thread fsyncs ACK(k, W) before publishing).
     fn covers(&self, ctx: &Ctx, header: &SnapshotHeader) -> bool {
         let last = header.fields.last;
         let offset = header.fields.offset;
         last.lineage == ctx.lineage
-            && ctx.acked <= last.position
-            && last.position <= ctx.logged
+            && last.position <= ctx.acked
             && self.reconcile.at() <= offset
             && offset <= self.reconcile.end()
     }

@@ -14,8 +14,9 @@
 //!    window;
 //! 5. copies the pages into a temp file 256 pages at a time, fsyncs the db file and appends
 //!    BASE(`k`);
-//! 6. waits for `k`'s acknowledgement, whose receipt names `W`, and writes the `USS3` body to a
-//!    temp file while its digest is computed;
+//! 6. waits for `k`'s acknowledgement, whose receipt names `W`, fsyncs ACK(`k`, `W`) (so the
+//!    snapshot never runs ahead of the durable acknowledged position the `410` rule compares
+//!    with), and writes the `USS3` body to a temp file while its digest is computed;
 //! 7. publishes it: a body of at most the request limit `L` in one `PUT {stream}/snapshot/{W}`
 //!    with `Stream-Snapshot-Digest`, whose `204` naming the digest confirms it. A `409` with a
 //!    later offset means another snapshot superseded it, one at `W` with another digest stops
@@ -85,6 +86,7 @@ use crate::transport::Transport;
 use crate::wire::Answer;
 use crate::wire::Exchange;
 use crate::wire::Method;
+use crate::wire::NoAnswer;
 use crate::wire::Request;
 use crate::wire::Target;
 use crate::wire::Typed;
@@ -437,6 +439,15 @@ pub(crate) enum Outcome {
 }
 
 /// Why an attempt failed.
+/// What the last attempt of a request that never got a definite answer met.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OutageCause {
+    #[error("no answer: {0:?}")]
+    NoAnswer(NoAnswer),
+    #[error("status {0}")]
+    Status(u16),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SnapshotFailure {
     #[error("the private connection: {0}")]
@@ -450,13 +461,12 @@ pub(crate) enum SnapshotFailure {
     },
     #[error("the snapshot body: {0}")]
     Body(#[from] SnapshotError),
-    #[error("the batch ending at position {} was acknowledged without a receipt ending there", .position.0)]
-    NoReceipt { position: Position },
+    /// `limit` is `None` when a `413` named none.
     #[error(
-        "request_too_large: a snapshot body of {bytes} bytes is above the request limit of \
-         {limit} bytes (parts come in M3)"
+        "request_too_large: a snapshot body of {bytes} bytes is above {} (parts come in M3)",
+        limit.map_or_else(|| "a limit the stream did not name".to_owned(), |l| format!("the request limit of {l} bytes"))
     )]
-    TooLarge { bytes: u64, limit: u64 },
+    TooLarge { bytes: u64, limit: Option<u64> },
     #[error("stream_state: the stream holds another snapshot at offset {offset}")]
     Conflict { offset: Offset },
     #[error("the stream answered {status} to the {what}")]
@@ -465,10 +475,10 @@ pub(crate) enum SnapshotFailure {
     Malformed { what: &'static str },
     #[error("the stream is another incarnation now")]
     Recreated,
-    #[error("unavailable: the {what} got no definite answer: {reason}")]
+    #[error("unavailable: the {what} got no definite answer: {cause}")]
     Outage {
         what: &'static str,
-        reason: String,
+        cause: OutageCause,
         retry_after: Option<Duration>,
     },
     #[error("the binding reset")]
@@ -629,14 +639,24 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
         b.reset(ResetKind::LocalDamage, &format_args!("snapshot: {e}"));
         return Err(SnapshotFailure::Reset);
     }
-    drop(conn);
+    // While the private connection is open the binding cannot retire: the log is still its own.
     base(b, k)?;
+    drop(conn);
     let Some(receipt) = snapper.wait_receipt(k) else {
         return Ok(Outcome::Skipped);
     };
-    let offset = receipt
-        .offset
-        .ok_or(SnapshotFailure::NoReceipt { position: k })?;
+    let Some(offset) = receipt.offset else {
+        // Acknowledged without a receipt ending at `k`: nothing to key a snapshot by this time.
+        log::emit(Level::Info, "snapshot_skipped", &[
+            ("file", &b.path),
+            ("position", &k.0),
+            ("reason", &"acknowledged without a receipt ending there"),
+        ]);
+        return Ok(Outcome::Skipped);
+    };
+    // The snapshot never runs ahead of the durable acknowledged position: the 410 rule trusts a
+    // snapshot of our lineage only at or below it (design §4.9).
+    durable_ack(b, k, offset, receipt.log_bytes)?;
     image.rewind().map_err(io("rewind", &image_path.0))?;
     let fields = SnapshotFields {
         offset,
@@ -650,12 +670,10 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
     let (len, digest) = write_snapshot(&fields, &mut image, &body_path.0)?;
     drop(image);
     drop(image_path);
-    let incarnation = Incarnation::try_from(b.handle.incarnation.parse::<u64>().unwrap_or(0))
-        .map_err(|_malformed| SnapshotFailure::Recreated)?;
     let published = publish(&Publish {
         transport: driver().transport(&b.url).as_ref(),
         snapper,
-        incarnation,
+        incarnation: b.handle.incarnation,
         request_limit: b.handle.replication().request_limit,
         offset,
         digest,
@@ -665,6 +683,46 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
     // Its frame bytes up to `k` no longer count toward the next snapshot.
     driver().snapshotted(b.id, receipt.log_bytes)?;
     Ok(published)
+}
+
+/// Appends ACK(`k`, `offset`) and fsyncs the log, before the snapshot of `k` is published. A
+/// failure resets the binding `local_damage`.
+fn durable_ack(
+    b: &Binding,
+    k: Position,
+    offset: Offset,
+    log_bytes: u64,
+) -> Result<(), SnapshotFailure> {
+    let commits = b.lock();
+    if b.reset_kind().is_some() {
+        return Err(SnapshotFailure::Reset);
+    }
+    let written = match b.handle.log() {
+        Ok(mut log) => log
+            .append(&RecordBody::Ack {
+                acked: k,
+                acked_offset: offset,
+                log_bytes,
+            })
+            .and_then(|_position| log.sync()),
+        Err(_poisoned) => {
+            drop(commits);
+            b.reset(
+                ResetKind::Internal,
+                &"snapshot: the log's lock was poisoned",
+            );
+            return Err(SnapshotFailure::Reset);
+        }
+    };
+    if let Err(e) = written {
+        drop(commits);
+        b.reset(
+            ResetKind::LocalDamage,
+            &format_args!("snapshot: the ACK record: {e}"),
+        );
+        return Err(SnapshotFailure::Reset);
+    }
+    Ok(())
 }
 
 /// Appends BASE(`k`) once the db file holds every commit up to `k` durably. A failure resets the
@@ -785,21 +843,21 @@ impl Publish<'_> {
                         return Ok(*answer);
                     }
                     attempt = Attempt::default();
-                    (format!("status {}", answer.status), answer.retry_after)
+                    (OutageCause::Status(answer.status), answer.retry_after)
                 }
                 Exchange::NoAnswer(no) => {
                     attempt = Attempt {
                         fresh_connection: true,
                         refresh_token: false,
                     };
-                    (format!("{no:?}"), None)
+                    (OutageCause::NoAnswer(no), None)
                 }
             };
             failures = failures.saturating_add(1);
             if failures >= PUBLISH_ATTEMPTS {
                 return Err(SnapshotFailure::Outage {
                     what,
-                    reason,
+                    cause: reason,
                     retry_after,
                 });
             }
@@ -839,7 +897,7 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
     if p.len > limit {
         return Err(SnapshotFailure::TooLarge {
             bytes: p.len,
-            limit,
+            limit: Some(limit),
         });
     }
     let body = std::fs::read(p.body).map_err(io("read", p.body))?;
@@ -873,8 +931,7 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
         Ok(Typed::TooLarge(limit)) => {
             return Err(SnapshotFailure::TooLarge {
                 bytes: p.len,
-                // A `413` that names no limit refused this body's size.
-                limit: limit.map_or(p.len.saturating_sub(1), |l| l.bytes()),
+                limit: limit.map(|l| l.bytes()),
             });
         }
         Ok(Typed::IncarnationMismatch(_)) => return Err(SnapshotFailure::Recreated),

@@ -330,26 +330,41 @@ fn gone_with_snapshot(kind: ClaimKind, last: CommitId) -> (Harness, Vec<Action>,
     (h, actions, w)
 }
 
-// Our own snapshot at or past the acknowledged position: its records are acknowledged and the
-// reconcile goes on from its offset, here the claim's start, so nothing is rebuilt.
+// A snapshot of our lineage at or below the acknowledged position: the stream holds that state
+// under our lineage and this copy acknowledged it, so the reconcile goes on from its offset (here
+// the claim's start, other claims having come between), and nothing is rebuilt.
 #[test]
-fn row_6_a_410_continues_from_our_own_snapshot() {
+fn row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked() {
     for kind in KINDS {
-        let last = CommitId {
-            lineage: LINEAGE,
-            position: Position(2),
-        };
-        let (h, actions, w) = gone_with_snapshot(kind, last);
-        assert!(streaming(&h), "{kind:?}: {actions:?}");
-        assert!(!actions.iter().any(|a| matches!(a, Action::Rebuild { .. })));
-        assert_eq!(acked(&actions), Some(Position(2)), "{kind:?}");
-        assert!(
-            actions.contains(&Action::Wake {
+        for position in [1, 2] {
+            let state = LocalState {
                 acked: Position(2),
-                offset: off(w + 37),
-            }),
-            "{actions:?}"
-        );
+                logged: Position(2),
+                ..local(Vec::new(), 100)
+            };
+            let (mut h, _) = Harness::activate(kind, state);
+            h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 200, 237, None)));
+            let actions = h.answer(&RawAnswer::new(410));
+            assert_eq!(sends(&actions)[0].method, Method::Head);
+            let last = CommitId {
+                lineage: LINEAGE,
+                position: Position(position),
+            };
+            let (body, snapshot) = snapshot_body(200, last);
+            h.answer(&head_naming(Some(snapshot), 237));
+            // Only the header is read.
+            assert_eq!(h.last_request().head_bytes, Some(56));
+            let actions = h.answer(&snapshot_read(snapshot, body[..56].to_vec()));
+            assert!(streaming(&h), "{kind:?} {position}: {actions:?}");
+            assert!(!actions.iter().any(|a| matches!(a, Action::Rebuild { .. })));
+            assert!(
+                actions.contains(&Action::Wake {
+                    acked: Position(2),
+                    offset: off(237),
+                }),
+                "{actions:?}"
+            );
+        }
     }
 }
 
@@ -365,7 +380,13 @@ fn row_6_a_410_with_a_snapshot_that_does_not_cover_us_diverges() {
         lineage: LINEAGE,
         position: Position(3),
     };
-    for last in [foreign, ahead] {
+    // Ours past the acknowledged position: maybe a clone's commit of our lineage with other
+    // bytes, never trusted.
+    let clone = CommitId {
+        lineage: LINEAGE,
+        position: Position(2),
+    };
+    for last in [foreign, ahead, clone] {
         let (_, actions, w) = gone_with_snapshot(KINDS[0], last);
         let w = usize::try_from(w).unwrap();
         assert!(
@@ -375,7 +396,7 @@ fn row_6_a_410_with_a_snapshot_that_does_not_cover_us_diverges() {
         let (_, actions, _) = gone_with_snapshot(KINDS[1], last);
         assert_eq!(reset_of(&actions), Some(ResetKind::Stale));
     }
-    // A body that is not the one the digest names.
+    // A header whose checksum fails.
     let p1 = commit(LINEAGE, 1, 1);
     let w = u64::try_from(p1.frame.len()).unwrap();
     let (mut h, _) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
@@ -385,7 +406,7 @@ fn row_6_a_410_with_a_snapshot_that_does_not_cover_us_diverges() {
     };
     let (mut body, snapshot) = snapshot_body(w, last);
     h.answer(&head_naming(Some(snapshot), w + 37));
-    body.push(0);
+    body[20] ^= 1;
     let actions = h.answer(&snapshot_read(snapshot, body));
     assert!(
         matches!(actions.first(), Some(Action::Rebuild { .. })),

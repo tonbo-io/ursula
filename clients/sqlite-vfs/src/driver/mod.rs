@@ -34,6 +34,8 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use ursula_headers::Incarnation;
+
 use self::disk::DiskJob;
 use crate::generation::CanonicalPath;
 use crate::generation::Generation;
@@ -131,7 +133,7 @@ pub(crate) struct BindingHandle {
     pub(crate) name: CanonicalPath,
     /// The stream's cluster id and incarnation token when the binding bound.
     pub(crate) cluster_id: String,
-    pub(crate) incarnation: String,
+    pub(crate) incarnation: Incarnation,
     log: Mutex<Log>,
     pending_bytes: AtomicU64,
     max_pending_bytes: u64,
@@ -479,7 +481,7 @@ pub(crate) struct Bind {
     pub(crate) generation: Generation,
     pub(crate) name: CanonicalPath,
     pub(crate) cluster_id: String,
-    pub(crate) incarnation: String,
+    pub(crate) incarnation: Incarnation,
     pub(crate) log: Log,
     pub(crate) pending_bytes: u64,
     pub(crate) max_pending_bytes: u64,

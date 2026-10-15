@@ -104,7 +104,11 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
         },
         16 => snapshot(5, b"image"),
         17 => snapshot(5, b"other image"),
-        18 => Request::snapshot_read(Offset::from_u64(5), 1 << 20),
+        18 => Request::snapshot_read(
+            Offset::from_u64(5),
+            token()?.incarnation,
+            crate::wire::SnapshotPart::Header,
+        ),
         19 => Request {
             keys: keys(token()),
             ..Request::new(Method::Put, Target::Retention {
@@ -171,7 +175,7 @@ fn model_answers_round_trip_through_http() {
     }
     assert_eq!(statuses, [
         404, 201, 200, 200, 200, 204, 403, 204, 409, 400, 200, 403, 403, 400, 200, 200, 204, 409,
-        200, 204, 412, 413, 200, 409, 409
+        206, 204, 412, 413, 200, 409, 409
     ]);
 }
 

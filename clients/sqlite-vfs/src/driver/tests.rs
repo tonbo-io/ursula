@@ -1037,7 +1037,7 @@ fn publishes_keep_retention_one_snapshot_behind_and_refuse_bodies_above_the_limi
     let e = publish_at_tail(&server, token, 100, 2).unwrap_err();
     assert!(
         matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
-            limit: 100,
+            limit: Some(100),
             ..
         }),
         "{e}"
@@ -1162,10 +1162,11 @@ fn an_open_below_retention_builds_from_the_snapshot_and_the_tail() {
     assert_eq!(w.stream_commits().last(), Some(&e1));
 }
 
-// A takeover whose acknowledged records retention passed, with its own snapshot covering them
-// (its ACK record lagging): the 410 rule continues from the snapshot's offset, no rebuild.
+// A takeover whose records retention passed, with a snapshot of its own lineage past its durable
+// acknowledged position (its ACK record lagging): clones share a lineage, so the 410 rule never
+// trusts it, and the takeover rebuilds from it. Nothing acknowledged is lost.
 #[test]
-fn a_410_covered_by_our_own_snapshot_continues_in_place() {
+fn a_410_with_our_lineages_snapshot_past_the_durable_ack_rebuilds() {
     let dir = TempDir::new("driver-gone-own");
     let mut w = World::new();
     let a = w.core();
@@ -1188,10 +1189,13 @@ fn a_410_covered_by_our_own_snapshot_continues_in_place() {
     });
     let a2 = w.core();
     let bound = w.open(a2, spec(dir.path(), 2));
-    assert_eq!(bound.handle.generation, generation, "continued in place");
+    assert_ne!(bound.handle.generation, generation, "rebuilt");
     assert_eq!(bound.handle.pending_bytes(), 0);
     assert_eq!(w.stream_commits(), vec![c1]);
-    assert_eq!(std::fs::read(generation.db()).unwrap(), vec![1u8; 4096]);
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        vec![1u8; 4096]
+    );
 }
 
 #[test]

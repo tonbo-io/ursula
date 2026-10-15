@@ -759,6 +759,10 @@ impl Core {
                 *local = Local::Busy;
                 self.disk(Owner::Disk(binding), DiskJob::Install { build, body }, ios);
             }
+            BuildStep::Restart => {
+                *local = Local::Busy;
+                self.disk(Owner::Disk(binding), DiskJob::Restart(build), ios);
+            }
             BuildStep::Apply(frames) => {
                 *local = Local::Busy;
                 self.disk(Owner::Disk(binding), DiskJob::Chunk { build, frames }, ios);
@@ -908,6 +912,11 @@ impl Core {
         let Some(mut b) = self.bindings.remove(&binding) else {
             return;
         };
+        // Bound, the replicator streams with its context.
+        let Some(incarnation) = b.replicator.ctx().map(|c| c.incarnation) else {
+            self.bindings.insert(binding, b);
+            return self.fail_open(binding, OpenError::Panicked);
+        };
         // A result nobody takes or cancels retires too.
         b.unconnected_since = Some((now_ms, 0));
         let Stage::Opening {
@@ -932,7 +941,7 @@ impl Core {
             generation,
             name: b.name.clone(),
             cluster_id: ctx.map(|c| c.cluster_id.to_string()).unwrap_or_default(),
-            incarnation: ctx.map(|c| c.incarnation.to_string()).unwrap_or_default(),
+            incarnation,
             log,
             pending_bytes: pending,
             max_pending_bytes: b.max_pending_bytes,

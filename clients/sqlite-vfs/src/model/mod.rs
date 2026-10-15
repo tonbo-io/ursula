@@ -705,7 +705,15 @@ impl ModelServer {
         else {
             return RawAnswer::new(404);
         };
-        let mut answer = RawAnswer::new(200);
+        // A `Range` of the body's first bytes is answered `206` with those bytes.
+        let (status, body) = match request.head_bytes {
+            Some(n) => {
+                let n = usize::try_from(n).unwrap_or(usize::MAX);
+                (206, snapshot.body.get(..n).unwrap_or(&snapshot.body))
+            }
+            None => (200, &snapshot.body[..]),
+        };
+        let mut answer = RawAnswer::new(status);
         SnapshotRead {
             snapshot: snapshot.snapshot,
             incarnation: stream.token_in(history),
@@ -713,7 +721,7 @@ impl ModelServer {
         }
         .render(answer.emit());
         answer.header(CONTENT_TYPE, snapshot.content_type.clone());
-        answer.body = snapshot.body.to_vec();
+        answer.body = body.to_vec();
         answer
     }
 

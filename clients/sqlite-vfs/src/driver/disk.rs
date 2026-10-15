@@ -53,6 +53,8 @@ pub(crate) enum DiskJob {
         build: Box<Build>,
         body: Vec<u8>,
     },
+    /// A build started over in a fresh `.tmp`; done as a [`DiskDone::Built`].
+    Restart(Box<Build>),
     /// One read's frames into a build.
     Chunk {
         build: Box<Build>,
@@ -104,6 +106,7 @@ impl DiskJob {
                 let result = build.install(&body);
                 DiskDone::Chunk { build, result }
             }
+            Self::Restart(build) => DiskDone::Built(build.restart().map(Box::new)),
             Self::Chunk { mut build, frames } => {
                 let result = build.apply(&frames);
                 DiskDone::Chunk { build, result }

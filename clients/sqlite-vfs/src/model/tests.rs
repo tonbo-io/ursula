@@ -991,12 +991,25 @@ fn snapshots_are_keyed_by_offset_and_digest() {
     bad.body = Arc::from(b"tampered".to_vec());
     assert_eq!(world.send(&bad).status, 400);
     // The snapshot reads back with its headers.
-    let read = world.send(&Request::snapshot_read(Offset::from_u64(64), 1 << 20));
+    let read = world.send(&Request::snapshot_read(
+        Offset::from_u64(64),
+        token,
+        crate::wire::SnapshotPart::Body { limit: 1 << 20 },
+    ));
     let Ok(Typed::SnapshotRead(snapshot)) = read.typed else {
         panic!("{read:?}");
     };
     assert!(snapshot.up_to_date);
     assert_eq!(read.body, b"image at 64");
+    // A header read asks for the first bytes alone (`Range`), answered `206`.
+    let header = world.send(&Request::snapshot_read(
+        Offset::from_u64(64),
+        token,
+        crate::wire::SnapshotPart::Header,
+    ));
+    assert_eq!(header.status, 206);
+    assert!(matches!(header.typed, Ok(Typed::SnapshotRead(_))));
+    assert_eq!(header.body, b"image at 64");
 }
 
 #[test]

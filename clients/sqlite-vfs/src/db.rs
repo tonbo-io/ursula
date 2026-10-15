@@ -544,7 +544,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
             generation,
             name,
             cluster_id: "cluster".into(),
-            incarnation: (1u64 << 52).to_string(),
+            incarnation: Incarnation::try_from(1 << 52).unwrap(),
             log,
             pending_bytes: 0,
             max_pending_bytes: 1 << 20,

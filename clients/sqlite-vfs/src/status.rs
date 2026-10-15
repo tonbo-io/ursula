@@ -155,7 +155,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
             replication.epoch.map_or_else(null, |e| e.to_string()),
         ),
         ("cluster_id", json_str(&h.cluster_id)),
-        ("incarnation", json_str(&h.incarnation)),
+        ("incarnation", json_str(&h.incarnation.to_string())),
         ("lineage", json_str(&lineage)),
         ("commits", commits),
         ("replication", repl),

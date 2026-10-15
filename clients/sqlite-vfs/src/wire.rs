@@ -18,6 +18,7 @@ use std::time::Duration;
 use ursula_headers::HeaderError;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
+use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
@@ -42,6 +43,12 @@ pub(crate) const RETRY_AFTER: &str = "retry-after";
 
 /// `Location` header name.
 pub(crate) const LOCATION: &str = "location";
+
+/// `Range`, which only a snapshot header read sends.
+pub(crate) const RANGE: &str = "range";
+
+/// A `USS3` header's length, which a header read asks for.
+const SNAPSHOT_HEADER: u64 = crate::codec::snapshot::HEADER as u64;
 
 /// The base protocol's read offset for the start of a stream.
 const START: &str = "-1";
@@ -167,6 +174,8 @@ pub(crate) enum WireError {
     Header(#[from] HeaderError),
     #[error("unknown query parameter `{0}`")]
     Query(String),
+    #[error("a `Range` other than `bytes=0-<n>`: {0}")]
+    Range(String),
 }
 
 /// One request to a stream. The transport adds the stream URL, `Content-Length`, the bearer token
@@ -186,6 +195,25 @@ pub(crate) struct Request {
     /// The largest answer body the caller expects (a read's chunk, a snapshot): it scales the
     /// time the answer's body may take. Not sent.
     pub(crate) answer_bytes: u64,
+    /// Only the body's first bytes: `Range: bytes=0-{n - 1}`. A server may answer the whole
+    /// body anyway (`200`), or just these (`206`).
+    pub(crate) head_bytes: Option<u64>,
+}
+
+/// Which part of a snapshot a read asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotPart {
+    /// The `USS3` header alone, which verifies without the body (design §4.11).
+    Header,
+    /// The whole body, at most `limit` bytes.
+    Body { limit: u64 },
+}
+
+/// The most a snapshot body published under `head` may hold: the single-request limit, or the
+/// limit in parts when the stream takes parts.
+pub(crate) fn snapshot_limit(head: &StreamHead) -> u64 {
+    head.max_snapshot_bytes()
+        .unwrap_or(head.max_request_bytes())
 }
 
 impl Request {
@@ -201,6 +229,7 @@ impl Request {
             closes: false,
             body: Arc::from(Vec::new()),
             answer_bytes: 0,
+            head_bytes: None,
         }
     }
 
@@ -212,10 +241,24 @@ impl Request {
         }
     }
 
-    /// A read of the snapshot at `offset`, whose body is up to `answer_bytes`.
-    pub(crate) fn snapshot_read(offset: Offset, answer_bytes: u64) -> Self {
+    /// A read of `part` of the snapshot at `offset`, under the precondition `incarnation`: the
+    /// one request every snapshot read sends.
+    pub(crate) fn snapshot_read(
+        offset: Offset,
+        incarnation: Incarnation,
+        part: SnapshotPart,
+    ) -> Self {
+        let (answer_bytes, head_bytes) = match part {
+            SnapshotPart::Header => (SNAPSHOT_HEADER, Some(SNAPSHOT_HEADER)),
+            SnapshotPart::Body { limit } => (limit, None),
+        };
         Self {
+            keys: ProducerRequestHeaders {
+                producer: None,
+                precondition: Some(IncarnationPrecondition { incarnation }),
+            },
             answer_bytes,
+            head_bytes,
             ..Self::new(Method::Get, Target::Snapshot { offset })
         }
     }
@@ -231,6 +274,9 @@ impl Request {
         }
         if self.closes {
             emit(names::STREAM_CLOSED, "true");
+        }
+        if let Some(n) = self.head_bytes {
+            emit(RANGE, &format!("bytes=0-{}", n.saturating_sub(1)));
         }
     }
 
@@ -252,6 +298,15 @@ impl Request {
         let keys = ProducerRequestHeaders::parse(headers.clone())?;
         let content_type = text(headers.clone(), CONTENT_TYPE)?.map(str::to_owned);
         let closes = flag(headers.clone(), names::STREAM_CLOSED)?;
+        let head_bytes = text(headers.clone(), RANGE)?
+            .map(|range| {
+                range
+                    .strip_prefix("bytes=0-")
+                    .and_then(|last| last.parse::<u64>().ok())
+                    .and_then(|last| last.checked_add(1))
+                    .ok_or_else(|| WireError::Range(range.to_owned()))
+            })
+            .transpose()?;
         let snapshot_digest = text(headers, names::STREAM_SNAPSHOT_DIGEST)?
             .map(|digest| SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest))
             .transpose()?;
@@ -264,6 +319,7 @@ impl Request {
             closes,
             body: Arc::from(body),
             answer_bytes: 0,
+            head_bytes,
         })
     }
 }
@@ -459,7 +515,7 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
         (Method::Put, Target::Snapshot { .. }) => {
             SnapshotPublishAnswer::parse(status, headers)?.map_or(Typed::Untyped, Typed::Snapshot)
         }
-        (Method::Get, Target::Snapshot { .. }) if status == 200 => {
+        (Method::Get, Target::Snapshot { .. }) if matches!(status, 200 | 206) => {
             Typed::SnapshotRead(SnapshotRead::parse(headers)?)
         }
         (Method::Get, Target::Read { .. }) if status == 200 => Typed::Read {

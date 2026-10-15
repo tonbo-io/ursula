@@ -84,8 +84,10 @@ use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
 use crate::wire::Request;
+use crate::wire::SnapshotPart;
 use crate::wire::Target;
 use crate::wire::Typed;
+use crate::wire::snapshot_limit;
 
 /// What `open()` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,11 +178,6 @@ pub(crate) enum StreamState {
     Undecodable,
     /// A read answered a range other than the one it names.
     Contradiction,
-    /// The frames a build would read from `from` are below retention: retention passed the
-    /// snapshot the build installed while it read.
-    BelowRetention {
-        from: Offset,
-    },
     /// The stream changed history while the open read it.
     HistoryChanged,
 }
@@ -444,12 +441,15 @@ impl Fetch {
 /// position before the log's first (the base the header names). The tail is read from there,
 /// or from the stream's start without a snapshot. Each read's frames are logged as COMMIT records
 /// with an ACK and fsynced before they are applied ([`materialize::catch_up_files`]), so memory
-/// stays bounded by one read.
+/// stays bounded by one read. A `410` while the tail is read (retention passed the installed
+/// snapshot) deletes the `.tmp` and starts over from the HEAD ([`Build::restart`]).
 #[derive(Debug)]
 pub(crate) struct Build {
     building: Building,
     /// Holds the root's lock while the build lives, in a disk job or not.
     root: Arc<Root>,
+    /// The log's first segment header, for a restart.
+    header: SegmentHeader,
     /// The position before the log's first: the snapshot's place in the new log.
     base: Position,
     stage: BuildStage,
@@ -464,11 +464,8 @@ pub(crate) struct Build {
 enum BuildStage {
     /// The HEAD that names the latest snapshot.
     Head,
-    /// The latest snapshot's body, expected up to `answer_bytes`.
-    Snapshot {
-        snapshot: SnapshotRef,
-        answer_bytes: u64,
-    },
+    /// The latest snapshot's body, at most `limit` bytes.
+    Snapshot { snapshot: SnapshotRef, limit: u64 },
     /// The frames after the snapshot (or from the start), up to the end.
     Tail,
 }
@@ -488,6 +485,8 @@ pub(crate) enum BuildStep {
     Install(Vec<u8>),
     /// Apply these frames (a disk job: [`Build::apply`]).
     Apply(Vec<ForeignFrame>),
+    /// Retention passed what the build installed: start over (a disk job: [`Build::restart`]).
+    Restart,
     /// Everything is read and applied: publish (a disk job: [`Build::publish`]).
     Done,
     Fail(OpenError),
@@ -497,14 +496,15 @@ impl Build {
     pub(crate) fn new(
         building: Building,
         root: Arc<Root>,
-        base: Position,
+        header: SegmentHeader,
         incarnation: Incarnation,
         end: Offset,
     ) -> Self {
         Self {
             building,
             root,
-            base,
+            base: Position(header.first_position.0.saturating_sub(1)),
+            header,
             stage: BuildStage::Head,
             fetch: Fetch::new(incarnation, Offset::ZERO, end, None),
             retry: Retry::default(),
@@ -516,16 +516,11 @@ impl Build {
     pub(crate) fn next(&self) -> BuildStep {
         let request = match self.stage {
             BuildStage::Head => head_request(),
-            BuildStage::Snapshot {
-                snapshot,
-                answer_bytes,
-            } => {
-                let mut request = Request::snapshot_read(snapshot.offset, answer_bytes);
-                request.keys.precondition = Some(IncarnationPrecondition {
-                    incarnation: self.fetch.incarnation,
-                });
-                request
-            }
+            BuildStage::Snapshot { snapshot, limit } => Request::snapshot_read(
+                snapshot.offset,
+                self.fetch.incarnation,
+                SnapshotPart::Body { limit },
+            ),
             BuildStage::Tail if self.fetch.done() => return BuildStep::Done,
             BuildStage::Tail => self.fetch.request(),
         };
@@ -570,9 +565,7 @@ impl Build {
                     {
                         BuildStage::Snapshot {
                             snapshot,
-                            answer_bytes: head
-                                .max_snapshot_bytes()
-                                .unwrap_or(head.max_request_bytes()),
+                            limit: snapshot_limit(&head),
                         }
                     }
                     _ => BuildStage::Tail,
@@ -677,13 +670,25 @@ impl Build {
                     Err(e) => BuildStep::Fail(e),
                 }
             }
-            ReadDecision::Gone => {
-                BuildStep::Fail(OpenError::StreamState(StreamState::BelowRetention {
-                    from: self.fetch.stream.at(),
-                }))
-            }
+            // Retention passed what this build installed: it starts over in a fresh `.tmp`, from
+            // the snapshot the HEAD names then.
+            ReadDecision::Gone => BuildStep::Restart,
             ReadDecision::Common(_) => self.failed(exchange, now_ms),
         }
+    }
+
+    /// Disk job: deletes what the build wrote and starts it again in a fresh `.tmp`, from its
+    /// HEAD.
+    pub(crate) fn restart(self) -> Result<Self, OpenError> {
+        let Self {
+            building,
+            root,
+            header,
+            fetch,
+            ..
+        } = self;
+        building.discard().map_err(local)?;
+        start_build(root, header, fetch.incarnation, fetch.stream.end())
     }
 
     /// Disk job: logs, acknowledges, fsyncs and applies one read's frames.
@@ -732,15 +737,25 @@ pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
         log_bytes: 0,
         claim,
     };
-    let mut building = root.build(header).map_err(local)?;
-    if let Some((epoch, activation)) = claim {
+    start_build(root, header, incarnation, end)
+}
+
+/// Starts building the generation `header` names, its claim (a rebuild's) logged and fsynced.
+fn start_build(
+    root: Arc<Root>,
+    header: SegmentHeader,
+    incarnation: Incarnation,
+    end: Offset,
+) -> Result<Build, OpenError> {
+    let mut building = root.build(header.clone()).map_err(local)?;
+    if let Some((epoch, activation)) = header.claim {
         building
             .log
             .append(&RecordBody::Claim { epoch, activation })
             .and_then(|_position| building.log.sync())
             .map_err(local)?;
     }
-    Ok(Build::new(building, root, before, incarnation, end))
+    Ok(Build::new(building, root, header, incarnation, end))
 }
 
 /// What the local steps of an open found.
@@ -1043,6 +1058,13 @@ impl Opening {
                 OpenStep::Disk {
                     opening: self,
                     job: DiskJob::Install { build, body },
+                }
+            }
+            BuildStep::Restart => {
+                self.phase = Phase::Building { cluster_id, head };
+                OpenStep::Disk {
+                    opening: self,
+                    job: DiskJob::Restart(build),
                 }
             }
             BuildStep::Apply(frames) => {
