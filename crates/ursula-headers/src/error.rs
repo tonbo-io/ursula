@@ -91,6 +91,13 @@ pub enum HeaderError {
     /// A parts manifest lists another number of parts than its commit's
     /// `Stream-Snapshot-Parts`.
     ManifestPartCount { declared: PartCount },
+    /// A decimal that must fit in a `u32` does not.
+    U32TooLarge { name: &'static str },
+    /// A producer header that the answer's status and outcome do not use,
+    /// such as `Producer-Seq` on a `403`.
+    UnexpectedHeader { name: &'static str, status: u16 },
+    /// The latest snapshot's offset is above the stream's tail.
+    SnapshotPastNext { snapshot: Offset, next: Offset },
 }
 
 impl fmt::Display for HeaderError {
@@ -144,6 +151,16 @@ impl fmt::Display for HeaderError {
                 f,
                 "{} does not fit status {status}",
                 names::PRODUCER_OUTCOME
+            ),
+            Self::U32TooLarge { name } => write!(f, "{name} does not fit in a u32"),
+            Self::UnexpectedHeader { name, status } => {
+                write!(f, "{name} does not belong on a {status} producer answer")
+            }
+            Self::SnapshotPastNext { snapshot, next } => write!(
+                f,
+                "{} {snapshot} is above {} {next}",
+                names::STREAM_SNAPSHOT_OFFSET,
+                names::STREAM_NEXT_OFFSET
             ),
             Self::InvalidClusterId => write!(
                 f,

@@ -221,12 +221,18 @@ fn stream_head() -> impl Strategy<Value = StreamHead> {
                     previous_incarnation,
                     offset: Offset::from_u64(offset),
                 });
+            // A snapshot lies at or below the tail.
+            let snapshot =
+                (0..=next.get(), snapshot_digest()).prop_map(|(offset, digest)| SnapshotRef {
+                    offset: Offset::from_u64(offset),
+                    digest,
+                });
             (
                 Just(current),
                 Just(next),
                 0..=next.get(),
                 any::<bool>(),
-                option::of(snapshot_ref()),
+                option::of(snapshot),
                 option::of(inherited),
                 any::<u64>(),
                 option::of(any::<u64>()),
@@ -247,6 +253,7 @@ fn stream_head() -> impl Strategy<Value = StreamHead> {
                     .unwrap()
                     .with_closed(closed)
                     .with_snapshot(snapshot)
+                    .unwrap()
                     .with_max_snapshot_bytes(max_snapshot)
                     .with_inherited(inherited)
                     .unwrap()
@@ -475,7 +482,7 @@ proptest! {
         final_offset in offset(),
     ) {
         let pairs = rendered(|emit| limit.render(emit));
-        prop_assert_eq!(SizeLimit::parse(iter(&pairs)), Ok(Some(limit)));
+        prop_assert_eq!(SizeLimit::parse(SizeLimit::STATUS, iter(&pairs)), Ok(Some(limit)));
         let pairs = rendered(|emit| routing.render(emit));
         prop_assert_eq!(RoutingAnswer::parse(routing.status(), iter(&pairs)), Ok(Some(routing)));
         let mismatch = IncarnationMismatch { current };
@@ -508,7 +515,7 @@ proptest! {
         let _publish = SnapshotPublishAnswer::parse(status, fuzz_iter(&headers));
         let _staged = PartStaged::parse(fuzz_iter(&headers));
         let _commit = PartsCommit::parse(fuzz_iter(&headers));
-        let _limit = SizeLimit::parse(fuzz_iter(&headers));
+        let _limit = SizeLimit::parse(status, fuzz_iter(&headers));
         let _routing = RoutingAnswer::parse(status, fuzz_iter(&headers));
         let _mismatch = IncarnationMismatch::parse(status, fuzz_iter(&headers));
         let _closed = StreamClosedConflict::parse(status, fuzz_iter(&headers));

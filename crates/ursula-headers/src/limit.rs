@@ -33,11 +33,16 @@ impl SizeLimit {
         }
     }
 
-    /// Parses the limit a `413` names. `Ok(None)` when it names none: the
-    /// refusal came from a layer that does not type its `413`, such as a
-    /// proxy with its own body limit.
-    pub fn parse<'a, I>(headers: I) -> Result<Option<Self>, HeaderError>
+    /// Parses the limit a `413` names. `Ok(None)` for any other status, and
+    /// for a `413` that names none: the refusal came from a layer that does
+    /// not type its `413`, such as a proxy with its own body limit. A
+    /// successful HEAD carries `Ursula-Max-Request-Bytes` too, so only the
+    /// status tells a refusal from metadata.
+    pub fn parse<'a, I>(status: u16, headers: I) -> Result<Option<Self>, HeaderError>
     where I: IntoIterator<Item = (&'a str, &'a [u8])> {
+        if status != Self::STATUS {
+            return Ok(None);
+        }
         let [request, snapshot] = fields::collect(headers, [
             names::URSULA_MAX_REQUEST_BYTES,
             names::URSULA_MAX_SNAPSHOT_BYTES,
@@ -65,7 +70,25 @@ mod tests {
     use crate::error::HeaderError;
 
     fn parse(pairs: &[(&str, &str)]) -> Result<Option<SizeLimit>, HeaderError> {
-        SizeLimit::parse(pairs.iter().map(|(name, value)| (*name, value.as_bytes())))
+        SizeLimit::parse(
+            SizeLimit::STATUS,
+            pairs.iter().map(|(name, value)| (*name, value.as_bytes())),
+        )
+    }
+
+    #[test]
+    fn only_a_413_names_a_limit() {
+        // A successful HEAD carries the request limit as metadata.
+        for status in [200, 400, 503] {
+            assert_eq!(
+                SizeLimit::parse(status, [(
+                    "ursula-max-request-bytes",
+                    b"33554432".as_slice()
+                )]),
+                Ok(None),
+                "{status}"
+            );
+        }
     }
 
     #[test]
