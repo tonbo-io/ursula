@@ -462,6 +462,7 @@ impl ModelServer {
         .expect("retention never passes the tail")
         .with_closed(stream.closed)
         .with_snapshot(stream.snapshot.as_ref().map(|s| s.snapshot))
+        .expect("a published snapshot is at most the tail")
         .with_max_snapshot_bytes(self.limits.max_snapshot_bytes)
         .with_inherited(stream.inherited(self.history))
         .expect("the inherited offset is at most the tail, under another token");
