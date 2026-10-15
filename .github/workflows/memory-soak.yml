@@ -8,7 +8,8 @@ name: Memory soak
 #
 # The vfs-outage job holds the SQLite VFS's M1 exit criterion: a ten-minute outage in front of the
 # model server, as a blackhole and as refused connections, ends with no reset and a full catch-up
-# (clients/sqlite-ursula/test/outage.e2e.ts, 60 s on every PR in integration.yml).
+# (clients/sqlite-ursula/test/outage.e2e.ts, 60 s on every PR in integration.yml). It also runs
+# weekly and on pushes to main that change the extension. The S3 soak runs on PRs and by hand only.
 
 on:
   pull_request:
@@ -20,6 +21,14 @@ on:
       - ".github/workflows/memory-soak.yml"
       - ".github/actions/ci-s3/**"
       - "scripts/minio_ci.sh"
+  push:
+    branches:
+      - main
+    paths:
+      - "clients/sqlite-vfs/**"
+  schedule:
+    # Mondays, 04:17 UTC: the outage job only.
+    - cron: "17 4 * * 1"
   workflow_dispatch:
     inputs:
       seconds:
@@ -37,7 +46,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +54,7 @@ env:
 jobs:
   build-ursula:
     name: Build release ursula
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     # Fork PRs run on GitHub-hosted runners: RunsOn runners run inside our AWS account.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
     steps:
