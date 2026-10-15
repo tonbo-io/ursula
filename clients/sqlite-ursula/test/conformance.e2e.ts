@@ -157,18 +157,30 @@ describe("a fresh cache", () => {
 		const db = facade(owner);
 		await db.exec("CREATE TABLE pad(i INTEGER PRIMARY KEY, b BLOB)");
 		for (let i = 1; i <= 8; i++) await db.run("INSERT INTO pad VALUES (?, randomblob(3000))", i);
-		// The snapshot that came due: HEAD names it once it is published.
-		let snapshot: number | undefined;
-		for (const deadline = Date.now() + 20_000; snapshot === undefined && Date.now() < deadline; ) {
-			const head = (await fetch(`${directUrl()}${name}`, { method: "HEAD" })).headers.get("stream-snapshot-offset");
-			if (head !== null) snapshot = Number(head);
-			else await new Promise((r) => setTimeout(r, 50));
+		// With snapshots due every 4 KiB, more keep coming while the owner commits: wait until the
+		// owner's latest published snapshot is the one HEAD names and no other is due.
+		const head = async (): Promise<{ snapshot: number | null; next: number }> => {
+			const r = await fetch(`${directUrl()}${name}`, { method: "HEAD" });
+			const snapshot = r.headers.get("stream-snapshot-offset");
+			return { snapshot: snapshot === null ? null : Number(snapshot), next: Number(r.headers.get("stream-next-offset")) };
+		};
+		const snapshots = (): { offset: number | null; log_bytes: number; due_bytes: number } =>
+			(status(location(owner)) as unknown as { snapshot: { offset: number | null; log_bytes: number; due_bytes: number } }).snapshot;
+		let settled = false;
+		for (const deadline = Date.now() + 20_000; !settled && Date.now() < deadline; ) {
+			const s = snapshots();
+			settled = s.offset !== null && s.offset === (await head()).snapshot && s.log_bytes <= s.due_bytes;
+			if (!settled) await new Promise((r) => setTimeout(r, 50));
 		}
-		expect(snapshot, "no snapshot was published within 20 s").toBeDefined();
+		expect(settled, `no snapshot settled within 20 s: ${JSON.stringify(snapshots())}`).toBe(true);
 		// A commit after it: the tail the build reads.
 		await db.run("INSERT INTO pad VALUES (9, x'00')");
 		const rows = await db.all("SELECT i, hex(b) AS b FROM pad ORDER BY i");
 		await owner.close(ctx);
+		// The snapshot the build reads is the one HEAD names now, with a tail after it.
+		const { snapshot, next } = await head();
+		expect(snapshot).not.toBeNull();
+		expect(next).toBeGreaterThan(snapshot as number);
 		const fresh = onSynced(await openUrsulaPiStorage(url, { dir: freshDir() }), "snapshot");
 		try {
 			expect(status(location(fresh)).attach).toEqual({ local: "built", snapshot_offset: snapshot });
