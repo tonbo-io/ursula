@@ -181,11 +181,17 @@ impl IngressAdmission {
         {
             return Err(AdmissionRefusal::RaftLogPressure);
         }
-        if body_bytes == 0 {
+        self.reserve(body_bytes)
+    }
+
+    /// `bytes` of the in-flight body budget, held until the answer.
+    fn reserve(&self, bytes: u64) -> Result<AdmissionPermit, AdmissionRefusal> {
+        if bytes == 0 {
             return Ok(AdmissionPermit { _held: None });
         }
-        // At most the request limit, which fits.
-        let permits = u32::try_from(body_bytes).unwrap_or(u32::MAX);
+        // A body of at most the request limit, with a parts commit's copy
+        // buffers, fits.
+        let permits = u32::try_from(bytes).unwrap_or(u32::MAX);
         match self.body_bytes.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Ok(AdmissionPermit {
                 _held: Some(permit),
@@ -230,6 +236,19 @@ impl DeferredAdmission {
     /// otherwise the permit is held until the answer.
     pub(crate) fn admit(self) -> Result<AdmissionPermit, AdmissionRefusal> {
         self.admission.admit(self.body_bytes)
+    }
+
+    /// Charges `bytes` more than the body against the in-flight budget: the
+    /// copy buffers a parts commit holds (#581 section 3.1).
+    pub(crate) fn with_buffers(mut self, bytes: u64) -> Self {
+        self.body_bytes = self.body_bytes.saturating_add(bytes);
+        self
+    }
+
+    /// The in-flight budget alone, without the WAL and Raft-log pressure
+    /// checks: a snapshot part touches neither until it is committed.
+    pub(crate) fn admit_budget(self) -> Result<AdmissionPermit, AdmissionRefusal> {
+        self.admission.reserve(self.body_bytes)
     }
 }
 

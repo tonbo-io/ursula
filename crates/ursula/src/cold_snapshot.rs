@@ -98,35 +98,21 @@ pub(crate) async fn receive_snapshot_body(
             .into_response());
     };
     let path = new_external_payload_path(stream_id);
-    let mut writer = cold_store
-        .open_object_writer(&path)
-        .await
-        .map_err(stage_error)?;
     let mut digest = SnapshotDigest::new(content_type);
-    let mut size = u64::try_from(buffered.len()).expect("buffer len fits u64");
-    digest.update(&buffered);
-    let staged: Result<(), Response> = async {
-        writer
-            .write(Bytes::from(buffered))
-            .await
-            .map_err(stage_error)?;
-        while let Some(frame) = frames.next().await {
-            let frame = frame.map_err(body_read_error)?;
-            size = size.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX));
-            if size > limits::MAX_REQUEST_BYTES {
-                return Err(limits::size_refusal(limits::REQUEST_LIMIT));
-            }
-            digest.update(&frame);
-            writer.write(frame).await.map_err(stage_error)?;
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(response) = staged {
-        writer.abort().await;
-        return Err(response);
-    }
-    let object_size = writer.close().await.map_err(stage_error)?;
+    let (size, object_size) = stream_into_object(
+        &cold_store,
+        &path,
+        Bytes::from(buffered),
+        frames,
+        Some(&mut digest),
+        limits::MAX_REQUEST_BYTES,
+    )
+    .await
+    .map_err(|err| match err {
+        StreamIntoObjectError::TooLarge => limits::size_refusal(limits::REQUEST_LIMIT),
+        StreamIntoObjectError::Body(err) => body_read_error(err),
+        StreamIntoObjectError::ColdStore(err) => stage_error(err),
+    })?;
     Ok(SnapshotUpload::Cold(ColdSnapshotBody {
         object: ExternalPayloadRef {
             s3_path: path,
@@ -135,6 +121,78 @@ pub(crate) async fn receive_snapshot_body(
         },
         digest: digest.finalize(),
     }))
+}
+
+/// Why a body could not be streamed into a new cold object. `E` is the
+/// error of the body's stream: a request body's, or a parts commit's copy.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StreamIntoObjectError<E: std::error::Error + 'static = axum::Error> {
+    /// The body is above its limit.
+    #[error("the body is above its limit")]
+    TooLarge,
+    /// The body could not be read.
+    #[error("read the body: {0}")]
+    Body(#[source] E),
+    /// The cold store failed.
+    #[error("write the object: {0}")]
+    ColdStore(#[source] io::Error),
+}
+
+/// Streams `first`, then `frames`, into a new object at `path`: at most
+/// `limit` bytes in all, every byte fed to `digest` when one is given. The
+/// one write loop of a staged snapshot body, a snapshot part and a parts
+/// commit's copy. The upload is aborted on any failure, so no object is
+/// left behind. Returns the bytes written and the object's size.
+pub(crate) async fn stream_into_object<E: std::error::Error + 'static>(
+    cold_store: &ColdStoreHandle,
+    path: &str,
+    first: Bytes,
+    frames: impl futures_util::Stream<Item = Result<Bytes, E>>,
+    mut digest: Option<&mut SnapshotDigest>,
+    limit: u64,
+) -> Result<(u64, u64), StreamIntoObjectError<E>> {
+    let mut frames = std::pin::pin!(frames);
+    let mut writer = cold_store
+        .open_object_writer(path)
+        .await
+        .map_err(StreamIntoObjectError::ColdStore)?;
+    let streamed: Result<u64, StreamIntoObjectError<E>> = async {
+        let mut size = 0_u64;
+        let mut next = (!first.is_empty()).then_some(first);
+        loop {
+            let frame = match next.take() {
+                Some(frame) => frame,
+                None => match frames.next().await {
+                    None => return Ok(size),
+                    Some(frame) => frame.map_err(StreamIntoObjectError::Body)?,
+                },
+            };
+            size = size.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX));
+            if size > limit {
+                return Err(StreamIntoObjectError::TooLarge);
+            }
+            if let Some(digest) = digest.as_deref_mut() {
+                digest.update(&frame);
+            }
+            writer
+                .write(frame)
+                .await
+                .map_err(StreamIntoObjectError::ColdStore)?;
+        }
+    }
+    .await;
+    let size = match streamed {
+        Ok(size) => size,
+        Err(err) => {
+            writer.abort().await;
+            return Err(err);
+        }
+    };
+    let object_size = writer
+        .close()
+        .await
+        .map_err(StreamIntoObjectError::ColdStore)?;
+    Ok((size, object_size))
 }
 
 fn stage_error(err: io::Error) -> Response {
@@ -158,7 +216,14 @@ async fn object_stream(
     let first_len = end
         .saturating_sub(start)
         .min(COLD_SNAPSHOT_READ_PIECE_BYTES);
-    let first = read_piece(&cold_store, &object, start, first_len).await?;
+    let first = read_piece(
+        &cold_store,
+        &object.s3_path,
+        object.payload_len,
+        start,
+        first_len,
+    )
+    .await?;
     let rest = stream::try_unfold(start.saturating_add(first_len), move |offset| {
         let cold_store = cold_store.clone();
         let object = object.clone();
@@ -168,7 +233,14 @@ async fn object_stream(
                 return Ok(None);
             }
             let len = remaining.min(COLD_SNAPSHOT_READ_PIECE_BYTES);
-            let piece = read_piece(&cold_store, &object, offset, len).await?;
+            let piece = read_piece(
+                &cold_store,
+                &object.s3_path,
+                object.payload_len,
+                offset,
+                len,
+            )
+            .await?;
             // `len <= remaining`, so `offset + len <= end` and never saturates.
             Ok(Some((piece, offset.saturating_add(len))))
         }
@@ -176,16 +248,21 @@ async fn object_stream(
     Ok(stream::once(async move { Ok(first) }).chain(rest))
 }
 
-async fn read_piece(
+/// Reads `len` bytes, at most one piece of
+/// [`COLD_SNAPSHOT_READ_PIECE_BYTES`], at `start` of the object at `path`,
+/// whose body is `size` bytes. The one piece reader of snapshot reads,
+/// `/bootstrap` and the copy of a parts commit.
+pub(crate) async fn read_piece(
     cold_store: &ColdStoreHandle,
-    object: &ExternalPayloadRef,
+    path: &str,
+    size: u64,
     start: u64,
     len: u64,
 ) -> io::Result<Bytes> {
-    let len =
-        usize::try_from(len).map_err(|_overflow| io::Error::other("piece length exceeds usize"))?;
+    // A piece is at most 8 MiB, which every `usize` holds.
+    let len = usize::try_from(len.min(COLD_SNAPSHOT_READ_PIECE_BYTES)).unwrap_or(usize::MAX);
     cold_store
-        .read_whole_object_range(&object.s3_path, object.payload_len, start, len)
+        .read_whole_object_range(path, size, start, len)
         .await
         .map(Bytes::from)
 }

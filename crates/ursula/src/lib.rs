@@ -327,6 +327,8 @@ pub struct HttpState {
     /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
     /// drawn for this process when the node runs without a WAL.
     cluster_id: Arc<ClusterId>,
+    /// Parts commits copying at once on this node (#581 section 3.1).
+    snapshot_assemblies: Arc<tokio::sync::Semaphore>,
 }
 
 impl HttpState {
@@ -408,6 +410,9 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
+            snapshot_assemblies: Arc::new(tokio::sync::Semaphore::new(
+                snapshot_parts::SNAPSHOT_ASSEMBLIES,
+            )),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -430,6 +435,9 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
+            snapshot_assemblies: Arc::new(tokio::sync::Semaphore::new(
+                snapshot_parts::SNAPSHOT_ASSEMBLIES,
+            )),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -473,6 +481,9 @@ impl HttpState {
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
+            snapshot_assemblies: Arc::new(tokio::sync::Semaphore::new(
+                snapshot_parts::SNAPSHOT_ASSEMBLIES,
+            )),
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -3651,7 +3662,7 @@ pub(crate) async fn publish_snapshot(
         )
         .await
         {
-            Ok(upload) => snapshot.publish(upload).await.0,
+            Ok(upload) => snapshot.publish(upload).await,
             Err(response) => response,
         };
     };
@@ -3669,16 +3680,23 @@ pub(crate) async fn publish_snapshot(
     if let HeadDecision::Answer(answer) = decision {
         return answer_before_body(answer, version, &headers, body).await;
     }
-    if let Some(answer) = snapshot_parts::published_answer(&snapshot, &commit).await {
-        return answer_before_body(answer, version, &headers, body).await;
-    }
-    let _permit = match front_door::admit(admission.0) {
+    let incarnation = match snapshot_parts::key_check(&snapshot, &commit).await {
+        snapshot_parts::KeyCheck::Answered(answer) => {
+            return answer_before_body(answer, version, &headers, body).await;
+        }
+        snapshot_parts::KeyCheck::Open { incarnation } => incarnation,
+    };
+    // The commit's copy buffers are charged with its manifest.
+    let admission = admission
+        .0
+        .map(|admission| admission.with_buffers(snapshot_parts::ASSEMBLY_BUFFER_BYTES));
+    let _permit = match front_door::admit(admission) {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
         HeadDecision::Read(permit) => permit,
     };
-    snapshot_parts::commit(snapshot, commit, body).await
+    snapshot_parts::commit(snapshot, commit, incarnation, body).await
 }
 
 /// The bare `{stream}/snapshot` path (the removed latest-snapshot redirect
@@ -3777,24 +3795,11 @@ pub(crate) struct PublishTarget {
     pub(crate) if_incarnation: Option<u64>,
 }
 
-/// Whether a publish's outcome is known, which decides what of its upload
-/// may be deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublishOutcome {
-    /// The publish applied, or was refused without applying.
-    Definite,
-    /// The publish may have applied although it failed.
-    Unknown,
-}
-
 impl PublishTarget {
     /// Publishes a received body: proposes it, verifies a JSON boundary the
     /// apply could not, and deletes a staged object after a definite
     /// refusal (F5).
-    pub(crate) async fn publish(
-        &self,
-        upload: cold_snapshot::SnapshotUpload,
-    ) -> (Response, PublishOutcome) {
+    pub(crate) async fn publish(&self, upload: cold_snapshot::SnapshotUpload) -> Response {
         let state = &self.state;
         let (payload, cold_body) = match upload {
             cold_snapshot::SnapshotUpload::Inline(payload) => (payload, None),
@@ -3828,7 +3833,7 @@ impl PublishTarget {
                 if let Some(staged_path) = staged_path.as_deref() {
                     delete_unreferenced_staged_payload(state, staged_path).await;
                 }
-                return (response, PublishOutcome::Definite);
+                return response;
             }
             request.expected_incarnation = Some(incarnation);
             request.now_ms = state.unix_time_ms();
@@ -3840,22 +3845,12 @@ impl PublishTarget {
             cleanup_external_payload(state, staged_path, err).await;
         }
         match result {
-            Ok(response) => (
-                snapshot_published_response(
-                    response.snapshot_offset,
-                    &response.snapshot_digest,
-                    response.incarnation,
-                ),
-                PublishOutcome::Definite,
+            Ok(response) => snapshot_published_response(
+                response.snapshot_offset,
+                &response.snapshot_digest,
+                response.incarnation,
             ),
-            Err(err) => {
-                let outcome = if staged_external_definitely_unreferenced(&err) {
-                    PublishOutcome::Definite
-                } else {
-                    PublishOutcome::Unknown
-                };
-                (runtime_error_after_body(state, err), outcome)
-            }
+            Err(err) => runtime_error_after_body(state, err),
         }
     }
 }
@@ -3962,7 +3957,7 @@ pub(crate) async fn read_snapshot(
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_bytes())),
             )
-            .map(|range| range.resolve(total));
+            .and_then(|range| range.resolve(total));
             let (status, mut response_headers) = snapshot_head(&response, range);
             let (start, len) = match range {
                 None => (0, total),
@@ -3982,7 +3977,15 @@ pub(crate) async fn read_snapshot(
                         .zip(usize::try_from(start.saturating_add(len)).ok());
                     match slice.and_then(|(start, end)| payload.get(start..end)) {
                         Some(bytes) => Body::from(payload.slice_ref(bytes)),
-                        None => Body::empty(),
+                        // A range resolved against this body lies inside it.
+                        None => {
+                            tracing::error!(start, len, total, "a snapshot range outside its body");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "snapshot range outside its body",
+                            )
+                                .into_response();
+                        }
                     }
                 }
             };

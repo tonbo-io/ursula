@@ -4,26 +4,31 @@
 //! Every request body is at most the request limit, so a snapshot above it
 //! goes up in parts, on a node with a cold store:
 //!
-//! - `POST {stream}/snapshot/{offset}/parts` stages one part as a new object
-//!   under the stream's external prefix and answers `201` with its id, the
-//!   object's file name. Nothing is proposed. A part's name ends in `.part`,
-//!   which no object that replicated state references does, so a commit can
-//!   name only parts, and deleting a part can never remove data.
+//! - `POST {stream}/snapshot/{offset}/parts` stages one part and answers
+//!   `201` with its id. Nothing is proposed. The part's object lives in the
+//!   group's part directory of the stream's bucket, named by its id and a
+//!   hash of the stream and its token, so only a commit on the same
+//!   incarnation of the same stream finds it. Its name ends in `.part`,
+//!   which no object that replicated state references does, so deleting a
+//!   part can never remove data.
 //! - `PUT {stream}/snapshot/{offset}` with `Stream-Snapshot-Parts` commits:
-//!   its body lists the part ids in order. The leader first answers a repeat
-//!   of a published snapshot from the key `(offset, digest)` alone, before
-//!   it reads the body. Otherwise it resolves each id under the same
-//!   stream's prefix, copies the parts in order into one new object while
-//!   hashing it, checks the digest, and proposes `PublishSnapshotExternal`
-//!   exactly as a single-request publish of a large body does. After a
-//!   definite outcome it deletes the parts, best effort.
+//!   its body lists the distinct part ids in order. Before it reads the body
+//!   the leader answers from the key `(offset, digest)` alone when the
+//!   stream's latest snapshot decides it: `204` for the same snapshot, `409`
+//!   naming the latest when another one is there or a later one supersedes
+//!   it. Otherwise it resolves the ids, checks their sizes concurrently,
+//!   copies the parts in order into one new object, a few pieces read ahead
+//!   while it hashes and writes in order, checks the digest, and proposes
+//!   `PublishSnapshotExternal` as a single-request publish of a large body
+//!   does. Once the commit's answer is final for its key it deletes the
+//!   parts; after a retryable answer it keeps them for the repeat.
 //!
-//! The server keeps no upload session. A part that no commit used, or whose
-//! deletion failed, is swept as an orphan once it is older than the sweep's
-//! grace (a day by default). Without a cold store, a part or a commit
-//! answers `501`.
+//! A node copies at most [`SNAPSHOT_ASSEMBLIES`] commits at once, and each
+//! charges its copy buffers against the in-flight body budget. The server
+//! keeps no upload session: the orphan sweep reclaims every part older than
+//! its grace (a day by default), the parts of a deleted stream included.
+//! Without a cold store, a part or a commit answers `501`.
 
-use std::collections::HashMap;
 use std::io;
 
 use axum::body::Body;
@@ -32,42 +37,68 @@ use axum::extract::OriginalUri;
 use axum::extract::Path;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::Version;
+use axum::http::header::RETRY_AFTER;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::StreamExt;
+use futures_util::stream;
 use ursula_headers::HeaderError;
+use ursula_headers::MAX_MANIFEST_BYTES;
 use ursula_headers::PartId;
 use ursula_headers::PartStaged;
 use ursula_headers::PartsCommit;
 use ursula_headers::PartsManifest;
+use ursula_headers::SnapshotPublishAnswer;
+use ursula_headers::names;
+use ursula_headers::value::SnapshotDigest as DigestValue;
+use ursula_runtime::COLD_OBJECT_WRITE_CONCURRENCY;
 use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 use ursula_runtime::SnapshotDigest;
-use ursula_runtime::cold_external_dir;
-use ursula_runtime::is_snapshot_part_file_name;
+use ursula_runtime::is_snapshot_part_id;
 use ursula_runtime::new_external_payload_path;
-use ursula_runtime::new_snapshot_part_path;
+use ursula_runtime::new_snapshot_part_id;
+use ursula_runtime::snapshot_part_path;
 use ursula_shard::BucketStreamId;
 
 use crate::HttpState;
-use crate::MAX_HTTP_BODY_BYTES;
-use crate::PublishOutcome;
 use crate::PublishTarget;
 use crate::SnapshotPath;
 use crate::admission::PendingAdmission;
 use crate::cold_snapshot::COLD_SNAPSHOT_READ_PIECE_BYTES;
 use crate::cold_snapshot::SnapshotUpload;
+use crate::cold_snapshot::StreamIntoObjectError;
+use crate::cold_snapshot::read_piece;
+use crate::cold_snapshot::stream_into_object;
 use crate::front_door;
 use crate::front_door::HeadDecision;
 use crate::limits;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 use crate::render::snapshot_published_response;
+use crate::render::snapshot_ref;
+
+/// Parts commits a node copies at once. A commit past them answers `503`
+/// with `Retry-After`.
+pub(crate) const SNAPSHOT_ASSEMBLIES: usize = 2;
+
+/// Pieces a commit reads ahead of the one it hashes and writes.
+const PIECES_IN_FLIGHT: usize = 4;
+
+/// Part sizes a commit checks at once.
+const STATS_IN_FLIGHT: usize = 16;
+
+/// What one commit's copy holds in memory at most, which it charges against
+/// the in-flight body budget: the pieces read ahead, the one it writes, and
+/// the writer's upload parts in flight.
+pub(crate) const ASSEMBLY_BUFFER_BYTES: u64 = COLD_SNAPSHOT_READ_PIECE_BYTES
+    * (PIECES_IN_FLIGHT as u64 + 1 + COLD_OBJECT_WRITE_CONCURRENCY as u64);
 
 /// Why a part upload or a parts commit was refused before it proposed
 /// anything.
@@ -76,17 +107,21 @@ pub(crate) enum PartsRefusal {
     /// The node has no cold store to stage parts in (`501`).
     #[error("this node has no cold backend, so it takes no snapshot parts")]
     NoColdStore,
-    /// A commit's headers or manifest are malformed (`400`).
+    /// A commit's headers or manifest are malformed, or the manifest repeats
+    /// a part (`400`).
     #[error("malformed parts commit: {0}")]
     Malformed(#[from] HeaderError),
-    /// A manifest names a part that is not a staged part of this stream
-    /// (`400`).
+    /// A manifest is longer than any valid one (`400`).
+    #[error("a parts manifest is at most {MAX_MANIFEST_BYTES} bytes")]
+    ManifestTooLarge,
+    /// A manifest names a part that is not staged for this incarnation of
+    /// this stream, or that is gone (`400`).
     #[error("part {part} is not a staged part of this stream")]
     UnknownPart { part: PartId },
     /// The assembled snapshot's digest is not `Stream-Snapshot-Digest`
     /// (`400`).
     #[error("the assembled snapshot's digest {assembled} differs from Stream-Snapshot-Digest")]
-    DigestMismatch { assembled: String },
+    DigestMismatch { assembled: DigestValue },
     /// The assembled snapshot is above the snapshot limit (`413` naming it).
     #[error("the assembled snapshot is above the snapshot limit")]
     SnapshotTooLarge,
@@ -96,30 +131,72 @@ pub(crate) enum PartsRefusal {
     /// A part's body could not be read (`400`).
     #[error("read part body: {0}")]
     Body(#[source] axum::Error),
+    /// The node copies as many commits as it may (`503`).
+    #[error("this node copies as many snapshot commits as it may; retry")]
+    Busy,
     /// The cold store failed (`502`).
     #[error("snapshot parts in the cold store: {0}")]
     ColdStore(#[source] io::Error),
+    /// A value the server produced is outside the protocol: a part id it
+    /// named or a digest it computed (`500`).
+    #[error("a value the server produced is outside the protocol: {0}")]
+    Invariant(#[source] HeaderError),
 }
 
 impl IntoResponse for PartsRefusal {
     fn into_response(self) -> Response {
+        let mut headers = HeaderMap::new();
+        insert_default_response_headers(&mut headers);
         let status = match &self {
             Self::NoColdStore => StatusCode::NOT_IMPLEMENTED,
             Self::SnapshotTooLarge => return limits::size_refusal(limits::SNAPSHOT_LIMIT),
             Self::PartTooLarge => return limits::size_refusal(limits::REQUEST_LIMIT),
             Self::Malformed(_)
+            | Self::ManifestTooLarge
             | Self::UnknownPart { .. }
             | Self::DigestMismatch { .. }
             | Self::Body(_) => StatusCode::BAD_REQUEST,
+            Self::Busy => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::ColdStore(err) => {
                 tracing::warn!(error = %err, "snapshot parts in the cold store failed");
                 StatusCode::BAD_GATEWAY
             }
+            Self::Invariant(err) => {
+                tracing::error!(error = %err, "a snapshot part value is outside the protocol");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
-        let mut headers = HeaderMap::new();
-        insert_default_response_headers(&mut headers);
         (status, headers, self.to_string()).into_response()
     }
+}
+
+impl From<StreamIntoObjectError> for PartsRefusal {
+    fn from(err: StreamIntoObjectError) -> Self {
+        match err {
+            StreamIntoObjectError::TooLarge => Self::PartTooLarge,
+            StreamIntoObjectError::Body(err) => Self::Body(err),
+            StreamIntoObjectError::ColdStore(err) => Self::ColdStore(err),
+        }
+    }
+}
+
+/// Whether a commit's answer is final for its key, so that no repeat needs
+/// its parts again: the publish (`204`), or a refusal that a repeat gets
+/// again (`400`, `404`, `409`, `410`, `412`). After any other answer, a
+/// `503` above all, the client repeats the commit and its parts stay.
+pub(crate) fn final_for_key(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NO_CONTENT
+            | StatusCode::BAD_REQUEST
+            | StatusCode::NOT_FOUND
+            | StatusCode::CONFLICT
+            | StatusCode::GONE
+            | StatusCode::PRECONDITION_FAILED
+    )
 }
 
 /// The commit a publish carries: `None` for a publish whose body is the
@@ -140,15 +217,22 @@ pub(crate) fn parts_commit(
     Ok(commit)
 }
 
-/// The answer a commit gets from its key alone, before its body is read:
-/// `204` when the stream's latest snapshot is the one it commits (A2 of the
-/// #581 addendum on the VFS client asks), and the stream's own refusals
-/// (`404`, `412`). `None` when
-/// the commit must assemble its parts.
-pub(crate) async fn published_answer(
-    target: &PublishTarget,
-    commit: &PartsCommit,
-) -> Option<Response> {
+/// What a commit's key decides before its body is read.
+pub(crate) enum KeyCheck {
+    /// The answer: `204` for the stream's latest snapshot, `409` naming the
+    /// latest when another snapshot is at the offset or a later one
+    /// supersedes it, or the stream's own refusal (`404`, `412`).
+    Answered(Response),
+    /// The key is open: the commit assembles its parts for the stream's
+    /// incarnation `incarnation`.
+    Open { incarnation: u64 },
+}
+
+/// Checks a commit's key against the stream's latest snapshot, on the
+/// leader's linearizable `HEAD`, so a deposed leader never answers from a
+/// stale state (A2 of the #581 addendum on the VFS client asks). A
+/// superseded or conflicting commit copies nothing.
+pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> KeyCheck {
     let state = &target.state;
     let head = match state
         .runtime
@@ -162,7 +246,7 @@ pub(crate) async fn published_answer(
     {
         Ok(head) => head,
         Err(err) => {
-            return Some(
+            return KeyCheck::Answered(
                 crate::runtime_error_or_leader_redirect_async(state, err, &target.request_target)
                     .await,
             );
@@ -170,21 +254,69 @@ pub(crate) async fn published_answer(
     };
     if let Some(refused) = crate::read_precondition_failed(target.if_incarnation, head.incarnation)
     {
-        return Some(refused);
+        return KeyCheck::Answered(refused);
     }
     let digest = commit.digest.to_string();
-    (head.snapshot_offset == Some(target.snapshot_offset)
-        && head.snapshot_digest.as_deref() == Some(digest.as_str()))
-    .then(|| snapshot_published_response(target.snapshot_offset, &digest, head.incarnation))
+    let Some((latest_offset, latest_digest)) = head.snapshot_offset.zip(head.snapshot_digest)
+    else {
+        return KeyCheck::Open {
+            incarnation: head.incarnation,
+        };
+    };
+    if latest_offset == target.snapshot_offset && latest_digest == digest {
+        return KeyCheck::Answered(snapshot_published_response(
+            target.snapshot_offset,
+            &digest,
+            head.incarnation,
+        ));
+    }
+    if latest_offset < target.snapshot_offset {
+        return KeyCheck::Open {
+            incarnation: head.incarnation,
+        };
+    }
+    KeyCheck::Answered(match snapshot_ref(latest_offset, &latest_digest) {
+        Ok(latest) => {
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            SnapshotPublishAnswer::Conflict { latest }
+                .render(|name, value| insert_header_str(&mut headers, name, value));
+            (
+                StatusCode::CONFLICT,
+                headers,
+                "another snapshot is the latest at or after this offset",
+            )
+                .into_response()
+        }
+        Err(err) => PartsRefusal::Invariant(err).into_response(),
+    })
 }
 
-/// Commits a snapshot uploaded in parts: reads the manifest, assembles the
-/// parts, and publishes the assembled object. The leader routed the commit
-/// and found its key unpublished.
-pub(crate) async fn commit(target: PublishTarget, commit: PartsCommit, body: Body) -> Response {
-    let manifest = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+/// Commits a snapshot uploaded in parts, staged for the stream's
+/// incarnation `incarnation`: reads the manifest, assembles the parts, and
+/// publishes the assembled object. The leader routed the commit, found its
+/// key open, and admitted its copy buffers. The publish carries the
+/// incarnation the parts were found for as its precondition, so a stream
+/// recreated meanwhile is answered `412`.
+pub(crate) async fn commit(
+    mut target: PublishTarget,
+    commit: PartsCommit,
+    incarnation: u64,
+    body: Body,
+) -> Response {
+    target.if_incarnation = Some(incarnation);
+    let manifest = match axum::body::to_bytes(body, MAX_MANIFEST_BYTES).await {
         Ok(manifest) => manifest,
-        Err(err) => return crate::unreadable_body_response(&err),
+        Err(err) => {
+            let over_limit = std::error::Error::source(&err)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            return if over_limit {
+                PartsRefusal::ManifestTooLarge
+            } else {
+                PartsRefusal::Body(err)
+            }
+            .into_response();
+        }
     };
     let manifest = match PartsManifest::parse(commit.parts, &manifest) {
         Ok(manifest) => manifest,
@@ -193,176 +325,217 @@ pub(crate) async fn commit(target: PublishTarget, commit: PartsCommit, body: Bod
     let Some(cold_store) = target.state.runtime.cold_store() else {
         return PartsRefusal::NoColdStore.into_response();
     };
-    let parts = match resolve(&cold_store, &target.stream_id, &manifest).await {
-        Ok(parts) => parts,
-        Err(refusal) => return refusal.into_response(),
+    let Ok(copying) = target.state.snapshot_assemblies.clone().try_acquire_owned() else {
+        return PartsRefusal::Busy.into_response();
     };
-    let assembled = match assemble(
-        &cold_store,
-        &target.stream_id,
-        &target.content_type,
-        &parts,
-        &commit,
-    )
-    .await
-    {
+    let owner = PartOwner {
+        stream_id: &target.stream_id,
+        raft_group_id: target
+            .state
+            .runtime
+            .locate(&target.stream_id)
+            .raft_group_id
+            .0,
+        incarnation,
+    };
+    let assembled = match resolve(&cold_store, owner, &manifest, MAX_COLD_SNAPSHOT_BYTES).await {
+        Ok(parts) => assemble(&cold_store, &target, &parts, &commit)
+            .await
+            .map(|assembled| (parts, assembled)),
+        Err(refusal) => Err(refusal),
+    };
+    drop(copying);
+    let (parts, assembled) = match assembled {
         Ok(assembled) => assembled,
+        // A part went away during the copy: a concurrent identical commit
+        // may have published the snapshot and deleted it.
+        Err(PartsRefusal::UnknownPart { part }) => {
+            return match key_check(&target, &commit).await {
+                KeyCheck::Answered(answer) => answer,
+                KeyCheck::Open { .. } => PartsRefusal::UnknownPart { part }.into_response(),
+            };
+        }
         Err(refusal) => return refusal.into_response(),
     };
-    let (response, outcome) = target.publish(SnapshotUpload::Cold(assembled)).await;
-    if outcome == PublishOutcome::Definite {
+    let response = target.publish(SnapshotUpload::Cold(assembled)).await;
+    if final_for_key(response.status()) {
         delete_parts(&cold_store, &parts).await;
     }
     response
 }
 
-/// One part a manifest names: its object and its size.
+/// The incarnation of a stream that parts are staged for.
+#[derive(Clone, Copy)]
+struct PartOwner<'a> {
+    stream_id: &'a BucketStreamId,
+    raft_group_id: u32,
+    incarnation: u64,
+}
+
+impl PartOwner<'_> {
+    fn path(&self, id: &str) -> String {
+        snapshot_part_path(self.stream_id, self.raft_group_id, self.incarnation, id)
+    }
+}
+
+/// One part a manifest names: its id, object and size.
 struct ResolvedPart {
+    id: PartId,
     path: String,
     size: u64,
 }
 
-/// Resolves every id of `manifest` under the stream's own external prefix,
-/// so that a manifest cannot name another stream's objects, and sums their
-/// sizes against the snapshot limit before anything is copied.
+/// Resolves every id of `manifest` for `owner` alone, so that a manifest
+/// cannot name another stream's part, and checks their sizes, a few at a
+/// time, against `limit` before anything is copied.
 async fn resolve(
     cold_store: &ColdStoreHandle,
-    stream_id: &BucketStreamId,
+    owner: PartOwner<'_>,
     manifest: &PartsManifest,
+    limit: u64,
 ) -> Result<Vec<ResolvedPart>, PartsRefusal> {
-    let dir = cold_external_dir(stream_id);
-    let mut sizes = HashMap::new();
-    let mut parts = Vec::with_capacity(manifest.parts().len());
-    let mut total = 0_u64;
-    for part in manifest.parts() {
-        if !is_snapshot_part_file_name(part.as_str()) {
-            return Err(PartsRefusal::UnknownPart { part: part.clone() });
-        }
-        let path = format!("{dir}{part}");
-        let size = match sizes.get(&path) {
-            Some(size) => *size,
-            None => {
-                let size = match cold_store.object_size(&path).await {
-                    Ok(size) => size,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        return Err(PartsRefusal::UnknownPart { part: part.clone() });
-                    }
-                    Err(err) => return Err(PartsRefusal::ColdStore(err)),
-                };
-                sizes.insert(path.clone(), size);
-                size
-            }
-        };
-        total = total
-            .checked_add(size)
-            .filter(|total| *total <= MAX_COLD_SNAPSHOT_BYTES)
-            .ok_or(PartsRefusal::SnapshotTooLarge)?;
-        parts.push(ResolvedPart { path, size });
+    if let Some(part) = manifest
+        .parts()
+        .iter()
+        .find(|part| !is_snapshot_part_id(part.as_str()))
+    {
+        return Err(PartsRefusal::UnknownPart { part: part.clone() });
     }
+    // Owned inputs and futures: a stream of futures that borrow does not
+    // prove `Send` for the handler.
+    let lookups = manifest
+        .parts()
+        .iter()
+        .map(|part| (part.clone(), owner.path(part.as_str())))
+        .collect::<Vec<_>>();
+    let parts = stream::iter(lookups)
+        .map(|(id, path)| {
+            let cold_store = cold_store.clone();
+            async move {
+                match cold_store.object_size(&path).await {
+                    Ok(size) => Ok(ResolvedPart { id, path, size }),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        Err(PartsRefusal::UnknownPart { part: id })
+                    }
+                    Err(err) => Err(PartsRefusal::ColdStore(err)),
+                }
+            }
+        })
+        .buffered(STATS_IN_FLIGHT)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    parts.iter().try_fold(0_u64, |total, part| {
+        total
+            .checked_add(part.size)
+            .filter(|total| *total <= limit)
+            .ok_or(PartsRefusal::SnapshotTooLarge)
+    })?;
     Ok(parts)
 }
 
 /// Copies `parts` in order into one new object under the stream's external
 /// prefix while computing the snapshot digest, and keeps the object only
-/// when the digest is the one the commit names.
+/// when the digest is the one the commit names. Up to [`PIECES_IN_FLIGHT`]
+/// pieces are read ahead of the one hashed and written, which stay in
+/// order. A part that is gone answers [`PartsRefusal::UnknownPart`].
 async fn assemble(
     cold_store: &ColdStoreHandle,
-    stream_id: &BucketStreamId,
-    content_type: &str,
+    target: &PublishTarget,
     parts: &[ResolvedPart],
     commit: &PartsCommit,
 ) -> Result<ColdSnapshotBody, PartsRefusal> {
-    let path = new_external_payload_path(stream_id);
-    let mut writer = cold_store
-        .open_object_writer(&path)
-        .await
-        .map_err(PartsRefusal::ColdStore)?;
-    let mut digest = SnapshotDigest::new(content_type);
-    let copied: Result<u64, PartsRefusal> = async {
-        let mut size = 0_u64;
-        for part in parts {
-            let mut start = 0_u64;
-            while start < part.size {
-                let len = part
-                    .size
-                    .saturating_sub(start)
-                    .min(COLD_SNAPSHOT_READ_PIECE_BYTES);
-                let piece = read_part_piece(cold_store, part, start, len).await?;
-                digest.update(&piece);
-                writer
-                    .write(Bytes::from(piece))
+    let path = new_external_payload_path(&target.stream_id);
+    let mut digest = SnapshotDigest::new(&target.content_type);
+    let piece_bytes = usize::try_from(COLD_SNAPSHOT_READ_PIECE_BYTES).unwrap_or(usize::MAX);
+    let pieces = parts
+        .iter()
+        .flat_map(|part| {
+            (0..part.size).step_by(piece_bytes).map(move |start| {
+                (
+                    part.id.clone(),
+                    part.path.clone(),
+                    part.size,
+                    start,
+                    part.size
+                        .saturating_sub(start)
+                        .min(COLD_SNAPSHOT_READ_PIECE_BYTES),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let reads = stream::iter(pieces)
+        .map(|(id, path, size, start, len)| {
+            let cold_store = cold_store.clone();
+            async move {
+                read_piece(&cold_store, &path, size, start, len)
                     .await
-                    .map_err(PartsRefusal::ColdStore)?;
-                // `len <= part.size - start`, so neither sum saturates.
-                start = start.saturating_add(len);
-                size = size.saturating_add(len);
+                    .map_err(|err| match err.kind() {
+                        io::ErrorKind::NotFound => PartsRefusal::UnknownPart { part: id },
+                        _ => PartsRefusal::ColdStore(err),
+                    })
             }
-        }
-        let assembled = digest.finalize();
-        if assembled != commit.digest.to_string() {
-            return Err(PartsRefusal::DigestMismatch { assembled });
-        }
-        Ok(size)
-    }
-    .await;
-    let size = match copied {
-        Ok(size) => size,
-        Err(refusal) => {
-            writer.abort().await;
-            return Err(refusal);
-        }
+        })
+        .buffered(PIECES_IN_FLIGHT);
+    let (size, object_size) = match stream_into_object(
+        cold_store,
+        &path,
+        Bytes::new(),
+        reads,
+        Some(&mut digest),
+        u64::MAX,
+    )
+    .await
+    {
+        Ok(written) => written,
+        Err(StreamIntoObjectError::Body(refusal)) => return Err(refusal),
+        Err(StreamIntoObjectError::ColdStore(err)) => return Err(PartsRefusal::ColdStore(err)),
+        // `resolve` checked the sizes against the snapshot limit.
+        Err(StreamIntoObjectError::TooLarge) => return Err(PartsRefusal::SnapshotTooLarge),
     };
-    let object_size = writer.close().await.map_err(PartsRefusal::ColdStore)?;
+    let assembled = DigestValue::parse(names::STREAM_SNAPSHOT_DIGEST, &digest.finalize())
+        .map_err(PartsRefusal::Invariant)?;
+    if assembled != commit.digest {
+        delete_object(cold_store, &path).await;
+        return Err(PartsRefusal::DigestMismatch { assembled });
+    }
     Ok(ColdSnapshotBody {
         object: ExternalPayloadRef {
             s3_path: path,
             payload_len: size,
             object_size,
         },
-        digest: digest.finalize(),
+        digest: assembled.to_string(),
     })
 }
 
-async fn read_part_piece(
-    cold_store: &ColdStoreHandle,
-    part: &ResolvedPart,
-    start: u64,
-    len: u64,
-) -> Result<Vec<u8>, PartsRefusal> {
-    // A piece is at most 8 MiB.
-    let len = usize::try_from(len).map_err(|_overflow| {
-        PartsRefusal::ColdStore(io::Error::other("part piece length exceeds usize"))
-    })?;
-    cold_store
-        .read_whole_object_range(&part.path, part.size, start, len)
-        .await
-        .map_err(PartsRefusal::ColdStore)
+/// Deletes the parts of a commit whose answer is final for its key, best
+/// effort: a part left behind is swept as an orphan.
+async fn delete_parts(cold_store: &ColdStoreHandle, parts: &[ResolvedPart]) {
+    for part in parts {
+        delete_object(cold_store, &part.path).await;
+    }
 }
 
-/// Deletes the parts of a commit whose outcome is definite, best effort: a
-/// part left behind is swept as an orphan.
-async fn delete_parts(cold_store: &ColdStoreHandle, parts: &[ResolvedPart]) {
-    let mut deleted = std::collections::HashSet::new();
-    for part in parts {
-        if !deleted.insert(part.path.as_str()) {
-            continue;
-        }
-        if let Err(err) = cold_store.delete_chunk(&part.path).await {
-            tracing::warn!(
-                path = %part.path,
-                error = %err,
-                "failed to delete a committed snapshot part; the orphan sweep reclaims it"
-            );
-        }
+async fn delete_object(cold_store: &ColdStoreHandle, path: &str) {
+    if let Err(err) = cold_store.delete_chunk(path).await {
+        tracing::warn!(
+            path = %path,
+            error = %err,
+            "failed to delete a snapshot part or copy; the orphan sweep reclaims it"
+        );
     }
 }
 
 /// `POST {stream}/snapshot/{offset}/parts`: stages one part of a snapshot
 /// and answers `201` with its id. It is routed before its body like every
 /// write, and the stream must exist (and hold the token a
-/// `Stream-Incarnation` precondition names), so that the sweep of the
-/// stream reclaims a part no commit uses. The offset in the path is checked
-/// and otherwise unused: a part is bound to its stream, not to an offset.
+/// `Stream-Incarnation` precondition names): the part is staged for that
+/// incarnation. It meets the in-flight body budget but no WAL or Raft-log
+/// pressure check, since it touches neither until it is committed. The
+/// offset in the path is checked and otherwise unused: a part is bound to
+/// its stream, not to an offset.
 #[tracing::instrument(
     name = "http.snapshot_part",
     skip_all,
@@ -411,22 +584,36 @@ pub(crate) async fn stage_snapshot_part(
             read_index: None,
         })
         .await;
-    let refused = match head {
-        Ok(head) => crate::read_precondition_failed(if_incarnation, head.incarnation),
+    let incarnation = match head {
+        Ok(head) => match crate::read_precondition_failed(if_incarnation, head.incarnation) {
+            Some(refused) => {
+                return crate::answer_before_body(refused, version, &headers, body).await;
+            }
+            None => head.incarnation,
+        },
         Err(err) => {
-            Some(crate::runtime_error_or_leader_redirect_async(&state, err, &request_target).await)
+            let refused =
+                crate::runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
+            return crate::answer_before_body(refused, version, &headers, body).await;
         }
     };
-    if let Some(refused) = refused {
-        return crate::answer_before_body(refused, version, &headers, body).await;
-    }
-    let _permit = match front_door::admit(admission.0) {
-        HeadDecision::Answer(answer) => {
-            return crate::answer_before_body(answer, version, &headers, body).await;
+    let _permit = match admission
+        .0
+        .map(crate::admission::DeferredAdmission::admit_budget)
+    {
+        None => None,
+        Some(Ok(permit)) => Some(permit),
+        Some(Err(refusal)) => {
+            return crate::answer_before_body(refusal.into_response(), version, &headers, body)
+                .await;
         }
-        HeadDecision::Read(permit) => permit,
     };
-    match stage(&cold_store, &stream_id, body).await {
+    let owner = PartOwner {
+        stream_id: &stream_id,
+        raft_group_id: state.runtime.locate(&stream_id).raft_group_id.0,
+        incarnation,
+    };
+    match stage(&cold_store, owner, body).await {
         Ok(part) => {
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
@@ -438,41 +625,89 @@ pub(crate) async fn stage_snapshot_part(
 }
 
 /// Streams a part's body, at most the request limit, into a new part
-/// object, and returns its id.
+/// object for `owner`, and returns its id.
 async fn stage(
     cold_store: &ColdStoreHandle,
-    stream_id: &BucketStreamId,
+    owner: PartOwner<'_>,
     body: Body,
 ) -> Result<PartId, PartsRefusal> {
-    let path = new_snapshot_part_path(stream_id);
-    let id = path
-        .rsplit('/')
-        .next()
-        .map(PartId::new)
-        .transpose()?
-        .ok_or_else(|| PartsRefusal::ColdStore(io::Error::other("a part path has no name")))?;
-    let mut writer = cold_store
-        .open_object_writer(&path)
-        .await
-        .map_err(PartsRefusal::ColdStore)?;
-    let mut frames = body.into_data_stream();
-    let streamed: Result<(), PartsRefusal> = async {
-        let mut size = 0_u64;
-        while let Some(frame) = frames.next().await {
-            let frame = frame.map_err(PartsRefusal::Body)?;
-            size = size.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX));
-            if size > limits::MAX_REQUEST_BYTES {
-                return Err(PartsRefusal::PartTooLarge);
-            }
-            writer.write(frame).await.map_err(PartsRefusal::ColdStore)?;
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(refusal) = streamed {
-        writer.abort().await;
-        return Err(refusal);
-    }
-    writer.close().await.map_err(PartsRefusal::ColdStore)?;
+    let id = PartId::new(new_snapshot_part_id()).map_err(PartsRefusal::Invariant)?;
+    stream_into_object(
+        cold_store,
+        &owner.path(id.as_str()),
+        Bytes::new(),
+        body.into_data_stream(),
+        None,
+        limits::MAX_REQUEST_BYTES,
+    )
+    .await?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::response::IntoResponse;
+    use ursula_headers::PartId;
+    use ursula_headers::PartsManifest;
+    use ursula_headers::SizeLimit;
+    use ursula_runtime::ColdStore;
+    use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
+    use ursula_runtime::new_snapshot_part_id;
+    use ursula_shard::BucketStreamId;
+
+    use super::PartOwner;
+    use super::PartsRefusal;
+    use super::resolve;
+
+    /// The snapshot limit is checked from the parts' sizes, before anything
+    /// is copied, and its refusal names the snapshot limit. A limit of a few
+    /// bytes stands in for 1 GiB, which a test cannot stage in memory.
+    #[tokio::test]
+    async fn the_assembled_size_is_checked_from_the_parts_before_any_copy() {
+        let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+        let stream_id = BucketStreamId::new("parts", "s");
+        let owner = PartOwner {
+            stream_id: &stream_id,
+            raft_group_id: 0,
+            incarnation: 1,
+        };
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let id = new_snapshot_part_id();
+            cold_store
+                .write_chunk(&owner.path(&id), &[7; 10])
+                .await
+                .expect("stage part");
+            ids.push(PartId::new(id).unwrap());
+        }
+        let manifest = PartsManifest::new(ids).unwrap();
+        let resolved = resolve(&cold_store, owner, &manifest, 30)
+            .await
+            .expect("30 bytes fit");
+        assert_eq!(resolved.iter().map(|part| part.size).sum::<u64>(), 30);
+        let refused = resolve(&cold_store, owner, &manifest, 29).await;
+        assert!(matches!(refused, Err(PartsRefusal::SnapshotTooLarge)));
+        let response = PartsRefusal::SnapshotTooLarge.into_response();
+        assert_eq!(
+            SizeLimit::parse(
+                413,
+                response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            ),
+            Ok(Some(SizeLimit::Snapshot(MAX_COLD_SNAPSHOT_BYTES)))
+        );
+        // Another incarnation of the stream finds none of them.
+        let other = PartOwner {
+            incarnation: 2,
+            ..owner
+        };
+        assert!(matches!(
+            resolve(&cold_store, other, &manifest, 30).await,
+            Err(PartsRefusal::UnknownPart { .. })
+        ));
+    }
 }

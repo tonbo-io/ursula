@@ -4,11 +4,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
+use axum::http::header::RETRY_AFTER;
 use tower::ServiceExt;
 use ursula_headers::PartId;
 use ursula_headers::PartStaged;
@@ -19,15 +21,47 @@ use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRead;
 use ursula_headers::StreamHead;
 use ursula_headers::value::SnapshotDigest as DigestHeader;
+use ursula_runtime::AppendExternalRequest;
+use ursula_runtime::AppendRequest;
+use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdStore;
+use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::CreateStreamExternalRequest;
+use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::DeleteStreamRequest;
+use ursula_runtime::GroupAppendFuture;
+use ursula_runtime::GroupBucketUsageFuture;
+use ursula_runtime::GroupCloseStreamFuture;
+use ursula_runtime::GroupCreateStreamFuture;
+use ursula_runtime::GroupDeleteStreamFuture;
+use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineCreateFuture;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineFactory;
+use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupHeadStreamFuture;
+use ursula_runtime::GroupInstallSnapshotFuture;
+use ursula_runtime::GroupPublishSnapshotFuture;
+use ursula_runtime::GroupReadStreamFuture;
+use ursula_runtime::GroupRouteWriteFuture;
+use ursula_runtime::GroupSnapshot;
+use ursula_runtime::GroupSnapshotFuture;
+use ursula_runtime::GroupTouchStreamAccessFuture;
+use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::InMemoryGroupEngine;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
+use ursula_runtime::PublishSnapshotRequest;
+use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SnapshotDigest;
 use ursula_runtime::cold_external_dir;
 use ursula_runtime::new_external_payload_path;
+use ursula_runtime::snapshot_part_dir;
 use ursula_shard::BucketStreamId;
+use ursula_shard::ShardPlacement;
 
 use super::*;
 
@@ -120,6 +154,14 @@ async fn external_names(cold_store: &ColdStore, stream: &str) -> Vec<String> {
         .expect("list external dir")
 }
 
+/// The staged parts of the test bucket's group 0, the only group.
+async fn part_names(cold_store: &ColdStore) -> Vec<String> {
+    cold_store
+        .list_file_names(&snapshot_part_dir("parts", 0))
+        .await
+        .expect("list part dir")
+}
+
 /// Three parts that together exceed the request limit are committed,
 /// read back whole and by range, and deleted after the commit. A repeat of
 /// the commit answers from its key, although its parts are gone.
@@ -142,7 +184,8 @@ async fn parts_commit_a_snapshot_above_the_request_limit() {
     for chunk in &chunks {
         parts.push(stage(&app, "/parts/s", chunk.clone()).await);
     }
-    assert_eq!(external_names(&cold_store, "s").await.len(), 3);
+    assert_eq!(part_names(&cold_store).await.len(), 3);
+    assert!(external_names(&cold_store, "s").await.is_empty());
 
     let digest = digest_of(&snapshot);
     let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
@@ -154,8 +197,12 @@ async fn parts_commit_a_snapshot_above_the_request_limit() {
         panic!("{published:?}");
     };
     assert_eq!(key.digest, digest);
+    assert!(
+        part_names(&cold_store).await.is_empty(),
+        "the parts are deleted"
+    );
     let names = external_names(&cold_store, "s").await;
-    assert_eq!(names.len(), 1, "the parts are deleted: {names:?}");
+    assert_eq!(names.len(), 1, "the assembled snapshot: {names:?}");
     assert!(names[0].ends_with(".bin"), "{names:?}");
 
     let response = send(
@@ -259,24 +306,33 @@ async fn a_commit_is_refused_for_unknown_foreign_or_mismatched_parts() {
     );
 }
 
-/// An assembled snapshot above the snapshot limit is refused with `413`
-/// naming that limit, before anything is copied. One part listed many
-/// times reaches it (a manifest may repeat an id).
+/// A manifest that names one part twice is refused with `400` before
+/// anything is copied: a commit costs at most the bytes its client staged.
+/// (The snapshot limit is checked from the parts' sizes, in
+/// `snapshot_parts::tests`.)
 #[tokio::test]
-async fn an_assembled_snapshot_above_the_snapshot_limit_names_it() {
+async fn a_manifest_that_repeats_a_part_is_refused() {
     let (app, _cold_store) = cold_app();
     create(&app, "/parts/s").await;
-    let part = stage(&app, "/parts/s", vec![7; MAX_HTTP_BODY_BYTES]).await;
-    let copies = usize::try_from(MAX_COLD_SNAPSHOT_BYTES).unwrap() / MAX_HTTP_BODY_BYTES + 1;
+    let part = stage(&app, "/parts/s", b"part".to_vec()).await;
     let response = send(
         &app,
-        commit_request("/parts/s", &vec![part; copies], digest_of(b"")),
+        Request::put("/parts/s/snapshot/3")
+            .header(CONTENT_TYPE, OCTET)
+            .header(names::STREAM_SNAPSHOT_PARTS, "2")
+            .header(
+                names::STREAM_SNAPSHOT_DIGEST,
+                digest_of(b"partpart").to_string(),
+            )
+            .body(Body::from(format!("{part}\n{part}\n")))
+            .unwrap(),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        SizeLimit::parse(413, pairs(&response)),
-        Ok(Some(SizeLimit::Snapshot(MAX_COLD_SNAPSHOT_BYTES)))
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(body_of(response).await)
+            .unwrap()
+            .contains("repeats"),
     );
 }
 
@@ -470,4 +526,263 @@ async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
     );
     assert!(body_of(response).await == snapshot[snapshot.len() - 17..]);
     server.abort();
+}
+
+/// An in-memory engine whose first `refusals` snapshot publishes are refused
+/// before they are proposed.
+struct FlakyPublishEngine {
+    inner: InMemoryGroupEngine,
+    refusals: Arc<AtomicUsize>,
+}
+
+impl GroupEngine for FlakyPublishEngine {
+    fn route_write<'a>(
+        &'a mut self,
+        request: RouteWriteRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a> {
+        self.inner.route_write(request, placement)
+    }
+
+    fn create_stream<'a>(
+        &'a mut self,
+        request: CreateStreamRequest,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupCreateStreamFuture<'a> {
+        self.inner.create_stream(request, placement, admission)
+    }
+
+    fn create_stream_external<'a>(
+        &'a mut self,
+        request: CreateStreamExternalRequest,
+        placement: ShardPlacement,
+    ) -> GroupCreateStreamFuture<'a> {
+        self.inner.create_stream_external(request, placement)
+    }
+
+    fn head_stream<'a>(
+        &'a mut self,
+        request: HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupHeadStreamFuture<'a> {
+        self.inner.head_stream(request, placement)
+    }
+
+    fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        self.inner.bucket_usage(placement)
+    }
+
+    fn read_stream<'a>(
+        &'a mut self,
+        request: ReadStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupReadStreamFuture<'a> {
+        self.inner.read_stream(request, placement)
+    }
+
+    fn touch_stream_access<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        now_ms: u64,
+        renew_ttl: bool,
+        placement: ShardPlacement,
+    ) -> GroupTouchStreamAccessFuture<'a> {
+        self.inner
+            .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
+    }
+
+    fn close_stream<'a>(
+        &'a mut self,
+        request: CloseStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupCloseStreamFuture<'a> {
+        self.inner.close_stream(request, placement)
+    }
+
+    fn delete_stream<'a>(
+        &'a mut self,
+        request: DeleteStreamRequest,
+        placement: ShardPlacement,
+    ) -> GroupDeleteStreamFuture<'a> {
+        self.inner.delete_stream(request, placement)
+    }
+
+    fn append<'a>(
+        &'a mut self,
+        request: AppendRequest,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupAppendFuture<'a> {
+        self.inner.append(request, placement, admission)
+    }
+
+    fn append_external<'a>(
+        &'a mut self,
+        request: AppendExternalRequest,
+        placement: ShardPlacement,
+    ) -> GroupAppendFuture<'a> {
+        self.inner.append_external(request, placement)
+    }
+
+    fn publish_snapshot<'a>(
+        &'a mut self,
+        request: PublishSnapshotRequest,
+        placement: ShardPlacement,
+    ) -> GroupPublishSnapshotFuture<'a> {
+        // The first publishes are refused before they are proposed, as a
+        // leadership change during the copy refuses them: a retryable `503`.
+        let refused = self
+            .refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if refused {
+            return Box::pin(async {
+                Err(GroupEngineError::forward_to_leader_before_proposal(
+                    "injected: leadership moved during the copy",
+                    None,
+                    None,
+                ))
+            });
+        }
+        self.inner.publish_snapshot(request, placement)
+    }
+
+    fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
+        self.inner.snapshot(placement)
+    }
+
+    fn install_snapshot<'a>(
+        &'a mut self,
+        snapshot: GroupSnapshot,
+    ) -> GroupInstallSnapshotFuture<'a> {
+        self.inner.install_snapshot(snapshot)
+    }
+}
+
+struct FlakyPublishEngineFactory {
+    cold_store: Arc<ColdStore>,
+    refusals: Arc<AtomicUsize>,
+}
+
+impl GroupEngineFactory for FlakyPublishEngineFactory {
+    fn create<'a>(
+        &'a self,
+        placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupEngineCreateFuture<'a> {
+        let mut inner = InMemoryGroupEngine::with_cold_store(self.cold_store.clone());
+        // An engine without Raft starts its group with its genesis.
+        inner.start_genesis(placement, 0);
+        let refusals = self.refusals.clone();
+        Box::pin(async move {
+            let engine: Box<dyn GroupEngine> = Box::new(FlakyPublishEngine { inner, refusals });
+            Ok(engine)
+        })
+    }
+}
+
+/// B1 of the step 4 review: a commit refused with a retryable `503` after
+/// its copy keeps its parts, and its repeat publishes.
+#[tokio::test]
+async fn a_retryable_refusal_keeps_the_parts_for_the_repeat() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let refusals = Arc::new(AtomicUsize::new(1));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        FlakyPublishEngineFactory {
+            cold_store: cold_store.clone(),
+            refusals: refusals.clone(),
+        },
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    let app = router(runtime);
+    create(&app, "/parts/s").await;
+    let parts = vec![
+        stage(&app, "/parts/s", b"first".to_vec()).await,
+        stage(&app, "/parts/s", b"second".to_vec()).await,
+    ];
+    let digest = digest_of(b"firstsecond");
+    let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key(RETRY_AFTER));
+    assert_eq!(part_names(&cold_store).await.len(), 2, "the parts stay");
+    assert!(
+        external_names(&cold_store, "s").await.is_empty(),
+        "the copy of a refusal before proposal is deleted (F5)"
+    );
+    let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "the repeat publishes"
+    );
+    assert!(
+        part_names(&cold_store).await.is_empty(),
+        "then the parts go"
+    );
+}
+
+/// M1 of the step 4 review: a repeat of a commit whose snapshot another one
+/// superseded, or that another snapshot at its offset beat, answers `409`
+/// naming the latest from its key alone, with its parts long gone.
+#[tokio::test]
+async fn a_superseded_or_conflicting_commit_answers_409_from_its_key() {
+    let (app, cold_store) = cold_app();
+    create(&app, "/parts/s").await;
+    let parts = vec![stage(&app, "/parts/s", b"three".to_vec()).await];
+    let digest = digest_of(b"three");
+    let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(part_names(&cold_store).await.is_empty());
+
+    // Another commit at the same offset, with parts that never existed.
+    let unknown = vec![PartId::new(format!("{:032x}-{:016x}.part", 1, 2)).unwrap()];
+    let response = send(
+        &app,
+        commit_request("/parts/s", &unknown, digest_of(b"other")),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "not 400 unknown part"
+    );
+    let SnapshotPublishAnswer::Conflict { latest } =
+        SnapshotPublishAnswer::parse(409, pairs(&response))
+            .expect("typed")
+            .expect("names the latest")
+    else {
+        panic!("a conflict");
+    };
+    assert_eq!(latest.digest, digest);
+
+    // A later snapshot supersedes the commit; its repeat learns so.
+    let response = send(
+        &app,
+        Request::post("/parts/s")
+            .header(CONTENT_TYPE, OCTET)
+            .body(Body::from("def"))
+            .unwrap(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let response = send(
+        &app,
+        Request::put("/parts/s/snapshot/6")
+            .header(CONTENT_TYPE, OCTET)
+            .body(Body::from("six"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = send(&app, commit_request("/parts/s", &parts, digest)).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let answer = SnapshotPublishAnswer::parse(409, pairs(&response))
+        .expect("typed")
+        .expect("names the latest");
+    assert!(answer.supersedes(ursula_headers::value::Offset::from_u64(3)));
 }

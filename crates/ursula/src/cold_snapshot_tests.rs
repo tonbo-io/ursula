@@ -365,3 +365,65 @@ async fn a_refused_publish_names_the_latest_snapshot() {
         );
     }
 }
+
+/// Addendum 7 edge cases: `HEAD` answers like `GET` without the body, a
+/// nonzero suffix of an empty snapshot gets the empty body whole, and a
+/// superseded snapshot below retention answers `404` whatever the range. A
+/// snapshot read never answers `410`: only the latest snapshot is readable,
+/// and retention never passes it.
+#[tokio::test]
+async fn range_edge_cases_on_snapshot_reads() {
+    let app = inline_app();
+    let response = send(&app, "PUT", "/edges/s", Body::from("abcdef")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = send(&app, "PUT", "/edges/s/snapshot/3", Body::from("snapshot")).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = send_with(
+        &app,
+        "HEAD",
+        "/edges/s/snapshot/3",
+        &[("range", "bytes=0-1")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[names::CONTENT_RANGE], "bytes 0-1/8");
+    assert!(body_of(response).await.is_empty());
+
+    // An empty snapshot at the tail.
+    let response = send(&app, "PUT", "/edges/s/snapshot/6", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = send_with(
+        &app,
+        "GET",
+        "/edges/s/snapshot/6",
+        &[("range", "bytes=-5")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_LENGTH], "0");
+    let response = send_with(
+        &app,
+        "GET",
+        "/edges/s/snapshot/6",
+        &[("range", "bytes=0-")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+    // Retention past a superseded snapshot's offset.
+    let response = send(&app, "PUT", "/edges/s/retention/6", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = send_with(
+        &app,
+        "GET",
+        "/edges/s/snapshot/3",
+        &[("range", "bytes=0-1")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
