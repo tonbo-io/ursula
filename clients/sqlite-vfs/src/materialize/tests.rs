@@ -29,6 +29,7 @@ use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::marker::mark;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
+use crate::generation::Fate;
 use crate::generation::Generation;
 use crate::generation::Root;
 use crate::generation::canonical_path;
@@ -66,7 +67,7 @@ fn header() -> SegmentHeader {
 fn generation(dir: &TempDir) -> (Root, Generation) {
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
-    let g = root.build(header()).unwrap().publish().unwrap();
+    let g = root.build(header()).unwrap().publish(Fate::Trash).unwrap();
     fs::write(g.db(), State::default().bytes()).unwrap();
     (root, g)
 }

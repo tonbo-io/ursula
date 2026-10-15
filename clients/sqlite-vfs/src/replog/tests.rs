@@ -682,3 +682,77 @@ fn trim_deletes_segments_across_a_rekey() {
     assert_eq!(r.header.incarnation, token(2));
     assert_eq!(r.claim, Some((epoch(2), Activation([2; 16]))));
 }
+
+/// A COMMIT record of a stream frame from another lineage, as a catch-up logs it.
+fn caught_up(n: u8) -> RecordBody {
+    let frame = crate::codec::frame::encode(&crate::codec::frame::Frame::Commit {
+        id: crate::ids::CommitId {
+            lineage: Lineage([9; 16]),
+            position: Position(u64::from(n)),
+        },
+        compressed: vec![n; 40],
+    })
+    .unwrap();
+    RecordBody::Commit { frame }
+}
+
+/// Stream frames a catch-up logged with no ACK after them were never applied (the catch-up
+/// applies them once that ACK is fsynced): the open cuts them like a torn tail, across segments,
+/// and the log goes on from the first of them. Frames an ACK follows, and the generation's own
+/// pending commits, stay.
+#[test]
+fn caught_up_frames_no_ack_follows_are_cut() {
+    let dir = TempDir::new("log-cut-caught-up");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.set_roll_bytes(200);
+    let ack = |acked: u64| RecordBody::Ack {
+        acked: Position(acked),
+        acked_offset: Offset::from_u64(acked * 10),
+        log_bytes: 0,
+    };
+    for body in [
+        caught_up(1),
+        ack(1),
+        caught_up(2),
+        caught_up(3),
+        caught_up(4),
+    ] {
+        log.append(&body).unwrap();
+    }
+    log.sync().unwrap();
+    let segments = log.segment_paths().len();
+    assert!(segments > 1, "the unacknowledged run crosses a roll");
+    drop(log);
+    let (mut log, r) = Log::open(&log_dir).unwrap();
+    assert!(r.cut.is_some());
+    assert_eq!(records(&r), vec![
+        (Position(1), caught_up(1)),
+        (Position(2), ack(1))
+    ]);
+    assert!(r.any_commit);
+    assert_eq!(log.next_position(), Position(3));
+    assert!(log.segment_paths().len() < segments);
+    // The log goes on from the cut, and reopens contiguous.
+    log.append(&commit(5, 10)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.cut, None);
+    assert_eq!(log.next_position(), Position(4));
+    assert_eq!(r.pending().len(), 1);
+}
+
+/// The generation's own commit after the ACK is pending, never cut.
+#[test]
+fn own_commits_after_the_ack_are_kept() {
+    let dir = TempDir::new("log-keep-own");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.append(&commit(1, 10)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    let (_, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.cut, None);
+    assert_eq!(r.pending().len(), 1);
+}

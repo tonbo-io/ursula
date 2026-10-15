@@ -5,8 +5,9 @@
 //! (typed `413`), the clock moved past idle expiry, history events (a new history that loses
 //! nothing, and restores of checkpoints), requests misrouted to another deployment, foreign
 //! appends and claims, retention (and with it `410`s), clones, restarts (through the open table of
-//! design §5.5), takeovers by new owners and `synced()` calls, then a `Heal` phase with a perfect
-//! network and the route restored.
+//! design §5.5: a restart whose history does not inherit the log, or may have lost commits it
+//! holds after its latest ACK, salvages it and continues as a fresh takeover), takeovers by new
+//! owners and `synced()` calls, then a `Heal` phase with a perfect network and the route restored.
 //!
 //! The monitors check, as the run goes:
 //!
@@ -34,7 +35,9 @@
 //!     acknowledged is in the stream the HEAD that decided it saw, in log order;
 //! 16. nothing applies on the other deployment;
 //! 17. a misrouted answer never resets an owner, and after `Heal` no owner ends blocked
-//!     `wrong_cluster`.
+//!     `wrong_cluster`;
+//! 18. a rebuild that discards pending records of a log re-keyed at open (and not bound since,
+//!     across restarts) carries `salvage: true`.
 //!
 //! Snapshots carry real `USS3` headers (the owner's lineage, an acknowledged position and its
 //! offset): the `410` rule reads them.
@@ -42,7 +45,8 @@
 //! Negative controls must fail them: the model with digest comparison off (requests reach it
 //! without `Producer-Digest`), a replicator that re-seals its in-flight batch on resend, one that
 //! re-keys on any other token, one that binds on a repeat receipt for a claim sent again after a
-//! re-key, and one that takes another cluster's HEAD for a deleted stream.
+//! re-key, one that takes another cluster's HEAD for a deleted stream, and one that re-keys a log
+//! holding commits after its latest ACK (the #611 B2 gate undone).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -88,9 +92,12 @@ use crate::model::ModelServer;
 use crate::model::faults::Fault;
 use crate::model::faults::Scripted;
 use crate::model::producer::IDLE_RETIREMENT_MS;
+use crate::open::table::Asked;
 use crate::open::table::HeadSeen;
+use crate::open::table::Local;
 use crate::open::table::LocalSummary;
 use crate::open::table::OpenRow;
+use crate::open::table::Superseded;
 use crate::open::table::decide;
 use crate::replicator::Action;
 use crate::replicator::BlockedReason;
@@ -107,6 +114,8 @@ use crate::replicator::ResetKind;
 use crate::replicator::Step;
 use crate::replicator::Work;
 use crate::replicator::answer::Unacked;
+use crate::replicator::answer::inherits;
+use crate::salvage::Reason;
 use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
@@ -244,6 +253,8 @@ struct LogModel {
     /// The last position when a rebuild published: the frames it brought in take no positions
     /// in this model (the driver logs each at the next one).
     rebuilt_through: u64,
+    /// The log rolled to a new token at open, and no claim bound under it since (property 18).
+    rekeyed_at_open: bool,
 }
 
 impl LogModel {
@@ -314,6 +325,8 @@ struct Coverage {
     rewound: AtomicU64,
     /// Owners blocked `wrong_cluster` that resumed.
     blocks_resumed: AtomicU64,
+    /// Restarts that salvaged the log and continued as a fresh takeover.
+    salvages: AtomicU64,
 }
 
 /// What the replicator was doing when an event came, and where its answer came from.
@@ -382,6 +395,8 @@ struct World {
     violations: Vec<String>,
     /// Another writer (a foreign append or claim) wrote on the stream.
     others: bool,
+    /// The commit frames of every log a restart salvaged.
+    salvaged: Vec<Arc<[u8]>>,
     coverage: Arc<Coverage>,
 }
 
@@ -454,6 +469,7 @@ impl World {
             acked_frames: HashMap::new(),
             violations: Vec::new(),
             others: false,
+            salvaged: Vec::new(),
             coverage,
         };
         world.takeover(false);
@@ -535,6 +551,19 @@ impl World {
         if self.owners.len() >= MAX_OWNERS {
             return;
         }
+        let (owner, actions) = self.fresh_owner(lagging);
+        self.owners.push(owner);
+        let index = self.owners.len() - 1;
+        let before = Before {
+            takeover: true,
+            ..Before::default()
+        };
+        self.process(index, actions, before);
+    }
+
+    /// An owner of a new family whose generation was built from the stream up to its tail (from
+    /// offset 0 when `lagging`), and the actions of its takeover.
+    fn fresh_owner(&mut self, lagging: bool) -> (Owner, Vec<Action>) {
         let activation = self.activation();
         let family = self.next_family;
         self.next_family += 1;
@@ -555,6 +584,7 @@ impl World {
             durable_acks: 0,
             catching_up: false,
             rebuilt_through: 0,
+            rekeyed_at_open: false,
         };
         let local = LocalState {
             lineage: log.lineage,
@@ -575,23 +605,19 @@ impl World {
             unacked: Unacked::Nothing,
         };
         let (inst, actions) = self.instance(local);
-        self.owners.push(Owner {
+        let owner = Owner {
             family,
             salt: u8::try_from(family % 250).unwrap(),
             log,
             inst,
-        });
-        let index = self.owners.len() - 1;
-        let before = Before {
-            takeover: true,
-            ..Before::default()
         };
-        self.process(index, actions, before);
+        (owner, actions)
     }
 
     /// The owner's process restarts and reopens from its log; the ACK it reads lags by `lag`. Its
     /// open's HEAD goes through the open table: the same token resumes, an inheriting history
-    /// re-keys, anything else is refused and no replicator runs.
+    /// re-keys a log with nothing pending, any other history salvages the log and the owner
+    /// continues as a fresh takeover, and a refusal runs no replicator.
     fn restart(&mut self, index: usize, lag: u8) {
         let activation = self.activation();
         let owner = &self.owners[index];
@@ -633,13 +659,36 @@ impl World {
             incarnation: log.incarnation,
             acked_offset,
             pending: unacked,
+            holds_data: !log.commits.is_empty() || log.rebuilt_through > 0,
         };
         let seen = HeadSeen {
             identity: identity.as_ref(),
             stream: stream.as_ref(),
             content_type: answer.content_type.as_deref(),
         };
-        let (incarnation, rekey_from) = match decide(Some((summary, ())), seen) {
+        let row = match decide(Local::Trusted(summary.clone(), ()), Asked::default(), seen) {
+            // The negative control: an inheriting history re-keys a log with commits pending.
+            OpenRow::Build {
+                superseded:
+                    Superseded::Salvage {
+                        reason: Reason::HistoryChanged,
+                        ..
+                    },
+                cluster_id,
+                head,
+            } if self.knobs.replicator.rekey_with_pending
+                && inherits(&head, summary.incarnation, summary.acked_offset) =>
+            {
+                OpenRow::ReKey {
+                    local: (),
+                    from: summary.incarnation,
+                    cluster_id,
+                    head,
+                }
+            }
+            row => row,
+        };
+        let (incarnation, rekey_from) = match row {
             OpenRow::Resume { .. } => (log.incarnation, None),
             OpenRow::ReKey { from, head, .. } => (head.incarnation(), Some(from)),
             OpenRow::Refuse { .. } => {
@@ -647,8 +696,28 @@ impl World {
                 self.owners[index].inst = inst;
                 return;
             }
-            row @ (OpenRow::Create | OpenRow::Build { .. }) => {
-                panic!("a trusted generation's open never takes row {row:?}")
+            OpenRow::Build { superseded, .. } => {
+                if matches!(superseded, Superseded::Salvage { .. }) {
+                    self.coverage.salvages.fetch_add(1, Ordering::Relaxed);
+                    let lineage = log.lineage;
+                    self.salvaged.extend(
+                        log.commits
+                            .values()
+                            .filter(|p| p.id.lineage == lineage)
+                            .map(|p| Arc::clone(&p.frame)),
+                    );
+                }
+                let (owner, actions) = self.fresh_owner(false);
+                self.owners[index] = owner;
+                let before = Before {
+                    takeover: true,
+                    ..Before::default()
+                };
+                self.process(index, actions, before);
+                return;
+            }
+            row @ OpenRow::Create { .. } => {
+                panic!("the world's stream is never missing, yet the open took row {row:?}")
             }
         };
         let local = LocalState {
@@ -922,9 +991,20 @@ impl World {
                     log.catching_up = false;
                     caught_up = true;
                 }
-                Action::Rebuild { discard_from, .. } => {
+                Action::Rebuild {
+                    discard_from,
+                    salvage,
+                    ..
+                } => {
                     if !takeover {
                         self.violation("property 6: a rebuild outside a takeover".to_owned());
+                    }
+                    if discard_from.is_some() && self.owners[index].log.rekeyed_at_open && !salvage
+                    {
+                        self.violation(format!(
+                            "property 18: owner {index} discarded pending records of a log \
+                             re-keyed at open with no salvage"
+                        ));
                     }
                     let owner = &mut self.owners[index];
                     if discard_from.is_none() && owner.inst.applies > 0 {
@@ -954,7 +1034,8 @@ impl World {
                     let log = &mut self.owners[index].log;
                     log.durable_acks = log.acks.len();
                 }
-                Action::Bound { .. } | Action::Reset(_) | Action::Refuse(_) => {}
+                Action::Bound { .. } => self.owners[index].log.rekeyed_at_open = false,
+                Action::Reset(_) | Action::Refuse(_) => {}
             }
         }
         if caught_up {
@@ -976,6 +1057,8 @@ impl World {
         claim: (Epoch, Activation),
         before: &Before,
     ) {
+        // A takeover's, at open or during its claim: its ACK may trail the stream's (property 18).
+        let at_open = before.takeover;
         let counter = if before.streaming {
             &self.coverage.rekeys_streaming
         } else if before.claiming {
@@ -1003,6 +1086,7 @@ impl World {
             log.claims.push(claim);
         }
         log.durable_acks = log.acks.len();
+        log.rekeyed_at_open |= at_open;
     }
 
     /// The first record owner `index` acknowledged that `stream` does not hold in log order, if
@@ -1528,6 +1612,7 @@ impl World {
         log.lineage = Lineage(lineage);
         log.catching_up = true;
         log.rebuilt_through = log.next_position.saturating_sub(1);
+        log.rekeyed_at_open = false;
     }
 
     fn apply_op(&mut self, op: &Op) {
@@ -1927,6 +2012,7 @@ fn the_world_catches_up_in_place_read_by_read() {
         ("re-keys at open", &coverage.rekeys_open),
         ("rewound resets", &coverage.rewound),
         ("blocks that resumed", &coverage.blocks_resumed),
+        ("salvages at open", &coverage.salvages),
     ];
     for (what, count) in counts {
         let count = count.load(Ordering::Relaxed);
@@ -2095,7 +2181,8 @@ fn negative_control_a_misroute_taken_for_a_history_writes_to_the_other_deploymen
 
 /// A history that loses nothing while owner 0 streams re-keys it with no reset, and a restart
 /// after another one re-keys at open; a restore that lost an acknowledged commit resets the
-/// streaming owner `rewound`, and the reopen is refused.
+/// streaming owner `rewound`, and the reopen salvages its log, with the lost commit, and
+/// continues as a fresh takeover.
 #[test]
 fn history_events_re_key_or_reset_rewound() {
     let ops = vec![
@@ -2126,15 +2213,109 @@ fn history_events_re_key_or_reset_rewound() {
     assert_eq!(world.violations, Vec::<String>::new());
 
     let mut world = World::new(Knobs::default(), 1, Arc::default());
-    for op in lossy_restore().iter().chain(&[Op::Restart(0, 0)]) {
-        world.step(op);
+    let lost = {
+        for op in &lossy_restore() {
+            world.step(op);
+        }
+        world.owners[0]
+            .log
+            .commits
+            .values()
+            .next()
+            .unwrap()
+            .frame
+            .clone()
+    };
+    for op in [Op::Restart(0, 0), Op::Flush] {
+        world.step(&op);
     }
     assert!(matches!(
         world.owners[0].inst.replicator,
-        Replicator::Stopped
+        Replicator::Streaming { .. }
     ));
+    assert_eq!(world.coverage.salvages.load(Ordering::Relaxed), 1);
+    assert!(world.salvaged.contains(&lost));
     world.heal();
     assert_eq!(world.violations, Vec::<String>::new());
+}
+
+/// Owner 0 acknowledges a commit after a checkpoint (its ACK record not durable), the stream is
+/// restored to that checkpoint and another writer commits, and owner 0 restarts with the lagging
+/// ACK, under which the history inherits its log, and restarts again before its takeover binds.
+/// With the #611 B2 gate the first restart salvages the log; undone, it re-keys the log with the
+/// acknowledged commit pending, the second restart resumes the re-keyed log, and its takeover
+/// discards the commit with no salvage.
+fn crash_after_a_rekey_at_open() -> Vec<Op> {
+    vec![
+        Op::Flush,
+        Op::Checkpoint,
+        Op::Commit(0),
+        Op::Flush,
+        Op::Restore(0),
+        Op::ForeignAppend(1),
+        Op::Restart(0, 1),
+        Op::Restart(0, 0),
+        Op::Flush,
+    ]
+}
+
+/// A re-key while bound checks inheritance against the exact acknowledged offset, so the history
+/// holds every commit the binding acknowledged: a later takeover that discards the pending tail
+/// after a reset loses nothing acknowledged, and property 18 does not count that re-key as one at
+/// open. A script the 1M-case run found when it did.
+#[test]
+fn a_rekey_while_bound_is_not_one_at_open() {
+    let ops = vec![
+        Op::Deliver(0),
+        Op::ForeignAppend(1),
+        Op::Deliver(0),
+        Op::Commit(0),
+        Op::ExpireIdle,
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::NewHistory,
+        Op::Commit(0),
+        Op::Flush,
+        Op::Commit(0),
+        Op::Commit(0),
+        Op::Commit(0),
+        Op::Retain(0),
+        Op::Restart(0, 0),
+        Op::Checkpoint,
+        Op::Commit(0),
+        Op::Checkpoint,
+        Op::Commit(0),
+    ];
+    assert_eq!(run(Knobs::default(), 0, &ops), Vec::<String>::new());
+}
+
+#[test]
+fn negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage() {
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &crash_after_a_rekey_at_open() {
+        world.step(op);
+    }
+    assert_eq!(world.coverage.salvages.load(Ordering::Relaxed), 1);
+    assert_eq!(world.coverage.rekeys_open.load(Ordering::Relaxed), 0);
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+    assert!(matches!(
+        world.owners[0].inst.replicator,
+        Replicator::Streaming { .. }
+    ));
+    let violations = run(
+        replicator_knobs(ReplicatorKnobs {
+            rekey_with_pending: true,
+            ..ReplicatorKnobs::default()
+        }),
+        1,
+        &crash_after_a_rekey_at_open(),
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 18")),
+        "{violations:?}"
+    );
 }
 
 /// Streaming owner 0 acknowledges a commit, is cloned, and both copies commit different bytes at

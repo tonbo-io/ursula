@@ -314,6 +314,7 @@ pub(crate) fn open(
                         activation: options.activation.unwrap_or_else(process_activation),
                         max_pending_bytes: options.max_pending_bytes,
                         max_request_bytes: crate::config::max_request_bytes(),
+                        recreate: options.recreate,
                         timeout_ms: if timeout_ms == 0 {
                             options.timeout_ms.unwrap_or(DEFAULT_OPEN_MS)
                         } else {
@@ -507,6 +508,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
 
     use crate::codec::segment::SegmentHeader;
     use crate::driver::Bind;
+    use crate::generation::Fate;
     use crate::generation::Root;
     use crate::ids::Lineage;
     use crate::replog::Log;
@@ -528,7 +530,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
             claim: None,
         })
         .unwrap()
-        .publish()
+        .publish(Fate::Trash)
         .unwrap();
     let (log, _) = Log::open(&generation.log_dir()).unwrap();
     let path = generation.db().to_string_lossy().into_owned();

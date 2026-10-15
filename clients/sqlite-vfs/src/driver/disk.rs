@@ -12,8 +12,8 @@ use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
-use super::Attach;
 use crate::generation::CanonicalPath;
+use crate::generation::Fate;
 use crate::generation::Root;
 use crate::ids::Activation;
 use crate::ids::Lineage;
@@ -26,6 +26,7 @@ use crate::open::Build;
 use crate::open::OpenError;
 use crate::open::OpenSpec;
 use crate::open::Prepared;
+use crate::open::Published;
 use crate::open::new_build;
 use crate::open::prepare;
 
@@ -42,6 +43,8 @@ pub(crate) struct NewBuild {
     /// A rebuild's claim, logged in the new generation.
     pub(crate) claim: Option<(Epoch, Activation)>,
     pub(crate) end: Offset,
+    /// What becomes of the generation the build replaces when it publishes.
+    pub(crate) fate: Fate,
 }
 
 #[derive(Debug)]
@@ -80,7 +83,7 @@ pub(crate) enum DiskDone {
         build: Box<Build>,
         result: Result<(), OpenError>,
     },
-    Published(Result<(Box<Materialized>, Option<Epoch>, Attach), OpenError>),
+    Published(Result<Published, OpenError>),
     /// The last position the frames took and the log's bytes.
     CaughtUp {
         m: Box<Materialized>,
@@ -112,11 +115,7 @@ impl DiskJob {
                 let result = build.apply(&frames);
                 DiskDone::Chunk { build, result }
             }
-            Self::Publish(build) => DiskDone::Published(
-                build
-                    .publish()
-                    .map(|(m, highest, attach)| (Box::new(m), highest, attach)),
-            ),
+            Self::Publish(build) => DiskDone::Published(build.publish()),
             Self::CatchUp {
                 mut m,
                 frames,

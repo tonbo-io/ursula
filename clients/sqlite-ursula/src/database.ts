@@ -23,7 +23,29 @@ const NO_TRANSACTION = "cannot rollback - no transaction is active";
 const NO_SAVEPOINT = "no such savepoint: ";
 
 /**
- * `ursula_status` (design §9, the part M1 reports): one snake_case JSON for every host.
+ * A local cache moved aside: a history change of the stream that does not keep it (`history_changed`),
+ * a db file that is not the cache's own (`replaced`), or a stream created again over it with
+ * `recreate` (`recreated`).
+ */
+export interface UrsulaSalvage {
+	readonly dir: string;
+	readonly reason: "history_changed" | "replaced" | "recreated";
+	/** When it was moved aside, RFC 3339 in UTC. */
+	readonly time: string;
+	/** The stream token the cache was built under, `null` for a replaced one. */
+	readonly incarnation: string | null;
+	/** The stream's token when it was moved aside. */
+	readonly stream_incarnation: string | null;
+	/** Every commit up to this position was in the stream under `incarnation`; `null` for a replaced one. */
+	readonly acknowledged_position: number | null;
+	/** The cache's commits after `acknowledged_position`, which the stream may never have held. */
+	readonly unacknowledged: number | null;
+	/** Whether `db` opens as a plain SQLite database. */
+	readonly plain: boolean;
+}
+
+/**
+ * `ursula_status` (design §9, the part built so far): one snake_case JSON for every host.
  */
 export interface UrsulaStatus {
 	/** The stream's path, such as `/acme/notes`. */
@@ -52,11 +74,18 @@ export interface UrsulaStatus {
 	 * Where the open got the local database: a trusted local cache (`resumed`), a trusted local cache
 	 * kept across a history change of the stream that inherits it (`rekeyed`), or a build from the
 	 * stream (`built`), from the snapshot at `snapshot_offset` and the tail after it, or from the
-	 * stream's start when it is `null`.
+	 * stream's start when it is `null`. A build that moved the local cache aside into `salvage` first
+	 * is `salvaged`.
 	 */
-	readonly attach: { readonly local: "resumed" | "rekeyed" | "built"; readonly snapshot_offset: number | null };
+	readonly attach: { readonly local: "resumed" | "rekeyed" | "built" | "salvaged"; readonly snapshot_offset: number | null };
 	/** The last write refused with nothing committed. */
 	readonly refused: { readonly kind: string; readonly action: string; readonly message: string } | null;
+	/**
+	 * Local caches of this stream moved aside, oldest first, never read or deleted by the extension:
+	 * each `dir` holds a plain SQLite database `db` (a replaced file as it was found), its log and a
+	 * `manifest.json`.
+	 */
+	readonly salvage: readonly UrsulaSalvage[];
 	readonly reset: { readonly kind: string; readonly action: string } | null;
 }
 

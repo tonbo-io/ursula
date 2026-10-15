@@ -46,6 +46,7 @@ use crate::open::OpenError;
 use crate::replicator::Condition;
 use crate::replicator::ResetKind;
 use crate::replog::Log;
+use crate::salvage::Reason;
 use crate::snapshotter::Snapshots;
 use crate::transport::Attempt;
 use crate::wire::Request;
@@ -520,8 +521,12 @@ pub(crate) enum Attach {
     /// re-keyed (design §6.2).
     ReKeyed,
     /// A generation built from the stream: from its latest snapshot at `snapshot` and the tail
-    /// after it, or from its start when `snapshot` is `None`.
-    Built { snapshot: Option<Offset> },
+    /// after it, or from its start when `snapshot` is `None`. `salvaged` names why the local
+    /// generation it replaced was salvaged, if it was.
+    Built {
+        snapshot: Option<Offset>,
+        salvaged: Option<Reason>,
+    },
 }
 
 /// A database bound by an open.

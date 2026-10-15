@@ -574,6 +574,7 @@ fn mode(kind: ClaimKind) -> Mode {
 fn rebuild(discard_from: Option<Position>, to: usize) -> Action {
     Action::Rebuild {
         discard_from,
+        salvage: false,
         to: off(u64::try_from(to).unwrap()),
         epoch: epoch(1),
         activation: ACTIVATION,

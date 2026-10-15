@@ -4,15 +4,21 @@ use std::os::unix::fs::FileExt;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
+use super::Fate;
 use super::GenerationError;
 use super::PathError;
 use super::Root;
 use super::canonical_path;
 use super::root_name;
+use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::marker::empty_page_one;
 use crate::codec::segment::SegmentHeader;
 use crate::ids::Lineage;
 use crate::ids::Position;
+use crate::salvage;
+use crate::salvage::Manifest;
+use crate::salvage::Reason;
+use crate::salvage::State;
 use crate::testdir::TempDir;
 
 fn path(url: &str) -> String {
@@ -128,12 +134,12 @@ fn a_built_generation_becomes_current_once_published() {
     let building = root.build(header(1)).unwrap();
     assert_eq!(root.current().unwrap(), None);
     fs::write(building.db_path(), b"pages").unwrap();
-    let g = building.publish().unwrap();
+    let g = building.publish(Fate::Trash).unwrap();
     assert_eq!(root.current().unwrap(), Some(g.clone()));
     assert_eq!(fs::read(g.db()).unwrap(), b"pages");
     assert!(g.log_dir().join("00000000000000000001.usl").exists());
     // The next one supersedes it.
-    let g2 = root.build(header(2)).unwrap().publish().unwrap();
+    let g2 = root.build(header(2)).unwrap().publish(Fate::Trash).unwrap();
     assert_eq!(root.current().unwrap(), Some(g2.clone()));
     assert_eq!(g2.first_header().unwrap().supersedes, Some(g.id));
     assert!(!g.dir.exists());
@@ -146,8 +152,12 @@ fn a_crash_after_each_publish_step_converges_to_one_generation() {
     loop {
         let dir = TempDir::new("gen-crash");
         let root = Root::lock(dir.path(), &p).unwrap();
-        let old = root.build(header(1)).unwrap().publish().unwrap();
-        let done = root.build(header(2)).unwrap().crash_after(steps).unwrap();
+        let old = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+        let done = root
+            .build(header(2))
+            .unwrap()
+            .crash_after(Fate::Trash, steps)
+            .unwrap();
         // The process dies, its lock with it, possibly midway through deleting the trash.
         drop(root);
         let trash = dir
@@ -186,9 +196,12 @@ fn an_unreadable_generation_another_supersedes_is_finished() {
     let dir = TempDir::new("gen-unreadable");
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
-    let old = root.build(header(1)).unwrap().publish().unwrap();
+    let old = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
     // A crash right after the new generation's rename, then the old one lost its log.
-    root.build(header(2)).unwrap().crash_after(5).unwrap();
+    root.build(header(2))
+        .unwrap()
+        .crash_after(Fate::Trash, 5)
+        .unwrap();
     fs::remove_dir_all(old.log_dir()).unwrap();
     drop(root);
     let root = Root::lock(dir.path(), &p).unwrap();
@@ -201,10 +214,10 @@ fn an_unreadable_generation_nothing_supersedes_is_an_error() {
     let dir = TempDir::new("gen-orphan");
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
-    let a = root.build(header(1)).unwrap().publish().unwrap();
+    let a = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
     let side = dir.path().join("side");
     fs::rename(&a.dir, &side).unwrap();
-    let b = root.build(header(2)).unwrap().publish().unwrap();
+    let b = root.build(header(2)).unwrap().publish(Fate::Trash).unwrap();
     fs::rename(&side, &a.dir).unwrap();
     // `b` supersedes nothing (it was built with no current generation), and `a` is unreadable.
     fs::remove_dir_all(a.log_dir()).unwrap();
@@ -222,7 +235,7 @@ fn a_generation_is_found_by_its_directory_id() {
     let dir = TempDir::new("gen-id");
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
-    let g = root.build(header(1)).unwrap().publish().unwrap();
+    let g = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
     assert_eq!(
         g.dir.file_name().unwrap().to_str().unwrap(),
         format!("gen-{}", g.id.hex())
@@ -243,8 +256,11 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
     let dir = TempDir::new("gen-same-lineage");
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
-    let old = root.build(header(1)).unwrap().publish().unwrap();
-    root.build(header(1)).unwrap().crash_after(5).unwrap();
+    let old = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+    root.build(header(1))
+        .unwrap()
+        .crash_after(Fate::Trash, 5)
+        .unwrap();
     drop(root);
     let root = Root::lock(dir.path(), &p).unwrap();
     root.finish_leftovers().unwrap();
@@ -257,7 +273,7 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
     // A second directory of the lineage that supersedes nothing: neither wins.
     let side = dir.path().join("side");
     fs::rename(&current.dir, &side).unwrap();
-    let other = root.build(header(1)).unwrap().publish().unwrap();
+    let other = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
     fs::rename(&side, &current.dir).unwrap();
     assert_eq!(other.first_header().unwrap().supersedes, None);
     root.finish_leftovers().unwrap();
@@ -275,13 +291,77 @@ fn a_generation_is_published_with_page_one_written() {
     let dir = TempDir::new("gen-empty");
     let p = canonical_path("https://h/v1/stream/db").unwrap();
     let root = Root::lock(dir.path(), &p).unwrap();
-    let g = root.build(header(1)).unwrap().publish().unwrap();
+    let g = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
     assert_eq!(
         fs::read(g.db()).unwrap(),
         empty_page_one(g.lineage).to_vec()
     );
     let building = root.build(header(2)).unwrap();
     building.db.write_all_at(&[7u8; 8192], 0).unwrap();
-    let g2 = building.publish().unwrap();
+    let g2 = building.publish(Fate::Trash).unwrap();
     assert_eq!(fs::read(g2.db()).unwrap(), vec![7u8; 8192]);
+}
+
+/// The manifest of a salvage of the generation of `header(n)`.
+fn manifest(n: u8) -> Manifest {
+    Manifest {
+        reason: Reason::HistoryChanged,
+        state: State::Moving,
+        time: "2026-10-16T12:00:00Z".to_owned(),
+        path: "/v1/stream/db".to_owned(),
+        cluster_id: Some("cluster".to_owned()),
+        lineage: Some(Lineage([n; 16])),
+        incarnation: None,
+        stream_incarnation: None,
+        acknowledged: None,
+        plain: true,
+    }
+}
+
+/// A crash after every step of a publish that salvages the generation it supersedes converges,
+/// at the next open, to one current generation and at most one salvage, complete and plain: the
+/// old generation stays current (its manifest deleted) until the rename, and is salvaged after.
+#[test]
+fn a_crash_after_each_salvaging_publish_step_converges() {
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let mut steps = 0;
+    loop {
+        let dir = TempDir::new("gen-salvage-crash");
+        let root = Root::lock(dir.path(), &p).unwrap();
+        let old = root.build(header(1)).unwrap().publish(Fate::Trash).unwrap();
+        let done = root
+            .build(header(2))
+            .unwrap()
+            .crash_after(Fate::Salvage(manifest(1)), steps)
+            .unwrap();
+        drop(root);
+        let root = Root::lock(dir.path(), &p).unwrap();
+        root.finish_leftovers().unwrap();
+        let current = root.current().unwrap().unwrap();
+        let salvages = salvage::list(root.path()).unwrap();
+        // Until the rename (step 5) the old generation stays, after it the new one.
+        if steps >= 5 {
+            assert_eq!(current.lineage, Lineage([2; 16]), "after {steps} steps");
+            assert_eq!(salvages.len(), 1, "after {steps} steps");
+            let s = &salvages[0];
+            assert_eq!(s.manifest.state, State::Complete);
+            assert_eq!(fs::read(s.dir.join("db")).unwrap()[..16], SQLITE_MAGIC);
+            assert!(s.dir.join("log").exists());
+        } else {
+            assert_eq!(current.lineage, old.lineage, "after {steps} steps");
+            assert!(salvages.is_empty(), "after {steps} steps");
+            assert!(!current.dir.join(salvage::MANIFEST).exists());
+        }
+        let gens: Vec<String> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("gen-"))
+            .collect();
+        assert_eq!(gens.len(), 1, "after {steps} steps: {gens:?}");
+        if done < steps {
+            break;
+        }
+        steps += 1;
+    }
+    assert_eq!(steps, 9);
 }

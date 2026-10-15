@@ -1,22 +1,24 @@
-//! Opening a stream (design §5.5, the rows M1 supports): from the URL to a takeover ready to
-//! claim. The driver's core runs it as a step machine: every request and every disk job goes out
-//! through the core, and their outcomes come back to [`Opening::answered`] and
-//! [`Opening::disk_done`].
+//! Opening a stream (design §5.5): from the URL to a takeover ready to claim. The driver's core
+//! runs it as a step machine: every request and every disk job goes out through the core, and
+//! their outcomes come back to [`Opening::answered`] and [`Opening::disk_done`].
 //!
 //! The first disk job ([`prepare`]) takes the stream's root lock (`in_use`), finishes what a crash
-//! left, and materializes the current generation when there is one (an unreadable segment header
-//! is `local_setup`, a gap under valid checksums `internal`). Then a HEAD without a precondition
-//! decides, before any claim, by the table of design §5.5 ([`table::decide`]): it creates the
-//! stream, builds a generation from the latest snapshot and the tail, takes over with the
-//! generation's token, re-keys a generation whose history the stream inherits and takes over, or
-//! refuses. A generation of another token that the history does not inherit, or that holds
-//! commits after its latest ACK, is refused `stream_state` with its files kept (salvage comes
-//! later in M2).
+//! left, and materializes the current generation when there is one (a gap under valid checksums
+//! is `internal`). A generation whose db file is not its own, or whose log's first segment header
+//! is unreadable, is left as found and salvaged as `replaced` by the build that replaces it. Then
+//! a HEAD without a precondition decides, before any claim, by the table of design §5.5
+//! ([`table::decide`]): it creates the stream, builds a generation from the latest snapshot and the
+//! tail, takes over with the generation's token, re-keys a generation whose history the stream
+//! inherits and takes over, or refuses. A build that replaces a generation holding data salvages
+//! it ([`crate::salvage`]) in the same publish: a generation of another token the history does not
+//! inherit, or does while its log holds commits after its latest ACK (`history_changed`), one over
+//! whose missing stream the open created another (`recreate`, `recreated`), or a replaced one.
 //!
 //! Every refusal keeps the local files and sends nothing to the stream. A request that gets no
 //! answer is sent again under the replicator's retry [`Policy`] until the open's deadline, which
-//! then fails with the last condition (`unreachable` when nothing ever went out). Provisional
-//! opens, salvage and readers are M2's.
+//! then fails with the last condition (`unreachable` when nothing ever went out). A fresh build
+//! whose stream changes history while it reads starts over under the new token (design D8),
+//! bounded like its restarts after a `410`. Provisional opens and readers come later in M2.
 //!
 //! Module map:
 //!
@@ -24,8 +26,11 @@
 
 pub(crate) mod table;
 
+use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
+use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,13 +42,17 @@ use ursula_headers::Offset;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 
+use self::table::Asked;
 use self::table::HeadSeen;
+use self::table::Local;
 use self::table::LocalSummary;
 use self::table::OpenRow;
+use self::table::Superseded;
 use crate::applier::stamp_page_one;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::Frame;
 use crate::codec::frame::FrameError;
+use crate::codec::marker;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentHeader;
 use crate::codec::snapshot::SnapshotError;
@@ -57,6 +66,7 @@ use crate::driver::disk::DiskJob;
 use crate::driver::disk::NewBuild;
 use crate::generation::Building;
 use crate::generation::CanonicalPath;
+use crate::generation::Fate;
 use crate::generation::GenerationError;
 use crate::generation::PathError;
 use crate::generation::Root;
@@ -65,10 +75,13 @@ use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
 use crate::ids::Position;
+use crate::log;
+use crate::log::Level;
 use crate::materialize;
 use crate::materialize::ForeignFrame;
 use crate::materialize::LocalError;
 use crate::materialize::Materialized;
+use crate::materialize::holds_data;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
 use crate::replicator::LocalState;
@@ -84,6 +97,11 @@ use crate::replicator::answer::decide_status;
 use crate::replicator::backoff::Next;
 use crate::replicator::backoff::Policy;
 use crate::replog::LogError;
+use crate::salvage::Acknowledged;
+use crate::salvage::Manifest;
+use crate::salvage::Reason;
+use crate::salvage::State;
+use crate::salvage::utc_now;
 use crate::transport::Attempt;
 use crate::wire::Exchange;
 use crate::wire::Method;
@@ -109,6 +127,9 @@ pub(crate) struct OpenSpec {
     pub(crate) max_request_bytes: Option<u64>,
     /// How long the open may take, from its start.
     pub(crate) timeout_ms: u64,
+    /// A missing stream is created again over a trusted generation holding data, which is
+    /// salvaged (`recreated`), instead of refusing `not_found`.
+    pub(crate) recreate: bool,
 }
 
 /// The condition an open that ran out of time reports (design §8.4, `UrsulaUnavailableError`).
@@ -173,12 +194,6 @@ impl From<&Condition> for Unavailable {
 /// Why the stream is not one the open can take over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StreamState {
-    /// The generation was built under another token whose history does not inherit it, or does
-    /// while its log holds commits after its latest ACK (salvage comes later in M2).
-    TokenChanged {
-        local: Incarnation,
-        stream: Incarnation,
-    },
     Closed,
     /// Bytes that are not `USQ2` frames.
     Undecodable,
@@ -189,7 +204,8 @@ pub(crate) enum StreamState {
     BelowRetention {
         from: Offset,
     },
-    /// The stream changed history while the open read it.
+    /// The stream changed history while a takeover's rebuild read it, or a fresh build started
+    /// over after a history change more times than it restarts.
     HistoryChanged,
     /// A commit or snapshot whose page 1 is not a SQLite database's.
     NotSqlite,
@@ -466,7 +482,8 @@ impl Fetch {
 /// or from the stream's start without a snapshot. Each read's frames are logged as COMMIT records
 /// with an ACK and fsynced before they are applied ([`materialize::catch_up_files`]), so memory
 /// stays bounded by one read. A `410` while the tail is read (retention passed the installed
-/// snapshot) deletes the `.tmp` and starts over from the HEAD ([`Build::restart`]).
+/// snapshot) deletes the `.tmp` and starts over from the HEAD ([`Build::restart`]), and so does a
+/// history change while a fresh build reads (design D8), under the new token.
 #[derive(Debug)]
 pub(crate) struct Build {
     building: Building,
@@ -485,9 +502,24 @@ pub(crate) struct Build {
     restarts: u32,
     /// The offset of the snapshot this build installed, if any.
     installed: Option<Offset>,
+    /// What becomes of the generation the publish supersedes.
+    fate: Fate,
+    /// The latest HEAD the build read: a fresh build that started over after a history change
+    /// takes over with its token.
+    head: Option<StreamHead>,
 }
 
-/// The restarts a build makes after a `410` before it gives up.
+/// A build published: the generation materialized, the highest epoch a CLAIM read named, where the
+/// open got the database, and the latest HEAD the build read.
+#[derive(Debug)]
+pub(crate) struct Published {
+    pub(crate) m: Box<Materialized>,
+    pub(crate) highest: Option<Epoch>,
+    pub(crate) attach: Attach,
+    pub(crate) head: Option<StreamHead>,
+}
+
+/// The restarts a build makes after a `410` or a history change before it gives up.
 const MAX_BUILD_RESTARTS: u32 = 8;
 
 /// What a build reads next.
@@ -530,20 +562,22 @@ impl Build {
         building: Building,
         root: Arc<Root>,
         header: SegmentHeader,
-        incarnation: Incarnation,
         end: Offset,
+        fate: Fate,
     ) -> Self {
         Self {
             building,
             root,
             base: Position(header.first_position.0.saturating_sub(1)),
+            fetch: Fetch::new(header.incarnation, Offset::ZERO, end, None),
             header,
             stage: BuildStage::Head,
-            fetch: Fetch::new(incarnation, Offset::ZERO, end, None),
             retry: Retry::default(),
             attempt: Attempt::default(),
             restarts: 0,
             installed: None,
+            fate,
+            head: None,
         }
     }
 
@@ -592,8 +626,9 @@ impl Build {
                 };
                 self.succeeded();
                 if head.incarnation() != self.fetch.incarnation {
-                    return BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged));
+                    return self.history_changed(head.incarnation());
                 }
+                self.head = Some(head);
                 // A fresh open's build reads up to the tail this HEAD names. A takeover's rebuild
                 // reads up to its claim: a snapshot past the claim means another owner wrote
                 // after it.
@@ -655,11 +690,38 @@ impl Build {
                 self.attempt = attempt;
                 BuildStep::Timer { at_ms, jitter_ms }
             }
-            Failure::Restart => {
-                BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged))
-            }
+            // A `412` or a `404`: the HEAD tells whether the history changed.
+            Failure::Restart => match self.restarted() {
+                Ok(()) => {
+                    self.stage = BuildStage::Head;
+                    self.next()
+                }
+                Err(e) => BuildStep::Fail(e),
+            },
             Failure::Closed => BuildStep::Fail(OpenError::StreamState(StreamState::Closed)),
         }
+    }
+
+    /// Counts a restart: past [`MAX_BUILD_RESTARTS`], or for a takeover's rebuild (which reads up
+    /// to its claim, in the history the claim landed in), the build gives up.
+    fn restarted(&mut self) -> Result<(), OpenError> {
+        self.restarts = self.restarts.saturating_add(1);
+        if self.header.claim.is_some() || self.restarts > MAX_BUILD_RESTARTS {
+            return Err(OpenError::StreamState(StreamState::HistoryChanged));
+        }
+        Ok(())
+    }
+
+    /// The stream changed history while a fresh build read it (design D8): it starts over in a
+    /// fresh `.tmp`, under the token the HEAD named.
+    fn history_changed(&mut self, incarnation: Incarnation) -> BuildStep {
+        if let Err(e) = self.restarted() {
+            return BuildStep::Fail(e);
+        }
+        self.header.incarnation = incarnation;
+        self.fetch.incarnation = incarnation;
+        self.stage = BuildStage::Restarting;
+        BuildStep::Restart
     }
 
     /// Disk job: checks the snapshot body and installs its image into the db file, then names
@@ -751,10 +813,11 @@ impl Build {
             fetch,
             retry,
             restarts,
+            fate,
             ..
         } = self;
         building.discard().map_err(local)?;
-        let mut build = start_build(root, header, fetch.incarnation, fetch.stream.end())?;
+        let mut build = start_build(root, header, fetch.stream.end(), fate)?;
         build.retry = retry;
         build.restarts = restarts;
         Ok(build)
@@ -767,17 +830,27 @@ impl Build {
             .map_err(local)
     }
 
-    /// Disk job: publishes the complete generation by one rename (the one it supersedes goes then)
-    /// and materializes it. Returns it with the highest epoch a CLAIM read named.
-    pub(crate) fn publish(self) -> Result<(Materialized, Option<Epoch>, Attach), OpenError> {
+    /// Disk job: publishes the complete generation by one rename (the one it supersedes is
+    /// trashed or salvaged then) and materializes it.
+    pub(crate) fn publish(self) -> Result<Published, OpenError> {
         let highest = self.fetch.highest_epoch;
+        let salvaged = match &self.fate {
+            Fate::Trash => None,
+            Fate::Salvage(manifest) => Some(manifest.reason),
+        };
         let attach = Attach::Built {
             snapshot: self.installed,
+            salvaged,
         };
-        let generation = self.building.publish().map_err(local)?;
+        let generation = self.building.publish(self.fate).map_err(local)?;
         let m = materialize::materialize(&generation).map_err(local)?;
         drop(self.root);
-        Ok((m, highest, attach))
+        Ok(Published {
+            m: Box::new(m),
+            highest,
+            attach,
+            head: self.head,
+        })
     }
 }
 
@@ -794,6 +867,7 @@ pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
         first,
         claim,
         end,
+        fate,
     } = job;
     let before = Position(first.0.saturating_sub(1));
     let header = SegmentHeader {
@@ -809,15 +883,15 @@ pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
         log_bytes: 0,
         claim,
     };
-    start_build(root, header, incarnation, end)
+    start_build(root, header, end, fate)
 }
 
 /// Starts building the generation `header` names, its claim (a rebuild's) logged and fsynced.
 fn start_build(
     root: Arc<Root>,
     header: SegmentHeader,
-    incarnation: Incarnation,
     end: Offset,
+    fate: Fate,
 ) -> Result<Build, OpenError> {
     let mut building = root.build(header.clone()).map_err(local)?;
     if let Some((epoch, activation)) = header.claim {
@@ -827,17 +901,45 @@ fn start_build(
             .and_then(|_position| building.log.sync())
             .map_err(local)?;
     }
-    Ok(Build::new(building, root, header, incarnation, end))
+    Ok(Build::new(building, root, header, end, fate))
+}
+
+/// A generation whose db file is not its own, or whose log's first segment header is unreadable:
+/// left as found, and salvaged as `replaced` by the build that replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Replaced {
+    lineage: Option<Lineage>,
+    cluster_id: Option<String>,
+    /// Its db file holds SQLite's own magic.
+    plain: bool,
+}
+
+/// The local generation the open found.
+#[derive(Debug)]
+enum Found {
+    None,
+    Replaced(Replaced),
+    Trusted(Box<Materialized>),
 }
 
 /// What the local steps of an open found.
 #[derive(Debug)]
 pub(crate) struct Prepared {
     root: Arc<Root>,
-    local: Option<Box<Materialized>>,
+    found: Found,
 }
 
-/// Disk job: locks the root, finishes leftovers and materializes the current generation.
+/// Whether the db file in `dir` starts with SQLite's magic.
+fn plain_db(dir: &Path) -> bool {
+    let mut head = [0u8; marker::LEN];
+    File::open(dir.join("db"))
+        .and_then(|f| f.read_exact_at(&mut head, 0))
+        .is_ok_and(|()| head == marker::SQLITE_MAGIC)
+}
+
+/// Disk job: locks the root, finishes leftovers and materializes the current generation, unless
+/// it is replaced (its db file not its own, its log's first segment header unreadable), which is
+/// left as found.
 pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
     let name = canonical_path(&spec.url)?;
     let root = Root::lock(&spec.dir, &name).map_err(|e| match e {
@@ -845,25 +947,48 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
         other => local(other),
     })?;
     root.finish_leftovers().map_err(local)?;
-    let local_generation = match root.current().map_err(local)? {
-        None => None,
-        Some(generation) => {
-            // A replaced db file is refused for now (`local_setup`, nothing changed): salvage keeps
-            // it in a later version.
-            let m = materialize::materialize(&generation).map_err(local)?;
-            let found = &m.recovered.header.stream_path;
-            if found != name.as_str() {
-                return Err(OpenError::LocalSetup(LocalSetup::OtherStream {
-                    found: found.clone(),
-                    expected: name.as_str().to_owned(),
-                }));
-            }
-            Some(Box::new(m))
+    let found = match root.current_or_unreadable().map_err(local)? {
+        None => Found::None,
+        Some(Err(unreadable)) => {
+            log::emit(Level::Warn, "generation_replaced", &[
+                ("dir", &unreadable.dir.display()),
+                ("error", &unreadable.error),
+            ]);
+            Found::Replaced(Replaced {
+                lineage: None,
+                cluster_id: None,
+                plain: plain_db(&unreadable.dir),
+            })
         }
+        Some(Ok(generation)) => match materialize::materialize(&generation) {
+            Ok(m) => {
+                let found = &m.recovered.header.stream_path;
+                if found != name.as_str() {
+                    return Err(OpenError::LocalSetup(LocalSetup::OtherStream {
+                        found: found.clone(),
+                        expected: name.as_str().to_owned(),
+                    }));
+                }
+                Found::Trusted(Box::new(m))
+            }
+            // Refused before anything was written: the generation stays as it was found.
+            Err(e) if e.is_replaced() => {
+                log::emit(Level::Warn, "generation_replaced", &[
+                    ("dir", &generation.dir.display()),
+                    ("error", &e),
+                ]);
+                Found::Replaced(Replaced {
+                    lineage: Some(generation.lineage),
+                    cluster_id: generation.first_header().ok().map(|h| h.cluster_id),
+                    plain: matches!(e, LocalError::Unmarked { .. }),
+                })
+            }
+            Err(e) => return Err(local(e)),
+        },
     };
     Ok(Prepared {
         root: Arc::new(root),
-        local: local_generation,
+        found,
     })
 }
 
@@ -875,16 +1000,43 @@ fn summary(m: &Materialized) -> LocalSummary {
         incarnation: r.header.incarnation,
         acked_offset: r.acked_offset,
         pending: unacked(m),
+        holds_data: holds_data(m),
     }
 }
 
-/// Whether the log holds any COMMIT record after its latest ACK, own or caught up: a caught-up
-/// frame whose ACK a crash lost is applied to the db too, past the acknowledged offset.
+/// Whether the log holds a commit of the generation after its latest ACK. A stream frame a
+/// catch-up logged is followed by an ACK, or the log's open cut it.
 fn unacked(m: &Materialized) -> Unacked {
-    if m.recovered.commit_after_ack() {
-        Unacked::Commits
-    } else {
+    if m.recovered.pending().is_empty() {
         Unacked::Nothing
+    } else {
+        Unacked::Commits
+    }
+}
+
+/// The manifest of a salvage of the trusted generation `m` for `reason`, decided now against
+/// a stream of token `stream` (design D3).
+pub(crate) fn salvage_manifest(
+    m: &Materialized,
+    reason: Reason,
+    stream: Option<Incarnation>,
+) -> Manifest {
+    let r = &m.recovered;
+    Manifest {
+        reason,
+        state: State::Moving,
+        time: utc_now(),
+        path: r.header.stream_path.clone(),
+        cluster_id: Some(r.header.cluster_id.clone()),
+        lineage: Some(r.header.lineage),
+        incarnation: Some(r.header.incarnation),
+        stream_incarnation: stream,
+        acknowledged: Some(Acknowledged {
+            position: r.acked,
+            offset: r.acked_offset,
+            unacknowledged: u64::try_from(r.pending().len()).unwrap_or(u64::MAX),
+        }),
+        plain: true,
     }
 }
 
@@ -977,6 +1129,8 @@ pub(crate) struct Opening {
     retry: Retry,
     /// The request to send when the timer fires.
     resend: Option<(Request, Attempt)>,
+    /// This open created the stream: a generation it salvages after is `recreated`.
+    created: bool,
 }
 
 /// What an open does next.
@@ -1030,6 +1184,7 @@ impl Opening {
                 phase: Phase::Preparing,
                 retry: Retry::default(),
                 resend: None,
+                created: false,
             }),
             job,
         }
@@ -1118,10 +1273,17 @@ impl Opening {
                 let step = build.next();
                 self.build_step(build, step, cluster_id, head)
             }
-            (
-                Phase::Building { cluster_id, head },
-                DiskDone::Published(Ok((m, highest, attach))),
-            ) => self.takeover(m, cluster_id, &head, highest, attach, None),
+            (Phase::Building { cluster_id, head }, DiskDone::Published(Ok(published))) => {
+                let Published {
+                    m,
+                    highest,
+                    attach,
+                    head: read,
+                } = published;
+                // A build that started over after a history change takes over with its token.
+                let head = read.unwrap_or(head);
+                self.takeover(m, cluster_id, &head, highest, attach, None)
+            }
             (
                 _,
                 DiskDone::Prepared(Err(e)) | DiskDone::Built(Err(e)) | DiskDone::Published(Err(e)),
@@ -1261,6 +1423,7 @@ impl Opening {
         match &answer.typed {
             Ok(Typed::Created { .. }) => {
                 self.retry.succeeded();
+                self.created = true;
                 self.phase = Phase::Head;
                 OpenStep::Send {
                     opening: self,
@@ -1294,18 +1457,36 @@ impl Opening {
         let Some(prepared) = &mut self.prepared else {
             return OpenStep::Fail(OpenError::Panicked);
         };
-        let local = prepared.local.take().map(|m| (summary(&m), m));
+        let found = std::mem::replace(&mut prepared.found, Found::None);
+        let (local, replaced) = match found {
+            Found::None => (Local::None, None),
+            Found::Replaced(replaced) => (Local::Replaced, Some(replaced)),
+            Found::Trusted(m) => (Local::Trusted(summary(&m), m), None),
+        };
         let seen = HeadSeen {
             identity: identity.as_ref(),
             stream: stream.as_ref(),
             content_type: answer.content_type.as_deref(),
         };
-        match table::decide(local, seen) {
+        let asked = Asked {
+            recreate: self.spec.recreate,
+            created: self.created,
+        };
+        // What the open found stays for a later HEAD unless a row takes it.
+        let keep = |prepared: &mut Prepared, local: Option<Box<Materialized>>| {
+            prepared.found = match (local, replaced.clone()) {
+                (Some(m), _) => Found::Trusted(m),
+                (None, Some(replaced)) => Found::Replaced(replaced),
+                (None, None) => Found::None,
+            };
+        };
+        match table::decide(local, asked, seen) {
             OpenRow::Refuse { refused, local } => {
-                prepared.local = local;
+                keep(prepared, local);
                 OpenStep::Fail(refused.into())
             }
-            OpenRow::Create => {
+            OpenRow::Create { local } => {
+                keep(prepared, local);
                 self.phase = Phase::Create;
                 OpenStep::Send {
                     opening: self,
@@ -1324,7 +1505,41 @@ impl Opening {
                 cluster_id,
                 head,
             } => self.takeover(local, cluster_id, &head, None, Attach::ReKeyed, Some(from)),
-            OpenRow::Build { cluster_id, head } => {
+            OpenRow::Build {
+                superseded,
+                cluster_id,
+                head,
+            } => {
+                let stream = Some(head.incarnation());
+                let fate = match superseded {
+                    Superseded::Nothing | Superseded::Trash(_) => Fate::Trash,
+                    Superseded::Salvage {
+                        reason,
+                        local: Some(m),
+                    } => Fate::Salvage(salvage_manifest(&m, reason, stream)),
+                    Superseded::Salvage {
+                        reason,
+                        local: None,
+                    } => {
+                        let replaced = replaced.unwrap_or(Replaced {
+                            lineage: None,
+                            cluster_id: None,
+                            plain: false,
+                        });
+                        Fate::Salvage(Manifest {
+                            reason,
+                            state: State::Moving,
+                            time: utc_now(),
+                            path: self.name.as_str().to_owned(),
+                            cluster_id: replaced.cluster_id,
+                            lineage: replaced.lineage,
+                            incarnation: None,
+                            stream_incarnation: stream,
+                            acknowledged: None,
+                            plain: replaced.plain,
+                        })
+                    }
+                };
                 let job = DiskJob::NewBuild(NewBuild {
                     root: Arc::clone(&prepared.root),
                     name: self.name.clone(),
@@ -1334,6 +1549,7 @@ impl Opening {
                     first: Position(1),
                     claim: None,
                     end: head.next_offset(),
+                    fate,
                 });
                 self.phase = Phase::Building { cluster_id, head };
                 OpenStep::Disk { opening: self, job }

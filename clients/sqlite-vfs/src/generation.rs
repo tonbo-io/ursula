@@ -7,6 +7,7 @@
 //!   gen-<id32>/               the current generation: db, db-uwal, db-shm, log/
 //!   gen-<id32>.tmp/           a generation being built
 //!   gen-<id32>.trash/         a superseded generation being deleted
+//!   salvage/<UTC>-<reason>/   generations moved aside, with manifest.json ([`crate::salvage`])
 //! ```
 //!
 //! A generation directory is named by a random id ([`GenId`]), not by its lineage: the lineage is
@@ -23,6 +24,12 @@
 //! generation is published with page 1 written and marked, the page 1 of an empty database when
 //! nothing was applied ([`marker::empty_page_one`]), so no published db file is ever empty or
 //! unmarked.
+//!
+//! The superseded generation's fate ([`Fate`]) is written before the publishing rename: it is
+//! trashed, or salvaged, its manifest written into it first and the directory moved into
+//! `salvage/` after the rename. A crash at any step leaves either the old generation current
+//! (its manifest deleted at the next open) or the new one current and the old one on its way into
+//! `salvage/` (finished at the next open).
 
 use std::fs::File;
 use std::fs::{self};
@@ -34,11 +41,16 @@ use crate::codec::marker;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
 use crate::codec::segment::scan;
+use crate::config::Step as AbortStep;
+use crate::config::abort_at;
 use crate::ids::GenId;
 use crate::ids::Lineage;
 use crate::replog::Log;
 use crate::replog::LogError;
 use crate::replog::sync_dir;
+use crate::salvage;
+use crate::salvage::Manifest;
+use crate::salvage::SalvageError;
 
 /// The lock file in a root.
 const LOCK: &str = "lock";
@@ -207,6 +219,16 @@ pub(crate) enum GenerationError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Salvage(#[from] SalvageError),
+}
+
+/// A generation directory whose log's first segment header cannot be read: no segment, or a
+/// header cut short, not verifying, or of another format. The open salvages it as `replaced`.
+#[derive(Debug)]
+pub(crate) struct Unreadable {
+    pub(crate) dir: PathBuf,
+    pub(crate) error: GenerationError,
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> GenerationError {
@@ -249,8 +271,7 @@ impl Generation {
     }
 
     /// The header of the generation's first log segment.
-    #[cfg(test)]
-    fn first_header(&self) -> Result<SegmentHeader, GenerationError> {
+    pub(crate) fn first_header(&self) -> Result<SegmentHeader, GenerationError> {
         first_header(&self.dir)
     }
 }
@@ -362,8 +383,10 @@ impl Root {
         &self.dir
     }
 
-    /// Finishes what a crash left: deletes every `gen-*.tmp` and every generation another one's
-    /// first segment says it supersedes.
+    /// Finishes what a crash left: deletes every `gen-*.tmp` and `gen-*.trash`, salvages every
+    /// generation another one's first segment says it supersedes that holds a salvage manifest
+    /// and deletes the others, deletes the manifest of a generation nothing supersedes (its
+    /// publish never happened), and completes every salvage still marked `moving`.
     pub(crate) fn finish_leftovers(&self) -> Result<(), GenerationError> {
         let mut removed = false;
         for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
@@ -382,10 +405,10 @@ impl Root {
             sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
         }
         let gens = self.generations()?;
+        let mut superseded = Vec::new();
         if gens.len() > 1 {
             // A generation whose header cannot be read is finished when a readable one says it
             // supersedes it; otherwise its error stands.
-            let mut superseded = Vec::new();
             let mut unreadable = Vec::new();
             for g in &gens {
                 match first_header(&g.path) {
@@ -399,10 +422,19 @@ impl Root {
             {
                 return Err(e);
             }
-            for g in gens.iter().filter(|g| superseded.contains(&g.id)) {
-                self.discard(g)?;
+        }
+        for g in &gens {
+            match (superseded.contains(&g.id), salvage::read_manifest(&g.path)?) {
+                (true, Some(manifest)) => {
+                    let moved = salvage::move_into(&self.dir, &g.path, &manifest)?;
+                    salvage::complete(&moved, manifest)?;
+                }
+                (true, None) => self.discard(g)?,
+                (false, Some(_)) => salvage::unmark(&g.path)?,
+                (false, None) => {}
             }
         }
+        salvage::finish(&self.dir)?;
         Ok(())
     }
 
@@ -417,8 +449,27 @@ impl Root {
     }
 
     /// The current generation, if any. Two left after [`Root::finish_leftovers`] are an error.
+    #[cfg(test)]
     pub(crate) fn current(&self) -> Result<Option<Generation>, GenerationError> {
         self.current_dir()?.map(Dir::generation).transpose()
+    }
+
+    /// The current generation, if any, or its directory when its log's first segment header
+    /// cannot be read. Two left after [`Root::finish_leftovers`] are an error.
+    pub(crate) fn current_or_unreadable(
+        &self,
+    ) -> Result<Option<Result<Generation, Unreadable>>, GenerationError> {
+        let Some(dir) = self.current_dir()? else {
+            return Ok(None);
+        };
+        let path = dir.path.clone();
+        match dir.generation() {
+            Ok(g) => Ok(Some(Ok(g))),
+            Err(error @ (GenerationError::Header { .. } | GenerationError::NoSegment { .. })) => {
+                Ok(Some(Err(Unreadable { dir: path, error })))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The current generation directory, if any, its log not read.
@@ -472,16 +523,31 @@ impl Root {
     }
 }
 
+/// What becomes of the generation a publish supersedes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fate {
+    /// Renamed to `gen-<id32>.trash` and deleted.
+    Trash,
+    /// Moved into `salvage/` with this manifest (design §6.2, D3).
+    Salvage(Manifest),
+}
+
 /// A step of [`Building::publish`].
 #[derive(Debug, Clone, Copy)]
 enum Step {
     FsyncDb,
     FsyncLog,
     FsyncDir,
+    /// The superseded generation's manifest written (`state: "moving"`) and fsynced into it.
+    MarkSalvage,
     Rename,
     FsyncRoot,
     TrashSuperseded,
     RemoveTrash,
+    /// The superseded generation moved into `salvage/`.
+    MoveSalvage,
+    /// Its magic restored and its manifest `complete`.
+    CompleteSalvage,
 }
 
 /// A generation being built.
@@ -499,36 +565,46 @@ pub(crate) struct Building {
 
 impl Building {
     /// Publishes the generation: writes the page 1 of an empty database into a db file nothing was
-    /// applied to (design D7), fsyncs the db, the log and the directory, renames it into place,
-    /// fsyncs the root, deletes the generation it supersedes and fsyncs the root again.
-    pub(crate) fn publish(self) -> Result<Generation, GenerationError> {
-        self.publish_steps(usize::MAX)
+    /// applied to (design D7), fsyncs the db, the log and the directory, writes the salvage
+    /// manifest into the generation it supersedes when `fate` salvages it, renames the new one into
+    /// place, fsyncs the root, then deletes the superseded one or moves it into `salvage/`.
+    pub(crate) fn publish(self, fate: Fate) -> Result<Generation, GenerationError> {
+        self.publish_steps(fate, usize::MAX)
             .map(|(generation, _)| generation)
     }
 
     /// Runs the first `steps` steps of [`Building::publish`] (all of them for `usize::MAX`), as a
     /// crash after them would leave the files. Returns the generation and how many steps ran.
-    fn publish_steps(mut self, steps: usize) -> Result<(Generation, usize), GenerationError> {
+    fn publish_steps(
+        mut self,
+        fate: Fate,
+        steps: usize,
+    ) -> Result<(Generation, usize), GenerationError> {
         let generation = Generation {
             dir: self.target.clone(),
             id: self.id,
             lineage: self.lineage,
         };
-        let mut plan = vec![
-            Step::FsyncDb,
-            Step::FsyncLog,
-            Step::FsyncDir,
-            Step::Rename,
-            Step::FsyncRoot,
-        ];
-        if self.supersedes.is_some() {
-            plan.extend([
+        let salvaging = match (&self.supersedes, fate) {
+            (Some(_), Fate::Salvage(manifest)) => Some(manifest),
+            (None, _) | (Some(_), Fate::Trash) => None,
+        };
+        let mut plan = vec![Step::FsyncDb, Step::FsyncLog, Step::FsyncDir];
+        if salvaging.is_some() {
+            plan.push(Step::MarkSalvage);
+        }
+        plan.extend([Step::Rename, Step::FsyncRoot]);
+        match (&self.supersedes, &salvaging) {
+            (None, _) => {}
+            (Some(_), Some(_)) => plan.extend([Step::MoveSalvage, Step::CompleteSalvage]),
+            (Some(_), None) => plan.extend([
                 Step::TrashSuperseded,
                 Step::FsyncRoot,
                 Step::RemoveTrash,
                 Step::FsyncRoot,
-            ]);
+            ]),
         }
+        let mut salvaged = None;
         for (ran, step) in plan.iter().enumerate() {
             if ran == steps {
                 return Ok((generation, ran));
@@ -547,10 +623,32 @@ impl Building {
                 }
                 Step::FsyncLog => self.log.sync()?,
                 Step::FsyncDir => sync_dir(&self.tmp).map_err(io("fsync", &self.tmp))?,
+                Step::MarkSalvage => {
+                    if let (Some(old), Some(manifest)) = (&self.supersedes, &salvaging) {
+                        salvage::write_manifest(&old.path, manifest)?;
+                        abort_at(AbortStep::SalvageMarked);
+                    }
+                }
                 Step::Rename => {
                     fs::rename(&self.tmp, &self.target).map_err(io("rename", &self.tmp))?;
                 }
-                Step::FsyncRoot => sync_dir(&self.root).map_err(io("fsync", &self.root))?,
+                Step::FsyncRoot => {
+                    sync_dir(&self.root).map_err(io("fsync", &self.root))?;
+                    if matches!(plan.get(ran.wrapping_sub(1)), Some(Step::Rename)) {
+                        abort_at(AbortStep::PublishRenamed);
+                    }
+                }
+                Step::MoveSalvage => {
+                    if let (Some(old), Some(manifest)) = (&self.supersedes, &salvaging) {
+                        salvaged = Some(salvage::move_into(&self.root, &old.path, manifest)?);
+                        abort_at(AbortStep::SalvageMoved);
+                    }
+                }
+                Step::CompleteSalvage => {
+                    if let (Some(dir), Some(manifest)) = (&salvaged, &salvaging) {
+                        salvage::complete(dir, manifest.clone())?;
+                    }
+                }
                 Step::TrashSuperseded => {
                     if let Some(old) = &self.supersedes {
                         let trash = self.trash(old);
@@ -570,8 +668,8 @@ impl Building {
 
     /// Test hook: publish as far as `steps` steps, as a crash after them leaves the files.
     #[cfg(test)]
-    pub(crate) fn crash_after(self, steps: usize) -> Result<usize, GenerationError> {
-        self.publish_steps(steps).map(|(_, done)| done)
+    pub(crate) fn crash_after(self, fate: Fate, steps: usize) -> Result<usize, GenerationError> {
+        self.publish_steps(fate, steps).map(|(_, done)| done)
     }
 
     fn trash(&self, old: &Dir) -> PathBuf {

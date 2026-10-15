@@ -28,11 +28,12 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 
 ## open
 
-`open(url, { dir, token, signal, maxPendingBytes, ...sqlite })` returns a promise of an `UrsulaDatabase`, a `node:sqlite` `DatabaseSync` subclass, so drizzle, kysely and Pi's driver take it. The rest of the options go to `DatabaseSync`.
+`open(url, { dir, token, signal, maxPendingBytes, recreate, ...sqlite })` returns a promise of an `UrsulaDatabase`, a `node:sqlite` `DatabaseSync` subclass, so drizzle, kysely and Pi's driver take it. The rest of the options go to `DatabaseSync`.
 
 - The first open of a stream in the process binds its cache in `dir` (by default `<user cache>/sqlite-ursula/0.8`), catches it up and claims the stream: the last open that reaches the stream owns it. Later opens in the process return another connection on the same binding, with no network. Concurrent opens share one. Worker threads call `open` too.
 - The open gives up when `signal` fires, after 30 s without one.
 - Several connections share one binding and its files, so node:sqlite's busy `timeout` defaults to 5000 ms. Pass `timeout` to change it.
+- A local cache the open cannot keep is moved aside, never deleted: after a history change of the stream that may have lost what the cache holds (a restore), when its db file is not its own, or with `recreate: true` when the stream is missing. It goes into `salvage/` in the stream's cache directory as a plain SQLite database with a `manifest.json`, `status().salvage` lists it, and the open builds a new cache from the stream. Without `recreate`, a missing stream over a cache that holds data fails with `not_found`.
 - `db.close()` is synchronous. Once a binding's last connection closes, replication drains in the background and the binding retires. Open it again with `open()`.
 
 `UrsulaDatabase` adds `name` (the stream's path, such as `/acme/notes`), `synced({ signal })`, `status()` and `on("reset", listener)` / `off("reset", listener)`.
