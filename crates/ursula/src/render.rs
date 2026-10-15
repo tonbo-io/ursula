@@ -346,14 +346,17 @@ pub(crate) fn insert_producer_answer(headers: &mut HeaderMap, answer: &ProducerA
     answer.render(|name, value| insert_header_str(headers, name, value));
 }
 
-pub(crate) fn insert_producer_error_headers(headers: &mut HeaderMap, err: &RuntimeError) {
-    match producer_refusal_answer(err.stream_error_context()) {
-        Some(Ok(answer)) => insert_producer_answer(headers, &answer),
-        Some(Err(render_err)) => {
-            tracing::error!(error = %render_err, refusal = %err, "a producer refusal is outside the protocol's range");
-        }
-        None => {}
+/// Adds the producer answer of a refused producer write. `Err` when the
+/// refusal holds a value outside the protocol's range: the caller answers
+/// `500`, as [`producer_answer_failed`] does.
+pub(crate) fn insert_producer_error_headers(
+    headers: &mut HeaderMap,
+    err: &RuntimeError,
+) -> Result<(), HeaderError> {
+    if let Some(answer) = producer_refusal_answer(err.stream_error_context()) {
+        insert_producer_answer(headers, &answer?);
     }
+    Ok(())
 }
 
 pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &RuntimeError) {

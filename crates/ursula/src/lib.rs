@@ -1460,18 +1460,16 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
 }
 
 pub(crate) fn append_http_response(response: AppendResponse) -> Response {
+    if let Some(ack) = response.producer.as_ref() {
+        return producer_answer_response(
+            producer_ack_answer(ack, response.incarnation),
+            response.incarnation,
+            AnswerTo::Append,
+        );
+    }
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_incarnation(&mut headers, response.incarnation);
-    if let Some(ack) = response.producer.as_ref() {
-        let answer = match producer_ack_answer(ack, response.incarnation) {
-            Ok(answer) => answer,
-            Err(err) => return producer_answer_failed(&err),
-        };
-        let status = StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::NO_CONTENT);
-        insert_producer_answer(&mut headers, &answer);
-        return (status, headers).into_response();
-    }
     insert_offset(&mut headers, response.next_offset);
     if response.closed {
         insert_static(&mut headers, names::STREAM_CLOSED, "true");
@@ -1479,22 +1477,56 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     (StatusCode::NO_CONTENT, headers).into_response()
 }
 
-/// The answer to a close: `204`, with the producer write's receipt when the
-/// close carried producer headers. A close-only write answers `204` whether
-/// it applied now or before, as the base protocol requires.
+/// The answer to a close-only write: `204` with the stream's tail and
+/// `Stream-Closed`, or, for a producer close, the producer answer alone.
 pub(crate) fn close_http_response(response: &CloseStreamResponse) -> Response {
+    if let Some(ack) = response.producer.as_ref() {
+        return producer_answer_response(
+            producer_ack_answer(ack, response.incarnation),
+            response.incarnation,
+            AnswerTo::CloseOnly,
+        );
+    }
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, response.next_offset);
     insert_incarnation(&mut headers, response.incarnation);
-    if let Some(ack) = response.producer.as_ref() {
-        match producer_ack_answer(ack, response.incarnation) {
-            Ok(answer) => insert_producer_answer(&mut headers, &answer),
-            Err(err) => return producer_answer_failed(&err),
-        }
-    }
     insert_static(&mut headers, names::STREAM_CLOSED, "true");
     (StatusCode::NO_CONTENT, headers).into_response()
+}
+
+/// What a producer answer responds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerTo {
+    /// A write with a body, or one whose body was not read.
+    Append,
+    /// An empty write with `Stream-Closed: true`. The base protocol answers
+    /// it `204` even when it applied now.
+    CloseOnly,
+}
+
+/// The one renderer of a producer answer, for the early and the late path:
+/// the answer's own headers (`Stream-Closed` only on a receipt of a write
+/// that closed the stream) and `Stream-Incarnation`, nothing else. A value
+/// outside the protocol's range answers `500`.
+fn producer_answer_response(
+    answer: Result<ProducerAnswer, ProducerHeaderError>,
+    incarnation: u64,
+    to: AnswerTo,
+) -> Response {
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => return producer_answer_failed(&err),
+    };
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_incarnation(&mut headers, incarnation);
+    insert_producer_answer(&mut headers, &answer);
+    let status = match (to, &answer) {
+        (AnswerTo::CloseOnly, ProducerAnswer::Receipt { .. }) => StatusCode::NO_CONTENT,
+        _ => StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::NO_CONTENT),
+    };
+    (status, headers).into_response()
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
@@ -2804,7 +2836,9 @@ pub(crate) async fn append_stream(
     body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    if let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await {
+    if early_answer_may_help(&headers, version, &body)
+        && let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await
+    {
         return answer_before_body(answer, version, &headers, body).await;
     }
     let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
@@ -2853,16 +2887,54 @@ async fn producer_early_answer(
             Epoch::try_from(epoch).map(|epoch| ProducerAnswer::KeyConflict { epoch })
         }
     };
-    let answer = match answer {
-        Ok(answer) => answer,
-        Err(err) => return Some(producer_answer_failed(&err)),
-    };
-    let mut response_headers = HeaderMap::new();
-    insert_default_response_headers(&mut response_headers);
-    insert_incarnation(&mut response_headers, incarnation);
-    insert_producer_answer(&mut response_headers, &answer);
-    let status = StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::NO_CONTENT);
-    Some((status, response_headers).into_response())
+    // A repeat is `204` whether the request is a close or an append, so the
+    // renderer needs no more than this.
+    Some(producer_answer_response(
+        answer,
+        incarnation,
+        AnswerTo::Append,
+    ))
+}
+
+/// The smallest declared body for which an early answer is worth its lookup
+/// on HTTP/1.1 without `Expect: 100-continue`: below it the drain costs about
+/// what the upload does, and the lookup would end the group's append batch
+/// for nothing.
+const EARLY_ANSWER_MIN_BODY_BYTES: u64 = 64 * 1024;
+
+/// Whether to look for an early answer: only when it can save the upload
+/// (HTTP/2, `Expect: 100-continue`, or a declared body of at least
+/// [`EARLY_ANSWER_MIN_BODY_BYTES`]), and only after the header-only checks
+/// the late path runs pass, so an early answer never answers what the late
+/// path refuses with `400`.
+fn early_answer_may_help(headers: &HeaderMap, version: Version, body: &Body) -> bool {
+    let expects_continue = headers
+        .get(axum::http::header::EXPECT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
+    let content_length = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let saves_upload = version >= Version::HTTP_2
+        || expects_continue
+        || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES);
+    if !saves_upload
+        || removed_surface::reject_removed_append_headers(headers).is_err()
+        || incarnation_precondition(headers).is_err()
+        || stream_seq(headers).is_err()
+    {
+        return false;
+    }
+    let empty = content_length == Some(0) || body.is_end_stream();
+    let close_after = stream_closed(headers);
+    // An empty write that does not close is `400 EmptyAppend`, and a body
+    // without a content type is `400` too.
+    if empty {
+        close_after
+    } else {
+        has_content_type(headers)
+    }
 }
 
 /// Sends an answer decided before the body was read (addendum A3 on #581).
@@ -4170,7 +4242,10 @@ fn runtime_error_response(err: RuntimeError) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_retry_after_for_temporary(&mut headers, &err);
-    insert_producer_error_headers(&mut headers, &err);
+    if let Err(render_err) = insert_producer_error_headers(&mut headers, &err) {
+        tracing::error!(refusal = %err, "producer refusal outside the protocol's range");
+        return producer_answer_failed(&render_err);
+    }
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
     (status, headers, err.to_string()).into_response()

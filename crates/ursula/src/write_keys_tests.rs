@@ -85,6 +85,10 @@ struct Write<'a> {
     digest: bool,
     incarnation: Option<&'a str>,
     version: Version,
+    /// Sends `Stream-Closed: true`.
+    closes: bool,
+    /// Declares the body's length in `Content-Length`.
+    declared: bool,
 }
 
 impl<'a> Write<'a> {
@@ -96,6 +100,8 @@ impl<'a> Write<'a> {
             digest: false,
             incarnation: None,
             version: Version::HTTP_11,
+            closes: false,
+            declared: false,
         }
     }
 
@@ -116,6 +122,20 @@ impl<'a> Write<'a> {
     fn http2(self) -> Self {
         Self {
             version: Version::HTTP_2,
+            ..self
+        }
+    }
+
+    fn closing(self) -> Self {
+        Self {
+            closes: true,
+            ..self
+        }
+    }
+
+    fn declared(self) -> Self {
+        Self {
+            declared: true,
             ..self
         }
     }
@@ -141,7 +161,18 @@ async fn send(app: &Router, write: &Write<'_>) -> (Response, bool) {
     if let Some(incarnation) = write.incarnation {
         request = request.header("stream-incarnation", incarnation);
     }
-    let body = watched(write.body, &polled);
+    if write.closes {
+        request = request.header("stream-closed", "true");
+    }
+    if write.declared {
+        request = request.header("content-length", write.body.len().to_string());
+    }
+    let body = if write.body.is_empty() {
+        polled.store(true, Ordering::SeqCst);
+        Body::empty()
+    } else {
+        watched(write.body, &polled)
+    };
     let response = app
         .clone()
         .oneshot(request.body(body).expect("request"))
@@ -454,9 +485,10 @@ async fn a_tokened_repeat_or_key_conflict_is_answered_before_the_body() {
         epoch: Epoch::ZERO
     });
 
-    // On HTTP/1.1 the unread body is drained, and the connection stays.
+    // On HTTP/1.1 without `Expect`, a small body is read and decided at
+    // apply: the lookup would save nothing.
     let (repeat, polled) = send(&app, &Write::new(0, 0, "abc").digest().tokened(&token)).await;
-    assert!(polled, "an HTTP/1.1 body is drained");
+    assert!(polled, "a small HTTP/1.1 body is read");
     assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
     assert!(!repeat.headers().contains_key("connection"));
 
@@ -473,4 +505,58 @@ async fn a_tokened_repeat_or_key_conflict_is_answered_before_the_body() {
     assert!(polled, "a write under another token is read");
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
     assert_eq!(tail(&app).await, after);
+}
+
+/// The early and the late path render one answer for the same request, and
+/// the early path answers nothing that the late path refuses with `400`
+/// (#581 section 2.5).
+#[tokio::test]
+async fn early_and_late_answers_agree() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let app = app(&now_ms);
+    let token = create(&app).await;
+    let big = "x".repeat(70_000);
+    let (first, _) = send(&app, &Write::new(0, 0, &big).tokened(&token)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let (first, _) = send(&app, &Write::new(0, 1, "y").tokened(&token)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // A repeat of the newest write, and of an older one, early (HTTP/2) and
+    // late (a small HTTP/1.1 body): the same headers.
+    for (seq, body) in [(1, "y"), (0, big.as_str())] {
+        let (early, early_polled) =
+            send(&app, &Write::new(0, seq, body).tokened(&token).http2()).await;
+        let (late, late_polled) = send(&app, &Write::new(0, seq, "z").tokened(&token)).await;
+        assert!(!early_polled && late_polled, "{seq}");
+        assert_eq!(early.status(), late.status(), "{seq}");
+        assert_eq!(early.headers(), late.headers(), "{seq}");
+        answer(&early);
+    }
+    // A declared body of at least 64 KiB over HTTP/1.1 takes the early path
+    // and is drained, keeping the connection.
+    let (repeat, _) = send(&app, &Write::new(0, 0, &big).tokened(&token).declared()).await;
+    assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
+    assert!(!repeat.headers().contains_key("connection"));
+
+    // A close-only repeat of a key whose write was an append: the receipt,
+    // and no `Stream-Closed` on the open stream, on both paths.
+    for write in [
+        Write::new(0, 1, "").tokened(&token).closing().http2(),
+        Write::new(0, 1, "").tokened(&token).closing(),
+    ] {
+        let (repeat, _) = send(&app, &write).await;
+        assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
+        assert!(!repeat.headers().contains_key("stream-closed"));
+        assert!(matches!(answer(&repeat), ProducerAnswer::Receipt { .. }));
+    }
+
+    // An empty write that does not close is `400` on both paths, never an
+    // early `204`.
+    for write in [
+        Write::new(0, 1, "").tokened(&token).http2(),
+        Write::new(0, 1, "").tokened(&token),
+    ] {
+        let (refused, _) = send(&app, &write).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
 }

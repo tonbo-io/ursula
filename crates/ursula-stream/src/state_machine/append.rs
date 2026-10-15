@@ -93,7 +93,10 @@ impl StreamStateMachine {
             };
 
             if stream.status == StreamStatus::Closed {
-                if close_after && payload.is_empty() {
+                // An unkeyed close of a closed stream is idempotent. A keyed
+                // one that would apply gets `409` like any other write: its
+                // repeat was answered by the gate above (#581 addendum 3).
+                if close_after && payload.is_empty() && gate.is_none() {
                     break 'append StreamResponse::Closed {
                         next_offset: stream.tail_offset,
                         producer: None,

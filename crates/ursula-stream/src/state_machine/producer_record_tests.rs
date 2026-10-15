@@ -624,6 +624,33 @@ fn a_producer_close_is_keyed_like_an_append() {
     assert_eq!(receipt.start_offset, receipt.next_offset);
     let repeat = ack(close(&mut machine));
     assert_eq!(repeat.delivery, ProducerDelivery::Repeat(receipt));
+    // A keyed close that would apply to the closed stream is `409`, a claim
+    // included, and the record does not move. Only the unkeyed close is
+    // idempotent.
+    for write in [
+        Write::new("p", 0, 2),
+        Write::new("q", 0, 0),
+        Write::new("p", 1, 0),
+    ] {
+        let (code, _) = refused(machine.apply(StreamCommand::Close {
+            stream_id: stream_id.clone(),
+            stream_seq: None,
+            producer: Some(write.producer()),
+            now_ms: 1,
+        }));
+        assert_eq!(code, StreamErrorCode::StreamClosed, "{write:?}");
+    }
+    assert_eq!(record(&machine, &stream_id, "p").unwrap().last_seq, 1);
+    assert!(record(&machine, &stream_id, "q").is_none());
+    assert!(matches!(
+        machine.apply(StreamCommand::Close {
+            stream_id: stream_id.clone(),
+            stream_seq: None,
+            producer: None,
+            now_ms: 1,
+        }),
+        StreamResponse::Closed { producer: None, .. }
+    ));
 }
 
 #[test]
@@ -1349,8 +1376,36 @@ proptest! {
                         .map_or(retired.epoch, |forgotten| forgotten.max(retired.epoch)),
                 );
             }
+            // The early answer, read before the write applies, must be what
+            // apply answers whenever it gives one (#581 section 2.5).
+            let early = machine.producer_early_answer(
+                &stream_id,
+                &write.producer(),
+                machine.stream_incarnation(&stream_id).unwrap(),
+                write.now_ms,
+            );
             let tail_before = tail(&machine, &stream_id);
             let response = send(&mut machine, &stream_id, write);
+            match early {
+                None => {}
+                Some(ProducerEarlyAnswer::Repeat(early)) => {
+                    let at_apply = match &response {
+                        StreamResponse::Appended { producer, .. }
+                        | StreamResponse::Closed { producer, .. } => *producer,
+                        _ => None,
+                    };
+                    prop_assert_eq!(at_apply, Some(early), "early repeat differs from apply");
+                }
+                Some(ProducerEarlyAnswer::KeyConflict { epoch }) => {
+                    let conflict = matches!(
+                        &response,
+                        StreamResponse::Error { context, .. }
+                            if context.as_slice()
+                                == [StreamErrorContext::Producer(ProducerRefusal::KeyConflict { epoch })]
+                    );
+                    prop_assert!(conflict, "early key conflict differs from apply: {:?}", response);
+                }
+            }
             let tail_after = tail(&machine, &stream_id);
             check_answer(
                 &mut ledger,
