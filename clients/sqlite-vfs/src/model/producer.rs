@@ -32,6 +32,10 @@ pub(crate) struct ProducerRecord {
     pub(crate) newest_digest: Option<BodyDigest>,
     /// The group's history id when the claim of the current epoch applied (G2).
     pub(crate) history: u64,
+    /// Whether the record was opened at or below the stream's floor, which only an untokened claim
+    /// can do, and no claim above the floor has applied since: tokened writes on such a record are
+    /// refused (the floor decision on #592).
+    pub(crate) below_floor: bool,
     pub(crate) last_seen_ms: u64,
 }
 
@@ -45,6 +49,7 @@ impl ProducerRecord {
     pub(crate) fn claimed(
         write: &ProducerWrite,
         closes: Option<ClosedEpoch>,
+        below_floor: bool,
         receipt: Receipt,
         group_history: u64,
         now_ms: u64,
@@ -61,6 +66,7 @@ impl ProducerRecord {
             newest: receipt,
             newest_digest: write.digest,
             history: group_history,
+            below_floor,
             last_seen_ms: now_ms,
         }
     }
@@ -87,8 +93,13 @@ impl ProducerRecord {
 /// What a row decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
-    /// Rows 2, 6 and 12: the write applies. `closes` is the epoch a claim closes (row 6).
-    Apply { closes: Option<ClosedEpoch> },
+    /// Rows 2, 6 and 12: the write applies. `closes` is the epoch a claim closes (row 6), and
+    /// `below_floor` whether a claim's epoch is at or below the floor, for its record's marker
+    /// (always false for row 12).
+    Apply {
+        closes: Option<ClosedEpoch>,
+        below_floor: bool,
+    },
     /// Every other row: this answer, and no state change.
     Answer(ProducerAnswer),
 }
@@ -108,37 +119,52 @@ impl Evaluation {
         }
     }
 
-    fn apply(row: u8, closes: Option<ClosedEpoch>) -> Self {
+    fn apply(row: u8, closes: Option<ClosedEpoch>, below_floor: bool) -> Self {
         Self {
             row,
-            decision: Decision::Apply { closes },
+            decision: Decision::Apply {
+                closes,
+                below_floor,
+            },
         }
     }
 }
 
 /// Evaluates producer write `write` (`(P, E, N)` with digest `d`) against P's record after idle
-/// retirement, the stream's epoch floor `watermark` and the group's history id. `incarnation` is
-/// the stream's token, which receipts carry. Rows match in order.
+/// retirement, the stream's epoch floor `watermark` and the group's history id. `tokened` is
+/// whether the write carries the stream's token, and `incarnation` is that token, which receipts
+/// carry. Rows match in order.
 ///
-/// Addendum 3 to #581 settles three rows. Row 1, the floor, binds every write of an epoch the
-/// record does not hold, tokened or not, with or without a record: no record is ever created or
-/// moved to an epoch at or below the floor. Row 5 answers `stale-epoch`. `producer-expired` means
-/// the floor only.
+/// The floor decision on #592 (superseding addendum 3 item 2) scopes row 1 to tokened writes. A
+/// tokened write is refused `producer-expired` when it has no record and its epoch is at or below
+/// the floor, or when its record was claimed at or below the floor, unless it claims above the
+/// floor. An untokened writer keeps the base protocol's rule that a forgotten producer is new, so
+/// its claim may open a record at or below the floor, marked as such. A record opened above the
+/// floor stays so: its claims of later epochs are not checked against the floor (row 6 or 7). A
+/// marked record is cleared only by a claim above the floor, tokened or not.
 pub(crate) fn evaluate(
     record: Option<&ProducerRecord>,
     watermark: Option<Epoch>,
     write: &ProducerWrite,
+    tokened: bool,
     group_history: u64,
     incarnation: Incarnation,
 ) -> Evaluation {
     let (e, n, d) = (write.epoch, write.seq, write.digest);
-    let opens = record.is_none_or(|r| e > r.epoch.epoch());
-    if let Some(w) = watermark.filter(|w| opens && e <= *w) {
+    let at_or_below_floor = watermark.is_some_and(|w| e <= w);
+    let expired = match record {
+        None => at_or_below_floor,
+        Some(r) => {
+            let claims_above_floor = n == Seq::ZERO && e > r.epoch.epoch() && !at_or_below_floor;
+            r.below_floor && !claims_above_floor
+        }
+    };
+    if let Some(w) = watermark.filter(|_| tokened && expired) {
         return Evaluation::answer(1, ProducerAnswer::ProducerExpired { epoch: w });
     }
     let Some(r) = record else {
         if n == Seq::ZERO {
-            return Evaluation::apply(2, None);
+            return Evaluation::apply(2, None, at_or_below_floor);
         }
         return Evaluation::answer(3, ProducerAnswer::SeqGap {
             expected: Seq::ZERO,
@@ -162,6 +188,7 @@ pub(crate) fn evaluate(
                     epoch: current,
                     seq: r.last,
                 }),
+                r.below_floor && at_or_below_floor,
             );
         }
         return Evaluation::answer(7, ProducerAnswer::EpochNotClaimed);
@@ -198,7 +225,7 @@ pub(crate) fn evaluate(
         .checked_add(1)
         .and_then(|next| Seq::try_from(next).ok());
     if Some(n) == next {
-        return Evaluation::apply(12, None);
+        return Evaluation::apply(12, None, false);
     }
     Evaluation::answer(13, ProducerAnswer::SeqGap {
         expected: next.unwrap_or(Seq::MAX),
@@ -273,16 +300,34 @@ mod tests {
             newest: receipt(100, 120),
             newest_digest: if last == 0 { digest(1) } else { digest(9) },
             history: HISTORY,
+            below_floor: false,
             last_seen_ms: 0,
         }
     }
 
+    /// A tokened write's evaluation.
     fn eval(
         record: Option<&ProducerRecord>,
         watermark: Option<u64>,
         write: &ProducerWrite,
     ) -> Evaluation {
-        evaluate(record, watermark.map(epoch), write, HISTORY, token())
+        evaluate(record, watermark.map(epoch), write, true, HISTORY, token())
+    }
+
+    /// An untokened write's evaluation.
+    fn eval_untokened(
+        record: Option<&ProducerRecord>,
+        watermark: Option<u64>,
+        write: &ProducerWrite,
+    ) -> Evaluation {
+        evaluate(record, watermark.map(epoch), write, false, HISTORY, token())
+    }
+
+    fn applied(closes: Option<ClosedEpoch>, below_floor: bool) -> Decision {
+        Decision::Apply {
+            closes,
+            below_floor,
+        }
     }
 
     fn answered(evaluation: &Evaluation) -> &ProducerAnswer {
@@ -293,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn row_1_the_floor_refuses_every_write_of_an_epoch_at_or_below_it() {
+    fn floor_decision_row_1_refuses_a_tokened_write_without_a_record_at_or_below_the_floor() {
         for n in [0, 3] {
             for e in [2, 3] {
                 let evaluation = eval(None, Some(3), &write(e, n, digest(1)));
@@ -304,32 +349,104 @@ mod tests {
             }
         }
         // Above the floor, a claim opens an epoch the stream never forgot (row 2).
-        assert_eq!(eval(None, Some(3), &write(4, 0, digest(1))).row, 2);
+        let evaluation = eval(None, Some(3), &write(4, 0, digest(1)));
+        assert_eq!(evaluation.row, 2);
+        assert_eq!(evaluation.decision, applied(None, false));
     }
 
     #[test]
-    fn row_1_binds_untokened_claims_too() {
-        // Addendum 3 item 3: with or without the token, no record is created at or below the
-        // floor. `evaluate` takes no tokened flag: both reach it alike.
-        let evaluation = eval(None, Some(3), &write(3, 0, None));
-        assert_eq!(evaluation.row, 1);
-        assert_eq!(answered(&evaluation), &ProducerAnswer::ProducerExpired {
-            epoch: epoch(3)
-        });
+    fn floor_decision_an_untokened_writer_without_a_record_is_a_new_producer() {
+        // The base protocol's rule: a forgotten producer is new. Its claim opens a record marked
+        // as claimed at or below the floor (row 2), and its seq gets the base gap (row 3).
+        let evaluation = eval_untokened(None, Some(3), &write(3, 0, None));
+        assert_eq!(evaluation.row, 2);
+        assert_eq!(evaluation.decision, applied(None, true));
+        assert_eq!(eval_untokened(None, Some(3), &write(2, 4, None)).row, 3);
+        let above = eval_untokened(None, Some(3), &write(4, 0, None));
+        assert_eq!(above.decision, applied(None, false));
     }
 
     #[test]
-    fn row_1_binds_a_record_moving_to_a_later_epoch() {
-        // The floor is per stream: another producer's retirement raised it above this record's
-        // epoch 5. A claim of 6 or 7 would move the record to a forgotten epoch.
-        for e in [6, 7] {
-            let evaluation = eval(Some(&record(2)), Some(7), &write(e, 0, digest(3)));
-            assert_eq!(evaluation.row, 1, "epoch {e}");
+    fn floor_decision_a_tokened_write_on_a_record_claimed_below_the_floor_is_expired() {
+        let mut below = record(2);
+        below.below_floor = true;
+        // Repeats, the next seq, a later seq and a claim at or below the floor are all refused.
+        for w in [
+            write(5, 2, digest(9)),
+            write(5, 3, None),
+            write(6, 1, None),
+            write(6, 0, digest(3)),
+            write(7, 0, digest(3)),
+        ] {
+            let evaluation = eval(Some(&below), Some(7), &w);
+            assert_eq!(evaluation.row, 1, "{w:?}");
+            assert_eq!(answered(&evaluation), &ProducerAnswer::ProducerExpired {
+                epoch: epoch(7)
+            });
         }
+        // A claim above the floor applies and clears the marker (row 6).
+        let evaluation = eval(Some(&below), Some(7), &write(8, 0, digest(3)));
+        assert_eq!(evaluation.row, 6);
         assert_eq!(
-            eval(Some(&record(2)), Some(7), &write(8, 0, digest(3))).row,
-            6
+            evaluation.decision,
+            applied(
+                Some(ClosedEpoch {
+                    epoch: epoch(5),
+                    seq: seq(2),
+                }),
+                false
+            )
         );
+        // An untokened claim keeps the marker at or below the floor and clears it above.
+        for (e, below_floor) in [(6, true), (7, true), (8, false)] {
+            let evaluation = eval_untokened(Some(&below), Some(7), &write(e, 0, digest(3)));
+            assert_eq!(evaluation.row, 6, "epoch {e}");
+            assert_eq!(
+                evaluation.decision,
+                applied(
+                    Some(ClosedEpoch {
+                        epoch: epoch(5),
+                        seq: seq(2),
+                    }),
+                    below_floor
+                ),
+                "epoch {e}"
+            );
+        }
+        // Untokened, the record is an ordinary one.
+        assert_eq!(
+            eval_untokened(Some(&below), Some(7), &write(5, 3, None)).row,
+            12
+        );
+        assert_eq!(
+            eval_untokened(Some(&below), Some(7), &write(5, 2, digest(9))).row,
+            9
+        );
+    }
+
+    #[test]
+    fn floor_decision_a_live_record_claims_a_later_epoch_without_the_floor_check() {
+        // Another producer's retirement raised the floor to 7, above this record's epoch 5.
+        // Row 6 applies, and the record stays opened above the floor.
+        for (e, below_floor) in [(6, false), (7, false), (8, false)] {
+            let evaluation = eval(Some(&record(2)), Some(7), &write(e, 0, digest(3)));
+            assert_eq!(evaluation.row, 6, "epoch {e}");
+            assert_eq!(
+                evaluation.decision,
+                applied(
+                    Some(ClosedEpoch {
+                        epoch: epoch(5),
+                        seq: seq(2),
+                    }),
+                    below_floor
+                ),
+                "epoch {e}"
+            );
+        }
+        // Row 7 answers 400 Expected-Seq 0 again, below the floor too.
+        let evaluation = eval(Some(&record(2)), Some(7), &write(6, 1, None));
+        assert_eq!(evaluation.row, 7);
+        assert_eq!(answered(&evaluation), &ProducerAnswer::EpochNotClaimed);
         // A write in the record's own epoch, below the floor, still applies or repeats.
         assert_eq!(eval(Some(&record(2)), Some(7), &write(5, 3, None)).row, 12);
         assert_eq!(
@@ -342,7 +459,7 @@ mod tests {
     fn row_2_a_first_claim_applies() {
         let evaluation = eval(None, None, &write(0, 0, None));
         assert_eq!(evaluation.row, 2);
-        assert_eq!(evaluation.decision, Decision::Apply { closes: None });
+        assert_eq!(evaluation.decision, applied(None, false));
     }
 
     #[test]
@@ -388,12 +505,16 @@ mod tests {
     fn row_6_a_later_claim_closes_the_epoch_at_its_last_seq() {
         let evaluation = eval(Some(&record(2)), None, &write(9, 0, digest(3)));
         assert_eq!(evaluation.row, 6);
-        assert_eq!(evaluation.decision, Decision::Apply {
-            closes: Some(ClosedEpoch {
-                epoch: epoch(5),
-                seq: seq(2),
-            }),
-        });
+        assert_eq!(
+            evaluation.decision,
+            applied(
+                Some(ClosedEpoch {
+                    epoch: epoch(5),
+                    seq: seq(2),
+                }),
+                false
+            )
+        );
     }
 
     #[test]
@@ -500,7 +621,7 @@ mod tests {
     fn row_12_the_next_seq_applies() {
         let evaluation = eval(Some(&record(2)), None, &write(5, 3, None));
         assert_eq!(evaluation.row, 12);
-        assert_eq!(evaluation.decision, Decision::Apply { closes: None });
+        assert_eq!(evaluation.decision, applied(None, false));
     }
 
     #[test]

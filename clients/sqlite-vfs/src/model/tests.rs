@@ -339,20 +339,64 @@ fn idle_expiry_raises_the_floor() {
             ..
         }
     ));
-    // Addendum 3 item 3: the floor binds untokened claims too, and claims with no record.
+}
+
+#[test]
+fn floor_decision_the_floor_binds_only_tokened_writes() {
+    // The floor decision on #592: a tokened write never opens an epoch at or below the floor,
+    // and an untokened writer keeps the base rule that a forgotten producer is new.
+    let world = World::new();
+    let token = world.create();
+    world.producer(&write(tokened(token), 5, 0, b"claim"));
     world.server().advance(IDLE_RETIREMENT_MS);
-    assert_eq!(
-        world.producer(&write(None, 2, 0, b"base client")),
-        ProducerAnswer::ProducerExpired { epoch: epoch(5) }
-    );
     assert_eq!(
         world.producer(&write(tokened(token), 3, 0, b"zombie")),
         ProducerAnswer::ProducerExpired { epoch: epoch(5) }
     );
     assert_eq!(
         world.producer(&write(None, 2, 3, b"no record")),
-        ProducerAnswer::ProducerExpired { epoch: epoch(5) }
+        ProducerAnswer::SeqGap {
+            expected: seq(0),
+            received: seq(3),
+        }
     );
+    // The untokened claim opens a record claimed below the floor.
+    assert!(matches!(
+        world.producer(&write(None, 2, 0, b"base client")),
+        ProducerAnswer::Receipt {
+            delivery: Delivery::Applied,
+            ..
+        }
+    ));
+    assert!(matches!(
+        world.producer(&write(None, 2, 1, b"base next")),
+        ProducerAnswer::Receipt {
+            delivery: Delivery::Applied,
+            ..
+        }
+    ));
+    // Tokened writes on that record are expired, its repeat too, until a claim above the floor.
+    for refused in [
+        write(tokened(token), 2, 1, b"base next"),
+        write(tokened(token), 2, 2, b"tokened next"),
+        write(tokened(token), 5, 0, b"at the floor"),
+    ] {
+        assert_eq!(world.producer(&refused), ProducerAnswer::ProducerExpired {
+            epoch: epoch(5)
+        });
+    }
+    for applied in [
+        write(tokened(token), 6, 0, b"above the floor"),
+        write(tokened(token), 6, 1, b"marker cleared"),
+    ] {
+        assert!(matches!(
+            world.producer(&applied),
+            ProducerAnswer::Receipt {
+                delivery: Delivery::Applied,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
