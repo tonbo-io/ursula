@@ -19,6 +19,10 @@ identifies the Raft leader.
   [Upstream Selection](#upstream-selection).
 - Buffers request bodies up to `--max-request-body-bytes`; larger requests
   receive `413 Payload Too Large` before reaching an upstream.
+- Bounds the bodies it buffers across requests with a node-wide budget and
+  headroom for small bodies, bounds each bucket's large uploads under a quota
+  policy, and cuts bodies whose client abandoned them. See [Request Body
+  Budget](#request-body-budget).
 - Reads the body of a request it refuses from the head alone (access control,
   tenant admission) before it answers, so that a client that sends its whole
   body first gets the refusal. See
@@ -192,6 +196,10 @@ to its first upstream failed, and after redirects that were all marked
 | `429` | `TenantRateLimited` | The bucket is over its request rate |
 | `429` | `TenantLiveReadsExhausted` | The bucket uses all of its live-read connections |
 | `413` | `RequestBodyTooLarge` | The body is over `--max-request-body-bytes` or the bucket's limit |
+| `429` | `TenantUploadBytes` | The large body would take the bucket's large bodies under way past its `max_upload_bytes` |
+| `429` | `TenantUploads` | The bucket has `max_concurrent_uploads` large bodies under way |
+| `503` | `UploadBudgetExhausted` | The body budget stayed spent for `--body-budget-wait-ms` |
+| `408` | `RequestBodyTooSlow` | No byte of the body arrived for `--body-stall-timeout`, or less than `--body-min-bytes-per-sec` over one such window |
 | `400` | `RequestBodyUnreadable` | The request body could not be read |
 | `503` | `NoUpstream` | No upstream is configured |
 | `503` | `UpstreamUnreachable` | The connection to the first upstream failed, so the request was never sent. Or the connection to an upstream after redirects failed, and every redirect was marked |
@@ -247,9 +255,11 @@ node that redirected may have proposed the write.
 
 The gateway decides some refusals from the request's head alone, before it
 reads the body: every access-control refusal (`401`, `403`, `404`, and the
-`503` while the token issuer or the authorizer is unavailable) and the tenant
-admission refusals (`429`). From 0.7.4 it reads the body before it sends such
-a refusal, and drops each chunk as it arrives. A client that sends its whole
+`503` while the token issuer or the authorizer is unavailable) and the
+tenant admission refusals (`429`). From 0.7.4 it reads the body before it
+sends such a refusal, and drops each chunk as it arrives. It does the same
+for the refusals of a body it would otherwise forward, described in [Request
+Body Budget](#request-body-budget). A client that sends its whole
 body before it reads the answer, as many HTTP/1.1 clients do, the SQLite
 extension among them, then gets the refusal with its headers.
 
@@ -300,11 +310,140 @@ longer.
 with a body that the gateway handled this way, and `refusal_drains_cut`, those
 whose body it did not read to the end: one over the limit, one that stopped
 arriving for 5 s or was still arriving after 30 s, one that failed, or one
-whose request went away while the gateway read it. Only a gateway with access
-control refuses requests from their head, so only its counters move. Such a
-gateway answers the metrics path `404` unless `--auth-public-metrics` is set,
+whose request went away while the gateway read it, and `refusal_drain_bytes`,
+the bytes of those bodies it read and dropped. They count the refusals
+of [Request Body Budget](#request-body-budget) too, which a gateway without
+access control also sends. A gateway with access
+control answers the metrics path `404` unless `--auth-public-metrics` is set,
 so read the counters with that option (see [Access Control and Logical
 Tenancy](#access-control-and-logical-tenancy)).
+
+## Request Body Budget
+
+The gateway buffers the body of each request it forwards whole, so that it
+can send it again after a leader redirect. `--max-request-body-bytes` bounds
+one body. The body budget bounds the bodies under way across requests, so
+that concurrent large or slow uploads cannot exhaust the gateway's memory.
+
+Before it reads any byte of a body, a request reserves the body's
+`Content-Length` from `--body-budget-bytes`. A body without a declared length
+reserves `--small-body-max-bytes` at first, and its reservation grows as the
+body arrives. The gateway copies each piece of a body into one buffer as it
+arrives and drops the piece, however small the pieces: a declared body gets a
+buffer of its `Content-Length`, and one without a declared length grows its
+buffer within its reservation, briefly holding up to twice its share while
+the buffer reallocates. The reservation shrinks to the buffer's size once the
+gateway has the body whole, and ends when the gateway is done forwarding it,
+when it refuses the request, or when the client goes away. A request without a body reserves
+nothing.
+
+- `--small-body-headroom-bytes` of the budget only bodies of at most
+  `--small-body-max-bytes` may take, so that small writes, such as SQLite
+  commits, never queue behind large uploads. A small body takes the rest of
+  the budget first and the headroom only when the rest is spent. A body
+  without a declared length counts as small until it grows past the
+  threshold, and then leaves the headroom.
+- A request that finds the budget spent waits for it for
+  `--body-budget-wait-ms`, and then gets `503` with `Retry-After: 1`.
+- With `--body-budget-bytes` unset, the budget is 256 MiB or
+  `--max-request-body-bytes` plus `--small-body-headroom-bytes`, whichever is
+  larger, so raising the limit alone grows the budget, with a warning. A
+  budget set explicitly must hold a body at the limit beside the headroom, and
+  `--small-body-max-bytes` must fit the headroom. The gateway exits at startup
+  otherwise.
+- Give the gateway at least twice its budget in memory. The gateway warns at
+  startup when the budget exceeds half of its cgroup memory limit, which it
+  looks up along its own cgroup path. Since the budget cannot go below the
+  limit plus the headroom, the remedy is a lower `--max-request-body-bytes`,
+  with the budget lowered to match, or more memory.
+- Once grown, the budget holds exactly one body at the limit beside the
+  headroom. Requests wait for the budget in order, so a request near the limit
+  that waits for the whole budget takes every share released meanwhile, for up
+  to `--body-budget-wait-ms`, and large bodies behind it can get `503` too.
+
+A body declared over its bucket's own limit (`max_request_body_bytes` in the
+quota policy) gets its `413` before it reserves anything. A body declared
+over `--max-request-body-bytes` gets it at once, with the body unread, and
+the connection closes.
+
+### Bucket Upload Limits
+
+With access control and a quota policy (`--quota-policy`), a bucket may also
+bound its large bodies, those over `--small-body-max-bytes`, while the
+gateway reads them:
+
+```toml
+[default]
+max_concurrent_uploads = 8
+max_upload_bytes = 67108864
+
+[[bucket]]
+id = "tenant-a"
+max_concurrent_uploads = 2
+```
+
+- `max_concurrent_uploads`: the bucket's large bodies the gateway reads at
+  once.
+- `max_upload_bytes`: the bytes those bodies reserve at once. The bucket's
+  only large body under way always passes, so a cap below a body's size never
+  refuses it for good.
+
+A `[[bucket]]` entry replaces `[default]` for its bucket rather than
+inheriting from it. In the example, `tenant-a` has two concurrent uploads and
+no `max_upload_bytes`. Repeat every limit the bucket should keep.
+
+A body counts from its reservation until the gateway has buffered it, not
+while a node commits it. A request past either limit gets `429` with
+`Retry-After: 1` at once. Small bodies never count and are never refused by
+these limits. Without a quota policy, or for a bucket the policy gives
+neither limit, only the budget bounds a bucket's uploads. Like the other
+quota limits, these are per gateway process.
+
+### Abandoned Uploads
+
+The gateway cuts a body only once its client has abandoned it: when no byte
+of it arrives for `--body-stall-timeout` (30 s by default), or when less than
+`--body-min-bytes-per-sec` (1 KiB/s by default) arrives over one window of
+the stall timeout, counted from the start of the reading. It then answers
+`408`, with nothing of the body forwarded. Nothing bounds a body's reading in
+all, and neither rule looks at its size or at its average rate since the
+start, so a slow upload that keeps arriving above the floor is never cut,
+however long it takes. Over HTTP/1.1 the connection closes after the `408`,
+so a client that is still sending may see the closed connection instead.
+
+A chunk counts toward the window it arrives in, so a pause of just under the
+stall timeout that spans the end of a window, on a link slower than the
+floor over a whole window, can leave that window short. The SQLite extension
+gives a commit 10 s and a snapshot transfer 120 s. With the defaults the
+gateway never cuts a body that keeps arriving. Keep `--body-stall-timeout` above 10 s. The gateway warns at startup
+otherwise.
+
+### Refusals and Metrics
+
+The gateway reads the body of each refusal here other than the `408` to its
+end before it answers, at the pace a forwarded body may keep, and drops each
+chunk. A client that
+sends its whole body first then gets the refusal on an intact connection, as
+in [Refusals Before the Body](#refusals-before-the-body). That holds for the
+`413` of a body over its bucket's own limit too. Only a body past
+`--max-request-body-bytes` gets its `413` with the rest unread.
+
+Every refusal here carries `x-ursula-not-applied` (see [Refusals That Applied
+Nothing](#refusals-that-applied-nothing)). `/__ursula/gateway/metrics`
+reports `upload_refusals_tenant_bytes`, `upload_refusals_tenant_uploads`,
+`upload_refusals_budget` and `upload_refusals_too_slow`, the refusals by
+reason, `upload_budget_bytes`, the budget in effect, `upload_reserved_bytes`,
+the bytes reserved now with each body's share rounded up to whole KiB,
+`upload_tenants`, the buckets with a large body under way under an upload
+limit now, and `body_bytes_buffered`, the bytes of bodies the gateway read to
+forward them, a body cut or refused part way included. The rest of a body
+refused part way counts in `refusal_drain_bytes`.
+
+The defaults suit a 512 MiB pod with the default 32 MiB per-request limit.
+The 256 MiB budget is half of the pod, leaving the rest to response streams,
+connection buffers and the allocator. The 32 MiB headroom holds at least 32
+small bodies of up to 1 MiB, and the rest of the budget seven bodies at the
+limit.
 
 ## SSE Behavior
 
@@ -379,8 +518,37 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 --max-request-body-bytes <BYTES>
     Maximum request body bytes buffered for leader-redirect replay.
     Larger requests return 413 before upstream forwarding. Also the most the
-    gateway reads of a body before it sends a refusal it decided from the
-    request's head alone. Defaults to 33554432.
+    gateway reads of a body before it sends a refusal. Must fit
+    --body-budget-bytes less --small-body-headroom-bytes. Defaults to
+    33554432.
+
+--body-budget-bytes <BYTES>
+    Bytes of request bodies the gateway buffers at once, across requests,
+    the small-body headroom included. See Request Body Budget. Defaults to
+    268435456.
+
+--small-body-headroom-bytes <BYTES>
+    Bytes of the body budget only bodies of at most --small-body-max-bytes
+    may take. Must hold one such body. Defaults to 33554432.
+
+--small-body-max-bytes <BYTES>
+    The largest declared body length that counts as small: it may take the
+    small-body headroom and never counts toward a bucket's upload limits.
+    Defaults to 1048576.
+
+--body-budget-wait-ms <MILLISECONDS>
+    How long a request waits for the body budget before the gateway answers
+    503. 0 refuses at once. Defaults to 1000.
+
+--body-stall-timeout <SECONDS>
+    How long a request body may go without a byte arriving before the
+    gateway answers 408, and the window --body-min-bytes-per-sec is measured
+    over. At least 1. Defaults to 30.
+
+--body-min-bytes-per-sec <BYTES>
+    The least rate at which a request body must arrive over each window of
+    --body-stall-timeout. A slower body is answered 408 before anything of it
+    is forwarded. 0 disables the floor. Defaults to 1024.
 
 --graceful-shutdown-timeout <SECONDS>
     Maximum graceful shutdown drain time after SIGTERM/CTRL-C. Defaults to 3600.
@@ -397,6 +565,7 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
   [Upstream Selection](#upstream-selection).
 - Request bodies are buffered up to `--max-request-body-bytes` because internal
   leader redirects require replaying the request to a different upstream.
+  The bodies under way across requests stay within `--body-budget-bytes`.
 - The gateway keeps no durable state and does not maintain cluster membership.
   Its leader cache and upstream ejections live in memory and start empty.
 - `RUST_LOG=ursula_gateway=debug` enables request forwarding and redirect logs.

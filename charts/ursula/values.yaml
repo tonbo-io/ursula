@@ -382,7 +382,17 @@ gateway:
   # Idle connections are probed three times within it. At least 1.
   upstreamTcpUserTimeoutSeconds: 5
   # Maximum request body bytes the gateway buffers for leader-redirect replay.
+  # With bodyBudgetBytes unset, the gateway grows its body budget to hold a
+  # body at this limit beside its 32 MiB small-body headroom. Give the pod at
+  # least twice the budget in memory. A budget cannot go below this limit
+  # plus 32 MiB, so lower this limit when the pod cannot hold that.
   maxRequestBodyBytes: 33554432
+  # Bytes of request bodies the gateway buffers at once, across requests
+  # (--body-budget-bytes, 0.7.6 and later). Unset, the flag is not rendered,
+  # so a gateway before 0.7.6, which exits on the flag, still starts, and the
+  # gateway uses 256 MiB or maxRequestBodyBytes plus 32 MiB, whichever is
+  # larger. Set, it must be at least maxRequestBodyBytes plus 32 MiB.
+  bodyBudgetBytes: null
   # Maximum graceful shutdown drain time after SIGTERM, in seconds.
   gracefulShutdownTimeoutSeconds: 3600
   # Extra CLI args appended after the generated gateway args.

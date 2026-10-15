@@ -907,7 +907,12 @@
         "maxRequestBodyBytes": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum request body bytes buffered for leader-redirect replay."
+          "description": "Maximum request body bytes buffered for leader-redirect replay. Must fit the body budget less its 32 MiB small-body headroom."
+        },
+        "bodyBudgetBytes": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Bytes of request bodies the gateway buffers at once, across requests (--body-budget-bytes, 0.7.6 and later). Unset, the gateway uses 256 MiB or maxRequestBodyBytes plus 32 MiB, whichever is larger."
         },
         "gracefulShutdownTimeoutSeconds": {
           "type": "integer",

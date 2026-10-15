@@ -4535,6 +4535,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-core",
+ "http-body",
  "http-body-util",
  "jsonwebtoken",
  "percent-encoding",
