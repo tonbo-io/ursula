@@ -31,6 +31,7 @@ use super::OpenId;
 use super::SyncError;
 use super::Ticket;
 use super::UNCONNECTED_MS;
+use super::Undone;
 use super::core::Core;
 use super::disk::DiskDone;
 use super::disk::DiskJob;
@@ -2676,11 +2677,11 @@ fn a_binding_is_given_up_only_when_the_host_holds_none_of_it() {
     );
 }
 
-/// Starts an open of the stream under `dir` after `after`, given up for it.
-fn open_after(w: &mut World, c: usize, spec: OpenSpec, after: &Bound) -> OpenId {
+/// Starts an open, leaving it to resolve.
+fn start_open(w: &mut World, c: usize, spec: OpenSpec) -> OpenId {
     let now = w.now;
     let open = OpenId(w.id());
-    let ios = w.c(c).open_after(open, spec, after.binding, now);
+    let ios = w.c(c).open(open, spec, now);
     w.queue_ios(c, ios);
     open
 }
@@ -2697,7 +2698,7 @@ fn an_open_after_a_given_up_binding_starts_once_it_retired() {
     assert!(bound.handle.connect(Holder::Private).is_some());
     assert!(bound.handle.disconnect(Holder::Host));
     assert_eq!(bound.handle.give_up(), Ok(()));
-    let open = open_after(&mut w, c, spec(second.path(), 1), &bound);
+    let open = start_open(&mut w, c, spec(second.path(), 1));
     w.run_for(5_000);
     assert!(
         w.c(c).take_opened(open).is_none(),
@@ -2736,7 +2737,7 @@ fn an_open_after_a_given_up_binding_ends_at_its_deadline_or_cancel() {
         timeout_ms: 2_000,
         ..spec(second.path(), 1)
     };
-    let open = open_after(&mut w, c, late, &bound);
+    let open = start_open(&mut w, c, late);
     w.run_for(3_000);
     let e = kind(w.c(c).take_opened(open).expect("resolved at its deadline"));
     match &*e {
@@ -2750,13 +2751,31 @@ fn an_open_after_a_given_up_binding_ends_at_its_deadline_or_cancel() {
         }
         other => panic!("{other}"),
     }
-    let open = open_after(&mut w, c, spec(second.path(), 1), &bound);
+    let open = start_open(&mut w, c, spec(second.path(), 1));
     let now = w.now;
     let ios = w.c(c).cancel(open, now);
     w.queue_ios(c, ios);
     let e = kind(w.c(c).take_opened(open).expect("resolved at its cancel"));
     assert!(matches!(*e, OpenError::Cancelled), "{e}");
     assert_eq!(bound.handle.life(), Life::GivenUp);
+    // A retry, under any root, waits for the binding too: never two bindings of the stream.
+    let third = TempDir::new("driver-after-late-third");
+    let retry = start_open(&mut w, c, spec(third.path(), 1));
+    w.run_for(5_000);
+    assert!(w.c(c).take_opened(retry).is_none(), "the retry waits");
+    assert!(bound.handle.disconnect(Holder::Private));
+    retire_asked(&mut w, c, &bound);
+    let mut opened = None;
+    for _ in 0..100 {
+        opened = w.c(c).take_opened(retry);
+        if opened.is_some() {
+            break;
+        }
+        w.run_for(100);
+    }
+    let again = opened.expect("the retry never resolved").unwrap();
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert_eq!(again.handle.dir, third.path());
 }
 
 // Two hand-outs before any connection: the first caller's connection opening and closing leaves
@@ -2803,7 +2822,7 @@ fn a_failed_open_undoes_its_connection() {
     let c = w.core();
     let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
     let connected = bound.handle.connect(Holder::Host).unwrap();
-    assert!(!bound.handle.unconnect(connected));
+    assert_eq!(bound.handle.unconnect(connected), Undone::WaitsAgain);
     assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
     retire_asked(&mut w, c, &bound);
     assert!(
@@ -2814,7 +2833,7 @@ fn a_failed_open_undoes_its_connection() {
     assert!(bound.handle.disconnect(Holder::Host));
     let connected = bound.handle.connect(Holder::Host).unwrap();
     assert_eq!(bound.handle.life(), Life::Live);
-    assert!(bound.handle.unconnect(connected));
+    assert_eq!(bound.handle.unconnect(connected), Undone::Retires);
     assert_eq!(bound.handle.life(), Life::Retiring);
     retire_asked(&mut w, c, &bound);
     assert_eq!(bound.handle.life(), Life::Retired);
@@ -4393,4 +4412,25 @@ fn a_reopen_beside_a_reset_provisional_binding_while_unreachable_is_provisional_
     let next = Epoch::try_from(own.get() + 1).unwrap();
     assert_eq!(claimed(&w, c), vec![own, next]);
     assert_eq!(w.stream_commits(), vec![first, x]);
+}
+
+// A hand-out a failed open gave back waits again from the start: the driver may have ended the
+// first wait in the moment the binding was live, and the binding still retires if nobody connects.
+#[test]
+fn a_hand_out_given_back_by_a_failed_open_waits_again() {
+    let dir = TempDir::new("driver-unconnect-wait");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open_result(c, spec(dir.path(), 1)).unwrap();
+    let connected = bound.handle.connect(Holder::Host).unwrap();
+    // A tick while it is live ends the hand-out's wait.
+    w.run_for(1_000);
+    assert_eq!(bound.handle.unconnect(connected), Undone::WaitsAgain);
+    let now = w.now;
+    w.c(c).unconnected(bound.binding, now);
+    w.run_for(UNCONNECTED_MS / 2);
+    assert_eq!(bound.handle.life(), Life::HandedOut { awaiting: 1 });
+    w.run_for(UNCONNECTED_MS / 2 + 1_000);
+    assert_eq!(bound.handle.life(), Life::Retired);
+    assert!(!bound.handle.holds_root());
 }

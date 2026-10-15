@@ -361,10 +361,14 @@ unsafe fn x_open(
                 };
                 connected = binding.connect(holder);
                 if connected.is_none() {
-                    log::emit(Level::Warn, "open_refused", &[
-                        ("file", &name),
-                        ("reason", &"its binding retired: ursula_open it again"),
-                    ]);
+                    // The private connection is refused beside no connection of the host: the
+                    // snapshot attempt skips, nothing to report.
+                    if holder == Holder::Host {
+                        log::emit(Level::Warn, "open_refused", &[
+                            ("file", &name),
+                            ("reason", &"its binding retired: ursula_open it again"),
+                        ]);
+                    }
                     return ffi::SQLITE_CANTOPEN;
                 }
                 Some(Ext {

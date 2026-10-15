@@ -442,24 +442,25 @@ impl Core {
         opens.chain(bindings).chain(deferred).flatten().min()
     }
 
-    /// Starts open `open` once binding `after`, of the same stream under another cache root and
-    /// given up ([`BindingHandle::give_up`]), drained and retired: at once if it is gone. The wait
-    /// counts toward the open's time.
-    pub(crate) fn open_after(
+    /// The binding of the stream at `url` given up for an open under another cache root
+    /// ([`BindingHandle::give_up`]), still draining, and its cache root.
+    fn given_up(&self, url: &str) -> Option<(BindingId, PathBuf)> {
+        let name = canonical_path(url).ok()?;
+        self.bindings.iter().find_map(|(id, b)| {
+            let handle = b.handle().filter(|h| h.life() == Life::GivenUp)?;
+            (b.name == name).then(|| (*id, handle.dir.clone()))
+        })
+    }
+
+    /// Defers open `open` until binding `after`, given up, drained and retired. The wait counts
+    /// toward the open's time.
+    fn defer(
         &mut self,
         open: OpenId,
         spec: OpenSpec,
-        after: BindingId,
+        (after, bound): (BindingId, PathBuf),
         now_ms: u64,
     ) -> Vec<Io> {
-        let Some(bound) = self
-            .bindings
-            .get(&after)
-            .and_then(Binding::handle)
-            .map(|h| h.dir.clone())
-        else {
-            return self.open(open, spec, now_ms);
-        };
         let deadline_ms = now_ms.saturating_add(spec.timeout_ms);
         self.deferred.insert(open, Deferred {
             spec,
@@ -505,6 +506,10 @@ impl Core {
 
     /// Starts open `open` (design §5.5). Its outcome comes as [`DriverEvent::Opened`].
     ///
+    /// While a binding of the stream given up for an open under another cache root drains, the
+    /// open waits for it to retire ([`Core::defer`]), so no two bindings of a stream ever run in
+    /// the process, whichever open of it comes first.
+    ///
     /// A binding of the stream that its connections reset, and whose reset has not reached the
     /// core yet, resets first, so its log takes no append once the open may copy it (G8). Then the
     /// open shares the stream's root when only reset bindings' connections still hold it: with
@@ -512,6 +517,9 @@ impl Core {
     /// tombstone whose disk job is out), it locks the root anew and is refused `in_use`, so it
     /// never runs beside a replicator or a job that writes the stream's files.
     pub(crate) fn open(&mut self, open: OpenId, spec: OpenSpec, now_ms: u64) -> Vec<Io> {
+        if let Some(given_up) = self.given_up(&spec.url) {
+            return self.defer(open, spec, given_up, now_ms);
+        }
         let mut ios = Vec::new();
         let root = match canonical_path(&spec.url) {
             Ok(name) => {

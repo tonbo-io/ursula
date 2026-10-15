@@ -9,7 +9,7 @@
 //   binds in the fresh cache;
 // - while a connection of the host is open, an open in another cache is refused
 //   `bound_elsewhere`, naming the cache the stream is open in.
-import { writeFileSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Child, freshDir, killChildren, type Opened, stream } from "./kit.ts";
@@ -90,7 +90,7 @@ describe("a database reopened while a snapshot attempt holds the private connect
 		const refused = await child.send({ bind: other });
 		expect(refused.ok).toBe(false);
 		expect(String(refused.error)).toMatch(/ursula_open: bound_elsewhere: /);
-		expect(String(refused.error)).toContain(`the stream is open in this process under ${dir}, not ${other}: connections are open on it (1)`);
+		expect(String(refused.error)).toContain(`the stream is open in this process under ${realpathSync(dir)}, not ${realpathSync(other)}: connections are open on it (1)`);
 		// The binding is untouched.
 		await child.exec("INSERT INTO t VALUES (2)");
 		expect(await child.rows("SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }]);

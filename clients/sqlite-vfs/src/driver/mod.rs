@@ -216,11 +216,23 @@ pub(crate) enum Holder {
 }
 
 /// A connection [`BindingHandle::connect`] counted: whose it is, and where the binding stood
-/// before, so an open that fails after it undoes it exactly ([`BindingHandle::unconnect`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// before, so an open that fails after it undoes it exactly ([`BindingHandle::unconnect`]), once.
+#[derive(Debug)]
 pub(crate) struct Connected {
     pub(crate) holder: Holder,
     before: Life,
+}
+
+/// What undoing a connection leads to ([`BindingHandle::unconnect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Undone {
+    /// Nothing the driver needs to hear of.
+    Stays,
+    /// The binding retires once drained: the driver hears of it, as of a last close.
+    Retires,
+    /// A hand-out waits for a connection again: the driver starts its wait over
+    /// ([`UNCONNECTED_MS`]).
+    WaitsAgain,
 }
 
 /// A binding's life with its open connections, decided under one lock: a connection opens only
@@ -519,27 +531,36 @@ impl BindingHandle {
     }
 
     /// Undoes `connected`, for an open that failed after it: the binding goes back to where it
-    /// stood, a hand-out it took up waiting again. True when the driver should hear of it, as for
-    /// [`BindingHandle::disconnect`].
-    pub(crate) fn unconnect(&self, connected: Connected) -> bool {
+    /// stood, a hand-out it took up waiting again, which the caller tells the driver of, as it
+    /// does a retirement.
+    pub(crate) fn unconnect(&self, connected: Connected) -> Undone {
         let mut l = self.life_lock();
         let n = l.count(connected.holder);
         *n = n.saturating_sub(1);
         if connected.holder == Holder::Host {
             match (connected.before, l.life) {
-                // The hand-out it took up waits again.
-                (Life::HandedOut { .. }, Life::Live) => l.life = Life::HandedOut { awaiting: 1 },
+                // The hand-out it took up waits again: the driver may have ended the wait while
+                // the binding was live, so it starts over.
+                (Life::HandedOut { .. }, Life::Live) => {
+                    l.life = Life::HandedOut { awaiting: 1 };
+                    return Undone::WaitsAgain;
+                }
                 (Life::HandedOut { .. }, Life::HandedOut { awaiting }) => {
                     l.life = Life::HandedOut {
                         awaiting: awaiting.saturating_add(1),
                     };
+                    return Undone::WaitsAgain;
                 }
                 // Taken back from retiring by this connection alone: retiring again.
                 (Life::Retiring, Life::Live) if l.host == 0 => l.life = Life::Retiring,
                 _ => {}
             }
         }
-        self.after_close(&mut l)
+        if self.after_close(&mut l) {
+            Undone::Retires
+        } else {
+            Undone::Stays
+        }
     }
 
     /// What a connection's close leads to, its count already taken off.

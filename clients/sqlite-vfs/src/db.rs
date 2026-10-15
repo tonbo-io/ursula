@@ -40,6 +40,7 @@ use crate::driver::Holder;
 use crate::driver::Kept;
 use crate::driver::LogPoisoned;
 use crate::driver::OpenId;
+use crate::driver::Undone;
 use crate::driver::runtime::driver;
 use crate::error::Error;
 use crate::error::WriteRefusal;
@@ -203,7 +204,12 @@ impl Binding {
 
     /// The open of a main db handle failed after [`Binding::connect`]: undone exactly.
     pub(crate) fn unconnect(&self, connected: Connected) {
-        if self.handle.unconnect(connected) && driver().retire(self.id).is_err() {
+        let told = match self.handle.unconnect(connected) {
+            Undone::Stays => Ok(()),
+            Undone::Retires => driver().retire(self.id),
+            Undone::WaitsAgain => driver().unconnected(self.id),
+        };
+        if told.is_err() {
             log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
         }
     }
@@ -344,7 +350,7 @@ pub(crate) fn open(
                     return Ok(Opened::Bound(b));
                 }
                 Claim::Join(open) => open,
-                Claim::Start { after } => {
+                Claim::Start => {
                     let spec = OpenSpec {
                         url: url.to_owned(),
                         dir: requested.path.clone(),
@@ -354,10 +360,7 @@ pub(crate) fn open(
                         recreate: options.recreate,
                         timeout_ms: open_ms,
                     };
-                    let open = match after {
-                        Some(after) => driver().open_after(spec, after)?,
-                        None => driver().open(spec)?,
-                    };
+                    let open = driver().open(spec)?;
                     reg.opens.insert(name.as_str().to_owned(), OpenEntry {
                         open,
                         url: url.to_owned(),
@@ -383,32 +386,35 @@ enum Claim {
     Bound(Arc<Binding>),
     /// The open of it in progress.
     Join(OpenId),
-    /// A new open, once the binding given up for it (`after`) retired.
-    Start { after: Option<BindingId> },
+    /// A new open. The driver starts it once a binding of the stream given up for it retired.
+    Start,
 }
 
 /// Decides, under the registry's lock, where an open of stream `name` under the cache root
 /// `requested` goes (a `blocking` call waits for an open in progress, another comes back for it).
-/// A stream binds under one cache root at a time: its binding under another root is given up when
-/// nothing of the host holds it ([`BindingHandle::give_up`]) and leaves the registry, the new open
-/// starting once it retired, and otherwise the open is refused, as one beside an open in progress
-/// under another root is. A reset or retired binding leaves the registry for a new open, which
-/// beside a reset binding's open connections shares their root and builds from a copy of their
-/// generation (design §5.6).
+/// A stream binds under one cache root at a time: an open in progress under another root refuses
+/// the open, and so does a binding under another root that the host holds. One nothing of the host
+/// holds is given up ([`BindingHandle::give_up`]) and leaves the registry, and the driver starts
+/// the new open once it retired. A reset or retired binding leaves the registry for a new open,
+/// which beside a reset binding's open connections shares their root and builds from a copy of
+/// their generation (design §5.6).
 fn claim(
     reg: &mut Registry,
     name: &str,
     requested: &CacheDir,
     blocking: bool,
 ) -> Result<Claim, Error> {
-    let mut after = None;
+    if let Some(entry) = reg.opens.get(name)
+        && entry.dir != *requested
+    {
+        return Err(elsewhere(&entry.dir, requested, Kept::Opening));
+    }
     if let Some(b) = reg.names.get(name).cloned() {
         if b.reset_kind().is_none() {
-            if !b.dir.same(requested) {
+            if b.dir != *requested {
                 b.handle
                     .give_up()
                     .map_err(|kept| elsewhere(&b.dir, requested, kept))?;
-                after = Some(b.id);
             } else if b.handle.revive() {
                 return Ok(Claim::Bound(b));
             }
@@ -417,9 +423,6 @@ fn claim(
         reg.paths.remove(&b.path);
     }
     match reg.opens.get_mut(name) {
-        Some(entry) if !entry.dir.same(requested) => {
-            Err(elsewhere(&entry.dir, requested, Kept::Opening))
-        }
         Some(entry) => {
             if blocking {
                 entry.waiting = entry.waiting.saturating_add(1);
@@ -428,41 +431,42 @@ fn claim(
             }
             Ok(Claim::Join(entry.open))
         }
-        None => Ok(Claim::Start { after }),
+        None => Ok(Claim::Start),
     }
 }
 
-/// A cache root, absolute and lexically normal (`.` and `..` resolved), and the directory it
-/// resolves to when it exists.
-#[derive(Debug, Clone)]
+/// A cache root in one form, for the open and for every comparison: absolute, its deepest
+/// existing ancestor resolved (symlinks, `..` as the file system follows it), the rest appended
+/// lexically (`.` and `..` resolved).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheDir {
     path: PathBuf,
-    resolved: Option<PathBuf>,
 }
 
 impl CacheDir {
     fn new(path: &Path) -> Self {
         let absolute = std::path::absolute(path).unwrap_or_else(|_no_cwd| path.to_owned());
-        let mut normal = PathBuf::new();
+        let mut resolved = PathBuf::new();
+        let mut exists = true;
         for part in absolute.components() {
             match part {
                 Component::CurDir => {}
+                // `resolved` has no symlink left in it: its parent is the one `..` reaches.
                 Component::ParentDir => {
-                    normal.pop();
+                    resolved.pop();
                 }
-                other => normal.push(other),
+                other => {
+                    resolved.push(other);
+                    if exists {
+                        match std::fs::canonicalize(&resolved) {
+                            Ok(real) => resolved = real,
+                            Err(_missing) => exists = false,
+                        }
+                    }
+                }
             }
         }
-        let resolved = std::fs::canonicalize(&normal).ok();
-        Self {
-            path: normal,
-            resolved,
-        }
-    }
-
-    /// Whether `self` and `other` are one directory: the same path, or two that resolve to one.
-    fn same(&self, other: &CacheDir) -> bool {
-        self.path == other.path || self.resolved.is_some() && self.resolved == other.resolved
+        Self { path: resolved }
     }
 }
 
@@ -748,30 +752,44 @@ mod tests {
     use crate::open::OpenError;
     use crate::testdir::TempDir;
 
-    // `ursula_open` takes two spellings of one directory for one cache root, existing or not, and
-    // another directory for another.
+    // A cache root has one form: two spellings of one directory, through a symlink, `.` or
+    // `..`, existing or not, are one root, and `..` after a symlink goes where the file system
+    // goes.
     #[test]
-    fn a_cache_dir_is_one_by_its_path_or_where_it_resolves() {
-        let dir = TempDir::new("db-cache-dir");
-        let root = dir.path().join("root");
+    fn a_cache_dir_has_one_form() {
+        let tmp = TempDir::new("db-cache-dir");
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = dir.join("root");
         std::fs::create_dir(&root).unwrap();
-        let link = dir.path().join("link");
+        let form = |p: &std::path::Path| CacheDir::new(p).path;
+        // A symlink, and a missing directory under one (as `/var` is `/private/var` on macOS).
+        let link = dir.join("link");
         std::os::unix::fs::symlink(&root, &link).unwrap();
-        let bound = CacheDir::new(&root);
-        assert!(bound.same(&CacheDir::new(&root)));
-        assert!(bound.same(&CacheDir::new(&link)));
-        assert!(bound.same(&CacheDir::new(&dir.path().join(".").join("root"))));
-        assert!(!bound.same(&CacheDir::new(dir.path())));
-        let missing = CacheDir::new(&dir.path().join("missing"));
-        assert!(!bound.same(&missing));
-        assert!(missing.same(&CacheDir::new(
-            &dir.path().join("x").join("..").join(".").join("missing")
-        )));
-        assert!(missing.path.is_absolute());
-        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(form(&link), root);
         assert_eq!(
-            CacheDir::new(std::path::Path::new("./a/../b")).path,
-            cwd.join("b")
+            form(&link.join("new").join("cache")),
+            root.join("new").join("cache")
+        );
+        assert_eq!(form(&dir.join(".").join("root")), root);
+        assert_ne!(form(&dir), root);
+        // `..` after a symlink is the target's parent; in a missing tail it is lexical.
+        let deep = dir.join("deep").join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let l2 = dir.join("l2");
+        std::os::unix::fs::symlink(&deep, &l2).unwrap();
+        assert_eq!(
+            form(&l2.join("..").join("z")),
+            dir.join("deep").join("a").join("z")
+        );
+        assert_eq!(
+            form(&dir.join("missing").join("x").join("..").join("y")),
+            dir.join("missing").join("y")
+        );
+        // Relative to the working directory.
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            form(std::path::Path::new("./no-such-a/../no-such-b")),
+            cwd.join("no-such-b")
         );
     }
 
@@ -824,10 +842,10 @@ mod tests {
         // Its connections close: given up, and gone from the registry.
         assert!(!b.handle.disconnect(Holder::Host));
         assert!(b.handle.disconnect(Holder::Host));
-        let Ok(Claim::Start { after }) = claim(&mut reg, &name, &there, true) else {
-            panic!("not started");
-        };
-        assert_eq!(after, Some(b.id));
+        assert!(matches!(
+            claim(&mut reg, &name, &there, true),
+            Ok(Claim::Start)
+        ));
         assert_eq!(b.handle.life(), Life::GivenUp);
         assert!(reg.names.is_empty() && reg.paths.is_empty());
         // The open in progress under the second root.
