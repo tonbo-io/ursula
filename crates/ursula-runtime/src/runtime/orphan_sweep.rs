@@ -31,9 +31,11 @@
 //! sweep logs an error and counts `cold_orphan_uncovered_chunks_kept` for an
 //! operator to repair the stream's cold index.
 //!
-//! Staged snapshot parts (`.part`, #581 section 3.1) in the external
-//! directory are swept the same way. No state references a part and it holds
-//! no stream bytes, so the guard below does not apply to it.
+//! Staged snapshot parts (#581 section 3.1) live in a group directory per
+//! bucket (`{bucket}/_parts/{group:08x}/`), which the cycle lists with the
+//! pack directories, so the parts of a deleted or expired stream are swept
+//! too. No state references a part and it holds no stream bytes, so the
+//! guards below do not apply to it.
 //!
 //! External payloads carry no range in their name, so the same guard works
 //! per stream: an unreferenced external payload of a stream is deleted only
@@ -64,7 +66,7 @@ use crate::cold_store::cold_chunk_file_range;
 use crate::cold_store::cold_external_dir;
 use crate::cold_store::is_cold_chunk_file_name;
 use crate::cold_store::is_external_payload_file_name;
-use crate::cold_store::is_snapshot_part_file_name;
+use crate::cold_store::is_snapshot_part_object_name;
 use crate::error::RuntimeError;
 
 /// A live chunk directory, its stream's cold range and the byte ranges its
@@ -131,6 +133,16 @@ impl ShardRuntime {
                 }
             }
         }
+        // A staged snapshot part is garbage once its grace passed, whether
+        // its stream lives or not: no state ever references one (#581
+        // section 3.1).
+        for dir in &listing_plan.part_dirs {
+            for name in cold_store.list_file_names(dir).await.map_err(cold_io)? {
+                if is_snapshot_part_object_name(&name) {
+                    aged.push((format!("{dir}{name}"), name));
+                }
+            }
+        }
         for stream in &listing_plan.streams {
             let chunk_dir = cold_chunk_dir(&stream.stream_id, stream.generation);
             for name in cold_store
@@ -148,9 +160,7 @@ impl ShardRuntime {
                 .await
                 .map_err(cold_io)?
             {
-                // A snapshot part no commit used is garbage once its grace
-                // passed: no state ever references one (#581 section 3.1).
-                if is_external_payload_file_name(&name) || is_snapshot_part_file_name(&name) {
+                if is_external_payload_file_name(&name) {
                     aged.push((format!("{external_dir}{name}"), name));
                 }
             }

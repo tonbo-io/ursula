@@ -30,7 +30,8 @@ use crate::cold_store::cold_pack_dir;
 use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::cold_store::new_cold_pack_path;
 use crate::cold_store::new_external_payload_path;
-use crate::cold_store::new_snapshot_part_path;
+use crate::cold_store::new_snapshot_part_id;
+use crate::cold_store::snapshot_part_path;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
 const BUCKET: &str = "benchcmp";
@@ -476,7 +477,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
     let orphan_chunk = new_cold_chunk_path_in_generation(&a, generation(&runtime, &a).await, 0, 2);
     let orphan_external = new_external_payload_path(&b);
     // A snapshot part no commit used (#581 section 3.1).
-    let orphan_part = new_snapshot_part_path(&a);
+    let orphan_part = snapshot_part_path(&a, GROUP.0, 1, &new_snapshot_part_id());
     for (path, payload) in [
         (&orphan_pack, b"orphan-pack".as_slice()),
         (&orphan_chunk, b"oc".as_slice()),
@@ -555,6 +556,42 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
         .await
         .expect("second sweep");
     assert_eq!(again.orphans_deleted, 0, "a second sweep finds nothing");
+}
+
+/// #581 section 3.1: the parts of a stream that was deleted are reclaimed
+/// too, though the sweep walks live streams only and no GC entry names them.
+#[tokio::test]
+async fn orphan_sweep_reclaims_the_parts_of_a_deleted_stream() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    let (gone, kept) = (stream("parts-gone"), stream("parts-kept"));
+    create(&runtime, &gone).await;
+    create(&runtime, &kept).await;
+    let part = snapshot_part_path(&gone, GROUP.0, 1, &new_snapshot_part_id());
+    cold_store
+        .write_chunk(&part, b"part")
+        .await
+        .expect("stage part");
+    runtime
+        .delete_stream(crate::DeleteStreamRequest {
+            stream_id: gone.clone(),
+            if_incarnation: None,
+        })
+        .await
+        .expect("delete stream");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let young = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, 60 * 60 * 1_000)
+        .await
+        .expect("sweep within the grace");
+    assert_eq!(young.orphans_deleted, 0);
+    assert!(exists(&cold_store, &part).await, "kept within the grace");
+    let swept = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, 0)
+        .await
+        .expect("sweep after the grace");
+    assert_eq!(swept.orphans_deleted, 1);
+    assert!(!exists(&cold_store, &part).await, "the part is reclaimed");
 }
 
 /// RT6: a page read-modify-write by a deposed leader can drop the entry of

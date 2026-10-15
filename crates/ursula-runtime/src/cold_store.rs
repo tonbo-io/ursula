@@ -36,6 +36,11 @@ pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 /// minimum).
 pub const COLD_OBJECT_WRITE_PART_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upload parts of one [`ColdObjectWriter`] in flight at once, so a large
+/// object does not wait for each part in turn. A writer buffers at most this
+/// many parts.
+pub const COLD_OBJECT_WRITE_CONCURRENCY: usize = 2;
+
 /// A streaming upload of one cold object. Dropping it without
 /// [`Self::close`] leaves no object behind on S3 (the multipart upload is
 /// never completed); [`Self::abort`] also releases the parts.
@@ -679,6 +684,7 @@ impl ColdStore {
             .operator
             .writer_with(path)
             .chunk(COLD_OBJECT_WRITE_PART_BYTES)
+            .concurrent(COLD_OBJECT_WRITE_CONCURRENCY)
             .await
             .map_err(|err| cold_store_io_error(path, err))?;
         Ok(ColdObjectWriter {
@@ -1708,26 +1714,65 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
-/// Names a new staged snapshot part of `stream_id` (#581 section 3.1),
-/// `{stream}/external/{nanos:032x}-{seq:016x}.part`. Its file name is the
-/// part id a client lists in a commit. The `.part` suffix keeps parts apart
-/// from the `.bin` objects that state references, so a commit can name only
-/// parts, and deleting a part after its commit can never remove data.
-pub fn new_snapshot_part_path(stream_id: &BucketStreamId) -> String {
+/// A new snapshot part id (#581 section 3.1), `{nanos:032x}-{seq:016x}.part`.
+/// The `.part` suffix keeps parts apart from the `.bin` objects that state
+/// references, so a commit can name only parts, and deleting a part after
+/// its commit can never remove data.
+pub fn new_snapshot_part_id() -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "{}{unix_nanos:032x}-{sequence:016x}{SNAPSHOT_PART_SUFFIX}",
-        cold_external_dir(stream_id)
-    )
+    format!("{unix_nanos:032x}-{sequence:016x}{SNAPSHOT_PART_SUFFIX}")
 }
 
 const SNAPSHOT_PART_SUFFIX: &str = ".part";
 
-/// Whether `name` has the form of a staged snapshot part,
-/// `{nanos:032x}-{seq:016x}.part`. No replicated state references one.
-pub fn is_snapshot_part_file_name(name: &str) -> bool {
-    hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[32, 16])
+/// Whether `id` has the form of a part id a client got from
+/// [`new_snapshot_part_id`].
+pub fn is_snapshot_part_id(id: &str) -> bool {
+    hex_fields_with_suffix(id, SNAPSHOT_PART_SUFFIX, &[32, 16])
+}
+
+/// The directory of the snapshot parts staged for the streams of one Raft
+/// group in one bucket: `{bucket}/_parts/{group:08x}/`. It does not depend on
+/// any stream being live, so the orphan sweep lists it from the group's
+/// buckets, as it lists the pack directories, and reclaims the parts of a
+/// stream that was deleted or expired as well as the unused parts of a live
+/// one. A bucket purge removes it with the bucket's prefix.
+pub fn snapshot_part_dir(bucket_id: &str, raft_group_id: u32) -> String {
+    format!("{bucket_id}/_parts/{raft_group_id:08x}/")
+}
+
+/// The object of part `id` staged for the incarnation `incarnation` of
+/// `stream_id`, in [`snapshot_part_dir`]: `{owner:016x}-{id}`, where `owner`
+/// is a hash of the stream and its token. A commit resolves an id only with
+/// its own stream's owner, so a manifest cannot name another stream's part,
+/// nor one staged for an earlier incarnation or history of its own stream.
+pub fn snapshot_part_path(
+    stream_id: &BucketStreamId,
+    raft_group_id: u32,
+    incarnation: u64,
+    id: &str,
+) -> String {
+    let mut owner = blake3::Hasher::new();
+    owner.update(b"ursula snapshot part owner\0");
+    owner.update(stream_id.to_string().as_bytes());
+    owner.update(b"\0");
+    owner.update(&incarnation.to_le_bytes());
+    let digest = owner.finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(digest.as_bytes().get(..8).unwrap_or(&[0; 8]));
+    format!(
+        "{}{:016x}-{id}",
+        snapshot_part_dir(&stream_id.bucket_id, raft_group_id),
+        u64::from_be_bytes(prefix)
+    )
+}
+
+/// Whether `name` (a file name in a [`snapshot_part_dir`]) has the form of
+/// a staged part object, `{owner:016x}-{nanos:032x}-{seq:016x}.part`. No
+/// replicated state ever references one.
+pub fn is_snapshot_part_object_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[16, 32, 16])
 }
 
 /// Reset the global cold-object sequence counter. Only available under
