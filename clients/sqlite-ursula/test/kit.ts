@@ -1,6 +1,8 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { expect, inject } from "vitest";
 
 /** The base URL of the server the suite runs against (test/stack.ts). */
@@ -69,4 +71,126 @@ export function thrown(f: () => unknown): unknown {
 		return error;
 	}
 	throw new Error("it did not throw");
+}
+
+/** `ursula_open`'s answer for a bound database. */
+export interface Opened {
+	done: boolean;
+	path: string;
+	name: string;
+	state: string;
+}
+
+/** Every child process a test started and has not stopped: {@link killChildren} kills them. */
+const children = new Set<Child>();
+
+/** Kills every child process still running: register it with `afterEach`. */
+export async function killChildren(): Promise<void> {
+	for (const c of [...children]) await c.stop("SIGKILL");
+}
+
+/**
+ * A Node process of a test: test/`script` (test/core-child.mjs by default) with the extension, `url`,
+ * `dir` and `args` as its arguments, read one JSON line at a time. core-child.mjs binds `url` in
+ * `dir` and answers one JSON command per line.
+ */
+export class Child {
+	private readonly proc: ChildProcess;
+	private readonly queue: string[] = [];
+	private waiting: ((line: string | undefined) => void) | undefined;
+	private ended = false;
+	/** How the process ended. */
+	readonly exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+
+	constructor(url: string, dir: string, env: NodeJS.ProcessEnv = {}, script = "core-child.mjs", args: readonly string[] = []) {
+		this.proc = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, script), ext(), url, dir, ...args], {
+			stdio: ["pipe", "pipe", "inherit"],
+			env: { ...process.env, ...env },
+		});
+		this.exit = new Promise((r) => this.proc.once("exit", (code, signal) => r({ code, signal })));
+		// A child that exited on its own closed its stdin: a later write fails, harmlessly.
+		this.proc.stdin?.on("error", () => {});
+		const lines = createInterface({ input: this.proc.stdout as NodeJS.ReadableStream });
+		lines.on("line", (line) => this.deliver(line));
+		lines.on("close", () => {
+			this.ended = true;
+			this.deliver(undefined);
+		});
+		children.add(this);
+	}
+
+	private deliver(line: string | undefined): void {
+		const waiting = this.waiting;
+		this.waiting = undefined;
+		if (waiting !== undefined) waiting(line);
+		else if (line !== undefined) this.queue.push(line);
+	}
+
+	/** The next line, or `undefined` once the process closed its stdout. */
+	async line(timeoutMs = 60_000): Promise<Record<string, unknown> | undefined> {
+		const queued = this.queue.shift();
+		if (queued !== undefined) return JSON.parse(queued) as Record<string, unknown>;
+		if (this.ended) return undefined;
+		const line = await new Promise<string | undefined>((res, rej) => {
+			const timer = setTimeout(() => rej(new Error("the child did not answer")), timeoutMs);
+			this.waiting = (l) => {
+				clearTimeout(timer);
+				res(l);
+			};
+		});
+		return line === undefined ? undefined : (JSON.parse(line) as Record<string, unknown>);
+	}
+
+	private async next(): Promise<Record<string, unknown>> {
+		const line = await this.line();
+		if (line === undefined) throw new Error("the child exited");
+		return line;
+	}
+
+	/** The open's outcome, the first line, as it came. */
+	first(): Promise<Record<string, unknown>> {
+		return this.next();
+	}
+
+	/** The open's outcome, the first line. */
+	async opened(): Promise<Opened> {
+		const reply = await this.next();
+		expect(reply.ok, JSON.stringify(reply)).toBe(true);
+		return reply.opened as Opened;
+	}
+
+	async send(cmd: Record<string, unknown>): Promise<Record<string, unknown>> {
+		this.proc.stdin?.write(`${JSON.stringify(cmd)}\n`);
+		return this.next();
+	}
+
+	async exec(sql: string): Promise<void> {
+		const reply = await this.send({ exec: sql });
+		expect(reply.ok, JSON.stringify(reply)).toBe(true);
+	}
+
+	async rows(sql: string): Promise<unknown[]> {
+		const reply = await this.send({ all: sql });
+		expect(reply.ok, JSON.stringify(reply)).toBe(true);
+		return reply.rows as unknown[];
+	}
+
+	/** Exits, cleanly (`exit`) or killed (`SIGKILL`). */
+	async stop(how: "exit" | "SIGKILL" = "exit"): Promise<void> {
+		if (this.proc.exitCode === null && this.proc.signalCode === null) {
+			if (how === "exit") this.proc.stdin?.write(`${JSON.stringify({ exit: true })}\n`);
+			else this.proc.kill("SIGKILL");
+			await this.exit;
+		}
+		children.delete(this);
+	}
+}
+
+/** The rows `sql` returns from a fresh build of the stream: a new process with a new cache root. */
+export async function fromStream(url: string, sql: string): Promise<unknown[]> {
+	const reader = new Child(url, freshDir());
+	await reader.opened();
+	const rows = await reader.rows(sql);
+	await reader.stop();
+	return rows;
 }
