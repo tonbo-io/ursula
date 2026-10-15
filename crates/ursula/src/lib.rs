@@ -2905,7 +2905,7 @@ pub(crate) async fn create_stream_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
         }),
-        Err(err) => runtime_error_after_body(err),
+        Err(err) => runtime_error_after_body(&state, err),
     }
 }
 
@@ -2944,7 +2944,7 @@ pub(crate) async fn create_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            runtime_error_after_body(err)
+            runtime_error_after_body(&state, err)
         }
     }
 }
@@ -3162,7 +3162,7 @@ pub(crate) async fn append_stream_by_id(
             .await
         {
             Ok(response) => close_http_response(&response),
-            Err(err) => runtime_error_after_body(err),
+            Err(err) => runtime_error_after_body(&state, err),
         };
     }
     let mut request = AppendRequest::from_bytes(stream_id, payload);
@@ -3179,7 +3179,7 @@ pub(crate) async fn append_stream_by_id(
 
     match state.runtime.append(request).await {
         Ok(response) => append_http_response(response),
-        Err(err) => runtime_error_after_body(err),
+        Err(err) => runtime_error_after_body(&state, err),
     }
 }
 
@@ -3208,7 +3208,7 @@ pub(crate) async fn append_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            runtime_error_after_body(err)
+            runtime_error_after_body(&state, err)
         }
     }
 }
@@ -3682,7 +3682,7 @@ async fn publish_snapshot_by_offset(
             insert_incarnation(&mut headers, response.incarnation);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => runtime_error_after_body(err),
+        Err(err) => runtime_error_after_body(&state, err),
     }
 }
 
@@ -4447,17 +4447,22 @@ fn insert_retry_after_for_temporary(headers: &mut HeaderMap, err: &RuntimeError)
     }
 }
 
-pub(crate) async fn runtime_error_or_leader_redirect_async(
-    state: &HttpState,
-    err: RuntimeError,
-    request_target: &str,
-) -> Response {
+/// Counts the refusals operators watch: `producer-expired` answers.
+fn count_refusal(state: &HttpState, err: &RuntimeError) {
     if err.stream_error_code() == Some(StreamErrorCode::ProducerExpired) {
         state
             .http_metrics
             .producer_expired_answers
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+pub(crate) async fn runtime_error_or_leader_redirect_async(
+    state: &HttpState,
+    err: RuntimeError,
+    request_target: &str,
+) -> Response {
+    count_refusal(state, &err);
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
@@ -4484,7 +4489,8 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
 /// redirect (#581 section 6.1). A leadership refusal, of a node that lost
 /// the group's leadership while it read the body, answers `503` with
 /// `Retry-After`, and the write's key resolves the outcome.
-pub(crate) fn runtime_error_after_body(err: RuntimeError) -> Response {
+pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> Response {
+    count_refusal(state, &err);
     if is_forward_to_leader(&err) || matches!(err, RuntimeError::GroupNotHosted { .. }) {
         return leader_unknown_retry_response(err);
     }

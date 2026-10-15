@@ -241,6 +241,6 @@ pub(crate) async fn write_error_response(
         BodyState::Unread => {
             crate::runtime_error_or_leader_redirect_async(state, err, request_target).await
         }
-        BodyState::Read => crate::runtime_error_after_body(err),
+        BodyState::Read => crate::runtime_error_after_body(state, err),
     }
 }

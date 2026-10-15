@@ -2684,8 +2684,19 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
 
 /// After the body is read, a node never redirects: a leadership refusal
 /// answers `503` with `Retry-After` (#581 section 6.1).
-#[test]
-fn a_leadership_refusal_after_the_body_is_a_retryable_503() {
+#[tokio::test]
+async fn a_leadership_refusal_after_the_body_is_a_retryable_503() {
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
     for err in [
         RuntimeError::GroupEngine {
             core_id: ursula_shard::CoreId(0),
@@ -2697,7 +2708,7 @@ fn a_leadership_refusal_after_the_body_is_a_retryable_503() {
             raft_group_id: RaftGroupId(0),
         },
     ] {
-        let response = super::runtime_error_after_body(err);
+        let response = super::runtime_error_after_body(&state, err);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response.headers().get(axum::http::header::RETRY_AFTER),
