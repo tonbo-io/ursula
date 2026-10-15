@@ -303,8 +303,9 @@ struct Instance {
     /// restart before that finds the old generation whole, as a crash before the publishing
     /// rename does (design §5.1, §5.6).
     unpublished: Option<Option<Position>>,
-    /// The stream's bytes up to a rebuild's claim, which its generation holds once published.
-    rebuilt_bytes: Option<Arc<[u8]>>,
+    /// The token a rebuild reads under, and the stream's bytes up to its claim, which its
+    /// generation holds once published.
+    rebuilt_bytes: Option<(Incarnation, Arc<[u8]>)>,
     /// The replicator reported itself blocked `wrong_cluster` and has not resumed since.
     blocked_wrong_cluster: bool,
     /// The highest epoch of this instance's claims the world saw the server receipt (applied, or
@@ -1011,11 +1012,13 @@ impl World {
                     discard_from,
                     salvage,
                     to,
+                    incarnation,
                     ..
                 } => {
                     let stream = self.stream();
                     let to = usize::try_from(to.get()).unwrap().min(stream.len());
-                    self.owners[index].inst.rebuilt_bytes = Some(Arc::from(&stream[..to]));
+                    self.owners[index].inst.rebuilt_bytes =
+                        Some((incarnation, Arc::from(&stream[..to])));
                     if !takeover {
                         self.violation("property 6: a rebuild outside a takeover".to_owned());
                     }
@@ -1619,6 +1622,25 @@ impl World {
             return;
         };
         if let Some(last) = self.owners[index].inst.caught_up_due.take() {
+            // A rebuild reads under its claim's token: a history change since, which an answer
+            // from before it hid, fails the rebuild before it publishes, and the takeover resets
+            // `rewound` with the old generation whole (its ACK fsynced, D5).
+            let token = self.token();
+            let inst = &mut self.owners[index].inst;
+            if inst.unpublished.is_some()
+                && inst
+                    .rebuilt_bytes
+                    .as_ref()
+                    .is_some_and(|(t, _)| *t != token)
+            {
+                inst.unpublished = None;
+                inst.rebuilt_bytes = None;
+                inst.replicator = Replicator::Reset(ResetKind::Rewound);
+                let log = &mut self.owners[index].log;
+                log.durable_acks = log.acks.len();
+                self.coverage.rewound.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if let Some(discard_from) = self.owners[index].inst.unpublished.take() {
                 self.publish(index, discard_from);
             }
@@ -1643,7 +1665,7 @@ impl World {
         log.lineage = Lineage(lineage);
         log.catching_up = true;
         log.rebuilt_through = log.next_position.saturating_sub(1);
-        if let Some(bytes) = self.owners[index].inst.rebuilt_bytes.take() {
+        if let Some((_, bytes)) = self.owners[index].inst.rebuilt_bytes.take() {
             self.owners[index].log.rebuilt = bytes;
         }
         let log = &mut self.owners[index].log;
@@ -2347,6 +2369,31 @@ fn a_rekey_while_bound_is_not_one_at_open() {
         Op::Checkpoint,
         Op::Commit(0),
     ];
+    assert_eq!(run(Knobs::default(), 0, &ops), Vec::<String>::new());
+}
+
+/// A restart with a lagging ACK whose reconcile meets a `410` past it rebuilds, discarding the
+/// acknowledged commit (it is in the snapshot the rebuild installs). A restore lands before the
+/// rebuild reads: the rebuild meets the new token and resets `rewound`, the old generation whole,
+/// so the commit the restore lost stays in the log (property 19). A script the 1M-case run found.
+#[test]
+fn a_rebuild_overtaken_by_a_restore_keeps_the_old_generation() {
+    let mut ops = vec![
+        Op::Commit(0),
+        Op::Commit(0),
+        Op::Advance(0),
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::Commit(0),
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::Sync(0),
+        Op::Retain(0),
+        Op::Restart(0, 1),
+        Op::Duplicate(0),
+    ];
+    ops.extend(std::iter::repeat_n(Op::Deliver(0), 10));
+    ops.extend([Op::Restore(0), Op::Commit(0), Op::Commit(0)]);
     assert_eq!(run(Knobs::default(), 0, &ops), Vec::<String>::new());
 }
 
