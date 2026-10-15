@@ -49,6 +49,7 @@ use crate::request::ImportGroupStateResponse;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -600,7 +601,7 @@ impl GroupActor {
         drop(raft_uncommitted);
         match response {
             Ok(response) => {
-                let deduplicated = response.deduplicated;
+                let deduplicated = response.deduplicated();
                 // Durability is established when the group engine returns.
                 // Wake/materialize blocked readers afterwards so a large fanout
                 // cannot inflate the writer's acknowledgement latency.
@@ -694,7 +695,7 @@ impl GroupActor {
             );
             let changed = response
                 .as_ref()
-                .is_ok_and(|response| !response.deduplicated);
+                .is_ok_and(|response| !response.deduplicated());
             reply(tx, response);
             if changed && !changed_streams.contains(&stream) {
                 changed_streams.push(stream);

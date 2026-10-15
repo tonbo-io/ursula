@@ -82,17 +82,8 @@ fn usage_does_not_count_deduplicated_appends() {
         producer: Some(producer("writer", 0, 0)),
         ..Append::default()
     });
-    assert!(matches!(
-        machine.apply(request.clone()),
-        StreamResponse::Appended {
-            deduplicated: false,
-            ..
-        }
-    ));
-    assert!(matches!(machine.apply(request), StreamResponse::Appended {
-        deduplicated: true,
-        ..
-    }));
+    assert!(!machine.apply(request.clone()).is_producer_repeat());
+    assert!(machine.apply(request).is_producer_repeat());
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(
         usage.committed_append_bytes, 4,
@@ -225,7 +216,6 @@ fn create_cmd(stream_id: BucketStreamId, args: Create) -> StreamCommand {
         initial_payload: args.payload.into(),
         close_after: args.close_after,
         stream_seq: args.stream_seq,
-        producer: None,
         stream_ttl_seconds: args.ttl_seconds,
         stream_expires_at_ms: args.expires_at_ms,
         now_ms: args.now_ms,
@@ -394,27 +384,51 @@ fn appended(offset: u64, next_offset: u64) -> StreamResponse {
         offset,
         next_offset,
         closed: false,
-        deduplicated: false,
         producer: None,
-        receipt_evicted: false,
     }
 }
 
-/// An `Appended` response acknowledged for `producer`.
+/// An `Appended` response to `producer`'s write at `offset..next_offset`,
+/// applied now or, when `repeat`, before. `producer` is the epoch's
+/// highest applied write.
 fn appended_by(
     producer: ProducerRequest,
     offset: u64,
     next_offset: u64,
     closed: bool,
-    deduplicated: bool,
+    repeat: bool,
 ) -> StreamResponse {
+    appended_ack(producer, offset, next_offset, closed, repeat, None)
+}
+
+/// [`appended_by`] for a claim that closed `closed_epoch`.
+fn appended_ack(
+    producer: ProducerRequest,
+    offset: u64,
+    next_offset: u64,
+    closed: bool,
+    repeat: bool,
+    closed_epoch: Option<ClosedEpoch>,
+) -> StreamResponse {
+    let receipt = WriteReceipt {
+        start_offset: offset,
+        next_offset,
+        closed,
+    };
     StreamResponse::Appended {
         offset,
         next_offset,
         closed,
-        deduplicated,
-        producer: Some(producer),
-        receipt_evicted: false,
+        producer: Some(ProducerAck {
+            epoch: producer.producer_epoch,
+            seq: producer.producer_seq,
+            closed_epoch,
+            delivery: if repeat {
+                ProducerDelivery::Repeat(receipt)
+            } else {
+                ProducerDelivery::Applied(receipt)
+            },
+        }),
     }
 }
 
@@ -785,6 +799,7 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_id: id.to_owned(),
         producer_epoch: epoch,
         producer_seq: seq,
+        digest: None,
     }
 }
 
@@ -2425,18 +2440,25 @@ fn snapshot_entry(
         external_segments: Vec::new(),
         visible_snapshot: None,
         producer_states,
+        retired_epoch_watermark: None,
     }
 }
 
 fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
     ProducerSnapshot {
         producer_id: "writer-1".to_owned(),
-        producer_epoch: epoch,
-        producer_seq: 0,
-        last_start_offset: 0,
-        last_next_offset: 0,
-        last_closed: false,
-        receipts: Vec::new(),
+        epoch,
+        last_seq: 0,
+        claim_digest: None,
+        newest: ProducerReceipt {
+            receipt: WriteReceipt {
+                start_offset: 0,
+                next_offset: 0,
+                closed: false,
+            },
+            digest: None,
+        },
+        closed_epoch: None,
         last_seen_ms: 0,
     }
 }
@@ -2543,16 +2565,13 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             offset: 0,
             next_offset: 3,
             closed: true,
-            deduplicated: false,
             producer: None,
-            receipt_evicted: false,
         }
     );
     assert_eq!(
         machine.apply(close_cmd(stream("s-1"))),
         StreamResponse::Closed {
             next_offset: 3,
-            deduplicated: false,
             producer: None,
         }
     );
@@ -2640,19 +2659,26 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             producer: Some(producer("writer-1", 1, 0)),
             ..Append::default()
         })),
-        appended_by(producer("writer-1", 1, 0), 1, 2, false, false)
+        appended_ack(
+            producer("writer-1", 1, 0),
+            1,
+            2,
+            false,
+            false,
+            Some(ClosedEpoch { epoch: 0, seq: 0 })
+        )
     );
     assert_error_code(
         machine.apply(append_cmd(stream("producer-stream"), b"stale", Append {
             producer: Some(producer("writer-1", 0, 1)),
             ..Append::default()
         })),
-        StreamErrorCode::ProducerEpochStale,
+        StreamErrorCode::ProducerEpochClosed,
     );
 }
 
 #[test]
-fn producer_delayed_retry_returns_its_original_receipt() {
+fn producer_delayed_retry_of_an_older_write_is_receipt_evicted() {
     let mut machine = machine();
     create_stream(&mut machine, "producer-delayed-retry");
 
@@ -2681,7 +2707,19 @@ fn producer_delayed_retry_returns_its_original_receipt() {
                 ..Append::default()
             }
         )),
-        appended_by(producer("writer-1", 0, 0), 0, 1, false, true)
+        // One receipt per producer (#581 section 2.7): the older write's
+        // range is not kept; the tail stands in and `seq` is the highest.
+        StreamResponse::Appended {
+            offset: 2,
+            next_offset: 2,
+            closed: false,
+            producer: Some(ProducerAck {
+                epoch: 0,
+                seq: 1,
+                closed_epoch: None,
+                delivery: ProducerDelivery::Evicted,
+            }),
+        }
     );
     assert_eq!(
         machine
@@ -2702,26 +2740,25 @@ fn producer_state_survives_snapshot_restore() {
             ..Append::default()
         })),
         StreamResponse::Appended {
-            deduplicated: false,
+            producer: Some(ProducerAck {
+                delivery: ProducerDelivery::Applied(_),
+                ..
+            }),
             ..
         }
     ));
 
     let snapshot = machine.snapshot();
     assert_eq!(snapshot.streams[0].producer_states.len(), 1);
-    // F3: the response lives in the producer's bounded receipt window.
+    // F3: the record keeps its newest write's receipt.
     let producer_state = &snapshot.streams[0].producer_states[0];
     assert_eq!(
-        producer_state
-            .receipts
-            .iter()
-            .map(|receipt| (
-                receipt.producer_seq,
-                receipt.start_offset,
-                receipt.next_offset
-            ))
-            .collect::<Vec<_>>(),
-        vec![(0, 0, 1)]
+        (producer_state.last_seq, producer_state.newest.receipt),
+        (0, WriteReceipt {
+            start_offset: 0,
+            next_offset: 1,
+            closed: false,
+        })
     );
     let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
 
@@ -2733,7 +2770,10 @@ fn producer_state_survives_snapshot_restore() {
         StreamResponse::Appended {
             offset: 0,
             next_offset: 1,
-            deduplicated: true,
+            producer: Some(ProducerAck {
+                delivery: ProducerDelivery::Repeat(_),
+                ..
+            }),
             ..
         }
     ));
@@ -3004,9 +3044,7 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             offset: 0,
             next_offset: 5,
             closed: true,
-            deduplicated: false,
             producer: None,
-            receipt_evicted: false,
         }
     );
 
@@ -3305,7 +3343,14 @@ proptest! {
                 false,
                 Some(producer("writer-1", 1, 0)),
             ),
-            appended_by(producer("writer-1", 1, 0), first_len, combined_len, false, false)
+            appended_ack(
+                producer("writer-1", 1, 0),
+                first_len,
+                combined_len,
+                false,
+                false,
+                Some(ClosedEpoch { epoch: 0, seq: 0 })
+            )
         );
         let stale_response = append_payload(
             &mut machine,
@@ -3318,7 +3363,7 @@ proptest! {
             matches!(
                 stale_response,
                 StreamResponse::Error {
-                    code: StreamErrorCode::ProducerEpochStale,
+                    code: StreamErrorCode::ProducerEpochClosed,
                     ..
                 }
             ),
@@ -4068,7 +4113,6 @@ fn f14g_external_create_keeps_its_payload_in_state_for_gc() {
             record_ends: Vec::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,

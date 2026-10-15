@@ -256,7 +256,7 @@ mod tests {
             retained_offset: 0,
             visible_snapshot: None,
             producers: HashMap::new(),
-            receipt_window: Default::default(),
+            retired_epoch_watermark: None,
             append_count: 0,
         }
     }

@@ -14,6 +14,9 @@ message ProducerRequestV1 {
   string producer_id = 1;
   uint64 producer_epoch = 2;
   uint64 producer_seq = 3;
+  // BLAKE3-256 of the write's body (Producer-Digest), 32 bytes, verified by
+  // the proposer. Part of the write's identity when present.
+  optional bytes digest = 4;
 }
 
 message ExternalPayloadRefV1 {

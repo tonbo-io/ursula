@@ -10,6 +10,9 @@ readme.workspace = true
 description = "Shared protobuf wire types for Ursula (stream commands, cold chunk refs, Raft RPC payloads)."
 
 [dependencies]
+# `serde` for the `bytes` fields of the protobuf types that commands carry
+# through serde (`ProducerRequestV1.digest`).
+bytes = { workspace = true, features = ["serde"] }
 prost = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

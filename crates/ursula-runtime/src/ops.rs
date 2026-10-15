@@ -203,6 +203,13 @@ macro_rules! runtime_operations {
                 handle { call open_live_read(engine, metrics, request, placement) }
                 client { stream fn queue_open_live_read }
             }
+            op ProducerEarlyAnswer {
+                fields { request: ProducerEarlyAnswerRequest }
+                reply { response_tx: Option<ursula_stream::ProducerEarlyAnswer> }
+                guard { none }
+                handle { call producer_early_answer(engine, metrics, request, placement) }
+                client { pub stream fn producer_early_answer }
+            }
             op AcceptsLocalWrites {
                 fields {}
                 reply { response_tx: bool }

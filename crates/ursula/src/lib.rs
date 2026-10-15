@@ -47,6 +47,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
+use axum::body::HttpBody;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::OriginalUri;
 use axum::extract::Path;
@@ -85,6 +86,14 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
+use ursula_headers::HeaderError as ProducerHeaderError;
+use ursula_headers::IncarnationPrecondition;
+use ursula_headers::ProducerAnswer;
+use ursula_headers::ProducerRequestHeaders;
+use ursula_headers::ProducerWrite;
+use ursula_headers::names;
+use ursula_headers::value::Epoch;
+use ursula_headers::value::Incarnation;
 use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
@@ -113,6 +122,7 @@ use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::CloseStreamResponse;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::CreateStreamResponse;
@@ -124,6 +134,8 @@ use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::LiveReadOwner;
 use ursula_runtime::PlanColdFlushRequest;
+use ursula_runtime::ProducerEarlyAnswer;
+use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
@@ -151,7 +163,7 @@ use crate::render::insert_lifetime_headers;
 use crate::render::insert_location;
 use crate::render::insert_offset;
 use crate::render::insert_padded_offset;
-use crate::render::insert_producer_ack;
+use crate::render::insert_producer_answer;
 use crate::render::insert_producer_error_headers;
 use crate::render::insert_snapshot_digest;
 use crate::render::insert_snapshot_offset;
@@ -162,6 +174,8 @@ use crate::render::insert_u64_header;
 use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
+use crate::render::producer_ack_answer;
+use crate::render::producer_answer_failed;
 use crate::render::read_response;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
@@ -174,26 +188,15 @@ use crate::render::sse_safe_line;
 type BoxResponse = Box<Response>;
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
-const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
-const HEADER_STREAM_INCARNATION: &str = "stream-incarnation";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
-const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
-const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
-const HEADER_STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
-const HEADER_STREAM_RETAINED_OFFSET: &str = "stream-retained-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
-const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
-const HEADER_PRODUCER_ID: &str = "producer-id";
-const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
-const HEADER_PRODUCER_SEQ: &str = "producer-seq";
 const HEADER_X_CONTENT_TYPE_OPTIONS: &str = "x-content-type-options";
 const HEADER_CROSS_ORIGIN_RESOURCE_POLICY: &str = "cross-origin-resource-policy";
-const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 #[cfg(feature = "jemalloc-prof")]
 const HEADER_URSULA_DEBUG_TOKEN: &str = "x-ursula-debug-token";
 // tikv-jemalloc-sys forces the `_rjem_` symbol prefix on Apple targets, so
@@ -260,7 +263,6 @@ struct CreateStreamHttpResponseInput<'a> {
     content_type: &'a str,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
-    producer: Option<&'a ProducerRequest>,
 }
 
 pub trait WallClock: Send + Sync + 'static {
@@ -629,7 +631,7 @@ impl ClientWriteLeaderRouter {
         } else {
             return None;
         }
-        insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, leader_id);
+        insert_u64_header(&mut headers, names::X_URSULA_RAFT_LEADER_ID, leader_id);
         Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
     }
 }
@@ -1438,7 +1440,6 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         content_type,
         stream_ttl_seconds,
         stream_expires_at_ms,
-        producer,
     } = input;
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -1447,9 +1448,8 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     insert_location(&mut headers, stream_id);
     insert_incarnation(&mut headers, response.incarnation);
     insert_lifetime_headers(&mut headers, stream_ttl_seconds, stream_expires_at_ms);
-    insert_producer_ack(&mut headers, producer);
     if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     }
     let status = if response.already_exists {
         StatusCode::OK
@@ -1462,22 +1462,39 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
 pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    // A duplicate beyond the receipt window (bounded-state F3) is answered
-    // `204` with `Producer-Seq` and without a byte range.
-    if !response.receipt_evicted {
-        insert_offset(&mut headers, response.next_offset);
-    }
     insert_incarnation(&mut headers, response.incarnation);
-    insert_producer_ack(&mut headers, response.producer.as_ref());
-    if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+    if let Some(ack) = response.producer.as_ref() {
+        let answer = match producer_ack_answer(ack, response.incarnation) {
+            Ok(answer) => answer,
+            Err(err) => return producer_answer_failed(&err),
+        };
+        let status = StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::NO_CONTENT);
+        insert_producer_answer(&mut headers, &answer);
+        return (status, headers).into_response();
     }
-    let status = if response.producer.is_some() && !response.deduplicated {
-        StatusCode::OK
-    } else {
-        StatusCode::NO_CONTENT
-    };
-    (status, headers).into_response()
+    insert_offset(&mut headers, response.next_offset);
+    if response.closed {
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
+    }
+    (StatusCode::NO_CONTENT, headers).into_response()
+}
+
+/// The answer to a close: `204`, with the producer write's receipt when the
+/// close carried producer headers. A close-only write answers `204` whether
+/// it applied now or before, as the base protocol requires.
+pub(crate) fn close_http_response(response: &CloseStreamResponse) -> Response {
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_offset(&mut headers, response.next_offset);
+    insert_incarnation(&mut headers, response.incarnation);
+    if let Some(ack) = response.producer.as_ref() {
+        match producer_ack_answer(ack, response.incarnation) {
+            Ok(answer) => insert_producer_answer(&mut headers, &answer),
+            Err(err) => return producer_answer_failed(&err),
+        }
+    }
+    insert_static(&mut headers, names::STREAM_CLOSED, "true");
+    (StatusCode::NO_CONTENT, headers).into_response()
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
@@ -2706,13 +2723,23 @@ pub(crate) async fn create_stream_by_id(
     };
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
-    let producer = match producer_request(&request_headers) {
-        Ok(producer) => producer,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    request.producer = producer.clone();
+    // A create carries no producer headers (#581 section 3): keyed bytes
+    // enter a stream only through claims and appends.
+    match parse_producer_headers(&request_headers) {
+        Ok(ProducerRequestHeaders { producer: None, .. }) => {}
+        Ok(ProducerRequestHeaders {
+            producer: Some(_), ..
+        }) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "a create carries no producer headers: create the stream, then claim an epoch",
+            )
+                .into_response();
+        }
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    }
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
-        return create_stream_external_by_id(state, request_target, request, producer).await;
+        return create_stream_external_by_id(state, request_target, request).await;
     }
 
     match state.runtime.create_stream(request).await {
@@ -2722,7 +2749,6 @@ pub(crate) async fn create_stream_by_id(
             content_type: &content_type,
             stream_ttl_seconds,
             stream_expires_at_ms,
-            producer: producer.as_ref(),
         }),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
@@ -2732,7 +2758,6 @@ pub(crate) async fn create_stream_external_by_id(
     state: HttpState,
     request_target: String,
     mut request: CreateStreamRequest,
-    producer: Option<ProducerRequest>,
 ) -> Response {
     let stream_id = request.stream_id.clone();
     let content_type = request.content_type.clone();
@@ -2761,7 +2786,6 @@ pub(crate) async fn create_stream_external_by_id(
                 content_type: &content_type,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                producer: producer.as_ref(),
             })
         }
         Err(err) => {
@@ -2774,12 +2798,114 @@ pub(crate) async fn create_stream_external_by_id(
 pub(crate) async fn append_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
+    version: Version,
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
+    if let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await {
+        return answer_before_body(answer, version, &headers, body).await;
+    }
+    let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return unreadable_body_response(&err),
+    };
     append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
+}
+
+/// The answer to a tokened producer write that its head alone decides
+/// (#581 section 2.5, W7): a repeat of a write that applied under the
+/// request's `Stream-Incarnation` (`204` with its receipt, or
+/// `receipt-evicted`), or a key conflict (`403`). Only the group's leader
+/// answers, from its applied state. `None` for every other write, which is
+/// read, proposed and decided at apply, as is any write whose head is
+/// malformed or whose early answer failed.
+async fn producer_early_answer(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let ProducerRequestHeaders {
+        producer: Some(write),
+        precondition: Some(IncarnationPrecondition { incarnation }),
+    } = parse_producer_headers(headers).ok()?
+    else {
+        return None;
+    };
+    let incarnation = incarnation.get();
+    let request = ProducerEarlyAnswerRequest {
+        stream_id: stream_id.clone(),
+        producer: producer_request(write),
+        incarnation,
+        now_ms: state.unix_time_ms(),
+    };
+    let answer = match state.runtime.producer_early_answer(request).await {
+        Ok(answer) => answer?,
+        Err(err) => {
+            tracing::debug!(error = %err, "no early answer; the write is read and proposed");
+            return None;
+        }
+    };
+    let answer = match answer {
+        ProducerEarlyAnswer::Repeat(ack) => producer_ack_answer(&ack, incarnation),
+        ProducerEarlyAnswer::KeyConflict { epoch } => {
+            Epoch::try_from(epoch).map(|epoch| ProducerAnswer::KeyConflict { epoch })
+        }
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => return Some(producer_answer_failed(&err)),
+    };
+    let mut response_headers = HeaderMap::new();
+    insert_default_response_headers(&mut response_headers);
+    insert_incarnation(&mut response_headers, incarnation);
+    insert_producer_answer(&mut response_headers, &answer);
+    let status = StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::NO_CONTENT);
+    Some((status, response_headers).into_response())
+}
+
+/// Sends an answer decided before the body was read (addendum A3 on #581).
+/// On HTTP/2 the answer goes first and the server ends the request stream
+/// (`RST_STREAM(NO_ERROR)`). A client that sent `Expect: 100-continue` gets
+/// no `100 Continue` and sends no body. On HTTP/1.1 otherwise the body is
+/// read and dropped within the request limit and the gateway's drain
+/// bounds, so the connection carries the next request; past them the
+/// connection closes after the answer.
+async fn answer_before_body(
+    mut response: Response,
+    version: Version,
+    headers: &HeaderMap,
+    body: Body,
+) -> Response {
+    let expects_continue = headers
+        .get(axum::http::header::EXPECT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
+    if version >= Version::HTTP_2 || expects_continue || body.is_end_stream() {
+        return response;
+    }
+    if ursula_gateway::drain(body, MAX_HTTP_BODY_BYTES).await != ursula_gateway::Drained::Whole {
+        response.headers_mut().insert(
+            axum::http::header::CONNECTION,
+            HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+/// `413` for a body over the request limit, `400` for one that failed.
+fn unreadable_body_response(err: &axum::Error) -> Response {
+    let over_limit = std::error::Error::source(err)
+        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+    if over_limit {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        format!("request body unreadable: {err}"),
+    )
+        .into_response()
 }
 
 #[tracing::instrument(
@@ -2803,11 +2929,11 @@ pub(crate) async fn append_stream_by_id(
     };
     let close_after = stream_closed(&headers);
 
+    let producer = match producer_write(&headers, &body) {
+        Ok(producer) => producer,
+        Err(response) => return *response,
+    };
     if body.is_empty() && close_after {
-        let producer = match producer_request(&headers) {
-            Ok(producer) => producer,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
         let stream_seq = match stream_seq(&headers) {
             Ok(stream_seq) => stream_seq,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -2823,15 +2949,7 @@ pub(crate) async fn append_stream_by_id(
             })
             .await
         {
-            Ok(response) => {
-                let mut headers = HeaderMap::new();
-                insert_default_response_headers(&mut headers);
-                insert_offset(&mut headers, response.next_offset);
-                insert_incarnation(&mut headers, response.incarnation);
-                insert_producer_ack(&mut headers, producer.as_ref());
-                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
-                (StatusCode::NO_CONTENT, headers).into_response()
-            }
+            Ok(response) => close_http_response(&response),
             Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         };
     }
@@ -2857,11 +2975,7 @@ pub(crate) async fn append_stream_by_id(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     request.now_ms = state.unix_time_ms();
-    let producer = match producer_request(&headers) {
-        Ok(producer) => producer,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    request.producer = producer.clone();
+    request.producer = producer;
 
     if should_externalize_payload(&state, request.payload.len(), true) {
         return append_stream_external_by_id(state, request_target, request).await;
@@ -2890,7 +3004,7 @@ pub(crate) async fn append_stream_external_by_id(
         AppendExternalRequest::from_append_request(request, external_payload, record_ends);
     match state.runtime.append_external(external_request).await {
         Ok(response) => {
-            if response.deduplicated {
+            if response.deduplicated() {
                 // The original append committed with its own object; this
                 // retry's object is referenced by nothing (F5 cleanup rule).
                 delete_unreferenced_staged_payload(&state, &external_path).await;
@@ -2990,7 +3104,7 @@ pub(crate) async fn head_stream_by_id(
                 HEADER_STREAM_COLD_HOT_START_OFFSET,
                 response.cold_hot_start_offset,
             );
-            insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+            insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
             insert_cache_control(&mut headers, "no-store");
             insert_lifetime_headers(
                 &mut headers,
@@ -3005,12 +3119,12 @@ pub(crate) async fn head_stream_by_id(
             }
             insert_padded_offset(
                 &mut headers,
-                HEADER_STREAM_RETAINED_OFFSET,
+                names::STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
             insert_incarnation(&mut headers, response.created_at_ms);
             if response.closed {
-                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+                insert_static(&mut headers, names::STREAM_CLOSED, "true");
             }
             (StatusCode::OK, headers).into_response()
         }
@@ -3398,7 +3512,7 @@ pub(crate) async fn advance_retention(
             insert_default_response_headers(&mut headers);
             insert_padded_offset(
                 &mut headers,
-                HEADER_STREAM_RETAINED_OFFSET,
+                names::STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
             insert_incarnation(&mut headers, response.incarnation);
@@ -3644,10 +3758,10 @@ pub(crate) async fn long_poll_stream(
             insert_offset(&mut headers, offset);
             insert_incarnation(&mut headers, head.created_at_ms);
             if at_tail {
-                insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+                insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
             }
             if at_tail && head.closed {
-                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+                insert_static(&mut headers, names::STREAM_CLOSED, "true");
             } else {
                 insert_cursor(
                     &mut headers,
@@ -3923,7 +4037,7 @@ pub(crate) fn parse_stream_expires_at(raw: &str) -> Result<u64, String> {
 /// token the server could have issued (one canonical decimal integer) is
 /// malformed and answers 400, as do repeated values.
 pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
-    let mut values = headers.get_all(HEADER_STREAM_INCARNATION).iter();
+    let mut values = headers.get_all(names::STREAM_INCARNATION).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
@@ -3935,10 +4049,9 @@ pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64
     let Some(value) = value.to_str().ok().map(str::trim) else {
         return Err(malformed());
     };
-    match value.parse::<u64>() {
-        Ok(incarnation) if incarnation.to_string() == value => Ok(Some(incarnation)),
-        _ => Err(malformed()),
-    }
+    Incarnation::parse(names::STREAM_INCARNATION, value)
+        .map(|incarnation| Some(incarnation.get()))
+        .map_err(|_malformed| malformed())
 }
 
 /// A read's `Stream-Incarnation` precondition (D12), checked against the
@@ -3961,7 +4074,7 @@ fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Respon
 
 pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
     headers
-        .get(HEADER_STREAM_CLOSED)
+        .get(names::STREAM_CLOSED)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
@@ -3993,40 +4106,53 @@ pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> 
     Ok(Some(value.to_owned()))
 }
 
-pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerRequest>, String> {
-    let producer_id = header_value(headers, HEADER_PRODUCER_ID);
-    let producer_epoch = header_value(headers, HEADER_PRODUCER_EPOCH);
-    let producer_seq = header_value(headers, HEADER_PRODUCER_SEQ);
-    let present = [
-        producer_id.is_some(),
-        producer_epoch.is_some(),
-        producer_seq.is_some(),
-    ];
-    if present.iter().all(|value| !*value) {
-        return Ok(None);
-    }
-    if !present.iter().all(|value| *value) {
-        return Err(
-            "producer-id, producer-epoch, and producer-seq must be provided together".to_owned(),
-        );
-    }
+/// The write-key headers of a request (#581 section 2.2), parsed by the
+/// shared header crate so the server and its clients cannot drift.
+pub(crate) fn parse_producer_headers(
+    headers: &HeaderMap,
+) -> Result<ProducerRequestHeaders, ProducerHeaderError> {
+    ProducerRequestHeaders::parse(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+}
 
-    let producer_id = producer_id.expect("checked present");
-    if producer_id.trim().is_empty() {
-        return Err("producer-id must not be empty".to_owned());
+/// The replicated form of a parsed producer key.
+fn producer_request(write: ProducerWrite) -> ProducerRequest {
+    ProducerRequest {
+        producer_id: write.id.as_str().to_owned(),
+        producer_epoch: write.epoch.get(),
+        producer_seq: write.seq.get(),
+        digest: write
+            .digest
+            .map(|digest| Bytes::copy_from_slice(digest.as_bytes())),
     }
-    check_write_identifier_len(HEADER_PRODUCER_ID, producer_id)?;
-    Ok(Some(ProducerRequest {
-        producer_id: producer_id.to_owned(),
-        producer_epoch: parse_producer_integer(
-            HEADER_PRODUCER_EPOCH,
-            producer_epoch.expect("checked present"),
-        )?,
-        producer_seq: parse_producer_integer(
-            HEADER_PRODUCER_SEQ,
-            producer_seq.expect("checked present"),
-        )?,
-    }))
+}
+
+/// A write's producer key with its `Producer-Digest` verified against
+/// `body`, the request body: `400` for malformed producer headers or a
+/// digest that does not match, so nothing is proposed. `None` for a write
+/// without a key.
+pub(crate) fn producer_write(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Option<ProducerRequest>, Box<Response>> {
+    let bad_request =
+        |message: String| Box::new((StatusCode::BAD_REQUEST, message).into_response());
+    let parsed = parse_producer_headers(headers).map_err(|err| bad_request(err.to_string()))?;
+    let Some(write) = parsed.producer else {
+        return Ok(None);
+    };
+    if let Some(digest) = write.digest
+        && blake3::hash(body).as_bytes() != digest.as_bytes()
+    {
+        return Err(bad_request(format!(
+            "{} does not match the request body",
+            ursula_headers::names::PRODUCER_DIGEST
+        )));
+    }
+    Ok(Some(producer_request(write)))
 }
 
 pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -4034,17 +4160,6 @@ pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-}
-
-pub(crate) fn parse_producer_integer(name: &str, raw: &str) -> Result<u64, String> {
-    const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-    let value = raw
-        .parse::<u64>()
-        .map_err(|_invalid| format!("{name} must be a non-negative integer"))?;
-    if value > MAX_JS_SAFE_INTEGER {
-        return Err(format!("{name} must be <= {MAX_JS_SAFE_INTEGER}"));
-    }
-    Ok(value)
 }
 
 fn runtime_error_response(err: RuntimeError) -> Response {
@@ -4156,3 +4271,5 @@ mod base_contract_tests;
 mod cold_snapshot_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
+#[cfg(test)]
+mod write_keys_tests;

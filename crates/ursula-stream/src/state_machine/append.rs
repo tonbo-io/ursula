@@ -3,8 +3,13 @@
 use super::AppendExternalInput;
 use super::AppendStreamInput;
 use super::BucketStreamId;
+use super::ClosedEpoch;
+use super::IncarnationCheck;
 use super::ObjectPayloadRef;
-use super::ProducerReceipt;
+use super::ProducerAck;
+use super::ProducerDelivery;
+use super::ProducerEarlyAnswer;
+use super::ProducerRefusal;
 use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamErrorCode;
@@ -13,14 +18,19 @@ use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
+use super::WriteReceipt;
 use super::canonical_json_record_ends;
+use super::producer_record::Evaluation;
+use super::producer_record::Refusal;
+use super::producer_record::WriteKey;
+use super::producer_record::evaluate;
+use super::producer_write_key;
 use super::renew_stream_ttl;
 use super::validate_external_payload_ref;
-use super::validate_producer_request;
 use super::validate_record_ends;
 
 impl StreamStateMachine {
-    /// Applies one append, then enforces the F3 receipt window once.
+    /// Applies one append, then enforces the F3 producer cap once.
     pub fn append_borrowed(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
         let enforce_on = input.producer.as_ref().map(|_| input.stream_id.clone());
         let now_ms = input.now_ms;
@@ -33,11 +43,9 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
+                check,
             } = input;
             if let Err(response) = self.validate_stream_scope(&stream_id) {
-                break 'append response;
-            }
-            if let Err(response) = validate_producer_request(producer.as_ref()) {
                 break 'append response;
             }
 
@@ -56,56 +64,17 @@ impl StreamStateMachine {
             if let Some(producer) = producer.as_ref() {
                 self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
             }
-            let producer_decision =
-                match self.evaluate_producer(&stream_id, producer.as_ref(), now_ms) {
-                    Ok(decision) => decision,
-                    Err(response) => break 'append response,
-                };
-            if let ProducerDecision::DuplicateEvicted { producer } = producer_decision {
-                let (tail, closed) = self
-                    .stream_metadata(&stream_id)
-                    .map_or((0, false), |stream| {
-                        (stream.tail_offset, stream.status == StreamStatus::Closed)
-                    });
-                if payload.is_empty() {
-                    break 'append StreamResponse::Closed {
-                        next_offset: tail,
-                        deduplicated: true,
-                        producer: Some(producer),
-                    };
+            let gate = match self.producer_gate(&stream_id, producer.as_ref(), check, now_ms) {
+                Ok(gate) => gate,
+                Err(response) => break 'append response,
+            };
+            let gate = match gate {
+                ProducerGate::Repeat(ack) => {
+                    break 'append self.repeat_response(&stream_id, ack, payload.is_empty());
                 }
-                break 'append StreamResponse::Appended {
-                    offset: tail,
-                    next_offset: tail,
-                    closed,
-                    deduplicated: true,
-                    producer: Some(producer),
-                    receipt_evicted: true,
-                };
-            }
-            if let ProducerDecision::Duplicate {
-                offset,
-                next_offset,
-                closed,
-                producer,
-            } = producer_decision
-            {
-                if payload.is_empty() {
-                    break 'append StreamResponse::Closed {
-                        next_offset,
-                        deduplicated: true,
-                        producer: Some(producer),
-                    };
-                }
-                break 'append StreamResponse::Appended {
-                    offset,
-                    next_offset,
-                    closed,
-                    deduplicated: true,
-                    producer: Some(producer),
-                    receipt_evicted: false,
-                };
-            }
+                ProducerGate::Unkeyed => None,
+                ProducerGate::Apply(key, advance) => Some((key, advance)),
+            };
 
             let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
             let record_ends = match content_type {
@@ -129,7 +98,6 @@ impl StreamStateMachine {
                 if close_after && payload.is_empty() {
                     break 'append StreamResponse::Closed {
                         next_offset: stream.tail_offset,
-                        deduplicated: false,
                         producer: None,
                     };
                 }
@@ -183,24 +151,25 @@ impl StreamStateMachine {
             let closed = stream.status == StreamStatus::Closed;
             let next_offset = stream.tail_offset;
             self.refresh_ttl_entry(&stream_id);
-            let producer_ack = producer.clone();
-            if let Some(producer) = producer {
-                self.record_producer_success(
-                    stream_id.clone(),
-                    producer,
-                    now_ms,
-                    ProducerReceiptRange {
+            let producer_ack = match (producer, gate) {
+                (Some(producer), Some((key, advance))) => Some(self.record_producer_success(
+                    &stream_id,
+                    producer.producer_id,
+                    key,
+                    advance,
+                    WriteReceipt {
                         start_offset: offset,
                         next_offset,
                         closed,
                     },
-                );
-            }
+                    now_ms,
+                )),
+                _ => None,
+            };
 
             if payload.is_empty() {
                 StreamResponse::Closed {
                     next_offset,
-                    deduplicated: false,
                     producer: producer_ack,
                 }
             } else {
@@ -219,14 +188,12 @@ impl StreamStateMachine {
                     offset,
                     next_offset,
                     closed: close_after,
-                    deduplicated: false,
                     producer: producer_ack,
-                    receipt_evicted: false,
                 }
             }
         };
         if let Some(stream_id) = enforce_on {
-            self.enforce_producer_window(&stream_id, now_ms);
+            self.enforce_producer_cap(&stream_id, now_ms);
         }
         response
     }
@@ -236,7 +203,7 @@ impl StreamStateMachine {
         let now_ms = input.now_ms;
         let response = self.append_external_unenforced(input);
         if let Some(stream_id) = enforce_on {
-            self.enforce_producer_window(&stream_id, now_ms);
+            self.enforce_producer_cap(&stream_id, now_ms);
         }
         response
     }
@@ -251,14 +218,12 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            check,
         } = input;
         if let Err(response) = validate_external_payload_ref(&payload) {
             return response;
         }
         if let Err(response) = self.validate_stream_scope(&stream_id) {
-            return response;
-        }
-        if let Err(response) = validate_producer_request(producer.as_ref()) {
             return response;
         }
         let Some(_) = self.stream_metadata(&stream_id) else {
@@ -276,42 +241,12 @@ impl StreamStateMachine {
         if let Some(producer) = producer.as_ref() {
             self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
         }
-        let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref(), now_ms)
-        {
-            Ok(decision) => decision,
+        let gate = match self.producer_gate(&stream_id, producer.as_ref(), check, now_ms) {
+            Ok(ProducerGate::Repeat(ack)) => return self.repeat_response(&stream_id, ack, false),
+            Ok(ProducerGate::Unkeyed) => None,
+            Ok(ProducerGate::Apply(key, advance)) => Some((key, advance)),
             Err(response) => return response,
         };
-        if let ProducerDecision::DuplicateEvicted { producer } = producer_decision {
-            let (tail, closed) = self
-                .stream_metadata(&stream_id)
-                .map_or((0, false), |stream| {
-                    (stream.tail_offset, stream.status == StreamStatus::Closed)
-                });
-            return StreamResponse::Appended {
-                offset: tail,
-                next_offset: tail,
-                closed,
-                deduplicated: true,
-                producer: Some(producer),
-                receipt_evicted: true,
-            };
-        }
-        if let ProducerDecision::Duplicate {
-            offset,
-            next_offset,
-            closed,
-            producer,
-        } = producer_decision
-        {
-            return StreamResponse::Appended {
-                offset,
-                next_offset,
-                closed,
-                deduplicated: true,
-                producer: Some(producer),
-                receipt_evicted: false,
-            };
-        }
 
         let Some(stream) = self.stream_metadata(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
@@ -363,19 +298,21 @@ impl StreamStateMachine {
         }
         let closed = stream.status == StreamStatus::Closed;
         self.refresh_ttl_entry(&stream_id);
-        let producer_ack = producer.clone();
-        if let Some(producer) = producer {
-            self.record_producer_success(
-                stream_id.clone(),
-                producer,
-                now_ms,
-                ProducerReceiptRange {
+        let producer_ack = match (producer, gate) {
+            (Some(producer), Some((key, advance))) => Some(self.record_producer_success(
+                &stream_id,
+                producer.producer_id,
+                key,
+                advance,
+                WriteReceipt {
                     start_offset: offset,
                     next_offset,
                     closed,
                 },
-            );
-        }
+                now_ms,
+            )),
+            _ => None,
+        };
         let object = ObjectPayloadRef {
             start_offset: offset,
             end_offset: next_offset,
@@ -400,56 +337,116 @@ impl StreamStateMachine {
             offset,
             next_offset,
             closed: close_after,
-            deduplicated: false,
             producer: producer_ack,
-            receipt_evicted: false,
         }
     }
 
-    /// Read-only: whether an append from `producer` would be
-    /// answered as a duplicate without mutating the stream. Lets admission
-    /// control bypass backpressure for idempotent retries without previewing
-    /// the write on a copy of the group (F9).
+    /// Read-only: whether a write from `producer` would be answered as a
+    /// repeat of a write that applied before, without mutating the stream.
+    /// Lets admission control bypass backpressure for idempotent retries
+    /// without previewing the write on a copy of the group (F9).
     pub fn append_would_deduplicate(
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
+        check: IncarnationCheck,
         now_ms: u64,
     ) -> bool {
-        if producer.is_none()
-            || self.validate_stream_scope(stream_id).is_err()
-            || validate_producer_request(producer).is_err()
-            || !self.stream_is_live(stream_id, now_ms)
-        {
-            return false;
-        }
-        matches!(
-            self.evaluate_producer(stream_id, producer, now_ms),
-            Ok(ProducerDecision::Duplicate { .. } | ProducerDecision::DuplicateEvicted { .. })
-        )
+        self.stream_is_live(stream_id, now_ms)
+            && self.validate_stream_scope(stream_id).is_ok()
+            && matches!(
+                self.producer_gate(stream_id, producer, check, now_ms),
+                Ok(ProducerGate::Repeat(_))
+            )
     }
 
-    fn evaluate_producer(
+    /// Read-only: the answer to a tokened producer write that does not
+    /// depend on its body (#581 section 2.5, W7): a repeat of a write that
+    /// applied under `incarnation` (rows 9 and 10), or a key conflict
+    /// (row 8). `None` when the write must be read and proposed: the stream
+    /// is another incarnation or gone, or any other row decides.
+    pub fn producer_early_answer(
+        &self,
+        stream_id: &BucketStreamId,
+        producer: &ProducerRequest,
+        incarnation: u64,
+        now_ms: u64,
+    ) -> Option<ProducerEarlyAnswer> {
+        if !self.stream_is_live(stream_id, now_ms)
+            || self.validate_stream_scope(stream_id).is_err()
+            || self.stream_incarnation(stream_id) != Some(incarnation)
+        {
+            return None;
+        }
+        let key = producer_write_key(producer).ok()?;
+        match self.evaluate_write(
+            stream_id,
+            &producer.producer_id,
+            key,
+            IncarnationCheck::Matched,
+            now_ms,
+        )? {
+            Evaluation::Repeat(ack) => Some(ProducerEarlyAnswer::Repeat(ack)),
+            Evaluation::Refuse(Refusal::Producer(ProducerRefusal::KeyConflict { epoch })) => {
+                Some(ProducerEarlyAnswer::KeyConflict { epoch })
+            }
+            Evaluation::Claim { .. } | Evaluation::Next | Evaluation::Refuse(_) => None,
+        }
+    }
+
+    /// Evaluates the write `key` of `producer_id` (#581 section 2.3.1). An
+    /// idle record counts as retired, so a read-only caller sees the same
+    /// floor that apply's retirement raises. `None` when the stream is gone.
+    fn evaluate_write(
+        &self,
+        stream_id: &BucketStreamId,
+        producer_id: &str,
+        key: WriteKey,
+        check: IncarnationCheck,
+        now_ms: u64,
+    ) -> Option<Evaluation> {
+        let slot = self.stream_slot(stream_id)?;
+        let record = slot.producers.get(producer_id);
+        let (record, floor) = match record {
+            Some(record) if super::producers::producer_is_idle(record, now_ms) => (
+                None,
+                Some(
+                    slot.retired_epoch_watermark
+                        .map_or(record.epoch, |floor| floor.max(record.epoch)),
+                ),
+            ),
+            record => (record, slot.retired_epoch_watermark),
+        };
+        Some(evaluate(record, floor, key, check))
+    }
+
+    /// Evaluates a write's producer key before it applies. A refusal is the
+    /// `Err` response; nothing changed.
+    fn producer_gate(
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
+        check: IncarnationCheck,
         now_ms: u64,
-    ) -> Result<ProducerDecision, StreamResponse> {
+    ) -> Result<ProducerGate, StreamResponse> {
         let Some(producer) = producer else {
-            return Ok(ProducerDecision::Accept);
+            return Ok(ProducerGate::Unkeyed);
         };
-        let Some(states) = self.stream_slot(stream_id).map(|slot| &slot.producers) else {
-            return Ok(ProducerDecision::Accept);
+        let key = producer_write_key(producer)?;
+        let Some(evaluation) =
+            self.evaluate_write(stream_id, &producer.producer_id, key, check, now_ms)
+        else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            ));
         };
-        // F3: an idle producer is treated as absent at its own next write.
-        let state = states
-            .get(&producer.producer_id)
-            .filter(|state| !super::producers::producer_is_idle(state, now_ms));
-        let Some(state) = state else {
-            if producer.producer_seq == 0 {
-                // F3 producer cap: a new producer needs room, either below
-                // the cap or by evicting producers idle for an hour.
-                if let Some(slot) = self.stream_slot(stream_id)
+        match evaluation {
+            Evaluation::Claim { closes } => {
+                // F3 producer cap: a new producer needs room, either below the
+                // cap or by evicting producers idle for an hour.
+                if closes.is_none()
+                    && let Some(slot) = self.stream_slot(stream_id)
                     && !slot.producer_cap_admits(&producer.producer_id, now_ms)
                 {
                     return Err(StreamResponse::error(
@@ -460,172 +457,162 @@ impl StreamStateMachine {
                         ),
                     ));
                 }
-                return Ok(ProducerDecision::Accept);
+                Ok(ProducerGate::Apply(key, Advance::Claim { closes }))
             }
-            return Err(StreamResponse::error_with_context(
+            Evaluation::Next => Ok(ProducerGate::Apply(key, Advance::Next)),
+            Evaluation::Repeat(ack) => Ok(ProducerGate::Repeat(ack)),
+            Evaluation::Refuse(refusal) => {
+                Err(refusal_response(&producer.producer_id, key, refusal))
+            }
+        }
+    }
+
+    /// The answer to a repeat of a producer write that applied before: an
+    /// append's receipt, or a close's when the request carried no body.
+    fn repeat_response(
+        &self,
+        stream_id: &BucketStreamId,
+        ack: ProducerAck,
+        empty_body: bool,
+    ) -> StreamResponse {
+        let receipt = match ack.delivery {
+            ProducerDelivery::Applied(receipt) | ProducerDelivery::Repeat(receipt) => receipt,
+            // No range is kept: the tail stands in, and renders nothing.
+            ProducerDelivery::Evicted => {
+                let (tail, closed) = self
+                    .stream_metadata(stream_id)
+                    .map_or((0, false), |stream| {
+                        (stream.tail_offset, stream.status == StreamStatus::Closed)
+                    });
+                WriteReceipt {
+                    start_offset: tail,
+                    next_offset: tail,
+                    closed,
+                }
+            }
+        };
+        if empty_body {
+            return StreamResponse::Closed {
+                next_offset: receipt.next_offset,
+                producer: Some(ack),
+            };
+        }
+        StreamResponse::Appended {
+            offset: receipt.start_offset,
+            next_offset: receipt.next_offset,
+            closed: receipt.closed,
+            producer: Some(ack),
+        }
+    }
+
+    /// Records an applied producer write (rows 2, 6 and 12) and returns its
+    /// answer.
+    pub(super) fn record_producer_success(
+        &mut self,
+        stream_id: &BucketStreamId,
+        producer_id: String,
+        key: WriteKey,
+        advance: Advance,
+        receipt: WriteReceipt,
+        now_ms: u64,
+    ) -> ProducerAck {
+        let slot = self
+            .stream_slot_mut(stream_id)
+            .expect("stream existence checked before producer evaluation");
+        match advance {
+            Advance::Claim { closes } => {
+                let state = ProducerState::claimed(key, closes, receipt, now_ms);
+                let ack = state.applied_ack();
+                slot.producers.insert(producer_id, state);
+                ack
+            }
+            Advance::Next => {
+                let state = slot
+                    .producers
+                    .get_mut(&producer_id)
+                    .expect("row 12 evaluated against this record");
+                state.advance(key, receipt, now_ms);
+                state.applied_ack()
+            }
+        }
+    }
+}
+
+/// How an applied producer write changes its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Advance {
+    /// Rows 2 and 6.
+    Claim { closes: Option<ClosedEpoch> },
+    /// Row 12.
+    Next,
+}
+
+/// The outcome of evaluating a write's producer key before it applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProducerGate {
+    /// A write without producer headers.
+    Unkeyed,
+    /// The write applies.
+    Apply(WriteKey, Advance),
+    /// The key applied before (rows 9 and 10).
+    Repeat(ProducerAck),
+}
+
+/// The response to a refused producer write.
+fn refusal_response(producer_id: &str, key: WriteKey, refusal: Refusal) -> StreamResponse {
+    let refusal = match refusal {
+        Refusal::SeqGap { expected, received } => {
+            return StreamResponse::error_with_context(
                 StreamErrorCode::ProducerSeqConflict,
                 format!(
-                    "producer '{}' expected sequence 0, received {}",
-                    producer.producer_id, producer.producer_seq
+                    "producer '{producer_id}' expected sequence {expected}, received {received}"
                 ),
                 vec![StreamErrorContext::ProducerSeqConflict {
-                    expected_seq: 0,
-                    received_seq: producer.producer_seq,
+                    expected_seq: expected,
+                    received_seq: received,
                 }],
-            ));
-        };
-
-        if producer.producer_epoch < state.producer_epoch {
-            return Err(StreamResponse::error_with_context(
-                StreamErrorCode::ProducerEpochStale,
-                format!(
-                    "producer '{}' epoch {} is stale; current epoch is {}",
-                    producer.producer_id, producer.producer_epoch, state.producer_epoch
-                ),
-                vec![StreamErrorContext::ProducerEpochStale {
-                    current_epoch: state.producer_epoch,
-                }],
-            ));
+            );
         }
-        if producer.producer_epoch > state.producer_epoch {
-            if producer.producer_seq == 0 {
-                return Ok(ProducerDecision::Accept);
-            }
-            return Err(StreamResponse::error(
-                StreamErrorCode::InvalidProducer,
-                format!(
-                    "producer '{}' new epoch {} must start at sequence 0",
-                    producer.producer_id, producer.producer_epoch
-                ),
-            ));
-        }
-
-        if producer.producer_seq <= state.producer_seq {
-            let Some(receipt) = find_receipt(&state.receipts, producer.producer_seq) else {
-                // F3: beyond the receipt window a duplicate is still a
-                // duplicate (never accepted twice), answered without ranges.
-                return Ok(ProducerDecision::DuplicateEvicted {
-                    producer: ProducerRequest {
-                        producer_id: producer.producer_id.clone(),
-                        producer_epoch: state.producer_epoch,
-                        producer_seq: producer.producer_seq,
-                    },
-                });
-            };
-            return Ok(ProducerDecision::Duplicate {
-                offset: receipt.start_offset,
-                next_offset: receipt.next_offset,
-                closed: receipt.closed,
-                producer: ProducerRequest {
-                    producer_id: producer.producer_id.clone(),
-                    producer_epoch: state.producer_epoch,
-                    producer_seq: receipt.producer_seq,
-                },
-            });
-        }
-        // The duplicate branch above returned for `producer_seq <=
-        // state.producer_seq`, so `state.producer_seq < u64::MAX` here and the
-        // saturating add never clamps.
-        let expected_seq = state.producer_seq.saturating_add(1);
-        if producer.producer_seq == expected_seq {
-            return Ok(ProducerDecision::Accept);
-        }
-        Err(StreamResponse::error_with_context(
-            StreamErrorCode::ProducerSeqConflict,
+        Refusal::Producer(refusal) => refusal,
+    };
+    let (code, message) = match refusal {
+        ProducerRefusal::EpochClosed { epoch, closed, .. } => (
+            StreamErrorCode::ProducerEpochClosed,
             format!(
-                "producer '{}' expected sequence {expected_seq}, received {}",
-                producer.producer_id, producer.producer_seq
+                "producer '{producer_id}' epoch {} is closed after sequence {}; current epoch is {epoch}",
+                closed.epoch, closed.seq
             ),
-            vec![StreamErrorContext::ProducerSeqConflict {
-                expected_seq,
-                received_seq: producer.producer_seq,
-            }],
-        ))
-    }
-
-    fn record_producer_success(
-        &mut self,
-        stream_id: BucketStreamId,
-        producer: ProducerRequest,
-        now_ms: u64,
-        last: ProducerReceiptRange,
-    ) {
-        let receipt = ProducerReceipt {
-            producer_seq: producer.producer_seq,
-            start_offset: last.start_offset,
-            next_offset: last.next_offset,
-            closed: last.closed,
-        };
-        let Some(slot) = self.stream_slot_mut(&stream_id) else {
-            return;
-        };
-        if let Some(state) = slot.producers.get_mut(&producer.producer_id)
-            && state.producer_epoch == producer.producer_epoch
-        {
-            state.producer_seq = producer.producer_seq;
-            state.last_start_offset = last.start_offset;
-            state.last_next_offset = last.next_offset;
-            state.last_closed = last.closed;
-            // O(1) window update: the front is unchanged by a push and
-            // becomes evictable once the producer holds two receipts.
-            slot.receipt_window
-                .push_receipt(&producer.producer_id, state);
-            state.receipts.push_back(receipt);
-            state.last_seen_ms = now_ms;
-            return;
-        }
-        // A new producer or a new epoch: the previous state (and its
-        // receipts) is replaced.
-        slot.remove_producer(&producer.producer_id);
-        let state = ProducerState {
-            producer_epoch: producer.producer_epoch,
-            producer_seq: producer.producer_seq,
-            last_start_offset: last.start_offset,
-            last_next_offset: last.next_offset,
-            last_closed: last.closed,
-            receipts: std::collections::VecDeque::from([receipt]),
-            last_seen_ms: now_ms,
-        };
-        slot.receipt_window
-            .add_producer(&producer.producer_id, &state);
-        slot.producers.insert(producer.producer_id, state);
-    }
-}
-
-/// The byte range and closure an accepted producer write committed.
-struct ProducerReceiptRange {
-    start_offset: u64,
-    next_offset: u64,
-    closed: bool,
-}
-
-/// O(1) duplicate lookup (F3): within an epoch a producer's sequences are
-/// accepted only as `0, 1, 2, ...` and receipts are evicted from the front,
-/// so the receipt of `seq` sits at `seq - front.seq`.
-pub(super) fn find_receipt(
-    receipts: &std::collections::VecDeque<ProducerReceipt>,
-    seq: u64,
-) -> Option<&ProducerReceipt> {
-    let front = receipts.front()?;
-    seq.checked_sub(front.producer_seq)
-        .and_then(|index| usize::try_from(index).ok())
-        .and_then(|index| receipts.get(index))
-        .filter(|receipt| receipt.producer_seq == seq)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProducerDecision {
-    Accept,
-    Duplicate {
-        offset: u64,
-        next_offset: u64,
-        closed: bool,
-        producer: ProducerRequest,
-    },
-    /// A duplicate whose receipt the window evicted (F3).
-    DuplicateEvicted {
-        producer: ProducerRequest,
-    },
+        ),
+        ProducerRefusal::Expired { epoch } => (
+            StreamErrorCode::ProducerExpired,
+            format!(
+                "producer '{producer_id}' epoch {} is not remembered; claim an epoch above {epoch}",
+                key.epoch
+            ),
+        ),
+        ProducerRefusal::StaleEpoch { epoch } => (
+            StreamErrorCode::ProducerEpochStale,
+            format!(
+                "producer '{producer_id}' epoch {} is stale; current epoch is {epoch}",
+                key.epoch
+            ),
+        ),
+        ProducerRefusal::KeyConflict { epoch } => (
+            StreamErrorCode::ProducerKeyConflict,
+            format!(
+                "producer '{producer_id}' epoch {epoch} sequence {} holds a write with another identity",
+                key.seq
+            ),
+        ),
+        ProducerRefusal::EpochNotClaimed => (
+            StreamErrorCode::InvalidProducer,
+            format!(
+                "producer '{producer_id}' new epoch {} must start at sequence 0",
+                key.epoch
+            ),
+        ),
+    };
+    StreamResponse::error_with_context(code, message, vec![StreamErrorContext::Producer(refusal)])
 }
 
 fn check_stream_seq(stream: &StreamMetadata, incoming: Option<&str>) -> Result<(), StreamResponse> {

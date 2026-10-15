@@ -2,7 +2,7 @@
 //! bounded (8 MiB threshold) so producer state dominates. `--producers=P`
 //! round-robins over P producer ids; `--epoch-every=E` bumps each producer's
 //! epoch every E of its appends; `--retain-every=N` (W6) adds retention.
-//! The per-stream receipt window (F3) applies.
+//! Each producer record keeps one receipt (F3).
 //! The producer cap (F3) answers `ProducerLimit` to producers beyond 4,096
 //! that find no producer idle for an hour; the workload counts those
 //! rejections and retries the producer's sequence 0 on its next turn.
@@ -128,15 +128,13 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                 producer_id: producer_id.clone(),
                 producer_epoch: *e,
                 producer_seq: *s,
+                digest: None,
             };
             let now = smx::T0.saturating_add(n.saturating_mul(10));
             let record = payload::json_record(&mut rng, n, args.rec_bytes);
             starts.push(n, smx::tail(&m, &id));
             let response = smx::append(&mut m, &id, record, Some(producer), now);
-            if let StreamResponse::Appended {
-                deduplicated: true, ..
-            } = response
-            {
+            if response.is_producer_repeat() {
                 bail!("unexpected deduplication at append {n}");
             }
             if let StreamResponse::Error {
@@ -182,13 +180,11 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                             producer_id: p0.clone(),
                             producer_epoch: *e0,
                             producer_seq: retry_seq,
+                            digest: None,
                         }),
                         smx::T0.saturating_add(n.saturating_mul(10)),
                     );
-                    deduplicated = matches!(response, StreamResponse::Appended {
-                        deduplicated: true,
-                        ..
-                    });
+                    deduplicated = response.is_producer_repeat();
                 }
                 timing.push(json!({"retry_seq": label, "deduplicated": deduplicated,
                     "us_per_retry": round3(started.elapsed().as_secs_f64() * 1e6 / f64::from(reps))}));
@@ -218,8 +214,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
             outcome.metric_i64("heap_bytes", measured.heap.bytes);
             outcome.metric_u64("snapshot_bytes", measured.snap.total_bytes);
             outcome.metric_u64("snapshot_producer_bytes", measured.snap.producer_bytes);
-            outcome.metric_u64("receipts", measured.gauges.receipts);
-            outcome.metric_u64("receipt_items", measured.gauges.receipt_items);
+            outcome.metric_u64("receipts", measured.snap.receipt_count);
             outcome.metric_u64("producers", measured.gauges.producers);
             outcome.metric_u64("producer_bytes", measured.gauges.producer_bytes);
             outcome.metric_u64("producer_limit_rejections", producer_limit_rejections);

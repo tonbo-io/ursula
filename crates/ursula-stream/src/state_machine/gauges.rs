@@ -7,7 +7,6 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::ProducerReceipt;
 use super::ProducerState;
 use super::StreamStateMachine;
 use super::stream_expiry_at_ms;
@@ -33,13 +32,6 @@ pub struct GroupStateGauges {
     pub producers: u64,
     /// Largest producer map held by one stream.
     pub max_producers_per_stream: u64,
-    /// Producer receipts across streams (F3).
-    pub receipts: u64,
-    /// Receipts counted against the F3 window (one item per receipt; target:
-    /// 1,024 per stream beyond each producer's newest).
-    pub receipt_items: u64,
-    /// Largest receipt count held by one stream.
-    pub max_receipt_items_per_stream: u64,
     /// Length-based producer state bytes across streams (F3 `Prod(s)`).
     pub producer_bytes: u64,
     /// Largest length-based producer state of one stream.
@@ -67,17 +59,14 @@ fn as_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-fn producer_state_bytes(producer_id: &str, state: &ProducerState) -> u64 {
-    let bytes = producer_id
-        .len()
-        .saturating_add(std::mem::size_of::<ProducerState>())
-        .saturating_add(
-            state
-                .receipts
-                .len()
-                .saturating_mul(std::mem::size_of::<ProducerReceipt>()),
-        );
-    as_u64(bytes)
+/// One record: its id and a fixed-size record holding one receipt and up to
+/// two digests (#581 section 2.7).
+fn producer_state_bytes(producer_id: &str) -> u64 {
+    as_u64(
+        producer_id
+            .len()
+            .saturating_add(std::mem::size_of::<ProducerState>()),
+    )
 }
 
 impl StreamStateMachine {
@@ -112,18 +101,11 @@ impl StreamStateMachine {
             let producers = as_u64(slot.producers.len());
             gauges.producers = gauges.producers.saturating_add(producers);
             gauges.max_producers_per_stream = gauges.max_producers_per_stream.max(producers);
-            let mut stream_items = 0u64;
-            let mut stream_producer_bytes = 0u64;
-            for (producer_id, state) in &slot.producers {
-                let receipts = as_u64(state.receipts.len());
-                gauges.receipts = gauges.receipts.saturating_add(receipts);
-                stream_items = stream_items.saturating_add(receipts);
-                stream_producer_bytes =
-                    stream_producer_bytes.saturating_add(producer_state_bytes(producer_id, state));
-            }
-            gauges.receipt_items = gauges.receipt_items.saturating_add(stream_items);
-            gauges.max_receipt_items_per_stream =
-                gauges.max_receipt_items_per_stream.max(stream_items);
+            let stream_producer_bytes = slot
+                .producers
+                .keys()
+                .map(|producer_id| producer_state_bytes(producer_id))
+                .fold(0u64, u64::saturating_add);
             gauges.producer_bytes = gauges.producer_bytes.saturating_add(stream_producer_bytes);
             gauges.max_producer_bytes_per_stream = gauges
                 .max_producer_bytes_per_stream
@@ -160,7 +142,6 @@ mod tests {
             initial_payload: Bytes::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: ttl,
             stream_expires_at_ms: None,
             now_ms: T0,
@@ -220,14 +201,13 @@ mod tests {
                     producer_id: "writer".to_owned(),
                     producer_epoch: 1,
                     producer_seq: seq,
+                    digest: None,
                 }),
             );
         }
         let gauges = m.state_gauges();
         assert_eq!(gauges.streams, 2);
         assert_eq!(gauges.producers, 1);
-        assert_eq!(gauges.receipts, 3);
-        assert_eq!(gauges.receipt_items, 3);
         assert!(gauges.producer_bytes > 0);
         assert_eq!(gauges.ttl_streams, 1);
         // F8: the heap keeps one armed entry per TTL stream.

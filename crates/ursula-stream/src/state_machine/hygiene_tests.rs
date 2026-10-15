@@ -32,7 +32,6 @@ fn compaction_shrinks_cold_ref_vectors() {
             initial_payload: vec![b'x'; usize::try_from(SLICES * 2).unwrap()].into(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,

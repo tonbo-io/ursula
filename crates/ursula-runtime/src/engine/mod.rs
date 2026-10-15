@@ -16,6 +16,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcPlanEntry;
+use ursula_stream::ProducerEarlyAnswer;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 
@@ -56,6 +57,7 @@ use crate::request::ImportGroupStateRequest;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -83,6 +85,9 @@ pub type GroupBucketUsageFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<BucketUsageSnapshot>, GroupEngineError>> + Send + 'a>>;
 pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupProducerEarlyAnswerFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<ProducerEarlyAnswer>, GroupEngineError>> + Send + 'a>,
+>;
 pub type GroupHeadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HeadStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamFuture<'a> =
@@ -268,6 +273,20 @@ pub trait GroupEngine: Send + 'static {
         request: HeadStreamRequest,
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a>;
+
+    /// The answer to a tokened producer write that its head alone decides
+    /// (#581 section 2.5, W7): a repeat of a write that applied under the
+    /// request's token, or a key conflict, from this replica's applied
+    /// state. `None` when the write must be read and proposed. A replicated
+    /// engine answers only while it leads, so routing stays ahead of early
+    /// answers. The default, for an engine without one, answers nothing.
+    fn producer_early_answer<'a>(
+        &'a mut self,
+        _request: ProducerEarlyAnswerRequest,
+        _placement: ShardPlacement,
+    ) -> GroupProducerEarlyAnswerFuture<'a> {
+        Box::pin(async move { Ok(None) })
+    }
 
     /// Per-bucket committed usage held by this group's replicated state.
     ///

@@ -4427,6 +4427,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures-util",
+ "http-body-util",
  "madsim",
  "memchr",
  "openraft",
@@ -4451,6 +4452,7 @@ dependencies = [
  "ursula-config",
  "ursula-ctl",
  "ursula-gateway",
+ "ursula-headers",
  "ursula-index",
  "ursula-observability",
  "ursula-proto",
@@ -4607,6 +4609,7 @@ dependencies = [
 name = "ursula-proto"
 version = "0.7.5"
 dependencies = [
+ "bytes",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",

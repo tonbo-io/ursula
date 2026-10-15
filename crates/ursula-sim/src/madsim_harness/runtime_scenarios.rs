@@ -708,7 +708,7 @@ pub(super) async fn run_runtime_raft_network_inner(
                     producer.producer_id
                 );
                 assert!(
-                    items.iter().all(|item| !item.deduplicated),
+                    items.iter().all(|item| !item.deduplicated()),
                     "runtime raft concurrent producer {} for {stream} unexpectedly deduplicated a first append",
                     producer.producer_id
                 );

@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
+use ursula_runtime::ProducerDelivery;
+
 use super::raft_scenarios::apply_barrier;
 use super::*;
 
@@ -1851,6 +1853,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
                 producer_id: producer_id.to_owned(),
                 producer_epoch: 1,
                 producer_seq: seq,
+                digest: None,
             });
             request.now_ms = now_ms;
             request
@@ -1954,7 +1957,10 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             )
             .await
             .expect("quiet retry");
-        assert!(newest.deduplicated && !newest.receipt_evicted);
+        assert!(matches!(
+            newest.producer.map(|ack| ack.delivery),
+            Some(ProducerDelivery::Repeat(_))
+        ));
         let evicted = engines[leader_index]
             .append(
                 append(3, "busy", 2_000),
@@ -1963,7 +1969,10 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
             )
             .await
             .expect("evicted retry");
-        assert!(evicted.deduplicated && evicted.receipt_evicted);
+        assert_eq!(
+            evicted.producer.map(|ack| ack.delivery),
+            Some(ProducerDelivery::Evicted)
+        );
         let idle_at = 5 + 7 * 24 * 60 * 60 * 1_000;
         engines[leader_index]
             .append(
@@ -1999,14 +2008,13 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
         .iter()
         .find(|producer| producer.producer_id == "busy")
         .expect("busy producer");
-    let receipts: usize = stream.iter().map(|producer| producer.receipts.len()).sum();
-    assert!(receipts <= 1_024, "receipts {receipts}");
-    assert_eq!(busy.receipts.last().map(|r| r.producer_seq), Some(1_299));
+    // One receipt per producer record (#581 section 2.7).
+    assert_eq!(busy.last_seq, 1_299);
     let quiet = stream
         .iter()
         .find(|producer| producer.producer_id == "quiet")
         .expect("quiet producer");
-    assert_eq!(quiet.receipts.len(), 1, "quiet restarted after idle expiry");
+    assert_eq!(quiet.last_seq, 0, "quiet restarted after idle expiry");
     assert_eq!(quiet.last_seen_ms, 5 + 7 * 24 * 60 * 60 * 1_000);
 }
 

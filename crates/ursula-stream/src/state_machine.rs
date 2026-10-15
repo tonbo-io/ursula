@@ -9,7 +9,10 @@
 //! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore serialization.
-//! - [`producers`]: F3 receipt window, idle-producer expiry and `TidyStream`.
+//! - [`producer_record`]: the producer record and the evaluation of a producer
+//!   write (#581 section 2.3).
+//! - [`producers`]: F3 producer bounds (idle expiry, the producer cap, the
+//!   epoch floor) and `TidyStream`.
 //! - [`external_locators`]: F5 state-held external payload locators and
 //!   `OffloadColdRefs`, plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
@@ -45,6 +48,7 @@ use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
 use crate::model::BucketUsage;
 use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
+use crate::model::ClosedEpoch;
 use crate::model::ColdChunkRef;
 use crate::model::ColdFlushCandidate;
 use crate::model::ColdGcEntry;
@@ -52,6 +56,7 @@ use crate::model::ColdGcPlanEntry;
 use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
+use crate::model::IncarnationCheck;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
@@ -67,6 +72,13 @@ use crate::model::StreamReadPlan;
 use crate::model::StreamReadSegment;
 use crate::model::StreamStatus;
 use crate::model::StreamVisibleSnapshot;
+use crate::model::WriteDigest;
+use crate::model::WriteReceipt;
+use crate::response::ClosedBy;
+use crate::response::ProducerAck;
+use crate::response::ProducerDelivery;
+use crate::response::ProducerEarlyAnswer;
+use crate::response::ProducerRefusal;
 use crate::response::StreamErrorCode;
 use crate::response::StreamErrorContext;
 use crate::response::StreamResponse;
@@ -103,6 +115,7 @@ pub use self::flush_planner::ColdFlushPlanStats;
 pub use self::flush_planner::ColdFlushPressure;
 mod lifecycle;
 mod persist;
+mod producer_record;
 mod producers;
 mod query;
 mod registry;
@@ -160,8 +173,9 @@ struct StreamSlot {
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
-    /// Derived F3 receipt window over `producers`; rebuilt on restore.
-    receipt_window: producers::ReceiptWindow,
+    /// The highest epoch of any producer record the stream retired: its
+    /// epoch floor (#581 section 2.3). `None` when it never retired one.
+    retired_epoch_watermark: Option<u64>,
     /// Runtime append count for this incarnation (F9). Kept by the group
     /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
     /// the stream on every removal path (delete, TTL expiry, bucket purge).
@@ -360,7 +374,20 @@ impl StreamStateMachine {
         self.registry.refresh_ttl(stream_id);
     }
 
+    /// Applies one command of a request without a `Stream-Incarnation`
+    /// precondition, or a wrapped [`StreamCommand::IfIncarnation`].
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
+        self.apply_checked(command, IncarnationCheck::Absent)
+    }
+
+    /// Applies one command. `check` says whether the request's
+    /// `Stream-Incarnation` precondition matched; the producer rules bind
+    /// tokened writes more tightly (the epoch floor).
+    pub fn apply_checked(
+        &mut self,
+        command: StreamCommand,
+        check: IncarnationCheck,
+    ) -> StreamResponse {
         match command {
             StreamCommand::CreateBucket { bucket_id } => self.create_bucket(bucket_id),
             StreamCommand::CreateStream {
@@ -369,7 +396,6 @@ impl StreamStateMachine {
                 initial_payload,
                 close_after,
                 stream_seq,
-                producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
                 now_ms,
@@ -382,7 +408,6 @@ impl StreamStateMachine {
                         record_ends,
                         close_after,
                         stream_seq,
-                        producer,
                         stream_ttl_seconds,
                         stream_expires_at_ms,
                         now_ms,
@@ -402,7 +427,6 @@ impl StreamStateMachine {
                 record_ends,
                 close_after,
                 stream_seq,
-                producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
                 now_ms,
@@ -414,7 +438,6 @@ impl StreamStateMachine {
                     record_ends,
                     close_after,
                     stream_seq,
-                    producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
                     now_ms,
@@ -439,6 +462,7 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
+                    check,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -462,6 +486,7 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
+                    check,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -546,7 +571,7 @@ impl StreamStateMachine {
                 producer,
                 now_ms,
             } => {
-                let response = self.close(stream_id, stream_seq, producer, now_ms);
+                let response = self.close(stream_id, stream_seq, producer, now_ms, check);
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
@@ -566,7 +591,7 @@ impl StreamStateMachine {
                 command,
             } => match self.incarnation_precondition(&command, incarnation) {
                 Some(refusal) => refusal,
-                None => self.apply(*command),
+                None => self.apply_checked(*command, IncarnationCheck::Matched),
             },
         }
     }
@@ -580,7 +605,6 @@ struct CreateStreamInput {
     record_ends: Vec<u64>,
     close_after: bool,
     stream_seq: Option<String>,
-    producer: Option<ProducerRequest>,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
     now_ms: u64,
@@ -594,7 +618,6 @@ struct CreateExternalStreamInput {
     record_ends: Vec<u64>,
     close_after: bool,
     stream_seq: Option<String>,
-    producer: Option<ProducerRequest>,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
     now_ms: u64,
@@ -642,10 +665,11 @@ fn renew_stream_ttl(stream: &mut StreamMetadata, now_ms: u64) {
     }
 }
 
-fn validate_producer_request(producer: Option<&ProducerRequest>) -> Result<(), StreamResponse> {
-    let Some(producer) = producer else {
-        return Ok(());
-    };
+/// The key of a producer write, validated: a non-empty id, an epoch and a
+/// seq within the base protocol's limit, and a 32-byte digest when present.
+fn producer_write_key(
+    producer: &ProducerRequest,
+) -> Result<producer_record::WriteKey, StreamResponse> {
     if producer.producer_id.trim().is_empty() {
         return Err(StreamResponse::error(
             StreamErrorCode::InvalidProducer,
@@ -671,7 +695,20 @@ fn validate_producer_request(producer: Option<&ProducerRequest>) -> Result<(), S
             ),
         ));
     }
-    Ok(())
+    let digest = match producer.digest.as_deref() {
+        None => None,
+        Some(bytes) => Some(WriteDigest::try_from(bytes).map_err(|_wrong_length| {
+            StreamResponse::error(
+                StreamErrorCode::InvalidProducer,
+                format!("producer digest must be 32 bytes, got {}", bytes.len()),
+            )
+        })?),
+    };
+    Ok(producer_record::WriteKey {
+        epoch: producer.producer_epoch,
+        seq: producer.producer_seq,
+        digest,
+    })
 }
 
 fn validate_external_payload_ref(payload: &ExternalPayloadRef) -> Result<(), StreamResponse> {
@@ -740,6 +777,6 @@ mod external_locators_tests;
 #[cfg(test)]
 mod hygiene_tests;
 #[cfg(test)]
-mod producer_window_tests;
+mod producer_record_tests;
 #[cfg(test)]
 mod tests;

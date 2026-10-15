@@ -45,6 +45,7 @@ impl StreamStateMachine {
                     retained_offset: slot.retained_offset,
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
+                    retired_epoch_watermark: slot.retired_epoch_watermark,
                 }
             })
             .collect::<Vec<_>>();
@@ -201,8 +202,8 @@ impl StreamStateMachine {
                 ),
                 retained_offset: entry.retained_offset,
                 visible_snapshot: entry.visible_snapshot,
-                receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
                 producers: producer_states,
+                retired_epoch_watermark: entry.retired_epoch_watermark,
                 append_count: 0,
             };
             if machine.insert_stream_slot(slot).is_none() {
@@ -259,12 +260,11 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
         .iter()
         .map(|(producer_id, state)| ProducerSnapshot {
             producer_id: producer_id.clone(),
-            producer_epoch: state.producer_epoch,
-            producer_seq: state.producer_seq,
-            last_start_offset: state.last_start_offset,
-            last_next_offset: state.last_next_offset,
-            last_closed: state.last_closed,
-            receipts: state.receipts.iter().cloned().collect(),
+            epoch: state.epoch,
+            last_seq: state.last_seq,
+            claim_digest: state.claim_digest,
+            newest: state.newest.clone(),
+            closed_epoch: state.closed_epoch,
             last_seen_ms: state.last_seen_ms,
         })
         .collect::<Vec<_>>();
@@ -278,15 +278,13 @@ fn restore_producer_states(
 ) -> Result<HashMap<String, ProducerState>, StreamSnapshotError> {
     let mut states = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let receipts = snapshot.receipts;
         if states
             .insert(snapshot.producer_id.clone(), ProducerState {
-                producer_epoch: snapshot.producer_epoch,
-                producer_seq: snapshot.producer_seq,
-                last_start_offset: snapshot.last_start_offset,
-                last_next_offset: snapshot.last_next_offset,
-                last_closed: snapshot.last_closed,
-                receipts: receipts.into(),
+                epoch: snapshot.epoch,
+                last_seq: snapshot.last_seq,
+                claim_digest: snapshot.claim_digest,
+                newest: snapshot.newest,
+                closed_epoch: snapshot.closed_epoch,
                 last_seen_ms: snapshot.last_seen_ms,
             })
             .is_some()

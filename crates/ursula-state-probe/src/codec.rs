@@ -156,11 +156,8 @@ fn add_stream(st: &mut SnapStats, entry: proto::StreamSnapshotEntryV1, frame_byt
     let hs = delta(&entry, full, |x| x.hot_segments.clear());
     let pr = delta(&entry, full, |x| x.producer_states.clear());
     let vs = delta(&entry, full, |x| x.visible_snapshot = None);
-    let receipts: u64 = entry
-        .producer_states
-        .iter()
-        .map(|p| n(p.receipts.len()))
-        .sum();
+    // One receipt per producer record (F3).
+    let receipts = n(entry.producer_states.len());
     bump(&mut st.cold_chunks_bytes, cc);
     bump(&mut st.cold_chunks_count, n(entry.cold_chunks.len()));
     bump(&mut st.external_segments_bytes, es);

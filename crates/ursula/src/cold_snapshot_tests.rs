@@ -65,7 +65,7 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     digest.update(&snapshot);
     let digest = digest.finalize();
     assert_eq!(
-        response.headers()[HEADER_STREAM_SNAPSHOT_DIGEST],
+        response.headers()[names::STREAM_SNAPSHOT_DIGEST],
         digest.as_str(),
         "the staged digest equals the inline one"
     );
@@ -81,7 +81,7 @@ async fn snapshot_above_the_inline_cap_round_trips_through_the_cold_tier() {
     let response = send(&app, "GET", "/cold-snapshots/s/snapshot/2", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers()[HEADER_STREAM_SNAPSHOT_DIGEST],
+        response.headers()[names::STREAM_SNAPSHOT_DIGEST],
         digest.as_str()
     );
     assert_eq!(

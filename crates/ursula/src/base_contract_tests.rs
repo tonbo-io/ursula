@@ -74,7 +74,7 @@ fn header<'a>(response: &'a Response, name: &str) -> &'a str {
 }
 
 fn next_offset(response: &Response) -> String {
-    header(response, HEADER_STREAM_NEXT_OFFSET).to_owned()
+    header(response, names::STREAM_NEXT_OFFSET).to_owned()
 }
 
 async fn body_text(response: Response) -> String {
@@ -107,7 +107,7 @@ async fn read_all(app: &Router, uri: &str) -> String {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         offset = next_offset(&response);
-        let up_to_date = response.headers().contains_key(HEADER_STREAM_UP_TO_DATE);
+        let up_to_date = response.headers().contains_key(names::STREAM_UP_TO_DATE);
         text.push_str(&body_text(response).await);
         if up_to_date {
             return text;
@@ -177,9 +177,9 @@ async fn stream_seq_check_runs_after_producer_dedup() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let first_try = [
-        (HEADER_PRODUCER_ID, "writer"),
-        (HEADER_PRODUCER_EPOCH, "0"),
-        (HEADER_PRODUCER_SEQ, "0"),
+        (names::PRODUCER_ID, "writer"),
+        (names::PRODUCER_EPOCH, "0"),
+        (names::PRODUCER_SEQ, "0"),
         (HEADER_STREAM_SEQ, "0001"),
     ];
     let response = append(&app, uri, &first_try, "a").await;
@@ -191,9 +191,9 @@ async fn stream_seq_check_runs_after_producer_dedup() {
         &app,
         uri,
         &[
-            (HEADER_PRODUCER_ID, "writer"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "1"),
+            (names::PRODUCER_ID, "writer"),
+            (names::PRODUCER_EPOCH, "0"),
+            (names::PRODUCER_SEQ, "1"),
             (HEADER_STREAM_SEQ, "0002"),
         ],
         "bb",
@@ -202,11 +202,15 @@ async fn stream_seq_check_runs_after_producer_dedup() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // The retry's Stream-Seq is now stale, but the producer duplicate is
-    // answered first: 204 with the original ack, not 409, not the tail and
-    // not the producer's latest ack.
+    // answered first: 204, not 409. The record keeps only its newest
+    // write's range, so the older write answers `receipt-evicted` with the
+    // epoch's highest seq and no range (#581 section 2.7).
     let response = append(&app, uri, &first_try, "a").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(next_offset(&response), original_ack);
+    assert_eq!(header(&response, "producer-outcome"), "receipt-evicted");
+    assert_eq!(header(&response, names::PRODUCER_SEQ), "1");
+    assert!(response.headers().get(names::STREAM_NEXT_OFFSET).is_none());
+    assert_ne!(tail(&app, uri).await, original_ack);
 
     assert_eq!(read_all(&app, uri).await, "abb");
 }
@@ -362,16 +366,16 @@ async fn head_reports_snapshot_and_retention_after_publish_and_advance() {
 
     let response = send(&app, "PUT", &format!("{uri}/snapshot/{at}"), &[], "state").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let digest = header(&response, HEADER_STREAM_SNAPSHOT_DIGEST).to_owned();
+    let digest = header(&response, names::STREAM_SNAPSHOT_DIGEST).to_owned();
     let response = send(&app, "PUT", &format!("{uri}/retention/{at}"), &[], "").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header(&response, HEADER_STREAM_RETAINED_OFFSET), at);
+    assert_eq!(header(&response, names::STREAM_RETAINED_OFFSET), at);
 
     let response = send(&app, "HEAD", uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_OFFSET), at);
-    assert_eq!(header(&response, HEADER_STREAM_SNAPSHOT_DIGEST), digest);
-    assert_eq!(header(&response, HEADER_STREAM_RETAINED_OFFSET), at);
+    assert_eq!(header(&response, names::STREAM_SNAPSHOT_OFFSET), at);
+    assert_eq!(header(&response, names::STREAM_SNAPSHOT_DIGEST), digest);
+    assert_eq!(header(&response, names::STREAM_RETAINED_OFFSET), at);
 }
 
 /// Incarnations are unique per group even when both creates land in the
@@ -381,7 +385,7 @@ async fn stream_incarnation_changes_on_delete_and_recreate() {
     async fn incarnation(app: &Router, uri: &str) -> String {
         let response = send(app, "HEAD", uri, &[], "").await;
         assert_eq!(response.status(), StatusCode::OK);
-        header(&response, HEADER_STREAM_INCARNATION).to_owned()
+        header(&response, names::STREAM_INCARNATION).to_owned()
     }
 
     let app = app();
@@ -423,9 +427,9 @@ async fn temporary_unavailable_answers_carry_retry_after() {
 
 fn producer_headers<'a>(id: &'a str, seq: &'a str) -> [(&'static str, &'a str); 3] {
     [
-        (HEADER_PRODUCER_ID, id),
-        (HEADER_PRODUCER_EPOCH, "0"),
-        (HEADER_PRODUCER_SEQ, seq),
+        (names::PRODUCER_ID, id),
+        (names::PRODUCER_EPOCH, "0"),
+        (names::PRODUCER_SEQ, seq),
     ]
 }
 
@@ -448,7 +452,7 @@ async fn duplicate_beyond_the_receipt_window_answers_204_without_next_offset() {
     let response = append(&app, uri, &producer_headers("writer", "0"), "x").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).is_none(),
+        response.headers().get(names::STREAM_NEXT_OFFSET).is_none(),
         "{:?}",
         response.headers()
     );
@@ -485,23 +489,23 @@ async fn stream_incarnation_precondition_that_holds_changes_nothing() {
     let uri = "/contract/incarnation-holds";
     let response = create(&app, uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let current = header(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let current = header(&response, names::STREAM_INCARNATION).to_owned();
     let response = send(&app, "HEAD", uri, &[], "").await;
-    assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
-    let matching = [(HEADER_STREAM_INCARNATION, current.as_str())];
+    assert_eq!(header(&response, names::STREAM_INCARNATION), current);
+    let matching = [(names::STREAM_INCARNATION, current.as_str())];
 
     for headers in [&[][..], &matching[..]] {
         let response = create(&app, uri, headers, "").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let response = append(&app, uri, headers, "ab").await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let at = next_offset(&response);
         // At the tail: the first round's retention trims the start.
         let response = send(&app, "GET", &format!("{uri}?offset={at}"), headers, "").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let response = send(
             &app,
             "GET",
@@ -511,23 +515,23 @@ async fn stream_incarnation_precondition_that_holds_changes_nothing() {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let response = send(&app, "HEAD", uri, headers, "").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let snapshot = format!("{uri}/snapshot/{at}");
         let response = send(&app, "PUT", &snapshot, headers, "state").await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let response = send(&app, "GET", &snapshot, headers, "").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let response = send(&app, "GET", &format!("{uri}/bootstrap"), headers, "").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
         let response = send(&app, "PUT", &format!("{uri}/retention/{at}"), headers, "").await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
     }
     let response = send(&app, "DELETE", uri, &matching, "").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -545,15 +549,15 @@ async fn stream_incarnation_precondition_refuses_a_recreated_stream() {
     let uri = "/contract/incarnation-refuses";
     let response = create(&app, uri, &[], "abc").await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let old = header(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let old = header(&response, names::STREAM_INCARNATION).to_owned();
     let at = next_offset(&response);
     let response = send(&app, "DELETE", uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = create(&app, uri, &[], "abc").await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let current = header(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let current = header(&response, names::STREAM_INCARNATION).to_owned();
     assert_ne!(current, old);
-    let stale = [(HEADER_STREAM_INCARNATION, old.as_str())];
+    let stale = [(names::STREAM_INCARNATION, old.as_str())];
 
     let refused = [
         append(&app, uri, &stale, "x").await,
@@ -573,16 +577,16 @@ async fn stream_incarnation_precondition_refuses_a_recreated_stream() {
     ];
     for response in refused {
         assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-        assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+        assert_eq!(header(&response, names::STREAM_INCARNATION), current);
     }
     // Nothing applied: the stream holds its own bytes, no snapshot, no trim.
     assert_eq!(read_all(&app, uri).await, "abc");
     let response = send(&app, "HEAD", uri, &[], "").await;
-    assert_eq!(header(&response, HEADER_STREAM_INCARNATION), current);
+    assert_eq!(header(&response, names::STREAM_INCARNATION), current);
     assert!(
         response
             .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
+            .get(names::STREAM_SNAPSHOT_OFFSET)
             .is_none()
     );
 
@@ -592,12 +596,12 @@ async fn stream_incarnation_precondition_refuses_a_recreated_stream() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let response = create(&app, uri, &stale, "").await;
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-    assert!(response.headers().get(HEADER_STREAM_INCARNATION).is_none());
+    assert!(response.headers().get(names::STREAM_INCARNATION).is_none());
     let response = send(&app, "HEAD", uri, &[], "").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     for malformed in ["", "x", "01", "-1", "1 2"] {
-        let response = create(&app, uri, &[(HEADER_STREAM_INCARNATION, malformed)], "").await;
+        let response = create(&app, uri, &[(names::STREAM_INCARNATION, malformed)], "").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{malformed:?}");
     }
     let response = send(&app, "HEAD", uri, &[], "").await;

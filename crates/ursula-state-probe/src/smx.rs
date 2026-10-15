@@ -55,7 +55,6 @@ pub fn create_stream(
             initial_payload: Bytes::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: ttl_seconds,
             stream_expires_at_ms: expires_at_ms,
             now_ms,

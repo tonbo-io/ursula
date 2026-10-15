@@ -20,11 +20,27 @@ use chrono::SecondsFormat;
 use chrono::Utc;
 #[cfg(test)]
 use serde_json::Value;
+use ursula_headers::ClosedEpoch;
+use ursula_headers::CurrentEpoch;
+use ursula_headers::Delivery;
+use ursula_headers::EpochClosure;
+use ursula_headers::HeaderError;
+use ursula_headers::ProducerAnswer;
+use ursula_headers::Receipt;
+use ursula_headers::names;
+use ursula_headers::value::Epoch;
+use ursula_headers::value::Incarnation;
+use ursula_headers::value::Offset;
+use ursula_headers::value::Seq;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::raft_grpc_metrics_snapshot;
 use ursula_runtime::BootstrapStreamResponse;
+use ursula_runtime::ClosedBy;
+use ursula_runtime::ClosedEpoch as StreamClosedEpoch;
 use ursula_runtime::ColdStoreInfo;
-use ursula_runtime::ProducerRequest;
+use ursula_runtime::ProducerAck;
+use ursula_runtime::ProducerDelivery;
+use ursula_runtime::ProducerRefusal;
 use ursula_runtime::ReadSnapshotResponse;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
@@ -32,20 +48,13 @@ use ursula_runtime::RuntimeMailboxSnapshot;
 use ursula_runtime::RuntimeMetricsSnapshot;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::StreamErrorContext;
+use ursula_runtime::WriteReceipt;
 use ursula_shard::BucketStreamId;
 
 use crate::HEADER_CROSS_ORIGIN_RESOURCE_POLICY;
-use crate::HEADER_PRODUCER_EPOCH;
-use crate::HEADER_PRODUCER_SEQ;
-use crate::HEADER_STREAM_CLOSED;
 use crate::HEADER_STREAM_CURSOR;
 use crate::HEADER_STREAM_EXPIRES_AT;
-use crate::HEADER_STREAM_INCARNATION;
-use crate::HEADER_STREAM_NEXT_OFFSET;
-use crate::HEADER_STREAM_SNAPSHOT_DIGEST;
-use crate::HEADER_STREAM_SNAPSHOT_OFFSET;
 use crate::HEADER_STREAM_TTL;
-use crate::HEADER_STREAM_UP_TO_DATE;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
 
@@ -108,7 +117,10 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::SnapshotConflict
         | StreamErrorCode::ProducerSeqConflict
         | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
-        StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
+        StreamErrorCode::ProducerEpochClosed
+        | StreamErrorCode::ProducerEpochStale
+        | StreamErrorCode::ProducerExpired
+        | StreamErrorCode::ProducerKeyConflict => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         StreamErrorCode::InvalidBucketId
         | StreamErrorCode::InvalidStreamId
@@ -136,7 +148,7 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
 /// leader sets it, and a stream's `created_at_ms` is never `0`.
 pub(crate) fn insert_incarnation(headers: &mut HeaderMap, incarnation: u64) {
     if incarnation != 0 {
-        insert_u64_header(headers, HEADER_STREAM_INCARNATION, incarnation);
+        insert_u64_header(headers, names::STREAM_INCARNATION, incarnation);
     }
 }
 
@@ -147,15 +159,15 @@ pub(crate) fn insert_padded_offset(headers: &mut HeaderMap, name: &'static str, 
 }
 
 pub(crate) fn insert_offset(headers: &mut HeaderMap, next_offset: u64) {
-    insert_padded_offset(headers, HEADER_STREAM_NEXT_OFFSET, next_offset);
+    insert_padded_offset(headers, names::STREAM_NEXT_OFFSET, next_offset);
 }
 
 pub(crate) fn insert_snapshot_offset(headers: &mut HeaderMap, snapshot_offset: u64) {
-    insert_padded_offset(headers, HEADER_STREAM_SNAPSHOT_OFFSET, snapshot_offset);
+    insert_padded_offset(headers, names::STREAM_SNAPSHOT_OFFSET, snapshot_offset);
 }
 
 pub(crate) fn insert_snapshot_digest(headers: &mut HeaderMap, digest: &str) {
-    insert_header_str(headers, HEADER_STREAM_SNAPSHOT_DIGEST, digest);
+    insert_header_str(headers, names::STREAM_SNAPSHOT_DIGEST, digest);
 }
 
 pub(crate) fn insert_cursor(headers: &mut HeaderMap, cursor: u64) {
@@ -221,31 +233,126 @@ pub(crate) fn insert_lifetime_headers(
     }
 }
 
-pub(crate) fn insert_producer_ack(headers: &mut HeaderMap, producer: Option<&ProducerRequest>) {
-    let Some(producer) = producer else {
-        return;
+/// The typed answer (#581 section 2.4) to a producer write that applied, now
+/// or before. `Err` only when a value is outside what the protocol carries,
+/// which the state machine never produces (epochs and seqs are validated
+/// before apply, a stream's incarnation is never `0`).
+pub(crate) fn producer_ack_answer(
+    ack: &ProducerAck,
+    incarnation: u64,
+) -> Result<ProducerAnswer, HeaderError> {
+    let epoch = Epoch::try_from(ack.epoch)?;
+    let current = match ack.closed_epoch {
+        None => CurrentEpoch::new(epoch),
+        Some(closed) => CurrentEpoch::closing(epoch, closed_epoch(closed)?)?,
     };
-    insert_u64_header(headers, HEADER_PRODUCER_EPOCH, producer.producer_epoch);
-    insert_u64_header(headers, HEADER_PRODUCER_SEQ, producer.producer_seq);
+    let seq = Seq::try_from(ack.seq)?;
+    let incarnation = Incarnation::try_from(incarnation)?;
+    let receipt = |written: WriteReceipt| {
+        Receipt::new(
+            Offset::from_u64(written.start_offset),
+            Offset::from_u64(written.next_offset),
+            written.closed,
+        )
+    };
+    Ok(match ack.delivery {
+        ProducerDelivery::Applied(written) => ProducerAnswer::Receipt {
+            delivery: Delivery::Applied,
+            epoch: current,
+            seq,
+            receipt: receipt(written)?,
+            incarnation,
+        },
+        ProducerDelivery::Repeat(written) => ProducerAnswer::Receipt {
+            delivery: Delivery::Repeat,
+            epoch: current,
+            seq,
+            receipt: receipt(written)?,
+            incarnation,
+        },
+        ProducerDelivery::Evicted => ProducerAnswer::ReceiptEvicted {
+            epoch: current,
+            seq,
+            incarnation,
+        },
+    })
+}
+
+fn closed_epoch(closed: StreamClosedEpoch) -> Result<ClosedEpoch, HeaderError> {
+    Ok(ClosedEpoch {
+        epoch: Epoch::try_from(closed.epoch)?,
+        seq: Seq::try_from(closed.seq)?,
+    })
+}
+
+/// The typed answer to a refused producer write, from the refusal's
+/// context. `None` for every other error; `Err` as for
+/// [`producer_ack_answer`].
+pub(crate) fn producer_refusal_answer(
+    context: &[StreamErrorContext],
+) -> Option<Result<ProducerAnswer, HeaderError>> {
+    let refusal = |refusal: ProducerRefusal| -> Result<ProducerAnswer, HeaderError> {
+        Ok(match refusal {
+            ProducerRefusal::EpochClosed {
+                epoch,
+                by: ClosedBy::Claim,
+                closed,
+            } => ProducerAnswer::EpochClosed(EpochClosure::by_claim(
+                Epoch::try_from(epoch)?,
+                closed_epoch(closed)?,
+            )?),
+            ProducerRefusal::Expired { epoch } => ProducerAnswer::ProducerExpired {
+                epoch: Epoch::try_from(epoch)?,
+            },
+            ProducerRefusal::StaleEpoch { epoch } => ProducerAnswer::StaleEpoch {
+                epoch: Epoch::try_from(epoch)?,
+            },
+            ProducerRefusal::KeyConflict { epoch } => ProducerAnswer::KeyConflict {
+                epoch: Epoch::try_from(epoch)?,
+            },
+            ProducerRefusal::EpochNotClaimed => ProducerAnswer::EpochNotClaimed,
+        })
+    };
+    context.iter().find_map(|context| match context {
+        StreamErrorContext::Producer(producer) => Some(refusal(*producer)),
+        StreamErrorContext::ProducerSeqConflict {
+            expected_seq,
+            received_seq,
+        } => Some((|| {
+            Ok(ProducerAnswer::SeqGap {
+                expected: Seq::try_from(*expected_seq)?,
+                received: Seq::try_from(*received_seq)?,
+            })
+        })()),
+        StreamErrorContext::StreamClosed
+        | StreamErrorContext::StaleColdFlushCandidate
+        | StreamErrorContext::StreamIncarnation { .. } => None,
+    })
+}
+
+/// `500` for a producer answer the server could not render: a value the
+/// state machine produced is outside what the protocol carries.
+pub(crate) fn producer_answer_failed(err: &HeaderError) -> Response {
+    tracing::error!(error = %err, "a producer answer is outside the protocol's range");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "producer answer outside the protocol's range",
+    )
+        .into_response()
+}
+
+/// Renders a producer answer's headers with the shared header crate.
+pub(crate) fn insert_producer_answer(headers: &mut HeaderMap, answer: &ProducerAnswer) {
+    answer.render(|name, value| insert_header_str(headers, name, value));
 }
 
 pub(crate) fn insert_producer_error_headers(headers: &mut HeaderMap, err: &RuntimeError) {
-    for context in err.stream_error_context() {
-        match context {
-            StreamErrorContext::ProducerEpochStale { current_epoch } => {
-                insert_u64_header(headers, HEADER_PRODUCER_EPOCH, *current_epoch);
-            }
-            StreamErrorContext::ProducerSeqConflict {
-                expected_seq,
-                received_seq,
-            } => {
-                insert_u64_header(headers, "producer-expected-seq", *expected_seq);
-                insert_u64_header(headers, "producer-received-seq", *received_seq);
-            }
-            StreamErrorContext::StreamClosed
-            | StreamErrorContext::StaleColdFlushCandidate
-            | StreamErrorContext::StreamIncarnation { .. } => {}
+    match producer_refusal_answer(err.stream_error_context()) {
+        Some(Ok(answer)) => insert_producer_answer(headers, &answer),
+        Some(Err(render_err)) => {
+            tracing::error!(error = %render_err, refusal = %err, "a producer refusal is outside the protocol's range");
         }
+        None => {}
     }
 }
 
@@ -255,7 +362,7 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
         .iter()
         .any(|context| matches!(context, StreamErrorContext::StreamClosed))
     {
-        insert_static(headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(headers, names::STREAM_CLOSED, "true");
     }
     // A failed `Stream-Incarnation` precondition names the current
     // incarnation when the stream exists (D12).
@@ -509,11 +616,11 @@ pub(crate) fn read_response(
         return (StatusCode::NOT_MODIFIED, headers).into_response();
     }
     if response.up_to_date {
-        insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+        insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     }
     let closed_at_tail = response.closed && response.up_to_date;
     if closed_at_tail {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     } else if request_cursor.is_some() {
         insert_cursor(
             &mut headers,
@@ -532,7 +639,7 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
     insert_offset(&mut headers, response.next_offset);
     insert_incarnation(&mut headers, response.incarnation);
     if response.up_to_date {
-        insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+        insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     }
     (StatusCode::OK, headers, response.payload).into_response()
 }
@@ -559,14 +666,14 @@ pub(crate) fn bootstrap_head(response: &BootstrapStreamResponse) -> (String, Hea
     insert_incarnation(&mut headers, response.incarnation);
     match response.snapshot_offset {
         Some(snapshot_offset) => insert_snapshot_offset(&mut headers, snapshot_offset),
-        None => insert_static(&mut headers, HEADER_STREAM_SNAPSHOT_OFFSET, "-1"),
+        None => insert_static(&mut headers, names::STREAM_SNAPSHOT_OFFSET, "-1"),
     }
     insert_offset(&mut headers, response.next_offset);
     if response.up_to_date {
-        insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+        insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     }
     if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     }
     insert_cache_control(&mut headers, "no-store");
     (boundary, headers)
@@ -648,10 +755,10 @@ pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
     insert_incarnation(&mut headers, response.incarnation);
-    insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+    insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     }
     (StatusCode::OK, headers, Bytes::new()).into_response()
 }
@@ -664,9 +771,9 @@ pub(crate) fn long_poll_no_content_response(
     insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, response.next_offset);
     insert_incarnation(&mut headers, response.incarnation);
-    insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+    insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     } else {
         insert_cursor(
             &mut headers,

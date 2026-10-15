@@ -26,6 +26,7 @@ fn producer_append(stream: &BucketStreamId, seq: u64) -> AppendRequest {
         producer_id: "writer".to_owned(),
         producer_epoch: 1,
         producer_seq: seq,
+        digest: None,
     });
     request.now_ms = 1;
     request

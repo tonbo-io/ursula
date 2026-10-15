@@ -2,7 +2,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
-use crate::model::ProducerRequest;
+use crate::model::ClosedEpoch;
+use crate::model::WriteReceipt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamResponse {
@@ -24,22 +25,21 @@ pub enum StreamResponse {
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
     },
+    /// An append that applied now, or a producer write that applied
+    /// before ([`ProducerAck::delivery`]). For a repeat, `offset` and
+    /// `next_offset` are the original write's range, or the stream's tail
+    /// when the range was not kept ([`ProducerDelivery::Evicted`]).
     Appended {
         offset: u64,
         next_offset: u64,
         closed: bool,
-        deduplicated: bool,
-        producer: Option<ProducerRequest>,
-        /// A duplicate whose receipt the stream's receipt window evicted
-        /// (F3). It is answered as deduplicated without
-        /// byte ranges: `offset` and `next_offset` are the stream tail and
-        /// carry no information about the original append.
-        receipt_evicted: bool,
+        producer: Option<ProducerAck>,
     },
+    /// A close that applied now, of a stream already closed (without
+    /// producer headers), or a producer write that applied before.
     Closed {
         next_offset: u64,
-        deduplicated: bool,
-        producer: Option<ProducerRequest>,
+        producer: Option<ProducerAck>,
     },
     Deleted,
     ColdFlushed {
@@ -125,7 +125,19 @@ pub enum StreamErrorCode {
     StreamClosed,
     StreamSeqConflict,
     InvalidProducer,
+    /// A producer write of an epoch that a claim closed (`403
+    /// epoch-closed`).
+    ProducerEpochClosed,
+    /// A tokened producer write at or below the stream's epoch floor (`403
+    /// producer-expired`): the stream keeps no memory of its epoch.
+    ProducerExpired,
+    /// A producer write of an epoch below the producer's current one, other
+    /// than the epoch its claim closed (`403 stale-epoch`, the base
+    /// protocol's stale epoch).
     ProducerEpochStale,
+    /// A producer write whose key holds a write with another identity (`403
+    /// key-conflict`).
+    ProducerKeyConflict,
     ProducerSeqConflict,
     InvalidRetention,
     OffsetOutOfRange,
@@ -158,9 +170,8 @@ pub enum StreamErrorCode {
 pub enum StreamErrorContext {
     StreamClosed,
     StaleColdFlushCandidate,
-    ProducerEpochStale {
-        current_epoch: u64,
-    },
+    /// The typed detail of a producer refusal (#581 section 2.3.1).
+    Producer(ProducerRefusal),
     ProducerSeqConflict {
         expected_seq: u64,
         received_seq: u64,
@@ -173,7 +184,87 @@ pub enum StreamErrorContext {
     },
 }
 
+/// What closed an epoch, the `by` of `epoch-closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClosedBy {
+    /// A claim of a later epoch.
+    Claim,
+}
+
+/// A producer refusal with what its answer reports. Every variant but
+/// [`Self::EpochNotClaimed`] renders `Producer-Epoch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProducerRefusal {
+    /// `403 epoch-closed`: `closed` is closed; `epoch` is the producer's
+    /// current epoch.
+    EpochClosed {
+        epoch: u64,
+        by: ClosedBy,
+        closed: ClosedEpoch,
+    },
+    /// `403 producer-expired`: `epoch` is the stream's epoch floor.
+    Expired { epoch: u64 },
+    /// `403 stale-epoch`: `epoch` is the producer's current epoch.
+    StaleEpoch { epoch: u64 },
+    /// `403 key-conflict`.
+    KeyConflict { epoch: u64 },
+    /// `400` with `Producer-Expected-Seq: 0`: a seq above 0 of an epoch
+    /// above the producer's, which no claim opened.
+    EpochNotClaimed,
+}
+
+/// The answer to a tokened producer write that does not depend on its body
+/// (#581 section 2.5, W7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProducerEarlyAnswer {
+    /// Rows 9 and 10: the key applied before.
+    Repeat(ProducerAck),
+    /// Row 8: the key holds a write with another identity.
+    KeyConflict { epoch: u64 },
+}
+
+/// How a producer write applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProducerDelivery {
+    /// This command applied the write.
+    Applied(WriteReceipt),
+    /// The producer's newest write, applied before.
+    Repeat(WriteReceipt),
+    /// An older write of the epoch, applied before. The stream keeps no
+    /// range for it (`receipt-evicted`).
+    Evicted,
+}
+
+/// The answer to a producer write that applied, now or before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerAck {
+    pub epoch: u64,
+    /// The epoch's highest applied seq (base protocol `Producer-Seq`).
+    pub seq: u64,
+    /// On a claim and its repeats: the epoch the claim closed.
+    pub closed_epoch: Option<ClosedEpoch>,
+    pub delivery: ProducerDelivery,
+}
+
+impl ProducerAck {
+    /// Whether the write applied before this command, so this command
+    /// changed nothing.
+    pub fn is_repeat(&self) -> bool {
+        !matches!(self.delivery, ProducerDelivery::Applied(_))
+    }
+}
+
 impl StreamResponse {
+    /// Whether this is a repeat of a producer write that applied before.
+    pub fn is_producer_repeat(&self) -> bool {
+        match self {
+            Self::Appended { producer, .. } | Self::Closed { producer, .. } => {
+                producer.as_ref().is_some_and(ProducerAck::is_repeat)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn error(code: StreamErrorCode, message: impl Into<String>) -> Self {
         Self::error_with_context(code, message, Vec::new())
     }

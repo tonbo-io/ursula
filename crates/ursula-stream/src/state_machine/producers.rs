@@ -1,17 +1,12 @@
 //! Producer-state bounds (bounded-stream-state F3) and `TidyStream`.
 //!
-//! - **Receipt window.** A stream keeps at most [`RECEIPT_WINDOW_ITEMS`]
-//!   receipts (one per append) beyond each producer's newest receipt, which
-//!   is never evicted. Eviction takes the
-//!   oldest evictable receipt in commit order: every producer's receipts are
-//!   in commit order, so the oldest evictable one is the front of some
-//!   producer that holds at least two. [`ReceiptWindow`] is derived state:
-//!   restore rebuilds it from the receipts, so a replica that installed a
-//!   snapshot evicts exactly what a replica that replayed the log evicts.
-//! - **One enforcement point.** The window is enforced once per command
-//!   after the whole command applied, at most [`RECEIPT_TRIM_BUDGET`]
-//!   receipts per command, so a producer with a large excess drains over
-//!   several commands without stalling apply.
+//! - **One receipt per producer.** A record keeps its newest write's receipt
+//!   only (#581 section 2.7); a repeat of an older write answers
+//!   `receipt-evicted`.
+//! - **Epoch floor.** Retiring a record, by idle expiry, the producer cap or
+//!   `TidyStream`, raises the stream's `retired_epoch_watermark` to at least
+//!   its epoch (#581 section 2.3), so a tokened write never reopens an epoch
+//!   the stream forgot.
 //! - **Idle expiry.** A producer whose newest write is at least
 //!   [`PRODUCER_IDLE_EXPIRY_MS`] old (by the persisted `last_seen_ms` and the
 //!   command's `now_ms`) is treated as absent at its own next write and
@@ -23,10 +18,7 @@
 //!   excess); when none is idle that long the write fails with
 //!   `ProducerLimit` (`429`).
 //! - **`TidyStream`.** Converges one stream in bounded steps: idle-producer
-//!   expiry, producer-cap eviction and receipt trimming.
-
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+//!   expiry and producer-cap eviction.
 
 use super::BucketStreamId;
 use super::ProducerState;
@@ -35,14 +27,8 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 
-/// Receipts a stream keeps beyond each producer's newest receipt (F3).
-pub const RECEIPT_WINDOW_ITEMS: u64 = 1_024;
-
 /// A producer idle this long is treated as absent at its next write (F3).
 pub const PRODUCER_IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-
-/// Receipts one command may evict from one stream (F3 bounded catch-up).
-pub const RECEIPT_TRIM_BUDGET: usize = 65_536;
 
 /// Producers a stream holds at most (F3 producer cap).
 pub const MAX_PRODUCERS_PER_STREAM: usize = 4_096;
@@ -69,100 +55,15 @@ fn producer_cap_evictable(state: &ProducerState, now_ms: u64) -> bool {
     now_ms.saturating_sub(state.last_seen_ms) >= PRODUCER_CAP_EVICT_IDLE_MS
 }
 
-/// Derived per-stream receipt window: the total receipts held and, for
-/// every producer with at least two receipts, its front receipt keyed by
-/// `(start_offset, producer_id)` in eviction order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct ReceiptWindow {
-    items: u64,
-    evictable: BTreeSet<(u64, String)>,
-}
-
-impl ReceiptWindow {
-    pub(super) fn rebuild(producers: &HashMap<String, ProducerState>) -> Self {
-        let mut window = Self::default();
-        for (producer_id, state) in producers {
-            window.add_producer(producer_id, state);
-        }
-        window
-    }
-
-    #[cfg(test)]
-    pub(super) fn items(&self) -> u64 {
-        self.items
-    }
-
-    fn front_key(producer_id: &str, state: &ProducerState) -> Option<(u64, String)> {
-        (state.receipts.len() >= 2)
-            .then(|| state.receipts.front())
-            .flatten()
-            .map(|front| (front.start_offset, producer_id.to_owned()))
-    }
-
-    /// Accounts for every receipt of `state`.
-    pub(super) fn add_producer(&mut self, producer_id: &str, state: &ProducerState) {
-        let items = u64::try_from(state.receipts.len()).unwrap_or(u64::MAX);
-        self.items = self.items.saturating_add(items);
-        if let Some(key) = Self::front_key(producer_id, state) {
-            self.evictable.insert(key);
-        }
-    }
-
-    /// Accounts for `receipt` about to be pushed onto `state`'s receipts.
-    pub(super) fn push_receipt(&mut self, producer_id: &str, state: &ProducerState) {
-        self.items = self.items.saturating_add(1);
-        if state.receipts.len() == 1
-            && let Some(front) = state.receipts.front()
-        {
-            self.evictable
-                .insert((front.start_offset, producer_id.to_owned()));
-        }
-    }
-
-    /// Removes every receipt of `state` from the window.
-    pub(super) fn remove_producer(&mut self, producer_id: &str, state: &ProducerState) {
-        let items = u64::try_from(state.receipts.len()).unwrap_or(u64::MAX);
-        self.items = self.items.saturating_sub(items);
-        if let Some(key) = Self::front_key(producer_id, state) {
-            self.evictable.remove(&key);
-        }
-    }
-}
-
 impl StreamSlot {
-    /// Evicts the oldest evictable receipts until the stream holds at most
-    /// [`RECEIPT_WINDOW_ITEMS`] receipts or nothing more is evictable, at most
-    /// `budget` receipts. Returns whether evictable excess remains.
-    pub(super) fn trim_receipt_window(&mut self, budget: usize) -> bool {
-        let mut evicted = 0usize;
-        while self.receipt_window.items > RECEIPT_WINDOW_ITEMS {
-            if evicted >= budget {
-                return true;
-            }
-            let Some((_, producer_id)) = self.receipt_window.evictable.pop_first() else {
-                return false;
-            };
-            let Some(state) = self.producers.get_mut(&producer_id) else {
-                continue;
-            };
-            if state.receipts.len() < 2 {
-                continue;
-            }
-            if state.receipts.pop_front().is_some() {
-                self.receipt_window.items = self.receipt_window.items.saturating_sub(1);
-                evicted = evicted.saturating_add(1);
-            }
-            if let Some(key) = ReceiptWindow::front_key(&producer_id, state) {
-                self.receipt_window.evictable.insert(key);
-            }
-        }
-        false
-    }
-
-    /// Removes one producer and its receipts from the window.
-    pub(super) fn remove_producer(&mut self, producer_id: &str) -> Option<ProducerState> {
+    /// Retires one producer record, raising the stream's epoch floor to at
+    /// least its epoch.
+    pub(super) fn retire_producer(&mut self, producer_id: &str) -> Option<ProducerState> {
         let state = self.producers.remove(producer_id)?;
-        self.receipt_window.remove_producer(producer_id, &state);
+        self.retired_epoch_watermark = Some(
+            self.retired_epoch_watermark
+                .map_or(state.epoch, |floor| floor.max(state.epoch)),
+        );
         Some(state)
     }
 
@@ -211,7 +112,7 @@ impl StreamSlot {
             candidates.truncate(excess);
         }
         for (_, victim) in candidates {
-            self.remove_producer(&victim);
+            self.retire_producer(&victim);
         }
     }
 
@@ -224,21 +125,14 @@ impl StreamSlot {
                 .values()
                 .any(|state| producer_cap_evictable(state, now_ms))
     }
-
-    /// Whether the window has evictable excess.
-    fn receipt_window_over(&self) -> bool {
-        self.receipt_window.items > RECEIPT_WINDOW_ITEMS
-            && !self.receipt_window.evictable.is_empty()
-    }
 }
 
 impl StreamStateMachine {
     /// F3 enforcement point, run once per command after it fully applied:
-    /// the producer cap, then the receipt window.
-    pub(super) fn enforce_producer_window(&mut self, stream_id: &BucketStreamId, now_ms: u64) {
+    /// the producer cap.
+    pub(super) fn enforce_producer_cap(&mut self, stream_id: &BucketStreamId, now_ms: u64) {
         if let Some(slot) = self.stream_slot_mut(stream_id) {
             slot.evict_producers_over_cap(now_ms, PRODUCER_CAP_EVICT_BUDGET);
-            slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
         }
     }
 
@@ -258,7 +152,7 @@ impl StreamStateMachine {
             .get(producer_id)
             .is_some_and(|state| producer_is_idle(state, now_ms))
         {
-            slot.remove_producer(producer_id);
+            slot.retire_producer(producer_id);
         }
     }
 
@@ -267,8 +161,7 @@ impl StreamStateMachine {
         let Some(slot) = self.stream_slot(stream_id) else {
             return false;
         };
-        slot.receipt_window_over()
-            || slot.producer_cap_over(now_ms)
+        slot.producer_cap_over(now_ms)
             || slot
                 .producers
                 .values()
@@ -325,10 +218,9 @@ impl StreamStateMachine {
         producer_ids.sort();
         producer_ids.truncate(TIDY_PRODUCER_BUDGET);
         for producer_id in producer_ids {
-            slot.remove_producer(&producer_id);
+            slot.retire_producer(&producer_id);
         }
         slot.evict_producers_over_cap(now_ms, PRODUCER_CAP_EVICT_BUDGET);
-        slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
         if slot.producers.capacity() > slot.producers.len().saturating_mul(2).saturating_add(8) {
             slot.producers.shrink_to_fit();
         }

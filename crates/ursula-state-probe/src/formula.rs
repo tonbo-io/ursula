@@ -8,8 +8,6 @@
 use crate::out::Measured;
 use crate::out::Outcome;
 
-/// Receipt window per stream (F3).
-pub const RECEIPT_WINDOW: u64 = 1_024;
 /// Producer ids per stream (F3).
 pub const MAX_PRODUCERS: u64 = 4_096;
 /// Shared pack references per stream (F2).
@@ -52,12 +50,6 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
         );
     }
     let g = &m.gauges;
-    outcome.check(
-        "f3_receipt_items_per_stream",
-        "receipts per stream <= 1,024 (F3)",
-        g.max_receipt_items_per_stream as f64,
-        RECEIPT_WINDOW as f64,
-    );
     outcome.check(
         "f8_ttl_heap_entries",
         "TTL heap entries <= 2 x live TTL streams (F8)",

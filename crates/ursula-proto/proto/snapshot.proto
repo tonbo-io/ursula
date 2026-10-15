@@ -98,6 +98,9 @@ message StreamSnapshotEntryV1 {
   // index keep no per-message boundaries.
   reserved 20;
   reserved "hot_append_starts";
+  // The highest epoch of any producer record the stream retired: its epoch
+  // floor. Absent when the stream never retired one.
+  optional uint64 retired_epoch_watermark = 21;
 }
 
 message StreamMetadataV1 {
@@ -148,32 +151,33 @@ message StreamVisibleSnapshotV1 {
 
 message ProducerSnapshotV1 {
   string producer_id = 1;
-  uint64 producer_epoch = 2;
-  uint64 producer_seq = 3;
-  uint64 last_start_offset = 4;
-  uint64 last_next_offset = 5;
-  bool last_closed = 6;
-  // Field 7 held the removed copy of the newest receipt's items; the newest
-  // receipt, which the receipt window never evicts, answers instead
-  // (bounded-state F3).
-  reserved 7;
-  reserved "last_items";
-  repeated ProducerReceiptV1 receipts = 8;
+  // The current epoch, opened by a claim.
+  uint64 epoch = 2;
+  // The highest applied seq of `epoch`.
+  uint64 last_seq = 3;
+  // The receipt of the write at `last_seq`.
+  uint64 newest_start_offset = 4;
+  uint64 newest_next_offset = 5;
+  bool newest_closed = 6;
+  // Fields 7 and 8 held the removed receipt items and receipt window: a
+  // record keeps one receipt, its newest write's.
+  reserved 7, 8;
+  reserved "last_items", "receipts";
   // now_ms of the producer's newest accepted write, for idle expiry
   // (bounded-state F3). Always written; decoding an absent value is an
   // error.
   optional uint64 last_seen_ms = 9;
+  // The 32-byte digest the claim of `epoch` carried, if any.
+  optional bytes claim_digest = 10;
+  // The 32-byte digest the write at `last_seq` carried, if any.
+  optional bytes newest_digest = 11;
+  // The epoch the claim of `epoch` closed, with its last applied seq.
+  ClosedEpochV1 closed_epoch = 12;
 }
 
-message ProducerReceiptV1 {
-  uint64 producer_seq = 1;
-  uint64 start_offset = 2;
-  uint64 next_offset = 3;
-  bool closed = 4;
-  // Field 5 held the removed per-receipt items; every receipt is exactly
-  // its own byte range.
-  reserved 5;
-  reserved "items";
+message ClosedEpochV1 {
+  uint64 epoch = 1;
+  uint64 seq = 2;
 }
 
 message StreamAppendCountV1 {

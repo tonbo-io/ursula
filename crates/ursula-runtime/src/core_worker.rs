@@ -62,6 +62,7 @@ use crate::request::ImportGroupStateResponse;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -929,6 +930,25 @@ impl CoreWorker {
 
     /// Plain leadership check with no quorum round trip, for background
     /// leader-side work (cold compaction) that does not serve a client read.
+    pub(crate) async fn producer_early_answer(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: ProducerEarlyAnswerRequest,
+        placement: ShardPlacement,
+    ) -> Result<Option<ursula_stream::ProducerEarlyAnswer>, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .producer_early_answer(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
     pub(crate) async fn accepts_local_writes(
         group: &mut Box<dyn GroupEngine>,
     ) -> Result<bool, RuntimeError> {
@@ -979,7 +999,7 @@ impl CoreWorker {
         );
         if response
             .as_ref()
-            .is_ok_and(|response| !response.deduplicated)
+            .is_ok_and(|response| !response.deduplicated())
         {
             metrics.record_applied_mutation(
                 placement.core_id,
@@ -1599,7 +1619,7 @@ impl CoreWorker {
             record_cold_backpressure_error(metrics, placement, incoming_bytes, admission, &error);
             RuntimeError::group_engine(placement, error)
         })?;
-        if !response.deduplicated {
+        if !response.deduplicated() {
             metrics.record_append(placement.core_id, placement.raft_group_id);
             metrics.record_applied_mutation(placement.core_id, placement.raft_group_id, elapsed);
             metrics.record_cold_hot_backlog(
@@ -1667,7 +1687,7 @@ impl CoreWorker {
             elapsed_ns(exec_started_at),
         );
 
-        if !response.deduplicated {
+        if !response.deduplicated() {
             metrics.record_append(placement.core_id, placement.raft_group_id);
             metrics.record_applied_mutation(
                 placement.core_id,

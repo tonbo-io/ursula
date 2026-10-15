@@ -142,6 +142,7 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_id: id.to_owned(),
         producer_epoch: epoch,
         producer_seq: seq,
+        digest: None,
     }
 }
 
@@ -316,7 +317,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 initial_payload: Bytes::new(),
                 close_after: false,
                 stream_seq: None,
-                producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 now_ms: 0,
@@ -361,12 +361,10 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             stream_append_count: 1,
             group_commit_index: 2,
             closed: false,
-            deduplicated: false,
             producer: None,
             // F6c: a binary stream's real hot bytes are its payload.
             stream_hot_bytes: 3,
             group_hot_bytes: 3,
-            receipt_evicted: false,
             incarnation: 1,
         })
     );
@@ -440,7 +438,6 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 initial_payload: Bytes::new(),
                 close_after: false,
                 stream_seq: None,
-                producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 now_ms: 0,
@@ -813,7 +810,6 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             record_ends: Vec::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,
@@ -1223,7 +1219,7 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     assert_eq!(first.start_offset, 0);
     assert_eq!(first.next_offset, 1);
     assert_eq!(first.stream_append_count, 1);
-    assert!(!first.deduplicated);
+    assert!(!first.deduplicated());
 
     let mut duplicate = AppendRequest::from_bytes(stream.clone(), b"ignored".to_vec());
     duplicate.producer = Some(producer("writer-1", 0, 0));
@@ -1231,7 +1227,7 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     assert_eq!(duplicate.start_offset, 0);
     assert_eq!(duplicate.next_offset, 1);
     assert_eq!(duplicate.stream_append_count, 1);
-    assert!(duplicate.deduplicated);
+    assert!(duplicate.deduplicated());
 
     let mut next = AppendRequest::from_bytes(stream.clone(), b"b".to_vec());
     next.producer = Some(producer("writer-1", 0, 1));
@@ -1239,7 +1235,7 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     assert_eq!(next.start_offset, 1);
     assert_eq!(next.next_offset, 2);
     assert_eq!(next.stream_append_count, 2);
-    assert!(!next.deduplicated);
+    assert!(!next.deduplicated());
 
     let read = runtime
         .read_stream(read_req(stream, 0, 16))
@@ -2502,7 +2498,7 @@ async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
         .append(retry)
         .await
         .expect("deduplicated retry should bypass cold admission");
-    assert!(retry.deduplicated);
+    assert!(retry.deduplicated());
     assert_eq!(retry.start_offset, 0);
     assert_eq!(retry.next_offset, 4);
 }
@@ -4050,7 +4046,7 @@ impl GroupEngine for RecordingEngine {
                 placement,
                 next_offset: self.commit_index,
                 group_commit_index: self.commit_index,
-                deduplicated: false,
+                producer: None,
                 incarnation: 0,
             })
         })
@@ -4090,11 +4086,9 @@ impl GroupEngine for RecordingEngine {
                 stream_append_count: self.commit_index,
                 group_commit_index: self.commit_index,
                 closed: request.close_after,
-                deduplicated: false,
-                producer: request.producer,
+                producer: None,
                 stream_hot_bytes: 0,
                 group_hot_bytes: 0,
-                receipt_evicted: false,
                 incarnation: 0,
             })
         })

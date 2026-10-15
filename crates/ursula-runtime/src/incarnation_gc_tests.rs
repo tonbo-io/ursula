@@ -260,7 +260,6 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             record_ends: Vec::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,

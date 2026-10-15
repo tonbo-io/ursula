@@ -1295,7 +1295,7 @@ impl IntoResponse for Refusal {
 
 /// How [`drain`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Drained {
+pub enum Drained {
     /// The body ended: the connection can carry the next request.
     Whole,
     /// The body is longer than the limit: by its declared length, and then
@@ -1329,8 +1329,9 @@ impl Drop for CutUnlessWhole<'_> {
 /// at most, the limit `to_bytes` applies to a body the gateway forwards,
 /// [`REFUSED_BODY_STALL_TIMEOUT`] without a chunk, and
 /// [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. Reads none of a body whose declared
-/// length is over `limit`.
-async fn drain(body: Body, limit: usize) -> Drained {
+/// length is over `limit`. A node uses it too, for the unread body of a
+/// write it answered from the head alone on HTTP/1.1.
+pub async fn drain(body: Body, limit: usize) -> Drained {
     if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
         return Drained::OverLimit;
     }

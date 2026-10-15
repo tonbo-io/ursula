@@ -587,6 +587,7 @@ fn raft_group_command_round_trips_through_wire_codec() {
             producer_id: "writer-1".to_owned(),
             producer_epoch: 7,
             producer_seq: 42,
+            digest: None,
         }),
         now_ms: 123,
     });

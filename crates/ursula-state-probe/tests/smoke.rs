@@ -68,9 +68,9 @@ fn tiny_workloads_produce_metrics_and_checks() {
     let w4 = Workload::W4(parse::<W4Args>("--appends=2000 --checkpoints=2000"))
         .run(&dir, false)
         .expect("w4");
-    // F3: the receipt window keeps 1,024 receipts.
-    assert_eq!(w4.metrics["receipts"], 1024.0);
-    assert!(check_met(&w4, "f3_receipt_items_per_stream"));
+    // F3: one receipt per producer record.
+    assert_eq!(w4.metrics["receipts"], w4.metrics["producers"]);
+    assert!(check_met(&w4, "f3_producer_bytes_per_stream"));
 
     let w5 = Workload::W5(parse::<W5Args>("--mode=ttl-heap --appends=500"))
         .run(&dir, false)

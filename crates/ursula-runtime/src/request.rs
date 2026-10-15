@@ -8,6 +8,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
+use ursula_stream::ProducerAck;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
@@ -27,7 +28,6 @@ pub struct CreateStreamRequest {
     pub initial_payload: Bytes,
     pub close_after: bool,
     pub stream_seq: Option<String>,
-    pub producer: Option<ProducerRequest>,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
     pub now_ms: u64,
@@ -44,7 +44,6 @@ pub struct CreateStreamExternalRequest {
     pub record_ends: Vec<u64>,
     pub close_after: bool,
     pub stream_seq: Option<String>,
-    pub producer: Option<ProducerRequest>,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
     pub now_ms: u64,
@@ -66,7 +65,6 @@ impl CreateStreamExternalRequest {
             record_ends,
             close_after: request.close_after,
             stream_seq: request.stream_seq,
-            producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
             now_ms: request.now_ms,
@@ -89,7 +87,6 @@ impl CreateStreamRequest {
             initial_payload: Bytes::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 0,
@@ -535,13 +532,22 @@ pub struct CloseStreamResponse {
     pub placement: ShardPlacement,
     pub next_offset: u64,
     pub group_commit_index: u64,
-    pub deduplicated: bool,
+    /// The producer write's answer when the close carried producer headers.
+    pub producer: Option<ProducerAck>,
     /// The stream incarnation (`created_at_ms`) the write applied to,
     /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
     /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
     /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
+}
+
+impl CloseStreamResponse {
+    /// Whether the write is a repeat of a producer write that applied
+    /// before, so this request changed nothing.
+    pub fn deduplicated(&self) -> bool {
+        self.producer.as_ref().is_some_and(ProducerAck::is_repeat)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -674,6 +680,18 @@ impl ColdWriteAdmission {
     }
 }
 
+/// A tokened producer write's head, for an answer before its body is read
+/// (#581 section 2.5, W7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerEarlyAnswerRequest {
+    pub stream_id: BucketStreamId,
+    pub producer: ProducerRequest,
+    /// The write's `Stream-Incarnation`. Only a write that names the token
+    /// of the applied state is answered early.
+    pub incarnation: u64,
+    pub now_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendRequest {
     pub stream_id: BucketStreamId,
@@ -772,20 +790,26 @@ pub struct AppendResponse {
     pub stream_append_count: u64,
     pub group_commit_index: u64,
     pub closed: bool,
-    pub deduplicated: bool,
-    pub producer: Option<ProducerRequest>,
+    /// The producer write's answer when the append carried producer headers.
+    /// For a repeat, `start_offset` and `next_offset` are the original
+    /// write's range, or the tail when its range was not kept.
+    pub producer: Option<ProducerAck>,
     pub stream_hot_bytes: u64,
     pub group_hot_bytes: u64,
-    /// A duplicate beyond the stream's receipt window (bounded-state F3):
-    /// deduplicated without byte ranges. `start_offset` and
-    /// `next_offset` then carry no information about the original append.
-    pub receipt_evicted: bool,
     /// The stream incarnation (`created_at_ms`) the write applied to,
     /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
     /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
     /// and renders no header.
     #[serde(default)]
     pub incarnation: u64,
+}
+
+impl AppendResponse {
+    /// Whether the write is a repeat of a producer write that applied
+    /// before, so this request changed nothing.
+    pub fn deduplicated(&self) -> bool {
+        self.producer.as_ref().is_some_and(ProducerAck::is_repeat)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

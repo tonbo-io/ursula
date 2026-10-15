@@ -24,7 +24,6 @@ fn fresh_machine() -> StreamStateMachine {
         initial_payload: bytes::Bytes::new(),
         close_after: false,
         stream_seq: None,
-        producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
         now_ms: 1,

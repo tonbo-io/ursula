@@ -116,7 +116,6 @@ fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemor
                     initial_payload: bytes::Bytes::new(),
                     close_after: false,
                     stream_seq: None,
-                    producer: None,
                     stream_ttl_seconds: None,
                     stream_expires_at_ms: None,
                     now_ms: 0,
@@ -171,7 +170,6 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
                 initial_payload: bytes::Bytes::new(),
                 close_after: false,
                 stream_seq: None,
-                producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 now_ms: 0,
@@ -224,6 +222,7 @@ fn producer_dedup(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
         producer_id: "producer-0".to_owned(),
         producer_epoch: 1,
         producer_seq: 0,
+        digest: None,
     };
     let first_tail = append(
         machine,

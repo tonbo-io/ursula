@@ -361,7 +361,7 @@ fn runtime_error_response_uses_structured_context_for_stream_closed_header() {
     });
 
     assert_eq!(
-        response.headers().get(HEADER_STREAM_CLOSED),
+        response.headers().get(names::STREAM_CLOSED),
         Some(&axum::http::HeaderValue::from_static("true"))
     );
 }
@@ -620,7 +620,7 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
 
@@ -628,7 +628,7 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
     let body = body_bytes(response).await;
@@ -637,7 +637,7 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
     let response = http_head(&app, "/benchcmp/stream-1").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
     assert_eq!(
@@ -664,12 +664,12 @@ async fn close_only_post_sets_closed_state_and_rejects_later_append() {
     let response = http_post(
         &app,
         "/benchcmp/closing",
-        &[(HEADER_STREAM_CLOSED, "true")],
+        &[(names::STREAM_CLOSED, "true")],
         Body::empty(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(header_str(&response, HEADER_STREAM_CLOSED), "true");
+    assert_eq!(header_str(&response, names::STREAM_CLOSED), "true");
 
     let response = http_post(
         &app,
@@ -699,14 +699,14 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
         "/benchcmp/closed-precedence",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_CLOSED, "true"),
+            (names::STREAM_CLOSED, "true"),
         ],
         Body::from("final"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
 
@@ -721,9 +721,9 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(header_str(&response, HEADER_STREAM_CLOSED), "true");
+    assert_eq!(header_str(&response, names::STREAM_CLOSED), "true");
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
 }
@@ -747,36 +747,36 @@ async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
         "/benchcmp/producer-http",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "0"),
+            (names::PRODUCER_ID, "writer-1"),
+            (names::PRODUCER_EPOCH, "0"),
+            (names::PRODUCER_SEQ, "0"),
         ],
         Body::from("a"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "0");
-    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
+    assert_eq!(header_str(&response, names::PRODUCER_EPOCH), "0");
+    assert_eq!(header_str(&response, names::PRODUCER_SEQ), "0");
 
     let response = http_post(
         &app,
         "/benchcmp/producer-http",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "0"),
+            (names::PRODUCER_ID, "writer-1"),
+            (names::PRODUCER_EPOCH, "0"),
+            (names::PRODUCER_SEQ, "0"),
         ],
         Body::from("ignored"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000001"
     );
-    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "0");
-    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
+    assert_eq!(header_str(&response, names::PRODUCER_EPOCH), "0");
+    assert_eq!(header_str(&response, names::PRODUCER_SEQ), "0");
 
     let response = http_get(&app, "/benchcmp/producer-http?offset=0&max_bytes=16").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -788,9 +788,9 @@ async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
         "/benchcmp/producer-http",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "2"),
+            (names::PRODUCER_ID, "writer-1"),
+            (names::PRODUCER_EPOCH, "0"),
+            (names::PRODUCER_SEQ, "2"),
         ],
         Body::from("gap"),
     )
@@ -804,31 +804,31 @@ async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
         "/benchcmp/producer-http",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "1"),
-            (HEADER_PRODUCER_SEQ, "0"),
+            (names::PRODUCER_ID, "writer-1"),
+            (names::PRODUCER_EPOCH, "1"),
+            (names::PRODUCER_SEQ, "0"),
         ],
         Body::from("b"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "1");
-    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
+    assert_eq!(header_str(&response, names::PRODUCER_EPOCH), "1");
+    assert_eq!(header_str(&response, names::PRODUCER_SEQ), "0");
 
     let response = http_post(
         &app,
         "/benchcmp/producer-http",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_PRODUCER_ID, "writer-1"),
-            (HEADER_PRODUCER_EPOCH, "0"),
-            (HEADER_PRODUCER_SEQ, "1"),
+            (names::PRODUCER_ID, "writer-1"),
+            (names::PRODUCER_EPOCH, "0"),
+            (names::PRODUCER_SEQ, "1"),
         ],
         Body::from("stale"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "1");
+    assert_eq!(header_str(&response, names::PRODUCER_EPOCH), "1");
 }
 
 #[tokio::test]
@@ -958,7 +958,7 @@ async fn json_message_text_is_stored_verbatim_minus_whitespace() {
 
     let response = http_head(&app, "/benchcmp/json-fidelity").await;
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         format!("{:020}", expected.len())
     );
 
@@ -968,7 +968,7 @@ async fn json_message_text_is_stored_verbatim_minus_whitespace() {
         "/benchcmp/json-fidelity",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_CLOSED, "true"),
+            (names::STREAM_CLOSED, "true"),
         ],
         Body::empty(),
     )
@@ -1040,7 +1040,7 @@ async fn invalid_json_bodies_are_refused_without_committing() {
 
     let response = http_head(&app, "/benchcmp/json-invalid").await;
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         format!("{:020}", 14)
     );
     let response = http_get(&app, "/benchcmp/json-invalid").await;
@@ -1209,7 +1209,7 @@ async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
     let body = body_bytes(response).await;
@@ -1373,10 +1373,10 @@ async fn long_poll_times_out_with_no_content_and_cleans_waiter() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000000"
     );
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(
         header_str(&response, HEADER_STREAM_CURSOR),
         "00000000000000000000"
@@ -1500,7 +1500,7 @@ async fn long_poll_returns_append_from_owner_waiter() {
         .expect("read task");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000004"
     );
     assert_eq!(
@@ -1539,7 +1539,7 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
         "/benchcmp/sse-stream",
         &[
             (CONTENT_TYPE.as_str(), "text/plain"),
-            (HEADER_STREAM_CLOSED, "true"),
+            (names::STREAM_CLOSED, "true"),
         ],
         Body::from("sse-token"),
     )
@@ -1585,7 +1585,7 @@ async fn sse_exposes_ndjson_data_content_type_for_json_streams() {
         "/benchcmp/sse-json",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_CLOSED, "true"),
+            (names::STREAM_CLOSED, "true"),
         ],
         Body::from(r#"{"event":"done"}"#),
     )
@@ -1631,7 +1631,7 @@ async fn sse_json_max_bytes_does_not_split_utf8_codepoints() {
         "/benchcmp/sse-json-utf8",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
-            (HEADER_STREAM_CLOSED, "true"),
+            (names::STREAM_CLOSED, "true"),
         ],
         // A literal two-byte code point: P1 stores escapes verbatim, so a
         // `\u00e9` escape would stay ASCII and not exercise the split.
@@ -2436,7 +2436,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
             "close",
             no_redirect_client
                 .post(&target)
-                .header(HEADER_STREAM_CLOSED, "true")
+                .header(names::STREAM_CLOSED, "true")
                 .send()
                 .await
                 .expect("close on the non-voter"),
@@ -2536,7 +2536,7 @@ async fn static_grpc_follower_redirects_writes_without_a_not_applied_marker() {
         .expect("append on a follower");
     let closed = client
         .post(format!("{follower}/benchcmp/marked"))
-        .header(HEADER_STREAM_CLOSED, "true")
+        .header(names::STREAM_CLOSED, "true")
         .send()
         .await
         .expect("close on a follower");
@@ -2592,11 +2592,11 @@ async fn static_grpc_follower_redirects_writes_without_a_not_applied_marker() {
     assert_eq!(head.status(), StatusCode::OK);
     assert_eq!(
         head.headers()
-            .get(HEADER_STREAM_NEXT_OFFSET)
+            .get(names::STREAM_NEXT_OFFSET)
             .and_then(|value| value.to_str().ok()),
         Some("00000000000000000000")
     );
-    assert!(!head.headers().contains_key(HEADER_STREAM_CLOSED));
+    assert!(!head.headers().contains_key(names::STREAM_CLOSED));
     let head = client
         .head(format!("{leader}/benchcmp/unmarked"))
         .send()
@@ -3054,7 +3054,7 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
     assert_eq!(
         leader_read
             .headers()
-            .get(HEADER_STREAM_UP_TO_DATE)
+            .get(names::STREAM_UP_TO_DATE)
             .and_then(|value| value.to_str().ok()),
         Some("true"),
         "leader consistency must not be served by follower-local applied state"
@@ -3078,12 +3078,12 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
     assert_eq!(read.status(), StatusCode::OK);
     assert_eq!(
         read.headers()
-            .get(HEADER_STREAM_NEXT_OFFSET)
+            .get(names::STREAM_NEXT_OFFSET)
             .and_then(|value| value.to_str().ok()),
         Some("00000000000000000019")
     );
     assert!(
-        read.headers().get(HEADER_STREAM_UP_TO_DATE).is_none(),
+        read.headers().get(names::STREAM_UP_TO_DATE).is_none(),
         "follower local reads must not assert open-tail freshness"
     );
     assert_eq!(
@@ -3493,7 +3493,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
     assert_eq!(
         follower_response
             .headers()
-            .get(HEADER_STREAM_NEXT_OFFSET)
+            .get(names::STREAM_NEXT_OFFSET)
             .and_then(|value| value.to_str().ok()),
         Some("00000000000000000023")
     );
@@ -3515,7 +3515,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
     assert_eq!(
         follower_sse
             .headers()
-            .get(HEADER_URSULA_RAFT_LEADER_ID)
+            .get(names::X_URSULA_RAFT_LEADER_ID)
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
@@ -3551,7 +3551,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
     assert_eq!(
         follower_read
             .headers()
-            .get(HEADER_STREAM_NEXT_OFFSET)
+            .get(names::STREAM_NEXT_OFFSET)
             .and_then(|value| value.to_str().ok()),
         Some("00000000000000000023")
     );
@@ -4501,14 +4501,14 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        header_str(&response, names::STREAM_SNAPSHOT_OFFSET),
         "00000000000000000003"
     );
 
     let response = http_head(&app, stream_uri).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        header_str(&response, names::STREAM_SNAPSHOT_OFFSET),
         "00000000000000000003"
     );
 
@@ -4520,7 +4520,7 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, CONTENT_TYPE), "application/json");
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
     let body = body_bytes(response).await;
@@ -4541,7 +4541,7 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
     let response = http_get(&app, "/benchcmp/snapshot-http?offset=0&max_bytes=1").await;
     assert_eq!(response.status(), StatusCode::GONE);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
 
@@ -4552,7 +4552,7 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
             .starts_with("multipart/mixed; boundary=ursula-bootstrap-")
     );
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
     let body = body_bytes(response).await;
@@ -4589,7 +4589,7 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
     assert!(
         response
             .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
+            .get(names::STREAM_SNAPSHOT_OFFSET)
             .is_none()
     );
 
@@ -4598,9 +4598,9 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
 
     let response = http_get(&app, "/benchcmp/bootstrap-nosnapshot/bootstrap").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET), "-1");
+    assert_eq!(header_str(&response, names::STREAM_SNAPSHOT_OFFSET), "-1");
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
     let body = body_bytes(response).await;
@@ -4706,15 +4706,15 @@ async fn bootstrap_after_cold_flush_past_snapshot_is_honest_partial() {
 
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
     assert_eq!(
-        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        header_str(&response, names::STREAM_SNAPSHOT_OFFSET),
         "00000000000000000003"
     );
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
-    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
-    assert!(response.headers().get(HEADER_STREAM_CLOSED).is_none());
+    assert!(response.headers().get(names::STREAM_UP_TO_DATE).is_none());
+    assert!(response.headers().get(names::STREAM_CLOSED).is_none());
     assert_eq!(parts, vec![r#"{"state":"abc"}"#.to_owned()]);
 
     // The client continues with an ordinary read from the next offset.
@@ -4735,10 +4735,10 @@ async fn bootstrap_after_cold_flush_past_snapshot_is_honest_partial() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000012"
     );
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(parts, vec![
         r#"{"state":"abcdefg"}"#.to_owned(),
         "hijkl".to_owned(),
@@ -4775,10 +4775,10 @@ async fn binary_snapshot_mid_message_is_accepted_and_bootstrap_is_one_part() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(parts, vec!["a".to_owned(), "bcdefg".to_owned()]);
 
     // Mid-message after a flush into the second message.
@@ -4792,7 +4792,7 @@ async fn binary_snapshot_mid_message_is_accepted_and_bootstrap_is_one_part() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(parts, vec!["abcd".to_owned(), "efg".to_owned()]);
 }
 
@@ -4816,16 +4816,16 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     ])
     .await;
     let response = http_head(&app, stream_uri).await;
-    let flushed_tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let flushed_tail = header_str(&response, names::STREAM_NEXT_OFFSET).to_owned();
     flush_cold(&app, stream_uri, 1024).await;
 
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
-    assert_eq!(header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET), "-1");
+    assert_eq!(header_str(&response, names::STREAM_SNAPSHOT_OFFSET), "-1");
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         "00000000000000000000"
     );
-    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert!(response.headers().get(names::STREAM_UP_TO_DATE).is_none());
     assert_eq!(parts, vec![String::new()]);
 
     let response = http_get(&app, &format!("{stream_uri}?offset=-1")).await;
@@ -4840,7 +4840,7 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     ])
     .await;
     let response = http_head(&app, stream_uri).await;
-    let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let tail = header_str(&response, names::STREAM_NEXT_OFFSET).to_owned();
     // A snapshot at the flush point (a JSON boundary whose preceding byte is
     // cold, so the server verifies it with a read) bootstraps complete, one
     // JSON message per update part...
@@ -4853,8 +4853,8 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
-    assert_eq!(header_str(&response, HEADER_STREAM_NEXT_OFFSET), tail);
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_NEXT_OFFSET), tail);
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(parts.len(), 3, "{parts:?}");
     assert_eq!(parts[0], r#"{"n":2}"#);
     assert!(parts[1].contains(r#"{"c":3}"#) && !parts[1].contains(r#"{"d":4}"#));
@@ -4874,8 +4874,8 @@ async fn json_bootstrap_never_merges_cold_messages_into_one_part() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let (response, parts) = bootstrap_get(&app, &format!("{stream_uri}/bootstrap")).await;
-    assert_eq!(header_str(&response, HEADER_STREAM_NEXT_OFFSET), tail);
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_NEXT_OFFSET), tail);
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0], r#"{"n":3}"#);
     assert!(parts[1].contains(r#"{"d":4}"#) && !parts[1].contains(r#"{"c":3}"#));
@@ -4918,7 +4918,7 @@ async fn json_snapshot_and_retention_offsets_must_follow_an_lf_hot_and_cold() {
         );
     }
     let head = http_head(&app, stream_uri).await;
-    assert!(head.headers().get(HEADER_STREAM_SNAPSHOT_OFFSET).is_none());
+    assert!(head.headers().get(names::STREAM_SNAPSHOT_OFFSET).is_none());
 
     // Cold boundary (8) and hot boundary (24): accepted; retention is exact.
     for offset in [8u64, 24] {
@@ -4937,13 +4937,13 @@ async fn json_snapshot_and_retention_offsets_must_follow_an_lf_hot_and_cold() {
     let response = put(format!("{stream_uri}/retention/{:020}", 8)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_RETAINED_OFFSET),
+        header_str(&response, names::STREAM_RETAINED_OFFSET),
         format!("{:020}", 8)
     );
     let response = put(format!("{stream_uri}/retention/{:020}", 24)).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_RETAINED_OFFSET),
+        header_str(&response, names::STREAM_RETAINED_OFFSET),
         format!("{:020}", 24)
     );
 }
@@ -4988,7 +4988,7 @@ async fn json_boundary_lookup_failure_answers_503() {
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let head = http_head(&app, stream_uri).await;
-    assert!(head.headers().get(HEADER_STREAM_SNAPSHOT_OFFSET).is_none());
+    assert!(head.headers().get(names::STREAM_SNAPSHOT_OFFSET).is_none());
 }
 
 #[tokio::test]
@@ -5053,7 +5053,7 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let snapshot_digest = header_str(&response, HEADER_STREAM_SNAPSHOT_DIGEST).to_owned();
+    let snapshot_digest = header_str(&response, names::STREAM_SNAPSHOT_DIGEST).to_owned();
     assert_eq!(snapshot_digest.len(), 64);
 
     let response = http_put(
@@ -5065,7 +5065,7 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_SNAPSHOT_DIGEST),
+        header_str(&response, names::STREAM_SNAPSHOT_DIGEST),
         snapshot_digest
     );
 
@@ -5121,7 +5121,7 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     let response = http_get(&app, "/benchcmp/snapshot-errors/bootstrap").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        header_str(&response, names::STREAM_SNAPSHOT_OFFSET),
         "00000000000000000005"
     );
     let body = body_bytes(response).await;
@@ -5509,8 +5509,8 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let old = header_str(&response, HEADER_STREAM_INCARNATION).to_owned();
-    let tail = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let old = header_str(&response, names::STREAM_INCARNATION).to_owned();
+    let tail = header_str(&response, names::STREAM_NEXT_OFFSET).to_owned();
 
     let poll = tokio::spawn({
         let app = app.clone();
@@ -5520,7 +5520,7 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
                 &app,
                 "GET",
                 &format!("{uri}?offset={tail}&live=long-poll&timeout_ms=30000"),
-                &[(HEADER_STREAM_INCARNATION, old.as_str())],
+                &[(names::STREAM_INCARNATION, old.as_str())],
                 Body::empty(),
             )
             .await
@@ -5537,7 +5537,7 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let current = header_str(&response, HEADER_STREAM_INCARNATION).to_owned();
+    let current = header_str(&response, names::STREAM_INCARNATION).to_owned();
     assert_ne!(current, old);
 
     let response = tokio::time::timeout(Duration::from_secs(10), poll)
@@ -5545,7 +5545,7 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
         .expect("the pinned long-poll ends on recreate")
         .expect("poll task");
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-    assert_eq!(header_str(&response, HEADER_STREAM_INCARNATION), current);
+    assert_eq!(header_str(&response, names::STREAM_INCARNATION), current);
 }
 
 /// Ingress admission as the server builds it, with an in-flight body budget
@@ -9275,7 +9275,7 @@ async fn tenant_buckets_isolate_identical_stream_names() {
     assert!(
         response
             .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
+            .get(names::STREAM_SNAPSHOT_OFFSET)
             .is_none()
     );
 }
@@ -9644,7 +9644,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     // Read the latest snapshot like a client: its offset comes from HEAD.
     let response = http_head(&restored, "/tenant-a/orders").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let snapshot_offset = header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET).to_owned();
+    let snapshot_offset = header_str(&response, names::STREAM_SNAPSHOT_OFFSET).to_owned();
     let response = http_get(
         &restored,
         &format!("/tenant-a/orders/snapshot/{snapshot_offset}"),
@@ -9889,7 +9889,7 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let snapshot_offset = header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET).to_owned();
+    let snapshot_offset = header_str(&response, names::STREAM_SNAPSHOT_OFFSET).to_owned();
 
     let response = send(
         &app,
@@ -10093,7 +10093,6 @@ async fn metrics_expose_per_group_state_gauges() {
         .find(|group| group["streams"] == 1)
         .expect("group holding the stream");
     assert_eq!(group["producers"], 1, "{group}");
-    assert_eq!(group["receipts"], 3);
     assert_eq!(group["ttl_streams"], 1);
     assert!(group["ttl_heap_entries"].as_u64().expect("ttl heap") >= 1);
     // F6b: the three contiguous appends share one hot block.
@@ -10102,7 +10101,6 @@ async fn metrics_expose_per_group_state_gauges() {
         "shared_refs",
         "live_packs",
         "staged_external_refs",
-        "receipt_items",
         "producer_bytes",
         "hot_payload_bytes",
         "hot_overhead_bytes",
@@ -10137,9 +10135,9 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
     let over_cap = "p".repeat(WRITE_IDENTIFIER_MAX_BYTES + 1);
     let producer = |id: &str| -> Vec<(&'static str, String)> {
         vec![
-            (HEADER_PRODUCER_ID, id.to_owned()),
-            (HEADER_PRODUCER_EPOCH, "0".to_owned()),
-            (HEADER_PRODUCER_SEQ, "0".to_owned()),
+            (names::PRODUCER_ID, id.to_owned()),
+            (names::PRODUCER_EPOCH, "0".to_owned()),
+            (names::PRODUCER_SEQ, "0".to_owned()),
         ]
     };
     fn as_refs<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
@@ -10211,14 +10209,14 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
 
     // Close with an empty body.
     let mut headers = producer(&over_cap);
-    headers.push((HEADER_STREAM_CLOSED, "true".to_owned()));
+    headers.push((names::STREAM_CLOSED, "true".to_owned()));
     let response = http_post(&app, "/benchcmp/caps-a", &as_refs(&headers), Body::empty()).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let response = http_post(
         &app,
         "/benchcmp/caps-a",
         &[
-            (HEADER_STREAM_CLOSED, "true"),
+            (names::STREAM_CLOSED, "true"),
             (HEADER_STREAM_SEQ, over_cap.as_str()),
         ],
         Body::empty(),
@@ -10227,11 +10225,11 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// bounded-stream-state F3: a duplicate whose receipt the stream's receipt
-/// window evicted answers `204` with `Producer-Seq` and without a byte
-/// range, and never appends.
+/// One receipt per producer (#581 section 2.7): a repeat of an older write
+/// answers `204 receipt-evicted` with the epoch's highest seq and no range,
+/// a repeat of the newest write gets its receipt, and neither appends.
 #[tokio::test]
-async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
+async fn an_older_repeat_is_receipt_evicted_and_the_newest_gets_its_receipt() {
     let app = test_router();
     let response = http_put(
         &app,
@@ -10250,39 +10248,41 @@ async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
                 "/benchcmp/receipt-window",
                 &[
                     (CONTENT_TYPE.as_str(), "application/json"),
-                    (HEADER_PRODUCER_ID, "writer"),
-                    (HEADER_PRODUCER_EPOCH, "0"),
-                    (HEADER_PRODUCER_SEQ, seq.as_str()),
+                    (names::PRODUCER_ID, "writer"),
+                    (names::PRODUCER_EPOCH, "0"),
+                    (names::PRODUCER_SEQ, seq.as_str()),
                 ],
                 Body::from(r#"{"a":1}"#),
             )
             .await
         }
     };
-    for seq in 0..1_026 {
+    for seq in 0..3 {
         assert_eq!(post(seq).await.status(), StatusCode::OK);
     }
     let tail = http_head(&app, "/benchcmp/receipt-window").await;
-    let tail_offset = tail.headers().get(HEADER_STREAM_NEXT_OFFSET).cloned();
+    let tail_offset = tail.headers().get(names::STREAM_NEXT_OFFSET).cloned();
 
     let evicted = post(0).await;
     assert_eq!(evicted.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        evicted
-            .headers()
-            .get(HEADER_PRODUCER_SEQ)
-            .and_then(|value| value.to_str().ok()),
-        Some("0")
-    );
-    assert!(evicted.headers().get(HEADER_STREAM_NEXT_OFFSET).is_none());
+    assert_eq!(header_str(&evicted, names::PRODUCER_SEQ), "2");
+    assert_eq!(header_str(&evicted, "producer-outcome"), "receipt-evicted");
+    assert!(evicted.headers().get(names::STREAM_NEXT_OFFSET).is_none());
+    assert!(evicted.headers().get("stream-offset").is_none());
 
-    let newest = post(1_025).await;
+    let newest = post(2).await;
     assert_eq!(newest.status(), StatusCode::NO_CONTENT);
-    assert!(newest.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
+    assert_eq!(header_str(&newest, names::PRODUCER_SEQ), "2");
+    assert!(newest.headers().get("producer-outcome").is_none());
+    assert_eq!(
+        newest.headers().get(names::STREAM_NEXT_OFFSET).cloned(),
+        tail_offset
+    );
+    assert!(newest.headers().get("stream-offset").is_some());
 
     let after = http_head(&app, "/benchcmp/receipt-window").await;
     assert_eq!(
-        after.headers().get(HEADER_STREAM_NEXT_OFFSET).cloned(),
+        after.headers().get(names::STREAM_NEXT_OFFSET).cloned(),
         tail_offset
     );
 }
@@ -10317,9 +10317,9 @@ async fn reads_are_capped_at_the_server_response_limit() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = http_get(&app, "/benchcmp/capped-bytes?offset=-1").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert!(response.headers().get(names::STREAM_UP_TO_DATE).is_none());
     assert_eq!(
-        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        header_str(&response, names::STREAM_NEXT_OFFSET),
         format!("{CAP:020}")
     );
     assert_eq!(body_bytes(response).await.len(), CAP);
@@ -10327,7 +10327,7 @@ async fn reads_are_capped_at_the_server_response_limit() {
     let response = http_get(&app, "/benchcmp/capped-bytes?offset=-1&max_bytes=99999999").await;
     assert_eq!(body_bytes(response).await.len(), CAP);
     let response = http_get(&app, &format!("/benchcmp/capped-bytes?offset={CAP:020}")).await;
-    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
     assert_eq!(body_bytes(response).await.len(), payload.len() - CAP);
 }
 
@@ -10365,8 +10365,8 @@ async fn a_capped_json_offset_read_may_end_mid_message() {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
-        let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+        assert!(response.headers().get(names::STREAM_UP_TO_DATE).is_none());
+        let next = header_str(&response, names::STREAM_NEXT_OFFSET).to_owned();
         assert_eq!(next, format!("{CAP:020}"));
         let first = body_bytes(response).await;
         assert_eq!(&first[..], &expected.as_bytes()[..CAP], "query={query}");
@@ -10375,7 +10375,7 @@ async fn a_capped_json_offset_read_may_end_mid_message() {
             &format!("/benchcmp/capped-big-record?offset={next}{query}"),
         )
         .await;
-        assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+        assert_eq!(header_str(&response, names::STREAM_UP_TO_DATE), "true");
         assert_eq!(&body_bytes(response).await[..], &expected.as_bytes()[CAP..]);
     }
 }
@@ -10405,7 +10405,7 @@ async fn capped_and_uncapped_offset_reads_continue_exactly() {
         let close = index == 2;
         let mut headers = vec![(CONTENT_TYPE.as_str(), "application/json")];
         if close {
-            headers.push((HEADER_STREAM_CLOSED, "true"));
+            headers.push((names::STREAM_CLOSED, "true"));
         }
         let response = http_post(
             &app,
@@ -10434,9 +10434,9 @@ async fn capped_and_uncapped_offset_reads_continue_exactly() {
                 .await;
                 assert_eq!(response.status(), StatusCode::OK, "{max_bytes}{live}");
                 pages += 1;
-                let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
-                let closed = response.headers().get(HEADER_STREAM_CLOSED).is_some();
-                let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET)
+                let up_to_date = response.headers().get(names::STREAM_UP_TO_DATE).is_some();
+                let closed = response.headers().get(names::STREAM_CLOSED).is_some();
+                let next = header_str(&response, names::STREAM_NEXT_OFFSET)
                     .parse::<u64>()
                     .unwrap();
                 let body = body_bytes(response).await;

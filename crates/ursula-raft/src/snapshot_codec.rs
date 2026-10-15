@@ -13,6 +13,7 @@ use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::ClosedEpoch;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
 use ursula_stream::HotPayloadSegment;
@@ -24,6 +25,8 @@ use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotEntry;
 use ursula_stream::StreamStatus;
 use ursula_stream::StreamVisibleSnapshot;
+use ursula_stream::WriteDigest;
+use ursula_stream::WriteReceipt;
 
 fn placement_to_proto(placement: ShardPlacement) -> proto::ShardPlacementV1 {
     proto::ShardPlacementV1 {
@@ -308,6 +311,7 @@ fn stream_to_proto(
             .map(producer_to_proto)
             .collect(),
         retained_offset: Some(entry.retained_offset),
+        retired_epoch_watermark: entry.retired_epoch_watermark,
     })
 }
 
@@ -340,6 +344,7 @@ fn stream_from_proto(
             .into_iter()
             .map(producer_from_proto)
             .collect::<Result<Vec<_>, _>>()?,
+        retired_epoch_watermark: entry.retired_epoch_watermark,
     })
 }
 
@@ -459,24 +464,32 @@ fn visible_snapshot_from_proto(snapshot: proto::StreamVisibleSnapshotV1) -> Stre
 }
 
 fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
+    let receipt = producer.newest.receipt;
     proto::ProducerSnapshotV1 {
         producer_id: producer.producer_id,
-        producer_epoch: producer.producer_epoch,
-        producer_seq: producer.producer_seq,
-        last_start_offset: producer.last_start_offset,
-        last_next_offset: producer.last_next_offset,
-        last_closed: producer.last_closed,
-        receipts: producer
-            .receipts
-            .into_iter()
-            .map(producer_receipt_to_proto)
-            .collect(),
+        epoch: producer.epoch,
+        last_seq: producer.last_seq,
+        newest_start_offset: receipt.start_offset,
+        newest_next_offset: receipt.next_offset,
+        newest_closed: receipt.closed,
         last_seen_ms: Some(producer.last_seen_ms),
+        claim_digest: producer
+            .claim_digest
+            .map(|digest| Bytes::copy_from_slice(&digest)),
+        newest_digest: producer
+            .newest
+            .digest
+            .map(|digest| Bytes::copy_from_slice(&digest)),
+        closed_epoch: producer.closed_epoch.map(|closed| proto::ClosedEpochV1 {
+            epoch: closed.epoch,
+            seq: closed.seq,
+        }),
     }
 }
 
 /// Field 9 `last_seen_ms` stays `optional` on the wire, but every writer sets
-/// it (bounded-state F3), so an absent value is corruption.
+/// it (bounded-state F3), so an absent value is corruption. A digest is 32
+/// bytes.
 fn producer_from_proto(
     producer: proto::ProducerSnapshotV1,
 ) -> Result<ProducerSnapshot, SnapshotStoreError> {
@@ -486,38 +499,40 @@ fn producer_from_proto(
             producer.producer_id
         ))
     })?;
+    let digest = |bytes: Option<Bytes>, field: &str| {
+        bytes
+            .map(|bytes| {
+                WriteDigest::try_from(bytes.as_ref()).map_err(|_wrong_length| {
+                    SnapshotStoreError::Deserialize(format!(
+                        "snapshot producer '{}' {field} is {} bytes, not 32",
+                        producer.producer_id,
+                        bytes.len()
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let claim_digest = digest(producer.claim_digest.clone(), "claim_digest")?;
+    let newest_digest = digest(producer.newest_digest.clone(), "newest_digest")?;
     Ok(ProducerSnapshot {
-        producer_id: producer.producer_id,
-        producer_epoch: producer.producer_epoch,
-        producer_seq: producer.producer_seq,
-        last_start_offset: producer.last_start_offset,
-        last_next_offset: producer.last_next_offset,
-        last_closed: producer.last_closed,
-        receipts: producer
-            .receipts
-            .into_iter()
-            .map(producer_receipt_from_proto)
-            .collect(),
+        epoch: producer.epoch,
+        last_seq: producer.last_seq,
+        claim_digest,
+        newest: ProducerReceipt {
+            receipt: WriteReceipt {
+                start_offset: producer.newest_start_offset,
+                next_offset: producer.newest_next_offset,
+                closed: producer.newest_closed,
+            },
+            digest: newest_digest,
+        },
+        closed_epoch: producer.closed_epoch.map(|closed| ClosedEpoch {
+            epoch: closed.epoch,
+            seq: closed.seq,
+        }),
         last_seen_ms,
+        producer_id: producer.producer_id,
     })
-}
-
-fn producer_receipt_to_proto(receipt: ProducerReceipt) -> proto::ProducerReceiptV1 {
-    proto::ProducerReceiptV1 {
-        producer_seq: receipt.producer_seq,
-        start_offset: receipt.start_offset,
-        next_offset: receipt.next_offset,
-        closed: receipt.closed,
-    }
-}
-
-fn producer_receipt_from_proto(receipt: proto::ProducerReceiptV1) -> ProducerReceipt {
-    ProducerReceipt {
-        producer_seq: receipt.producer_seq,
-        start_offset: receipt.start_offset,
-        next_offset: receipt.next_offset,
-        closed: receipt.closed,
-    }
 }
 
 fn append_count_to_proto(count: StreamAppendCount) -> proto::StreamAppendCountV1 {
@@ -671,7 +686,6 @@ mod tests {
             initial_payload: bytes::Bytes::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 1,
@@ -691,6 +705,7 @@ mod tests {
                         producer_id: producer_id.to_owned(),
                         producer_epoch: 1,
                         producer_seq: seq,
+                        digest: None,
                     }),
                     now_ms,
                 });
@@ -901,7 +916,6 @@ mod tests {
             initial_payload: bytes::Bytes::from_static(b"ab"),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 1,
