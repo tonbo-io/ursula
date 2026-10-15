@@ -298,6 +298,14 @@ fn generate_leader_read_linearizability(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::LeaderReadLinearizability)
 }
 
+fn generate_producer_repeats_exactly_once(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::ProducerRepeatsExactlyOnce)
+}
+
+fn generate_idle_expiry_cannot_reopen_an_epoch(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::IdleExpiryCannotReopenAnEpoch)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -312,6 +320,27 @@ struct SeedFamily {
 /// NOTE: `scripts/dst/audits.py` parses this table (the `name`, `start`, and
 /// `end` fields) for the seed-inventory audit; keep the field layout intact.
 const SEED_FAMILIES: &[SeedFamily] = &[
+    SeedFamily {
+        name: "producer-repeats-exactly-once",
+        start: 365,
+        end: 369,
+        kind: "producer-repeats-exactly-once",
+        generate: generate_producer_repeats_exactly_once,
+    },
+    SeedFamily {
+        name: "idle-expiry-cannot-reopen-an-epoch",
+        start: 370,
+        end: 374,
+        kind: "idle-expiry-cannot-reopen-an-epoch",
+        generate: generate_idle_expiry_cannot_reopen_an_epoch,
+    },
+    SeedFamily {
+        name: "producer-repeats-exactly-once-extended",
+        start: 800,
+        end: 849,
+        kind: "producer-repeats-exactly-once",
+        generate: generate_producer_repeats_exactly_once,
+    },
     SeedFamily {
         name: "leader-read-linearizability",
         start: 360,

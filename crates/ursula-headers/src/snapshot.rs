@@ -270,6 +270,15 @@ impl TryFrom<u32> for PartCount {
     }
 }
 
+impl PartCount {
+    /// The count as a length; [`HeaderError::ManifestPartCount`] where a
+    /// `usize` cannot hold it.
+    fn len(self) -> Result<usize, HeaderError> {
+        usize::try_from(self.0)
+            .map_err(|_overflow| HeaderError::ManifestPartCount { declared: self })
+    }
+}
+
 impl TryFrom<usize> for PartCount {
     type Error = HeaderError;
 
@@ -313,6 +322,15 @@ impl PartsCommit {
         Ok(Some(Self { parts, digest }))
     }
 
+    /// The commit of `manifest`, whose parts assemble a snapshot with
+    /// `digest`.
+    pub fn for_manifest(manifest: &PartsManifest, digest: SnapshotDigest) -> Self {
+        Self {
+            parts: manifest.count(),
+            digest,
+        }
+    }
+
     /// Emits `Stream-Snapshot-Parts` and `Stream-Snapshot-Digest`.
     pub fn render(&self, mut emit: impl FnMut(&'static str, &str)) {
         emit(names::STREAM_SNAPSHOT_PARTS, &self.parts.to_string());
@@ -353,7 +371,7 @@ impl PartsManifest {
         };
         let mut parts = Vec::new();
         for (index, line) in lines.split(|byte| *byte == b'\n').enumerate() {
-            if parts.len() >= count.0 as usize {
+            if parts.len() >= count.len()? {
                 return Err(HeaderError::ManifestPartCount { declared: count });
             }
             let id = std::str::from_utf8(line)
@@ -364,7 +382,7 @@ impl PartsManifest {
                 })?;
             parts.push(PartId(id.to_owned()));
         }
-        if parts.len() != count.0 as usize {
+        if parts.len() != count.len()? {
             return Err(HeaderError::ManifestPartCount { declared: count });
         }
         Ok(Self(parts))
@@ -713,6 +731,8 @@ mod tests {
                 .collect(),
         ] {
             let manifest = PartsManifest::new(parts.clone()).unwrap();
+            let commit = PartsCommit::for_manifest(&manifest, SnapshotDigest::from_bytes([7; 32]));
+            assert_eq!(commit.parts, manifest.count());
             assert_eq!(manifest.parts(), parts.as_slice());
             let body = manifest.render();
             assert!(body.ends_with('\n') && !body.contains('\r'));

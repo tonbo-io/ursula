@@ -88,6 +88,7 @@ use crate::request::ImportGroupStateResponse;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -1854,53 +1855,6 @@ pub(crate) fn unix_time_ms() -> u64 {
 /// group_rpc`]. Entries with `client { none }` keep hand-written methods; see
 /// the manifest grammar in [`crate::ops`].
 macro_rules! shard_runtime_operations {
-    // Stream-routed write with admission and an emptiness precheck.
-    (@munch
-        methods { $($methods:tt)* }
-        rest {
-            $(#[$attr:meta])*
-            op $Variant:ident {
-                fields { $req:ident: $Req:ty $(,)? }
-                reply { $tx:ident: $Resp:ty }
-                guard { $g:ident }
-                handle { $($handle:tt)* }
-                client {
-                    $vis:vis stream fn $method:ident,
-                    non_empty: $ne:ident,
-                    admit: $incoming:expr
-                }
-            }
-            $($rest:tt)*
-        }
-    ) => {
-        shard_runtime_operations! {
-            @munch
-            methods {
-                $($methods)*
-                $(#[$attr])*
-                $vis async fn $method(&self, $req: $Req) -> Result<$Resp, RuntimeError> {
-                    if $req.$ne.is_empty() {
-                        return Err(RuntimeError::EmptyAppend);
-                    }
-                    let placement = self.shard_map.locate(&$req.stream_id);
-                    let incoming_bytes = $incoming;
-                    let (response_tx, response_rx) = oneshot::channel();
-                    self.group_rpc(
-                        placement,
-                        Some(incoming_bytes),
-                        GroupCommand::$Variant {
-                            $req,
-                            $tx: response_tx,
-                            $g: None,
-                        },
-                        response_rx,
-                    )
-                    .await
-                }
-            }
-            rest { $($rest)* }
-        }
-    };
     // Stream-routed write with admission.
     (@munch
         methods { $($methods:tt)* }

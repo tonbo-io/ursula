@@ -69,9 +69,9 @@ mod tests {
     use crate::UrsulaRaftTypeConfig;
 
     #[test]
-    fn epoch3_persisted_envelopes_are_stable() {
+    fn epoch4_persisted_envelopes_are_stable() {
         // Named MessagePack (rmp_serde::to_vec_named) of the OpenRaft types
-        // that format epoch 3 writes to disk and sends to peers: Vote, LogId,
+        // that format epoch 4 writes to disk and sends to peers: Vote, LogId,
         // a joint StoredMembership with a learner and node addresses, a
         // membership Entry, and SnapshotMeta (snapshot record and transfer).
         // The SnapshotMeta bytes are the map {last_log_id, last_membership,
@@ -79,7 +79,7 @@ mod tests {
         // snapshot id in the state machine's format. Decoding and re-encoding
         // must reproduce each value byte for byte.
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch3.json")).unwrap();
+            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch4.json")).unwrap();
         fn check<T: serde::de::DeserializeOwned + serde::Serialize>(
             fixtures: &serde_json::Value,
             name: &str,

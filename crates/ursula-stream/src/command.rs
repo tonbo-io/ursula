@@ -16,13 +16,14 @@ pub enum StreamCommand {
     CreateBucket {
         bucket_id: String,
     },
+    /// Creates a stream. A create carries no producer headers (#581 section
+    /// 3): keyed bytes enter a stream only through claims and appends.
     CreateStream {
         stream_id: BucketStreamId,
         content_type: String,
         initial_payload: Bytes,
         close_after: bool,
         stream_seq: Option<String>,
-        producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
         now_ms: u64,
@@ -34,7 +35,6 @@ pub enum StreamCommand {
         record_ends: Vec<u64>,
         close_after: bool,
         stream_seq: Option<String>,
-        producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
         now_ms: u64,
@@ -155,10 +155,9 @@ pub enum StreamCommand {
         snapshot: Box<StreamSnapshot>,
     },
     /// Bounded normalization of one stream's replicated state (bounded-state
-    /// F0): expires idle producers, evicts producers over the cap and trims
-    /// the receipt window (F3). Each command does bounded work; a
-    /// leader-side driver repeats it while debt remains.
-    /// Idempotent.
+    /// F0): expires idle producers and evicts producers over the cap (F3).
+    /// Each command does bounded work; a leader-side driver repeats it while
+    /// debt remains. Idempotent.
     TidyStream {
         stream_id: BucketStreamId,
         now_ms: u64,

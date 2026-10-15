@@ -575,7 +575,7 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
         return Ok(Typed::Routing(routing));
     }
     if status == SizeLimit::STATUS {
-        return Ok(Typed::TooLarge(SizeLimit::parse(headers)?));
+        return Ok(Typed::TooLarge(SizeLimit::parse(status, headers)?));
     }
     if let Some(mismatch) = IncarnationMismatch::parse(status, headers.clone())? {
         return Ok(Typed::IncarnationMismatch(mismatch));

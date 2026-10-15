@@ -33,7 +33,6 @@ fn create_stream(name: &str) -> GroupWriteCommand {
         initial_payload: bytes::Bytes::copy_from_slice(name.as_bytes()),
         close_after: false,
         stream_seq: None,
-        producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
         now_ms: 0,

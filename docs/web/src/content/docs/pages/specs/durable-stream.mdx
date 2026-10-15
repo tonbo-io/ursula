@@ -327,9 +327,8 @@ if epoch > state.epoch:
 # Same epoch: sequence validation
 if seq <= state.lastSeq:
   -> 204 No Content (duplicate, idempotent success)
-  -> Return the exact original byte range for this seq when its receipt is
-     retained (the stream's receipt window, and always the newest seq);
-     beyond the window, return no byte range
+  -> Ursula returns the original byte range when seq is the newest
+     accepted seq, and no byte range for an older one (extensions §5.3)
 
 if seq == state.lastSeq + 1:
   -> Accept, update state.lastSeq = seq
@@ -347,6 +346,8 @@ if seq > state.lastSeq + 1:
 - `400 Bad Request`: Invalid producer headers (e.g., non-integer values, epoch increase with seq != 0)
 - `403 Forbidden`: Stale producer epoch (zombie fencing). Response includes `Producer-Epoch` header with current server epoch.
 - `409 Conflict`: Sequence gap detected. Response includes `Producer-Expected-Seq` and `Producer-Received-Seq` headers.
+
+> **Note (informative).** Ursula refuses producer headers on create, adds `Producer-Expected-Seq: 0` to the `400` of an epoch increase with a non-zero seq, types its producer refusals with `Producer-Outcome`, and refuses a write with `Stream-Incarnation` that could reach a producer epoch at or below a stream's epoch floor. A write without it keeps this section's rule that a producer whose state expired is treated as new (see [extensions Section 5](/docs/specs/extensions#5-write-keys-and-typed-answers)).
 
 #### Bootstrap and Restart Flow
 

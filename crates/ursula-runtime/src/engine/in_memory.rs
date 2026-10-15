@@ -4,7 +4,10 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
 use ursula_stream::ColdFlushPassRequest;
+use ursula_stream::IncarnationCheck;
 use ursula_stream::ObjectPayloadRef;
+use ursula_stream::ProducerAck;
+use ursula_stream::ProducerEarlyAnswer;
 use ursula_stream::ProducerRequest;
 use ursula_stream::SharedRefCandidate;
 use ursula_stream::SharedRefCompactionRequest;
@@ -18,6 +21,7 @@ use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamResponse;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
+use ursula_stream::WriteKind;
 
 use super::GroupAckColdGcFuture;
 use super::GroupAdvanceRetentionFuture;
@@ -43,6 +47,7 @@ use super::GroupPlanColdGcFuture;
 use super::GroupPlanColdOrphanSweepFuture;
 use super::GroupPlanNextColdFlushBatchFuture;
 use super::GroupPlanSharedRefCompactionFuture;
+use super::GroupProducerEarlyAnswerFuture;
 use super::GroupPublishSnapshotFuture;
 use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
@@ -105,6 +110,7 @@ use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -128,6 +134,7 @@ pub(crate) struct AppendPayloadInput<'a> {
     stream_seq: Option<String>,
     producer: Option<ProducerRequest>,
     now_ms: u64,
+    check: IncarnationCheck,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +207,17 @@ impl InMemoryGroupEngine {
         command: StreamCommand,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
+        self.apply_checked_stream_command(command, placement, IncarnationCheck::Absent)
+    }
+
+    /// [`Self::apply_stream_command`] for a command whose
+    /// `Stream-Incarnation` precondition `check` says whether it matched.
+    fn apply_checked_stream_command(
+        &mut self,
+        command: StreamCommand,
+        placement: ShardPlacement,
+        check: IncarnationCheck,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
         match command {
             // The `Stream-Incarnation` precondition (D12) is checked before
             // anything the wrapped command does here (a create's implicit
@@ -214,7 +232,7 @@ impl InMemoryGroupEngine {
                 {
                     return self.group_response_from_stream(refusal, None, placement);
                 }
-                self.apply_stream_command(*command, placement)
+                self.apply_checked_stream_command(*command, placement, IncarnationCheck::Matched)
             }
             // Appends skip `StreamStateMachine::apply` to keep the exact
             // borrowed fast path (no TTL sweep on the append hot path).
@@ -236,6 +254,7 @@ impl InMemoryGroupEngine {
                         stream_seq,
                         producer,
                         now_ms,
+                        check,
                     },
                     placement,
                 )
@@ -270,7 +289,7 @@ impl InMemoryGroupEngine {
                 {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
-                let response = self.state_machine.apply(command);
+                let response = self.state_machine.apply_checked(command, check);
                 let response = self.group_response_from_stream(response, stream_id, placement);
                 if response.is_ok()
                     && let (Some(cache), Some(stream_id)) =
@@ -344,14 +363,12 @@ impl InMemoryGroupEngine {
                 offset,
                 next_offset,
                 closed,
-                deduplicated,
                 producer,
-                receipt_evicted,
             } => {
                 let stream_id = require_response_stream_id(stream_id, "appended")?;
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                if !deduplicated {
+                if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
                     self.advance_commit_index();
                     self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
@@ -363,11 +380,9 @@ impl InMemoryGroupEngine {
                     stream_append_count,
                     group_commit_index: self.commit_index,
                     closed,
-                    deduplicated,
                     producer,
                     stream_hot_bytes,
                     group_hot_bytes,
-                    receipt_evicted,
                     incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 }))
             }
@@ -457,18 +472,17 @@ impl InMemoryGroupEngine {
             }
             StreamResponse::Closed {
                 next_offset,
-                deduplicated,
-                ..
+                producer,
             } => {
                 let stream_id = require_response_stream_id(stream_id, "closed")?;
-                if !deduplicated {
+                if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
                     self.advance_commit_index();
                 }
                 Ok(GroupWriteResponse::CloseStream(CloseStreamResponse {
                     placement,
                     next_offset,
                     group_commit_index: self.commit_index,
-                    deduplicated,
+                    producer,
                     incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 }))
             }
@@ -624,6 +638,15 @@ impl InMemoryGroupEngine {
             && !self.state_machine.append_would_deduplicate(
                 &request.stream_id,
                 request.producer.as_ref(),
+                match request.if_incarnation {
+                    Some(incarnation)
+                        if self.state_machine.stream_incarnation(&request.stream_id)
+                            == Some(incarnation) =>
+                    {
+                        IncarnationCheck::Matched
+                    }
+                    _ => IncarnationCheck::Absent,
+                },
                 request.now_ms,
             )
         {
@@ -643,6 +666,20 @@ impl InMemoryGroupEngine {
                 }
             };
         Ok(response)
+    }
+
+    /// [`GroupEngine::producer_early_answer`] from this engine's applied
+    /// state.
+    pub fn producer_early_answer_now(
+        &self,
+        request: &ProducerEarlyAnswerRequest,
+    ) -> Option<ProducerEarlyAnswer> {
+        self.state_machine.producer_early_answer(
+            &request.stream_id,
+            &request.producer,
+            request.incarnation,
+            request.now_ms,
+        )
     }
 
     pub fn access_requires_write(
@@ -712,6 +749,7 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
+            check,
         } = input;
         let stream_count_key = stream_id.clone();
         let response = self.state_machine.append_borrowed(AppendStreamInput {
@@ -722,6 +760,8 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
+            kind: WriteKind::Append,
+            check,
         });
         self.append_response_from_stream(stream_count_key, response, placement)
     }
@@ -737,13 +777,11 @@ impl InMemoryGroupEngine {
                 offset,
                 next_offset,
                 closed,
-                deduplicated,
                 producer,
-                receipt_evicted,
             } => {
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                if !deduplicated {
+                if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
                     self.advance_commit_index();
                     self.state_machine.add_stream_append_count(&stream_id, 1);
                 }
@@ -755,11 +793,9 @@ impl InMemoryGroupEngine {
                     stream_append_count,
                     group_commit_index: self.commit_index,
                     closed,
-                    deduplicated,
                     producer,
                     stream_hot_bytes,
                     group_hot_bytes,
-                    receipt_evicted,
                     incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 })
             }
@@ -1681,6 +1717,14 @@ impl GroupEngine for InMemoryGroupEngine {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             self.head_stream_after_access(&request, placement)
         })
+    }
+
+    fn producer_early_answer<'a>(
+        &'a mut self,
+        request: ProducerEarlyAnswerRequest,
+        _placement: ShardPlacement,
+    ) -> GroupProducerEarlyAnswerFuture<'a> {
+        Box::pin(async move { Ok(self.producer_early_answer_now(&request)) })
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {

@@ -1,8 +1,8 @@
 //! The bounded-state F0 tidy driver through the runtime on the in-memory
 //! engine: rate-limited passes over every group converge streams with
-//! normalization debt. The debt here is idle-producer expiry (F3). (The F3
-//! receipt window is pinned by the state machine's producer-window tests and
-//! the HTTP 204 regression.)
+//! normalization debt. The debt here is idle-producer expiry (F3). (One
+//! receipt per producer is pinned by the state machine's producer-record
+//! tests and the HTTP `receipt-evicted` regression.)
 
 use ursula_shard::BucketStreamId;
 use ursula_stream::ProducerRequest;
@@ -26,6 +26,8 @@ fn producer_append(stream: &BucketStreamId, seq: u64) -> AppendRequest {
         producer_id: "writer".to_owned(),
         producer_epoch: 1,
         producer_seq: seq,
+        digest: None,
+        ..Default::default()
     });
     request.now_ms = 1;
     request

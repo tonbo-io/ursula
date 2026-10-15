@@ -169,6 +169,22 @@ pub enum SnapshotStoreError {
     Serialize(String),
     #[error("snapshot deserialize: {0}")]
     Deserialize(String),
+    /// A required field of a snapshot frame is absent.
+    #[error("snapshot deserialize: missing {field}")]
+    MissingField { field: &'static str },
+    /// A producer record lacks a field every writer sets.
+    #[error("snapshot producer '{producer_id}' has no {field}")]
+    ProducerFieldMissing {
+        producer_id: String,
+        field: &'static str,
+    },
+    /// A producer record's digest is not 32 bytes.
+    #[error("snapshot producer '{producer_id}' {field} is {len} bytes, not 32")]
+    ProducerDigestLength {
+        producer_id: String,
+        field: &'static str,
+        len: usize,
+    },
     /// A group snapshot whose leading frame names another format epoch than
     /// [`ursula_stream::FORMAT_EPOCH`], or that has no such frame
     /// (`found: None`, Ursula 0.5.x and earlier).

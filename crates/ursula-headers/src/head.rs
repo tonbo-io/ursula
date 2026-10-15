@@ -78,7 +78,7 @@ impl ServerIdentity {
             fields::collect(headers, [names::URSULA_PROTOCOL, names::URSULA_CLUSTER_ID])?;
         let protocol = fields::decimal(names::URSULA_PROTOCOL, protocol)?
             .map(|protocol| {
-                u32::try_from(protocol).map_err(|_overflow| HeaderError::IntegerTooLarge {
+                u32::try_from(protocol).map_err(|_overflow| HeaderError::U32TooLarge {
                     name: names::URSULA_PROTOCOL,
                 })
             })
@@ -166,10 +166,19 @@ impl StreamHead {
         self
     }
 
-    #[must_use]
-    pub const fn with_snapshot(mut self, snapshot: Option<SnapshotRef>) -> Self {
+    /// The latest published snapshot, whose offset must be at most the
+    /// tail.
+    pub fn with_snapshot(mut self, snapshot: Option<SnapshotRef>) -> Result<Self, HeaderError> {
+        if let Some(snapshot) = snapshot
+            && snapshot.offset > self.next_offset
+        {
+            return Err(HeaderError::SnapshotPastNext {
+                snapshot: snapshot.offset,
+                next: self.next_offset,
+            });
+        }
         self.snapshot = snapshot;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -295,7 +304,7 @@ impl StreamHead {
             )?,
         )?
         .with_closed(fields::flag(names::STREAM_CLOSED, closed)?)
-        .with_snapshot(SnapshotRef::from_fields(snapshot_offset, snapshot_digest)?)
+        .with_snapshot(SnapshotRef::from_fields(snapshot_offset, snapshot_digest)?)?
         .with_max_snapshot_bytes(fields::decimal(
             names::URSULA_MAX_SNAPSHOT_BYTES,
             max_snapshot,
@@ -438,7 +447,7 @@ mod tests {
                     ("ursula-protocol", "4294967296"),
                     ("ursula-cluster-id", "c"),
                 ]),
-                HeaderError::IntegerTooLarge {
+                HeaderError::U32TooLarge {
                     name: "ursula-protocol",
                 },
             ),
@@ -502,6 +511,7 @@ mod tests {
             .unwrap()
             .with_closed(true)
             .with_snapshot(Some(snapshot))
+            .unwrap()
             .with_max_snapshot_bytes(Some(1_073_741_824))
             .with_inherited(Some(Inherited {
                 previous_incarnation: token(4_503_599_627_370_496),
@@ -511,6 +521,7 @@ mod tests {
             StreamHead::new(token(1), offset(u64::MAX), offset(u64::MAX), u64::MAX)
                 .unwrap()
                 .with_snapshot(Some(snapshot))
+                .unwrap()
                 .with_max_snapshot_bytes(Some(u64::MAX))
                 .with_inherited(Some(Inherited {
                     previous_incarnation: token(2),
@@ -546,6 +557,17 @@ mod tests {
                 offset: offset(5),
             })),
             Err(HeaderError::PreviousIncarnationIsCurrent)
+        );
+        let snapshot = crate::snapshot::SnapshotRef {
+            offset: offset(6),
+            digest: crate::value::SnapshotDigest::from_bytes([1; 32]),
+        };
+        assert_eq!(
+            head.with_snapshot(Some(snapshot)),
+            Err(HeaderError::SnapshotPastNext {
+                snapshot: offset(6),
+                next: offset(5)
+            })
         );
         let full = || {
             let mut pairs = Pairs::new();

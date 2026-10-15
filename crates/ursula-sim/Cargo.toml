@@ -22,10 +22,12 @@ ursula-shard = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
 axum = { workspace = true }
+blake3 = { workspace = true }
 madsim = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 ursula = { workspace = true }
 ursula-ctl = { workspace = true }
+ursula-headers = { workspace = true }
 ursula-proto = { workspace = true }
 
 [lints]

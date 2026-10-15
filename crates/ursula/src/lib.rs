@@ -47,6 +47,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
+use axum::body::HttpBody;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::OriginalUri;
 use axum::extract::Path;
@@ -85,6 +86,15 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
+use ursula_headers::HeaderError as ProducerHeaderError;
+use ursula_headers::IncarnationPrecondition;
+use ursula_headers::ProducerAnswer;
+use ursula_headers::ProducerRequestHeaders;
+use ursula_headers::ProducerWrite;
+use ursula_headers::names;
+use ursula_headers::value::Epoch;
+use ursula_headers::value::Incarnation;
+use ursula_proto::ContentFaultV1;
 use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
@@ -113,6 +123,7 @@ use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::CloseStreamResponse;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::CreateStreamResponse;
@@ -124,11 +135,12 @@ use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::LiveReadOwner;
 use ursula_runtime::PlanColdFlushRequest;
+use ursula_runtime::ProducerEarlyAnswer;
+use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
-use ursula_runtime::RefusedBeforeProposal;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
@@ -139,7 +151,6 @@ use ursula_shard::RaftGroupId;
 use wal_disk::WalDiskMonitor;
 
 use crate::admission::ingress_admission_middleware;
-use crate::admission::mark_not_applied;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
 use crate::render::http_read_content_type;
@@ -153,7 +164,7 @@ use crate::render::insert_lifetime_headers;
 use crate::render::insert_location;
 use crate::render::insert_offset;
 use crate::render::insert_padded_offset;
-use crate::render::insert_producer_ack;
+use crate::render::insert_producer_answer;
 use crate::render::insert_producer_error_headers;
 use crate::render::insert_snapshot_digest;
 use crate::render::insert_snapshot_offset;
@@ -164,6 +175,8 @@ use crate::render::insert_u64_header;
 use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
+use crate::render::producer_ack_answer;
+use crate::render::producer_answer_failed;
 use crate::render::read_response;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
@@ -176,26 +189,15 @@ use crate::render::sse_safe_line;
 type BoxResponse = Box<Response>;
 
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
-const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
-const HEADER_STREAM_INCARNATION: &str = "stream-incarnation";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
-const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
-const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
-const HEADER_STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
-const HEADER_STREAM_RETAINED_OFFSET: &str = "stream-retained-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
-const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
-const HEADER_PRODUCER_ID: &str = "producer-id";
-const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
-const HEADER_PRODUCER_SEQ: &str = "producer-seq";
 const HEADER_X_CONTENT_TYPE_OPTIONS: &str = "x-content-type-options";
 const HEADER_CROSS_ORIGIN_RESOURCE_POLICY: &str = "cross-origin-resource-policy";
-const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 #[cfg(feature = "jemalloc-prof")]
 const HEADER_URSULA_DEBUG_TOKEN: &str = "x-ursula-debug-token";
 // tikv-jemalloc-sys forces the `_rjem_` symbol prefix on Apple targets, so
@@ -262,7 +264,6 @@ struct CreateStreamHttpResponseInput<'a> {
     content_type: &'a str,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
-    producer: Option<&'a ProducerRequest>,
 }
 
 pub trait WallClock: Send + Sync + 'static {
@@ -528,6 +529,9 @@ struct HttpMetrics {
     sse_data_events: AtomicU64,
     sse_control_events: AtomicU64,
     sse_error_events: AtomicU64,
+    /// Producer writes answered `producer-expired` (the stream's epoch
+    /// floor refused them).
+    producer_expired_answers: AtomicU64,
 }
 
 impl HttpMetrics {
@@ -538,6 +542,7 @@ impl HttpMetrics {
             sse_data_events: self.sse_data_events.load(Ordering::Relaxed),
             sse_control_events: self.sse_control_events.load(Ordering::Relaxed),
             sse_error_events: self.sse_error_events.load(Ordering::Relaxed),
+            producer_expired_answers: self.producer_expired_answers.load(Ordering::Relaxed),
         }
     }
 }
@@ -549,6 +554,7 @@ struct HttpMetricsSnapshot {
     sse_data_events: u64,
     sse_control_events: u64,
     sse_error_events: u64,
+    producer_expired_answers: u64,
 }
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
@@ -631,7 +637,7 @@ impl ClientWriteLeaderRouter {
         } else {
             return None;
         }
-        insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, leader_id);
+        insert_u64_header(&mut headers, names::X_URSULA_RAFT_LEADER_ID, leader_id);
         Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
     }
 }
@@ -1388,9 +1394,9 @@ pub(crate) async fn stage_external_payload(
 /// deleted only when its append or create definitely did not commit. That is
 /// a typed stream error (apply, or a pre-proposal check, rejected it on every
 /// replica alike), a request the runtime refused before dispatch, or a refusal
-/// before proposal ([`PreProposalRefusal`]: a redirect raised by the local
-/// leadership check, a backpressure rejection, a group this node does not
-/// host). Every other failure (a lost response, a forward-to-leader reported
+/// before proposal ([`refused_before_proposal`]: a redirect raised by the
+/// local leadership check, a backpressure rejection, a group this node does
+/// not host). Every other failure (a lost response, a forward-to-leader reported
 /// by OpenRaft after `client_write` (RT1), a transport or storage error, an
 /// untyped engine error) may follow a committed proposal that references the
 /// object, so the object is kept. An orphan sweep or stream GC reclaims it if
@@ -1398,8 +1404,8 @@ pub(crate) async fn stage_external_payload(
 pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
     match err {
         RuntimeError::GroupEngine { error, .. } if error.code().is_some() => true,
-        RuntimeError::EmptyAppend | RuntimeError::InvalidRaftGroup { .. } => true,
-        other => PreProposalRefusal::of(other).is_some(),
+        RuntimeError::InvalidRaftGroup { .. } => true,
+        other => refused_before_proposal(other),
     }
 }
 
@@ -1440,7 +1446,6 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         content_type,
         stream_ttl_seconds,
         stream_expires_at_ms,
-        producer,
     } = input;
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -1449,9 +1454,8 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     insert_location(&mut headers, stream_id);
     insert_incarnation(&mut headers, response.incarnation);
     insert_lifetime_headers(&mut headers, stream_ttl_seconds, stream_expires_at_ms);
-    insert_producer_ack(&mut headers, producer);
     if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     }
     let status = if response.already_exists {
         StatusCode::OK
@@ -1462,22 +1466,68 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
 }
 
 pub(crate) fn append_http_response(response: AppendResponse) -> Response {
+    if let Some(ack) = response.producer.as_ref() {
+        return producer_answer_response(
+            producer_ack_answer(ack, response.incarnation),
+            AnswerTo::Append,
+        );
+    }
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    // A duplicate beyond the receipt window (bounded-state F3) is answered
-    // `204` with `Producer-Seq` and without a byte range.
-    if !response.receipt_evicted {
-        insert_offset(&mut headers, response.next_offset);
-    }
     insert_incarnation(&mut headers, response.incarnation);
-    insert_producer_ack(&mut headers, response.producer.as_ref());
+    insert_offset(&mut headers, response.next_offset);
     if response.closed {
-        insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+        insert_static(&mut headers, names::STREAM_CLOSED, "true");
     }
-    let status = if response.producer.is_some() && !response.deduplicated {
-        StatusCode::OK
-    } else {
-        StatusCode::NO_CONTENT
+    (StatusCode::NO_CONTENT, headers).into_response()
+}
+
+/// The answer to a close-only write: `204` with the stream's tail and
+/// `Stream-Closed`, or, for a producer close, the producer answer alone.
+pub(crate) fn close_http_response(response: &CloseStreamResponse) -> Response {
+    if let Some(ack) = response.producer.as_ref() {
+        return producer_answer_response(
+            producer_ack_answer(ack, response.incarnation),
+            AnswerTo::CloseOnly,
+        );
+    }
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_offset(&mut headers, response.next_offset);
+    insert_incarnation(&mut headers, response.incarnation);
+    insert_static(&mut headers, names::STREAM_CLOSED, "true");
+    (StatusCode::NO_CONTENT, headers).into_response()
+}
+
+/// What a producer answer responds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerTo {
+    /// A write with a body, or one whose body was not read.
+    Append,
+    /// An empty write with `Stream-Closed: true`. The base protocol answers
+    /// it `204` even when it applied now.
+    CloseOnly,
+}
+
+/// The one renderer of a producer answer, for the early and the late path:
+/// the answer's own headers (`Stream-Incarnation` and the range on a
+/// receipt, `Stream-Closed` only on a receipt of a write that closed the
+/// stream), nothing else. A value outside the protocol's range answers
+/// `500`.
+fn producer_answer_response(
+    answer: Result<ProducerAnswer, ProducerHeaderError>,
+    to: AnswerTo,
+) -> Response {
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => return producer_answer_failed(&err),
+    };
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_producer_answer(&mut headers, &answer);
+    let status = match (to, &answer) {
+        (AnswerTo::CloseOnly, ProducerAnswer::Receipt { .. }) => StatusCode::NO_CONTENT,
+        _ => StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     };
     (status, headers).into_response()
 }
@@ -2708,13 +2758,23 @@ pub(crate) async fn create_stream_by_id(
     };
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
-    let producer = match producer_request(&request_headers) {
-        Ok(producer) => producer,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    request.producer = producer.clone();
+    // A create carries no producer headers (#581 section 3): keyed bytes
+    // enter a stream only through claims and appends.
+    match parse_producer_headers(&request_headers) {
+        Ok(ProducerRequestHeaders { producer: None, .. }) => {}
+        Ok(ProducerRequestHeaders {
+            producer: Some(_), ..
+        }) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "a create carries no producer headers: create the stream, then claim an epoch",
+            )
+                .into_response();
+        }
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    }
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
-        return create_stream_external_by_id(state, request_target, request, producer).await;
+        return create_stream_external_by_id(state, request_target, request).await;
     }
 
     match state.runtime.create_stream(request).await {
@@ -2724,9 +2784,8 @@ pub(crate) async fn create_stream_by_id(
             content_type: &content_type,
             stream_ttl_seconds,
             stream_expires_at_ms,
-            producer: producer.as_ref(),
         }),
-        Err(err) => one_command_error_response(&state, err, &request_target).await,
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2734,7 +2793,6 @@ pub(crate) async fn create_stream_external_by_id(
     state: HttpState,
     request_target: String,
     mut request: CreateStreamRequest,
-    producer: Option<ProducerRequest>,
 ) -> Response {
     let stream_id = request.stream_id.clone();
     let content_type = request.content_type.clone();
@@ -2763,12 +2821,11 @@ pub(crate) async fn create_stream_external_by_id(
                 content_type: &content_type,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                producer: producer.as_ref(),
             })
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            one_command_error_response(&state, err, &request_target).await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
 }
@@ -2776,12 +2833,139 @@ pub(crate) async fn create_stream_external_by_id(
 pub(crate) async fn append_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
+    version: Version,
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
+    if early_answer_may_help(&headers)
+        && let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await
+    {
+        return answer_before_body(answer, version, &headers, body).await;
+    }
+    let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return unreadable_body_response(&err),
+    };
     append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
+}
+
+/// The answer to a tokened producer write that its head alone decides
+/// (#581 section 2.5, W7): a repeat of a write that applied under the
+/// request's `Stream-Incarnation` (`204` with its receipt, or
+/// `receipt-evicted`), or a key conflict (`403`). Only the group's leader
+/// answers, from its applied state. `None` for every other write, which is
+/// read, proposed and decided at apply, as is any write whose head is
+/// malformed or whose early answer failed.
+async fn producer_early_answer(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let ProducerRequestHeaders {
+        producer: Some(write),
+        precondition: Some(IncarnationPrecondition { incarnation }),
+    } = parse_producer_headers(headers).ok()?
+    else {
+        return None;
+    };
+    let incarnation = incarnation.get();
+    let request = ProducerEarlyAnswerRequest {
+        stream_id: stream_id.clone(),
+        producer: producer_request(write),
+        incarnation,
+        now_ms: state.unix_time_ms(),
+    };
+    let answer = match state.runtime.producer_early_answer(request).await {
+        Ok(answer) => answer?,
+        Err(err) => {
+            tracing::debug!(error = %err, "no early answer; the write is read and proposed");
+            return None;
+        }
+    };
+    let answer = match answer {
+        ProducerEarlyAnswer::Repeat(ack) => producer_ack_answer(&ack, incarnation),
+        ProducerEarlyAnswer::KeyConflict { epoch } => {
+            Epoch::try_from(epoch).map(|epoch| ProducerAnswer::KeyConflict { epoch })
+        }
+    };
+    // A repeat is `204` whether the request is a close or an append, so the
+    // renderer needs no more than this.
+    Some(producer_answer_response(answer, AnswerTo::Append))
+}
+
+/// The smallest declared body for which an early answer is worth its lookup
+/// without `Expect: 100-continue`, on any HTTP version: below it the lookup
+/// ends the group's append batch for less than it saves. On HTTP/2 the
+/// answer saves the rest of the upload; on HTTP/1.1 the body is still read
+/// and dropped, so the answer saves the staging and the proposal.
+const EARLY_ANSWER_MIN_BODY_BYTES: u64 = 64 * 1024;
+
+/// Whether to look for an early answer: only after `Expect: 100-continue`,
+/// which always saves the upload, or for a declared body of at least
+/// [`EARLY_ANSWER_MIN_BODY_BYTES`], and only after the request-shape checks
+/// of step 1 (#581 section 5.3) pass, as on the late path. The content
+/// checks of step 5 come after the producer rows on both paths, so a repeat
+/// or a key conflict is answered whatever the body is.
+fn early_answer_may_help(headers: &HeaderMap) -> bool {
+    let expects_continue = headers
+        .get(axum::http::header::EXPECT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
+    let content_length = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let worth_it =
+        expects_continue || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES);
+    worth_it
+        && removed_surface::reject_removed_append_headers(headers).is_ok()
+        && incarnation_precondition(headers).is_ok()
+        && stream_seq(headers).is_ok()
+}
+
+/// Sends an answer decided before the body was read (addendum A3 on #581).
+/// On HTTP/2 the answer goes first and the server ends the request stream
+/// (`RST_STREAM(NO_ERROR)`). A client that sent `Expect: 100-continue` gets
+/// no `100 Continue` and sends no body. On HTTP/1.1 otherwise the body is
+/// read and dropped within the request limit and the gateway's drain
+/// bounds, so the connection carries the next request; past them the
+/// connection closes after the answer.
+async fn answer_before_body(
+    mut response: Response,
+    version: Version,
+    headers: &HeaderMap,
+    body: Body,
+) -> Response {
+    let expects_continue = headers
+        .get(axum::http::header::EXPECT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
+    if version >= Version::HTTP_2 || expects_continue || body.is_end_stream() {
+        return response;
+    }
+    if ursula_gateway::drain(body, MAX_HTTP_BODY_BYTES).await != ursula_gateway::Drained::Whole {
+        response.headers_mut().insert(
+            axum::http::header::CONNECTION,
+            HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+/// `413` for a body over the request limit, `400` for one that failed.
+fn unreadable_body_response(err: &axum::Error) -> Response {
+    let over_limit = std::error::Error::source(err)
+        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+    if over_limit {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        format!("request body unreadable: {err}"),
+    )
+        .into_response()
 }
 
 #[tracing::instrument(
@@ -2805,65 +2989,52 @@ pub(crate) async fn append_stream_by_id(
     };
     let close_after = stream_closed(&headers);
 
-    if body.is_empty() && close_after {
-        let producer = match producer_request(&headers) {
-            Ok(producer) => producer,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
-        let stream_seq = match stream_seq(&headers) {
-            Ok(stream_seq) => stream_seq,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
+    let mut producer = match producer_write(&headers) {
+        Ok(producer) => producer,
+        Err(response) => return *response,
+    };
+    let stream_seq_header = match stream_seq(&headers) {
+        Ok(stream_seq) => stream_seq,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let content_type = request_content_type(&headers);
+    let close_only = body.is_empty() && close_after;
+    let payload = match content_checks(&headers, &content_type, body, producer.as_mut()) {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    // A write without a key has no producer rows, so its empty body is
+    // refused here, with the other content faults, instead of in the log.
+    if producer.is_none() && payload.is_empty() && !close_after {
+        return (
+            StatusCode::BAD_REQUEST,
+            "append payload must be non-empty unless closing the stream",
+        )
+            .into_response();
+    }
+    if close_only {
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
                 stream_id,
-                stream_seq,
+                stream_seq: stream_seq_header,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
                 if_incarnation,
             })
             .await
         {
-            Ok(response) => {
-                let mut headers = HeaderMap::new();
-                insert_default_response_headers(&mut headers);
-                insert_offset(&mut headers, response.next_offset);
-                insert_incarnation(&mut headers, response.incarnation);
-                insert_producer_ack(&mut headers, producer.as_ref());
-                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
-                (StatusCode::NO_CONTENT, headers).into_response()
-            }
-            Err(err) => one_command_error_response(&state, err, &request_target).await,
+            Ok(response) => close_http_response(&response),
+            Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         };
     }
-    if !body.is_empty() && !has_content_type(&headers) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "append with a body must include content type",
-        )
-            .into_response();
-    }
-
-    let content_type = request_content_type(&headers);
-    let payload = match normalize_http_write_payload(&content_type, body.clone(), false) {
-        Ok(payload) => payload,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
     request.if_incarnation = if_incarnation;
     request.close_after = close_after;
-    request.stream_seq = match stream_seq(&headers) {
-        Ok(stream_seq) => stream_seq,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
+    request.stream_seq = stream_seq_header;
     request.now_ms = state.unix_time_ms();
-    let producer = match producer_request(&headers) {
-        Ok(producer) => producer,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    request.producer = producer.clone();
+    request.producer = producer;
 
     if should_externalize_payload(&state, request.payload.len(), true) {
         return append_stream_external_by_id(state, request_target, request).await;
@@ -2871,7 +3042,7 @@ pub(crate) async fn append_stream_by_id(
 
     match state.runtime.append(request).await {
         Ok(response) => append_http_response(response),
-        Err(err) => one_command_error_response(&state, err, &request_target).await,
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2892,7 +3063,7 @@ pub(crate) async fn append_stream_external_by_id(
         AppendExternalRequest::from_append_request(request, external_payload, record_ends);
     match state.runtime.append_external(external_request).await {
         Ok(response) => {
-            if response.deduplicated {
+            if response.deduplicated() {
                 // The original append committed with its own object; this
                 // retry's object is referenced by nothing (F5 cleanup rule).
                 delete_unreferenced_staged_payload(&state, &external_path).await;
@@ -2901,7 +3072,7 @@ pub(crate) async fn append_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            one_command_error_response(&state, err, &request_target).await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
 }
@@ -2939,7 +3110,7 @@ pub(crate) async fn delete_stream_by_id(
             insert_default_response_headers(&mut headers);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => one_command_error_response(&state, err, &request_target).await,
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2992,7 +3163,7 @@ pub(crate) async fn head_stream_by_id(
                 HEADER_STREAM_COLD_HOT_START_OFFSET,
                 response.cold_hot_start_offset,
             );
-            insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+            insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
             insert_cache_control(&mut headers, "no-store");
             insert_lifetime_headers(
                 &mut headers,
@@ -3007,12 +3178,12 @@ pub(crate) async fn head_stream_by_id(
             }
             insert_padded_offset(
                 &mut headers,
-                HEADER_STREAM_RETAINED_OFFSET,
+                names::STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
             insert_incarnation(&mut headers, response.created_at_ms);
             if response.closed {
-                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+                insert_static(&mut headers, names::STREAM_CLOSED, "true");
             }
             (StatusCode::OK, headers).into_response()
         }
@@ -3400,7 +3571,7 @@ pub(crate) async fn advance_retention(
             insert_default_response_headers(&mut headers);
             insert_padded_offset(
                 &mut headers,
-                HEADER_STREAM_RETAINED_OFFSET,
+                names::STREAM_RETAINED_OFFSET,
                 response.retained_offset,
             );
             insert_incarnation(&mut headers, response.incarnation);
@@ -3646,10 +3817,10 @@ pub(crate) async fn long_poll_stream(
             insert_offset(&mut headers, offset);
             insert_incarnation(&mut headers, head.created_at_ms);
             if at_tail {
-                insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+                insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
             }
             if at_tail && head.closed {
-                insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
+                insert_static(&mut headers, names::STREAM_CLOSED, "true");
             } else {
                 insert_cursor(
                     &mut headers,
@@ -3925,7 +4096,7 @@ pub(crate) fn parse_stream_expires_at(raw: &str) -> Result<u64, String> {
 /// token the server could have issued (one canonical decimal integer) is
 /// malformed and answers 400, as do repeated values.
 pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
-    let mut values = headers.get_all(HEADER_STREAM_INCARNATION).iter();
+    let mut values = headers.get_all(names::STREAM_INCARNATION).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
@@ -3937,10 +4108,9 @@ pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64
     let Some(value) = value.to_str().ok().map(str::trim) else {
         return Err(malformed());
     };
-    match value.parse::<u64>() {
-        Ok(incarnation) if incarnation.to_string() == value => Ok(Some(incarnation)),
-        _ => Err(malformed()),
-    }
+    Incarnation::parse(names::STREAM_INCARNATION, value)
+        .map(|incarnation| Some(incarnation.get()))
+        .map_err(|_malformed| malformed())
 }
 
 /// A read's `Stream-Incarnation` precondition (D12), checked against the
@@ -3963,7 +4133,7 @@ fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Respon
 
 pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
     headers
-        .get(HEADER_STREAM_CLOSED)
+        .get(names::STREAM_CLOSED)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
@@ -3995,40 +4165,92 @@ pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> 
     Ok(Some(value.to_owned()))
 }
 
-pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerRequest>, String> {
-    let producer_id = header_value(headers, HEADER_PRODUCER_ID);
-    let producer_epoch = header_value(headers, HEADER_PRODUCER_EPOCH);
-    let producer_seq = header_value(headers, HEADER_PRODUCER_SEQ);
-    let present = [
-        producer_id.is_some(),
-        producer_epoch.is_some(),
-        producer_seq.is_some(),
-    ];
-    if present.iter().all(|value| !*value) {
-        return Ok(None);
-    }
-    if !present.iter().all(|value| *value) {
-        return Err(
-            "producer-id, producer-epoch, and producer-seq must be provided together".to_owned(),
-        );
-    }
+/// The write-key headers of a request (#581 section 2.2), parsed by the
+/// shared header crate so the server and its clients cannot drift.
+pub(crate) fn parse_producer_headers(
+    headers: &HeaderMap,
+) -> Result<ProducerRequestHeaders, ProducerHeaderError> {
+    ProducerRequestHeaders::parse(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+}
 
-    let producer_id = producer_id.expect("checked present");
-    if producer_id.trim().is_empty() {
-        return Err("producer-id must not be empty".to_owned());
+/// The replicated form of a parsed producer key.
+fn producer_request(write: ProducerWrite) -> ProducerRequest {
+    ProducerRequest {
+        producer_id: write.id.as_str().to_owned(),
+        producer_epoch: write.epoch.get(),
+        producer_seq: write.seq.get(),
+        digest: write
+            .digest
+            .map(|digest| Bytes::copy_from_slice(digest.as_bytes())),
+        content_fault: ContentFaultV1::ContentFaultNone.into(),
     }
-    check_write_identifier_len(HEADER_PRODUCER_ID, producer_id)?;
-    Ok(Some(ProducerRequest {
-        producer_id: producer_id.to_owned(),
-        producer_epoch: parse_producer_integer(
-            HEADER_PRODUCER_EPOCH,
-            producer_epoch.expect("checked present"),
-        )?,
-        producer_seq: parse_producer_integer(
-            HEADER_PRODUCER_SEQ,
-            producer_seq.expect("checked present"),
-        )?,
-    }))
+}
+
+/// A write's producer key from its headers (step 1 of #581 section 5.3):
+/// `400` for malformed producer headers. `None` for a write without a key.
+pub(crate) fn producer_write(
+    headers: &HeaderMap,
+) -> Result<Option<ProducerRequest>, Box<Response>> {
+    let parsed = parse_producer_headers(headers)
+        .map_err(|err| Box::new((StatusCode::BAD_REQUEST, err.to_string()).into_response()))?;
+    Ok(parsed.producer.map(producer_request))
+}
+
+/// The content checks of a write's body (step 5 of #581 section 5.3) and
+/// the payload to propose. A keyed write carries its fault into apply,
+/// which answers it only when the write would apply, after the producer
+/// rows and the closed check. Apply never needs the bytes of a faulty
+/// write, so it is proposed with an empty payload: one small log entry,
+/// and nothing in the hot ring. A write without a key has no rows, so its
+/// fault is answered here.
+fn content_checks(
+    headers: &HeaderMap,
+    content_type: &str,
+    body: Bytes,
+    producer: Option<&mut ProducerRequest>,
+) -> Result<Bytes, Box<Response>> {
+    let digest_mismatch = producer
+        .as_ref()
+        .and_then(|producer| producer.digest.as_ref())
+        .is_some_and(|digest| blake3::hash(&body).as_bytes().as_slice() != digest.as_ref());
+    let missing_content_type = !body.is_empty() && !has_content_type(headers);
+    let (payload, malformed) = match normalize_http_write_payload(content_type, body.clone(), false)
+    {
+        Ok(payload) => (payload, None),
+        Err(message) => (body, Some(message)),
+    };
+    let fault = if digest_mismatch {
+        Some(ContentFaultV1::ContentFaultDigestMismatch)
+    } else if missing_content_type {
+        Some(ContentFaultV1::ContentFaultMissingContentType)
+    } else if malformed.is_some() {
+        Some(ContentFaultV1::ContentFaultMalformedJson)
+    } else {
+        None
+    };
+    match (producer, fault) {
+        (_, None) => Ok(payload),
+        (Some(producer), Some(fault)) => {
+            producer.content_fault = fault.into();
+            Ok(Bytes::new())
+        }
+        (None, Some(fault)) => {
+            let message = match fault {
+                ContentFaultV1::ContentFaultMissingContentType => {
+                    "append with a body must include content type".to_owned()
+                }
+                ContentFaultV1::ContentFaultMalformedJson => malformed.unwrap_or_default(),
+                ContentFaultV1::ContentFaultDigestMismatch | ContentFaultV1::ContentFaultNone => {
+                    "producer-digest does not match the request body".to_owned()
+                }
+            };
+            Err(Box::new((StatusCode::BAD_REQUEST, message).into_response()))
+        }
+    }
 }
 
 pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -4036,17 +4258,6 @@ pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-}
-
-pub(crate) fn parse_producer_integer(name: &str, raw: &str) -> Result<u64, String> {
-    const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-    let value = raw
-        .parse::<u64>()
-        .map_err(|_invalid| format!("{name} must be a non-negative integer"))?;
-    if value > MAX_JS_SAFE_INTEGER {
-        return Err(format!("{name} must be <= {MAX_JS_SAFE_INTEGER}"));
-    }
-    Ok(value)
 }
 
 fn runtime_error_response(err: RuntimeError) -> Response {
@@ -4057,7 +4268,10 @@ fn runtime_error_response(err: RuntimeError) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_retry_after_for_temporary(&mut headers, &err);
-    insert_producer_error_headers(&mut headers, &err);
+    if let Err(render_err) = insert_producer_error_headers(&mut headers, &err) {
+        tracing::error!(refusal = %err, "producer refusal outside the protocol's range");
+        return producer_answer_failed(&render_err);
+    }
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
     (status, headers, err.to_string()).into_response()
@@ -4077,6 +4291,12 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     err: RuntimeError,
     request_target: &str,
 ) -> Response {
+    if err.stream_error_code() == Some(StreamErrorCode::ProducerExpired) {
+        state
+            .http_metrics
+            .producer_expired_answers
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
@@ -4097,119 +4317,30 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     runtime_error_response(err)
 }
 
-/// A write the runtime refused before it proposed the write's command, so the
-/// command never reached the Raft log and nothing of the write can apply.
-/// Each is temporary: the answer is a redirect, or carries `Retry-After`. A
-/// handler that proposes one command for the request marks that answer with
-/// [`NOT_APPLIED_HEADER`] and the refusal's [`code`] (see
-/// [`one_command_error_response`]).
+/// Whether the runtime refused `err`'s write before it proposed the write's
+/// command, so the command never reached the Raft log: a group this node does
+/// not host, or what the engine refused before proposing
+/// ([`GroupEngineError::is_refused_before_proposal`]). Every other failure can
+/// follow a proposal (a forward or a lost response after `client_write`, a
+/// group that stopped applying, a storage error) or is no refusal to retry.
+/// Only the F5 staged-payload cleanup asks; no response says it.
 ///
-/// [`code`]: PreProposalRefusal::code
-/// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreProposalRefusal {
-    /// The engine found that the node does not lead the stream's group
-    /// before it proposed anything (RT1): a `307` to the leader, or, while
-    /// the node knows no leader, a `503` (a `500` on a node without peers).
-    /// The engine checks first for an append, with or without an external
-    /// payload, a close and, with cold admission on, an inline create. It
-    /// hands a delete, an external create and an inline create without cold
-    /// admission straight to `client_write`. A forward OpenRaft reports from
-    /// there is not one of these, because the entry may have committed, so
-    /// their redirects stay unmarked.
-    NotLeader,
-    /// The node does not host the stream's group: a `307` to a node that does,
-    /// or a `503` when it knows none. The core worker refuses before any
-    /// engine runs.
-    GroupNotHosted,
-    /// The group's proposed but unapplied bytes would exceed their limit
-    /// (`503`). The core worker checks the body of an inline create or
-    /// append before the group actor sees it.
-    RaftUncommittedBackpressure,
-    /// The group's hot bytes would exceed the cold-tier limit (`503`). The
-    /// engine checks an inline create or append before it proposes it.
-    ColdBackpressure,
-}
-
-impl From<RefusedBeforeProposal> for PreProposalRefusal {
-    fn from(refusal: RefusedBeforeProposal) -> Self {
-        match refusal {
-            RefusedBeforeProposal::NotLeader => Self::NotLeader,
-            RefusedBeforeProposal::RaftUncommittedBackpressure => Self::RaftUncommittedBackpressure,
-            RefusedBeforeProposal::ColdBackpressure => Self::ColdBackpressure,
-        }
+/// [`GroupEngineError::is_refused_before_proposal`]: ursula_runtime::GroupEngineError::is_refused_before_proposal
+fn refused_before_proposal(err: &RuntimeError) -> bool {
+    match err {
+        RuntimeError::GroupNotHosted { .. } => true,
+        RuntimeError::GroupEngine { error, .. } => error.is_refused_before_proposal(),
+        RuntimeError::InvalidConfig(_)
+        | RuntimeError::InvalidRaftGroup { .. }
+        | RuntimeError::SnapshotPlacementMismatch { .. }
+        | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::StaticMembershipConfig { .. }
+        | RuntimeError::ColdStoreIo { .. }
+        | RuntimeError::LiveReadBackpressure { .. }
+        | RuntimeError::MailboxClosed { .. }
+        | RuntimeError::ResponseDropped { .. }
+        | RuntimeError::SpawnCoreThread { .. } => false,
     }
-}
-
-impl PreProposalRefusal {
-    /// The refusal `err` reports, if the runtime raised it before it proposed
-    /// the failed command: a group this node does not host, or what the
-    /// engine refused before proposing
-    /// ([`GroupEngineError::refused_before_proposal`]). Every other failure
-    /// can follow a proposal (a forward or a lost response after
-    /// `client_write`, a group that stopped applying, a storage error) or is
-    /// no refusal to retry.
-    fn of(err: &RuntimeError) -> Option<Self> {
-        match err {
-            RuntimeError::GroupNotHosted { .. } => Some(Self::GroupNotHosted),
-            RuntimeError::GroupEngine { error, .. } => {
-                error.refused_before_proposal().map(Self::from)
-            }
-            RuntimeError::InvalidConfig(_)
-            | RuntimeError::InvalidRaftGroup { .. }
-            | RuntimeError::SnapshotPlacementMismatch { .. }
-            | RuntimeError::EmptyAppend
-            | RuntimeError::ColdStoreConfig { .. }
-            | RuntimeError::StaticMembershipConfig { .. }
-            | RuntimeError::ColdStoreIo { .. }
-            | RuntimeError::LiveReadBackpressure { .. }
-            | RuntimeError::MailboxClosed { .. }
-            | RuntimeError::ResponseDropped { .. }
-            | RuntimeError::SpawnCoreThread { .. } => None,
-        }
-    }
-
-    /// The refusal's token: the value of [`NOT_APPLIED_HEADER`].
-    ///
-    /// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
-    fn code(self) -> &'static str {
-        match self {
-            Self::NotLeader => "NotLeader",
-            Self::GroupNotHosted => "GroupNotHosted",
-            Self::RaftUncommittedBackpressure => "RaftUncommittedBackpressure",
-            Self::ColdBackpressure => "ColdBackpressure",
-        }
-    }
-}
-
-/// [`runtime_error_or_leader_redirect_async`] for a write that proposes one
-/// command for the request: a stream create, append, close or delete. When
-/// the runtime refused that command before proposing it
-/// ([`PreProposalRefusal`]), the request applied nothing, so the answer
-/// carries [`NOT_APPLIED_HEADER`], a redirect to the leader included. A
-/// request that can propose more than one command must not use this: a
-/// refusal of a later command says nothing about the earlier ones.
-///
-/// A close and an append with an external payload can still propose a
-/// `TouchStreamAccess` before their write: when the stream has expired, the
-/// engine proposes it after its leadership check to apply the expiry. That
-/// command can commit, so no refusal that [`PreProposalRefusal::of`]
-/// classifies may be raised after it. None is: the core worker refuses before
-/// any engine runs, the leadership check runs before the touch, and cold
-/// admission covers only inline creates and appends, which propose no touch.
-///
-/// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
-async fn one_command_error_response(
-    state: &HttpState,
-    err: RuntimeError,
-    request_target: &str,
-) -> Response {
-    let refusal = PreProposalRefusal::of(&err);
-    let mut response = runtime_error_or_leader_redirect_async(state, err, request_target).await;
-    if let Some(refusal) = refusal {
-        mark_not_applied(&mut response, refusal.code());
-    }
-    response
 }
 
 /// True when `err` is a group-engine error asking the caller to forward to the
@@ -4245,6 +4376,6 @@ mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
 #[cfg(test)]
-mod not_applied_tests;
-#[cfg(test)]
 mod staging_cleanup_tests;
+#[cfg(test)]
+mod write_keys_tests;

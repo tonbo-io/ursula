@@ -68,6 +68,7 @@ use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupOpenLiveReadFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
+use ursula_runtime::GroupProducerEarlyAnswerFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
@@ -85,6 +86,7 @@ use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
@@ -153,6 +155,8 @@ pub enum SimScenario {
     HttpProducerProtocolSurface,
     HttpProtocolSurface,
     LeaderReadLinearizability,
+    ProducerRepeatsExactlyOnce,
+    IdleExpiryCannotReopenAnEpoch,
 }
 
 #[derive(Clone)]
@@ -194,6 +198,8 @@ impl SimScenario {
             Self::HttpProducerProtocolSurface => "http-producer-protocol-surface",
             Self::HttpProtocolSurface => "http-protocol-surface",
             Self::LeaderReadLinearizability => "leader-read-linearizability",
+            Self::ProducerRepeatsExactlyOnce => "producer-repeats-exactly-once",
+            Self::IdleExpiryCannotReopenAnEpoch => "idle-expiry-cannot-reopen-an-epoch",
         }
     }
 }
@@ -530,6 +536,7 @@ use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
 mod http;
 mod leader_reads;
+mod write_keys;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;
 use http::run_http_producer_protocol_surface_inner;
@@ -1166,6 +1173,16 @@ impl GroupEngine for MadsimScopedGroupEngine {
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.bucket_usage(placement).await
+        }))
+    }
+
+    fn producer_early_answer<'a>(
+        &'a mut self,
+        request: ProducerEarlyAnswerRequest,
+        placement: ShardPlacement,
+    ) -> GroupProducerEarlyAnswerFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.producer_early_answer(request, placement).await
         }))
     }
 
@@ -1923,6 +1940,8 @@ pub(super) fn runtime_raft_network_producer_with_lane(
         producer_id,
         producer_epoch: (seed % 7) + epoch_delta,
         producer_seq: seq,
+        digest: None,
+        ..Default::default()
     }
 }
 
@@ -1937,11 +1956,22 @@ pub(super) fn assert_runtime_raft_producer_duplicate(
         original.len(),
         "runtime raft producer duplicate item count mismatch for {stream} seq {producer_seq}"
     );
+    let newest = original.len().saturating_sub(1);
     for (item_index, (original, duplicate)) in original.iter().zip(duplicate).enumerate() {
         assert!(
-            duplicate.deduplicated,
+            duplicate.deduplicated(),
             "runtime raft producer duplicate item {item_index} for {stream} seq {producer_seq} was not marked deduplicated"
         );
+        // A record keeps its newest write's receipt only (#581 section 2.7):
+        // the older writes answer `receipt-evicted`, without a range.
+        if item_index < newest {
+            assert_eq!(
+                duplicate.producer.map(|ack| ack.delivery),
+                Some(ursula_runtime::ProducerDelivery::Evicted),
+                "runtime raft producer duplicate item {item_index} for {stream} seq {producer_seq} kept an older receipt"
+            );
+            continue;
+        }
         assert_eq!(
             duplicate.start_offset, original.start_offset,
             "runtime raft producer duplicate item {item_index} for {stream} seq {producer_seq} changed start offset"
@@ -1962,8 +1992,16 @@ pub(super) fn assert_runtime_raft_producer_stale_epoch(
             "runtime raft stale producer epoch for {stream} unexpectedly appended {} item(s)",
             items.len()
         ),
+        // A write of an epoch the producer moved past is a typed `403`: the
+        // epoch a claim closed, or an older, stale one.
         Err(err) => assert!(
-            err.to_string().contains("ProducerEpochStale"),
+            matches!(
+                err.stream_error_code(),
+                Some(
+                    ursula_runtime::StreamErrorCode::ProducerEpochClosed
+                        | ursula_runtime::StreamErrorCode::ProducerEpochStale
+                )
+            ),
             "runtime raft stale producer epoch for {stream} returned unexpected error: {err}"
         ),
     }

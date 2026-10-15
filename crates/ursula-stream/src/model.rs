@@ -28,6 +28,55 @@ pub struct StreamMetadata {
 
 pub type ProducerRequest = ProducerRequestV1;
 
+/// What the proposer found wrong with a keyed write's body. Apply answers
+/// it only for a write that would apply, after the producer rows and the
+/// closed check (#581 section 5.3, step 5), so a repeat of an applied key
+/// gets its receipt on every transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentFault {
+    /// A body without a `Content-Type`.
+    MissingContentType,
+    /// The body's BLAKE3-256 differs from the `Producer-Digest` header.
+    DigestMismatch,
+    /// A JSON body that is not valid JSON message text.
+    MalformedJson,
+}
+
+/// Whether a write's `Stream-Incarnation` precondition matched. A write that
+/// carries it is "tokened"; the epoch floor binds tokened writes (#581
+/// section 2.3.1, row 1, and the decision on PR #592). A mismatch is refused
+/// before evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncarnationCheck {
+    /// The request carried no `Stream-Incarnation`.
+    Absent,
+    /// The request carried `Stream-Incarnation`, and it matched.
+    Matched,
+}
+
+/// Whether a producer record holds a lineage of epochs that opened above the
+/// stream's epoch floor of its time. A record opened above the floor holds
+/// epochs above every epoch its producer ever had retired, so no claim on it
+/// reopens a forgotten epoch. A record opened at or below the floor, by a
+/// claim without `Stream-Incarnation` (the base protocol treats a forgotten
+/// producer as new), may hold a forgotten epoch: a tokened write on it is
+/// `producer-expired` until it claims above the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Opened {
+    AboveFloor,
+    BelowFloor,
+}
+
+/// What a write asks for, which fixes its answer's shape: an append (a
+/// body, perhaps closing the stream) or a close-only request. A keyed append
+/// whose body the proposer found faulty is proposed without its bytes, so
+/// the payload's emptiness does not tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    Append,
+    CloseOnly,
+}
+
 #[derive(Debug)]
 pub struct AppendStreamInput<'a> {
     pub stream_id: BucketStreamId,
@@ -37,6 +86,8 @@ pub struct AppendStreamInput<'a> {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    pub kind: WriteKind,
+    pub check: IncarnationCheck,
 }
 
 #[derive(Debug)]
@@ -49,43 +100,68 @@ pub(crate) struct AppendExternalInput<'a> {
     pub(crate) stream_seq: Option<String>,
     pub(crate) producer: Option<ProducerRequest>,
     pub(crate) now_ms: u64,
+    pub(crate) check: IncarnationCheck,
 }
 
+/// BLAKE3-256 of a producer write's body (`Producer-Digest`), part of the
+/// write's identity when the write carries it (#581 W1).
+pub type WriteDigest = [u8; 32];
+
+/// The range and closure of one write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteReceipt {
+    pub start_offset: u64,
+    pub next_offset: u64,
+    /// The write closed the stream.
+    pub closed: bool,
+}
+
+/// An epoch a claim closed, with its last applied seq: every seq at or below
+/// `seq` applied, and no seq above it ever will.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosedEpoch {
+    pub epoch: u64,
+    pub seq: u64,
+}
+
+/// A producer's newest applied write: its receipt and its identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerReceipt {
+    pub receipt: WriteReceipt,
+    pub digest: Option<WriteDigest>,
+}
+
+/// The persisted producer record (#581 section 2.3). It holds one state, the
+/// open epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProducerSnapshot {
     pub producer_id: String,
-    pub producer_epoch: u64,
-    pub producer_seq: u64,
-    pub last_start_offset: u64,
-    pub last_next_offset: u64,
-    pub last_closed: bool,
-    /// Exact response history for delayed retries, oldest first, bounded by
-    /// the stream's receipt window (F3). A producer's newest receipt is never
-    /// evicted, so it is never empty.
-    pub receipts: Vec<ProducerReceipt>,
+    /// The current epoch, opened by a claim.
+    pub epoch: u64,
+    /// The highest applied seq of `epoch`.
+    pub last_seq: u64,
+    /// The digest the claim of `epoch` carried; `None` when it carried none.
+    pub claim_digest: Option<WriteDigest>,
+    /// The write at `last_seq`.
+    pub newest: ProducerReceipt,
+    /// The epoch the claim of `epoch` closed, with its last seq.
+    pub closed_epoch: Option<ClosedEpoch>,
+    /// Whether the record's lineage opened above the epoch floor.
+    pub opened: Opened,
     /// `now_ms` of the producer's newest accepted write (F3 idle expiry).
     pub last_seen_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProducerReceipt {
-    pub producer_seq: u64,
-    pub start_offset: u64,
-    pub next_offset: u64,
-    pub closed: bool,
-}
-
+/// [`ProducerSnapshot`] without the id, as the stream's producer map holds
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProducerState {
-    pub(crate) producer_epoch: u64,
-    pub(crate) producer_seq: u64,
-    pub(crate) last_start_offset: u64,
-    pub(crate) last_next_offset: u64,
-    pub(crate) last_closed: bool,
-    /// Receipts of the current epoch in sequence order, with contiguous
-    /// sequences, so a duplicate's receipt sits at `seq - front.seq`.
-    pub(crate) receipts: std::collections::VecDeque<ProducerReceipt>,
-    /// See [`ProducerSnapshot::last_seen_ms`].
+    pub(crate) epoch: u64,
+    pub(crate) last_seq: u64,
+    pub(crate) claim_digest: Option<WriteDigest>,
+    pub(crate) newest: ProducerReceipt,
+    pub(crate) closed_epoch: Option<ClosedEpoch>,
+    pub(crate) opened: Opened,
     pub(crate) last_seen_ms: u64,
 }
 

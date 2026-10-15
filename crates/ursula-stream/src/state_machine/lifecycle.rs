@@ -7,10 +7,9 @@ use super::CreateExternalStreamInput;
 use super::CreateStreamInput;
 use super::HashMap;
 use super::HotBuffer;
+use super::IncarnationCheck;
 use super::ObjectPayloadRef;
-use super::ProducerReceipt;
 use super::ProducerRequest;
-use super::ProducerState;
 use super::StreamColdState;
 use super::StreamCommand;
 use super::StreamErrorCode;
@@ -20,11 +19,11 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
+use super::WriteKind;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
 use super::validate_bucket_id;
 use super::validate_external_payload_ref;
-use super::validate_producer_request;
 use super::validate_record_ends;
 use super::validate_stream_id;
 
@@ -87,25 +86,7 @@ impl StreamStateMachine {
         {
             return response;
         }
-        if let Err(response) = validate_producer_request(input.producer.as_ref()) {
-            return response;
-        }
         let initial_len = input.initial_len();
-        if let Some(producer) = input.producer.as_ref()
-            && producer.producer_seq != 0
-        {
-            return StreamResponse::error_with_context(
-                StreamErrorCode::ProducerSeqConflict,
-                format!(
-                    "producer '{}' expected sequence 0, received {}",
-                    producer.producer_id, producer.producer_seq
-                ),
-                vec![StreamErrorContext::ProducerSeqConflict {
-                    expected_seq: 0,
-                    received_seq: producer.producer_seq,
-                }],
-            );
-        }
         if self
             .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
@@ -150,23 +131,6 @@ impl StreamStateMachine {
             last_ttl_touch_at_ms: input.now_ms,
         };
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
-        let mut producer_states = HashMap::new();
-        if let Some(producer) = input.producer {
-            producer_states.insert(producer.producer_id, ProducerState {
-                producer_epoch: producer.producer_epoch,
-                producer_seq: producer.producer_seq,
-                last_start_offset: 0,
-                last_next_offset: initial_len,
-                last_closed: input.close_after,
-                receipts: std::collections::VecDeque::from([ProducerReceipt {
-                    producer_seq: producer.producer_seq,
-                    start_offset: 0,
-                    next_offset: initial_len,
-                    closed: input.close_after,
-                }]),
-                last_seen_ms: input.now_ms,
-            });
-        }
         let stream_id = input.stream_id.clone();
         let slot = StreamSlot {
             metadata,
@@ -174,8 +138,8 @@ impl StreamStateMachine {
             cold: StreamColdState::with_generation(created_at_ms),
             retained_offset: 0,
             visible_snapshot: None,
-            receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
-            producers: producer_states,
+            producers: HashMap::new(),
+            retired_epoch_watermark: None,
             append_count: 0,
         };
         if self.insert_stream_slot(slot).is_none() {
@@ -215,30 +179,12 @@ impl StreamStateMachine {
         {
             return response;
         }
-        if let Err(response) = validate_producer_request(input.producer.as_ref()) {
-            return response;
-        }
         if let Err(response) = validate_record_ends(
             &input.content_type,
             input.initial_payload.payload_len,
             &input.record_ends,
         ) {
             return response;
-        }
-        if let Some(producer) = input.producer.as_ref()
-            && producer.producer_seq != 0
-        {
-            return StreamResponse::error_with_context(
-                StreamErrorCode::ProducerSeqConflict,
-                format!(
-                    "producer '{}' expected sequence 0, received {}",
-                    producer.producer_id, producer.producer_seq
-                ),
-                vec![StreamErrorContext::ProducerSeqConflict {
-                    expected_seq: 0,
-                    received_seq: producer.producer_seq,
-                }],
-            );
         }
         if self
             .stream_metadata(&input.stream_id)
@@ -295,23 +241,6 @@ impl StreamStateMachine {
         // The payload was staged before apply chose the incarnation, so no
         // page of this generation can reference it; keep it in state.
         cold.push_direct_external_segment(object.clone());
-        let mut producer_states = HashMap::new();
-        if let Some(producer) = input.producer {
-            producer_states.insert(producer.producer_id, ProducerState {
-                producer_epoch: producer.producer_epoch,
-                producer_seq: producer.producer_seq,
-                last_start_offset: 0,
-                last_next_offset: initial_len,
-                last_closed: input.close_after,
-                receipts: std::collections::VecDeque::from([ProducerReceipt {
-                    producer_seq: producer.producer_seq,
-                    start_offset: 0,
-                    next_offset: initial_len,
-                    closed: input.close_after,
-                }]),
-                last_seen_ms: input.now_ms,
-            });
-        }
         let stream_id = input.stream_id.clone();
         let slot = StreamSlot {
             metadata,
@@ -319,8 +248,8 @@ impl StreamStateMachine {
             cold,
             retained_offset: 0,
             visible_snapshot: None,
-            receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
-            producers: producer_states,
+            producers: HashMap::new(),
+            retired_epoch_watermark: None,
             append_count: 0,
         };
         if self.insert_stream_slot(slot).is_none() {
@@ -351,6 +280,7 @@ impl StreamStateMachine {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
+        check: IncarnationCheck,
     ) -> StreamResponse {
         self.append_borrowed(AppendStreamInput {
             stream_id,
@@ -360,6 +290,8 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            kind: WriteKind::CloseOnly,
+            check,
         })
     }
 

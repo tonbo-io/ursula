@@ -615,6 +615,24 @@ pub enum SimEvent {
         current_leader_id: u64,
         flushed_count: usize,
     },
+    /// `producer_repeats_are_exactly_once` held: `keys` keys answered,
+    /// with `repeats` repeat answers and `conflicts` refused clones.
+    ProducerRepeatsVerified {
+        stream: BucketStreamId,
+        keys: u64,
+        repeats: u64,
+        conflicts: u64,
+        leader_kills: u64,
+    },
+    /// `idle_expiry_cannot_reopen_an_epoch` held: `refused` stale writes of
+    /// `retired_epoch` were refused.
+    IdleExpiryVerified {
+        stream: BucketStreamId,
+        retired_epoch: u64,
+        refused: u64,
+        tidied: bool,
+        leader_kills: u64,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

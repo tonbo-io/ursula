@@ -14,6 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ProducerRequestV1",
             "#[derive(serde::Serialize, serde::Deserialize)]",
         )
+        .type_attribute(
+            "ContentFaultV1",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
         .type_attribute("ExternalPayloadRefV1", "#[derive(Eq)]")
         .type_attribute(
             "ExternalPayloadRefV1",

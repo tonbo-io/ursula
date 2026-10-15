@@ -35,6 +35,10 @@ api: "POST /{bucket}/{stream}"
  Producer sequence number. Starts at `0` for a new epoch and must increase by exactly `1` per append. Exact `(epoch, seq)` duplicates are silently deduplicated. Max value `2^53 − 1`.
 </ParamField>
 
+<ParamField header="Producer-Digest" type="string">
+ Optional, with producer headers: the BLAKE3-256 hash of the body as 64 lowercase hex digits. The server checks it against the body (`400` on a mismatch, nothing appended) and makes it part of the write's identity, so a different body under an applied key answers `403` with `Producer-Outcome: key-conflict`. See [write keys](/docs/specs/extensions#5-write-keys-and-typed-answers).
+</ParamField>
+
 <ParamField header="Stream-Incarnation" type="string">
  Optional precondition: the stream's incarnation token, as a previous response's `Stream-Incarnation` header returned it. The request applies only if the stream is still that incarnation, checked atomically with the write; otherwise it answers `412` and changes nothing. Without the header, the request behaves exactly as described here. A malformed value answers `400`. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
 </ParamField>
@@ -49,18 +53,18 @@ api: "POST /{bucket}/{stream}"
 | ------ | ------------------------------------------------------------------ |
 | `204` | Append successful (default success response, no body). |
 | `200` | Append successful with body - returned when a `Producer-Id` was supplied and the append was not deduplicated, so the response carries producer ack headers. |
-| `307` | In a cluster, this node does not lead or host the stream's group. `Location` is the same request on the leader, or on a node that hosts the group. When the node raised the redirect before it proposed the append, the response carries `x-ursula-not-applied` (`NotLeader` or `GroupNotHosted`). |
-| `400` | Empty body without `Stream-Closed: true`, missing content type, invalid JSON or UTF-8, a JSON message nested deeper than 127 levels, a `Producer-Id` or `Stream-Seq` longer than 256 bytes, or a header removed in 0.6.0 (see the [release notes](/docs/release-notes)). |
-| `403` | `Producer-Epoch` is older than the last epoch accepted for this `Producer-Id`. The response's `Producer-Epoch` is the current epoch. |
+| `307` | In a cluster, this node does not lead or host the stream's group. `Location` is the same request on the leader, or on a node that hosts the group. |
+| `400` | Empty body without `Stream-Closed: true`, missing content type, invalid JSON or UTF-8, a JSON message nested deeper than 127 levels, a `Producer-Id` or `Stream-Seq` longer than 256 bytes, a `Producer-Digest` that does not match the body, a `Producer-Seq` above `0` of a later epoch that is not claimed yet (with `Producer-Expected-Seq: 0`), or a header removed in 0.6.0 (see the [release notes](/docs/release-notes)). |
+| `403` | A producer refusal. The response carries `Producer-Epoch` and one `Producer-Outcome`: `epoch-closed;by=claim` or `stale-epoch` for a write of an older epoch, `key-conflict` for another body under an applied key, or `producer-expired` for a write with `Stream-Incarnation` that could reach an epoch the stream forgot (at or below its epoch floor). See [producer write answers](/docs/specs/extensions#53-producer-write-answers). |
 | `404` | Stream not found. |
-| `409` | Content type does not match the stream, stream is already closed, `Stream-Seq` not greater than the stored value, or `Producer-Seq` out of order. |
+| `409` | Content type does not match the stream, stream is already closed (also for a close with producer headers that is not a repeat of the producer's own close), `Stream-Seq` not greater than the stored value, or `Producer-Seq` out of order. |
 | `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. Nothing was appended; the response's `Stream-Incarnation` is the current token. |
 | `413` | Body larger than 32 MiB. |
-| `503` | Write admission refused the append (the JSON `error` and `x-ursula-not-applied` name `WalDiskPressure`, `RaftLogPressure` or `IngressBodyBytesLimitReached`), or the stream's Raft group refused it with cold-write or uncommitted-bytes backpressure (`x-ursula-not-applied` names `ColdBackpressure` or `RaftUncommittedBackpressure`). A node also answers `503` when it knows no leader for the group yet (`NotLeader`) and when it knows no node that hosts the group (`GroupNotHosted`). When it found that before it proposed the append, the response carries `x-ursula-not-applied` with that name. Retry after the duration in `Retry-After`. |
+| `503` | Write admission refused the append (the JSON `error` names `WalDiskPressure`, `RaftLogPressure` or `IngressBodyBytesLimitReached`), or the stream's Raft group refused it with cold-write or uncommitted-bytes backpressure. A node also answers `503` when it knows no leader for the group yet and when it knows no node that hosts the group. Retry after the duration in `Retry-After`. |
 
-A response with both `x-ursula-not-applied` and `x-ursula-not-applied-checked`, the vouch that a gateway at 0.7.3 or newer adds, proves that this attempt appended nothing, whatever the status. The headers say nothing about earlier attempts, and the marker alone proves nothing. See [refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
+Any answer other than a `2xx` or a producer refusal of [extensions Section 5.3](/docs/specs/extensions#53-producer-write-answers) leaves the outcome unknown: repeat the same write. See [write outcomes](/docs/api/overview#write-outcomes).
 
-Response headers include `Stream-Incarnation` and `Stream-Next-Offset`, except on a duplicate whose receipt has left the stream's receipt window ([exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
+Response headers include `Stream-Incarnation` and `Stream-Next-Offset`, except on a repeat of a producer's older write, which answers `204` with `Producer-Outcome: receipt-evicted` and no range ([exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). When a `Producer-Id` was supplied, the response carries `Producer-Epoch`, `Producer-Seq` (the epoch's highest applied seq) and `Stream-Offset`, where the write's bytes start, so the producer can confirm what was durably recorded. A claim that closed an earlier epoch also carries `Producer-Closed-Epoch` and `Producer-Closed-Seq`. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
 
 <RequestExample>
 ```bash Append binary

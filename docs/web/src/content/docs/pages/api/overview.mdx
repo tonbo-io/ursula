@@ -62,58 +62,17 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 ```
 
-## Refusals that applied nothing
+## Write outcomes
 
-A client may count a write attempt as never applied, which means that nothing of it can apply later, only when the response
+A write whose answer is lost, such as one that timed out or got a `5xx`, may have applied. No response says that a write applied nothing. Resolve an unknown outcome by repeating the write with its key: the same `Producer-Id`, `Producer-Epoch`, `Producer-Seq` and body, and the same `Producer-Digest` and `Stream-Incarnation` when the first attempt carried them. The answer to the repeat is definite. A `200` or `204` means the write applied. A producer `403` carries `Producer-Epoch` and a `Producer-Outcome` that says what became of the write's epoch. A `409`, or a `400` with `Producer-Expected-Seq`, names the seq the server expects next. See [write keys and typed answers](/docs/specs/extensions#5-write-keys-and-typed-answers) for every answer and [exactly-once writes](/docs/concepts/exactly-once-writes) for the producer model.
 
-- has the status `401`, `402` or `429`, or
-- carries both `x-ursula-not-applied` and `x-ursula-not-applied-checked`. Only a gateway at 0.7.3 or newer sends the second header.
-
-Any other response proves nothing, including a `403`, `413` or `503` without both headers. A `503` without them, or a timeout, can follow a write that committed. After such an attempt, keep retrying with the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq` until an answer settles the write, so that the server deduplicates it (see [exactly-once writes](/docs/concepts/exactly-once-writes)).
-
-`x-ursula-not-applied`, the marker, answers a request that was refused before anything of it was proposed, so nothing of it can apply later. Its value is a short token that names the refusal, such as `RaftLogPressure`. Log the token, but rely only on the presence of the header. `x-ursula-not-applied-checked: 1`, the vouch, comes only from a gateway at 0.7.3 or newer, which sets it on every response it returns after it applied the redirect rule below. Nodes never set the vouch, so a client that talks to the nodes directly ignores the marker.
-
-The three statuses count without the headers. A layer in front of the nodes, such as the gateway's access control and tenant limits, answers them before it forwards a request. The server never answers `401` or `402`, and answers `429` only to a new producer on a stream that has no room for one. That refusal applies nothing. Within the same attempt, a replay of a write that did commit, such as the one a gateway sends when it follows a redirect, would be deduplicated instead.
-
-The server sets the marker on every refusal of its write admission, which runs before a request reaches the stream:
-
-| Status | Token | Cause |
-| ------ | ----- | ----- |
-| `503` | `WalDiskPressure` | The WAL filesystem's free space is below `raft.wal.min_available_size`, or the free-space check failed. Writes pass again once the free space reaches `raft.wal.resume_available_size`. |
-| `503` | `RaftLogPressure` | The node's unsnapshotted Raft log is over twice `raft.snapshot_log_budget`. Writes with a body pass again once the log is below 1.5 times the budget. Writes without a body still pass. |
-| `503` | `IngressBodyBytesLimitReached` | Write bodies in flight on the node leave too little of `server.http_inflight_body_size` for this body. |
-| `413` | `RequestBodyTooLarge` | The `Content-Length` is over the route's limit. |
-
-The `503` refusals also carry `Retry-After: 1` and name the token as the JSON `error`.
-
-A node also sets the marker on some refusals it makes after admission, before it proposes the write to the stream's Raft group. It does so only for these writes and refusals:
-
-| Status | Token | Writes | Cause |
-| ------ | ----- | ------ | ----- |
-| `307` or `503` | `NotLeader` | Appends and closes. Creates too, unless the body is staged in object storage or `storage.cold.max_hot_size_per_group` is `0`. | The node does not lead the stream's Raft group. A `307` sends the same request to the leader in `Location`. A `503` means that the node knows no leader yet, for example during an election. |
-| `307` or `503` | `GroupNotHosted` | Creates, appends, closes and deletes. | The node does not host the stream's Raft group. A `307` sends the same request to a node that does. A `503` means that the node knows none. |
-| `503` | `RaftUncommittedBackpressure` | Creates and appends with a body that is not staged in object storage. | The group's write bytes that are proposed but not yet applied would exceed `raft.max_uncommitted_size_per_group`. |
-| `503` | `ColdBackpressure` | Creates and appends with a body that is not staged in object storage. | The group's hot bytes would exceed `storage.cold.max_hot_size_per_group`. Writes pass again once cold flush catches up. |
-
-These `503` refusals also carry `Retry-After: 1`. A node without peers answers a `NotLeader` refusal with `500` and `Retry-After: 1` instead. With a cold store, a node stages a body of at least `runtime.external_payload_min_size` in object storage before it proposes the write. Staging proposes nothing, and after a marked refusal the node deletes the staged object.
-
-Every other redirect and `503` from a node carries no marker, even when nothing was proposed. A node hands a delete, a create whose body is staged in object storage, and a create on a node where `storage.cold.max_hot_size_per_group` is `0` to Raft without checking leadership itself, so it cannot tell whether a redirect it answers for them came before or after the proposal. Snapshot and retention `PUT`s carry no marker either, and need none. Repeating a snapshot publish with the same body, or a retention advance to the same offset, is harmless, so retry one whose outcome is unknown.
-
-The gateway sets the marker on every request it refuses before forwarding it, and on a request it could not send because the connection to its first upstream failed. When every redirect a request met was marked, it also marks its `503` for a node it then could not connect to, and its `503` when it stops following the redirects. It passes a node's marker through, except after a leader redirect, as described below. Its tokens are listed in the [gateway README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-gateway/README.md#refusals-that-applied-nothing). A proxy in front of the gateway can make its own refusals count too: answer them with `401`, `402` or `429`, but only on requests it did not pass on.
-
-The marker speaks for one attempt only. A marked answer to a retry says nothing about the earlier attempts.
+A write without producer headers has no key. Repeating it can apply it twice.
 
 ### Redirects and retries
 
-A node can answer a write with a leader redirect after it proposed the write, and that redirect carries no marker. A node marks only the redirects listed above, which it sends before it proposes anything. The gateway follows Raft leader redirects itself, so its clients never get one: up to three hops in a row, none started later than 5 s after the first redirect, and through the upstreams it has not tried yet when a redirect names an address that is none of them, or one it already went to. It keeps the final answer's marker only if every redirect carried one too. So when a leader refuses writes at admission, for example with `RaftLogPressure`, a write that the gateway follows there from marked redirects still gets the marked refusal, with the vouch. When no upstream answers without redirecting within those limits, the gateway answers `503` with `Retry-After: 1`, marked `LeaderNotFound` only if every redirect was marked. Each hop sends the request again, so a plain append without a producer or `Stream-Seq` can apply more than once, once for each node that proposed it before it redirected. Use a producer for exactly-once writes. Gateways older than 0.7.3 followed one redirect and passed others on, and passed the leader's marker on after any redirect, but they never send the vouch, so a client that requires the vouch does not trust their markers. Upgrading gateways before nodes, and rolling back nodes before gateways, is still recommended, so that clients keep the benefit of the marker during a rollout. But no order, including whichever order a `helm upgrade` or `helm rollback` replaces gateways and voters in, can make a client count a committed write as never applied.
+A node that does not lead the stream's Raft group answers a write with a `307` to the leader, or `503` when it knows no leader yet. The gateway follows Raft leader redirects itself, so its clients never get one: up to three hops in a row, none started later than 5 s after the first redirect, and through the upstreams it has not tried yet when a redirect names an address that is none of them, or one it already went to. When no upstream answers without redirecting within those limits, the gateway answers `503` with `Retry-After: 1`. Each hop sends the request again, and a node can redirect a write after it proposed it. A keyed write is safe to repeat, because the server answers a repeat of an applied write as a duplicate. A plain append without a producer can apply more than once, once for each node that proposed it before it redirected. Use a producer for exactly-once writes.
 
-An HTTP library or proxy that follows redirects or retries a write on its own hides the earlier attempts, and the vouch covers only the one request the gateway received. Turn both off for writes before relying on the marker. Checking for a followed redirect, such as a `fetch` response whose `redirected` is `true`, is not enough, because a retry leaves no such trace.
-
-The vouch also covers only the exchanges the gateway makes itself, so point its `--upstream` at the nodes themselves. A proxy, service-mesh sidecar or another gateway between the gateway and the nodes must not resend requests, or the gateway vouches for a marker from a later delivery. For example, a node can propose a write and then answer `503` without a marker. If a sidecar resends the request and a node refuses the copy at admission with a marked `503`, the gateway sees only that refusal and vouches for it. For the same reason, a 0.7.3 gateway must not sit in front of an older gateway, which follows redirects itself and passes a leader's marker on after any of them.
-
-Nothing between the gateway and the nodes may answer `401`, `402` or `429` either, as a sidecar's local rate limit does. A client counts those statuses as never applied without the headers, and after a redirect without a marker the gateway returns the leader's status unchanged, although the node that redirected may have proposed the write.
-
-So a proxy in front of the gateway must not retry writes, and nothing behind it may resend requests or answer `401`, `402` or `429`. With ingress-nginx, set `nginx.ingress.kubernetes.io/proxy-next-upstream: "off"`, as the chart's [TLS ingress example](https://github.com/tonbo-io/ursula/blob/main/charts/ursula/examples/tls-ingress.yaml) does. In a service mesh, turn off retries for the stream routes on both sides of the gateway, and local rate limits between the gateway and the nodes. Istio before 1.24, for example, resends a request up to twice by default when it gets a `503`, and any version resends requests on a route whose `retryOn` includes `503`, `5xx`, `gateway-error` or `reset`. Istio 1.24 to 1.26 restores the default `503` retry when istiod runs with `EXCLUDE_UNSAFE_503_FROM_DEFAULT_RETRY=false`, which `compatibilityVersion=1.23` sets. Set `retries: {attempts: 0}` on those routes in their `VirtualService`.
+For the same reason, a proxy or service mesh must not resend writes on its own. A resent write without producer headers applies twice. With ingress-nginx, set `nginx.ingress.kubernetes.io/proxy-next-upstream: "off"`, as the chart's [TLS ingress example](https://github.com/tonbo-io/ursula/blob/main/charts/ursula/examples/tls-ingress.yaml) does. In a service mesh, turn off retries for the stream routes on both sides of the gateway. Istio before 1.24, for example, resends a request up to twice by default when it gets a `503`, and any version resends requests on a route whose `retryOn` includes `503`, `5xx`, `gateway-error` or `reset`. Istio 1.24 to 1.26 restores the default `503` retry when istiod runs with `EXCLUDE_UNSAFE_503_FROM_DEFAULT_RETRY=false`, which `compatibilityVersion=1.23` sets. Set `retries: {attempts: 0}` on those routes in their `VirtualService`.
 
 ## Related concepts
 

@@ -36,8 +36,6 @@ pub enum RuntimeError {
         expected: ShardPlacement,
         actual: ShardPlacement,
     },
-    #[error("append payload must be non-empty")]
-    EmptyAppend,
     #[error("invalid cold store config: {message}")]
     ColdStoreConfig { message: String },
     #[error("invalid static Raft membership config: {message}")]

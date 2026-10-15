@@ -59,6 +59,9 @@ pub struct StreamSnapshotEntry {
     pub retained_offset: u64,
     pub visible_snapshot: Option<StreamVisibleSnapshot>,
     pub producer_states: Vec<ProducerSnapshot>,
+    /// The stream's epoch floor: the highest epoch of any producer record it
+    /// retired.
+    pub retired_epoch_watermark: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -63,6 +63,7 @@ use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanColdOrphanSweepFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPlanSharedRefCompactionFuture;
+use ursula_runtime::GroupProducerEarlyAnswerFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadRoute;
@@ -85,6 +86,7 @@ use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -905,6 +907,27 @@ impl GroupEngine for RaftGroupEngine {
                 .await?
                 .resolve()
                 .await
+        })
+    }
+
+    fn producer_early_answer<'a>(
+        &'a mut self,
+        request: ProducerEarlyAnswerRequest,
+        _placement: ShardPlacement,
+    ) -> GroupProducerEarlyAnswerFuture<'a> {
+        Box::pin(async move {
+            // Only the leader answers early (#581 section 2.5). A follower
+            // answers nothing and the write takes its usual path, which
+            // forwards it. Applied entries are committed, so a leader that was
+            // deposed a moment ago still answers truly under the request's
+            // token.
+            if !self.raft.is_leader() {
+                return Ok(None);
+            }
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move { state_machine.engine.producer_early_answer_now(&request) })
+            })
+            .await
         })
     }
 

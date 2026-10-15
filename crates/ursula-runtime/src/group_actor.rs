@@ -49,6 +49,7 @@ use crate::request::ImportGroupStateResponse;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -600,7 +601,7 @@ impl GroupActor {
         drop(raft_uncommitted);
         match response {
             Ok(response) => {
-                let deduplicated = response.deduplicated;
+                let deduplicated = response.deduplicated();
                 // Durability is established when the group engine returns.
                 // Wake/materialize blocked readers afterwards so a large fanout
                 // cannot inflate the writer's acknowledgement latency.
@@ -636,11 +637,30 @@ impl GroupActor {
         let mut batch_bytes = request.payload_len();
         let mut requests = vec![request];
         let mut replies = vec![(response_tx, guard)];
-        while requests.len() < MAX_BATCH {
+        // Early answers between appends are read-only lookups of applied
+        // state: serve them inline so they do not end the batch (#581
+        // section 2.5). Bounded like the batch itself.
+        let mut early_answers = 0usize;
+        while requests.len() < MAX_BATCH && early_answers < MAX_BATCH {
             let Ok(command) = self.rx.try_recv() else {
                 break;
             };
             match command.value {
+                GroupCommand::ProducerEarlyAnswer {
+                    request,
+                    response_tx,
+                } => {
+                    self.metrics
+                        .record_group_mailbox_dequeued(self.placement.raft_group_id);
+                    early_answers = early_answers.saturating_add(1);
+                    let answer = CoreWorker::producer_early_answer(
+                        &mut self.engine,
+                        request,
+                        self.placement,
+                    )
+                    .await;
+                    reply(response_tx, answer);
+                }
                 GroupCommand::Append { ref request, .. }
                     if batch_bytes.saturating_add(request.payload_len()) > MAX_BATCH_BYTES =>
                 {
@@ -694,7 +714,7 @@ impl GroupActor {
             );
             let changed = response
                 .as_ref()
-                .is_ok_and(|response| !response.deduplicated);
+                .is_ok_and(|response| !response.deduplicated());
             reply(tx, response);
             if changed && !changed_streams.contains(&stream) {
                 changed_streams.push(stream);

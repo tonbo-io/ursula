@@ -19,7 +19,10 @@ use crate::value::Offset;
 use crate::value::Seq;
 
 /// Whether a receipt reports a write applied by this request or a repeat of
-/// the producer's newest write.
+/// the producer's newest write. The base protocol answers a close-only write
+/// (an empty body with `Stream-Closed: true`) `204` whether it applied now or
+/// before, so a `204` receipt for a close-only write does not tell new from
+/// repeat: it parses as [`Delivery::Repeat`] either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     /// `200`: this request applied the write.
@@ -191,6 +194,94 @@ impl EpochClosure {
     }
 }
 
+/// The RFC 9651 grammar `Producer-Outcome` needs.
+mod sf {
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+
+    /// `sf-token = ( ALPHA / "*" ) *( tchar / ":" / "/" )`.
+    pub(super) fn is_token(text: &str) -> bool {
+        let mut bytes = text.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'*')
+            && bytes.all(|byte| is_tchar(byte) || byte == b':' || byte == b'/')
+    }
+
+    /// `key = ( lcalpha / "*" ) *( lcalpha / DIGIT / "_" / "-" / "." / "*" )`.
+    pub(super) fn is_key(text: &str) -> bool {
+        let mut bytes = text.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first == b'*')
+            && bytes.all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-.*".contains(&byte)
+            })
+    }
+
+    /// A bare item: an integer or decimal, a string, a token, a byte
+    /// sequence or a boolean. Dates and display strings are not accepted.
+    pub(super) fn is_bare_item(text: &str) -> bool {
+        is_number(text) || is_string(text) || is_token(text) || is_bytes(text) || is_boolean(text)
+    }
+
+    fn is_number(text: &str) -> bool {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        let (integer, fraction) = match digits.split_once('.') {
+            Some((integer, fraction)) => (integer, Some(fraction)),
+            None => (digits, None),
+        };
+        let all_digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+        match fraction {
+            None => (1..=15).contains(&integer.len()) && all_digits(integer),
+            Some(fraction) => {
+                (1..=12).contains(&integer.len())
+                    && (1..=3).contains(&fraction.len())
+                    && all_digits(integer)
+                    && all_digits(fraction)
+            }
+        }
+    }
+
+    fn is_string(text: &str) -> bool {
+        let Some(inner) = text
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        else {
+            return false;
+        };
+        let mut escaped = false;
+        for byte in inner.bytes() {
+            if escaped {
+                if byte != b'"' && byte != b'\\' {
+                    return false;
+                }
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' || !(0x20..=0x7e).contains(&byte) {
+                return false;
+            }
+        }
+        !escaped
+    }
+
+    fn is_bytes(text: &str) -> bool {
+        text.strip_prefix(':')
+            .and_then(|rest| rest.strip_suffix(':'))
+            .is_some_and(|inner| {
+                inner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
+            })
+    }
+
+    fn is_boolean(text: &str) -> bool {
+        text == "?0" || text == "?1"
+    }
+}
+
 /// The value of `Producer-Outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -202,18 +293,32 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Parses an RFC 9651 token with an optional `by` parameter. Unknown
-    /// parameters are ignored, as RFC 9651 asks.
+    /// Parses an RFC 9651 item: a token, then parameters, each `;`, any
+    /// number of spaces, a key and an optional `=` bare item, with nothing
+    /// else (no space before a `;`, none at the ends: the field's own
+    /// whitespace is already gone). The `by` parameter names what closed an
+    /// epoch; other parameters must be well formed and are ignored, as RFC
+    /// 9651 asks, and a repeated key keeps its last value.
     pub fn parse(text: &str) -> Result<Self, HeaderError> {
-        let mut parts = text.split(';').map(|part| part.trim_matches([' ', '\t']));
+        let mut parts = text.split(';');
         let token = parts.next().unwrap_or_default();
+        if !sf::is_token(token) {
+            return Err(HeaderError::InvalidOutcome);
+        }
         let mut by = None;
         for parameter in parts {
-            let (key, value) = parameter.split_once('=').unwrap_or((parameter, "?1"));
+            let parameter = parameter.trim_start_matches(' ');
+            let (key, value) = match parameter.split_once('=') {
+                Some((key, value)) => (key, Some(value)),
+                None => (parameter, None),
+            };
+            if !sf::is_key(key) || value.is_some_and(|value| !sf::is_bare_item(value)) {
+                return Err(HeaderError::InvalidOutcome);
+            }
             if key == "by" {
                 by = Some(match value {
-                    "claim" => ClosedBy::Claim,
-                    "history" => ClosedBy::History,
+                    Some("claim") => ClosedBy::Claim,
+                    Some("history") => ClosedBy::History,
                     _ => return Err(HeaderError::InvalidOutcome),
                 });
             }
@@ -399,7 +504,15 @@ impl ProducerAnswer {
         match status {
             409 => {
                 let Some(expected) = seq_field(names::PRODUCER_EXPECTED_SEQ, expected)? else {
-                    return Ok(None);
+                    // A `409` of another rule carries neither header; one
+                    // with only the received seq is a malformed gap.
+                    return if received.is_some() {
+                        Err(HeaderError::Missing {
+                            name: names::PRODUCER_EXPECTED_SEQ,
+                        })
+                    } else {
+                        Ok(None)
+                    };
                 };
                 let received = fields::required(
                     names::PRODUCER_RECEIVED_SEQ,
@@ -447,6 +560,21 @@ impl ProducerAnswer {
         )?
         .map(|(epoch, seq)| ClosedEpoch { epoch, seq });
         if status == 403 {
+            // A refusal carries `Producer-Epoch`, the outcome and, for
+            // `epoch-closed` only, `Producer-Closed-*`. Any other producer
+            // header means the answer is not what it says.
+            let stray = [
+                (names::PRODUCER_SEQ, seq.is_some()),
+                (names::PRODUCER_EXPECTED_SEQ, expected.is_some()),
+                (names::PRODUCER_RECEIVED_SEQ, received.is_some()),
+                (
+                    names::PRODUCER_CLOSED_EPOCH,
+                    closed.is_some() && !matches!(outcome, Some(Outcome::EpochClosed(_))),
+                ),
+            ];
+            if let Some((name, _)) = stray.into_iter().find(|(_, present)| *present) {
+                return Err(HeaderError::UnexpectedHeader { name, status });
+            }
             return match outcome {
                 None => Err(HeaderError::Missing {
                     name: names::PRODUCER_OUTCOME,
@@ -660,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn outcomes_round_trip_and_tolerate_parameters() {
+    fn outcomes_round_trip_and_follow_rfc_9651_parameters() {
         for outcome in [
             Outcome::ReceiptEvicted,
             Outcome::EpochClosed(ClosedBy::Claim),
@@ -671,16 +799,41 @@ mod tests {
         ] {
             assert_eq!(Outcome::parse(outcome.as_str()), Ok(outcome));
         }
-        assert_eq!(
-            Outcome::parse("epoch-closed ; x=1; by=history"),
-            Ok(Outcome::EpochClosed(ClosedBy::History))
-        );
+        // Well-formed unknown parameters are ignored, spaces may follow a
+        // `;`, and a repeated key keeps its last value.
+        for (text, outcome) in [
+            (
+                "epoch-closed;x=1;  by=history",
+                Outcome::EpochClosed(ClosedBy::History),
+            ),
+            (
+                "epoch-closed;by=claim;by=history",
+                Outcome::EpochClosed(ClosedBy::History),
+            ),
+            (
+                "key-conflict;a;b=?0;c=-1.25;d=\"q\\\"s\";e=:AQ==:;f=tok/en",
+                Outcome::KeyConflict,
+            ),
+        ] {
+            assert_eq!(Outcome::parse(text), Ok(outcome), "{text}");
+        }
         for invalid in [
             "epoch-closed",
             "key-conflict;by=claim",
             "applied",
             "",
             "epoch-closed;by=query",
+            "epoch-closed ;by=claim",
+            "epoch-closed;by=claim ",
+            " key-conflict",
+            "epoch-closed;by",
+            "epoch-closed;by=\"claim\"",
+            "key-conflict;",
+            "key-conflict;X=1",
+            "key-conflict;x=@",
+            "key-conflict;x=1.2345",
+            "key-conflict;x=\"open",
+            "key-conflict;;x",
         ] {
             assert_eq!(
                 Outcome::parse(invalid),
@@ -805,6 +958,43 @@ mod tests {
                 ("stream-next-offset", "00000000000000000008"),
             ]),
             Err(HeaderError::ReceiptRangeInverted { start, next })
+        );
+    }
+
+    #[test]
+    fn a_gap_without_its_expected_seq_and_stray_403_headers_are_malformed() {
+        assert_eq!(
+            parse(409, &[("producer-received-seq", "4")]),
+            Err(HeaderError::Missing {
+                name: "producer-expected-seq"
+            })
+        );
+        for (stray, name) in [
+            (("producer-seq", "1"), "producer-seq"),
+            (("producer-expected-seq", "1"), "producer-expected-seq"),
+            (("producer-received-seq", "1"), "producer-received-seq"),
+        ] {
+            assert_eq!(
+                parse(403, &[
+                    ("producer-epoch", "3"),
+                    ("producer-outcome", "key-conflict"),
+                    stray
+                ]),
+                Err(HeaderError::UnexpectedHeader { name, status: 403 }),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            parse(403, &[
+                ("producer-epoch", "3"),
+                ("producer-outcome", "stale-epoch"),
+                ("producer-closed-epoch", "1"),
+                ("producer-closed-seq", "2"),
+            ]),
+            Err(HeaderError::UnexpectedHeader {
+                name: "producer-closed-epoch",
+                status: 403
+            })
         );
     }
 

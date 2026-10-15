@@ -1,6 +1,6 @@
 # Bounded Per-Stream State for Long-Lived Streams
 
-Related documents: [`raft-wal.md`](raft-wal.md), [`deterministic-simulation-testing.md`](deterministic-simulation-testing.md), [`sqlite-vfs.md`](sqlite-vfs.md). Specs: `extensions.mdx` §2, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
+Related documents: [`raft-wal.md`](raft-wal.md), [`deterministic-simulation-testing.md`](deterministic-simulation-testing.md), [`sqlite-vfs.md`](sqlite-vfs.md). Specs: `extensions.mdx` §2 and §5, `durable-stream.mdx`, `concepts/exactly-once-writes.mdx`, `operations.mdx`.
 
 ## 1. Scope and principle
 
@@ -28,7 +28,7 @@ H(s)    = unflushed payload bytes (also capped per group by admission)
 Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (0 for streams without Producer-* headers)
 ```
 
-`Prod(s)` covers each producer's scalars and newest receipt, plus a window of at most 1,024 further receipt items per stream (F3). No term grows with record count or with cold history.
+`Prod(s)` covers each producer's id and its fixed-size record (scalars, the newest write's receipt, up to two digests, the closed epoch and the floor marker), plus the stream's epoch floor (F3). The constant term is slack. No term grows with record count or with cold history.
 
 **I2. Per group.** The sum of I1 over the group's streams, plus three terms. The hot window is capped by the 64 MiB per-group admission cap (F6c). Shared-pack maps hold at most one entry per live pack. The cold-GC queue stays bounded while GC is healthy (F14b). Tenant tombstones are the one documented exception (F15).
 
@@ -51,7 +51,7 @@ Each subsection names the structure, its bound, the driver that enforces it, the
 
 ### F0: `TidyStream`
 
-`TidyStream { stream_id, now_ms }` normalizes one idle stream's producer state: it expires idle producers, evicts producers over the cap and trims receipts beyond the window (F3), then shrinks the producer map's capacity. Each command does bounded work (at most 4,096 idle producers, 1,024 cap evictions and 65,536 receipts), so a large backlog converges over several commands without stalling apply. It is idempotent and answers `StreamTidied { debt_remaining }`.
+`TidyStream { stream_id, now_ms }` normalizes one idle stream's producer state: it expires idle producers and evicts producers over the cap (F3), then shrinks the producer map's capacity. Each command does bounded work (at most 4,096 idle producers and 1,024 cap evictions), so a large backlog converges over several commands without stalling apply. It is idempotent and answers `StreamTidied { debt_remaining }`.
 
 The leader-side driver (`ursula-runtime/src/tidy_worker.rs`) runs every 60 s on every node, with or without a cold store. In each group the node leads it proposes `TidyStream` for at most 64 streams with debt (`StreamStateMachine::tidy_candidates`), in stream-id order, and repeats on later passes until no debt remains. Debt is derived from persisted fields and `now_ms` only (`stream_has_tidy_debt` in `ursula-stream/src/state_machine/producers.rs`).
 
@@ -65,21 +65,21 @@ The leader-side driver (`ursula-runtime/src/tidy_worker.rs`) runs every 60 s on 
 
 ### F3: producer state bounds
 
-**Structure.** Per stream, a producer map of `ProducerState` (epoch, sequence, `last_seen_ms`, receipts in a per-producer `VecDeque`).
+**Structure.** Per stream, a producer map of `ProducerState`: the current epoch, its highest applied sequence, the newest write's receipt (start, end, whether it closed the stream, and its `Producer-Digest`), the claim's digest, the epoch the claim closed with that epoch's last sequence, and `last_seen_ms`. Per stream, one more field: `retired_epoch_watermark`, the epoch floor.
 
-**Bound.** At most 4,096 producers. At most `RECEIPT_WINDOW_ITEMS` = 1,024 receipts per stream beyond each producer's newest receipt, which is never evicted. `Prod(s)` in I1.
+**Bound.** At most 4,096 producers, one fixed-size record each. One receipt per producer and no receipt window. `Prod(s)` in I1.
 
 **Mechanism** (`ursula-stream/src/state_machine/producers.rs`):
 
-- **Receipt window.** A derived per-stream `ReceiptWindow` orders receipts by commit order. Eviction takes the oldest evictable receipt, which is the front of a producer holding at least two. Restore rebuilds the window from the receipts, so a replica that installed a snapshot evicts exactly what a replica that replayed the log evicts. A duplicate's receipt sits at index `seq − front.seq`, which is O(1).
-- **Newest acknowledgement.** Because the newest receipt is never evicted, a retry of a producer's newest sequence (the common case, a client retrying after a timeout) always gets its exact ranges.
-- **Beyond the window.** A duplicate whose receipt was evicted answers `204` deduplicated, with `Producer-Seq` and without range headers. It never appends again (upstream `PROTOCOL.md`).
-- **One enforcement point.** The window and cap are enforced once per command after it applied, at most 65,536 receipts trimmed per command.
+- **One receipt per producer.** A repeat of the producer's newest write gets that write's receipt. A repeat of an older write of the epoch answers `204` with `Producer-Outcome: receipt-evicted` and no range headers: the record's highest applied sequence says it applied, so it never appends again.
+- **Identity.** A record holds at most two 32-byte digests, the newest write's and the current epoch's claim's, and only when those writes carried `Producer-Digest`.
+- **Closed epoch.** A record remembers the last sequence of the one epoch its current epoch's claim closed. A write of an older epoch answers `stale-epoch`.
+- **Epoch floor.** Retiring a record, by idle expiry, the producer cap or F0, raises `retired_epoch_watermark` to at least its epoch. A write with `Stream-Incarnation` from a producer without a record, at or below the floor, answers `403 producer-expired` with the floor. Without the token a forgotten producer is new, and each record carries one marker, opened above or below the floor: a tokened write on a record opened below answers `producer-expired` until it claims above the floor. A record opened above the floor holds epochs above every retired epoch of its producer, so its claims are never checked against the floor again.
 - **Idle expiry.** A producer whose `last_seen_ms` is at least 7 days older than the command's `now_ms` is treated as absent at its next write and removed then. F0 removes idle producers in bulk.
 - **Producer cap.** A new producer beyond 4,096 evicts the least recently seen producers idle for at least an hour, at most 1,024 per command. When none is idle that long the write fails with `ProducerLimit` (`429`).
 - **Length caps.** `Producer-Id` and `Stream-Seq` are capped at 256 B on every HTTP write path and at apply.
 
-The spec pages state the window: duplicates get exact ranges within the stream's receipt window, and always for the newest sequence.
+The spec pages state the answers: `extensions.mdx` §5, write keys and typed answers.
 
 ### F4b: no per-message state
 
@@ -185,7 +185,7 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Per-message boundaries | replicated | none kept | F4b |
 | Shared pack refs and group pack maps | replicated | ≤ 64 + one interval per stream, ≤ live packs per group | F2 |
 | Staged external refs | replicated | ≤ 16 + in flight per stream | F5 |
-| Producer map and receipts | replicated | ≤ 4,096 producers, ≤ 1,024 receipts beyond each newest | F0, F3 |
+| Producer map and epoch floor | replicated | ≤ 4,096 producers, one receipt each | F0, F3 |
 | Cold coverage | replicated | derived, no field | F18 |
 | Cold-GC queue | replicated | bounded while GC is healthy | F14b |
 | `bucket_usage`, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
@@ -237,23 +237,23 @@ Every workload uses distinct stream names, so counts and snapshot sizes are dete
 
 `.github/workflows/bounded-state.yml` runs two jobs.
 
-- **state-growth** runs on every pull request and push to `main`. It runs the reduced `pr` suite (`gate::pr_suite`: W1, W3 to W6, the W2 starvation and driver runs, planner, L2, cadence and wal) and compares it with `crates/ursula-state-probe/ratchet.json`. The ratchet holds 126 metrics and 84 formula targets with a tolerance of 0.1. A metric above its baseline plus 10% fails, and one below its baseline minus 10% is reported for tightening. A target recorded as met that is lost fails, and a newly met target is reported. Metrics or targets missing on either side fail, so coverage cannot shrink silently. A `workflow_dispatch` with `write_ratchet` regenerates the file.
+- **state-growth** runs on every pull request and push to `main`. It runs the reduced `pr` suite (`gate::pr_suite`: W1, W3 to W6, the W2 starvation and driver runs, planner, L2, cadence and wal) and compares it with `crates/ursula-state-probe/ratchet.json`. The ratchet holds 123 metrics and 73 formula targets with a tolerance of 0.1. A metric above its baseline plus 10% fails, and one below its baseline minus 10% is reported for tightening. A target recorded as met that is lost fails, and a newly met target is reported. Metrics or targets missing on either side fail, so coverage cannot shrink silently. A `workflow_dispatch` with `write_ratchet` regenerates the file.
 - **nightly** runs the full-scale `nightly` suite (W1 at 3M records, W2 over 24 simulated hours, W4 and W5 at 1M appends, L2 120-minute runs on both engines, cadence at full scale, and W6 variants) and publishes JSONL as artifacts. It gates nothing.
 
-The formula targets (`crates/ursula-state-probe/src/formula.rs`) check per stream: shared refs at most 64 plus one interval (F2), producers at most 4,096 and producer bytes within `Prod(s)` (F3), staged external refs at most 16 (F5), receipts per stream at most 1,024 (F3), TTL heap entries at most twice the TTL streams (F8), heap slack after flush or retention within the tight size plus 64 KiB (F7), residual snapshot state growing at most 1 KiB between N and 4N records on W1, F12e snapshot bytes per log byte and node log within budget, F2 shared `CompactCold` on both engines, F10 maximum stream hot on W2, and WAL heap within index and caches. Two targets are recorded as unmet: `planner.f10_starved_stream_planned` and `w4_p10000.f3_receipt_items_per_stream`.
+The formula targets (`crates/ursula-state-probe/src/formula.rs`) check per stream: shared refs at most 64 plus one interval (F2), producers at most 4,096 and producer bytes within `Prod(s)` (F3), staged external refs at most 16 (F5), TTL heap entries at most twice the TTL streams (F8), heap slack after flush or retention within the tight size plus 64 KiB (F7), residual snapshot state growing at most 1 KiB between N and 4N records on W1, F12e snapshot bytes per log byte and node log within budget, F2 shared `CompactCold` on both engines, F10 maximum stream hot on W2, and WAL heap within index and caches. One target is recorded as unmet: `planner.f10_starved_stream_planned`.
 
 ### 7.3 DST invariants
 
 The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.rs` check two invariants on top of the correctness invariants in [`deterministic-simulation-testing.md`](deterministic-simulation-testing.md).
 
 - **Invariant 11, no stale locators.** After any ambiguous external append, offload or compaction, readable bytes equal acknowledged bytes on every replica, and inputs of a compaction that never committed are not deleted. Tests: `external_locators_survive_ambiguous_commits`, `external_locators_survive_snapshot_install_with_staged_refs`, `external_locators_survive_ambiguous_compaction`.
-- **Invariant 12, identical producer state.** After the same log prefix every replica holds the same producers, receipt windows and newest acknowledgements, whether it replayed the log or installed a snapshot. Test: `producer_state_matches_after_snapshot_install_mid_stream`.
+- **Invariant 12, identical producer state.** After the same log prefix every replica holds the same producer records and epoch floor, whether it replayed the log or installed a snapshot. Test: `producer_state_matches_after_snapshot_install_mid_stream`.
 
 `ci.yml` runs a few seeds of each on every pull request. `dst-nightly.yml` sweeps larger seed ranges of the `external_locators_survive` family through the `*_SEEDS` variables.
 
 ### 7.4 Gauges
 
-`StreamStateMachine::state_gauges` (`ursula-stream/src/state_machine/gauges.rs`) walks a group's streams on demand, so scrapes pay for it and apply does not. `/__ursula/metrics` exports it per group as `group_state_gauges`, from local state on leaders and followers: streams, shared refs (total and per-stream maximum), live packs, staged external refs, producers, receipts and receipt items (total and per-stream maximum), producer bytes, TTL streams and TTL heap entries, hot payload bytes, hot blocks and their overhead, pending cold-GC entries, bucket usage rows and erased buckets. Per group the same endpoint exports log bytes since the last snapshot and the last snapshot's size, and per node `raft_log_bytes`, the pressure-flush counters and the `cold_orphan_*` counters. No alerts ship with them.
+`StreamStateMachine::state_gauges` (`ursula-stream/src/state_machine/gauges.rs`) walks a group's streams on demand, so scrapes pay for it and apply does not. `/__ursula/metrics` exports it per group as `group_state_gauges`, from local state on leaders and followers: streams, shared refs (total and per-stream maximum), live packs, staged external refs, producers (total and per-stream maximum), producer bytes (total and per-stream maximum), streams with an epoch floor, TTL streams and TTL heap entries, hot payload bytes, hot blocks and their overhead, pending cold-GC entries, bucket usage rows and erased buckets. Per group the same endpoint exports log bytes since the last snapshot and the last snapshot's size, and per node `raft_log_bytes`, the pressure-flush counters, the `cold_orphan_*` counters and `producer_expired_answers`. No alerts ship with them.
 
 ## 8. Design rationale
 
@@ -261,4 +261,4 @@ The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.r
 - **No local KV store.** Persisting the state machine in RocksDB or similar is a non-goal. Nodes stay close to stateless, and S3 cold-index pages are the sanctioned offload (F5, F14).
 - **Coverage from the hot buffer.** Keeping a scalar cold frontier and raising it with `max` would fix D1's reads but accept intra-message offsets below an external append. The complement of the hot buffer is exact and needs no field (F18).
 - **Incarnation names over a recreate ban.** Rejecting a recreate while stream GC is pending would couple create availability to GC health, and the new stream would still share the old one's page keys during a sweep (F14g).
-- **A stream-wide receipt budget.** Per-producer receipt rings bound each producer but not the stream: 4,096 producers with 64 receipts each hold 262k receipts. Keeping each producer's newest receipt already covers the common retry (F3).
+- **One receipt per producer, no window.** The base protocol answers an older duplicate `204` with the epoch's highest accepted sequence and requires no range for it, and a pipelining client needs only `Producer-Expected-Seq` and `Producer-Seq`. Keeping each producer's newest receipt covers the common retry, so a window of older receipts would add a derived structure, its rebuild on restore and a trim budget for ranges no client reads (F3).

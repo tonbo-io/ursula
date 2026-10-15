@@ -13,10 +13,12 @@ use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::ClosedEpoch;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
 use ursula_stream::HotPayloadSegment;
 use ursula_stream::ObjectPayloadRef;
+use ursula_stream::Opened;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
 use ursula_stream::StreamMetadata;
@@ -24,6 +26,8 @@ use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotEntry;
 use ursula_stream::StreamStatus;
 use ursula_stream::StreamVisibleSnapshot;
+use ursula_stream::WriteDigest;
+use ursula_stream::WriteReceipt;
 
 fn placement_to_proto(placement: ShardPlacement) -> proto::ShardPlacementV1 {
     proto::ShardPlacementV1 {
@@ -308,6 +312,7 @@ fn stream_to_proto(
             .map(producer_to_proto)
             .collect(),
         retained_offset: Some(entry.retained_offset),
+        retired_epoch_watermark: entry.retired_epoch_watermark,
     })
 }
 
@@ -340,6 +345,7 @@ fn stream_from_proto(
             .into_iter()
             .map(producer_from_proto)
             .collect::<Result<Vec<_>, _>>()?,
+        retired_epoch_watermark: entry.retired_epoch_watermark,
     })
 }
 
@@ -459,65 +465,82 @@ fn visible_snapshot_from_proto(snapshot: proto::StreamVisibleSnapshotV1) -> Stre
 }
 
 fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
+    let receipt = producer.newest.receipt;
     proto::ProducerSnapshotV1 {
         producer_id: producer.producer_id,
-        producer_epoch: producer.producer_epoch,
-        producer_seq: producer.producer_seq,
-        last_start_offset: producer.last_start_offset,
-        last_next_offset: producer.last_next_offset,
-        last_closed: producer.last_closed,
-        receipts: producer
-            .receipts
-            .into_iter()
-            .map(producer_receipt_to_proto)
-            .collect(),
+        epoch: producer.epoch,
+        last_seq: producer.last_seq,
+        newest_start_offset: receipt.start_offset,
+        newest_next_offset: receipt.next_offset,
+        newest_closed: receipt.closed,
         last_seen_ms: Some(producer.last_seen_ms),
+        claim_digest: producer
+            .claim_digest
+            .map(|digest| Bytes::copy_from_slice(&digest)),
+        newest_digest: producer
+            .newest
+            .digest
+            .map(|digest| Bytes::copy_from_slice(&digest)),
+        closed_epoch: producer.closed_epoch.map(|closed| proto::ClosedEpochV1 {
+            epoch: closed.epoch,
+            seq: closed.seq,
+        }),
+        opened_below_floor: producer.opened == Opened::BelowFloor,
     }
 }
 
 /// Field 9 `last_seen_ms` stays `optional` on the wire, but every writer sets
-/// it (bounded-state F3), so an absent value is corruption.
+/// it (bounded-state F3), so an absent value is corruption. A digest is 32
+/// bytes.
 fn producer_from_proto(
     producer: proto::ProducerSnapshotV1,
 ) -> Result<ProducerSnapshot, SnapshotStoreError> {
-    let last_seen_ms = producer.last_seen_ms.ok_or_else(|| {
-        SnapshotStoreError::Deserialize(format!(
-            "snapshot producer '{}' has no last_seen_ms",
-            producer.producer_id
-        ))
-    })?;
+    let last_seen_ms =
+        producer
+            .last_seen_ms
+            .ok_or_else(|| SnapshotStoreError::ProducerFieldMissing {
+                producer_id: producer.producer_id.clone(),
+                field: "last_seen_ms",
+            })?;
+    let digest = |bytes: Option<Bytes>, field: &'static str| {
+        bytes
+            .map(|bytes| {
+                WriteDigest::try_from(bytes.as_ref()).map_err(|_wrong_length| {
+                    SnapshotStoreError::ProducerDigestLength {
+                        producer_id: producer.producer_id.clone(),
+                        field,
+                        len: bytes.len(),
+                    }
+                })
+            })
+            .transpose()
+    };
+    let claim_digest = digest(producer.claim_digest.clone(), "claim_digest")?;
+    let newest_digest = digest(producer.newest_digest.clone(), "newest_digest")?;
     Ok(ProducerSnapshot {
-        producer_id: producer.producer_id,
-        producer_epoch: producer.producer_epoch,
-        producer_seq: producer.producer_seq,
-        last_start_offset: producer.last_start_offset,
-        last_next_offset: producer.last_next_offset,
-        last_closed: producer.last_closed,
-        receipts: producer
-            .receipts
-            .into_iter()
-            .map(producer_receipt_from_proto)
-            .collect(),
+        epoch: producer.epoch,
+        last_seq: producer.last_seq,
+        claim_digest,
+        newest: ProducerReceipt {
+            receipt: WriteReceipt {
+                start_offset: producer.newest_start_offset,
+                next_offset: producer.newest_next_offset,
+                closed: producer.newest_closed,
+            },
+            digest: newest_digest,
+        },
+        closed_epoch: producer.closed_epoch.map(|closed| ClosedEpoch {
+            epoch: closed.epoch,
+            seq: closed.seq,
+        }),
+        opened: if producer.opened_below_floor {
+            Opened::BelowFloor
+        } else {
+            Opened::AboveFloor
+        },
         last_seen_ms,
+        producer_id: producer.producer_id,
     })
-}
-
-fn producer_receipt_to_proto(receipt: ProducerReceipt) -> proto::ProducerReceiptV1 {
-    proto::ProducerReceiptV1 {
-        producer_seq: receipt.producer_seq,
-        start_offset: receipt.start_offset,
-        next_offset: receipt.next_offset,
-        closed: receipt.closed,
-    }
-}
-
-fn producer_receipt_from_proto(receipt: proto::ProducerReceiptV1) -> ProducerReceipt {
-    ProducerReceipt {
-        producer_seq: receipt.producer_seq,
-        start_offset: receipt.start_offset,
-        next_offset: receipt.next_offset,
-        closed: receipt.closed,
-    }
 }
 
 fn append_count_to_proto(count: StreamAppendCount) -> proto::StreamAppendCountV1 {
@@ -580,8 +603,8 @@ fn placement_from_proto(placement: proto::ShardPlacementV1) -> ShardPlacement {
     }
 }
 
-fn required<T>(value: Option<T>, field: &str) -> Result<T, SnapshotStoreError> {
-    value.ok_or_else(|| SnapshotStoreError::Deserialize(format!("missing {field}")))
+fn required<T>(value: Option<T>, field: &'static str) -> Result<T, SnapshotStoreError> {
+    value.ok_or(SnapshotStoreError::MissingField { field })
 }
 
 #[cfg(test)]
@@ -655,11 +678,12 @@ mod tests {
         assert_eq!(decoded, snapshot);
     }
 
-    /// Bounded-state F3: the producer idle clock and the receipt window
-    /// survive the group snapshot codec, so an installed replica holds
+    /// The producer record (#581 section 2.3) survives the group snapshot
+    /// codec with every field set: the idle clock, both digests, the closed
+    /// epoch and the stream's epoch floor, so an installed replica holds
     /// exactly the live replica's producer state.
     #[test]
-    fn producer_last_seen_and_receipt_window_round_trip() {
+    fn producer_record_and_epoch_floor_round_trip() {
         let mut machine = ursula_stream::StreamStateMachine::new();
         machine.apply(ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
@@ -671,49 +695,114 @@ mod tests {
             initial_payload: bytes::Bytes::new(),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 1,
         });
-        for seq in 0..1_100u64 {
-            for (producer_id, now_ms) in [("a", 10 + seq), ("b", 20 + seq)] {
-                if producer_id == "b" && seq > 3 {
-                    continue;
-                }
-                let response = machine.apply(ursula_stream::StreamCommand::Append {
-                    stream_id: stream_id.clone(),
-                    content_type: Some("application/octet-stream".to_owned()),
-                    payload: bytes::Bytes::from_static(b"xy"),
-                    close_after: false,
-                    stream_seq: None,
-                    producer: Some(ursula_stream::ProducerRequest {
-                        producer_id: producer_id.to_owned(),
-                        producer_epoch: 1,
-                        producer_seq: seq,
-                    }),
-                    now_ms,
-                });
-                assert!(
-                    matches!(response, ursula_stream::StreamResponse::Appended { .. }),
-                    "{response:?}"
-                );
-            }
+        const IDLE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+        let tidy_at = 20 + IDLE_MS;
+        let mut write = |producer_id: &str, epoch: u64, seq: u64, digest: Option<u8>, now_ms| {
+            let response = machine.apply(ursula_stream::StreamCommand::Append {
+                stream_id: stream_id.clone(),
+                content_type: Some("application/octet-stream".to_owned()),
+                payload: bytes::Bytes::from_static(b"xy"),
+                close_after: false,
+                stream_seq: None,
+                producer: Some(ursula_stream::ProducerRequest {
+                    producer_id: producer_id.to_owned(),
+                    producer_epoch: epoch,
+                    producer_seq: seq,
+                    digest: digest.map(|digest| bytes::Bytes::copy_from_slice(&[digest; 32])),
+                    ..Default::default()
+                }),
+                now_ms,
+            });
+            assert!(
+                matches!(response, ursula_stream::StreamResponse::Appended { .. }),
+                "{response:?}"
+            );
+        };
+        // `b` goes idle and retires, which raises the floor to its epoch 3.
+        write("b", 3, 0, None, 20);
+        for seq in 0..5 {
+            write("a", 1, seq, Some(1), tidy_at - 1);
         }
+        // `a`'s claim of epoch 2 closes epoch 1 at seq 4, with digests on
+        // the claim and the newest write.
+        write("a", 2, 0, Some(7), tidy_at - 1);
+        write("a", 2, 1, Some(8), tidy_at - 1);
+        machine.apply(ursula_stream::StreamCommand::TidyStream {
+            stream_id: stream_id.clone(),
+            now_ms: tidy_at,
+        });
+        // Without the token `b` is new, and its claim of the forgotten epoch
+        // 3 opens a record below the floor.
+        let reclaim = machine.apply(ursula_stream::StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            payload: bytes::Bytes::from_static(b"xy"),
+            close_after: false,
+            stream_seq: None,
+            producer: Some(ursula_stream::ProducerRequest {
+                producer_id: "b".to_owned(),
+                producer_epoch: 3,
+                producer_seq: 0,
+                ..Default::default()
+            }),
+            now_ms: tidy_at,
+        });
+        assert!(
+            matches!(reclaim, ursula_stream::StreamResponse::Appended { .. }),
+            "{reclaim:?}"
+        );
         let stream_snapshot = machine.snapshot();
-        let producers = &stream_snapshot.streams[0].producer_states;
-        assert_eq!(producers[0].last_seen_ms, 10 + 1_099);
-        assert_eq!(producers[1].last_seen_ms, 23);
+        let entry = &stream_snapshot.streams[0];
+        assert_eq!(entry.retired_epoch_watermark, Some(3));
+        let producers = &entry.producer_states;
+        assert_eq!(producers.len(), 2);
+        assert_eq!(producers[1].opened, ursula_stream::Opened::BelowFloor);
+        assert_eq!(producers[0].opened, ursula_stream::Opened::AboveFloor);
+        assert_eq!(producers[0].last_seen_ms, tidy_at - 1);
+        assert_eq!(producers[0].claim_digest, Some([7; 32]));
+        assert_eq!(producers[0].newest.digest, Some([8; 32]));
+        assert_eq!(
+            producers[0].closed_epoch,
+            Some(ursula_stream::ClosedEpoch { epoch: 1, seq: 4 })
+        );
+        // A digest is 32 bytes on the wire.
+        let mut proto_entry =
+            stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
+        proto_entry.producer_states[0].claim_digest = Some(Bytes::from_static(b"short"));
+        let error = stream_from_proto(proto_entry).expect_err("a short digest");
+        assert!(
+            matches!(error, SnapshotStoreError::ProducerDigestLength {
+                field: "claim_digest",
+                len: 5,
+                ..
+            }),
+            "{error}"
+        );
         // Field 9 stays optional on the wire; an absent value is refused.
         let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
         entry.producer_states[0].last_seen_ms = None;
         let error = stream_from_proto(entry).expect_err("absent last_seen_ms");
-        assert!(error.to_string().contains("last_seen_ms"), "{error}");
+        assert!(
+            matches!(error, SnapshotStoreError::ProducerFieldMissing {
+                field: "last_seen_ms",
+                ..
+            }),
+            "{error}"
+        );
         // So does entry field 16.
         let mut entry = stream_to_proto(stream_snapshot.streams[0].clone()).expect("encode entry");
         entry.retained_offset = None;
         let error = stream_from_proto(entry).expect_err("absent retained_offset");
-        assert!(error.to_string().contains("retained_offset"), "{error}");
+        assert!(
+            matches!(error, SnapshotStoreError::MissingField {
+                field: "snapshot stream retained_offset"
+            }),
+            "{error}"
+        );
         let snapshot = GroupSnapshot {
             placement: ShardPlacement {
                 core_id: CoreId(0),
@@ -901,7 +990,6 @@ mod tests {
             initial_payload: bytes::Bytes::from_static(b"ab"),
             close_after: false,
             stream_seq: None,
-            producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
             now_ms: 1,

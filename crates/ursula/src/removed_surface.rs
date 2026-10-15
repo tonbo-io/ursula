@@ -99,12 +99,11 @@ mod tests {
     use axum::http::Request;
     use axum::http::header::CONTENT_TYPE;
     use tower::ServiceExt;
+    use ursula_headers::names;
     use ursula_runtime::RuntimeConfig;
     use ursula_runtime::ShardRuntime;
 
     use super::*;
-    use crate::HEADER_STREAM_NEXT_OFFSET;
-    use crate::HEADER_STREAM_SNAPSHOT_OFFSET;
 
     fn app() -> Router {
         crate::router(ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"))
@@ -141,7 +140,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         response
             .headers()
-            .get(HEADER_STREAM_NEXT_OFFSET)
+            .get(names::STREAM_NEXT_OFFSET)
             .expect("next offset")
             .to_str()
             .expect("utf-8 header")
@@ -163,7 +162,7 @@ mod tests {
 
         let head = send(&app, "HEAD", uri, &[], "").await;
         assert_eq!(head.status(), StatusCode::OK);
-        assert!(!head.headers().contains_key(HEADER_STREAM_SNAPSHOT_OFFSET));
+        assert!(!head.headers().contains_key(names::STREAM_SNAPSHOT_OFFSET));
     }
 
     #[tokio::test]
@@ -198,7 +197,7 @@ mod tests {
         let head = send(&app, "HEAD", uri, &[], "").await;
         assert_eq!(
             head.headers()
-                .get(HEADER_STREAM_NEXT_OFFSET)
+                .get(names::STREAM_NEXT_OFFSET)
                 .expect("next offset"),
             &format!("{:020}", 8)
         );

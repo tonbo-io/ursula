@@ -16,6 +16,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcPlanEntry;
+use ursula_stream::ProducerEarlyAnswer;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 
@@ -56,6 +57,7 @@ use crate::request::ImportGroupStateRequest;
 use crate::request::LiveReadOwner;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
+use crate::request::ProducerEarlyAnswerRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
@@ -83,6 +85,9 @@ pub type GroupBucketUsageFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<BucketUsageSnapshot>, GroupEngineError>> + Send + 'a>>;
 pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupProducerEarlyAnswerFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<ProducerEarlyAnswer>, GroupEngineError>> + Send + 'a>,
+>;
 pub type GroupHeadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HeadStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamFuture<'a> =
@@ -268,6 +273,20 @@ pub trait GroupEngine: Send + 'static {
         request: HeadStreamRequest,
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a>;
+
+    /// The answer to a tokened producer write that its head alone decides
+    /// (#581 section 2.5, W7): a repeat of a write that applied under the
+    /// request's token, or a key conflict, from this replica's applied
+    /// state. `None` when the write must be read and proposed. A replicated
+    /// engine answers only while it leads, so routing stays ahead of early
+    /// answers. The default, for an engine without one, answers nothing.
+    fn producer_early_answer<'a>(
+        &'a mut self,
+        _request: ProducerEarlyAnswerRequest,
+        _placement: ShardPlacement,
+    ) -> GroupProducerEarlyAnswerFuture<'a> {
+        Box::pin(async move { Ok(None) })
+    }
 
     /// Per-bucket committed usage held by this group's replicated state.
     ///
@@ -1136,45 +1155,23 @@ impl GroupEngineError {
         self.infra().is_some_and(GroupInfraError::is_backpressure)
     }
 
-    /// The refusal a write's error reports when the runtime raised it before
-    /// the write's command was proposed, so that nothing of the write can
-    /// apply: the engine's own leadership check, the core worker's check of
+    /// Whether the runtime raised a write's error before the write's command
+    /// was proposed, so that nothing of the write can apply: the engine's own leadership check, the core worker's check of
     /// the group's unapplied bytes (before any engine sees the command), or
     /// the engine's cold-tier admission. Every other error, a forward OpenRaft
     /// reports after `client_write` among them, can follow a proposal or is no
     /// refusal to retry. It classifies a write's error only: a read's forward
     /// is raised before any proposal as well (on a follower, or on a leader
     /// that could not confirm it leads) and is no refusal of a write. The HTTP
-    /// layer marks exactly these answers to single-command writes as applying
-    /// nothing.
-    pub fn refused_before_proposal(&self) -> Option<RefusedBeforeProposal> {
-        if self.is_forward_before_proposal() {
-            return Some(RefusedBeforeProposal::NotLeader);
-        }
-        match self.infra()? {
-            GroupInfraError::RaftUncommittedBackpressure { .. } => {
-                Some(RefusedBeforeProposal::RaftUncommittedBackpressure)
-            }
-            GroupInfraError::ColdBackpressure { .. } => {
-                Some(RefusedBeforeProposal::ColdBackpressure)
-            }
-            _ => None,
-        }
+    /// layer deletes a staged external payload only after such a refusal.
+    pub fn is_refused_before_proposal(&self) -> bool {
+        self.is_forward_before_proposal()
+            || matches!(
+                self.infra(),
+                Some(
+                    GroupInfraError::RaftUncommittedBackpressure { .. }
+                        | GroupInfraError::ColdBackpressure { .. }
+                )
+            )
     }
-}
-
-/// What the runtime refused a write for before the write's command was
-/// proposed ([`GroupEngineError::refused_before_proposal`]). It classifies a
-/// write's error only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefusedBeforeProposal {
-    /// The engine's own leadership check found that the node does not lead
-    /// the group (RT1).
-    NotLeader,
-    /// The core worker found that the group's proposed but unapplied bytes
-    /// would exceed their limit, before any engine saw the command.
-    RaftUncommittedBackpressure,
-    /// The engine's cold-tier admission found that the group's hot bytes
-    /// would exceed their limit.
-    ColdBackpressure,
 }
