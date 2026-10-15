@@ -67,10 +67,10 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 Every error answer, any `4xx` or `5xx` from a node or from the gateway, carries the same JSON body:
 
 ```json
-{"error":"StreamNotFound"}
+{"error":"StreamNotFound","message":"stream 'demo/hello' does not exist"}
 ```
 
-`error` is a stable code that names the refusal, so match it instead of parsing text. The status and the typed headers keep their meaning beside it: a `413` names its limit in `Ursula-Max-Request-Bytes` or `Ursula-Max-Snapshot-Bytes`, a `503` carries `Retry-After`, a producer `403` carries `Producer-Outcome`. A `503` whose code is `NoLeader` means no leader of the stream's group is known yet. A layer in front of Ursula, such as a proxy, may answer with another body, so treat the code as optional and fall back on the status. [Error bodies](/docs/specs/extensions#11-error-bodies) lists every code. Rust clients parse the body with `ursula_headers::ErrorBody`.
+`error` is a stable code that names the refusal, so match it instead of parsing text. `message` says why for a person reading it, for example which header was malformed. Its wording can change in any release, so never match it. It never echoes the request body or a credential. The status and the typed headers keep their meaning beside it: a `413` names its limit in `Ursula-Max-Request-Bytes` or `Ursula-Max-Snapshot-Bytes`, a `503` carries `Retry-After`, a producer `403` carries `Producer-Outcome`. A `503` whose code is `NoLeader` means no leader of the stream's group is known yet. A layer in front of Ursula, such as a proxy, may answer with another body, so treat the code as optional and fall back on the status. [Error bodies](/docs/specs/extensions#11-error-bodies) lists every code. Rust clients parse the body with `ursula_headers::ErrorBody`.
 
 The operator routes under `/__ursula/` keep their own answers.
 

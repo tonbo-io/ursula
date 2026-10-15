@@ -40,7 +40,20 @@ pub(crate) fn max_snapshot_bytes(cold_store: bool) -> Option<u64> {
 pub(crate) fn size_refusal(limit: SizeLimit) -> Response {
     let mut headers = HeaderMap::new();
     insert_size_limit(&mut headers, limit);
-    error_answer(StatusCode::PAYLOAD_TOO_LARGE, limit.error_code(), headers)
+    let message = match limit {
+        SizeLimit::Request(bytes) => {
+            format!("the request body is above the request limit of {bytes} bytes")
+        }
+        SizeLimit::Snapshot(bytes) => {
+            format!("the snapshot is above the snapshot limit of {bytes} bytes")
+        }
+    };
+    error_answer(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        limit.error_code(),
+        message,
+        headers,
+    )
 }
 
 fn insert_size_limit(headers: &mut HeaderMap, limit: SizeLimit) {

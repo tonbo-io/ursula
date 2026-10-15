@@ -1,5 +1,5 @@
 //! Every error answer of the client plane carries one JSON body,
-//! `{"error":"<code>"}` (extensions Section 11): the handlers' own refusals,
+//! `{"error":"<code>","message":"<detail>"}` (extensions Section 11): the handlers' own refusals,
 //! the runtime's, and axum's `404`, `405` and extractor rejections, which
 //! the router renders. The operator paths under `/__ursula/` keep their own
 //! answers.
@@ -16,6 +16,7 @@ use ursula_headers::names;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
+use crate::render::error_body_of;
 use crate::render::error_code_of;
 use crate::router;
 
@@ -59,24 +60,23 @@ async fn front_door_refusals_name_their_code() {
     assert_eq!(created.status(), StatusCode::CREATED);
 
     // 400s of the request's shape.
-    assert_refused(
-        send(&app, "GET", "/errors/s?consistency=strong", &[]).await,
-        StatusCode::BAD_REQUEST,
-        ErrorCode::InvalidQuery,
-    )
-    .await;
+    let refused = send(&app, "GET", "/errors/s?consistency=strong", &[]).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = error_body_of(refused).await;
+    assert_eq!(body.code, ErrorCode::InvalidQuery);
+    assert_eq!(body.message, "invalid consistency");
     assert_refused(
         send(&app, "GET", "/errors/s?offset=abc", &[]).await,
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidOffset,
     )
     .await;
-    assert_refused(
-        send(&app, "PUT", "/errors/t", &[("stream-ttl", "01")]).await,
-        StatusCode::BAD_REQUEST,
-        ErrorCode::InvalidHeader,
-    )
-    .await;
+    // The message says which header and why.
+    let refused = send(&app, "PUT", "/errors/t", &[("stream-ttl", "01")]).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = error_body_of(refused).await;
+    assert_eq!(body.code, ErrorCode::InvalidHeader);
+    assert_eq!(body.message, "stream-ttl must not contain leading zeros");
     assert_refused(
         send(&app, "GET", "/errors/s", &[(
             names::STREAM_INCARNATION,
@@ -122,6 +122,21 @@ async fn front_door_refusals_name_their_code() {
         ErrorCode::InvalidOffset,
     )
     .await;
+
+    // A malformed JSON body is named, never echoed.
+    let json = send_body(
+        &app,
+        "PUT",
+        "/errors/j",
+        &[("content-type", "application/json")],
+        "{\"secret-token\": nope}",
+    )
+    .await;
+    assert_eq!(json.status(), StatusCode::BAD_REQUEST);
+    let body = error_body_of(json).await;
+    assert_eq!(body.code, ErrorCode::InvalidRecordBoundaries);
+    assert!(!body.message.contains("secret-token"), "{}", body.message);
+    assert!(!body.message.contains("nope"), "{}", body.message);
 
     // The stream's own refusals.
     assert_refused(

@@ -1280,11 +1280,16 @@ enum Refusal {
 impl IntoResponse for Refusal {
     fn into_response(self) -> AxumResponse {
         let mut headers = HeaderMap::new();
-        let (status, code) = match self {
-            Self::NotFound => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
+        let (status, code, message) = match self {
+            Self::NotFound => (
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "not found".to_owned(),
+            ),
             Self::Authentication(AuthenticationError::Unavailable) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::AuthenticationUnavailable,
+                "authentication service is unavailable".to_owned(),
             ),
             Self::Authentication(
                 error @ (AuthenticationError::InvalidCredential
@@ -1299,52 +1304,82 @@ impl IntoResponse for Refusal {
                     AuthenticationError::Expired => ErrorCode::CredentialExpired,
                     _ => ErrorCode::InvalidCredential,
                 };
-                (StatusCode::UNAUTHORIZED, code)
+                // The error's own text names no part of the credential.
+                (StatusCode::UNAUTHORIZED, code, error.to_string())
             }
-            Self::Forbidden => (StatusCode::FORBIDDEN, ErrorCode::Forbidden),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                ErrorCode::Forbidden,
+                "the request is not allowed".to_owned(),
+            ),
             Self::Authorization(AuthorizationError::Unavailable) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::AuthorizationUnavailable,
+                "authorization service is unavailable".to_owned(),
             ),
             Self::Admission(AdmissionRejection::RateLimited { retry_after_secs }) => {
                 headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
-                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited)
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    ErrorCode::RateLimited,
+                    "tenant request rate limit exceeded".to_owned(),
+                )
             }
-            Self::Admission(AdmissionRejection::LiveReadsExhausted) => {
-                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::LiveReadsExhausted)
-            }
+            Self::Admission(AdmissionRejection::LiveReadsExhausted) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::LiveReadsExhausted,
+                "tenant live-read connection limit exceeded".to_owned(),
+            ),
             Self::BodyTooLarge { limit } => {
-                let limit = SizeLimit::Request(limit);
-                limit.render(|name, value| {
+                let typed = SizeLimit::Request(limit);
+                typed.render(|name, value| {
                     if let Ok(value) = HeaderValue::from_str(value) {
                         headers.insert(name, value);
                     }
                 });
-                (StatusCode::PAYLOAD_TOO_LARGE, limit.error_code())
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    typed.error_code(),
+                    format!("the request body is above the request limit of {limit} bytes"),
+                )
             }
-            Self::BodyUnreadable => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
-            Self::NoUpstream => (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoUpstream),
+            Self::BodyUnreadable => (
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BodyUnreadable,
+                "the request body could not be read".to_owned(),
+            ),
+            Self::NoUpstream => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::NoUpstream,
+                "no upstream is configured".to_owned(),
+            ),
         };
-        error_answer(status, code, headers)
+        error_answer(status, code, message, headers)
     }
 }
 
 /// The one renderer of the gateway's own error answers: `status`, `headers`
-/// and the JSON error body naming `code` (extensions Section 11), the body
-/// Ursula renders.
-fn error_answer(status: StatusCode, code: ErrorCode, mut headers: HeaderMap) -> AxumResponse {
+/// and the JSON error body naming `code` with `message` (extensions Section
+/// 11), the body Ursula renders. A message names no internal address and
+/// echoes no request body or credential.
+fn error_answer(
+    status: StatusCode,
+    code: ErrorCode,
+    message: impl Into<String>,
+    mut headers: HeaderMap,
+) -> AxumResponse {
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static(ErrorBody::CONTENT_TYPE),
     );
-    (status, headers, ErrorBody::new(code).render()).into_response()
+    (status, headers, ErrorBody::new(code, message).render()).into_response()
 }
 
 /// [`error_answer`] with `Retry-After: 1`.
-fn retry_answer(status: StatusCode, code: ErrorCode) -> AxumResponse {
+fn retry_answer(status: StatusCode, code: ErrorCode, message: &str) -> AxumResponse {
     let mut headers = HeaderMap::new();
     headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
-    error_answer(status, code, headers)
+    error_answer(status, code, message, headers)
 }
 
 /// Replaces `Ursula-Max-Request-Bytes` on a forwarded response with the
@@ -1781,17 +1816,21 @@ impl GatewayError {
             Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => {
                 unreachable_response()
             }
-            Self::LeaderNotFound { .. } => {
-                retry_answer(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
-            }
+            Self::LeaderNotFound { .. } => retry_answer(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::NoLeader,
+                "no leader found; retry",
+            ),
             Self::UpstreamTimeout { .. } => error_answer(
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorCode::UpstreamTimeout,
+                "upstream sent no response in time",
                 HeaderMap::new(),
             ),
             Self::Upstream { .. } | Self::ResponseBuild(_) => error_answer(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamFailed,
+                "upstream request failed",
                 HeaderMap::new(),
             ),
         }
@@ -1802,6 +1841,7 @@ fn unreachable_response() -> AxumResponse {
     retry_answer(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::UpstreamUnreachable,
+        "upstream unreachable; retry",
     )
 }
 

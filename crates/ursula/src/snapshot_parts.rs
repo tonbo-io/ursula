@@ -280,19 +280,26 @@ impl IntoResponse for PartsRefusal {
                 (StatusCode::BAD_REQUEST, ErrorCode::SnapshotDigestMismatch)
             }
             Self::Body(_) => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
-            Self::Busy => return retry_after_json(ErrorCode::SnapshotCommitsBusy),
-            Self::InProgress => return retry_after_json(ErrorCode::SnapshotCommitInProgress),
+            Self::Busy => {
+                return retry_after_json(ErrorCode::SnapshotCommitsBusy, self.to_string());
+            }
+            Self::InProgress => {
+                return retry_after_json(ErrorCode::SnapshotCommitInProgress, self.to_string());
+            }
             Self::ColdStore(err) => {
                 tracing::warn!(error = %err, "snapshot parts in the cold store failed");
-                (StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    ErrorCode::ColdStoreFailed,
+                    "snapshot parts in the cold store failed",
+                );
             }
             Self::Invariant(err) => {
                 tracing::error!(error = %err, "a snapshot part value is outside the protocol");
                 (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
             }
         };
-        tracing::debug!(%status, refusal = %self, "snapshot parts refused");
-        error_response(status, code)
+        error_response(status, code, self.to_string())
     }
 }
 
@@ -400,7 +407,12 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
             let mut headers = HeaderMap::new();
             SnapshotPublishAnswer::Conflict { latest }
                 .render(|name, value| insert_header_str(&mut headers, name, value));
-            error_answer(StatusCode::CONFLICT, ErrorCode::SnapshotConflict, headers)
+            error_answer(
+                StatusCode::CONFLICT,
+                ErrorCode::SnapshotConflict,
+                "another snapshot is the latest at or after this offset",
+                headers,
+            )
         }
         Err(err) => PartsRefusal::Invariant(err).into_response(),
     })
@@ -414,17 +426,19 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
 fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -> KeyCheck {
     // The codes of the publish's own refusals (`StreamGone` and
     // `SnapshotConflict`).
-    let (status, next_offset, code) = if target.snapshot_offset < head.retained_offset {
+    let (status, next_offset, code, message) = if target.snapshot_offset < head.retained_offset {
         (
             StatusCode::GONE,
             head.retained_offset,
             ErrorCode::StreamGone,
+            "snapshot offset is older than the stream's retained offset",
         )
     } else if target.snapshot_offset > head.tail_offset {
         (
             StatusCode::CONFLICT,
             head.tail_offset,
             ErrorCode::SnapshotConflict,
+            "snapshot offset is beyond the stream's tail",
         )
     } else {
         return KeyCheck::Open {
@@ -433,7 +447,7 @@ fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -
     };
     let mut headers = HeaderMap::new();
     insert_offset(&mut headers, next_offset);
-    KeyCheck::Answered(error_answer(status, code, headers))
+    KeyCheck::Answered(error_answer(status, code, message, headers))
 }
 
 /// Commits a snapshot uploaded in parts, staged for the stream's
@@ -534,7 +548,11 @@ pub(crate) async fn commit(
             if let Err(err) = task.await {
                 tracing::error!(error = %err, "a snapshot commit task failed");
             }
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "the snapshot commit failed",
+            )
         }
     }
 }

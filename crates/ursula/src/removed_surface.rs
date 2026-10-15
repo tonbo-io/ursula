@@ -54,13 +54,11 @@ pub(crate) fn reject_removed_read_parameters(
         .iter()
         .find(|name| query.contains_key(**name))
     {
-        Some(name) => {
-            tracing::debug!(parameter = name, "a removed read parameter");
-            Err(Box::new(error_response(
-                StatusCode::BAD_REQUEST,
-                ErrorCode::Unsupported,
-            )))
-        }
+        Some(name) => Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            format!("the {name} parameter is not supported; record coordinates were removed"),
+        ))),
         None => Ok(()),
     }
 }
@@ -71,6 +69,7 @@ pub(crate) fn reject_removed_append_headers(headers: &HeaderMap) -> Result<(), B
         return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::Unsupported,
+            "Stream-Record-Match is not supported",
         )));
     }
     Ok(())
@@ -82,6 +81,7 @@ pub(crate) fn reject_removed_snapshot_headers(headers: &HeaderMap) -> Result<(),
         return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::Unsupported,
+            "Stream-Snapshot-Match is not supported",
         )));
     }
     Ok(())

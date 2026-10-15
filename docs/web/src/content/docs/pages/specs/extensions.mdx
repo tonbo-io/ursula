@@ -548,14 +548,14 @@ Every error answer of a server implementing this extension, any `4xx` or `5xx`, 
 ```
 Content-Type: application/json
 
-{"error":"<code>"}
+{"error":"<code>","message":"<detail>"}
 ```
 
-`<code>` is a stable code of ASCII letters and digits that names the refusal, so a client matches it without parsing text. The status and the typed headers of Sections 2, 5 and 10 keep their meaning, and the body adds the code beside them: a `413` still names its limit in a header, a `503` still carries `Retry-After`, a producer refusal still carries `Producer-Outcome`. An answer to `HEAD` carries the `Content-Type` and no body. A redirect is no error answer and carries no error body.
+Both members are REQUIRED strings, and the object has no other member. `<code>` is a stable code of ASCII letters and digits that names the refusal. A client matches `error` and nothing else. `message` is a human-readable detail, such as which header or parameter was malformed and why. It is informative only: its text MAY change in any release, and a client MUST NOT parse it or base a decision on it. A server MUST NOT echo the request body or a credential in `message`. The status and the typed headers of Sections 2, 5 and 10 keep their meaning, and the body adds the code beside them: a `413` still names its limit in a header, a `503` still carries `Retry-After`, a producer refusal still carries `Producer-Outcome`. An answer to `HEAD` carries the `Content-Type` and no body. A redirect is no error answer and carries no error body.
 
 A client MUST NOT require the body. An answer from a layer that does not implement this section, such as a proxy, may carry any body or none, and a later version may add codes. A client that does not know a code acts on the status and the headers alone.
 
-An intermediary that implements this section renders its own error answers with the same shape, and passes the server's through unchanged.
+An intermediary that implements this section renders its own error answers with the same shape, and passes the server's through unchanged. Its messages name no internal address.
 
 | Status | Codes |
 | ------ | ----- |
@@ -578,4 +578,4 @@ An intermediary that implements this section renders its own error answers with 
 
 A code says what refused the request. It says nothing more about a write's outcome than its status does: `OutcomeUnknown`, like any `503` after the body was read, leaves the outcome unknown (Section 5.6).
 
-> **Note (informative).** `ursula-headers` defines the codes (`ErrorCode`) and parses and renders the body (`ErrorBody`). Ursula's operator routes under `/__ursula/` keep their own answers.
+> **Note (informative).** `ursula-headers` defines the codes (`ErrorCode`) and parses and renders the body (`ErrorBody`). Its parser accepts the two members in either order and any JSON string as the message, and refuses an unknown code, a missing member or any other member. Ursula's operator routes under `/__ursula/` keep their own answers.

@@ -45,8 +45,11 @@ pub(crate) enum SnapshotUpload {
 }
 
 fn body_read_error(err: impl std::fmt::Display) -> Response {
-    tracing::debug!(error = %err, "read snapshot body");
-    render::error_response(StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable)
+    render::error_response(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::BodyUnreadable,
+        format!("read snapshot body: {err}"),
+    )
 }
 
 /// Receives a snapshot body of at most the request limit (`413` above it).
@@ -92,6 +95,7 @@ pub(crate) async fn receive_snapshot_body(
         return Err(render::error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::ColdStoreFailed,
+            "cold backend must be configured before staging snapshots",
         ));
     };
     let path = new_external_payload_path(stream_id);
@@ -194,7 +198,11 @@ pub(crate) async fn stream_into_object<E: std::error::Error + 'static>(
 
 fn stage_error(err: io::Error) -> Response {
     tracing::warn!(error = %err, "write snapshot object");
-    render::error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
+    render::error_response(
+        StatusCode::BAD_GATEWAY,
+        ErrorCode::ColdStoreFailed,
+        "writing the snapshot object failed",
+    )
 }
 
 /// Streams `len` bytes of a cold snapshot body from `start`, piece by
@@ -273,7 +281,11 @@ pub(crate) async fn read_piece(
 
 fn cold_read_error(err: io::Error) -> Response {
     tracing::error!(error = %err, "read cold snapshot body");
-    render::error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
+    render::error_response(
+        StatusCode::BAD_GATEWAY,
+        ErrorCode::ColdStoreFailed,
+        "reading the snapshot object failed",
+    )
 }
 
 /// The response body of a snapshot read whose body lives in `object`: its

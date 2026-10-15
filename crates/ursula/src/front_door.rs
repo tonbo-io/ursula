@@ -203,6 +203,7 @@ fn routing_response(answer: RoutingAnswer, location: Option<&str>) -> Response {
             error_answer(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::NoLeader,
+                "no leader of the stream's group is known",
                 headers,
             )
         }

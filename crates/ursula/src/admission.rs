@@ -118,9 +118,18 @@ impl IntoResponse for AdmissionRefusal {
     fn into_response(self) -> Response {
         match self {
             Self::BodyTooLarge(limit) => limits::size_refusal(limit),
-            Self::WalDiskPressure | Self::RaftLogPressure | Self::IngressBodyBytesLimitReached => {
-                retry_after_json(self.code())
-            }
+            Self::WalDiskPressure => retry_after_json(
+                self.code(),
+                "the WAL filesystem is below its free-space floor; retry",
+            ),
+            Self::RaftLogPressure => retry_after_json(
+                self.code(),
+                "the node's Raft log is over its hard limit; retry",
+            ),
+            Self::IngressBodyBytesLimitReached => retry_after_json(
+                self.code(),
+                "the node's in-flight request bodies fill its budget; retry",
+            ),
         }
     }
 }
@@ -320,11 +329,11 @@ fn is_write_method(method: &Method) -> bool {
 }
 
 /// A `503` with `Retry-After: 1` whose error body names `code`.
-pub(crate) fn retry_after_json(code: ErrorCode) -> Response {
+pub(crate) fn retry_after_json(code: ErrorCode, message: impl Into<String>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),
     );
-    error_answer(StatusCode::SERVICE_UNAVAILABLE, code, headers)
+    error_answer(StatusCode::SERVICE_UNAVAILABLE, code, message, headers)
 }

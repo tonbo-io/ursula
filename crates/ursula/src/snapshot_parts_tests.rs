@@ -907,8 +907,8 @@ async fn a_commit_finishes_after_its_client_goes_away() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(response.headers().contains_key(RETRY_AFTER));
     assert_eq!(
-        body_of(response).await,
-        br#"{"error":"SnapshotCommitInProgress"}"#
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitInProgress
     );
 
     gate.open();
@@ -951,8 +951,8 @@ async fn a_third_concurrent_commit_is_busy() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(response.headers().contains_key(RETRY_AFTER));
     assert_eq!(
-        body_of(response).await,
-        br#"{"error":"SnapshotCommitsBusy"}"#
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitsBusy
     );
     let metrics = send(
         &app,
@@ -1012,8 +1012,8 @@ async fn one_copy_and_one_full_request_fit_the_smallest_budget() {
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        body_of(response).await,
-        br#"{"error":"SnapshotCommitsBusy"}"#
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitsBusy
     );
 
     let response = send(

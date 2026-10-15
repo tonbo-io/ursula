@@ -1584,6 +1584,7 @@ pub(crate) async fn stage_external_payload(
         return Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::ColdStoreFailed,
+            "cold backend must be configured before externalizing payloads",
         ));
     };
     let s3_path = new_external_payload_path(stream_id);
@@ -1592,7 +1593,11 @@ pub(crate) async fn stage_external_payload(
         .await
         .map_err(|err| {
             tracing::warn!(error = %err, "write external payload object");
-            error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::ColdStoreFailed,
+                "writing the external payload object failed",
+            )
         })?;
     Ok(ExternalPayloadRef {
         s3_path,
@@ -1741,8 +1746,32 @@ fn producer_answer_response(
         _ => StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     };
     match answer.error_code() {
-        Some(code) => error_answer(status, code, headers),
+        Some(code) => error_answer(status, code, producer_refusal_message(&answer), headers),
         None => (status, headers).into_response(),
+    }
+}
+
+/// The message of a producer refusal answered before the body, from its
+/// typed answer: the late path's message names the producer too.
+fn producer_refusal_message(answer: &ProducerAnswer) -> String {
+    match answer {
+        ProducerAnswer::Receipt { .. } | ProducerAnswer::ReceiptEvicted { .. } => String::new(),
+        ProducerAnswer::EpochClosed(_) => "the producer's epoch is closed".to_owned(),
+        ProducerAnswer::KeyConflict { epoch } => {
+            format!("producer epoch {epoch} holds a write with another identity under this key")
+        }
+        ProducerAnswer::ProducerExpired { epoch } => {
+            format!("the producer's epoch is not remembered; claim an epoch above {epoch}")
+        }
+        ProducerAnswer::StaleEpoch { epoch } => {
+            format!("the producer's epoch is stale; current epoch is {epoch}")
+        }
+        ProducerAnswer::SeqGap { expected, received } => {
+            format!("producer sequence {received} is out of order; expected {expected}")
+        }
+        ProducerAnswer::EpochNotClaimed => {
+            "a new producer epoch must start at sequence 0".to_owned()
+        }
     }
 }
 
@@ -1836,8 +1865,7 @@ pub(crate) async fn create_bucket(Path(bucket): Path<String>) -> Response {
     match ursula_runtime::validate_bucket_id(&bucket) {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(message) => {
-            tracing::debug!(%message, "invalid bucket id");
-            error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidBucketId)
+            error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidBucketId, message)
         }
     }
 }
@@ -3089,6 +3117,7 @@ fn refuse_create_producer_headers(headers: &HeaderMap) -> Result<(), Box<Respons
         }) => Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidProducer,
+            "a create carries no producer headers: create the stream, then claim an epoch",
         ))),
         Err(err) => Err(invalid_producer(&err)),
     }
@@ -3117,8 +3146,11 @@ pub(crate) async fn create_stream_by_id(
     {
         Ok(payload) => payload,
         Err(message) => {
-            tracing::debug!(%message, "a create's JSON body is malformed");
-            return error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidRecordBoundaries);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidRecordBoundaries,
+                message,
+            );
         }
     };
     request.close_after = stream_closed(&request_headers);
@@ -3329,8 +3361,11 @@ fn unreadable_body_response(err: &axum::Error) -> Response {
     if over_limit {
         return limits::size_refusal(limits::REQUEST_LIMIT);
     }
-    tracing::debug!(error = %err, "request body unreadable");
-    error_response(StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable)
+    error_response(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::BodyUnreadable,
+        format!("request body unreadable: {err}"),
+    )
 }
 
 #[tracing::instrument(
@@ -3361,7 +3396,11 @@ pub(crate) async fn append_stream_by_id(
     // A write without a key has no producer rows, so its empty body is
     // refused here, with the other content faults, instead of in the log.
     if producer.is_none() && payload.is_empty() && !close_after {
-        return error_response(StatusCode::BAD_REQUEST, ErrorCode::EmptyAppend);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::EmptyAppend,
+            "append payload must be non-empty unless closing the stream",
+        );
     }
     if close_only {
         return match state
@@ -3510,7 +3549,11 @@ pub(crate) async fn head_stream_by_id(
                 Ok(head) => head,
                 Err(err) => {
                     tracing::error!(error = %err, "a stream's HEAD is outside the protocol's range");
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal);
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorCode::Internal,
+                        "stream metadata outside the protocol's range",
+                    );
                 }
             };
             let mut headers = HeaderMap::new();
@@ -3573,16 +3616,28 @@ pub(crate) async fn read_stream_by_id(
     let leader_only = match query.get("consistency").map(String::as_str) {
         None | Some("local") => false,
         Some("leader") => true,
-        Some(_) => return error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery),
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidQuery,
+                "invalid consistency",
+            );
+        }
     };
-    // Leader consistency is available only for catch-up reads.
     if leader_only && live_mode.is_some() {
-        return error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
+            "leader consistency is available only for catch-up reads",
+        );
     }
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
-    // A live read requires a start position.
     if live_mode.is_some() && !query.contains_key("offset") {
-        return error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
+            "live reads require a start position",
+        );
     }
     // A live read takes every lookup from its owner check (D10): `offset=now`,
     // existence, content type and incarnation come from state this replica
@@ -3657,7 +3712,13 @@ pub(crate) async fn read_stream_by_id(
             )
             .await;
         }
-        (Some(_), _) => return error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery),
+        (Some(_), _) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidQuery,
+                "invalid live mode",
+            );
+        }
         (None, _) => {}
     }
 
@@ -3813,6 +3874,7 @@ pub(crate) async fn removed_latest_snapshot() -> Response {
     error_answer(
         StatusCode::METHOD_NOT_ALLOWED,
         ErrorCode::Unsupported,
+        "the latest-snapshot redirect was removed; read Stream-Snapshot-Offset from HEAD",
         headers,
     )
 }
@@ -3880,10 +3942,12 @@ async fn verify_json_boundary(
         Some(_) => Err(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::NotJsonBoundary,
+            format!("offset {offset} is not a JSON message boundary"),
         )),
         None => Err(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::JsonBoundaryUnverified,
+            format!("could not verify that offset {offset} is a JSON message boundary"),
         )),
     }
 }
@@ -4063,7 +4127,12 @@ pub(crate) async fn read_snapshot(
             .and_then(|range| range.resolve(total));
             let (status, mut response_headers) = snapshot_head(&response, range);
             if let Some(ContentRange::Unsatisfied { .. }) = range {
-                return error_answer(status, ErrorCode::RangeNotSatisfiable, response_headers);
+                return error_answer(
+                    status,
+                    ErrorCode::RangeNotSatisfiable,
+                    "the range lies outside the snapshot",
+                    response_headers,
+                );
             }
             let (start, len) = match range {
                 None => (0, total),
@@ -4089,6 +4158,7 @@ pub(crate) async fn read_snapshot(
                             return error_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 ErrorCode::Internal,
+                                "snapshot range outside its body",
                             );
                         }
                     }
@@ -4118,9 +4188,12 @@ pub(crate) async fn bootstrap_stream(
         Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
-    // Bootstrap does not support live reads.
     if query.contains_key("live") {
-        return error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidQuery);
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
+            "bootstrap does not support live reads",
+        );
     }
     let stream_id = path.into_stream_id();
     match state
@@ -4152,6 +4225,7 @@ fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
         Box::new(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidOffset,
+            "invalid snapshot offset",
         ))
     };
     if raw == "-1" {
@@ -4202,6 +4276,7 @@ pub(crate) fn parse_read_offset(raw: Option<&str>) -> Result<u64, BoxResponse> {
             Box::new(error_response(
                 StatusCode::BAD_REQUEST,
                 ErrorCode::InvalidOffset,
+                "invalid offset",
             ))
         }),
     }
@@ -4495,6 +4570,7 @@ pub(crate) fn parse_query(raw: Option<&str>) -> Result<HashMap<String, String>, 
             return Err(Box::new(error_response(
                 StatusCode::BAD_REQUEST,
                 ErrorCode::InvalidQuery,
+                "multiple offset parameters",
             )));
         }
         query.insert(key.into_owned(), value.into_owned());
@@ -4578,19 +4654,19 @@ pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64
 
 /// `400 InvalidHeader`, for a header value that `message` describes.
 fn invalid_header(message: String) -> BoxResponse {
-    tracing::debug!(%message, "a malformed header");
     Box::new(error_response(
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidHeader,
+        message,
     ))
 }
 
 /// `400 InvalidProducer`, for malformed producer headers.
 fn invalid_producer(err: &ProducerHeaderError) -> BoxResponse {
-    tracing::debug!(error = %err, "malformed producer headers");
     Box::new(error_response(
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidProducer,
+        err.to_string(),
     ))
 }
 
@@ -4600,11 +4676,6 @@ fn invalid_producer(err: &ProducerHeaderError) -> BoxResponse {
 fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Response> {
     let expected = expected?;
     (expected != served).then(|| {
-        tracing::debug!(
-            expected,
-            served,
-            "Stream-Incarnation does not match the stream"
-        );
         let mut headers = HeaderMap::new();
         insert_incarnation_mismatch(&mut headers, IncarnationMismatch {
             current: Incarnation::try_from(served).ok(),
@@ -4612,6 +4683,7 @@ fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Respon
         error_answer(
             StatusCode::PRECONDITION_FAILED,
             ErrorCode::IncarnationMismatch,
+            format!("Stream-Incarnation {expected} does not match the stream"),
             headers,
         )
     })
@@ -4725,19 +4797,25 @@ fn content_checks(
         }
         // The codes apply gives the same faults of a keyed write.
         (None, Some(fault)) => {
-            let code = match fault {
-                ContentFaultV1::ContentFaultMissingContentType => ErrorCode::MissingContentType,
-                ContentFaultV1::ContentFaultMalformedJson => {
-                    if let Some(message) = malformed {
-                        tracing::debug!(%message, "an append's JSON body is malformed");
-                    }
-                    ErrorCode::InvalidRecordBoundaries
-                }
-                ContentFaultV1::ContentFaultDigestMismatch | ContentFaultV1::ContentFaultNone => {
-                    ErrorCode::ProducerDigestMismatch
-                }
+            let (code, message) = match fault {
+                ContentFaultV1::ContentFaultMissingContentType => (
+                    ErrorCode::MissingContentType,
+                    "append with a body must include content type".to_owned(),
+                ),
+                ContentFaultV1::ContentFaultMalformedJson => (
+                    ErrorCode::InvalidRecordBoundaries,
+                    malformed.unwrap_or_default(),
+                ),
+                ContentFaultV1::ContentFaultDigestMismatch | ContentFaultV1::ContentFaultNone => (
+                    ErrorCode::ProducerDigestMismatch,
+                    "producer-digest does not match the request body".to_owned(),
+                ),
             };
-            Err(Box::new(error_response(StatusCode::BAD_REQUEST, code)))
+            Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                code,
+                message,
+            )))
         }
     }
 }
@@ -4753,8 +4831,6 @@ fn runtime_error_response(err: RuntimeError) -> Response {
     let status = runtime_error_status(&err);
     if status.is_server_error() {
         tracing::warn!(%status, error = %err, "runtime request failed");
-    } else {
-        tracing::debug!(%status, error = %err, "runtime request refused");
     }
     let mut headers = HeaderMap::new();
     insert_retry_after_for_temporary(&mut headers, &err);
@@ -4764,7 +4840,7 @@ fn runtime_error_response(err: RuntimeError) -> Response {
     }
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
-    error_answer(status, runtime_error_code(&err), headers)
+    error_answer(status, runtime_error_code(&err), err.to_string(), headers)
 }
 
 fn insert_retry_after_for_temporary(headers: &mut HeaderMap, err: &RuntimeError) {
@@ -4872,7 +4948,6 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 /// 503 + `Retry-After: 1` for a request that must reach the group leader but
 /// cannot be redirected (purge) or has no known leader. Retryable.
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
-    tracing::debug!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
     let group = match &err {
         RuntimeError::GroupEngine { raft_group_id, .. }
@@ -4892,6 +4967,7 @@ fn leader_unknown_retry_response(err: RuntimeError) -> Response {
     error_answer(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::NoLeader,
+        err.to_string(),
         headers,
     )
 }

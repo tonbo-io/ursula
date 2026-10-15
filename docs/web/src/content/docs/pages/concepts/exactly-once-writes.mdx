@@ -35,7 +35,7 @@ A create (`PUT`) with producer headers answers `400`. Create the stream, then cl
 
 Dedup state is scoped per stream. The same `Producer-Id` writing to two different streams maintains two independent epoch/seq counters, so you do not have to elect a single global writer per producer.
 
-The server keeps the receipt of each producer's newest write only, and forgets older epochs once a higher epoch is claimed. A producer that has not written to a stream for 7 days is forgotten. A stream holds at most 4,096 producers: a new producer beyond that replaces the least recently seen producer idle for at least an hour, and when none has been idle that long its append is rejected with `429` and the error body `{"error":"ProducerLimit"}`.
+The server keeps the receipt of each producer's newest write only, and forgets older epochs once a higher epoch is claimed. A producer that has not written to a stream for 7 days is forgotten. A stream holds at most 4,096 producers: a new producer beyond that replaces the least recently seen producer idle for at least an hour, and when none has been idle that long its append is rejected with `429` and the error code `ProducerLimit`.
 
 When the server forgets a producer, it raises the stream's epoch floor to that producer's epoch. A write that carries `Stream-Incarnation` never reaches an epoch at or below the floor that the stream may have forgotten: it answers `403` with `Producer-Outcome: producer-expired` and the floor as `Producer-Epoch`. Claim an epoch above the floor, starting at sequence `0`. Without `Stream-Incarnation`, a forgotten producer is new, as the base protocol says.
 

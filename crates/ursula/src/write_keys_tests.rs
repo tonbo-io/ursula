@@ -746,14 +746,28 @@ async fn assert_same_answer(app: &Router, early: Write<'_>, late: Write<'_>, sta
         "late: {:?}",
         late_answer.headers()
     );
-    // Both paths answer the same headers and the same error body.
-    assert_eq!(early_answer.headers(), late_answer.headers());
-    let body = |response: Response| async {
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body")
+    // Both paths answer the same headers and, on a refusal, the same code.
+    // The late message names the producer, the early one cannot, so the
+    // lengths differ.
+    let headers = |response: &Response| {
+        let mut headers = response.headers().clone();
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        headers
     };
-    assert_eq!(body(early_answer).await, body(late_answer).await);
+    assert_eq!(headers(&early_answer), headers(&late_answer));
+    if status.is_success() {
+        let body = |response: Response| async {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+        };
+        assert_eq!(body(early_answer).await, body(late_answer).await);
+    } else {
+        assert_eq!(
+            crate::render::error_code_of(early_answer).await,
+            crate::render::error_code_of(late_answer).await
+        );
+    }
 }
 
 /// D1 and D2 of the evaluation order (#581 section 5.3): the producer rows

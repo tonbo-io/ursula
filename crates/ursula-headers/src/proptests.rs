@@ -8,6 +8,7 @@ use proptest::prelude::Just;
 use proptest::prelude::Strategy;
 use proptest::prelude::any;
 use proptest::prelude::prop;
+use proptest::prop_assert;
 use proptest::prop_assert_eq;
 use proptest::prop_oneof;
 use proptest::proptest;
@@ -569,6 +570,19 @@ proptest! {
     ) {
         if let Ok(parsed) = ErrorBody::parse(&body) {
             prop_assert_eq!(ErrorBody::parse(parsed.render().as_bytes()), Ok(parsed));
+        }
+    }
+
+    #[test]
+    fn error_bodies_round_trip(
+        index in 0..crate::error_body::ErrorCode::ALL.len(),
+        message in any::<String>(),
+    ) {
+        let code = crate::error_body::ErrorCode::ALL.get(index).copied();
+        prop_assert!(code.is_some());
+        if let Some(code) = code {
+            let body = ErrorBody::new(code, message);
+            prop_assert_eq!(ErrorBody::parse(body.render().as_bytes()), Ok(body));
         }
     }
 }

@@ -260,9 +260,16 @@ pub(crate) fn stream_error_code(code: StreamErrorCode) -> ErrorCode {
 }
 
 /// The code of an error answer's body, for tests: panics unless the
-/// answer is JSON and its body parses.
+/// answer is JSON and its body parses with a message.
 #[cfg(test)]
 pub(crate) async fn error_code_of(response: Response) -> ErrorCode {
+    error_body_of(response).await.code
+}
+
+/// The error body of an answer, for tests: panics unless the answer is
+/// JSON and its body parses with a message.
+#[cfg(test)]
+pub(crate) async fn error_body_of(response: Response) -> ErrorBody {
     assert_eq!(
         response
             .headers()
@@ -275,7 +282,10 @@ pub(crate) async fn error_code_of(response: Response) -> ErrorCode {
         .await
         .expect("an error body");
     match ErrorBody::parse(&body) {
-        Ok(body) => body.code,
+        Ok(parsed) => {
+            assert!(!parsed.message.is_empty(), "{}", parsed.code);
+            parsed
+        }
         Err(err) => panic!("{err}: {}", String::from_utf8_lossy(&body)),
     }
 }
@@ -286,14 +296,24 @@ pub(crate) async fn error_code_of(response: Response) -> ErrorCode {
 struct RenderedErrorBody;
 
 /// [`error_answer`] with no headers of its own.
-pub(crate) fn error_response(status: StatusCode, code: ErrorCode) -> Response {
-    error_answer(status, code, HeaderMap::new())
+pub(crate) fn error_response(
+    status: StatusCode,
+    code: ErrorCode,
+    message: impl Into<String>,
+) -> Response {
+    error_answer(status, code, message, HeaderMap::new())
 }
 
 /// The one renderer of an error answer on the client plane: `status`, the
-/// default headers, then `headers`, and the JSON body naming `code`
-/// (extensions Section 11).
-pub(crate) fn error_answer(status: StatusCode, code: ErrorCode, headers: HeaderMap) -> Response {
+/// default headers, then `headers`, and the JSON body naming `code` with
+/// `message`, a human-readable detail (extensions Section 11). A message
+/// never echoes the request body or a credential.
+pub(crate) fn error_answer(
+    status: StatusCode,
+    code: ErrorCode,
+    message: impl Into<String>,
+    headers: HeaderMap,
+) -> Response {
     let mut all = HeaderMap::new();
     insert_default_response_headers(&mut all);
     all.extend(headers);
@@ -302,7 +322,7 @@ pub(crate) fn error_answer(status: StatusCode, code: ErrorCode, headers: HeaderM
         CONTENT_TYPE,
         HeaderValue::from_static(ErrorBody::CONTENT_TYPE),
     );
-    let mut response = (status, all, ErrorBody::new(code).render()).into_response();
+    let mut response = (status, all, ErrorBody::new(code, message).render()).into_response();
     response.extensions_mut().insert(RenderedErrorBody);
     response
 }
@@ -317,15 +337,21 @@ pub(crate) fn render_unrendered_error(response: &mut Response) {
     {
         return;
     }
-    let code = match status {
-        StatusCode::NOT_FOUND => ErrorCode::NotFound,
-        StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
-        StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::RequestTooLarge,
-        status if status.is_server_error() => ErrorCode::Internal,
-        _ => ErrorCode::InvalidRequest,
+    let (code, message) = match status {
+        StatusCode::NOT_FOUND => (ErrorCode::NotFound, "no route serves this path"),
+        StatusCode::METHOD_NOT_ALLOWED => (
+            ErrorCode::MethodNotAllowed,
+            "the route does not serve this method",
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            ErrorCode::RequestTooLarge,
+            "the request body is above the request limit",
+        ),
+        status if status.is_server_error() => (ErrorCode::Internal, "the server failed"),
+        _ => (ErrorCode::InvalidRequest, "the request is malformed"),
     };
     let headers = std::mem::take(response.headers_mut());
-    *response = error_answer(status, code, headers);
+    *response = error_answer(status, code, message, headers);
 }
 
 /// `Stream-Incarnation` (D12): the opaque token of the stream incarnation
@@ -579,7 +605,11 @@ pub(crate) fn producer_refusal_answer(
 /// state machine produced is outside what the protocol carries.
 pub(crate) fn producer_answer_failed(err: &HeaderError) -> Response {
     tracing::error!(error = %err, "a producer answer is outside the protocol's range");
-    error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        "producer answer outside the protocol's range",
+    )
 }
 
 /// Renders a producer answer's headers with the shared header crate.
@@ -668,7 +698,11 @@ pub(crate) fn snapshot_published_response(offset: u64, digest: &str, incarnation
         }
         Err(err) => {
             tracing::error!(error = %err, "a published snapshot outside the protocol's range");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "snapshot answer outside the protocol's range",
+            )
         }
     }
 }

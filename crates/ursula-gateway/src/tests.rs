@@ -3993,6 +3993,10 @@ async fn the_gateways_own_answers_carry_an_error_body() {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        assert_eq!(ErrorBody::parse(&body), Ok(ErrorBody::new(code)));
+        let parsed = ErrorBody::parse(&body).expect("an error body");
+        assert_eq!(parsed.code, code);
+        assert!(!parsed.message.is_empty(), "{code}");
+        // No internal address leaks into a message.
+        assert!(!parsed.message.contains("node:4437"), "{code}");
     }
 }

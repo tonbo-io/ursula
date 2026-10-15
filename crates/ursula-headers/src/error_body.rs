@@ -1,15 +1,17 @@
 //! The one body of every error answer (extensions Section 11): a JSON
-//! object with one member, `error`, whose value is a stable [`ErrorCode`].
+//! object with two string members, `error`, a stable [`ErrorCode`], and
+//! `message`, a human-readable detail.
 //!
 //! ```text
-//! {"error":"SnapshotCommitsBusy"}
+//! {"error":"InvalidHeader","message":"stream-ttl must not contain leading zeros"}
 //! ```
 //!
 //! The body adds the code to what the status and the typed headers say: a
 //! `413` names its limit in a header and its code here, a `503` keeps its
 //! `Retry-After`. The server and the gateway render every error body with
 //! [`ErrorBody::render`], so a client matches the code instead of parsing
-//! text. A code is ASCII letters and digits, so the body needs no escaping.
+//! text. The message is informative only: its text may change in any
+//! release, and a client never matches it.
 
 use crate::error::HeaderError;
 
@@ -223,65 +225,187 @@ impl std::fmt::Display for ErrorCode {
 }
 
 /// The body of an error answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ErrorBody {
+    /// What refused the request: the member a client matches.
     pub code: ErrorCode,
+    /// Why, for a person reading it. Never matched.
+    pub message: String,
 }
 
 impl ErrorBody {
     /// The `Content-Type` of every error body.
     pub const CONTENT_TYPE: &'static str = "application/json";
 
-    pub const fn new(code: ErrorCode) -> Self {
-        Self { code }
-    }
-
-    /// The body: `{"error":"<code>"}`.
-    pub fn render(self) -> String {
-        format!(r#"{{"error":"{}"}}"#, self.code.as_str())
-    }
-
-    /// Parses an error body: one JSON object whose only member is `error`,
-    /// a string naming a known code. JSON whitespace may surround each
-    /// token. `Err` for any other body, such as the plain text of a proxy
-    /// in front of Ursula, or a code this version does not know.
-    pub fn parse(body: &[u8]) -> Result<Self, HeaderError> {
-        let mut rest = body;
-        for expected in [b"{".as_slice(), b"\"error\"", b":", b"\""] {
-            rest = skip_whitespace(rest)
-                .strip_prefix(expected)
-                .ok_or(HeaderError::InvalidErrorBody)?;
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
         }
-        let end = rest
+    }
+
+    /// The body: `{"error":"<code>","message":"<message>"}`, with the
+    /// message escaped as a JSON string.
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(self.message.len().saturating_add(48));
+        out.push_str(r#"{"error":""#);
+        out.push_str(self.code.as_str());
+        out.push_str(r#"","message":""#);
+        for c in self.message.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if u32::from(c) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", u32::from(c)));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push_str(r#""}"#);
+        out
+    }
+
+    /// Parses an error body: one JSON object whose members are `error`, a
+    /// string naming a known code, and `message`, any string, in either
+    /// order, each exactly once and nothing else. JSON whitespace may
+    /// surround each token. `Err` for any other body, such as the plain
+    /// text of a proxy in front of Ursula, or a code this version does not
+    /// know.
+    pub fn parse(body: &[u8]) -> Result<Self, HeaderError> {
+        let mut cursor = Cursor(body);
+        cursor.expect(b'{')?;
+        let mut error = None;
+        let mut message = None;
+        loop {
+            let key = cursor.string()?;
+            cursor.expect(b':')?;
+            let value = cursor.string()?;
+            let slot = match key.as_str() {
+                "error" => &mut error,
+                "message" => &mut message,
+                _ => return Err(HeaderError::InvalidErrorBody),
+            };
+            if slot.replace(value).is_some() {
+                return Err(HeaderError::InvalidErrorBody);
+            }
+            match cursor.next()? {
+                b',' => continue,
+                b'}' => break,
+                _ => return Err(HeaderError::InvalidErrorBody),
+            }
+        }
+        if !cursor.rest().is_empty() {
+            return Err(HeaderError::InvalidErrorBody);
+        }
+        let (Some(error), Some(message)) = (error, message) else {
+            return Err(HeaderError::InvalidErrorBody);
+        };
+        let code = ErrorCode::from_name(&error).ok_or(HeaderError::UnknownErrorCode)?;
+        Ok(Self { code, message })
+    }
+}
+
+/// The unread rest of an error body.
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    /// The rest, without its leading JSON whitespace.
+    fn rest(&mut self) -> &'a [u8] {
+        let start = self
+            .0
             .iter()
-            .position(|byte| *byte == b'"')
+            .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+            .unwrap_or(self.0.len());
+        self.0 = self.0.get(start..).unwrap_or_default();
+        self.0
+    }
+
+    /// The next byte after whitespace.
+    fn next(&mut self) -> Result<u8, HeaderError> {
+        let (&byte, rest) = self
+            .rest()
+            .split_first()
             .ok_or(HeaderError::InvalidErrorBody)?;
-        let (name, rest) = rest.split_at(end);
-        let rest = skip_whitespace(rest.get(1..).unwrap_or_default());
-        if skip_whitespace(
-            rest.strip_prefix(b"}")
-                .ok_or(HeaderError::InvalidErrorBody)?,
-        )
-        .is_empty()
-        {
-            let name =
-                std::str::from_utf8(name).map_err(|_not_utf8| HeaderError::InvalidErrorBody)?;
-            ErrorCode::from_name(name)
-                .map(Self::new)
-                .ok_or(HeaderError::UnknownErrorCode)
+        self.0 = rest;
+        Ok(byte)
+    }
+
+    fn expect(&mut self, byte: u8) -> Result<(), HeaderError> {
+        if self.next()? == byte {
+            Ok(())
         } else {
             Err(HeaderError::InvalidErrorBody)
         }
     }
-}
 
-/// `bytes` without its leading JSON whitespace.
-fn skip_whitespace(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-        .unwrap_or(bytes.len());
-    bytes.get(start..).unwrap_or_default()
+    /// A JSON string after whitespace, decoded.
+    fn string(&mut self) -> Result<String, HeaderError> {
+        self.expect(b'"')?;
+        let mut out = Vec::new();
+        loop {
+            let (&byte, rest) = self.0.split_first().ok_or(HeaderError::InvalidErrorBody)?;
+            self.0 = rest;
+            match byte {
+                b'"' => break,
+                b'\\' => {
+                    let (&escape, rest) =
+                        self.0.split_first().ok_or(HeaderError::InvalidErrorBody)?;
+                    self.0 = rest;
+                    let c = match escape {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => self.escaped_char()?,
+                        _ => return Err(HeaderError::InvalidErrorBody),
+                    };
+                    let mut buf = [0; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                0..=0x1f => return Err(HeaderError::InvalidErrorBody),
+                byte => out.push(byte),
+            }
+        }
+        String::from_utf8(out).map_err(|_not_utf8| HeaderError::InvalidErrorBody)
+    }
+
+    /// The character of a `\uXXXX` escape, whose `\u` was read, with the
+    /// low half of a surrogate pair when it is the high half.
+    fn escaped_char(&mut self) -> Result<char, HeaderError> {
+        let high = self.hex4()?;
+        if !(0xd800..=0xdbff).contains(&high) {
+            return char::from_u32(u32::from(high)).ok_or(HeaderError::InvalidErrorBody);
+        }
+        self.0 = self
+            .0
+            .strip_prefix(b"\\u")
+            .ok_or(HeaderError::InvalidErrorBody)?;
+        let low = self.hex4()?;
+        char::decode_utf16([high, low])
+            .next()
+            .and_then(Result::ok)
+            .ok_or(HeaderError::InvalidErrorBody)
+    }
+
+    fn hex4(&mut self) -> Result<u16, HeaderError> {
+        let digits = self.0.get(..4).ok_or(HeaderError::InvalidErrorBody)?;
+        let text =
+            std::str::from_utf8(digits).map_err(|_not_utf8| HeaderError::InvalidErrorBody)?;
+        if !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(HeaderError::InvalidErrorBody);
+        }
+        let value =
+            u16::from_str_radix(text, 16).map_err(|_not_hex| HeaderError::InvalidErrorBody)?;
+        self.0 = self.0.get(4..).unwrap_or_default();
+        Ok(value)
+    }
 }
 
 #[cfg(test)]
@@ -293,9 +417,27 @@ mod tests {
     #[test]
     fn every_code_round_trips() {
         for &code in ErrorCode::ALL {
-            let body = ErrorBody::new(code).render();
-            assert_eq!(body, format!(r#"{{"error":"{code}"}}"#));
-            assert_eq!(ErrorBody::parse(body.as_bytes()), Ok(ErrorBody::new(code)));
+            let body = ErrorBody::new(code, "why").render();
+            assert_eq!(body, format!(r#"{{"error":"{code}","message":"why"}}"#));
+            assert_eq!(
+                ErrorBody::parse(body.as_bytes()),
+                Ok(ErrorBody::new(code, "why"))
+            );
+        }
+    }
+
+    #[test]
+    fn messages_are_escaped_and_round_trip() {
+        for message in [
+            "",
+            "a \"quoted\" \\ path",
+            "line\nbreak\ttab\r\u{1}",
+            "ünïcødé 🦀",
+        ] {
+            let body = ErrorBody::new(ErrorCode::InvalidHeader, message);
+            let rendered = body.render();
+            assert!(!rendered.bytes().any(|byte| byte < 0x20), "{rendered}");
+            assert_eq!(ErrorBody::parse(rendered.as_bytes()), Ok(body));
         }
     }
 
@@ -312,14 +454,14 @@ mod tests {
     }
 
     #[test]
-    fn the_existing_503_bodies_parse() {
+    fn any_json_layout_of_the_two_members_parses() {
         assert_eq!(
-            ErrorBody::parse(br#"{"error":"SnapshotCommitsBusy"}"#),
-            Ok(ErrorBody::new(ErrorCode::SnapshotCommitsBusy))
+            ErrorBody::parse(br#"{"message":"m","error":"SnapshotCommitsBusy"}"#),
+            Ok(ErrorBody::new(ErrorCode::SnapshotCommitsBusy, "m"))
         );
         assert_eq!(
-            ErrorBody::parse(b" {\n  \"error\" : \"NoLeader\"\n}\n"),
-            Ok(ErrorBody::new(ErrorCode::NoLeader))
+            ErrorBody::parse(b" {\n  \"error\" : \"NoLeader\" ,\n \"message\":\"a\\u00e9\\ud83e\\udd80\\/\"\n}\n"),
+            Ok(ErrorBody::new(ErrorCode::NoLeader, "aé🦀/"))
         );
     }
 
@@ -329,11 +471,17 @@ mod tests {
             b"".as_slice(),
             b"request body is too large",
             b"{}",
-            br#"{"error":"NoLeader""#,
-            br#"{"error":"NoLeader","message":"x"}"#,
-            br#"{"error":NoLeader}"#,
-            br#"{"code":"NoLeader"}"#,
-            br#"{"error":"NoLeader"} trailing"#,
+            br#"{"error":"NoLeader"}"#,
+            br#"{"message":"m"}"#,
+            br#"{"error":"NoLeader","message":"m""#,
+            br#"{"error":"NoLeader","message":"m","extra":"x"}"#,
+            br#"{"error":"NoLeader","error":"NoLeader","message":"m"}"#,
+            br#"{"error":NoLeader,"message":"m"}"#,
+            br#"{"error":"NoLeader","message":1}"#,
+            br#"{"error":"NoLeader","message":"m"} trailing"#,
+            br#"{"error":"NoLeader","message":"\x"}"#,
+            br#"{"error":"NoLeader","message":"\ud800"}"#,
+            b"{\"error\":\"NoLeader\",\"message\":\"a\nb\"}",
         ] {
             assert_eq!(
                 ErrorBody::parse(body),
@@ -343,7 +491,7 @@ mod tests {
             );
         }
         assert_eq!(
-            ErrorBody::parse(br#"{"error":"NoSuchCode"}"#),
+            ErrorBody::parse(br#"{"error":"NoSuchCode","message":"m"}"#),
             Err(HeaderError::UnknownErrorCode)
         );
     }
