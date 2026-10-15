@@ -10,8 +10,6 @@ use std::time::Instant;
 
 use crate::client::RESENT_UP_TO;
 use crate::client::answers;
-use crate::client::before_connection;
-use crate::client::body_text;
 use crate::client::get_snapshot;
 use crate::client::head;
 use crate::client::header_offset;
@@ -28,6 +26,8 @@ use crate::log;
 use crate::log::Level;
 use crate::snapshot;
 use crate::stats::SnapshotStat;
+use crate::transport::http::before_connection;
+use crate::transport::http::body_text;
 
 /// Wakes an attached database's snapshot thread.
 #[derive(Default)]

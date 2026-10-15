@@ -182,6 +182,27 @@ pub(crate) fn first_claim_epoch() -> Option<u64> {
     })
 }
 
+/// `URSULA_VFS_MIN_UPLOAD_KBPS`: the slowest upload, in KiB/s, an attempt's body time limit allows
+/// for (256 by default, at least 1): a body of `n` bytes may take `5 s + n / rate` to send (design
+/// §4.12, #566).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
+pub(crate) fn min_upload_kbps() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("URSULA_VFS_MIN_UPLOAD_KBPS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256)
+            .max(1)
+    })
+}
+
 /// `URSULA_VFS_CA_FILE`: a PEM bundle of the certificate authorities trusted for `https://` stream
 /// URLs, instead of the bundled Mozilla roots.
 pub(crate) fn ca_file() -> Option<&'static str> {
