@@ -144,9 +144,8 @@ proptest! {
         }
     }
 
-    // A damaged bit anywhere in a record breaks the chain there: the prefix before it is the log.
-    // When a chain-valid record follows, it is damage inside the log, not a torn tail. The record
-    // after the damaged one verifies unless the damage hit the chain it is seeded by.
+    // A damaged bit anywhere in a record breaks the chain there: the prefix before it is the log,
+    // and the rest is a torn tail whatever follows.
     #[test]
     fn a_chain_break_keeps_the_prefix_before_it(
         h in header(),
@@ -161,13 +160,7 @@ proptest! {
         bytes[bit / 8] ^= 1 << (bit % 8);
         let s = scan(&bytes).unwrap();
         prop_assert_eq!(&s.records[..], &records[..i]);
-        let in_chain = bit / 8 >= records[i].end - 4;
-        let followed = i + 2 < records.len() || (i + 1 < records.len() && !in_chain);
-        if followed {
-            prop_assert_eq!(s.tail, Tail::Damaged { at: start });
-        } else {
-            prop_assert_eq!(s.tail, Tail::Torn { at: start });
-        }
+        prop_assert_eq!(s.tail, Tail::Torn { at: start });
     }
 
     // A record whose chain verifies but whose position skips is a gap, never a torn tail.

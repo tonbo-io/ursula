@@ -1,54 +1,19 @@
-//! The local WAL file's format: frame layout, the recovery scan SQLite would do, folding it
-//! into the db file, and the sidecar's claim on it ([`WalClaim`]).
+//! The local WAL file's recovery scan SQLite would do, folding it into the db file, and the
+//! sidecar's claim on it ([`WalClaim`]). The layout is `capture`'s.
 
 use std::collections::BTreeMap;
 use std::fs::{self};
 use std::os::unix::fs::FileExt;
 
+use crate::capture::FIRST_PAGE_AT;
+use crate::capture::FRAME_HDR_LEN;
+use crate::capture::FRAME_LEN;
+use crate::capture::WAL_HDR_LEN;
+use crate::capture::be32;
+use crate::capture::db_len;
+use crate::capture::page_offset;
 use crate::error::Error;
 use crate::frame::PAGE;
-
-/// The WAL header's size, a frame header's, and a frame's (header and page), as file offsets.
-pub(crate) const WAL_HDR: i64 = WAL_HDR_LEN as i64;
-pub(crate) const FRAME_HDR: i64 = FRAME_HDR_LEN as i64;
-pub(crate) const FRAME: i64 = FRAME_LEN as i64;
-
-/// Where frame 0's page starts in the WAL file, and a page's size as a file offset.
-pub(crate) const FIRST_PAGE: i64 = WAL_HDR + FRAME_HDR;
-pub(crate) const PAGE_BYTES: i64 = PAGE as i64;
-
-/// Whether `off` is where a frame's page starts in the WAL file.
-pub(crate) fn page_at(off: i64) -> bool {
-    off >= FIRST_PAGE && off.saturating_sub(FIRST_PAGE).checked_rem(FRAME) == Some(0)
-}
-
-/// The same sizes, as buffer lengths.
-const WAL_HDR_LEN: usize = 32;
-pub(crate) const FRAME_HDR_LEN: usize = 24;
-pub(crate) const FRAME_LEN: usize = FRAME_HDR_LEN + PAGE;
-const FIRST_PAGE_AT: u64 = (WAL_HDR_LEN + FRAME_HDR_LEN) as u64;
-
-/// The db file offset of page `pgno` (1-based).
-pub(crate) fn page_offset(pgno: u32) -> u64 {
-    db_len(pgno.saturating_sub(1))
-}
-
-/// The whole pages in a db file of `len` bytes.
-pub(crate) fn pages_in(len: u64) -> u32 {
-    const PAGE_LEN: u64 = PAGE as u64;
-    u32::try_from(len / PAGE_LEN).unwrap_or(u32::MAX)
-}
-
-/// The length of a db file of `pages` pages.
-pub(crate) fn db_len(pages: u32) -> u64 {
-    u64::from(pages).saturating_mul(PAGE as u64)
-}
-
-/// The big-endian u32 at `at` in `b`.
-pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
-    let w = b.get(at..)?.first_chunk::<4>()?;
-    Some(u32::from_be_bytes(*w))
-}
 
 /// What a sidecar needs of the local WAL, so attach can check it against the files instead of
 /// inferring it: the WAL's generation (the salts of its header, which SQLite changes at every

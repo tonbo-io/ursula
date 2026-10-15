@@ -26,6 +26,14 @@ use std::time::Instant;
 
 use libsqlite3_sys as ffi;
 
+use crate::capture::FRAME;
+use crate::capture::FRAME_HDR;
+use crate::capture::FRAME_HDR_LEN;
+use crate::capture::FRAME_LEN;
+use crate::capture::PAGE_BYTES;
+use crate::capture::WAL_HDR;
+use crate::capture::be32;
+use crate::capture::page_at;
 use crate::claim::reclaim;
 use crate::client::Append;
 use crate::client::append;
@@ -53,15 +61,7 @@ use crate::local::write_sidecar;
 use crate::log;
 use crate::log::Level;
 use crate::stats::CommitStat;
-use crate::wal::FRAME;
-use crate::wal::FRAME_HDR;
-use crate::wal::FRAME_HDR_LEN;
-use crate::wal::FRAME_LEN;
-use crate::wal::PAGE_BYTES;
-use crate::wal::WAL_HDR;
 use crate::wal::WalClaim;
-use crate::wal::be32;
-use crate::wal::page_at;
 
 /// `WAL_WRITE_LOCK` and `WAL_CKPT_LOCK`: the shm lock slots SQLite takes for a write transaction and
 /// a checkpoint.
@@ -1378,6 +1378,8 @@ mod tests {
     use super::failed_open;
     use super::lost_page;
     use super::unencodable;
+    use crate::capture::FIRST_PAGE;
+    use crate::capture::FRAME;
     use crate::client::mock::LAST;
     use crate::client::mock::VOUCH;
     use crate::client::mock::answer;
@@ -1396,8 +1398,6 @@ mod tests {
     use crate::error::WriteRefusal;
     use crate::frame::FrameError;
     use crate::frame::PAGE;
-    use crate::wal::FIRST_PAGE;
-    use crate::wal::FRAME;
 
     /// The server's answer under pressure: refused at ingress, marked as applying nothing, through
     /// a gateway that vouches for the marker.

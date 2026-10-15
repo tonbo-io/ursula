@@ -1,0 +1,35 @@
+# Transcribed from proto-phasetwo/runs/v24.14.0/spill.log (SQLite 3.51.2).
+# One line per call on a main db handle, or per WAL write of its connection:
+# <trace line> <connection> <event>. See README.md.
+3 c1 other
+19 c1 phasetwo
+20 c1 other
+25 c1 lock-write
+26 c1 other
+37 c1 unlock-write
+38 c1 other
+39 c1 lock-write
+40 c1 other
+44 c1 wal-write
+51 c1 commit
+53 c1 unlock-write
+54 c1 phasetwo
+55 c1 other
+61 c1 lock-write
+62 c1 wal-write
+420 c1 commit
+421 c1 wal-write
+537 c1 unlock-write
+538 c1 phasetwo
+539 c1 other
+544 c1 lock-write
+545 c1 wal-write
+916 c1 unlock-write
+917 c1 other
+920 c1 lock-write
+921 c1 wal-write
+924 c1 commit
+926 c1 unlock-write
+927 c1 phasetwo
+928 c1 other
+1063 c1 close

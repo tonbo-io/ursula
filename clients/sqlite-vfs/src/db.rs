@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use libsqlite3_sys as ffi;
 
+use crate::capture::db_len;
 use crate::config::fail_post_ack;
 use crate::config::snapshot_min_bytes;
 use crate::error::Action;
@@ -28,7 +29,6 @@ use crate::log::Level;
 use crate::snapshotter::Snapper;
 use crate::snapshotter::SnapshotFailing;
 use crate::stats::Stats;
-use crate::wal::db_len;
 
 /// How `ursula_attach` binds a file to its stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

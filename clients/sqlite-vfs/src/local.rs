@@ -321,9 +321,9 @@ mod tests {
     use super::read_sidecar;
     use super::sidecar_line;
     use super::stamp;
+    use crate::capture::be32;
     use crate::frame::PAGE;
     use crate::wal::WalClaim;
-    use crate::wal::be32;
     use crate::wal::fold_wal;
 
     // Attach trusts local files only when the sidecar was written in this boot, from this stream

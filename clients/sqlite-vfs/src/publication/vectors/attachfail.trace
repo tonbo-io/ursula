@@ -1,0 +1,37 @@
+# Transcribed from proto-phasetwo/runs/v24.14.0/attachfail.log (SQLite 3.51.2).
+# One line per call on a main db handle, or per WAL write of its connection:
+# <trace line> <connection> <event>. See README.md.
+3 c1 other
+19 c1 phasetwo
+20 c1 other
+25 c1 lock-write
+26 c1 other
+37 c1 unlock-write
+38 c1 other
+39 c1 lock-write
+40 c1 other
+44 c1 wal-write
+51 c1 commit
+53 c1 unlock-write
+54 c1 phasetwo
+55 c1 other
+57 c2 other
+73 c2 phasetwo
+74 c2 other
+77 c1 other
+80 c1 lock-write
+81 c2 other
+90 c1 wal-write
+93 c1 commit
+101 c2 other
+106 c1 unlock-write
+107 c1 other
+108 c2 other
+117 c1 other
+121 c2 other
+124 c3 other
+135 c3 close
+137 c1 other
+151 c1 close
+152 c2 other
+153 c2 close
