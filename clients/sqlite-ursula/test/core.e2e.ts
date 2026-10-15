@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
-import { Child, fromStream, frames, freshDir, killChildren, type Opened, stream, ursulaUrl } from "./kit.ts";
+import { Child, directUrl, fromStream, frames, freshDir, killChildren, type Opened, stream } from "./kit.ts";
 
 const SQLITE_IOERR_READ = 266;
 const SQLITE_IOERR_WRITE = 778;
@@ -51,7 +51,7 @@ afterEach(killChildren);
 
 /** The stream's latest snapshot offset and retained offset, from a HEAD. */
 async function retention(path: string): Promise<{ snapshot: number | null; retained: number }> {
-	const r = await fetch(`${ursulaUrl()}${path}`, { method: "HEAD" });
+	const r = await fetch(`${directUrl()}${path}`, { method: "HEAD" });
 	const snapshot = r.headers.get("stream-snapshot-offset");
 	return { snapshot: snapshot === null ? null : Number(snapshot), retained: Number(r.headers.get("stream-retained-offset") ?? "0") };
 }

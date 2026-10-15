@@ -8,6 +8,12 @@ import { expect, inject } from "vitest";
 /** The base URL of the server the suite runs against (test/stack.ts). */
 export const ursulaUrl = (): string => inject("ursulaUrl");
 
+/**
+ * The server with no gate in front, for the reads and writes a test makes itself: they never take
+ * a fault scripted for the database's requests.
+ */
+export const directUrl = (): string => inject("ursulaDirect");
+
 /** Whether the suite runs against the model server (E2E_SERVER=model). */
 export const onModel = (): boolean => inject("ursulaServer") === "model";
 
@@ -34,10 +40,10 @@ export const freshDir = (): string => mkdtempSync(join(tmpdir(), "sqlite-ursula-
  * its start to its tail.
  */
 async function streamBytes(path: string): Promise<Uint8Array> {
-	if (onModel()) return new Uint8Array(await (await fetch(`${ursulaUrl()}/__model/frames?path=${path}`)).arrayBuffer());
+	if (onModel()) return new Uint8Array(await (await fetch(`${directUrl()}/__model/frames?path=${path}`)).arrayBuffer());
 	const chunks: Uint8Array[] = [];
 	for (let offset = "-1"; ; ) {
-		const r = await fetch(`${ursulaUrl()}${path}?offset=${offset}`);
+		const r = await fetch(`${directUrl()}${path}?offset=${offset}`);
 		expect(r.status, `read ${path} from ${offset}`).toBe(200);
 		const chunk = new Uint8Array(await r.arrayBuffer());
 		chunks.push(chunk);
@@ -82,8 +88,8 @@ export async function fault(line: string, times = 1, method?: string): Promise<v
 /** An append to the stream at `path` by another writer: `body` with no producer headers. */
 export async function foreignAppend(path: string, body: string): Promise<void> {
 	const r = onModel()
-		? await fetch(`${ursulaUrl()}/__model/foreign?path=${path}`, { method: "POST", body })
-		: await fetch(`${ursulaUrl()}${path}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body });
+		? await fetch(`${directUrl()}/__model/foreign?path=${path}`, { method: "POST", body })
+		: await fetch(`${directUrl()}${path}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body });
 	expect(r.ok, `${r.status} ${await r.text()}`).toBe(true);
 }
 

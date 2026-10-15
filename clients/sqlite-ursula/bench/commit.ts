@@ -114,17 +114,16 @@ const plain = new DatabaseSync(join(plainDir, "b1.db"));
 plain.exec("PRAGMA journal_mode=WAL");
 const b1 = new Arm("B1", plain);
 
-const benchUrl = process.env.BENCH_URL;
-const model = benchUrl === undefined || benchUrl.length === 0 ? await startModel() : undefined;
-let base = model?.url;
-if (base === undefined) {
-	// Ursula: the stream lives in a bucket, which must exist.
-	base = `${(benchUrl as string).replace(/\/+$/, "")}/sqlite-bench`;
-	const r = await fetch(base, { method: "PUT" });
-	if (!r.ok && r.status !== 409) throw new Error(`create the bucket ${base}: ${r.status} ${await r.text()}`);
+const benchUrl = (process.env.BENCH_URL ?? "").replace(/\/+$/, "");
+const model = benchUrl === "" ? await startModel() : undefined;
+/** The stream's bucket: Ursula's must exist (and its ids are 4 to 64 bytes). */
+const bucket = model === undefined ? `${benchUrl}/sqlite-bench` : `${model.url}/bench`;
+if (model === undefined) {
+	const r = await fetch(bucket, { method: "PUT" });
+	if (!r.ok && r.status !== 409) throw new Error(`create the bucket ${bucket}: ${r.status} ${await r.text()}`);
 }
 const control = loadUrsulaVfs(ext);
-const vfsDb = await open(`${base}/commit-${process.pid}`, { dir: mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-vfs-")) });
+const vfsDb = await open(`${bucket}/commit-${process.pid}`, { dir: mkdtempSync(join(tmpdir(), "sqlite-ursula-bench-vfs-")) });
 const vfs = new Arm("VFS", vfsDb);
 const stats = (): { commits: { log_us: number; vfs_us: number; bytes: number; pages: number }[] } =>
 	JSON.parse(Object.values(control.prepare("SELECT ursula_stats(?)").get(vfsDb.boundPath) as Record<string, string>)[0] as string);

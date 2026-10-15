@@ -8,10 +8,12 @@
 //   - Default: one `ursula server` node with its Raft WAL in its temporary directory and an
 //     in-memory cold store (URSULA_COLD=none for none).
 //   - E2E_NODES=3: three nodes (each with its own Raft WAL directory, `server.cluster_id` set)
-//     behind an `ursula gateway`. With no S3 configured there is no cold tier (the nodes cannot
-//     share an in-memory one). With S3 configured (see `resolveS3`: an endpoint (MinIO) with static
-//     keys, or AWS S3 with the ambient AWS_* credentials), snapshot bodies go to the cold tier. A
-//     control server (`ursulaControl`) kills and restarts nodes for test/failover.e2e.ts.
+//     behind an `ursula gateway`, with S3 as the cold store (see `resolveS3`: an endpoint (MinIO)
+//     with static keys, or AWS S3 with the ambient AWS_* credentials), or with no cold tier when
+//     URSULA_COLD=none (the nodes cannot share an in-memory one). A control server
+//     (`ursulaControl`) kills and restarts nodes for test/failover.e2e.ts.
+// Every server runs under test/watchdog.mjs, and the gate and the model exit with their stdin, so
+// none outlives the vitest process.
 import { type ChildProcess, spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
@@ -43,13 +45,25 @@ function ursulaBin(): string {
 	return resolve(bin);
 }
 
-/** A spawned process with a bounded log tail. */
+/**
+ * A server process with a bounded log tail. It runs under test/watchdog.mjs, which kills it once
+ * this process's end of the watchdog's stdin closes: a vitest process that dies before its
+ * teardown leaves no server behind.
+ */
 class Proc {
 	private readonly child: ChildProcess;
 	private tail = "";
+	private serverPid = 0;
 	/** With E2E_LOG_DIR set, the full output also goes to `${E2E_LOG_DIR}/${name}.log`. */
 	constructor(bin: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv = {}, name?: string) {
-		this.child = spawn(bin, [...args], { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
+		this.child = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, "watchdog.mjs"), bin, ...args], {
+			cwd,
+			stdio: ["pipe", "pipe", "pipe", "pipe"],
+			env: { ...process.env, ...env },
+		});
+		(this.child.stdio[3] as NodeJS.ReadableStream | null)?.on("data", (chunk: Buffer) => {
+			this.serverPid = Number.parseInt(chunk.toString(), 10);
+		});
 		const logDir = process.env.E2E_LOG_DIR;
 		const logFile = logDir !== undefined && logDir.length > 0 && name !== undefined ? join(logDir, `${name}.log`) : undefined;
 		if (logFile !== undefined) mkdirSync(logDir as string, { recursive: true });
@@ -60,8 +74,9 @@ class Proc {
 		this.child.stdout?.on("data", keep);
 		this.child.stderr?.on("data", keep);
 	}
+	/** The server's process id (for RSS sampling), once it started. */
 	get pid(): number {
-		return this.child.pid ?? 0;
+		return this.serverPid;
 	}
 	get exited(): boolean {
 		return this.child.exitCode !== null || this.child.signalCode !== null;
@@ -69,24 +84,37 @@ class Proc {
 	logs(): string {
 		return this.tail;
 	}
-	/** Kills it with SIGKILL, as a crash would. */
+	private signal(signal: NodeJS.Signals): void {
+		try {
+			if (this.serverPid > 0) process.kill(this.serverPid, signal);
+		} catch {
+			// It exited meanwhile.
+		}
+	}
+	/** Kills the server with SIGKILL, as a crash would. */
 	async kill(): Promise<void> {
 		if (!this.exited) {
 			const exited = new Promise((r) => this.child.once("exit", r));
-			this.child.kill("SIGKILL");
+			this.signal("SIGKILL");
 			await exited;
 		}
+		this.release();
 	}
 	async stop(): Promise<void> {
 		if (!this.exited) {
 			const exited = new Promise((r) => this.child.once("exit", r));
 			this.child.kill("SIGTERM");
-			const timer = setTimeout(() => this.child.kill("SIGKILL"), 5000);
+			const timer = setTimeout(() => this.signal("SIGKILL"), 5000);
 			await exited;
 			clearTimeout(timer);
 		}
+		this.release();
+	}
+	private release(): void {
+		this.child.stdin?.destroy();
 		this.child.stdout?.destroy();
 		this.child.stderr?.destroy();
+		this.child.stdio[3]?.destroy();
 	}
 }
 
@@ -220,7 +248,7 @@ async function startSingle(): Promise<Stack> {
 			...(cold === "none" ? [] : ["[storage.cold]", `backend = "${cold}"`, ""]),
 		].join("\n"),
 	);
-	const node = new Proc(ursulaBin(), ["server", "--config", config], dir);
+	const node = new Proc(ursulaBin(), ["server", "--config", config], dir, {}, "node1");
 	const url = `http://127.0.0.1:${port}`;
 	const stop = async (): Promise<void> => {
 		await node.stop();
@@ -275,7 +303,7 @@ interface S3Target {
  *    that existing bucket under URSULA_S3_PREFIX; otherwise a new bucket per stack, root `ursula`.
  * 2. Otherwise URSULA_S3_BUCKET set (AWS): the existing bucket under URSULA_S3_PREFIX, no endpoint
  *    and no keys in the TOML (the nodes inherit AWS_*, and SSE-S3 applies, as in production).
- * 3. Otherwise there is no S3: the cluster runs without a cold tier.
+ * 3. Otherwise there is no S3 (`undefined`).
  * A shared bucket gets a per-stack root `<prefix>/sqlite-<pid>-<ts36>-<8 hex>`.
  */
 async function resolveS3(): Promise<S3Target | undefined> {
@@ -326,7 +354,13 @@ interface ClusterNode {
 }
 
 async function startCluster(): Promise<Stack> {
-	const s3 = await resolveS3();
+	// S3, unless the run opts out of a cold tier with URSULA_COLD=none: the soak never runs without
+	// one by accident.
+	const noCold = process.env.URSULA_COLD === "none";
+	const s3 = noCold ? undefined : await resolveS3();
+	if (!noCold && s3 === undefined) {
+		throw new Error("E2E_NODES=3 needs S3 (URSULA_S3_ENDPOINT for MinIO, URSULA_S3_BUCKET for AWS), or URSULA_COLD=none for no cold tier");
+	}
 	const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-cluster-"));
 	// Defaults are the e2e shape; the soak (test/soak.e2e.ts) raises them with E2E_GROUPS and
 	// E2E_CORES.

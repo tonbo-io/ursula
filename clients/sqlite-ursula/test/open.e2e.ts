@@ -170,7 +170,7 @@ describe("open()", () => {
 		};
 		const k = new Kysely<{ t: { x: number } }>({ dialect: new SqliteDialect({ database }) });
 		await k.schema.createTable("t").addColumn("x", "integer").execute();
-		// With a 1-byte bound, the next commit waits for this one's acknowledgement.
+		// With a 1-byte bound, a commit while this one is unacknowledged is refused (backlog_full).
 		await db.synced();
 		await k.insertInto("t").values([{ x: 1 }, { x: 2 }]).execute();
 		await db.synced();

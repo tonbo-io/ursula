@@ -18,7 +18,7 @@ import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { afterAll, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, type UrsulaStatus } from "../src/index.ts";
 import { openUrsulaPiStorage } from "../src/pi.ts";
-import { ext, freshDir, stream, ursulaUrl } from "./kit.ts";
+import { directUrl, ext, freshDir, stream } from "./kit.ts";
 
 // Read once, when the extension first needs it: before it loads.
 process.env.URSULA_VFS_SNAPSHOT_DUE_BYTES ??= "4096";
@@ -160,7 +160,7 @@ describe("a fresh cache", () => {
 		// The snapshot that came due: HEAD names it once it is published.
 		let snapshot: number | undefined;
 		for (const deadline = Date.now() + 20_000; snapshot === undefined && Date.now() < deadline; ) {
-			const head = (await fetch(`${ursulaUrl()}${name}`, { method: "HEAD" })).headers.get("stream-snapshot-offset");
+			const head = (await fetch(`${directUrl()}${name}`, { method: "HEAD" })).headers.get("stream-snapshot-offset");
 			if (head !== null) snapshot = Number(head);
 			else await new Promise((r) => setTimeout(r, 50));
 		}

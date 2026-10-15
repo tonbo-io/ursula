@@ -125,7 +125,13 @@ const control = createServer((req, res) => {
 			res.writeHead(204).end();
 			return;
 		}
-		const { mode } = JSON.parse(body);
+		let mode;
+		try {
+			({ mode } = JSON.parse(body));
+		} catch {
+			res.writeHead(400).end(`not a JSON body: ${body}`);
+			return;
+		}
 		if (req.method !== "PUT" || req.url !== "/mode" || !["forward", "blackhole", "refuse"].includes(mode)) {
 			res.writeHead(400).end();
 			return;
