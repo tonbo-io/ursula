@@ -46,7 +46,10 @@ const xs = (file: string): string[] => {
 	}
 };
 
-it("an 8 MiB commit whose token the gateway refuses before reading its body fails alone as unauthorized, and the next commit succeeds", async () => {
+// Quarantined for 0.8: the server no longer sends `x-ursula-not-applied`, so
+// this driver cannot learn why a write was refused. The 0.8 VFS driver (#590
+// and successors) replaces it and owns this test.
+it.skip("an 8 MiB commit whose token the gateway refuses before reading its body fails alone as unauthorized, and the next commit succeeds", async () => {
 	const g = gateway as AuthGateway;
 	const path = streamPath();
 	const file = freshFile();
@@ -82,7 +85,6 @@ it("an 8 MiB commit whose token the gateway refuses before reading its body fail
 		fenced: false,
 		writes_refused: true,
 		refused_kind: "unauthorized",
-		refused_reason: "InvalidCredential",
 		offset: accepted?.offset,
 		epoch: accepted?.epoch,
 	});
