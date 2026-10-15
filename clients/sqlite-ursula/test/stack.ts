@@ -1,5 +1,9 @@
-// Vitest global setup: the Ursula the suite runs against, from URSULA_BIN, in the default config
-// except where noted. The per-group hot admission limit always stays at its default.
+// Vitest global setup: the server the suite runs against.
+// - E2E_SERVER=model: the model of the 0.8 server (`ursula-vfs-model`, clients/sqlite-vfs with the
+//   `model` feature), from URSULA_VFS_MODEL or the crate's release build. The SQLite VFS suites run
+//   against it until the server speaks #581.
+// - Otherwise the Ursula from URSULA_BIN, in the default config except where noted. The per-group
+//   hot admission limit always stays at its default.
 // - Default: one `ursula server` node with its Raft WAL in its temporary directory and an
 //   in-memory cold store (URSULA_COLD=none for none).
 // - E2E_NODES=3: three nodes (each with its own Raft WAL directory) behind an `ursula gateway`,
@@ -128,6 +132,30 @@ interface Stack {
 	readonly url: string;
 	readonly nodes: readonly StackNode[];
 	stop(): Promise<void>;
+}
+
+/** The model server: it prints `{"port": n}` once it accepts connections. */
+async function startModel(): Promise<Stack> {
+	const bin = resolve(process.env.URSULA_VFS_MODEL ?? join(import.meta.dirname, "../../sqlite-vfs/target/release/ursula-vfs-model"));
+	const child = spawn(bin, [], { stdio: ["ignore", "pipe", "inherit"] });
+	const port = await new Promise<number>((res, rej) => {
+		let out = "";
+		child.once("error", rej);
+		child.once("exit", (code) => rej(new Error(`${bin} exited (${code}) before it printed its port`)));
+		child.stdout?.on("data", (chunk: Buffer) => {
+			out += chunk.toString();
+			const line = out.split("\n").find((l) => l.startsWith("{"));
+			if (line !== undefined) res((JSON.parse(line) as { port: number }).port);
+		});
+	});
+	const stop = async (): Promise<void> => {
+		if (child.exitCode === null && child.signalCode === null) {
+			const exited = new Promise((r) => child.once("exit", r));
+			child.kill("SIGTERM");
+			await exited;
+		}
+	};
+	return { url: `http://127.0.0.1:${port}`, nodes: [], stop };
 }
 
 async function startSingle(): Promise<Stack> {
@@ -319,11 +347,15 @@ declare module "vitest" {
 	export interface ProvidedContext {
 		ursulaUrl: string;
 		ursulaNodes: StackNode[];
+		/** `model` for the model server, `ursula` otherwise. */
+		ursulaServer: "model" | "ursula";
 	}
 }
 
 export default async function setup(project: TestProject): Promise<() => Promise<void>> {
-	const stack = process.env.E2E_NODES === "3" ? await startCluster() : await startSingle();
+	const model = process.env.E2E_SERVER === "model";
+	const stack = model ? await startModel() : process.env.E2E_NODES === "3" ? await startCluster() : await startSingle();
+	project.provide("ursulaServer", model ? "model" : "ursula");
 	project.provide("ursulaUrl", stack.url);
 	project.provide("ursulaNodes", [...stack.nodes]);
 	return () => stack.stop();

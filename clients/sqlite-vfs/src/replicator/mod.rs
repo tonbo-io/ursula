@@ -563,7 +563,13 @@ pub(crate) enum Replicator {
         probe: Option<Probe>,
         ctx: Box<Ctx>,
     },
-    Reset(ResetKind),
+    Reset(
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "the driver takes the kind from Action::Reset")
+        )]
+        ResetKind,
+    ),
     Refused(Refusal),
     Stopped,
 }

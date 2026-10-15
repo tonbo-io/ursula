@@ -1,10 +1,10 @@
 name: Integration
 
 # Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
-# target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against a
-# release `ursula` built once per run, on a single node and on 3 nodes + gateway + S3. S3 is real
-# AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork PRs and
-# release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
+# target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against the
+# model of the 0.8 server (`ursula-vfs-model`), which it runs against until the server speaks #581.
+# S3 is real AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork
+# PRs and release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
 on:
   pull_request:
@@ -105,33 +105,6 @@ jobs:
           case "$URSULA_S3_PREFIX" in ci/*/*) ;; *) echo "::error::refusing to delete '$URSULA_S3_PREFIX'"; exit 1 ;; esac
           aws s3 rm "s3://$URSULA_S3_BUCKET/$URSULA_S3_PREFIX/" --recursive --only-show-errors
 
-  build-ursula:
-    name: Build release ursula
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
-    steps:
-      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
-      - name: Use the RunsOn cache
-        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
-
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          rustflags: ""
-
-      - name: Build ursula
-        run: cargo build --release -p ursula --bin ursula
-
-      - name: Upload ursula
-        uses: actions/upload-artifact@v6
-        with:
-          name: ursula-release
-          path: target/release/ursula
-          if-no-files-found: error
-          retention-days: 1
-
   sqlite-vfs:
     name: sqlite-vfs (extension lint + units + build)
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
@@ -177,16 +150,18 @@ jobs:
           cargo build --locked --release --features model --bin ursula-vfs-model
           ldd target/release/libsqlite_ursula_vfs.so
 
-      - name: Upload the extension
+      - name: Upload the extension and the model server
         uses: actions/upload-artifact@v6
         with:
           name: sqlite-ursula-vfs
-          path: clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so
+          path: |
+            clients/sqlite-vfs/target/release/libsqlite_ursula_vfs.so
+            clients/sqlite-vfs/target/release/ursula-vfs-model
           if-no-files-found: error
           retention-days: 1
 
-  # The extension's macOS-only code (the kernel boot id from `kern.bootsessionuuid`) compiles and its
-  # unit test runs only here, and so does the macOS side of the reset tests (`EINVAL`, #542).
+  # The extension's macOS side (`F_GETPATH`, the descriptor scan, `/dev/fd`) compiles and its unit
+  # tests run only here.
   sqlite-vfs-macos:
     name: sqlite-vfs on macOS (extension lint + units)
     runs-on: macos-15
@@ -210,10 +185,16 @@ jobs:
           cargo test --locked --release
 
   sqlite-vfs-e2e:
-    name: sqlite-vfs e2e (single-node ursula)
-    needs: [build-ursula, sqlite-vfs]
+    name: sqlite-vfs e2e (model server, Node ${{ matrix.node }})
+    needs: [sqlite-vfs]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.19.0 is the oldest Node the package supports, whose SQLite (3.50.4) is the extension's
+        # floor: the PHASETWO scenarios run there and on the latest 22.
+        node: ["22.19.0", "22"]
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
       - name: Use the RunsOn cache
@@ -225,188 +206,20 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
 
-      - name: Download ursula
-        uses: actions/download-artifact@v7
-        with:
-          name: ursula-release
-          path: ${{ runner.temp }}/ursula-bin
-
-      - name: Download the extension
+      - name: Download the extension and the model server
         uses: actions/download-artifact@v7
         with:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      # Same-minor compatibility (docs/architecture/sqlite-vfs.md §7): the latest published patch of
-      # this minor up to package.json's version (the same version included: between releases main
-      # carries the released one) and this build must take over each other's streams
-      # (test/compat.e2e.ts). Only when the minor has no published patch yet does the test run this
-      # build against itself. A registry failure fails the step.
-      - name: Previous patch of this minor
-        shell: bash
+      - name: e2e (the core through its SQL functions)
+        timeout-minutes: 20
         run: |
-          # npm's answer, retried: stdout of the last attempt only.
-          npm_retry() {
-            local out
-            for attempt in 1 2 3; do
-              if out=$("$@"); then
-                printf '%s' "$out"
-                return 0
-              fi
-              echo "::warning::$* failed (attempt $attempt of 3)" >&2
-              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
-            done
-            return 1
-          }
-          current=$(node -p "require('./clients/sqlite-ursula/package.json').version")
-          series=$(node -p "process.argv[1].split('.').slice(0, 2).join('.')" "$current")
-          versions=$(npm_retry npm view @tonbo/sqlite-ursula versions --json)
-          previous=$(printf '%s' "$versions" | node -e '
-            const version = /^(\d+)\.(\d+)\.(\d+)/.exec(process.argv[1]);
-            if (version === null) throw new Error(`package.json version ${process.argv[1]} is not major.minor.patch`);
-            const [major, minor, patch] = version.slice(1).map(Number);
-            const listed = [JSON.parse(require("fs").readFileSync(0, "utf8"))].flat();
-            if (listed.length === 0 || !listed.every((v) => typeof v === "string")) {
-              throw new Error(`npm view did not answer a version list: ${JSON.stringify(listed)}`);
-            }
-            const candidates = listed
-              .filter((v) => /^\d+\.\d+\.\d+$/.test(v))
-              .map((v) => v.split(".").map(Number))
-              .filter(([a, b, c]) => a === major && b === minor && c <= patch)
-              .sort((x, y) => x[2] - y[2]);
-            console.log(candidates.length === 0 ? "" : candidates.at(-1).join("."));
-          ' "$current")
-          if [ -z "$previous" ]; then
-            echo "::notice::No $series.x patch up to $current of @tonbo/sqlite-ursula is published: the compatibility e2e runs this build against itself."
-            echo "SQLITE_URSULA_VFS_PREVIOUS=$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" >> "$GITHUB_ENV"
-          else
-            mkdir -p "$RUNNER_TEMP/previous"
-            cd "$RUNNER_TEMP/previous"
-            packed=$(npm_retry npm pack "@tonbo/sqlite-ursula-linux-x64-gnu@$previous" --json)
-            file=$(printf '%s' "$packed" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename')
-            tar xzf "$file"
-            echo "Compatibility e2e: $previous against this build ($current)"
-            echo "SQLITE_URSULA_VFS_PREVIOUS=$RUNNER_TEMP/previous/package/libsqlite_ursula_vfs.so" >> "$GITHUB_ENV"
-          fi
-
-      - name: e2e (transparency, crash matrix, fencing, recovery, local cache, snapshots, Pi conformance, benchmark, same-minor compatibility)
-        timeout-minutes: 30
-        run: |
-          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
+          chmod +x "$RUNNER_TEMP/vfs/ursula-vfs-model"
           cd clients/sqlite-ursula
           npm ci
           npm run typecheck
           npm run build
-          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e
-
-      # Without a cold tier the default per-group hot limit trips after ~68 MB of frames: the
-      # snapshot run writes ~160 MB, so only snapshots + retention keep it admitted.
-      - name: snapshots + retention without a cold tier (default hot limit)
-        timeout-minutes: 10
-        run: |
-          cd clients/sqlite-ursula
-          URSULA_COLD=none URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/snapshot.e2e.ts
-
-      # package.json declares the @earendil-works/pi-durable versions the `/pi` entry supports as an
-      # optional peer dependency, ">=oldest <first-unsupported", and the steps above test the
-      # version in the lockfile (a devDependency). This one
-      # installs the oldest without saving it, then runs the typecheck, Pi's storage conformance
-      # (three modes), and the fencing, 402 and refusal suites: their Pi cases reach
-      # openUrsulaPiStorage's mapping of the errors the node driver throws for a failed commit, which
-      # conformance never triggers.
-      - name: Pi conformance, fencing, 402 and refusals on the oldest supported pi-durable
-        timeout-minutes: 10
-        run: |
-          cd clients/sqlite-ursula
-          range=$(node -p 'require("./package.json").peerDependencies["@earendil-works/pi-durable"]')
-          oldest=$(node -e '
-            const bounds = /^>=(\d+\.\d+\.\d+) <\d+\.\d+\.\d+$/.exec(process.argv[1]);
-            if (bounds === null) throw new Error("pi-durable range is not >=oldest <first-unsupported: " + process.argv[1]);
-            console.log(bounds[1]);
-          ' "$range")
-          # pi-durable, pi-ai and chord are released together: test the oldest version of all three,
-          # the set an application on that release has, not the oldest pi-durable with newer siblings.
-          pkgs=(@earendil-works/pi-durable @earendil-works/pi-ai @earendil-works/chord)
-          npm install --no-save "${pkgs[@]/%/@$oldest}"
-          for pkg in "${pkgs[@]}"; do
-            # By path: pi-ai's exports map does not expose its package.json.
-            installed=$(node -p "require(\"./node_modules/$pkg/package.json\").version")
-            echo "Pi suites on $pkg $installed, the oldest of $range"
-            [ "$installed" = "$oldest" ]
-          done
-          npm run typecheck
-          URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npx vitest --run test/conformance.e2e.ts test/fencing.e2e.ts test/payment.e2e.ts test/refused.e2e.ts
-
-  sqlite-vfs-e2e-cluster:
-    name: sqlite-vfs e2e (3 nodes + gateway + S3)
-    needs: [build-ursula, sqlite-vfs]
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
-    timeout-minutes: 40
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      # Keeps the job's OIDC request variables out of npm and test processes: a speed bump against
-      # env-scraping code, not a boundary.
-      NO_OIDC: env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
-    steps:
-      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
-      - name: Use the RunsOn cache
-        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
-
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-
-      - name: Download ursula
-        uses: actions/download-artifact@v7
-        with:
-          name: ursula-release
-          path: ${{ runner.temp }}/ursula-bin
-
-      - name: Download the extension
-        uses: actions/download-artifact@v7
-        with:
-          name: sqlite-ursula-vfs
-          path: ${{ runner.temp }}/vfs
-
-      # Before any AWS credential exists. The tree's install scripts are not needed.
-      - name: Install dependencies
-        run: |
-          chmod +x "$RUNNER_TEMP/ursula-bin/ursula"
-          cd clients/sqlite-ursula
-          $NO_OIDC npm ci --ignore-scripts
-
-      # AWS S3 through the CI role (one prefix per job) on same-repo PRs and main, MinIO otherwise.
-      - name: S3 backend
-        id: s3
-        uses: ./.github/actions/ci-s3
-        with:
-          role-arn: ${{ secrets.URSULA_CI_AWS_ROLE_ARN }}
-          bucket: ${{ secrets.URSULA_CI_S3_BUCKET }}
-          region: ${{ vars.URSULA_CI_S3_REGION || 'us-east-1' }}
-          job-key: ${{ github.job }}
-
-      # Snapshot bodies above 1 MiB go to the cold tier (S3); cold-snapshot.e2e.ts publishes one above
-      # the 8 MiB part size (a multipart upload). The benchmark's Pi turns snapshot and trim as they go
-      # (a 64 KiB minimum, so the threshold is the database size).
-      - name: Pi conformance (3 modes), snapshots + retention, multipart snapshot, benchmark, leader redirects through the gateway
-        timeout-minutes: 30
-        run: |
-          cd clients/sqlite-ursula
-          E2E_NODES=3 URSULA_VFS_SNAPSHOT_MIN_BYTES=65536 URSULA_BIN="$RUNNER_TEMP/ursula-bin/ursula" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" $NO_OIDC npx vitest --run test/conformance.e2e.ts test/snapshot.e2e.ts test/cold-snapshot.e2e.ts test/bench.e2e.ts test/redirects.e2e.ts
-
-      - name: Delete this job's S3 prefix
-        if: always() && env.URSULA_S3_PREFIX != ''
-        continue-on-error: true
-        timeout-minutes: 10
-        env: { AWS_EC2_METADATA_DISABLED: "true" }
-        run: |
-          case "$URSULA_S3_PREFIX" in ci/*/*) ;; *) echo "::error::refusing to delete '$URSULA_S3_PREFIX'"; exit 1 ;; esac
-          aws s3 rm "s3://$URSULA_S3_BUCKET/$URSULA_S3_PREFIX/" --recursive --only-show-errors
+          E2E_SERVER=model URSULA_VFS_MODEL="$RUNNER_TEMP/vfs/ursula-vfs-model" SQLITE_URSULA_VFS="$RUNNER_TEMP/vfs/libsqlite_ursula_vfs.so" npm run test:e2e

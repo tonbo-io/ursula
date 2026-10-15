@@ -1,799 +1,467 @@
-//! Attached databases: their replication state ([`Db`]) and the process-wide registry.
+//! Bound databases ([`Binding`]) and the process-wide registry: what `ursula_open` bound, keyed
+//! by the db file's path (the VFS's key) and by the canonical stream name (`ursula_open`'s).
+//!
+//! A binding is shared by every connection of its database in the process. Its [`Commit`] state,
+//! under one mutex, is the commit path's: the write transaction's capture, the main db handles
+//! whose logged commits are undecided, the last logged, confirmed and based positions, the
+//! WAL-write bookkeeping and the measurements. The reset lives in the driver's
+//! [`BindingHandle`], read without the mutex. After its last connection closes the binding drains
+//! and retires, unless an open takes it back first ([`BindingHandle::revive`]).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ffi::c_int;
-use std::fmt::Display;
-use std::fs::{self};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::PoisonError;
+use std::time::Duration;
 use std::time::Instant;
 
-use libsqlite3_sys as ffi;
-
-use crate::capture::db_len;
-use crate::config::fail_post_ack;
-use crate::config::snapshot_min_bytes;
-use crate::error::Action;
+use crate::capture::WriteTxn;
+use crate::descriptors::open_in_process;
+use crate::driver::BindingHandle;
+use crate::driver::BindingId;
+use crate::driver::Bound;
+use crate::driver::OpenId;
+use crate::driver::runtime::driver;
 use crate::error::Error;
-use crate::error::ErrorKind;
 use crate::error::WriteRefusal;
-use crate::host::OK;
+use crate::generation::canonical_path;
+use crate::host::full_pathname;
+use crate::host::init_wal_format;
+use crate::ids::Activation;
+use crate::ids::Position;
 use crate::log;
 use crate::log::Level;
-use crate::snapshotter::Snapper;
-use crate::snapshotter::SnapshotFailing;
+use crate::open::OpenSpec;
+use crate::options::OpenOptions;
+use crate::replicator::ResetKind;
 use crate::stats::Stats;
 
-/// How `ursula_attach` binds a file to its stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// Claims the stream, which fences every earlier owner, and replicates every commit.
-    Owner,
-    /// Claims nothing and never writes the stream (no claim, commit, snapshot or retention move),
-    /// so it fences no owner and a layer that refuses writes does not stop it: the file holds the
-    /// stream as of the attach, and every write fails with SQLITE_READONLY (`x_write`).
-    ReadOnly,
-}
+/// How long a driver-side open may take when `ursula_open` returns at once (`timeout_ms` 0).
+const DEFAULT_OPEN_MS: u64 = 30_000;
 
-/// The mode argument of `ursula_attach`: `'owner'` (the default, also for an absent or NULL
-/// argument) or `'read_only'`.
-impl TryFrom<&str> for Mode {
-    type Error = Error;
-
-    fn try_from(mode: &str) -> Result<Mode, Error> {
-        match mode {
-            "" | "owner" => Ok(Mode::Owner),
-            "read_only" => Ok(Mode::ReadOnly),
-            other => Err(Error::AttachMode {
-                mode: other.to_owned(),
-            }),
-        }
-    }
-}
-
-pub(crate) struct Db {
-    pub(crate) url: String,
-    pub(crate) mode: Mode,
-    /// The stream's incarnation at attach (`Head::incarnation`): a re-claim or a snapshot checks
-    /// the stream is still it.
-    pub(crate) incarnation: String,
-    /// `producer_id(incarnation)`.
-    pub(crate) producer: String,
-    pub(crate) sidecar: String,
-    /// What the sidecar records besides offset, epoch, format, log count and the WAL claim (see
-    /// `stamp`).
-    pub(crate) stamp: String,
+/// A database `ursula_open` bound.
+#[derive(Debug)]
+pub(crate) struct Binding {
+    pub(crate) id: BindingId,
+    pub(crate) handle: Arc<BindingHandle>,
+    /// The db file, as SQLite names it.
     pub(crate) path: String,
-    /// The owner's epoch; for a read-only attachment, the highest one claimed up to `offset`.
-    pub(crate) epoch: u64,
-    /// Producer sequence of the last acknowledged append (the claim is 0).
-    pub(crate) seq: u64,
-    /// Stream offset after the last acknowledged frame.
-    pub(crate) offset: String,
-    /// Frame bytes since the latest snapshot, counted locally (see `snapshot_due`).
-    pub(crate) log: u64,
-    /// Why the database is poisoned (re-attach to recover), see `set_poisoned`.
-    pub(crate) poisoned: Option<Poisoned>,
-    /// Set once a fence poisons the database (`Poisoned::fenced`), and never cleared: read without
-    /// the mutex by every read transaction's start (`vfs::x_shm_lock`), which must not wait for a
-    /// commit holding the mutex across its append. The registry hands it to each main db handle
-    /// (`Registry::fences`).
-    pub(crate) fence: Arc<AtomicBool>,
-    /// Why the latest write was refused before it reached the stream, which applied nothing of it:
-    /// by a layer in front of the stream (`writes_refused`), or by the extension itself, which
-    /// never sent it (`refuse_unsent`). `ursula_status` reports it (`writes_refused`,
-    /// `refused_kind`, `refused_reason`). Cleared by the next acknowledged commit. Never set while
-    /// `poisoned`: a poisoned database needs a re-attach whatever the refusing layer does
-    /// (`set_poisoned`).
-    pub(crate) refused: Option<WriteRefusal>,
-    /// The latest refusal that a layer in front of the stream answered and that refuses other
-    /// writes too (`WriteRefusal::refuses_other_writes`), cleared with `refused`: what that layer
-    /// does now. A write the extension refused itself, or a 413 for one frame alone, leaves it.
-    /// `payment_required` follows it, and so does whether a snapshot may be taken
-    /// (`snapshot_wanted`).
-    pub(crate) layer_refused: Option<WriteRefusal>,
-    /// The epoch and producer sequence of the latest commit refused before it reached the stream
-    /// (`refuse`), until a commit is acknowledged. The next commit goes out with them, so a
-    /// duplicate's answer to it that none of its own attempts explains may be the refused
-    /// commit's receipt: it may have been applied after all (`append_commit`).
-    pub(crate) refused_at: Option<(u64, u64)>,
-    /// WAL writes of that transaction not yet on the local WAL, by offset (WAL writes never
-    /// partially overlap: the header at 0, frame headers at frame offsets, page data at frame
-    /// offset + 24).
-    pub(crate) overlay: BTreeMap<i64, Vec<u8>>,
+    pub(crate) url: String,
+    state: Mutex<Commit>,
     /// The crc32c of every WAL page this process wrote in the WAL's current generation, by file
-    /// offset. A page read back with other bytes was lost on its way to the disk (see
-    /// `overlay_read`).
-    pub(crate) wal_written: BTreeMap<i64, u32>,
-    /// The transaction's commit is acknowledged: later writes go straight to the local WAL, and
-    /// the sidecar advances once the transaction ends.
-    pub(crate) committed: bool,
-    /// WAL frame number (1-based) of the acknowledged commit frame: the transaction is published
-    /// locally once the wal-index header's mxFrame reaches it.
-    pub(crate) commit_frame_no: u32,
-    /// Open WAL handles, and the main db handle holding an EXCLUSIVE file lock (0: none):
-    /// together the closing connection's checkpoint, the one main-db write that takes no
-    /// checkpoint shm lock.
-    pub(crate) wal_open: usize,
-    pub(crate) exclusive: usize,
-    /// The main db handle holding the WAL write lock (0: none): the write transaction in progress
-    /// (between taking and releasing that lock); see `sync_db`.
+    /// offset: a page read back with other bytes was lost on its way to the disk. Under a lock of
+    /// its own, so WAL reads never wait behind the commit path's fsyncs. Taken after `state`.
+    pub(crate) wal_written: Mutex<BTreeMap<i64, u32>>,
+    /// Signalled whenever an undecided commit is decided, or the binding resets.
+    decided: Condvar,
+}
+
+/// The commit path's state of a binding.
+#[derive(Debug, Default)]
+pub(crate) struct Commit {
+    /// The write transaction's capture, from its first WAL write (admission) to the WAL write
+    /// lock's release.
+    pub(crate) txn: Option<WriteTxn>,
+    /// The main db handle holding the WAL write lock (0: none), by address.
     pub(crate) writer: usize,
-    pub(crate) acked: u64,
-    pub(crate) fault_fired: bool,
-    /// What `ursula_stats` drains, bounded whether or not anything drains it.
+    /// The main db handle holding an EXCLUSIVE file lock (0: none): a closing connection's
+    /// checkpoint, the one main-db write that takes no checkpoint lock.
+    pub(crate) exclusive: usize,
+    /// Open WAL handles.
+    pub(crate) wal_open: usize,
+    /// The checkpoint in progress (checkpoint lock held), and whether it wrote a db page yet.
+    pub(crate) checkpoint: Option<(Instant, bool)>,
+    /// Main db handles whose logged commit is undecided (design §4.2), by address.
+    pub(crate) undecided: BTreeMap<usize, Position>,
+    /// The last commit SQLite published (PHASETWO), and the last BASE record written.
+    pub(crate) confirmed: Position,
+    pub(crate) based: Position,
+    /// The latest write refused, until a commit is logged.
+    pub(crate) refused: Option<WriteRefusal>,
     pub(crate) stats: Stats,
-    pub(crate) checkpoint_started: Option<Instant>,
-    /// Database size in pages at `offset`.
-    pub(crate) pages: u32,
-    /// Offset of the latest snapshot known readable (published and read back by this owner, or
-    /// found at attach); `START` for none.
-    pub(crate) snapshot: String,
-    /// Retention this owner advanced the stream to (`START`: none).
-    pub(crate) retained: String,
-    pub(crate) snapper: Arc<Snapper>,
-    /// A snapshot is pinning the state at `offset`: no commit is acknowledged until it closes.
-    pub(crate) window: bool,
-    /// A due snapshot is waiting to open its window: the next commit waits at its commit point
-    /// (up to `WINDOW_WAIT`) until it has, so a writer committing back to back cannot starve it.
-    pub(crate) window_wanted: bool,
-    /// Stream offset of the local state attach started from (`START`: rebuilt from nothing), and of
-    /// the snapshot it installed (`START`: none).
-    pub(crate) attached_from: String,
-    pub(crate) installed: String,
-    /// How long the attach took.
-    pub(crate) attach_ms: u64,
-    /// Append attempts beyond the first, over every acknowledged commit.
-    pub(crate) append_retries: u64,
-    /// When this owner last saw a snapshot published (its own, or a newer one it found).
-    pub(crate) snapshot_published_at: Option<Instant>,
-    /// Snapshot attempts that failed in a row since one published a snapshot or found one at its
-    /// offset, and the wait before the next (`None` while none has).
-    pub(crate) snapshot_failing: Option<SnapshotFailing>,
-    /// The compressed size of the latest snapshot body built, published or not.
-    pub(crate) snapshot_bytes: Option<usize>,
-    /// The largest snapshot body this owner published, or installed at attach
-    /// (`attach::Applier::installed_bytes`), in bytes: the publish of a larger body that fails may
-    /// have failed for its size, which a probe of the stream decides
-    /// (`snapshotter::FailureKind::may_be_size`).
-    pub(crate) snapshot_published_bytes: usize,
 }
 
-/// Why an attached database is poisoned: the first reason, and what any reason so far showed.
-pub(crate) struct Poisoned {
-    /// The first reason, which a later one never replaces.
-    pub(crate) first: Error,
-    /// A reason so far was a fence ([`Error::is_fenced`]), the first or a later one: once set, it
-    /// stays.
-    pub(crate) fenced: bool,
-    /// A reason so far says the local files may hold other pages than this process wrote
-    /// ([`Error::is_local_damage`]): once set, it stays.
-    pub(crate) damaged: bool,
-}
-
-impl Poisoned {
-    /// The kind `ursula_status` reports for the poison: `fenced` once a fence was seen, whatever
-    /// the first reason was, and otherwise the first reason's (`Error::poison_kind`).
-    pub(crate) fn kind(&self) -> ErrorKind {
-        if self.fenced {
-            ErrorKind::Fenced
-        } else {
-            self.first.poison_kind()
-        }
-    }
-
-    /// What a caller does about the poison: the kind's action (a poison's kind always has one).
-    pub(crate) fn action(&self) -> Action {
-        self.kind().action().unwrap_or(Action::Reattach)
-    }
-}
-
-impl Db {
-    /// The log since the latest snapshot outgrew the database (and the configured minimum,
-    /// `snapshot_due_bytes`). The log is counted in frame bytes, not taken from offsets (opaque):
-    /// what attach replayed after the snapshot it started from (plus, from trusted local files, the
-    /// sidecar's count), and every frame acknowledged since; a snapshot taken subtracts what it
-    /// covers.
-    pub(crate) fn snapshot_due(&self) -> bool {
-        self.log > self.snapshot_due_bytes()
-    }
-
-    /// A snapshot is due and may be taken now: never while the database is poisoned, nor while
-    /// writes are refused before they reach the stream by a layer that refuses other writes too
-    /// (`layer_refused`): its publish would be refused too. The next acknowledged commit clears the
-    /// refusal and requests one if it is still due. A commit frame too large for one request,
-    /// never sent or refused with a 413 in front, holds no snapshot back: an owner that stops
-    /// committing after one still publishes, and retention still moves. Nor does it lift the hold
-    /// of a layer that refused before it.
-    pub(crate) fn snapshot_wanted(&self) -> bool {
-        self.snapshot_due() && self.poisoned.is_none() && self.layer_refused.is_none()
-    }
-
-    /// The log size past which a snapshot is due: the database's size, or the configured minimum
-    /// (`URSULA_VFS_SNAPSHOT_MIN_BYTES`) when larger.
-    pub(crate) fn snapshot_due_bytes(&self) -> u64 {
-        db_len(self.pages).max(snapshot_min_bytes())
-    }
-
-    pub(crate) fn overlay_end(&self) -> i64 {
-        self.overlay
-            .iter()
-            .next_back()
-            .map(|(&o, d)| o.saturating_add(i64::try_from(d.len()).unwrap_or(i64::MAX)))
-            .unwrap_or(0)
-    }
-
-    /// Another owner, a writer outside the protocol, or another incarnation of the stream holds
-    /// the stream: a fence was observed since the database was poisoned (`Poisoned::fenced`).
-    pub(crate) fn fenced(&self) -> bool {
-        self.poisoned.as_ref().is_some_and(|p| p.fenced)
-    }
-
-    /// The local files may hold other pages than this process wrote (`Poisoned::damaged`): nothing
-    /// read from them may reach the stream.
-    pub(crate) fn damaged(&self) -> bool {
-        self.poisoned.as_ref().is_some_and(|p| p.damaged)
-    }
-
-    /// Poisons the database (`set_poisoned`) and drops the write transaction's overlay: the write
-    /// that fails with the code returned rolls the transaction back.
-    pub(crate) fn poison(&mut self, why: Error) -> c_int {
-        self.set_poisoned(why, None);
-        self.overlay.clear();
-        self.committed = false;
-        ffi::SQLITE_IOERR_WRITE
-    }
-
-    /// Records why the database is poisoned (`during`: what failed, for the log). The first reason
-    /// stays: a later one follows from it (the rest of a fenced transaction's writes, a lost page
-    /// read again) or changes nothing (every commit is refused already). But a fence and a lost
-    /// write are kept whenever they come (`Poisoned`), so [`Db::fenced`] and [`Db::damaged`] never
-    /// flip back. Logged when it poisons the database, and when it fences a poisoned one. It drops
-    /// a refusal recorded before (`refused`): the database now needs a re-attach whatever the
-    /// refusing layer does, so `ursula_status` reports the poison alone.
-    pub(crate) fn set_poisoned(&mut self, why: Error, during: Option<&str>) {
-        let fenced = why.is_fenced();
-        let damaged = why.is_local_damage();
-        if self.poisoned.as_ref().is_none_or(|p| fenced && !p.fenced) {
-            let mut fields: Vec<(&str, &dyn Display)> = vec![
-                ("file", &self.path),
-                ("stream", &self.url),
-                ("fenced", &fenced),
-            ];
-            if let Some(during) = &during {
-                fields.push(("during", during));
-            }
-            fields.push(("reason", &why));
-            log::emit(Level::Warn, "poisoned", &fields);
-        }
-        match &mut self.poisoned {
-            Some(p) => {
-                p.fenced |= fenced;
-                p.damaged |= damaged;
-            }
-            None => {
-                self.poisoned = Some(Poisoned {
-                    first: why,
-                    fenced,
-                    damaged,
-                });
-            }
-        }
-        if fenced {
-            self.fence.store(true, Ordering::Release);
-        }
-        self.refused = None;
-        self.layer_refused = None;
-    }
-
-    /// The write transaction's commit was refused before it reached the stream, and so was every
-    /// attempt of it (`Append::Refused`): the write fails with SQLITE_IOERR_AUTH and SQLite rolls
-    /// the transaction back, as on a poison, but the database is not poisoned. Its epoch, producer
-    /// sequence and offset still describe the stream, so the next commit is sent as usual, with the
-    /// sequence the refused one left free (`refused_at`), and is acknowledged once the refusals
-    /// stop: no attach is needed.
-    pub(crate) fn refuse(&mut self, refusal: WriteRefusal) -> c_int {
-        self.writes_refused(refusal, "commit");
-        self.refused_at = Some((self.epoch, self.seq.saturating_add(1)));
-        self.commit_failed_alone()
-    }
-
-    /// The write transaction's commit was refused by the extension itself and never sent
-    /// (`Append::Unsent`: its frame is over the frame limit). It fails alone as a refused commit
-    /// does, but no exchange took place. So a layer's refusal recorded before it stays
-    /// (`layer_refused`), and so does the sequence check (`refused_at`), which it neither sets nor
-    /// clears: the stream cannot hold a frame that was never sent.
-    pub(crate) fn refuse_unsent(&mut self, refusal: WriteRefusal) -> c_int {
-        if self.poisoned.is_none() {
-            self.log_refusal(&refusal, "commit");
-            self.refused = Some(refusal);
-        }
-        self.commit_failed_alone()
-    }
-
-    /// Drops the write transaction's overlay: the write that fails with the code returned,
-    /// SQLITE_IOERR_AUTH, rolls the transaction back without poisoning the database.
-    fn commit_failed_alone(&mut self) -> c_int {
-        self.overlay.clear();
-        self.committed = false;
-        ffi::SQLITE_IOERR_AUTH
-    }
-
-    /// Records a write that a layer in front of the stream refused before it reached the stream
-    /// (`during`: which, for the log), as the latest refusal, and as the layer's when it refuses
-    /// other writes too. A 413 for one frame alone leaves the refusal before it, and the snapshots
-    /// that one holds back, as they were. A poisoned database records none (a snapshot publish
-    /// under way can be refused after the poison): see `set_poisoned`.
-    pub(crate) fn writes_refused(&mut self, refusal: WriteRefusal, during: &str) {
-        if self.poisoned.is_some() {
-            return;
-        }
-        self.log_refusal(&refusal, during);
-        if refusal.refuses_other_writes() {
-            self.layer_refused = Some(refusal.clone());
-        }
-        self.refused = Some(refusal);
-    }
-
-    /// Logs a refusal (`during`: of which write) when no refusal of its kind is recorded yet: a
-    /// 402 as `payment_required` with the layer's explanation (as since 0.7.1), any other as
-    /// `writes_refused` with its kind.
-    fn log_refusal(&self, refusal: &WriteRefusal, during: &str) {
-        if self
-            .refused
-            .as_ref()
-            .is_some_and(|last| last.kind() == refusal.kind())
-        {
-            return;
-        }
-        match refusal {
-            WriteRefusal::PaymentRequired { body } => {
-                log::emit(Level::Warn, "payment_required", &[
-                    ("file", &self.path),
-                    ("stream", &self.url),
-                    ("during", &during),
-                    ("reason", body),
-                ]);
-            }
-            other => log::emit(Level::Warn, "writes_refused", &[
-                ("file", &self.path),
-                ("stream", &self.url),
-                ("during", &during),
-                ("kind", &other.kind()),
-                ("reason", other),
-            ]),
-        }
-    }
-
-    /// A commit was acknowledged: whatever refused writes before accepts them again, and the
-    /// sequence a refused commit left free is taken.
-    pub(crate) fn writes_accepted(&mut self) {
-        self.refused_at = None;
-        self.layer_refused = None;
-        if self.refused.take().is_some() {
-            log::emit(Level::Info, "writes_resumed", &[
-                ("file", &self.path),
-                ("stream", &self.url),
-            ]);
-        }
-    }
-
-    /// A local operation of an acknowledged transaction (the rest of its WAL writes, -shm growth)
-    /// failed: SQLite rolls the transaction back locally, so the file no longer
-    /// reflects the stream offset; poison it (re-attach replays the commit from the stream).
-    pub(crate) fn post_ack(&mut self, what: &'static str, rc: c_int) -> c_int {
-        if rc != OK && self.committed {
-            self.poison(Error::PostAck { what, code: rc });
-        }
-        rc
-    }
-
-    /// Test hook `URSULA_VFS_FAIL_POST_ACK=<n>`: fail the local WAL write of the n-th acknowledged
-    /// commit.
-    pub(crate) fn fault(&mut self) -> bool {
-        if !self.fault_fired && fail_post_ack() == Some(self.acked) {
-            self.fault_fired = true;
-            return true;
-        }
-        false
-    }
-
+impl Commit {
     /// Whether a write to the main db file is a checkpoint: under the checkpoint lock, or the
     /// closing connection's checkpoint (EXCLUSIVE file lock with the WAL still open). Anything else
-    /// (a rollback journal mode, journal_mode=MEMORY/OFF) would bypass replication.
+    /// (a rollback journal mode, `journal_mode=MEMORY` or `OFF`) would bypass the log.
     pub(crate) fn db_write_allowed(&self) -> bool {
-        self.checkpoint_started.is_some() || (self.exclusive != 0 && self.wal_open > 0)
+        self.checkpoint.is_some() || (self.exclusive != 0 && self.wal_open > 0)
+    }
+}
+
+impl Binding {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Commit> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits on [`Binding::decided`] for at most `left`.
+    pub(crate) fn wait_decided<'a>(
+        &self,
+        state: MutexGuard<'a, Commit>,
+        left: Duration,
+    ) -> MutexGuard<'a, Commit> {
+        self.decided
+            .wait_timeout(state, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+    }
+
+    pub(crate) fn wal_written(&self) -> MutexGuard<'_, BTreeMap<i64, u32>> {
+        self.wal_written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn notify_decided(&self) {
+        self.decided.notify_all();
+    }
+
+    pub(crate) fn reset_kind(&self) -> Option<ResetKind> {
+        self.handle.reset()
+    }
+
+    /// The binding's connections found it damaged: it resets (the first reset stays), the driver
+    /// fails its `synced()` calls, and its statements fail from now on.
+    pub(crate) fn reset(&self, kind: ResetKind, why: &dyn std::fmt::Display) {
+        if self.handle.mark_reset(kind) {
+            log::emit(Level::Error, "reset", &[
+                ("file", &self.path),
+                ("stream", &self.url),
+                ("kind", &kind.kind()),
+                ("reason", why),
+            ]);
+            if driver().reset(self.id, kind).is_err() {
+                log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
+            }
+        }
+        self.notify_decided();
+    }
+
+    /// A main db handle opened: a retiring binding is taken back. False once it retired.
+    pub(crate) fn connect(&self) -> bool {
+        self.handle.connect()
+    }
+
+    /// A main db handle closed: after the last one, the binding drains and retires.
+    pub(crate) fn disconnect(&self) {
+        if self.handle.disconnect() && driver().retire(self.id).is_err() {
+            log::emit(Level::Error, "driver_gone", &[("file", &self.path)]);
+        }
     }
 }
 
 #[derive(Default)]
-pub(crate) struct Registry {
-    pub(crate) dbs: HashMap<String, Arc<Mutex<Db>>>,
-    /// The fence flag of each binding in `dbs` (`Db::fence`), bound and unbound with it, which
-    /// `x_open` hands to the main db handles it opens without taking the database's mutex.
-    pub(crate) fences: HashMap<String, Arc<AtomicBool>>,
-    /// Open main-db handles per path (attached or not): attach requires none.
-    pub(crate) open: HashMap<String, usize>,
-    /// Paths being attached: `x_open` refuses their main db meanwhile (an open would read under
-    /// attach's writes, and its close would drop the lock attach holds against other processes:
-    /// `lock_unused`). Each keeps its binding in `dbs` (if any) until the attach ends.
-    pub(crate) attaching: HashSet<String>,
-    /// Paths whose last attach failed, with the reason (`ursula_status`, and the refusal `x_open`
-    /// logs: see `refused`).
-    pub(crate) failed: HashMap<String, Arc<Error>>,
-    /// Host locks held for the process lifetime.
-    pub(crate) locks: HashMap<String, fs::File>,
-    /// Snapshot thread per attached database.
-    pub(crate) snappers: HashMap<String, SnapshotThread>,
+struct Registry {
+    /// By canonical stream name.
+    names: HashMap<String, Arc<Binding>>,
+    /// By db file path.
+    paths: HashMap<String, Arc<Binding>>,
+    /// Opens in progress, by canonical stream name, and the URL each was asked with.
+    opens: HashMap<String, (OpenId, String)>,
 }
 
-pub(crate) type SnapshotThread = (Arc<Snapper>, std::thread::JoinHandle<()>);
-
-pub(crate) fn registry() -> MutexGuard<'static, Registry> {
+fn registry() -> MutexGuard<'static, Registry> {
     static R: OnceLock<Mutex<Registry>> = OnceLock::new();
     R.get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
-pub(crate) fn lookup(path: &str) -> Option<Arc<Mutex<Db>>> {
-    registry().dbs.get(path).cloned()
+/// The binding of the db file `path` (as SQLite names it), for the VFS.
+pub(crate) fn lookup(path: &str) -> Option<Arc<Binding>> {
+    registry().paths.get(path).cloned()
 }
 
-/// The attachment of `path`, for `ursula_status` and `ursula_stats`.
-pub(crate) fn attached(path: &str) -> Result<Arc<Mutex<Db>>, Error> {
-    let reg = registry();
-    if let Some(db) = reg.dbs.get(path) {
-        return Ok(db.clone());
+/// The binding of `path` (any spelling of the db file's path), for the SQL functions.
+pub(crate) fn bound(path: &str) -> Result<Arc<Binding>, Error> {
+    let full = full_pathname(path)?;
+    lookup(&full).ok_or(Error::NotBound { path: full })
+}
+
+/// The binding of driver binding `id`, for events.
+pub(crate) fn by_id(id: BindingId) -> Option<Arc<Binding>> {
+    registry().paths.values().find(|b| b.id == id).cloned()
+}
+
+/// What `ursula_open` came to.
+#[derive(Debug)]
+pub(crate) enum Opened {
+    Bound(Arc<Binding>),
+    /// Still opening: the request id to wait on (another `ursula_open`) or cancel.
+    Pending(OpenId),
+}
+
+/// `ursula_open(url, dir, options_json, timeout_ms)`: the binding of the stream at `url`, bound
+/// now or already, or the open in progress after `timeout_ms`.
+pub(crate) fn open(
+    url: &str,
+    dir: Option<&str>,
+    options: &str,
+    timeout_ms: u64,
+) -> Result<Opened, Error> {
+    let name = canonical_path(url)
+        .map_err(|e| Error::Open(Arc::new(crate::open::OpenError::InvalidUrl(e))))?;
+    let options = OpenOptions::try_from(options)?;
+    if let Some(token) = &options.token {
+        crate::auth::set_token(Some(token));
     }
-    Err(Error::NotAttached {
-        path: path.to_owned(),
-        last_failure: reg.failed.get(path).cloned(),
+    let open = {
+        let mut reg = registry();
+        if let Some(b) = reg.names.get(name.as_str()).cloned() {
+            if b.reset_kind().is_none() && b.handle.revive() {
+                handed_out(&b);
+                return Ok(Opened::Bound(b));
+            }
+            // Reset, or retired: a new open (refused `in_use` while old handles hold its root).
+            reg.names.remove(name.as_str());
+            reg.paths.remove(&b.path);
+        }
+        match reg.opens.get(name.as_str()) {
+            Some((open, _)) => *open,
+            None => {
+                let spec = OpenSpec {
+                    url: url.to_owned(),
+                    dir: dir.map_or_else(default_dir, PathBuf::from),
+                    activation: options.activation.unwrap_or_else(process_activation),
+                    max_pending_bytes: options.max_pending_bytes,
+                    max_request_bytes: crate::config::max_request_bytes(),
+                    timeout_ms: if timeout_ms == 0 {
+                        DEFAULT_OPEN_MS
+                    } else {
+                        timeout_ms
+                    },
+                };
+                let open = driver().open(spec)?;
+                reg.opens
+                    .insert(name.as_str().to_owned(), (open, url.to_owned()));
+                open
+            }
+        }
+    };
+    take(open, timeout_ms)
+}
+
+/// How much longer than the open's own deadline `ursula_open` waits, so the driver's failure (the
+/// last condition) is what it reports.
+const DEADLINE_GRACE_MS: u64 = 1_000;
+
+/// The outcome of open `open`: with `timeout_ms` 0 if it resolved, without waiting; otherwise
+/// waiting for it (the open's own deadline is `timeout_ms`). Bound, it is registered.
+fn take(open: OpenId, timeout_ms: u64) -> Result<Opened, Error> {
+    let outcome = if timeout_ms == 0 {
+        driver().try_open(open)
+    } else {
+        driver().wait_open(
+            open,
+            Duration::from_millis(timeout_ms.saturating_add(DEADLINE_GRACE_MS)),
+        )
+    };
+    let Some(outcome) = outcome else {
+        if timeout_ms == 0 {
+            return Ok(Opened::Pending(open));
+        }
+        forget(open);
+        return Err(Error::Open(Arc::new(crate::open::OpenError::Cancelled)));
+    };
+    let url = forget(open).unwrap_or_default();
+    let bound = outcome.map_err(Error::Open)?;
+    register(bound, url).map(Opened::Bound)
+}
+
+/// A database the driver bound: its empty db file gets WAL format, and it joins the registry.
+fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
+    let Bound { binding, handle } = bound;
+    let refuse = |e: Error| {
+        handle.retiring();
+        if driver().retire(binding).is_err() {
+            log::emit(Level::Error, "driver_gone", &[("stream", &url)]);
+        }
+        e
+    };
+    let db = handle.generation.db();
+    let path = full_pathname(&db.to_string_lossy()).map_err(|e| refuse(e.into()))?;
+    if std::fs::metadata(&db).map_or(0, |m| m.len()) == 0 {
+        init_wal_format(&path).map_err(|e| refuse(e.into()))?;
+    }
+    if open_in_process(&path).is_some() {
+        return Err(refuse(Error::OpenOutside { path }));
+    }
+    let at_bind = match handle.log() {
+        Ok(log) => Position(log.next_position().0.saturating_sub(1)),
+        Err(_poisoned) => return Err(refuse(Error::Reset(ResetKind::Internal))),
+    };
+    let b = Arc::new(Binding {
+        id: binding,
+        handle: Arc::clone(&handle),
+        path: path.clone(),
+        url,
+        state: Mutex::new(Commit {
+            confirmed: at_bind,
+            based: at_bind,
+            ..Commit::default()
+        }),
+        wal_written: Mutex::new(BTreeMap::new()),
+        decided: Condvar::new(),
+    });
+    let mut reg = registry();
+    reg.names
+        .insert(handle.name.as_str().to_owned(), Arc::clone(&b));
+    reg.paths.insert(path, Arc::clone(&b));
+    drop(reg);
+    log::emit(Level::Info, "open", &[
+        ("file", &b.path),
+        ("stream", &b.url),
+    ]);
+    handed_out(&b);
+    Ok(b)
+}
+
+/// `ursula_open` hands `b` out: unless a connection opens it soon, it retires again.
+fn handed_out(b: &Binding) {
+    if driver().unconnected(b.id).is_err() {
+        log::emit(Level::Error, "driver_gone", &[("file", &b.path)]);
+    }
+}
+
+/// `ursula_cancel(request)`: gives up an open in progress. One that bound meanwhile and was not
+/// taken retires (the driver's cancel).
+pub(crate) fn cancel(open: OpenId) -> Result<(), Error> {
+    if forget(open).is_none() {
+        return Err(Error::NoRequest { request: open.0 });
+    }
+    Ok(driver().cancel(open)?)
+}
+
+/// Drops open `open` from the opens in progress: the URL it was asked with.
+fn forget(open: OpenId) -> Option<String> {
+    let mut reg = registry();
+    let name = reg
+        .opens
+        .iter()
+        .find(|(_, (o, _))| *o == open)
+        .map(|(name, _)| name.clone())?;
+    reg.opens.remove(&name).map(|(_, url)| url)
+}
+
+/// The default cache root (design §5.1): `<user cache>/sqlite-ursula/0.8`.
+fn default_dir() -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            if cfg!(target_os = "macos") {
+                home().map(|h| h.join("Library").join("Caches"))
+            } else {
+                home().map(|h| h.join(".cache"))
+            }
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    cache.join("sqlite-ursula").join("0.8")
+}
+
+/// This process's activation when the open names none: random, once per process.
+fn process_activation() -> Activation {
+    static A: OnceLock<Activation> = OnceLock::new();
+    *A.get_or_init(|| {
+        let bytes = crate::ids::random16().unwrap_or_else(|_unavailable| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            (nanos ^ u128::from(std::process::id())).to_le_bytes()
+        });
+        Activation(bytes)
     })
 }
 
-/// Why `x_open` refuses the main db `path` that has no binding. After a failed attach of it in
-/// this process, always: the application meant it to be replicated, and passed through to "unix"
-/// its commits would never reach the stream (and its files may hold anything between their old
-/// state and the stream's). An attach refused for the file as it stands records none
-/// (`attach::refuses_the_file`). Otherwise a sidecar next to it makes it the cache of a stream (in
-/// a process that never attached it), and a path without one passes through. No WAL open can
-/// follow a refusal: SQLite opens `<db>-wal` only through a connection whose main db it opened.
-pub(crate) fn refused(reg: &Registry, path: &str) -> Option<Refusal> {
-    if let Some(why) = reg.failed.get(path) {
-        return Some(Refusal::AttachFailed(why.clone()));
-    }
-    if !fs::exists(format!("{path}-ursula")).unwrap_or(true) {
-        return None;
-    }
-    Some(Refusal::NotAttached)
-}
-
-/// Why `x_open` refuses a main db (`refused`), for its log line.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Refusal {
-    #[error(
-        "its last attach failed ({}: {0}); it opens through the extension once an attach succeeds",
-        .0.kind().as_str()
-    )]
-    AttachFailed(Arc<Error>),
-    #[error("it is the cache of an Ursula stream (it has a sidecar); attach it first")]
-    NotAttached,
-}
-
-pub(crate) fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(|e| e.into_inner())
-}
-
+/// A binding of a fresh generation under `dir`, for tests of the file methods. It is in no
+/// registry, and the driver never heard of it: a reset only marks it.
 #[cfg(test)]
-impl Db {
-    /// An attachment of nothing: the state alone, for tests of its bookkeeping.
-    pub(crate) fn for_tests() -> Db {
-        Db {
-            url: "http://h/b/s".into(),
-            mode: Mode::Owner,
-            incarnation: "i1".into(),
-            producer: "sqlite-ursula-vfs/i1".into(),
-            sidecar: "/data/app.db-ursula".into(),
-            stamp: String::new(),
-            path: "/data/app.db".into(),
-            epoch: 2,
-            seq: 0,
-            offset: crate::client::START.into(),
-            log: 0,
-            poisoned: None,
-            fence: Arc::new(AtomicBool::new(false)),
-            refused: None,
-            layer_refused: None,
-            refused_at: None,
-            overlay: BTreeMap::new(),
-            wal_written: BTreeMap::new(),
-            committed: false,
-            commit_frame_no: 0,
-            wal_open: 0,
-            exclusive: 0,
-            writer: 0,
-            acked: 0,
-            fault_fired: false,
-            stats: Stats::default(),
-            checkpoint_started: None,
-            pages: 0,
-            snapshot: crate::client::START.into(),
-            retained: crate::client::START.into(),
-            snapper: Arc::new(Snapper::default()),
-            window: false,
-            window_wanted: false,
-            attached_from: crate::client::START.into(),
-            installed: crate::client::START.into(),
-            attach_ms: 0,
-            append_retries: 0,
-            snapshot_published_at: None,
-            snapshot_failing: None,
-            snapshot_bytes: None,
-            snapshot_published_bytes: 0,
-        }
-    }
+pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
+    use ursula_headers::Incarnation;
+    use ursula_headers::Offset;
+
+    use crate::codec::segment::SegmentHeader;
+    use crate::driver::Bind;
+    use crate::generation::Root;
+    use crate::ids::Lineage;
+    use crate::replog::Log;
+
+    let name = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir, &name).unwrap();
+    let generation = root
+        .build(SegmentHeader {
+            lineage: Lineage([7; 16]),
+            first_position: Position(1),
+            supersedes: None,
+            cluster_id: "cluster".into(),
+            stream_path: name.as_str().to_owned(),
+            incarnation: Incarnation::try_from(1 << 52).unwrap(),
+            base: Position(0),
+            acked: Position(0),
+            acked_offset: Offset::from_u64(0),
+            log_bytes: 0,
+            claim: None,
+        })
+        .unwrap()
+        .publish()
+        .unwrap();
+    let (log, _) = Log::open(&generation.log_dir()).unwrap();
+    let path = generation.db().to_string_lossy().into_owned();
+    let handle = Arc::new(BindingHandle::new(
+        Bind {
+            generation,
+            name,
+            cluster_id: "cluster".into(),
+            incarnation: (1u64 << 52).to_string(),
+            log,
+            pending_bytes: 0,
+            max_pending_bytes: 1 << 20,
+            max_frame_bytes: 1 << 20,
+            acked: Position(0),
+        },
+        Arc::new(root),
+    ));
+    Arc::new(Binding {
+        id: BindingId(u64::MAX),
+        handle,
+        path,
+        url: "https://h/v1/stream/db".into(),
+        state: Mutex::new(Commit::default()),
+        wal_written: Mutex::new(BTreeMap::new()),
+        decided: Condvar::new(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
-    use libsqlite3_sys as ffi;
+    use super::Commit;
+    use super::default_dir;
 
-    use super::Db;
-    use super::Mode;
-    use super::Refusal;
-    use super::Registry;
-    use super::refused;
-    use crate::error::Error;
-    use crate::error::Fence;
-    use crate::error::FrameLimit;
-    use crate::error::WriteRefusal;
-
-    // A commit refused before it reached the stream (a 402, or any refusal that applied nothing)
-    // fails its transaction alone: the overlay goes, as on a poison, but the database is not
-    // poisoned and keeps its epoch, sequence and offset, so the next commit goes out as usual. The
-    // latest refusal shows until a commit is acknowledged, or until a poison, which needs a
-    // re-attach whatever the refusing layer does.
+    // The cache root ends in `sqlite-ursula/0.8`, so 0.7's caches are never read.
     #[test]
-    fn a_refused_commit_fails_alone() {
-        let payment = |body: &str| WriteRefusal::PaymentRequired { body: body.into() };
-        let pressure = WriteRefusal::NotApplied {
-            status: 503,
-            reason: "RaftLogPressure".into(),
-        };
-        let mut d = Db::for_tests();
-        d.seq = 4;
-        d.offset = "00000000000000000009".into();
-        d.overlay.insert(0, vec![1u8; 32]);
-        d.committed = true;
-        assert_eq!(d.refuse(payment("quota exhausted")), ffi::SQLITE_IOERR_AUTH);
-        assert!(d.overlay.is_empty() && !d.committed);
-        assert!(d.poisoned.is_none() && !d.fenced());
-        assert_eq!(d.refused, Some(payment("quota exhausted")));
-        assert_eq!(
-            (d.epoch, d.seq, d.offset.as_str()),
-            (2, 4, "00000000000000000009")
-        );
-        // The next commit goes out at the epoch and sequence the refused one left free.
-        assert_eq!(d.refused_at, Some((2, 5)));
-        d.refuse(payment(""));
-        assert_eq!(d.refused, Some(payment("")));
-        d.writes_accepted();
-        assert!(d.refused.is_none() && d.refused_at.is_none());
-        // Any other refusal that applied nothing: the same, with its own reason.
-        d.overlay.insert(0, vec![1u8; 32]);
-        assert_eq!(d.refuse(pressure.clone()), ffi::SQLITE_IOERR_AUTH);
-        assert!(d.overlay.is_empty() && d.poisoned.is_none());
-        assert_eq!((d.seq, d.refused.as_ref()), (4, Some(&pressure)));
-        d.refuse(payment("quota exhausted"));
-        assert_eq!(d.refused, Some(payment("quota exhausted")));
-        // A fence after a refusal still poisons, and the poison clears the refusal.
-        d.poison(Error::Fenced(Fence::Superseded {
-            epoch: 2,
-            current: Some(3),
-        }));
-        assert!(d.fenced());
-        assert!(d.refused.is_none());
-        // A refusal after a poison (a snapshot publish under way) is not recorded.
-        d.writes_refused(payment("quota exhausted"), "snapshot publish");
-        d.writes_refused(pressure, "commit");
-        assert!(d.refused.is_none() && d.fenced());
+    fn the_default_dir_is_versioned() {
+        assert!(default_dir().ends_with(std::path::Path::new("sqlite-ursula").join("0.8")));
     }
 
-    // A due snapshot waits while writes are refused by a layer that refuses other writes too (its
-    // publish would be refused too), and while the database is poisoned. An acknowledged commit lets
-    // it go again. A commit frame too large to send holds it back for no reason, so it does not, nor
-    // does a 413 in front.
+    // A main-db write is a checkpoint's, or a closing connection's checkpoint, and nothing else.
     #[test]
-    fn no_snapshot_while_writes_are_refused() {
-        let mut d = Db::for_tests();
-        assert!(!d.snapshot_wanted(), "not due");
-        d.log = u64::MAX;
-        assert!(d.snapshot_due() && d.snapshot_wanted());
-        for refusal in [
-            WriteRefusal::NotApplied {
-                status: 503,
-                reason: "RaftLogPressure".into(),
-            },
-            WriteRefusal::Unauthorized {
-                body: String::new(),
-            },
-            WriteRefusal::Forbidden {
-                body: String::new(),
-            },
-            WriteRefusal::RateLimited {
-                body: String::new(),
-            },
-            WriteRefusal::PaymentRequired {
-                body: String::new(),
-            },
-        ] {
-            let kind = refusal.kind();
-            d.refuse(refusal);
-            assert!(!d.snapshot_wanted(), "{kind}");
-            d.writes_accepted();
-            assert!(d.snapshot_wanted(), "{kind}");
-        }
-        d.refuse_unsent(WriteRefusal::frame_over_limit(40 << 20, 32 << 20));
-        assert!(d.refused.is_some() && d.snapshot_wanted(), "too_large");
-        let in_front = WriteRefusal::TooLarge {
-            bytes: 40 << 20,
-            over: FrameLimit::InFront {
-                token: "RequestBodyTooLarge".into(),
-            },
-        };
-        d.refuse(in_front.clone());
-        assert!(d.layer_refused.is_none() && d.snapshot_wanted(), "413");
-        // A 413 for one frame leaves a refusal of other writes before it, which still holds the
-        // snapshot back.
-        d.refuse(WriteRefusal::NotApplied {
-            status: 503,
-            reason: "RaftLogPressure".into(),
-        });
-        d.refuse(in_front.clone());
-        assert_eq!(d.refused, Some(in_front));
-        assert!(!d.snapshot_wanted(), "503, then a 413");
-        d.poison(Error::ProducerExpiredAgain);
-        assert!(!d.snapshot_wanted());
-    }
-
-    // A transaction the extension refuses itself, never sent, leaves what a layer refused before
-    // it: the layer still refuses writes, so `payment_required` stays and snapshots still wait.
-    // The latest refusal, the one `ursula_status` reports, is the transaction's. It neither sets
-    // nor clears the sequence check a refused commit needs (`refused_at`): the stream cannot hold
-    // a frame that was never sent. An acknowledged commit clears both refusals.
-    #[test]
-    fn a_transaction_refused_unsent_leaves_what_the_layer_refused() {
-        let mut d = Db::for_tests();
-        d.log = u64::MAX;
-        let payment = WriteRefusal::PaymentRequired {
-            body: "quota exhausted".into(),
-        };
-        let too_large = WriteRefusal::frame_over_limit(40 << 20, 32 << 20);
-
-        d.refuse(payment.clone());
-        let at = d.refused_at;
-        assert!(at.is_some());
-        assert_eq!(d.refuse_unsent(too_large.clone()), ffi::SQLITE_IOERR_AUTH);
-        assert_eq!(d.refused, Some(too_large.clone()));
-        assert_eq!(d.layer_refused, Some(payment));
-        assert_eq!(d.refused_at, at);
-        assert!(!d.snapshot_wanted());
-        d.writes_accepted();
-        assert!(d.refused.is_none() && d.layer_refused.is_none() && d.refused_at.is_none());
-
-        // Alone, it records no layer refusal and no sequence check.
-        d.refuse_unsent(too_large.clone());
-        assert_eq!(d.refused, Some(too_large));
-        assert!(d.layer_refused.is_none() && d.refused_at.is_none());
-        assert!(d.snapshot_wanted());
-    }
-
-    // After a failed attach, `x_open` refuses the path whether or not a sidecar exists (the
-    // attach may have failed before writing one), naming the failure's kind; a path never
-    // attached opens unless it has a sidecar.
-    #[test]
-    fn a_failed_attach_refuses_opens_without_a_sidecar_too() {
-        let dir = std::env::temp_dir().join(format!("ursula-refused-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("app.db").to_string_lossy().into_owned();
-        let mut reg = Registry::default();
-        assert!(refused(&reg, &path).is_none());
-        reg.failed.insert(
-            path.clone(),
-            Arc::new(Error::Status {
-                op: "head",
-                url: "http://h/s2/kv1".into(),
-                status: 400,
-                body: "bucket_id must be 4 to 64 bytes, got 2 bytes".into(),
-            }),
-        );
-        let why = refused(&reg, &path).unwrap();
-        assert!(matches!(why, Refusal::AttachFailed(_)));
-        assert!(
-            why.to_string()
-                .starts_with("its last attach failed (invalid_name: head ")
-        );
-        reg.failed.clear();
-        std::fs::write(format!("{path}-ursula"), "x").unwrap();
-        assert!(matches!(refused(&reg, &path), Some(Refusal::NotAttached)));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    // A fence raises the flag every read transaction's start checks without the database's mutex,
-    // and nothing lowers it. Any other poison leaves it down.
-    #[test]
-    fn a_fence_raises_the_read_flag() {
-        let mut d = Db::for_tests();
-        d.poison(Error::ProducerExpiredAgain);
-        assert!(!d.fence.load(Ordering::Acquire));
-        d.poison(Error::Fenced(Fence::Superseded {
-            epoch: 2,
-            current: Some(3),
-        }));
-        assert!(d.fence.load(Ordering::Acquire));
-        d.poison(Error::LostWrite { offset: 56 });
-        assert!(d.fence.load(Ordering::Acquire) && d.fenced() && d.damaged());
-    }
-
-    #[test]
-    fn attach_modes() {
-        assert_eq!(Mode::try_from("").unwrap(), Mode::Owner);
-        assert_eq!(Mode::try_from("owner").unwrap(), Mode::Owner);
-        assert_eq!(Mode::try_from("read_only").unwrap(), Mode::ReadOnly);
-        assert!(matches!(
-            Mode::try_from("readonly"),
-            Err(Error::AttachMode { mode }) if mode == "readonly"
-        ));
-    }
-
-    // The first poison's reason stays, whatever fails after it (the rest of the transaction, a
-    // lost page read again, the snapshot thread's own fence). A fence and a lost write stick
-    // whenever they come: `fenced` and `damaged` never flip back, in either order.
-    #[test]
-    fn a_later_poison_does_not_replace_a_fence() {
-        let mut d = Db::for_tests();
-        d.poison(Error::Fenced(Fence::Superseded {
-            epoch: 2,
-            current: Some(3),
-        }));
-        assert!(d.fenced() && !d.damaged());
-        d.poison(Error::LostWrite { offset: 56 });
-        d.poison(Error::DbWriteOutsideCheckpoint);
-        d.set_poisoned(
-            Error::NotPublished {
-                mx_frame: 1,
-                frame: 2,
-            },
-            Some("snapshot at 7 not published"),
-        );
-        assert!(d.fenced() && d.damaged());
-        assert!(matches!(
-            d.poisoned.as_ref().map(|p| &p.first),
-            Some(Error::Fenced(Fence::Superseded {
-                epoch: 2,
-                current: Some(3)
-            }))
-        ));
-        // A fence after another reason: `fenced` too, and the first reason stays.
-        let mut d = Db::for_tests();
-        d.poison(Error::LostWrite { offset: 56 });
-        assert!(!d.fenced() && d.damaged());
-        d.poison(Error::Fenced(Fence::Reclaim));
-        d.poison(Error::ProducerExpiredAgain);
-        assert!(d.fenced() && d.damaged());
-        assert!(matches!(
-            d.poisoned.as_ref().map(|p| &p.first),
-            Some(Error::LostWrite { offset: 56 })
-        ));
+    fn db_writes_only_checkpoint() {
+        let mut c = Commit::default();
+        assert!(!c.db_write_allowed());
+        c.checkpoint = Some((std::time::Instant::now(), false));
+        assert!(c.db_write_allowed());
+        c.checkpoint = None;
+        c.exclusive = 1;
+        assert!(!c.db_write_allowed());
+        c.wal_open = 1;
+        assert!(c.db_write_allowed());
     }
 }

@@ -49,6 +49,7 @@ use crate::ids::Position;
 use crate::open::OpenError;
 use crate::open::OpenSpec;
 use crate::replicator::Pending;
+use crate::replicator::ResetKind;
 use crate::transport::Transport;
 use crate::transport::http::HttpTransport;
 use crate::wire::Exchange;
@@ -82,6 +83,13 @@ enum Command {
         position: Position,
     },
     Retire {
+        binding: BindingId,
+    },
+    Reset {
+        binding: BindingId,
+        kind: ResetKind,
+    },
+    Unconnected {
         binding: BindingId,
     },
     Cancel {
@@ -157,10 +165,6 @@ pub(crate) struct Driver {
 }
 
 /// The process driver, over HTTP, started on first use.
-#[expect(
-    dead_code,
-    reason = "the SQL functions call it from the 0.8 switch PR; tests start their own drivers"
-)]
 pub(crate) fn driver() -> &'static Driver {
     static DRIVER: OnceLock<Driver> = OnceLock::new();
     DRIVER.get_or_init(|| {
@@ -241,6 +245,12 @@ impl Driver {
 
     /// The open's outcome, waiting at most `timeout` for it. It is handed out once. When the
     /// time runs out the open is cancelled ([`Driver::cancel`]), so no result is left untaken.
+    /// The open's outcome if it resolved, without waiting and without cancelling it otherwise
+    /// (`ursula_open` with `timeout_ms` 0). It is handed out once.
+    pub(crate) fn try_open(&self, open: OpenId) -> Option<Result<Bound, Arc<OpenError>>> {
+        self.shared.lock().opened.remove(&open)
+    }
+
     pub(crate) fn wait_open(
         &self,
         open: OpenId,
@@ -307,6 +317,8 @@ impl Driver {
             }
         };
         if let Some(Ok(bound)) = untaken {
+            // Nobody took it, so no connection holds it.
+            bound.handle.retiring();
             return self.command(Command::Retire {
                 binding: bound.binding,
             });
@@ -318,6 +330,17 @@ impl Driver {
         self.command(Command::Retire { binding })
     }
 
+    /// `ursula_open` handed the binding out: it retires unless a connection opens it soon.
+    pub(crate) fn unconnected(&self, binding: BindingId) -> Result<(), DriverGone> {
+        self.command(Command::Unconnected { binding })
+    }
+
+    /// The binding's connections found it damaged: it resets `kind`.
+    pub(crate) fn reset(&self, binding: BindingId, kind: ResetKind) -> Result<(), DriverGone> {
+        self.command(Command::Reset { binding, kind })
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "snapshots call it from PR7"))]
     pub(crate) fn boundary(
         &self,
         binding: BindingId,
@@ -529,7 +552,9 @@ fn run(mut core: Core, inbox: &mpsc::Receiver<Command>, threads: &mut Threads, s
                 break;
             }
             for binding in retire {
-                let ios = guard::contain("driver_core", Vec::new, || core.retire(binding, now()));
+                let ios = guard::contain("driver_core", Vec::new, || {
+                    core.retire_untaken(binding, now())
+                });
                 threads.dispatch(ios);
             }
         }
@@ -589,6 +614,14 @@ fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {
         } => core.sync(ticket, binding, target, now_ms),
         Command::Boundary { binding, position } => core.boundary(binding, position, now_ms),
         Command::Retire { binding } => core.retire(binding, now_ms),
+        Command::Unconnected { binding } => {
+            core.unconnected(binding, now_ms);
+            Vec::new()
+        }
+        Command::Reset { binding, kind } => {
+            core.reset_binding(binding, kind, now_ms);
+            Vec::new()
+        }
         Command::Cancel { open } => core.cancel(open, now_ms),
         Command::Completed { io, exchange } => core.completed(io, exchange, now_ms),
         Command::DiskDone { io, done } => core.disk_done(io, *done, now_ms),

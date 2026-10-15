@@ -30,7 +30,6 @@ pub(crate) const PAGE_BYTES: i64 = PAGE as i64;
 pub(crate) const WAL_HDR_LEN: usize = 32;
 pub(crate) const FRAME_HDR_LEN: usize = 24;
 pub(crate) const FRAME_LEN: usize = FRAME_HDR_LEN + PAGE;
-pub(crate) const FIRST_PAGE_AT: u64 = (WAL_HDR_LEN + FRAME_HDR_LEN) as u64;
 
 /// Whether `off` is where a frame's page starts in the WAL file.
 pub(crate) fn page_at(off: i64) -> bool {
@@ -38,7 +37,6 @@ pub(crate) fn page_at(off: i64) -> bool {
 }
 
 /// Whether `off` is where a frame's header starts in the WAL file.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 fn frame_header_at(off: i64) -> bool {
     off >= WAL_HDR && off.saturating_sub(WAL_HDR).checked_rem(FRAME) == Some(0)
 }
@@ -46,12 +44,6 @@ fn frame_header_at(off: i64) -> bool {
 /// The db file offset of page `pgno` (1-based).
 pub(crate) fn page_offset(pgno: u32) -> u64 {
     db_len(pgno.saturating_sub(1))
-}
-
-/// The whole pages in a db file of `len` bytes.
-pub(crate) fn pages_in(len: u64) -> u32 {
-    const PAGE_LEN: u64 = PAGE as u64;
-    u32::try_from(len / PAGE_LEN).unwrap_or(u32::MAX)
 }
 
 /// The length of a db file of `pages` pages.
@@ -67,7 +59,6 @@ pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
 
 /// A WAL write, by its offset and length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) enum WalWrite<'a> {
     /// The WAL header (a new WAL generation), with the page size it names.
     Header { page_size: Option<u32> },
@@ -85,7 +76,6 @@ pub(crate) enum WalWrite<'a> {
 }
 
 /// Names the WAL write of `data` at `off`.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) fn classify(off: i64, data: &[u8]) -> WalWrite<'_> {
     match data.len() {
         WAL_HDR_LEN if off == 0 => WalWrite::Header {
@@ -109,7 +99,6 @@ pub(crate) fn classify(off: i64, data: &[u8]) -> WalWrite<'_> {
 
 /// The commit point: the commit frame's page is being written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) struct CommitPoint {
     /// The database size after the commit, in pages.
     pub(crate) db_pages_after: u32,
@@ -119,7 +108,6 @@ pub(crate) struct CommitPoint {
 
 /// A write transaction's WAL write or commit that the extension does not capture.
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) enum CaptureError {
     #[error("a WAL write of {len} bytes at offset {off}: not a header, frame header or page")]
     Shape { off: i64, len: usize },
@@ -152,7 +140,6 @@ pub(crate) enum CaptureError {
 
 /// A frame the transaction wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 struct Written {
     pgno: u32,
     /// The crc32c of the page as this process last wrote it.
@@ -161,7 +148,6 @@ struct Written {
 
 /// Where the transaction stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 enum Stage {
     /// Frames are being written. `pending` is a frame header whose page has not followed yet.
     Open { pending: Option<Pending> },
@@ -170,7 +156,6 @@ enum Stage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 struct Pending {
     off: i64,
     pgno: u32,
@@ -179,7 +164,6 @@ struct Pending {
 
 /// One write transaction's frames, from its WRITE lock to its commit point.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) struct WriteTxn {
     /// Frame page offset → what was written there. A frame header written at or below the highest
     /// frame drops every frame from its offset on: `ROLLBACK TO` after a cache spill rewinds the
@@ -194,7 +178,6 @@ impl Default for WriteTxn {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 impl WriteTxn {
     pub(crate) fn new() -> Self {
         WriteTxn {
@@ -343,7 +326,6 @@ impl WriteTxn {
 
 /// Page 1 keeps WAL mode (file format read and write versions 2, bytes 18 and 19) and 4096-byte
 /// pages (bytes 16 and 17, big-endian).
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) fn check_page1(p: &[u8]) -> Result<(), CaptureError> {
     let byte = |at: usize| p.get(at).copied().unwrap_or(0);
     let (write, read) = (byte(18), byte(19));

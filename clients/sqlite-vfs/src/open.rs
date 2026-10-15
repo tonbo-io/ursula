@@ -241,27 +241,6 @@ pub(crate) enum OpenError {
     Cancelled,
 }
 
-impl OpenError {
-    /// The stable kind token (design §8.4).
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::InvalidUrl(_) => "invalid_url",
-            Self::InUse { .. } => "in_use",
-            Self::LocalSetup(_) => "local_setup",
-            Self::Internal(_) | Self::Panicked => "internal",
-            Self::StreamFormat(_) => "stream_format",
-            Self::ServerTooOld { .. } => "server_too_old",
-            Self::WrongCluster { .. } => "wrong_cluster",
-            Self::StreamState(_) => "stream_state",
-            Self::NotFound => "not_found",
-            Self::ClaimRaces => "claim_races",
-            Self::Unavailable(condition) => condition.kind(),
-            Self::Reset(kind) => kind.kind(),
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
 /// A local failure: a gap or malformed record under valid checksums is the extension's own bug
 /// (`internal`), anything else `local_setup`.
 pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {

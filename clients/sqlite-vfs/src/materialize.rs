@@ -83,6 +83,7 @@ pub(crate) enum LocalError {
         "catching up with stream frames while this generation's commit at {first:?} is pending: \
          a takeover with pending commits rebuilds instead"
     )]
+    #[cfg(test)]
     OwnPending { first: Position },
     #[error("encoding a frame to catch up: {0}")]
     Encode(#[source] FrameError),
@@ -153,6 +154,7 @@ pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
 /// fsyncs the db and appends a BASE, so a crash midway replays. Refused while this generation has
 /// pending commits: commits after both the log's latest ACK and `acked`, the position the caller
 /// knows acknowledged (a takeover's reconcile acknowledges commits before any ACK names them).
+#[cfg(test)]
 pub(crate) fn catch_up(
     m: &mut Materialized,
     acked: Position,

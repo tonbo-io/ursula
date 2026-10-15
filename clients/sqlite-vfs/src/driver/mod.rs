@@ -29,6 +29,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -46,6 +48,9 @@ use crate::wire::Request;
 
 /// The bounded event queue's length (design §8.6).
 pub(crate) const EVENTS: usize = 4096;
+
+/// How long a binding `ursula_open` handed out waits for a connection before it retires.
+pub(crate) const UNCONNECTED_MS: u64 = 60_000;
 
 /// How often, at most, a bound database writes an ACK record (design §5.2).
 pub(crate) const ACK_INTERVAL_MS: u64 = 1_000;
@@ -116,21 +121,74 @@ pub(crate) enum SyncError {
 }
 
 /// A bound database's state that its connections share with the driver: the generation, the log
-/// the commit path appends to, the pending bytes admission reads (design §4.4), and the root's
-/// lock, held until the last of them drops. So a reopen in this process while old handles live
-/// is refused `in_use` and never materializes a generation they still write (M2 builds it a copy
-/// instead).
+/// the commit path appends to, the pending bytes admission reads (design §4.4), the reset the
+/// connections refuse their work on, what status reports of the replicator, and the root's lock.
+/// The lock is released when the binding retires with no connection left, and otherwise (a reset)
+/// only when the last handle drops. So a reopen while old handles live is refused `in_use` and
+/// never materializes a generation they still write (M2 builds it a copy instead).
 #[derive(Debug)]
 pub(crate) struct BindingHandle {
     pub(crate) generation: Generation,
     pub(crate) name: CanonicalPath,
+    /// The stream's cluster id and incarnation token when the binding bound.
+    pub(crate) cluster_id: String,
+    pub(crate) incarnation: String,
     log: Mutex<Log>,
     pending_bytes: AtomicU64,
     max_pending_bytes: u64,
     /// The last COMMIT record's position, as the commit path records it.
     last_commit: AtomicU64,
-    _root: Arc<Root>,
+    /// The largest commit frame the replicator can send in one batch.
+    max_frame_bytes: AtomicU64,
+    /// The last acknowledged position.
+    acked: AtomicU64,
+    /// The reset, once one happened: [`ResetKind`] + 1, 0 for none. The first one stays.
+    reset: AtomicU8,
+    life: Mutex<Lifecycle>,
+    replication: Mutex<Replication>,
+    /// Released when the binding retires with no connection left; otherwise with the last handle.
+    root: Mutex<Option<Arc<Root>>>,
 }
+
+/// Where a binding stands between its connections and the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Life {
+    Live,
+    /// Its last connection closed: it drains, then retires. A new open revives it first.
+    Retiring,
+    /// Gone from the driver.
+    Retired,
+}
+
+/// A binding's life with its open connections, decided under one lock: a connection opens only
+/// while the binding is not retired, and a binding retires only while none is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lifecycle {
+    life: Life,
+    connections: usize,
+    /// How many times `ursula_open` handed the binding out again.
+    handouts: u64,
+}
+
+/// What status reports of a binding's replicator (design §9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Replication {
+    pub(crate) state: &'static str,
+    pub(crate) epoch: Option<u64>,
+    pub(crate) condition: Option<Condition>,
+    /// Logged commits not yet acknowledged.
+    pub(crate) pending: usize,
+}
+
+const RESETS: [ResetKind; 7] = [
+    ResetKind::Fenced,
+    ResetKind::Stale,
+    ResetKind::Rewound,
+    ResetKind::Deleted,
+    ResetKind::LocalDamage,
+    ResetKind::StreamState,
+    ResetKind::Internal,
+];
 
 /// A write transaction refused at admission (design §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -146,22 +204,26 @@ pub(crate) struct BacklogFull {
 pub(crate) struct LogPoisoned;
 
 impl BindingHandle {
-    pub(crate) fn new(
-        generation: Generation,
-        name: CanonicalPath,
-        log: Log,
-        root: Arc<Root>,
-        pending_bytes: u64,
-        max_pending_bytes: u64,
-    ) -> Self {
+    pub(crate) fn new(bind: Bind, root: Arc<Root>) -> Self {
         Self {
-            generation,
-            name,
-            log: Mutex::new(log),
-            pending_bytes: AtomicU64::new(pending_bytes),
-            max_pending_bytes,
+            generation: bind.generation,
+            name: bind.name,
+            cluster_id: bind.cluster_id,
+            incarnation: bind.incarnation,
+            log: Mutex::new(bind.log),
+            pending_bytes: AtomicU64::new(bind.pending_bytes),
+            max_pending_bytes: bind.max_pending_bytes,
+            max_frame_bytes: AtomicU64::new(bind.max_frame_bytes),
+            acked: AtomicU64::new(bind.acked.0),
+            reset: AtomicU8::new(0),
+            life: Mutex::new(Lifecycle {
+                life: Life::Live,
+                connections: 0,
+                handouts: 0,
+            }),
+            replication: Mutex::new(Replication::default()),
             last_commit: AtomicU64::new(0),
-            _root: root,
+            root: Mutex::new(Some(root)),
         }
     }
 
@@ -215,6 +277,185 @@ impl BindingHandle {
         let now = self.pending_bytes().saturating_sub(len);
         self.pending_bytes.store(now, Ordering::Release);
     }
+
+    pub(crate) fn max_frame_bytes(&self) -> u64 {
+        self.max_frame_bytes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn acked(&self) -> Position {
+        Position(self.acked.load(Ordering::Acquire))
+    }
+
+    /// The reset, once one happened.
+    pub(crate) fn reset(&self) -> Option<ResetKind> {
+        let n = usize::from(self.reset.load(Ordering::Acquire));
+        RESETS.get(n.checked_sub(1)?).copied()
+    }
+
+    /// Records a reset: true for the first one, which stays.
+    pub(crate) fn mark_reset(&self, kind: ResetKind) -> bool {
+        let n = RESETS
+            .iter()
+            .position(|k| *k == kind)
+            .and_then(|i| u8::try_from(i.saturating_add(1)).ok())
+            .unwrap_or(u8::MAX);
+        self.reset
+            .compare_exchange(0, n, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn life_lock(&self) -> MutexGuard<'_, Lifecycle> {
+        self.life.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn life(&self) -> Life {
+        self.life_lock().life
+    }
+
+    pub(crate) fn connections(&self) -> usize {
+        self.life_lock().connections
+    }
+
+    /// A connection opens: a retiring binding is taken back. False once it retired.
+    pub(crate) fn connect(&self) -> bool {
+        let mut l = self.life_lock();
+        if l.life == Life::Retired {
+            return false;
+        }
+        l.life = Life::Live;
+        l.connections = l.connections.saturating_add(1);
+        true
+    }
+
+    /// A connection closed. True when it was the last of a live binding, which now retires once
+    /// drained (the driver hears of it). The last one of a reset binding unlocks its root.
+    pub(crate) fn disconnect(&self) -> bool {
+        let mut l = self.life_lock();
+        l.connections = l.connections.saturating_sub(1);
+        if l.connections > 0 {
+            return false;
+        }
+        match l.life {
+            Life::Live => {
+                l.life = Life::Retiring;
+                true
+            }
+            Life::Retired => {
+                self.release_root();
+                false
+            }
+            Life::Retiring => false,
+        }
+    }
+
+    /// A binding no connection holds retires once drained: an open's result nobody took, or one
+    /// `ursula_open` handed out that no connection opened.
+    pub(crate) fn retiring(&self) {
+        let mut l = self.life_lock();
+        if l.life == Life::Live && l.connections == 0 {
+            l.life = Life::Retiring;
+        }
+    }
+
+    /// `ursula_open` hands the binding out again, taking a retiring one back: false once it
+    /// retired.
+    pub(crate) fn revive(&self) -> bool {
+        let mut l = self.life_lock();
+        if l.life == Life::Retired {
+            return false;
+        }
+        l.life = Life::Live;
+        l.handouts = l.handouts.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn handouts(&self) -> u64 {
+        self.life_lock().handouts
+    }
+
+    /// No connection opened the binding since `ursula_open` handed it out for the `handouts`-th
+    /// time: it retires once drained. A hand-out since, or a connection, keeps it.
+    pub(crate) fn idle_retire(&self, handouts: u64) {
+        let mut l = self.life_lock();
+        if l.life == Life::Live && l.connections == 0 && l.handouts == handouts {
+            l.life = Life::Retiring;
+        }
+    }
+
+    /// Retires a binding that is still retiring with no connection open: false when a connection
+    /// or an open took it back meanwhile. Retired, no connection opens it again, so the driver
+    /// unlocks its root once its last ACK is written.
+    fn try_retire(&self) -> bool {
+        let mut l = self.life_lock();
+        let retiring = l.life == Life::Retiring && l.connections == 0;
+        if retiring {
+            l.life = Life::Retired;
+        }
+        retiring
+    }
+
+    /// The binding reset: it retires at once. With no connection open its root unlocks now,
+    /// otherwise when the last one closes.
+    fn reset_retired(&self) {
+        let mut l = self.life_lock();
+        l.life = Life::Retired;
+        if l.connections == 0 {
+            self.release_root();
+        }
+    }
+
+    /// Whether the root is still locked (tests).
+    #[cfg(test)]
+    pub(crate) fn holds_root(&self) -> bool {
+        self.root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn release_root(&self) {
+        drop(
+            self.root
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    pub(crate) fn replication(&self) -> Replication {
+        self.replication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_replication(&self, replication: Replication, max_frame_bytes: Option<u64>) {
+        *self
+            .replication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = replication;
+        if let Some(max) = max_frame_bytes {
+            self.max_frame_bytes.store(max, Ordering::Release);
+        }
+    }
+
+    fn set_acked(&self, acked: Position) {
+        self.acked.fetch_max(acked.0, Ordering::AcqRel);
+    }
+}
+
+/// What a bound database starts with.
+#[derive(Debug)]
+pub(crate) struct Bind {
+    pub(crate) generation: Generation,
+    pub(crate) name: CanonicalPath,
+    pub(crate) cluster_id: String,
+    pub(crate) incarnation: String,
+    pub(crate) log: Log,
+    pub(crate) pending_bytes: u64,
+    pub(crate) max_pending_bytes: u64,
+    pub(crate) max_frame_bytes: u64,
+    pub(crate) acked: Position,
 }
 
 /// A database bound by an open.

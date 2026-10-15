@@ -6,7 +6,7 @@
 //! it releases the WAL write lock of a committed transaction, and only then. So a commit is
 //! confirmed per handle, and only when PHASETWO is the very next call on that handle after the
 //! WRITE shm unlock. Any other call there first (a read-mark unlock, a file lock, a new write
-//! lock, a close) leaves the commit unconfirmed, and the attachment resets.
+//! lock, a close) leaves the commit unconfirmed, and the binding resets.
 //!
 //! [`HandleState`] is that rule as a pure state machine over a main db handle's calls, with the
 //! WAL writes of its connection and the position its commit was logged at. A WAL write without
