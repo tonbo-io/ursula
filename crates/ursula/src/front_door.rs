@@ -157,7 +157,7 @@ fn leadership_view(state: &HttpState, raft_group_id: RaftGroupId) -> Option<Writ
     let Some(registry) = state.raft_registry() else {
         return Some(WriteRoute::Leader { early_answer: None });
     };
-    let leadership = registry.get(raft_group_id)?.leadership();
+    let leadership = registry.leadership(raft_group_id)?;
     Some(match leadership.leader_id {
         Some(leader) if leader == leadership.node_id => WriteRoute::Leader { early_answer: None },
         Some(leader_id) => WriteRoute::Follower {
@@ -176,7 +176,7 @@ pub(crate) fn leader_term(
     raft_group_id: RaftGroupId,
     leader: u64,
 ) -> Option<u64> {
-    let leadership = state.raft_registry()?.get(raft_group_id)?.leadership();
+    let leadership = state.raft_registry()?.leadership(raft_group_id)?;
     (leadership.leader_id == Some(leader)).then_some(leadership.term)
 }
 

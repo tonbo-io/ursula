@@ -98,7 +98,6 @@ use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
 use ursula_headers::ClusterId;
 use ursula_headers::HeaderError as ProducerHeaderError;
-use ursula_headers::IncarnationPrecondition;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
@@ -2960,11 +2959,12 @@ pub(crate) async fn append_stream(
 ) -> Response {
     let stream_id = path.into_stream_id();
     let request_target = request_target(&uri);
-    if let Err(response) = append_head_checks(&headers) {
-        return answer_before_body(*response, version, &headers, body).await;
-    }
+    let head = match AppendHead::parse(&headers) {
+        Ok(head) => head,
+        Err(response) => return answer_before_body(*response, version, &headers, body).await,
+    };
     let early_answer = early_answer_may_help(&headers)
-        .then(|| early_answer_query(&state, &headers))
+        .then(|| head.early_answer_query(state.unix_time_ms()))
         .flatten();
     let decision = front_door::route_before_body(
         &state,
@@ -2984,38 +2984,41 @@ pub(crate) async fn append_stream(
         Ok(body) => body,
         Err(err) => return unreadable_body_response(&err),
     };
-    append_stream_by_id(state, stream_id, headers, body).await
+    append_stream_by_id(state, stream_id, headers, head, body).await
 }
 
-/// The checks of an append's head that answer `400`, which come before
-/// routing (#581 section 6.1). The late path runs them again.
-fn append_head_checks(headers: &HeaderMap) -> Result<(), Box<Response>> {
-    removed_surface::reject_removed_append_headers(headers)?;
-    incarnation_precondition(headers)?;
-    stream_seq(headers)
-        .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
-    parse_producer_headers(headers)
-        .map_err(|err| Box::new((StatusCode::BAD_REQUEST, err.to_string()).into_response()))?;
-    Ok(())
+/// An append's head, parsed once before routing (step 1 of #581 section
+/// 5.3, which answers `400`), and carried to the late path.
+pub(crate) struct AppendHead {
+    if_incarnation: Option<u64>,
+    stream_seq: Option<String>,
+    producer: Option<ProducerRequest>,
 }
 
-/// The key of a tokened producer write, whose answer the group's leader
-/// may decide from the head alone (#581 section 2.5, W7). `None` for every
-/// other write, which is read, proposed and decided at apply, as is any
-/// write whose head is malformed.
-fn early_answer_query(state: &HttpState, headers: &HeaderMap) -> Option<EarlyAnswerQuery> {
-    let ProducerRequestHeaders {
-        producer: Some(write),
-        precondition: Some(IncarnationPrecondition { incarnation }),
-    } = parse_producer_headers(headers).ok()?
-    else {
-        return None;
-    };
-    Some(EarlyAnswerQuery {
-        producer: producer_request(write),
-        incarnation: incarnation.get(),
-        now_ms: state.unix_time_ms(),
-    })
+impl AppendHead {
+    fn parse(headers: &HeaderMap) -> Result<Self, Box<Response>> {
+        removed_surface::reject_removed_append_headers(headers)?;
+        let if_incarnation = incarnation_precondition(headers)?;
+        let producer = producer_write(headers)?;
+        let stream_seq = stream_seq(headers)
+            .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+        Ok(Self {
+            if_incarnation,
+            stream_seq,
+            producer,
+        })
+    }
+
+    /// The key of a tokened producer write, whose answer the group's leader
+    /// may decide from the head alone (#581 section 2.5, W7). `None` for
+    /// every other write, which is read, proposed and decided at apply.
+    fn early_answer_query(&self, now_ms: u64) -> Option<EarlyAnswerQuery> {
+        Some(EarlyAnswerQuery {
+            producer: self.producer.clone()?,
+            incarnation: self.if_incarnation?,
+            now_ms,
+        })
+    }
 }
 
 /// The early answer to a tokened producer write: a repeat of a write that
@@ -3042,10 +3045,10 @@ const EARLY_ANSWER_MIN_BODY_BYTES: u64 = 64 * 1024;
 
 /// Whether to look for an early answer: only after `Expect: 100-continue`,
 /// which always saves the upload, or for a declared body of at least
-/// [`EARLY_ANSWER_MIN_BODY_BYTES`], and only after the request-shape checks
-/// of step 1 (#581 section 5.3) pass, as on the late path. The content
-/// checks of step 5 come after the producer rows on both paths, so a repeat
-/// or a key conflict is answered whatever the body is.
+/// [`EARLY_ANSWER_MIN_BODY_BYTES`]. The caller has run the request-shape
+/// checks of step 1 (#581 section 5.3) already ([`AppendHead::parse`]). The
+/// content checks of step 5 come after the producer rows on both paths, so
+/// a repeat or a key conflict is answered whatever the body is.
 fn early_answer_may_help(headers: &HeaderMap) -> bool {
     let expects_continue = headers
         .get(axum::http::header::EXPECT)
@@ -3055,12 +3058,7 @@ fn early_answer_may_help(headers: &HeaderMap) -> bool {
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let worth_it =
-        expects_continue || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES);
-    worth_it
-        && removed_surface::reject_removed_append_headers(headers).is_ok()
-        && incarnation_precondition(headers).is_ok()
-        && stream_seq(headers).is_ok()
+    expects_continue || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES)
 }
 
 /// Sends an answer decided before the body was read (addendum A3 on #581).
@@ -3115,25 +3113,16 @@ pub(crate) async fn append_stream_by_id(
     state: HttpState,
     stream_id: BucketStreamId,
     headers: HeaderMap,
+    head: AppendHead,
     body: Bytes,
 ) -> Response {
-    if let Err(response) = removed_surface::reject_removed_append_headers(&headers) {
-        return *response;
-    }
-    let if_incarnation = match incarnation_precondition(&headers) {
-        Ok(if_incarnation) => if_incarnation,
-        Err(response) => return *response,
-    };
+    let AppendHead {
+        if_incarnation,
+        stream_seq: stream_seq_header,
+        mut producer,
+    } = head;
     let close_after = stream_closed(&headers);
 
-    let mut producer = match producer_write(&headers) {
-        Ok(producer) => producer,
-        Err(response) => return *response,
-    };
-    let stream_seq_header = match stream_seq(&headers) {
-        Ok(stream_seq) => stream_seq,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
     let content_type = request_content_type(&headers);
     let close_only = body.is_empty() && close_after;
     let payload = match content_checks(&headers, &content_type, body, producer.as_mut()) {

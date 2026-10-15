@@ -657,6 +657,16 @@ impl RaftGroupHandleRegistry {
             .and_then(|entry| entry.active().map(|active| active.raft().clone()))
     }
 
+    /// This replica's view of a group's leadership
+    /// ([`OwnerRaftHandle::leadership`]), without cloning its handle. `None`
+    /// when no active replica of the group is registered here.
+    pub fn leadership(&self, raft_group_id: RaftGroupId) -> Option<crate::GroupLeadership> {
+        self.groups
+            .load()
+            .get(&raft_group_id.0)
+            .and_then(|entry| entry.active().map(|active| active.raft().leadership()))
+    }
+
     pub fn contains_group(&self, raft_group_id: RaftGroupId) -> bool {
         self.groups.load().contains_key(&raft_group_id.0)
     }
