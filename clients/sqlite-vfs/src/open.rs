@@ -6,23 +6,23 @@
 //! The first disk job ([`prepare`]) takes the stream's root lock (`in_use`), finishes what a crash
 //! left, and materializes the current generation when there is one (an unreadable segment header
 //! is `local_setup`, a gap under valid checksums `internal`). Then a HEAD without a precondition
-//! decides, before any claim:
-//!
-//! | local generation | HEAD | the open |
-//! | --- | --- | --- |
-//! | any | no `Ursula-Protocol: 2` | refuses `server_too_old` |
-//! | any | another content type | refuses `stream_format` |
-//! | trusted | another `Ursula-Cluster-Id` | refuses `wrong_cluster` |
-//! | none | `404` | creates the stream, then HEAD again |
-//! | none | `200` | builds a generation from the latest snapshot and the tail, then takes over |
-//! | trusted | `404` | refuses `not_found` |
-//! | trusted, same token | `200` | takes over |
-//! | trusted, other token | `200` | refuses `stream_state`, files kept (re-key and salvage: M2) |
+//! decides, before any claim, by the table of design §5.5 ([`table::decide`]): it creates the
+//! stream, builds a generation from the latest snapshot and the tail, takes over with the
+//! generation's token, re-keys a generation whose history the stream inherits and takes over, or
+//! refuses. A generation of another token that the history does not inherit, or that holds
+//! commits after its latest ACK, is refused `stream_state` with its files kept (salvage comes
+//! later in M2).
 //!
 //! Every refusal keeps the local files and sends nothing to the stream. A request that gets no
 //! answer is sent again under the replicator's retry [`Policy`] until the open's deadline, which
 //! then fails with the last condition (`unreachable` when nothing ever went out). Provisional
 //! opens, salvage and readers are M2's.
+//!
+//! Module map:
+//!
+//! - [`table`]: the open table of design §5.5, one pure function.
+
+pub(crate) mod table;
 
 use std::io::BufWriter;
 use std::io::Write;
@@ -37,6 +37,9 @@ use ursula_headers::Offset;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 
+use self::table::HeadSeen;
+use self::table::LocalSummary;
+use self::table::OpenRow;
 use crate::applier::stamp_page_one;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::Frame;
@@ -75,13 +78,13 @@ use crate::replicator::READ_ANSWER_BYTES;
 use crate::replicator::ResetKind;
 use crate::replicator::answer::Common;
 use crate::replicator::answer::ReadDecision;
+use crate::replicator::answer::Unacked;
 use crate::replicator::answer::decide_read;
 use crate::replicator::answer::decide_status;
 use crate::replicator::backoff::Next;
 use crate::replicator::backoff::Policy;
 use crate::replog::LogError;
 use crate::transport::Attempt;
-use crate::wire::Answer;
 use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
@@ -170,7 +173,8 @@ impl From<&Condition> for Unavailable {
 /// Why the stream is not one the open can take over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StreamState {
-    /// The generation was built under another token (re-key and salvage: M2).
+    /// The generation was built under another token whose history does not inherit it, or does
+    /// while its log holds commits after its latest ACK (salvage comes later in M2).
     TokenChanged {
         local: Incarnation,
         stream: Incarnation,
@@ -863,13 +867,30 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
     })
 }
 
-/// What the replicator starts from: a trusted or freshly built generation, as its log says.
+/// What the open table reads of a trusted local generation.
+fn summary(m: &Materialized) -> LocalSummary {
+    let r = &m.recovered;
+    LocalSummary {
+        cluster_id: r.header.cluster_id.clone(),
+        incarnation: r.header.incarnation,
+        acked_offset: r.acked_offset,
+        pending: if r.pending().is_empty() {
+            Unacked::Nothing
+        } else {
+            Unacked::Commits
+        },
+    }
+}
+
+/// What the replicator starts from: a trusted or freshly built generation, as its log says, and the
+/// token it re-keys from when the stream's history inherits it.
 fn local_state(
     spec: &OpenSpec,
     m: &Materialized,
     cluster_id: ClusterId,
     head: &StreamHead,
     highest_epoch: Option<Epoch>,
+    rekey_from: Option<Incarnation>,
 ) -> LocalState {
     let r = &m.recovered;
     let lineage = r.header.lineage;
@@ -902,6 +923,7 @@ fn local_state(
         configured_max_request_bytes: spec.max_request_bytes,
         // A catch-up in place larger than the database rebuilds instead (design §5.6).
         db_bytes: m.db.metadata().map_or(u64::MAX, |meta| meta.len()),
+        rekey_from,
     }
 }
 
@@ -1092,7 +1114,7 @@ impl Opening {
             (
                 Phase::Building { cluster_id, head },
                 DiskDone::Published(Ok((m, highest, attach))),
-            ) => self.takeover(m, cluster_id, &head, highest, attach),
+            ) => self.takeover(m, cluster_id, &head, highest, attach, None),
             (
                 _,
                 DiskDone::Prepared(Err(e)) | DiskDone::Built(Err(e)) | DiskDone::Published(Err(e)),
@@ -1262,67 +1284,51 @@ impl Opening {
             _ => return self.failed(exchange, now_ms),
         };
         self.retry.succeeded();
-        let identity = match identity {
-            Some(identity) if identity.protocol == ursula_headers::PROTOCOL_VERSION => identity,
-            other => {
-                return OpenStep::Fail(OpenError::ServerTooOld {
-                    protocol: other.map(|i| i.protocol),
-                });
-            }
-        };
         let Some(prepared) = &mut self.prepared else {
             return OpenStep::Fail(OpenError::Panicked);
         };
-        if let Some(m) = &prepared.local {
-            let local_cluster = &m.recovered.header.cluster_id;
-            if local_cluster != identity.cluster_id.as_str() {
-                return OpenStep::Fail(OpenError::WrongCluster {
-                    local: local_cluster.clone(),
-                    stream: identity.cluster_id,
-                });
-            }
-        }
-        let Some(head) = stream else {
-            if prepared.local.is_some() {
-                return OpenStep::Fail(OpenError::NotFound);
-            }
-            self.phase = Phase::Create;
-            return OpenStep::Send {
-                opening: self,
-                request: create_request(),
-                attempt: Attempt::default(),
-            };
+        let local = prepared.local.take().map(|m| (summary(&m), m));
+        let seen = HeadSeen {
+            identity: identity.as_ref(),
+            stream: stream.as_ref(),
+            content_type: answer.content_type.as_deref(),
         };
-        if let Err(e) = check_stream(answer, &head) {
-            return OpenStep::Fail(e);
-        }
-        match prepared.local.take() {
-            Some(m) => {
-                let local_token = m.recovered.header.incarnation;
-                if local_token != head.incarnation() {
-                    prepared.local = Some(m);
-                    return OpenStep::Fail(OpenError::StreamState(StreamState::TokenChanged {
-                        local: local_token,
-                        stream: head.incarnation(),
-                    }));
-                }
-                self.takeover(m, identity.cluster_id, &head, None, Attach::Resumed)
+        match table::decide(local, seen) {
+            OpenRow::Refuse { refused, local } => {
+                prepared.local = local;
+                OpenStep::Fail(refused.into())
             }
-            None => {
+            OpenRow::Create => {
+                self.phase = Phase::Create;
+                OpenStep::Send {
+                    opening: self,
+                    request: create_request(),
+                    attempt: Attempt::default(),
+                }
+            }
+            OpenRow::Resume {
+                local,
+                cluster_id,
+                head,
+            } => self.takeover(local, cluster_id, &head, None, Attach::Resumed, None),
+            OpenRow::ReKey {
+                local,
+                from,
+                cluster_id,
+                head,
+            } => self.takeover(local, cluster_id, &head, None, Attach::ReKeyed, Some(from)),
+            OpenRow::Build { cluster_id, head } => {
                 let job = DiskJob::NewBuild(NewBuild {
                     root: Arc::clone(&prepared.root),
                     name: self.name.clone(),
                     lineage,
-                    cluster_id: identity.cluster_id.clone(),
+                    cluster_id: cluster_id.clone(),
                     incarnation: head.incarnation(),
                     first: Position(1),
                     claim: None,
                     end: head.next_offset(),
                 });
-                self.phase = Phase::Building {
-                    cluster_id: identity.cluster_id,
-                    head,
-                };
+                self.phase = Phase::Building { cluster_id, head };
                 OpenStep::Disk { opening: self, job }
             }
         }
@@ -1335,12 +1341,13 @@ impl Opening {
         head: &StreamHead,
         highest_epoch: Option<Epoch>,
         attach: Attach,
+        rekey_from: Option<Incarnation>,
     ) -> OpenStep {
         let this = *self;
         let Some(prepared) = this.prepared else {
             return OpenStep::Fail(OpenError::Panicked);
         };
-        let local = local_state(&this.spec, &m, cluster_id, head, highest_epoch);
+        let local = local_state(&this.spec, &m, cluster_id, head, highest_epoch, rekey_from);
         OpenStep::Takeover(Box::new(Takeover {
             spec: this.spec,
             name: this.name,
@@ -1351,17 +1358,4 @@ impl Opening {
             attach,
         }))
     }
-}
-
-/// A stream of this format that takes writes.
-fn check_stream(answer: &Answer, head: &StreamHead) -> Result<(), OpenError> {
-    if answer.content_type.as_deref() != Some(CONTENT_TYPE) {
-        return Err(OpenError::StreamFormat(StreamFormat::ContentType {
-            found: answer.content_type.clone(),
-        }));
-    }
-    if head.closed() {
-        return Err(OpenError::StreamState(StreamState::Closed));
-    }
-    Ok(())
 }

@@ -132,9 +132,10 @@ pub(crate) enum SyncError {
 pub(crate) struct BindingHandle {
     pub(crate) generation: Generation,
     pub(crate) name: CanonicalPath,
-    /// The stream's cluster id and incarnation token when the binding bound.
+    /// The stream's cluster id.
     pub(crate) cluster_id: String,
-    pub(crate) incarnation: Incarnation,
+    /// The stream's token: the one it bound with, then the one of each re-key (design §6.2).
+    incarnation: Mutex<Incarnation>,
     log: Mutex<Log>,
     pending_bytes: AtomicU64,
     max_pending_bytes: u64,
@@ -219,7 +220,7 @@ impl BindingHandle {
             generation: bind.generation,
             name: bind.name,
             cluster_id: bind.cluster_id,
-            incarnation: bind.incarnation,
+            incarnation: Mutex::new(bind.incarnation),
             log: Mutex::new(bind.log),
             pending_bytes: AtomicU64::new(bind.pending_bytes),
             max_pending_bytes: bind.max_pending_bytes,
@@ -237,6 +238,22 @@ impl BindingHandle {
             snapshots: Snapshots::default(),
             attach: bind.attach,
         }
+    }
+
+    /// The stream's token: the requests of the snapshot thread carry it.
+    pub(crate) fn incarnation(&self) -> Incarnation {
+        *self
+            .incarnation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The generation re-keyed to `incarnation`.
+    fn set_incarnation(&self, incarnation: Incarnation) {
+        *self
+            .incarnation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = incarnation;
     }
 
     /// The log. The commit path appends under it, and the driver appends CLAIM and ACK records
@@ -499,6 +516,9 @@ pub(crate) struct Bind {
 pub(crate) enum Attach {
     /// A trusted local generation, materialized.
     Resumed,
+    /// A trusted local generation of another token whose history inherits it, materialized and
+    /// re-keyed (design §6.2).
+    ReKeyed,
     /// A generation built from the stream: from its latest snapshot at `snapshot` and the tail
     /// after it, or from its start when `snapshot` is `None`.
     Built { snapshot: Option<Offset> },

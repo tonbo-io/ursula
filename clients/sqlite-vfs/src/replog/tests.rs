@@ -554,3 +554,131 @@ fn a_failed_roll_leaves_nothing_that_refuses_the_next() {
     let positions: Vec<Position> = r.records.iter().map(|r| r.position).collect();
     assert_eq!(positions, vec![Position(1), Position(2)]);
 }
+
+fn token(n: u64) -> Incarnation {
+    Incarnation::try_from((1 << 52) | n).unwrap()
+}
+
+#[test]
+fn a_rekey_rolls_to_a_segment_naming_the_new_token_with_its_claim() {
+    let dir = TempDir::new("log-rekey");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.append(&commit(1, 100)).unwrap();
+    log.append(&RecordBody::Ack {
+        acked: Position(1),
+        acked_offset: Offset::from_u64(140),
+        log_bytes: 100,
+    })
+    .unwrap();
+    let position = log.rekey(token(2), epoch(4), Activation([4; 16])).unwrap();
+    assert_eq!(position, Position(3));
+    let segments = log.segment_paths();
+    assert_eq!(segments.len(), 2);
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(log.next_position(), Position(4));
+    // The latest segment names the new token and carries the state over.
+    assert_eq!(r.header.incarnation, token(2));
+    assert_eq!(r.header.first_position, Position(3));
+    assert_eq!(
+        (r.acked, r.acked_offset),
+        (Position(1), Offset::from_u64(140))
+    );
+    assert_eq!(r.claim, Some((epoch(4), Activation([4; 16]))));
+    let first = crate::codec::segment::scan(&fs::read(&segments[0]).unwrap()).unwrap();
+    assert_eq!(first.header.incarnation, header().incarnation);
+}
+
+#[test]
+fn a_rekey_of_an_empty_segment_replaces_its_header() {
+    let dir = TempDir::new("log-rekey-empty");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    // A stale temp file of an earlier crash goes.
+    let temp = log.segment_paths()[0].with_extension("usl.tmp");
+    fs::write(&temp, b"torn").unwrap();
+    let position = log.rekey(token(2), epoch(1), Activation([1; 16])).unwrap();
+    assert_eq!(position, Position(1));
+    assert_eq!(log.segment_paths().len(), 1);
+    assert!(!temp.exists());
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(log.next_position(), Position(2));
+    assert_eq!(r.header.incarnation, token(2));
+    assert_eq!(r.claims, vec![(epoch(1), Activation([1; 16]))]);
+}
+
+#[test]
+fn a_crash_after_the_roll_before_the_claim_leaves_the_new_token() {
+    let dir = TempDir::new("log-rekey-crash");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.append(&RecordBody::Claim {
+        epoch: epoch(1),
+        activation: Activation([1; 16]),
+    })
+    .unwrap();
+    log.append(&commit(1, 100)).unwrap();
+    // The roll of a re-key, and a crash before its CLAIM record.
+    log.roll_to(token(2)).unwrap();
+    drop(log);
+    let (mut log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.cut, None);
+    assert_eq!(r.header.incarnation, token(2));
+    assert_eq!(log.next_position(), Position(3));
+    // The claim the crash left out, and nothing lost before it.
+    assert_eq!(r.claim, Some((epoch(1), Activation([1; 16]))));
+    assert_eq!(r.pending().len(), 1);
+    // A re-key after the reopen goes into the empty segment.
+    log.rekey(token(3), epoch(2), Activation([2; 16])).unwrap();
+    assert_eq!(log.segment_paths().len(), 2);
+    drop(log);
+    let (_, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.header.incarnation, token(3));
+    assert_eq!(r.claim, Some((epoch(2), Activation([2; 16]))));
+}
+
+#[test]
+fn a_crash_before_the_rename_keeps_the_old_header() {
+    let dir = TempDir::new("log-rekey-temp");
+    let log_dir = dir.path().join("log");
+    let log = Log::create(&log_dir, header()).unwrap();
+    // The temp header was written, the rename never happened.
+    let path = log.segment_paths()[0].clone();
+    drop(log);
+    let mut h = header();
+    h.incarnation = token(2);
+    super::write_segment(&path.with_extension("usl.tmp"), &h).unwrap();
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.header.incarnation, header().incarnation);
+    assert_eq!(log.segment_paths(), vec![path]);
+}
+
+#[test]
+fn trim_deletes_segments_across_a_rekey() {
+    let dir = TempDir::new("log-rekey-trim");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    for n in 1..=3 {
+        log.append(&commit(n, 100)).unwrap();
+    }
+    log.rekey(token(2), epoch(2), Activation([2; 16])).unwrap();
+    log.append(&commit(5, 100)).unwrap();
+    log.append(&RecordBody::Ack {
+        acked: Position(5),
+        acked_offset: Offset::from_u64(500),
+        log_bytes: 400,
+    })
+    .unwrap();
+    log.append(&RecordBody::Base {
+        position: Position(5),
+    })
+    .unwrap();
+    assert_eq!(log.trim().unwrap(), 1);
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(log.segment_paths().len(), 1);
+    assert_eq!(r.header.incarnation, token(2));
+    assert_eq!(r.claim, Some((epoch(2), Activation([2; 16]))));
+}

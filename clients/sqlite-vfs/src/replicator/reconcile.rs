@@ -161,6 +161,11 @@ impl Reconcile {
         self.stream.at()
     }
 
+    /// The epoch of the claim this reconcile follows.
+    pub(crate) fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
     /// Nothing (more) to read.
     pub(crate) fn complete(&self) -> bool {
         self.stream.done()
@@ -321,10 +326,9 @@ impl Reconcile {
     /// Whether `position` went out in a batch of the epoch the claim closed, above its last
     /// applied seq: that batch must not be in the stream (design §4.8).
     ///
-    /// Dead in M1, kept for the continuations of M2 and M3: a takeover binds afresh (nothing
-    /// sent), and M1's only continuation follows `producer-expired`, which the server sends only
-    /// at or below the epoch floor, where the producer's record was retired, so the claim closes
-    /// no epoch. Re-keys and re-cuts claim over a live record and make it live.
+    /// A takeover binds afresh (nothing sent), and a continuation after `producer-expired` claims
+    /// over a retired record, so the claim closes no epoch. A re-key while bound claims over the
+    /// live, history-fenced record and closes the epoch the binding streamed in.
     fn above_closed_seq(&self, position: Position, ctx: &Ctx) -> bool {
         let Some(closed) = self.closed else {
             return false;

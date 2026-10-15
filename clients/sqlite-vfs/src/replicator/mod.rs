@@ -21,8 +21,22 @@
 //! A snapshot asks for a batch ending exactly at its `k` ([`Event::Boundary`]); once `k` is
 //! acknowledged, [`Action::Boundary`] hands back `W`, the end offset of that batch's receipt.
 //!
-//! Left for later milestones: re-key while bound (M2), resume (M4), re-cut and PART sending (M3)
-//! and the provisional deferred claim (M2).
+//! A HEAD naming another token whose history inherits the generation ([`answer::inherits`], design
+//! §6.2) re-keys it: [`Action::ReKey`] rolls the log to a segment naming the new token with the
+//! CLAIM record of the claim that follows, and the replicator claims as after any fence. A
+//! takeover claims above every epoch seen. While bound, a continuation claims `own + 1` from
+//! streaming (or over a claim it holds and is reconciling), and an unconfirmed continuation claim
+//! is sent again, same epoch and body, under the new token: claiming higher at once would fence an
+//! owner that claimed `own + 1` meanwhile, since every owner shares the producer id. A repeat
+//! receipt for that claim means it applied before the history event, so the record stays
+//! history-fenced and the next append would be refused (#581 §2.3.1 rows 9 and 11): one more
+//! continuation claim follows. A takeover re-keys only with nothing pending
+//! ([`answer::takeover_may_rekey`]): otherwise it resets `rewound` before the log rolls, and the
+//! next open refuses with the files kept, since the log's acknowledged offset may trail
+//! acknowledgements the pending tail holds (salvage comes later in M2).
+//!
+//! Left for later milestones: resume (M4), re-cut and PART sending (M3) and the provisional
+//! deferred claim (M2).
 //!
 //! Module map:
 //!
@@ -46,6 +60,7 @@ use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 
+use ursula_headers::ClosedEpoch;
 use ursula_headers::ClusterId;
 use ursula_headers::Delivery;
 use ursula_headers::Epoch;
@@ -62,13 +77,17 @@ use ursula_headers::SnapshotRef;
 use self::answer::AppendDecision;
 use self::answer::ClaimDecision;
 use self::answer::Common;
+use self::answer::HeadCheck;
 use self::answer::HeadDecision;
 use self::answer::ReadDecision;
+use self::answer::Unacked;
 use self::answer::decide_append;
 use self::answer::decide_claim;
 use self::answer::decide_head;
 use self::answer::decide_read;
 use self::answer::decide_status;
+use self::answer::takeover_may_rekey;
+use self::backoff::HeadOutcome;
 use self::backoff::Hit;
 use self::backoff::Link;
 use self::batch::SealError;
@@ -125,10 +144,22 @@ pub(crate) struct Pending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaimKind {
     /// `open()` with the stream answering: above every epoch seen, retried higher after a lost
-    /// claim, at most [`TAKEOVER_ROUNDS`] rounds. `round` counts from 1.
-    Takeover { round: u8 },
-    /// After `producer-expired`: exactly `own + 1`, lost at the first answer but its receipt.
-    Continuation { own: Epoch },
+    /// claim, at most [`TAKEOVER_ROUNDS`] rounds. `round` counts from 1. `rekeyed`: the
+    /// generation re-keyed in this open (design §6.2).
+    Takeover { round: u8, rekeyed: bool },
+    /// After `producer-expired` or a re-key while bound: exactly `own + 1`, lost at the first
+    /// answer but its receipt. `rekeyed`: the claim went out again under a new token, so a repeat
+    /// receipt may be of an attempt that applied before the history event.
+    Continuation { own: Epoch, rekeyed: bool },
+}
+
+/// The claim a replicator holds or is making when it re-keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Holding {
+    /// The claim of this epoch is out, its outcome unknown.
+    Claiming(Epoch),
+    /// The claim of this epoch applied (streaming, or reconciling after it).
+    Held(Epoch),
 }
 
 /// Why requests wait for something other than the network to change (design §4.7).
@@ -217,6 +248,14 @@ pub(crate) enum Action {
     /// Append a CLAIM record and fsync it before carrying out any later action: a claim frame
     /// whose activation is in the log is then always ours.
     PersistClaim {
+        epoch: Epoch,
+        activation: Activation,
+    },
+    /// Re-key the generation (design §6.2): roll the log to a new segment naming `incarnation`,
+    /// append the CLAIM record of `(epoch, activation)` and fsync it, all before carrying out any
+    /// later action, the claim's send among them. Every request after it carries `incarnation`.
+    ReKey {
+        incarnation: Incarnation,
         epoch: Epoch,
         activation: Activation,
     },
@@ -317,6 +356,10 @@ pub(crate) struct LocalState {
     /// The db file's size: a takeover's catch-up in place whose frames grow past it rebuilds
     /// instead (design §5.6).
     pub(crate) db_bytes: u64,
+    /// A takeover at open whose generation was built under this token and whose history the
+    /// open's HEAD found inheriting: the replicator re-keys before it claims, and `incarnation`
+    /// is the stream's new token.
+    pub(crate) rekey_from: Option<Incarnation>,
 }
 
 /// The request limit `L` (design §4.6): the latest HEAD's, any limit a typed `413` named since,
@@ -375,13 +418,35 @@ pub(crate) struct Ctx {
     reached: Vec<BoundaryReceipt>,
     /// The db file's size at the start.
     pub(crate) db_bytes: u64,
+    /// The token the generation re-keyed from, until a claim under the new one applies: a HEAD
+    /// still inherits from it ([`HeadCheck::previous`]). Several re-keys with no write between
+    /// them keep the first.
+    pub(crate) rekey_from: Option<Incarnation>,
+    /// What the repeat before D4's follow-up claim said it closed: the epoch the binding streamed
+    /// in, which the follow-up's own receipt (closing the repeated claim's epoch) no longer names.
+    repeat_closed: Option<ClosedEpoch>,
     /// `Producer-Id`, checked once when the replicator starts.
     producer: ProducerId,
     next_id: u64,
-    /// Negative control: re-seal the in-flight batch when resending it, so one key carries two
-    /// bodies. The proptest checks that its properties catch this.
+    /// The negative controls the proptest checks its properties against.
     #[cfg(test)]
+    pub(crate) knobs: Knobs,
+}
+
+/// Negative controls: each breaks one rule, and the proptest checks that its properties catch it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Knobs {
+    /// Re-seal the in-flight batch when resending it, so one key carries two bodies.
     pub(crate) renumber: bool,
+    /// Re-key on any other token, inheriting or not.
+    pub(crate) rekey_always: bool,
+    /// Bind on a repeat receipt for a claim sent again after a re-key, with no claim after it.
+    pub(crate) no_claim_after_repeat: bool,
+    /// Take a HEAD of another cluster for a deleted stream.
+    pub(crate) misroute_as_deleted: bool,
+    /// Take a HEAD of another cluster's stream for a history that inherits the generation.
+    pub(crate) misroute_as_rekey: bool,
 }
 
 impl Ctx {
@@ -411,11 +476,31 @@ impl Ctx {
             condition: None,
             reached: Vec::new(),
             db_bytes: local.db_bytes,
+            rekey_from: local.rekey_from,
+            repeat_closed: None,
             producer,
             next_id: 0,
             #[cfg(test)]
-            renumber: false,
+            knobs: Knobs::default(),
         })
+    }
+
+    /// What a HEAD is checked against.
+    fn head_check(&self) -> HeadCheck<'_> {
+        HeadCheck {
+            cluster_id: &self.cluster_id,
+            incarnation: self.incarnation,
+            previous: self.rekey_from,
+            acked_offset: self.acked_offset,
+        }
+    }
+
+    /// What a HEAD answer decides for this generation.
+    pub(crate) fn head_decision(&self, exchange: &Exchange) -> HeadDecision {
+        let decision = decide_head(exchange, self.head_check());
+        #[cfg(test)]
+        let decision = self.knobs.head_decision(exchange, decision);
+        decision
     }
 
     /// The id of the next attempt.
@@ -572,6 +657,37 @@ impl Ctx {
     }
 }
 
+#[cfg(test)]
+impl Knobs {
+    /// What the HEAD knobs make of `decision`.
+    fn head_decision(self, exchange: &Exchange, decision: HeadDecision) -> HeadDecision {
+        let head = match exchange {
+            Exchange::Answered(answer) => match &answer.typed {
+                Ok(Typed::Head {
+                    stream: Some(head), ..
+                }) => Some(*head),
+                _ => None,
+            },
+            Exchange::NoAnswer(_) => None,
+        };
+        let rekey = |head: ursula_headers::StreamHead| HeadDecision::ReKey {
+            incarnation: head.incarnation(),
+            from: head
+                .inherited()
+                .map_or(head.incarnation(), |i| i.previous_incarnation),
+            max_request_bytes: head.max_request_bytes(),
+        };
+        match decision {
+            HeadDecision::Rewound if self.rekey_always => head.map_or(HeadDecision::Rewound, rekey),
+            HeadDecision::WrongCluster if self.misroute_as_deleted => HeadDecision::Deleted,
+            HeadDecision::WrongCluster if self.misroute_as_rekey => {
+                head.map_or(HeadDecision::WrongCluster, rekey)
+            }
+            other => other,
+        }
+    }
+}
+
 fn next_epoch(epoch: Epoch) -> Option<Epoch> {
     epoch
         .get()
@@ -664,7 +780,8 @@ pub(crate) enum Replicator {
 const OVERSIZED_RETRY_MS: u64 = backoff::BLOCKED_RETRY_MS;
 
 impl Replicator {
-    /// Starts claiming: the CLAIM record, then the claim.
+    /// Starts claiming: the CLAIM record, then the claim. A takeover whose `local` names a token
+    /// to re-key from re-keys first ([`Action::ReKey`] in place of the CLAIM record).
     pub(crate) fn activate(kind: ClaimKind, local: LocalState) -> (Self, Vec<Action>) {
         let mut actions = Vec::new();
         let Some(ctx) = Ctx::new(local) else {
@@ -672,15 +789,26 @@ impl Replicator {
             return (Self::Reset(ResetKind::Internal), actions);
         };
         let mut ctx = Box::new(ctx);
-        let epoch = match kind {
-            ClaimKind::Takeover { .. } => ctx.takeover_epoch(),
-            ClaimKind::Continuation { own } => next_epoch(own),
+        let (kind, epoch, rekeyed) = match kind {
+            ClaimKind::Takeover { round, .. } => {
+                let rekeyed = ctx.rekey_from.is_some();
+                let kind = ClaimKind::Takeover { round, rekeyed };
+                (kind, ctx.takeover_epoch(), rekeyed)
+            }
+            ClaimKind::Continuation { own, rekeyed } => {
+                let kind = ClaimKind::Continuation { own, rekeyed };
+                (kind, next_epoch(own), false)
+            }
         };
         let Some(epoch) = epoch else {
             actions.push(Action::Reset(ResetKind::Internal));
             return (Self::Reset(ResetKind::Internal), actions);
         };
-        let link = claim(&mut ctx, epoch, &mut actions);
+        let link = if rekeyed {
+            rekey_claim(&mut ctx, epoch, &mut actions)
+        } else {
+            claim(&mut ctx, epoch, &mut actions)
+        };
         let state = Self::Activating {
             kind,
             step: Step::Claim { epoch, link },
@@ -689,11 +817,11 @@ impl Replicator {
         (state, actions)
     }
 
-    /// The test-only knob of the renumbering negative control.
+    /// The test-only negative controls.
     #[cfg(test)]
-    pub(crate) fn set_renumber(&mut self, renumber: bool) {
+    pub(crate) fn set_knobs(&mut self, knobs: Knobs) {
         if let Some(ctx) = self.ctx_mut() {
-            ctx.renumber = renumber;
+            ctx.knobs = knobs;
         }
     }
 
@@ -750,9 +878,108 @@ fn claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
     let activation = ctx.activation;
     ctx.claims.push((epoch, activation));
     actions.push(Action::PersistClaim { epoch, activation });
-    let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, activation));
+    send_claim(ctx, epoch, actions)
+}
+
+/// Re-keys the generation to `ctx.incarnation` with the CLAIM record of `epoch`, and sends that
+/// claim under the new token.
+fn rekey_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
+    let activation = ctx.activation;
+    if !ctx.claims.contains(&(epoch, activation)) {
+        ctx.claims.push((epoch, activation));
+    }
+    actions.push(Action::ReKey {
+        incarnation: ctx.incarnation,
+        epoch,
+        activation,
+    });
+    send_claim(ctx, epoch, actions)
+}
+
+/// Sends the claim of `epoch`, whose CLAIM record is logged.
+fn send_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
+    let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, ctx.activation));
     let request = ctx.write_request(epoch, Seq::ZERO, body);
     Link::send(request, ctx, actions)
+}
+
+/// A HEAD named `incarnation`, another token whose history inherits the generation (design
+/// §6.2): the generation re-keys to it and claims under it, as after any fence. A takeover claims
+/// above every epoch seen. A continuation sends an unconfirmed claim again, same epoch and body,
+/// and claims `own + 1` over a claim it holds. Whatever was outstanding goes: the claim's
+/// reconcile reads what landed.
+fn rekey(
+    kind: ClaimKind,
+    holding: Holding,
+    incarnation: Incarnation,
+    previous: Incarnation,
+    mut ctx: Box<Ctx>,
+    actions: &mut Vec<Action>,
+) -> Replicator {
+    let unacked = if ctx.pending.is_empty() {
+        Unacked::Nothing
+    } else {
+        Unacked::Commits
+    };
+    if matches!(kind, ClaimKind::Takeover { .. }) && !takeover_may_rekey(unacked) {
+        // Before the log rolls: the next open finds the old token and refuses the same way.
+        return reset(ResetKind::Rewound, actions);
+    }
+    ctx.set_condition(None, actions);
+    let from = ctx.incarnation;
+    // The token the HEAD says the stream was last written under: a later history event with no
+    // write between names it again.
+    ctx.rekey_from = Some(previous);
+    ctx.incarnation = incarnation;
+    let (kind, epoch) = match (kind, holding) {
+        (ClaimKind::Takeover { round, .. }, _) => (
+            ClaimKind::Takeover {
+                round,
+                rekeyed: true,
+            },
+            ctx.takeover_epoch(),
+        ),
+        (ClaimKind::Continuation { own, .. }, Holding::Claiming(epoch)) => {
+            (ClaimKind::Continuation { own, rekeyed: true }, Some(epoch))
+        }
+        (ClaimKind::Continuation { .. }, Holding::Held(epoch)) => (
+            ClaimKind::Continuation {
+                own: epoch,
+                rekeyed: true,
+            },
+            next_epoch(epoch),
+        ),
+    };
+    let Some(epoch) = epoch else {
+        return reset(ResetKind::Internal, actions);
+    };
+    log::emit(Level::Info, "rekey", &[
+        ("from", &from),
+        ("to", &incarnation),
+        ("epoch", &epoch),
+    ]);
+    let link = rekey_claim(&mut ctx, epoch, actions);
+    Replicator::Activating {
+        kind,
+        step: Step::Claim { epoch, link },
+        ctx,
+    }
+}
+
+/// What an activating replicator does with what its link's HEAD decided.
+fn activating_head(
+    outcome: HeadOutcome,
+    kind: ClaimKind,
+    holding: Holding,
+    ctx: Box<Ctx>,
+    step: Step,
+    actions: &mut Vec<Action>,
+) -> Replicator {
+    match outcome {
+        HeadOutcome::Waiting => Replicator::Activating { kind, step, ctx },
+        HeadOutcome::ReKey { to, from } => rekey(kind, holding, to, from, ctx, actions),
+        HeadOutcome::Reset(kind) => reset(kind, actions),
+    }
 }
 
 /// How a live state ends on an event every state handles alike.
@@ -861,14 +1088,11 @@ fn activating(
                     step: Step::Claim { epoch, link },
                     ctx,
                 },
-                Hit::Head => match link.head_answer(&exchange, now_ms, &mut ctx, actions) {
-                    Err(kind) => reset(kind, actions),
-                    Ok(()) => Replicator::Activating {
-                        kind,
-                        step: Step::Claim { epoch, link },
-                        ctx,
-                    },
-                },
+                Hit::Head => {
+                    let outcome = link.head_answer(&exchange, now_ms, &mut ctx, actions);
+                    let step = Step::Claim { epoch, link };
+                    activating_head(outcome, kind, Holding::Claiming(epoch), ctx, step, actions)
+                }
                 Hit::Main => claim_answered(kind, epoch, link, ctx, id, &exchange, now_ms, actions),
             },
             Event::Logged(_)
@@ -900,14 +1124,12 @@ fn activating(
                     step: Step::Reconcile { reconcile, link },
                     ctx,
                 },
-                Hit::Head => match link.head_answer(&exchange, now_ms, &mut ctx, actions) {
-                    Err(kind) => reset(kind, actions),
-                    Ok(()) => Replicator::Activating {
-                        kind,
-                        step: Step::Reconcile { reconcile, link },
-                        ctx,
-                    },
-                },
+                Hit::Head => {
+                    let outcome = link.head_answer(&exchange, now_ms, &mut ctx, actions);
+                    let holding = Holding::Held(reconcile.epoch());
+                    let step = Step::Reconcile { reconcile, link };
+                    activating_head(outcome, kind, holding, ctx, step, actions)
+                }
                 Hit::Main => match decide_read(&exchange) {
                     ReadDecision::Bytes { next } => {
                         ctx.set_condition(None, actions);
@@ -1040,9 +1262,14 @@ fn activating(
             match (event, hit) {
                 (Event::Tick, _) => link.tick(now_ms, &mut ctx, actions),
                 (Event::Answer { exchange, .. }, Hit::Head) => {
-                    if let Err(kind) = link.head_answer(&exchange, now_ms, &mut ctx, actions) {
-                        return reset(kind, actions);
-                    }
+                    let outcome = link.head_answer(&exchange, now_ms, &mut ctx, actions);
+                    let holding = Holding::Held(reconcile.epoch());
+                    let step = Step::Gone {
+                        reconcile,
+                        link,
+                        snapshot,
+                    };
+                    return activating_head(outcome, kind, holding, ctx, step, actions);
                 }
                 (Event::Answer { exchange, .. }, Hit::Main) => {
                     let gone = Gone {
@@ -1128,7 +1355,7 @@ impl Gone {
             return self.common(common, exchange, ctx, now_ms, actions);
         };
         let Some(snapshot) = self.snapshot else {
-            return match decide_head(exchange, &ctx.cluster_id, ctx.incarnation) {
+            return match ctx.head_decision(exchange) {
                 HeadDecision::Same { max_request_bytes } => {
                     ctx.set_condition(None, actions);
                     ctx.limits.head = max_request_bytes;
@@ -1151,6 +1378,15 @@ impl Gone {
                             .waiting(ctx)
                         }
                     }
+                }
+                HeadDecision::ReKey {
+                    incarnation,
+                    from,
+                    max_request_bytes,
+                } => {
+                    ctx.limits.head = max_request_bytes;
+                    let holding = Holding::Held(self.reconcile.epoch());
+                    rekey(self.kind, holding, incarnation, from, ctx, actions)
                 }
                 HeadDecision::Rewound => reset(ResetKind::Rewound, actions),
                 HeadDecision::Deleted => reset(ResetKind::Deleted, actions),
@@ -1292,6 +1528,40 @@ fn claim_answered(
             if receipt.start() < ctx.acked_offset {
                 return reset(ResetKind::StreamState, actions);
             }
+            if delivery == Delivery::Repeat
+                && matches!(kind, ClaimKind::Continuation { rekeyed: true, .. })
+                && !repeat_binds(&ctx)
+            {
+                // The claim applied before the history event, so the record stays
+                // history-fenced: one more claim over it (design §6.2, D4).
+                let Some(next) = next_epoch(epoch) else {
+                    return reset(ResetKind::Internal, actions);
+                };
+                ctx.repeat_closed = closed;
+                let link = claim(&mut ctx, next, actions);
+                return Replicator::Activating {
+                    kind: ClaimKind::Continuation {
+                        own: epoch,
+                        rekeyed: false,
+                    },
+                    step: Step::Claim { epoch: next, link },
+                    ctx,
+                };
+            }
+            // Every claim but a repeat after a re-key (handled above) only ever went out under the
+            // current token: it landed under it, and a later history event begins from it.
+            ctx.rekey_from = None;
+            // D4's follow-up closes only the repeated claim's epoch, at seq 0: the reconcile
+            // cross-checks the epoch the binding streamed in against what the repeat named.
+            let repeated = ctx.repeat_closed.take();
+            let closed = match (closed, repeated) {
+                (Some(own), Some(repeated))
+                    if own.seq == Seq::ZERO && next_epoch(own.epoch) == Some(epoch) =>
+                {
+                    Some(repeated)
+                }
+                (closed, _) => closed,
+            };
             let mode = match kind {
                 ClaimKind::Takeover { .. } => Mode::Takeover,
                 ClaimKind::Continuation { .. } => Mode::Continuation,
@@ -1320,11 +1590,11 @@ fn claim_answered(
             }
             match kind {
                 ClaimKind::Continuation { .. } => reset(ResetKind::Fenced, actions),
-                ClaimKind::Takeover { round } if round >= TAKEOVER_ROUNDS => {
+                ClaimKind::Takeover { round, .. } if round >= TAKEOVER_ROUNDS => {
                     actions.push(Action::Refuse(Refusal::ClaimRaces));
                     Replicator::Refused(Refusal::ClaimRaces)
                 }
-                ClaimKind::Takeover { round } => {
+                ClaimKind::Takeover { round, rekeyed } => {
                     let Some(next) = ctx.takeover_epoch() else {
                         return reset(ResetKind::Internal, actions);
                     };
@@ -1332,6 +1602,7 @@ fn claim_answered(
                     Replicator::Activating {
                         kind: ClaimKind::Takeover {
                             round: round.saturating_add(1),
+                            rekeyed,
                         },
                         step: Step::Claim { epoch: next, link },
                         ctx,
@@ -1350,6 +1621,18 @@ fn claim_answered(
             }
         }
     }
+}
+
+/// Whether a repeat receipt for a claim sent again after a re-key binds without the claim after
+/// it: never, but under the negative control that leaves that claim out.
+#[cfg(test)]
+fn repeat_binds(ctx: &Ctx) -> bool {
+    ctx.knobs.no_claim_after_repeat
+}
+
+#[cfg(not(test))]
+fn repeat_binds(_ctx: &Ctx) -> bool {
+    false
 }
 
 /// After a read of the reconcile: a takeover with nothing pending first applies the read's
@@ -1424,6 +1707,8 @@ fn finish(
 /// Streams under the claimed epoch: the ACK, the tickets, then the first batch.
 fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
     actions.push(Action::Bound { epoch: done.epoch });
+    // A claim under the current token applied: the stream was written under it.
+    ctx.rekey_from = None;
     ctx.acked_offset = done.after_claim;
     ctx.ack_actions(actions);
     ctx.sent.clear();
@@ -1446,7 +1731,7 @@ fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -
 /// now, under the same seq. Only tests turn it on.
 #[cfg(test)]
 fn renumber(epoch: Epoch, sealed: &mut Sealed, link: &mut Link, ctx: &Ctx, now_ms: u64) {
-    if ctx.renumber
+    if ctx.knobs.renumber
         && link.due(now_ms)
         && let Ok(resealed) = batch::seal(epoch, sealed.seq, ctx)
     {
@@ -1598,8 +1883,10 @@ impl Stream {
         };
         let ctx = &mut self.ctx;
         if link.hit(id) == Hit::Head {
-            if let Err(kind) = link.head_answer(exchange, now_ms, ctx, actions) {
-                return reset(kind, actions);
+            match link.head_answer(exchange, now_ms, ctx, actions) {
+                HeadOutcome::Waiting => {}
+                HeadOutcome::ReKey { to, from } => return self.rekey(to, from, actions),
+                HeadOutcome::Reset(kind) => return reset(kind, actions),
             }
             self.work = Work::Append {
                 sealed,
@@ -1645,7 +1932,10 @@ impl Stream {
                 let mut ctx = self.ctx;
                 let link = claim(&mut ctx, next, actions);
                 Replicator::Activating {
-                    kind: ClaimKind::Continuation { own: self.epoch },
+                    kind: ClaimKind::Continuation {
+                        own: self.epoch,
+                        rekeyed: false,
+                    },
                     step: Step::Claim { epoch: next, link },
                     ctx,
                 }
@@ -1664,6 +1954,28 @@ impl Stream {
                 self.into()
             }
         }
+    }
+
+    /// A HEAD of the append or the probe named a history that inherits the generation: the
+    /// in-flight batch and the probe go, and a continuation claims `own + 1` under the new token.
+    fn rekey(
+        self,
+        incarnation: Incarnation,
+        from: Incarnation,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let kind = ClaimKind::Continuation {
+            own: self.epoch,
+            rekeyed: false,
+        };
+        rekey(
+            kind,
+            Holding::Held(self.epoch),
+            incarnation,
+            from,
+            self.ctx,
+            actions,
+        )
     }
 
     fn probe_answered(
@@ -1685,11 +1997,13 @@ impl Stream {
         let quiet = !matches!(self.work, Work::Idle);
         let ctx = &mut self.ctx;
         if link.hit(id) == Hit::Head {
-            let result = quietly(quiet, ctx, actions, |ctx, actions| {
+            let outcome = quietly(quiet, ctx, actions, |ctx, actions| {
                 link.head_answer(exchange, now_ms, ctx, actions)
             });
-            if let Err(kind) = result {
-                return reset(kind, actions);
+            match outcome {
+                HeadOutcome::Waiting => {}
+                HeadOutcome::ReKey { to, from } => return self.rekey(to, from, actions),
+                HeadOutcome::Reset(kind) => return reset(kind, actions),
             }
             self.probe = Some(Probe { from, link });
             return self.into();

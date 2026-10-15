@@ -7,6 +7,10 @@
 //!
 //! `stale-epoch` answers an append whose epoch a newer claim superseded, so it fences, and a claim
 //! that a newer epoch outranks, so the claim is lost.
+//!
+//! [`inherits`] is the test of design §6.2 (W5) that both a HEAD while bound and the open's table
+//! apply: a generation keeps itself across a history whose `Stream-Previous-Incarnation` is its
+//! own token and whose `Stream-Inherited-Offset` is at or above its acknowledged offset.
 
 use std::time::Duration;
 
@@ -19,6 +23,7 @@ use ursula_headers::Offset;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
 use ursula_headers::RoutingAnswer;
+use ursula_headers::StreamHead;
 
 use super::BlockedReason;
 use super::ResetKind;
@@ -30,7 +35,7 @@ use crate::wire::Typed;
 /// Why a HEAD is sent before deciding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeadReason {
-    /// A `412` or `404`: another history, a deleted stream, or misrouting.
+    /// A `412`, `404` or `416`: another history, a deleted stream, or misrouting.
     Precondition,
     /// A `413` that names no limit: a layer outside #581 §6.4.
     TooLarge,
@@ -109,13 +114,62 @@ pub(crate) enum HeadDecision {
     Same {
         max_request_bytes: u64,
     },
-    /// Another token: in M1 (no re-key) a reset `rewound`.
+    /// Another token, and the history it names inherits every byte this generation acknowledged
+    /// ([`inherits`]): re-key to `incarnation` (design §6.2).
+    ReKey {
+        incarnation: Incarnation,
+        from: Incarnation,
+        max_request_bytes: u64,
+    },
+    /// Another token whose history does not inherit what this generation acknowledged: a reset
+    /// `rewound`.
     Rewound,
     /// No stream at the path, on our cluster.
     Deleted,
     /// Another `Ursula-Cluster-Id`.
     WrongCluster,
     Common(Common),
+}
+
+/// What a HEAD is checked against: the generation's cluster, its token, the token it re-keyed
+/// from while no write of it landed under the new one, and its acknowledged offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeadCheck<'a> {
+    pub(crate) cluster_id: &'a ClusterId,
+    pub(crate) incarnation: Incarnation,
+    /// The token this generation re-keyed from, until a claim of it applies under the new one. Two
+    /// history events with no write between them name the token from before both (#581 §4.8), so
+    /// a re-key whose claim has not landed still inherits from it.
+    pub(crate) previous: Option<Incarnation>,
+    pub(crate) acked_offset: Offset,
+}
+
+/// Whether the history `head` names inherits a generation of token `ours` that acknowledged
+/// everything below `acked_offset` (design §6.2, W5): the stream was last written under `ours`
+/// before the history event, and its bytes survived at least up to `acked_offset`. Offsets lie in
+/// one space across history events, so they compare by order.
+pub(crate) fn inherits(head: &StreamHead, ours: Incarnation, acked_offset: Offset) -> bool {
+    head.incarnation() != ours
+        && head
+            .inherited()
+            .is_some_and(|i| i.previous_incarnation == ours && acked_offset <= i.offset)
+}
+
+/// Whether a log holds commits of its own after its latest ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unacked {
+    Nothing,
+    /// Some, and an ACK record may trail the stream's acknowledgements of them.
+    Commits,
+}
+
+/// Whether a takeover may re-key a generation whose log holds `pending`: only with nothing
+/// pending. An ACK record trails the stream's acknowledgements, so a pending tail may hold
+/// acknowledged commits a history change lost, and a re-keyed log names the new token: a later
+/// open would resume it and discard that tail. Until salvage keeps it (later in M2), the
+/// open refuses such a generation, and a takeover resets before its log rolls, keeping the files.
+pub(crate) fn takeover_may_rekey(pending: Unacked) -> bool {
+    pending == Unacked::Nothing
 }
 
 /// The epoch a producer answer names, if any.
@@ -213,11 +267,7 @@ pub(crate) fn decide_read(exchange: &Exchange) -> ReadDecision {
 }
 
 /// The HEAD after a `412`, `404` or untyped `413`: our cluster and token, or why not.
-pub(crate) fn decide_head(
-    exchange: &Exchange,
-    cluster_id: &ClusterId,
-    incarnation: Incarnation,
-) -> HeadDecision {
+pub(crate) fn decide_head(exchange: &Exchange, check: HeadCheck<'_>) -> HeadDecision {
     let answer = match exchange {
         Exchange::NoAnswer(_) => return HeadDecision::Common(no_answer()),
         Exchange::Answered(answer) => answer,
@@ -227,14 +277,25 @@ pub(crate) fn decide_head(
             identity: Some(identity),
             stream,
         }) if matches!(answer.status, 200 | 404) => {
-            if &identity.cluster_id != cluster_id {
+            if &identity.cluster_id != check.cluster_id {
                 return HeadDecision::WrongCluster;
             }
             match stream {
                 None => HeadDecision::Deleted,
-                Some(head) if head.incarnation() != incarnation => HeadDecision::Rewound,
-                Some(head) => HeadDecision::Same {
+                Some(head) if head.incarnation() == check.incarnation => HeadDecision::Same {
                     max_request_bytes: head.max_request_bytes(),
+                },
+                Some(head) => match [Some(check.incarnation), check.previous]
+                    .into_iter()
+                    .flatten()
+                    .find(|ours| inherits(head, *ours, check.acked_offset))
+                {
+                    Some(from) => HeadDecision::ReKey {
+                        incarnation: head.incarnation(),
+                        from,
+                        max_request_bytes: head.max_request_bytes(),
+                    },
+                    None => HeadDecision::Rewound,
                 },
             }
         }
@@ -277,7 +338,9 @@ pub(crate) fn decide_status(answer: &Answer) -> Common {
             fresh: false,
         },
         _ => match status {
-            404 => Common::Head(HeadReason::Precondition),
+            // A `416` answers a read past the tail. Under our token that cannot happen (H1), and the
+            // precondition is checked after the range (#581 §2.4): the history changed.
+            404 | 416 => Common::Head(HeadReason::Precondition),
             401 => Common::Reauthorize,
             402 => Common::Blocked(BlockedReason::PaymentRequired),
             // A `403` with `Producer-Epoch` is a producer answer: this one is an authorizer's.
