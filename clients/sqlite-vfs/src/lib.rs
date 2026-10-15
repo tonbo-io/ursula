@@ -145,6 +145,8 @@
 //!
 //! Module map:
 //!
+//! - [`codec`]: the 0.8 formats (`USQ2` frames, `USL1` log segments, `USS3` snapshot bodies) and
+//!   the digests the server checks, not yet used by the extension.
 //! - [`frame`]: the stream's frames (commits and claims).
 //! - [`snapshot`]: snapshot bodies.
 //! - `attach`: `ursula_attach`, from the local files' trust decision to the bound attachment.
@@ -160,6 +162,7 @@
 //!   `Action`).
 //! - `extension`: the entry point and the SQL functions.
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
+//! - [`ids`]: lineages, activations, positions, epochs, sequence numbers and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
@@ -174,6 +177,7 @@ mod attach;
 mod auth;
 mod claim;
 mod client;
+pub mod codec;
 mod config;
 mod db;
 mod descriptors;
@@ -182,6 +186,7 @@ mod extension;
 pub mod frame;
 mod guard;
 mod host;
+pub mod ids;
 mod local;
 mod log;
 mod net;

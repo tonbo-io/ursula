@@ -1,0 +1,191 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "tests compute cuts, bits and positions from small generated sizes"
+)]
+
+use std::io::Cursor;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+
+use proptest::collection::vec;
+use proptest::prelude::any;
+use proptest::prop_assert_eq;
+use proptest::proptest;
+
+use super::HEADER;
+use super::PAGE;
+use super::SnapshotError;
+use super::SnapshotFields;
+use super::SnapshotHeader;
+use super::read_header;
+use super::read_image;
+use super::write_body;
+use crate::ids::CommitId;
+use crate::ids::Epoch;
+use crate::ids::Lineage;
+use crate::ids::Position;
+
+fn fields() -> SnapshotFields {
+    SnapshotFields {
+        offset: 4242,
+        epoch: Epoch(9),
+        last: CommitId {
+            lineage: Lineage([5; 16]),
+            position: Position(77),
+        },
+    }
+}
+
+fn image(pages: usize) -> Vec<u8> {
+    (0..pages * PAGE).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+fn body(fields: &SnapshotFields, image: &[u8]) -> (Vec<u8>, SnapshotHeader) {
+    let mut out = Vec::new();
+    let header = write_body(fields, &mut Cursor::new(image), &mut out).unwrap();
+    (out, header)
+}
+
+fn read(body: &[u8]) -> Result<(SnapshotHeader, Vec<u8>), SnapshotError> {
+    let (header, at) = read_header(body)?;
+    let mut out = Vec::new();
+    read_image(&header, &mut &body[at..], &mut out)?;
+    Ok((header, out))
+}
+
+proptest! {
+    // A body carries its fields and image through, whatever they are.
+    #[test]
+    fn bodies_round_trip(
+        offset in any::<u64>(),
+        epoch in any::<u64>(),
+        lineage in any::<[u8; 16]>(),
+        position in any::<u64>(),
+        seeds in vec(any::<u8>(), 0..4),
+    ) {
+        let f = SnapshotFields {
+            offset,
+            epoch: Epoch(epoch),
+            last: CommitId { lineage: Lineage(lineage), position: Position(position) },
+        };
+        let image: Vec<u8> = seeds.iter().flat_map(|&s| [s; PAGE]).collect();
+        let (body, header) = body(&f, &image);
+        prop_assert_eq!(header.fields, f);
+        prop_assert_eq!(header.pages as usize, seeds.len());
+        prop_assert_eq!(read(&body).unwrap(), (header, image));
+    }
+}
+
+#[test]
+fn the_image_is_read_from_its_current_position() {
+    let mut file = vec![1u8; 10];
+    file.extend(image(2));
+    let mut cursor = Cursor::new(file);
+    cursor.seek(SeekFrom::Start(10)).unwrap();
+    let mut out = Vec::new();
+    let header = write_body(&fields(), &mut cursor, &mut out).unwrap();
+    assert_eq!(header.pages, 2);
+    assert_eq!(read(&out).unwrap().1, image(2));
+}
+
+// A damaged page count fails before anything is decompressed or written.
+#[test]
+fn a_damaged_page_count_fails_without_allocating() {
+    let (mut body, _) = body(&fields(), &image(3));
+    body[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+    let (header, at) = read_header(&body).unwrap();
+    assert_eq!(header.pages, u32::MAX);
+    let mut out = Vec::new();
+    assert!(matches!(
+        read_image(&header, &mut &body[at..], &mut out),
+        Err(SnapshotError::PageCount { pages: u32::MAX, found: Some(n) }) if n == 3 * PAGE as u64
+    ));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn a_checksum_mismatch_is_an_error() {
+    let (mut body, header) = body(&fields(), &image(3));
+    body[48] ^= 1;
+    assert!(matches!(
+        read(&body),
+        Err(SnapshotError::Checksum { expected, found }) if found == header.crc && expected != found
+    ));
+}
+
+#[test]
+fn a_cut_or_damaged_image_is_an_error() {
+    let (body, _) = body(&fields(), &image(3));
+    assert!(matches!(
+        read(&body[..body.len() - 1]),
+        Err(SnapshotError::Zstd(_) | SnapshotError::ImageLength { .. })
+    ));
+    assert!(matches!(
+        read(&body[..HEADER + 2]),
+        Err(SnapshotError::PageCount { found: None, .. })
+    ));
+    assert!(matches!(
+        read(&body[..HEADER - 1]),
+        Err(SnapshotError::HeaderTruncated { len }) if len == HEADER - 1
+    ));
+}
+
+#[test]
+fn partial_pages_are_refused() {
+    let mut out = Vec::new();
+    assert!(matches!(
+        write_body(&fields(), &mut Cursor::new(&image(1)[1..]), &mut out),
+        Err(SnapshotError::PartialPage { len }) if len == PAGE as u64 - 1
+    ));
+}
+
+/// An image that grows between `write_body`'s two reads.
+struct Growing {
+    inner: Cursor<Vec<u8>>,
+    rewound: bool,
+}
+
+impl Read for Growing {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for Growing {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        if matches!(pos, SeekFrom::Start(_)) && !self.rewound {
+            self.rewound = true;
+            let mut more = self.inner.get_ref().clone();
+            more.extend(image(1));
+            *self.inner.get_mut() = more;
+        }
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn an_image_that_changes_between_reads_is_refused() {
+    let mut out = Vec::new();
+    let mut growing = Growing {
+        inner: Cursor::new(image(1)),
+        rewound: false,
+    };
+    assert!(matches!(
+        write_body(&fields(), &mut growing, &mut out),
+        Err(SnapshotError::ImageChanged)
+    ));
+}
+
+// A body of another format fails closed and names what it found.
+#[test]
+fn another_format_is_refused_by_its_magic() {
+    let (mut body, _) = body(&fields(), &image(1));
+    body[3] = b'2';
+    let err = read_header(&body).unwrap_err();
+    assert!(matches!(&err, SnapshotError::Magic { found } if found == b"USS2"));
+    assert!(
+        err.to_string()
+            .starts_with("snapshot magic \"USS2\": this extension reads \"USS3\"")
+    );
+}
