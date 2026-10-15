@@ -1179,6 +1179,17 @@ fn producer_cap_evicts_hour_idle_producers_and_rejects_otherwise() {
     assert_eq!(producer_snapshot(&restored), producer_snapshot(&machine));
 }
 
+/// How a proptest write closes the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closing {
+    /// An append that leaves the stream open.
+    No,
+    /// An append with `Stream-Closed: true`.
+    WithBody,
+    /// A close-only write.
+    CloseOnly,
+}
+
 /// One step of the producer proptest.
 #[derive(Debug, Clone)]
 enum Op {
@@ -1209,21 +1220,35 @@ enum Op {
         digest: Option<u8>,
         tokened: bool,
     },
-    /// The clock moves on, past idle expiry or not.
-    Wait { idle: bool },
+    /// The producer's next key closes the stream, with or without a body.
+    Close {
+        producer: usize,
+        with_body: bool,
+        tokened: bool,
+    },
+    /// The clock moves on: a second, past the producer cap's idle hour, or
+    /// past idle expiry.
+    Wait { by: u64 },
+    /// `TidyStream` retires the idle records.
+    Tidy,
+    /// Other producers fill the stream to the producer cap, at `epoch`.
+    Crowd { epoch: u64 },
+    /// A replica restores the snapshot and carries on in its place.
+    Restore,
 }
 
 const PRODUCERS: [&str; 2] = ["a", "b"];
 
 fn op_strategy() -> impl Strategy<Value = Op> {
+    use super::producers::PRODUCER_CAP_EVICT_IDLE_MS;
     let digest = prop_oneof![Just(None), Just(Some(1_u8)), Just(Some(2_u8))];
     prop_oneof![
-        4 => (0..2_usize, digest.clone(), any::<bool>()).prop_map(|(producer, digest, tokened)| Op::Next {
+        8 => (0..2_usize, digest.clone(), any::<bool>()).prop_map(|(producer, digest, tokened)| Op::Next {
             producer,
             digest,
             tokened,
         }),
-        2 => (0..2_usize, 1..3_u64, digest.clone(), any::<bool>()).prop_map(
+        4 => (0..2_usize, 1..3_u64, digest.clone(), any::<bool>()).prop_map(
             |(producer, bump, digest, tokened)| Op::Claim {
                 producer,
                 bump,
@@ -1231,12 +1256,12 @@ fn op_strategy() -> impl Strategy<Value = Op> {
                 tokened,
             }
         ),
-        3 => (any::<usize>(), digest.clone(), any::<bool>()).prop_map(|(pick, digest, tokened)| Op::Repeat {
+        6 => (any::<usize>(), digest.clone(), any::<bool>()).prop_map(|(pick, digest, tokened)| Op::Repeat {
             pick,
             digest,
             tokened,
         }),
-        2 => (0..2_usize, 0..5_u64, 0..4_u64, digest, any::<bool>()).prop_map(
+        4 => (0..2_usize, 0..6_u64, 0..4_u64, digest, any::<bool>()).prop_map(
             |(producer, epoch, seq, digest, tokened)| Op::Any {
                 producer,
                 epoch,
@@ -1245,7 +1270,20 @@ fn op_strategy() -> impl Strategy<Value = Op> {
                 tokened,
             }
         ),
-        1 => any::<bool>().prop_map(|idle| Op::Wait { idle }),
+        1 => (0..2_usize, any::<bool>(), any::<bool>()).prop_map(|(producer, with_body, tokened)| Op::Close {
+            producer,
+            with_body,
+            tokened,
+        }),
+        2 => prop_oneof![
+            Just(1_000_u64),
+            Just(PRODUCER_CAP_EVICT_IDLE_MS),
+            Just(PRODUCER_IDLE_EXPIRY_MS),
+        ]
+        .prop_map(|by| Op::Wait { by }),
+        1 => Just(Op::Tidy),
+        1 => (0..6_u64).prop_map(|epoch| Op::Crowd { epoch }),
+        1 => Just(Op::Restore),
     ]
 }
 
@@ -1253,6 +1291,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 /// the life of its record.
 #[derive(Debug, Default)]
 struct Ledger {
+    /// The keys of each producer's current record and their receipts.
     applied: HashMap<(String, u64, u64), (WriteReceipt, Option<u8>)>,
     /// The highest applied seq of each `(producer, epoch)`.
     last: HashMap<(String, u64), u64>,
@@ -1262,24 +1301,58 @@ struct Ledger {
     dead: std::collections::HashSet<(String, u64)>,
 }
 
+impl Ledger {
+    /// `producer`'s record retired at `epoch`: none of its keys can be
+    /// repeated, and its epoch is dead to tokened writes.
+    fn retire(&mut self, producer: &str, epoch: u64) {
+        self.dead.insert((producer.to_owned(), epoch));
+        self.applied.retain(|(id, _, _), _| id != producer);
+    }
+}
+
+/// What the test knew before one write.
+struct Before<'a> {
+    write: Write<'a>,
+    closing: Closing,
+    /// The producer's record, unless it was idle and retires at this write.
+    record: Option<ProducerState>,
+    /// Whether the stream was closed.
+    closed: bool,
+    /// The floor the write is evaluated against: the stream's, raised by
+    /// the producer's own idle record. The cap may raise it after.
+    floor: Option<u64>,
+    tail: u64,
+}
+
+/// A write's producer ack, from an append or a close-only answer.
+fn producer_ack(response: &StreamResponse) -> Option<ProducerAck> {
+    match response {
+        StreamResponse::Appended { producer, .. } | StreamResponse::Closed { producer, .. } => {
+            *producer
+        }
+        _ => None,
+    }
+}
+
 fn check_answer(
     ledger: &mut Ledger,
-    write: Write<'_>,
-    record_before: Option<&ProducerState>,
-    floor_before: Option<u64>,
-    tail_before: u64,
+    before: &Before<'_>,
+    floor_after: Option<u64>,
     tail_after: u64,
     response: StreamResponse,
 ) -> Result<(), TestCaseError> {
+    let write = before.write;
+    let record_before = before.record.as_ref();
+    let tail_before = before.tail;
     let id = write.id.to_owned();
     let key = (id.clone(), write.epoch, write.seq);
-    match response {
-        StreamResponse::Appended {
-            producer: Some(ack),
-            ..
-        } => match ack.delivery {
+    if let Some(ack) = producer_ack(&response) {
+        match ack.delivery {
             ProducerDelivery::Applied(receipt) => {
                 prop_assert_eq!((ack.epoch, ack.seq), (write.epoch, write.seq));
+                // Nothing applies to a closed stream.
+                prop_assert!(!before.closed, "a write applied to a closed stream");
+                prop_assert_eq!(receipt.closed, before.closing != Closing::No);
                 // G2b: an epoch a claim closed or a retirement forgot never
                 // applies a tokened write again. Without the token the base
                 // protocol treats a forgotten producer as new (#581 section
@@ -1294,7 +1367,7 @@ fn check_answer(
                     // L4, rows 1 and 2: a tokened claim without a record opens
                     // above the floor.
                     if write.tokened && record_before.is_none() {
-                        prop_assert!(floor_before.is_none_or(|floor| write.epoch > floor));
+                        prop_assert!(before.floor.is_none_or(|floor| write.epoch > floor));
                     }
                     // L1: a key applies at most once, except an untokened
                     // claim of an epoch the stream forgot, which is new: by a
@@ -1348,147 +1421,415 @@ fn check_answer(
                 }
                 prop_assert_eq!(ledger.last.get(&(id, write.epoch)).copied(), Some(ack.seq));
             }
-        },
-        StreamResponse::Error { code, context, .. } => {
+        }
+        return Ok(());
+    }
+    let StreamResponse::Error { code, context, .. } = response else {
+        prop_assert!(false, "unexpected answer {:?}", response);
+        return Ok(());
+    };
+    prop_assert_eq!(
+        tail_after,
+        tail_before,
+        "a refusal changed the stream: {:?}",
+        code
+    );
+    if let [StreamErrorContext::Producer(refusal)] = context.as_slice() {
+        prop_assert_eq!(code, refusal.code());
+    }
+    match context.as_slice() {
+        [StreamErrorContext::Producer(ProducerRefusal::EpochClosed { epoch, closed, .. })] => {
+            // L3: the closure is reported exactly, with the current epoch.
+            let record = record_before.unwrap();
+            prop_assert_eq!(*epoch, record.epoch);
+            prop_assert_eq!(closed.epoch, write.epoch);
             prop_assert_eq!(
-                tail_after,
-                tail_before,
-                "a refusal changed the stream: {:?}",
-                code
+                ledger.last.get(&(id, closed.epoch)).copied(),
+                Some(closed.seq)
             );
-            match context.as_slice() {
-                [StreamErrorContext::Producer(ProducerRefusal::EpochClosed { closed, .. })] => {
-                    // L3: the closure is reported exactly.
-                    prop_assert_eq!(closed.epoch, write.epoch);
-                    prop_assert_eq!(
-                        ledger.last.get(&(id, closed.epoch)).copied(),
-                        Some(closed.seq)
+        }
+        [StreamErrorContext::Producer(ProducerRefusal::StaleEpoch { epoch })] => {
+            // Row 5: an epoch older than the current one and not the one its
+            // claim closed.
+            let record = record_before.unwrap();
+            prop_assert_eq!(*epoch, record.epoch);
+            prop_assert!(write.epoch < record.epoch);
+            prop_assert!(
+                record
+                    .closed_epoch
+                    .is_none_or(|closed| closed.epoch != write.epoch)
+            );
+        }
+        [StreamErrorContext::Producer(ProducerRefusal::Expired { epoch })] => {
+            // Row 1 and the marker: only a tokened write, only at or below
+            // the floor, and the answer names the floor.
+            prop_assert!(write.tokened, "an untokened write got producer-expired");
+            prop_assert_eq!(Some(*epoch), before.floor);
+            prop_assert_eq!(before.floor, floor_after);
+            match record_before {
+                None => prop_assert!(write.epoch <= *epoch),
+                Some(record) => {
+                    prop_assert_eq!(record.opened, Opened::BelowFloor);
+                    prop_assert!(
+                        !(write.seq == 0 && write.epoch > record.epoch && write.epoch > *epoch),
+                        "a claim above the floor was expired"
                     );
                 }
-                [StreamErrorContext::Producer(ProducerRefusal::KeyConflict { .. })] => {
-                    let original = ledger.applied.get(&key);
-                    prop_assert!(original.is_some(), "a conflict on a key that never applied");
-                    prop_assert_ne!(original.unwrap().1, write.digest);
-                }
-                _ => {}
             }
         }
-        other => prop_assert!(false, "unexpected answer {:?}", other),
+        [StreamErrorContext::Producer(ProducerRefusal::KeyConflict { .. })] => {
+            let original = ledger.applied.get(&key);
+            prop_assert!(original.is_some(), "a conflict on a key that never applied");
+            prop_assert_ne!(original.unwrap().1, write.digest);
+        }
+        [StreamErrorContext::Producer(ProducerRefusal::EpochNotClaimed)] => {
+            // Row 7: a seq above 0 of an epoch above the record's.
+            let record = record_before.unwrap();
+            prop_assert!(write.seq > 0 && write.epoch > record.epoch);
+        }
+        [
+            StreamErrorContext::ProducerSeqConflict {
+                expected_seq,
+                received_seq,
+            },
+        ] => {
+            // Row 3 expects 0 of a new producer; a gap expects the next seq.
+            prop_assert_eq!(*received_seq, write.seq);
+            let expected = match record_before {
+                Some(record) if record.epoch == write.epoch => record.last_seq.saturating_add(1),
+                Some(_) => {
+                    prop_assert!(false, "a gap in another epoch than the record's");
+                    0
+                }
+                None => 0,
+            };
+            prop_assert_eq!(*expected_seq, expected);
+            prop_assert!(write.seq > expected);
+        }
+        _ if code == StreamErrorCode::StreamClosed => {
+            // Step 4 comes after the producer rows: a closed stream refuses
+            // only a write that would apply, never a repeat or a conflict.
+            prop_assert!(before.closed || before.closing == Closing::CloseOnly);
+            prop_assert!(
+                record_before.is_none() || !ledger.applied.contains_key(&key),
+                "a closed stream refused a key that applied"
+            );
+        }
+        _ if code == StreamErrorCode::ProducerLimit => {
+            // The cap refuses only a producer without a record.
+            prop_assert!(record_before.is_none());
+        }
+        other => prop_assert!(false, "unexpected refusal {:?} {:?}", code, other),
     }
     Ok(())
+}
+
+/// Applies a proptest write: an append, an append that closes, or a
+/// close-only write.
+fn send_closing(
+    machine: &mut StreamStateMachine,
+    stream_id: &BucketStreamId,
+    write: Write<'_>,
+    closing: Closing,
+) -> StreamResponse {
+    let command = match closing {
+        Closing::No => return send(machine, stream_id, write),
+        Closing::WithBody => StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some(OCTET.to_owned()),
+            payload: write.body(),
+            close_after: true,
+            stream_seq: None,
+            producer: Some(write.producer()),
+            now_ms: write.now_ms,
+        },
+        Closing::CloseOnly => StreamCommand::Close {
+            stream_id: stream_id.clone(),
+            stream_seq: None,
+            producer: Some(write.producer()),
+            now_ms: write.now_ms,
+        },
+    };
+    let command = if write.tokened {
+        StreamCommand::IfIncarnation {
+            incarnation: machine.stream_incarnation(stream_id).unwrap(),
+            command: Box::new(command),
+        }
+    } else {
+        command
+    };
+    machine.apply(command)
+}
+
+/// Fills the stream with other producers up to the producer cap.
+fn crowd(machine: &mut StreamStateMachine, stream_id: &BucketStreamId, epoch: u64, now_ms: u64) {
+    use super::producers::MAX_PRODUCERS_PER_STREAM;
+    let mut index = 0_usize;
+    while machine.stream_slot(stream_id).unwrap().producers.len() < MAX_PRODUCERS_PER_STREAM {
+        let id = format!("f{index:04}");
+        index = index.saturating_add(1);
+        if !matches!(
+            send(machine, stream_id, Write::new(&id, epoch, 0).at(now_ms)),
+            StreamResponse::Appended { .. }
+        ) {
+            return;
+        }
+    }
+}
+
+/// Runs `ops` against one stream and checks every answer. `Err` names the
+/// first broken property.
+fn run_producer_ops(ops: Vec<Op>) -> Result<(), TestCaseError> {
+    let mut machine = fresh_machine();
+    let stream_id = create(&mut machine, "prop", OCTET);
+    let mut ledger = Ledger::default();
+    let mut now_ms = 1_u64;
+    let mut crowded = false;
+    for op in ops {
+        let records = PRODUCERS.map(|id| record(&machine, &stream_id, id));
+        let floor_at_start = floor(&machine, &stream_id);
+        let (write, closing) = match op {
+            Op::Wait { by } => {
+                now_ms = now_ms.saturating_add(by);
+                continue;
+            }
+            Op::Restore => {
+                // A replica that restores the snapshot holds the same state,
+                // and the rest of the run goes on against it.
+                let restored = StreamStateMachine::restore(machine.snapshot())
+                    .map_err(|err| TestCaseError::fail(format!("restore: {err:?}")))?;
+                prop_assert_eq!(restored.snapshot(), machine.snapshot());
+                machine = restored;
+                continue;
+            }
+            Op::Tidy => {
+                let tidied = machine.apply(StreamCommand::TidyStream {
+                    stream_id: stream_id.clone(),
+                    now_ms,
+                });
+                prop_assert!(
+                    matches!(tidied, StreamResponse::StreamTidied { .. }),
+                    "{:?}",
+                    tidied
+                );
+                retire_gone(&mut ledger, &machine, &stream_id, &records);
+                prop_assert!(floor(&machine, &stream_id) >= floor_at_start);
+                continue;
+            }
+            Op::Crowd { epoch } => {
+                if !crowded {
+                    crowded = true;
+                    crowd(&mut machine, &stream_id, epoch, now_ms);
+                }
+                continue;
+            }
+            Op::Next {
+                producer,
+                digest,
+                tokened,
+            } => {
+                let id = PRODUCERS[producer];
+                let (epoch, seq) = record(&machine, &stream_id, id).map_or((0, 0), |state| {
+                    (state.epoch, state.last_seq.saturating_add(1))
+                });
+                (
+                    Write {
+                        id,
+                        epoch,
+                        seq,
+                        digest,
+                        tokened,
+                        now_ms,
+                    },
+                    Closing::No,
+                )
+            }
+            Op::Close {
+                producer,
+                with_body,
+                tokened,
+            } => {
+                let id = PRODUCERS[producer];
+                let (epoch, seq) = record(&machine, &stream_id, id).map_or((0, 0), |state| {
+                    (state.epoch, state.last_seq.saturating_add(1))
+                });
+                let closing = if with_body {
+                    Closing::WithBody
+                } else {
+                    Closing::CloseOnly
+                };
+                (
+                    Write {
+                        id,
+                        epoch,
+                        seq,
+                        digest: None,
+                        tokened,
+                        now_ms,
+                    },
+                    closing,
+                )
+            }
+            Op::Claim {
+                producer,
+                bump,
+                digest,
+                tokened,
+            } => {
+                let id = PRODUCERS[producer];
+                let epoch = record(&machine, &stream_id, id)
+                    .map_or(0, |state| state.epoch)
+                    .max(floor(&machine, &stream_id).unwrap_or(0))
+                    .saturating_add(bump);
+                (
+                    Write {
+                        id,
+                        epoch,
+                        seq: 0,
+                        digest,
+                        tokened,
+                        now_ms,
+                    },
+                    Closing::No,
+                )
+            }
+            Op::Repeat {
+                pick,
+                digest,
+                tokened,
+            } => {
+                if ledger.keys.is_empty() {
+                    continue;
+                }
+                let (id, epoch, seq) = &ledger.keys[pick.checked_rem(ledger.keys.len()).unwrap()];
+                let id = PRODUCERS.iter().find(|candidate| *candidate == id).unwrap();
+                (
+                    Write {
+                        id,
+                        epoch: *epoch,
+                        seq: *seq,
+                        digest,
+                        tokened,
+                        now_ms,
+                    },
+                    Closing::No,
+                )
+            }
+            Op::Any {
+                producer,
+                epoch,
+                seq,
+                digest,
+                tokened,
+            } => (
+                Write {
+                    id: PRODUCERS[producer],
+                    epoch,
+                    seq,
+                    digest,
+                    tokened,
+                    now_ms,
+                },
+                Closing::No,
+            ),
+        };
+        // The write retires its producer's idle record first: that epoch is
+        // forgotten.
+        let idle_epoch = record(&machine, &stream_id, write.id)
+            .filter(|state| producers::producer_is_idle(state, write.now_ms))
+            .map(|state| state.epoch);
+        if let Some(retired) = idle_epoch {
+            ledger.retire(write.id, retired);
+        }
+        let before = Before {
+            write,
+            closing,
+            record: record(&machine, &stream_id, write.id)
+                .filter(|state| !producers::producer_is_idle(state, write.now_ms)),
+            closed: machine.head(&stream_id).unwrap().status == StreamStatus::Closed,
+            floor: match (floor(&machine, &stream_id), idle_epoch) {
+                (Some(floor), Some(idle)) => Some(floor.max(idle)),
+                (floor, idle) => floor.or(idle),
+            },
+            tail: tail(&machine, &stream_id),
+        };
+        // The early answer, read before the write applies, must be what
+        // apply answers whenever it gives one (#581 section 2.5).
+        let early = machine.producer_early_answer(
+            &stream_id,
+            &write.producer(),
+            machine.stream_incarnation(&stream_id).unwrap(),
+            write.now_ms,
+        );
+        let response = send_closing(&mut machine, &stream_id, write, closing);
+        // Only tokened writes are answered early.
+        let early = early.filter(|_| write.tokened);
+        match early {
+            None => {}
+            Some(ProducerEarlyAnswer::Repeat(early)) => {
+                prop_assert_eq!(
+                    producer_ack(&response),
+                    Some(early),
+                    "early repeat differs from apply"
+                );
+            }
+            Some(ProducerEarlyAnswer::KeyConflict { epoch }) => {
+                let conflict = matches!(
+                    &response,
+                    StreamResponse::Error { context, .. }
+                        if context.as_slice()
+                            == [StreamErrorContext::Producer(ProducerRefusal::KeyConflict { epoch })]
+                );
+                prop_assert!(
+                    conflict,
+                    "early key conflict differs from apply: {:?}",
+                    response
+                );
+            }
+        }
+        // The producer cap may retire other records to admit this one.
+        let floor_after = floor(&machine, &stream_id);
+        let tail_after = tail(&machine, &stream_id);
+        check_answer(&mut ledger, &before, floor_after, tail_after, response)?;
+        retire_gone(&mut ledger, &machine, &stream_id, &records);
+        // The floor never decreases.
+        prop_assert!(floor_after >= floor_at_start);
+    }
+    let restored = StreamStateMachine::restore(machine.snapshot())
+        .map_err(|err| TestCaseError::fail(format!("restore: {err:?}")))?;
+    prop_assert_eq!(restored.snapshot(), machine.snapshot());
+    Ok(())
+}
+
+/// Records of the tested producers that a command removed retired: their
+/// epochs are dead to tokened writes.
+fn retire_gone(
+    ledger: &mut Ledger,
+    machine: &StreamStateMachine,
+    stream_id: &BucketStreamId,
+    records: &[Option<ProducerState>; 2],
+) {
+    for (id, before) in PRODUCERS.iter().zip(records) {
+        if let Some(before) = before
+            && record(machine, stream_id, id).is_none()
+        {
+            ledger.retire(id, before.epoch);
+        }
+    }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// Producers with one write in flight, re-claims, clones that share a
-    /// key with other bodies, idle expiry and untokened re-claims: every
-    /// answer is true against what applied, every key applies at most once
-    /// within its record's life, seqs apply in order, and no tokened claim
-    /// opens an epoch at or below one the stream retired.
+    /// key with other bodies, closes, idle expiry, `TidyStream`, the
+    /// producer cap, untokened re-claims and restores: every answer is true
+    /// against what applied, every refusal is the row the record calls for,
+    /// every key applies at most once within its record's life, seqs apply
+    /// in order, nothing applies to a closed stream, and no tokened write
+    /// reaches an epoch the stream retired.
     #[test]
     fn producer_answers_are_true_and_keys_apply_once(ops in proptest::collection::vec(op_strategy(), 1..80)) {
-        let mut machine = fresh_machine();
-        let stream_id = create(&mut machine, "prop", OCTET);
-        let mut ledger = Ledger::default();
-        let mut now_ms = 1_u64;
-        for op in ops {
-            let write = match op {
-                Op::Wait { idle } => {
-                    now_ms = now_ms.saturating_add(if idle { PRODUCER_IDLE_EXPIRY_MS } else { 1_000 });
-                    continue;
-                }
-                Op::Next { producer, digest, tokened } => {
-                    let id = PRODUCERS[producer];
-                    let (epoch, seq) = record(&machine, &stream_id, id)
-                        .map_or((0, 0), |state| (state.epoch, state.last_seq.saturating_add(1)));
-                    Write { id, epoch, seq, digest, tokened, now_ms }
-                }
-                Op::Claim { producer, bump, digest, tokened } => {
-                    let id = PRODUCERS[producer];
-                    let epoch = record(&machine, &stream_id, id)
-                        .map_or(0, |state| state.epoch)
-                        .max(floor(&machine, &stream_id).unwrap_or(0))
-                        .saturating_add(bump);
-                    Write { id, epoch, seq: 0, digest, tokened, now_ms }
-                }
-                Op::Repeat { pick, digest, tokened } => {
-                    if ledger.keys.is_empty() {
-                        continue;
-                    }
-                    let (id, epoch, seq) = &ledger.keys[pick.checked_rem(ledger.keys.len()).unwrap()];
-                    let id = PRODUCERS.iter().find(|candidate| *candidate == id).unwrap();
-                    Write { id, epoch: *epoch, seq: *seq, digest, tokened, now_ms }
-                }
-                Op::Any { producer, epoch, seq, digest, tokened } => {
-                    Write { id: PRODUCERS[producer], epoch, seq, digest, tokened, now_ms }
-                }
-            };
-            let floor_before = {
-                let retired = record(&machine, &stream_id, write.id)
-                    .filter(|state| producers::producer_is_idle(state, write.now_ms))
-                    .map(|state| state.epoch);
-                match (floor(&machine, &stream_id), retired) {
-                    (Some(floor), Some(retired)) => Some(floor.max(retired)),
-                    (floor, retired) => floor.or(retired),
-                }
-            };
-            // The write retires its producer's idle record first: that
-            // epoch is forgotten.
-            if let Some(retired) = record(&machine, &stream_id, write.id)
-                .filter(|state| producers::producer_is_idle(state, write.now_ms))
-            {
-                ledger.dead.insert((write.id.to_owned(), retired.epoch));
-            }
-            let record_before = record(&machine, &stream_id, write.id)
-                .filter(|state| !producers::producer_is_idle(state, write.now_ms));
-            // The early answer, read before the write applies, must be what
-            // apply answers whenever it gives one (#581 section 2.5).
-            let early = machine.producer_early_answer(
-                &stream_id,
-                &write.producer(),
-                machine.stream_incarnation(&stream_id).unwrap(),
-                write.now_ms,
-            );
-            let tail_before = tail(&machine, &stream_id);
-            let response = send(&mut machine, &stream_id, write);
-            // Only tokened writes are answered early.
-            let early = early.filter(|_| write.tokened);
-            match early {
-                None => {}
-                Some(ProducerEarlyAnswer::Repeat(early)) => {
-                    let at_apply = match &response {
-                        StreamResponse::Appended { producer, .. }
-                        | StreamResponse::Closed { producer, .. } => *producer,
-                        _ => None,
-                    };
-                    prop_assert_eq!(at_apply, Some(early), "early repeat differs from apply");
-                }
-                Some(ProducerEarlyAnswer::KeyConflict { epoch }) => {
-                    let conflict = matches!(
-                        &response,
-                        StreamResponse::Error { context, .. }
-                            if context.as_slice()
-                                == [StreamErrorContext::Producer(ProducerRefusal::KeyConflict { epoch })]
-                    );
-                    prop_assert!(conflict, "early key conflict differs from apply: {:?}", response);
-                }
-            }
-            let tail_after = tail(&machine, &stream_id);
-            check_answer(
-                &mut ledger,
-                write,
-                record_before.as_ref(),
-                floor_before,
-                tail_before,
-                tail_after,
-                response,
-            )?;
-            // The floor never decreases, and a restored replica holds the
-            // same records.
-            prop_assert!(floor(&machine, &stream_id) >= floor_before);
-        }
-        let restored = StreamStateMachine::restore(machine.snapshot()).unwrap();
-        prop_assert_eq!(restored.snapshot(), machine.snapshot());
+        run_producer_ops(ops)?;
     }
 }
