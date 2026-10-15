@@ -483,6 +483,53 @@ async fn a_digest_that_does_not_match_the_body_applies_nothing() {
     assert_eq!(answer(&response).status(), 200);
 }
 
+/// An empty append without a key that does not close is refused before
+/// the runtime sees it, as the other content faults of an unkeyed write are.
+#[tokio::test]
+async fn an_unkeyed_empty_append_is_refused_before_routing() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let app = app(&now_ms);
+    create(&app).await;
+    let routed = |app: Router| async move {
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/__ursula/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let metrics: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(metrics.into_body(), usize::MAX)
+                .await
+                .expect("metrics body"),
+        )
+        .expect("metrics json");
+        metrics["routed_requests"]
+            .as_u64()
+            .expect("routed requests")
+    };
+    // A metrics scrape routes requests of its own: measure them first.
+    let first = routed(app.clone()).await;
+    let before = routed(app.clone()).await;
+    let scrape = before - first;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(URI)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(routed(app).await - before, scrape);
+}
+
 #[tokio::test]
 async fn a_create_with_producer_headers_is_refused() {
     let now_ms = Arc::new(AtomicU64::new(1_000));

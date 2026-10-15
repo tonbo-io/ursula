@@ -9,8 +9,6 @@
 //!   tokened write never reaches an epoch the stream forgot; an untokened
 //!   writer keeps the base protocol's rule that a forgotten producer is new
 //!   (see `producer_record`).
-//!
-//! [`Opened`]: crate::Opened
 //! - **Idle expiry.** A producer whose newest write is at least
 //!   [`PRODUCER_IDLE_EXPIRY_MS`] old (by the persisted `last_seen_ms` and the
 //!   command's `now_ms`) is treated as absent at its own next write and
@@ -23,6 +21,8 @@
 //!   `ProducerLimit` (`429`).
 //! - **`TidyStream`.** Converges one stream in bounded steps: idle-producer
 //!   expiry and producer-cap eviction.
+//!
+//! [`Opened`]: crate::Opened
 
 use super::BucketStreamId;
 use super::ProducerState;

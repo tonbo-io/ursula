@@ -3003,6 +3003,15 @@ pub(crate) async fn append_stream_by_id(
         Ok(payload) => payload,
         Err(response) => return *response,
     };
+    // A write without a key has no producer rows, so its empty body is
+    // refused here, with the other content faults, instead of in the log.
+    if producer.is_none() && payload.is_empty() && !close_after {
+        return (
+            StatusCode::BAD_REQUEST,
+            "append payload must be non-empty unless closing the stream",
+        )
+            .into_response();
+    }
     if close_only {
         return match state
             .runtime
@@ -4181,10 +4190,6 @@ fn producer_request(write: ProducerWrite) -> ProducerRequest {
     }
 }
 
-/// A write's producer key with its `Producer-Digest` verified against
-/// `body`, the request body: `400` for malformed producer headers or a
-/// digest that does not match, so nothing is proposed. `None` for a write
-/// without a key.
 /// A write's producer key from its headers (step 1 of #581 section 5.3):
 /// `400` for malformed producer headers. `None` for a write without a key.
 pub(crate) fn producer_write(
