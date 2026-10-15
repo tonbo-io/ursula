@@ -4550,6 +4550,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tracing",
+ "ursula-headers",
  "ursula-observability",
  "ursula-proto",
  "ursula-shard",

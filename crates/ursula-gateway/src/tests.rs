@@ -1213,7 +1213,76 @@ async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
     let resp = gateway.handle(req).await;
 
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(named_limit(&resp), Some(SizeLimit::Request(4)));
     assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+/// The limit a `413` names, as clients parse it.
+fn named_limit(response: &AxumResponse) -> Option<SizeLimit> {
+    SizeLimit::parse(
+        response.status().as_u16(),
+        response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("well-formed limit")
+}
+
+/// The gateway replaces `Ursula-Max-Request-Bytes` on every forwarded answer
+/// that carries it with the smaller of the node's value and its own limit,
+/// a `413` of the node included, and adds it to no answer without it.
+#[tokio::test]
+async fn gateway_lowers_the_request_limit_a_node_advertises() {
+    let upstream = spawn_upstream(
+        Router::new()
+            .route(
+                "/bucket/head",
+                any(|| async { ([("ursula-max-request-bytes", "33554432")], "") }),
+            )
+            .route(
+                "/bucket/small",
+                any(|| async { ([("ursula-max-request-bytes", "2")], "") }),
+            )
+            .route(
+                "/bucket/refused",
+                any(|| async {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        [("ursula-max-request-bytes", "33554432")],
+                        "",
+                    )
+                }),
+            )
+            .route(
+                "/bucket/malformed",
+                any(|| async { ([("ursula-max-request-bytes", "lots")], "") }),
+            )
+            .route("/bucket/plain", any(|| async { "" })),
+    )
+    .await;
+    let mut config = test_config(vec![upstream.url.clone()]);
+    config.max_request_body_bytes = 1_048_576;
+    let gateway = Gateway::new(config);
+    for (path, expected) in [
+        ("/bucket/head", Some("1048576")),
+        ("/bucket/small", Some("2")),
+        ("/bucket/refused", Some("1048576")),
+        ("/bucket/malformed", Some("1048576")),
+        ("/bucket/plain", None),
+    ] {
+        let response = gateway.handle(post_path(path)).await;
+        assert_eq!(
+            response
+                .headers()
+                .get("ursula-max-request-bytes")
+                .map(|value| value.to_str().expect("ascii")),
+            expected,
+            "{path}"
+        );
+    }
+    let refused = gateway.handle(post_path("/bucket/refused")).await;
+    assert_eq!(named_limit(&refused), Some(SizeLimit::Request(1_048_576)));
 }
 
 /// A request body that fails while the gateway buffers it, as when the
@@ -2737,6 +2806,11 @@ mod admission_and_usage {
 
         let oversized = send(&gateway, "POST", "/tenant-a/orders", "123456789").await;
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            super::named_limit(&oversized),
+            Some(SizeLimit::Request(8)),
+            "the tenant's limit, below the gateway's"
+        );
         assert_eq!(
             hits.load(Ordering::Relaxed),
             0,

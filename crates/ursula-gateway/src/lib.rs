@@ -64,6 +64,8 @@ use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
+use ursula_headers::SizeLimit;
+use ursula_headers::lowered_request_limit;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 
@@ -358,28 +360,22 @@ impl Gateway {
             }
         }
 
-        let body_bytes = match axum::body::to_bytes(body, self.config.max_request_body_bytes).await
-        {
-            Ok(b) => b,
-            Err(err) => {
-                let refusal = if err
-                    .source()
-                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-                {
-                    Refusal::BodyTooLarge
-                } else {
-                    Refusal::BodyUnreadable
-                };
-                return refusal.into_response();
-            }
-        };
-        if let Some(max) = context
-            .as_ref()
-            .and_then(|ctx| ctx.limits.max_request_body_bytes)
-            && body_bytes.len() as u64 > max
-        {
-            return Refusal::BodyTooLarge.into_response();
-        }
+        let limit = self.request_limit(context.as_ref());
+        let body_bytes =
+            match axum::body::to_bytes(body, usize::try_from(limit).unwrap_or(usize::MAX)).await {
+                Ok(b) => b,
+                Err(err) => {
+                    let refusal = if err
+                        .source()
+                        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                    {
+                        Refusal::BodyTooLarge { limit }
+                    } else {
+                        Refusal::BodyUnreadable
+                    };
+                    return refusal.into_response();
+                }
+            };
 
         let upstream = match self.pick_upstream(&parts.uri) {
             Some(u) => u,
@@ -420,12 +416,24 @@ impl Gateway {
         };
 
         match self.forward(&upstream, &parts, body_bytes, tail).await {
-            Ok(response) => response,
+            Ok(mut response) => {
+                lower_request_limit(response.headers_mut(), limit);
+                response
+            }
             Err(e) => {
                 error!(error = ?e, "gateway request failed");
                 e.into_response()
             }
         }
+    }
+
+    /// The largest body the gateway forwards for a request: the smaller of
+    /// `max_request_body_bytes` and the tenant's limit.
+    fn request_limit(&self, context: Option<&RequestContext>) -> u64 {
+        let global = u64::try_from(self.config.max_request_body_bytes).unwrap_or(u64::MAX);
+        context
+            .and_then(|ctx| ctx.limits.max_request_body_bytes)
+            .map_or(global, |tenant| tenant.min(global))
     }
 
     /// Classifies and authorizes the request. `Ok(None)` means access control
@@ -1247,8 +1255,9 @@ enum Refusal {
     Authorization(AuthorizationError),
     /// A tenant admission limit (`429`).
     Admission(AdmissionRejection),
-    /// The body is larger than the gateway's or the tenant's limit (`413`).
-    BodyTooLarge,
+    /// The body is larger than the gateway's or the tenant's limit, the
+    /// smaller of the two (`413` naming it).
+    BodyTooLarge { limit: u64 },
     /// The body could not be read (`400`).
     BodyUnreadable,
     /// No upstream is configured (`503`).
@@ -1286,11 +1295,44 @@ impl IntoResponse for Refusal {
                 "tenant live-read connection limit exceeded",
             )
                 .into_response(),
-            Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            Self::BodyTooLarge { limit } => {
+                let mut headers = HeaderMap::new();
+                SizeLimit::Request(limit).render(|name, value| {
+                    if let Ok(value) = HeaderValue::from_str(value) {
+                        headers.insert(name, value);
+                    }
+                });
+                (StatusCode::PAYLOAD_TOO_LARGE, headers).into_response()
+            }
             Self::BodyUnreadable => StatusCode::BAD_REQUEST.into_response(),
             Self::NoUpstream => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     }
+}
+
+/// Replaces `Ursula-Max-Request-Bytes` on a forwarded response with the
+/// smaller of the upstream's value and `limit`, the gateway's own limit for
+/// the request (extensions Section 10). A response without the header gets
+/// none. A malformed one gets `limit`, the most the gateway knows.
+fn lower_request_limit(headers: &mut HeaderMap, limit: u64) {
+    let lowered = lowered_request_limit(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        limit,
+    );
+    let lowered = match lowered {
+        Ok(None) => return,
+        Ok(Some(lowered)) => lowered,
+        Err(error) => {
+            debug!(%error, "an upstream sent a malformed request limit");
+            limit
+        }
+    };
+    headers.insert(
+        ursula_headers::names::URSULA_MAX_REQUEST_BYTES,
+        HeaderValue::from(lowered),
+    );
 }
 
 /// How [`drain`] ended.
