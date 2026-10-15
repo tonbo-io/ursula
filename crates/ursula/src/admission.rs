@@ -18,10 +18,12 @@ use axum::http::header::CONTENT_TYPE;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use ursula_headers::SizeLimit;
 
 use crate::CLUSTER_PROBE_PATH;
 use crate::MAX_HTTP_BODY_BYTES;
 use crate::cold_snapshot;
+use crate::limits;
 use crate::render::insert_default_response_headers;
 use crate::wal_disk::WalDiskMonitor;
 
@@ -41,6 +43,9 @@ pub struct IngressAdmission {
     /// The node's Raft log-pressure flag (set by the snapshot driver's
     /// monitor while the unsnapshotted log is over its hard limit).
     raft_log: Option<ursula_raft::SnapshotBuildCoordinator>,
+    /// Whether the node stages snapshot bodies in a cold store, which sets
+    /// the body limit of a snapshot publish.
+    cold_snapshots: bool,
 }
 
 impl Default for IngressAdmission {
@@ -51,6 +56,7 @@ impl Default for IngressAdmission {
             )),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
+            cold_snapshots: false,
         }
     }
 }
@@ -62,6 +68,7 @@ impl IngressAdmission {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
+            cold_snapshots: false,
         }
     }
 
@@ -70,7 +77,14 @@ impl IngressAdmission {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
             wal_disk: WalDiskMonitor::default(),
             raft_log: None,
+            cold_snapshots: false,
         }
+    }
+
+    /// Sets whether the node stages snapshot bodies in a cold store.
+    pub(crate) fn with_cold_snapshots(mut self, cold_snapshots: bool) -> Self {
+        self.cold_snapshots = cold_snapshots;
+        self
     }
 
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
@@ -92,8 +106,9 @@ impl IngressAdmission {
 /// reaches a handler, so nothing of a refused request was proposed or applied.
 #[derive(Debug, Clone, Copy)]
 enum AdmissionRefusal {
-    /// The body is larger than admission admits on the route (`413`).
-    BodyTooLarge,
+    /// The body is larger than admission admits on the route (`413` naming
+    /// the limit).
+    BodyTooLarge(SizeLimit),
     /// The WAL filesystem is below its free-space floor, or its free-space
     /// check failed (`503`).
     WalDiskPressure,
@@ -107,7 +122,7 @@ impl AdmissionRefusal {
     /// The refusal's token: the JSON `error` of a `503`.
     fn code(self) -> &'static str {
         match self {
-            Self::BodyTooLarge => "RequestBodyTooLarge",
+            Self::BodyTooLarge(_) => "RequestBodyTooLarge",
             Self::WalDiskPressure => "WalDiskPressure",
             Self::RaftLogPressure => "RaftLogPressure",
             Self::IngressBodyBytesLimitReached => "IngressBodyBytesLimitReached",
@@ -118,9 +133,7 @@ impl AdmissionRefusal {
 impl IntoResponse for AdmissionRefusal {
     fn into_response(self) -> Response {
         match self {
-            Self::BodyTooLarge => {
-                (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response()
-            }
+            Self::BodyTooLarge(limit) => limits::size_refusal(limit),
             Self::WalDiskPressure | Self::RaftLogPressure | Self::IngressBodyBytesLimitReached => {
                 retry_after_json(self.code())
             }
@@ -139,8 +152,13 @@ pub(crate) async fn ingress_admission_middleware(
     let Some(body_bytes) = request_write_body_bytes(&request) else {
         return next.run(request).await;
     };
-    if body_bytes > cold_snapshot::max_admitted_body_bytes(request.method(), request.uri()) {
-        return AdmissionRefusal::BodyTooLarge.into_response();
+    let limit = cold_snapshot::admitted_body_limit(
+        request.method(),
+        request.uri(),
+        admission.cold_snapshots,
+    );
+    if body_bytes > limit.bytes() {
+        return AdmissionRefusal::BodyTooLarge(limit).into_response();
     }
     if admission.wal_disk.is_pressured() {
         return AdmissionRefusal::WalDiskPressure.into_response();
@@ -162,7 +180,7 @@ pub(crate) async fn ingress_admission_middleware(
 
     let _body_permits = if body_bytes > 0 {
         let Ok(permits) = u32::try_from(body_bytes) else {
-            return AdmissionRefusal::BodyTooLarge.into_response();
+            return AdmissionRefusal::BodyTooLarge(limits::REQUEST_LIMIT).into_response();
         };
         match admission.body_bytes.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Some(permit),

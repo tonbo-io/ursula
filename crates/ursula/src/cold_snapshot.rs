@@ -20,6 +20,7 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::StreamExt;
 use futures_util::stream;
+use ursula_headers::SizeLimit;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
@@ -31,6 +32,7 @@ use ursula_shard::BucketStreamId;
 
 use crate::HttpState;
 use crate::MAX_HTTP_BODY_BYTES;
+use crate::limits;
 use crate::render;
 
 /// Bytes read from the cold store per piece of a streamed snapshot body.
@@ -43,10 +45,11 @@ pub(crate) enum SnapshotUpload {
 }
 
 /// Whether a request publishes a snapshot (`PUT …/snapshot/{offset}`).
-/// Admission lets these bodies exceed the inline
-/// cap, up to [`MAX_COLD_SNAPSHOT_BYTES`], and charges at most the inline cap
+/// With a cold store, admission lets these bodies exceed the inline cap, up
+/// to [`MAX_COLD_SNAPSHOT_BYTES`], and charges at most the inline cap
 /// against the in-flight budget, because a large body is streamed to the
-/// cold store in bounded parts. The handler enforces the real limit.
+/// cold store in bounded parts. The handler enforces the limit again for a
+/// body without `Content-Length`.
 pub(crate) fn is_snapshot_publish(method: &Method, uri: &Uri) -> bool {
     if *method != Method::PUT {
         return false;
@@ -63,17 +66,14 @@ pub(crate) fn is_snapshot_publish(method: &Method, uri: &Uri) -> bool {
     }
 }
 
-/// Admission's body limit for a write request.
-pub(crate) fn max_admitted_body_bytes(method: &Method, uri: &Uri) -> u64 {
+/// Admission's body limit for a write request on a node with or without a
+/// cold store.
+pub(crate) fn admitted_body_limit(method: &Method, uri: &Uri, cold_store: bool) -> SizeLimit {
     if is_snapshot_publish(method, uri) {
-        MAX_COLD_SNAPSHOT_BYTES
+        limits::snapshot_publish_limit(cold_store)
     } else {
-        u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64")
+        limits::REQUEST_LIMIT
     }
-}
-
-fn payload_too_large() -> Response {
-    (StatusCode::PAYLOAD_TOO_LARGE, "snapshot body is too large").into_response()
 }
 
 fn body_read_error(err: impl std::fmt::Display) -> Response {
@@ -114,7 +114,7 @@ pub(crate) async fn receive_snapshot_body(
             Some(Ok(frame)) => {
                 buffered.extend_from_slice(&frame);
                 if !cold && buffered.len() > MAX_HTTP_BODY_BYTES {
-                    return Err(payload_too_large());
+                    return Err(limits::size_refusal(limits::REQUEST_LIMIT));
                 }
                 if cold && buffered.len() >= threshold {
                     break;
@@ -147,7 +147,9 @@ pub(crate) async fn receive_snapshot_body(
             let frame = frame.map_err(body_read_error)?;
             size = size.saturating_add(u64::try_from(frame.len()).unwrap_or(u64::MAX));
             if size > MAX_COLD_SNAPSHOT_BYTES {
-                return Err(payload_too_large());
+                return Err(limits::size_refusal(SizeLimit::Snapshot(
+                    MAX_COLD_SNAPSHOT_BYTES,
+                )));
             }
             digest.update(&frame);
             writer.write(frame).await.map_err(stage_error)?;

@@ -8,6 +8,8 @@
 //!   they reach a handler and marks those refusals with `x-ursula-not-applied`.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
+//! - [`limits`]: the request and snapshot limits HEAD advertises and every
+//!   `413` names.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
@@ -17,6 +19,7 @@ mod admission;
 mod bootstrap;
 mod cold_snapshot;
 pub mod json_text;
+mod limits;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -171,6 +174,7 @@ use crate::render::insert_snapshot_offset;
 use crate::render::insert_static;
 use crate::render::insert_stream_error_headers;
 use crate::render::insert_stream_error_offset;
+use crate::render::insert_stream_head;
 use crate::render::insert_u64_header;
 use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
@@ -185,6 +189,7 @@ use crate::render::runtime_error_status;
 use crate::render::should_base64_encode_sse_data;
 use crate::render::snapshot_response;
 use crate::render::sse_safe_line;
+use crate::render::stream_head;
 
 type BoxResponse = Box<Response>;
 
@@ -1011,6 +1016,7 @@ fn admin_ops_router(state: HttpState) -> Router {
             require_admin_incarnation,
         ))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn(limits::name_size_refusals))
         .with_state(state)
 }
 
@@ -1342,9 +1348,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
-            admission,
+            admission.with_cold_snapshots(state.runtime.has_cold_store()),
             ingress_admission_middleware,
         ))
+        .layer(middleware::from_fn(limits::name_size_refusals))
         .layer(response_compression)
         .with_state(state)
 }
@@ -2959,7 +2966,7 @@ fn unreadable_body_response(err: &axum::Error) -> Response {
     let over_limit = std::error::Error::source(err)
         .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
     if over_limit {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+        return limits::size_refusal(limits::REQUEST_LIMIT);
     }
     (
         StatusCode::BAD_REQUEST,
@@ -3154,10 +3161,24 @@ pub(crate) async fn head_stream_by_id(
             {
                 return refused;
             }
+            let head = match stream_head(
+                &response,
+                limits::max_snapshot_bytes(state.runtime.has_cold_store()),
+            ) {
+                Ok(head) => head,
+                Err(err) => {
+                    tracing::error!(error = %err, "a stream's HEAD is outside the protocol's range");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "stream metadata outside the protocol's range",
+                    )
+                        .into_response();
+                }
+            };
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
-            insert_offset(&mut headers, response.tail_offset);
+            insert_stream_head(&mut headers, &head);
             insert_padded_offset(
                 &mut headers,
                 HEADER_STREAM_COLD_HOT_START_OFFSET,
@@ -3170,21 +3191,6 @@ pub(crate) async fn head_stream_by_id(
                 response.stream_ttl_seconds,
                 response.stream_expires_at_ms,
             );
-            if let Some(snapshot_offset) = response.snapshot_offset {
-                insert_snapshot_offset(&mut headers, snapshot_offset);
-            }
-            if let Some(snapshot_digest) = response.snapshot_digest {
-                insert_snapshot_digest(&mut headers, &snapshot_digest);
-            }
-            insert_padded_offset(
-                &mut headers,
-                names::STREAM_RETAINED_OFFSET,
-                response.retained_offset,
-            );
-            insert_incarnation(&mut headers, response.created_at_ms);
-            if response.closed {
-                insert_static(&mut headers, names::STREAM_CLOSED, "true");
-            }
             (StatusCode::OK, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
@@ -4375,6 +4381,8 @@ mod tests;
 mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
+#[cfg(test)]
+mod limits_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
 #[cfg(test)]
