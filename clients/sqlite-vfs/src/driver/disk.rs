@@ -29,7 +29,7 @@ use crate::open::Prepared;
 use crate::open::new_build;
 use crate::open::prepare;
 
-/// A build to start: a fresh generation in `gen-<lineage>.tmp`, read up to `end`.
+/// A build to start: a fresh generation in `gen-<id32>.tmp`, read up to `end`.
 #[derive(Debug)]
 pub(crate) struct NewBuild {
     pub(crate) root: Arc<Root>,

@@ -37,6 +37,7 @@ use ursula_headers::Offset;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 
+use crate::applier::stamp_page_one;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::codec::frame::Frame;
 use crate::codec::frame::FrameError;
@@ -186,6 +187,8 @@ pub(crate) enum StreamState {
     },
     /// The stream changed history while the open read it.
     HistoryChanged,
+    /// A commit or snapshot whose page 1 is not a SQLite database's.
+    NotSqlite,
 }
 
 /// Why the stream's content is not this format.
@@ -252,9 +255,15 @@ pub(crate) enum OpenError {
 }
 
 /// A local failure: a gap or malformed record under valid checksums is the extension's own bug
-/// (`internal`), anything else `local_setup`.
+/// (`internal`), a commit or snapshot from the stream whose page 1 is not a SQLite database's is
+/// the stream's (`stream_state`), anything else `local_setup`.
 pub(crate) fn local(e: impl Into<LocalSetup>) -> OpenError {
     let e = e.into();
+    if let LocalSetup::Local(l) = &e
+        && l.is_stream_content()
+    {
+        return OpenError::StreamState(StreamState::NotSqlite);
+    }
     let bug = |log: &LogError| matches!(log, LogError::Gap { .. } | LogError::Malformed { .. });
     let internal = match &e {
         LocalSetup::Local(LocalError::Log(log))
@@ -441,7 +450,7 @@ impl Fetch {
     }
 }
 
-/// A generation built from the stream in `gen-<lineage>.tmp` (design §5.6): the open's build, or
+/// A generation built from the stream in `gen-<id32>.tmp` (design §5.6): the open's build, or
 /// a takeover's rebuild. It is published by one rename only once complete ([`Build::publish`]), so
 /// the generation it supersedes stays whole until then, and a failed build leaves it in place. A
 /// crash midway leaves only the `.tmp`, which the next open deletes (`finish_leftovers`).
@@ -664,11 +673,13 @@ impl Build {
         out.flush().map_err(|source| {
             local(LocalError::Io {
                 op: "write",
-                path: db_path,
+                path: db_path.clone(),
                 source,
             })
         })?;
         drop(out);
+        stamp_page_one(&self.building.db, &db_path, self.header.lineage)
+            .map_err(|e| local(LocalError::from(e)))?;
         self.building
             .log
             .append(&RecordBody::Ack {
@@ -766,7 +777,7 @@ impl Build {
     }
 }
 
-/// Disk job: starts building a generation of a fresh lineage in `gen-<lineage>.tmp`, whose log
+/// Disk job: starts building a generation of a fresh lineage in `gen-<id32>.tmp`, whose log
 /// starts at `first`. A rebuild's claim is logged as a CLAIM record, fsynced, so the generation
 /// knows its claim frame as its own.
 pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
@@ -833,6 +844,8 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
     let local_generation = match root.current().map_err(local)? {
         None => None,
         Some(generation) => {
+            // A replaced db file is refused for now (`local_setup`, nothing changed): salvage keeps
+            // it in a later version.
             let m = materialize::materialize(&generation).map_err(local)?;
             let found = &m.recovered.header.stream_path;
             if found != name.as_str() {

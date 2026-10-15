@@ -26,6 +26,7 @@ use super::encode_header;
 use super::encode_record;
 use super::scan;
 use crate::ids::Activation;
+use crate::ids::GenId;
 use crate::ids::Lineage;
 use crate::ids::Position;
 
@@ -58,7 +59,7 @@ fn header() -> impl Strategy<Value = SegmentHeader> {
             )| SegmentHeader {
                 lineage: Lineage(lineage),
                 first_position: Position(first),
-                supersedes: supersedes.map(Lineage),
+                supersedes: supersedes.map(GenId),
                 cluster_id,
                 stream_path,
                 incarnation: Incarnation::try_from(incarnation).unwrap(),
@@ -285,7 +286,7 @@ fn long_strings_are_refused() {
 #[test]
 fn every_header_bit_flip_is_refused() {
     let mut h = sample();
-    h.supersedes = Some(Lineage([6; 16]));
+    h.supersedes = Some(GenId([6; 16]));
     for h in [sample(), h] {
         let (bytes, _) = encode_header(&h).unwrap();
         for bit in 0..bytes.len() * 8 {

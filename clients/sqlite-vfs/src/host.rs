@@ -152,7 +152,7 @@ pub(crate) enum Checkpoint {
 /// A private connection of the extension's own, in the extension's process. [`Private::open`]
 /// goes through the "ursula" VFS, so its checkpoints take F1 (design §4.3) and it counts as a
 /// connection of the binding: the snapshot thread's checkpoint, read transaction, page copy and
-/// db fsync. [`init_wal_format`] alone goes through "unix", before the database is bound.
+/// db fsync.
 pub(crate) struct Private {
     /// From `sqlite3_open_v2` (possibly a failed open's handle, which still needs closing).
     db: *mut ffi::sqlite3,
@@ -344,13 +344,4 @@ impl Drop for Private {
             unsafe { close(self.db) };
         }
     }
-}
-
-/// Gives an empty db file its WAL-format page 1 through a private "unix" connection, so no
-/// connection ever commits through a rollback journal, which the VFS refuses. Its WAL and `-shm`
-/// go when it closes. Not a commit: the first commit writes page 1 again (every schema change
-/// does), so the stream holds it. It runs before the database is bound and writes no page from
-/// the log, so it needs neither the "ursula" VFS nor F1, which would refuse its db write.
-pub(crate) fn init_wal_format(path: &str) -> Result<(), HostError> {
-    Private::open_on(path, true, c"unix")?.exec(c"PRAGMA journal_mode=WAL")
 }

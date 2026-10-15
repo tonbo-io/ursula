@@ -4,26 +4,37 @@
 //! ```text
 //! <dir>/<label>-<hash32>/     the root: BLAKE3 of the canonical stream path, first 32 hex digits
 //!   lock                      flock, held with the binding
-//!   gen-<lineage>/            the current generation: db, db-wal, db-shm, log/
-//!   gen-<lineage>.tmp/        a generation being built
-//!   gen-<lineage>.trash/      a superseded generation being deleted
+//!   gen-<id32>/               the current generation: db, db-uwal, db-shm, log/
+//!   gen-<id32>.tmp/           a generation being built
+//!   gen-<id32>.trash/         a superseded generation being deleted
 //! ```
+//!
+//! A generation directory is named by a random id ([`GenId`]), not by its lineage: the lineage is
+//! read from its log's segment header, and a copy of a generation keeps it in a directory of its
+//! own. The db file holds the page-1 marker ([`crate::codec::marker`]) and the WAL is `db-uwal`, a
+//! name SQLite never probes, so SQLite outside the extension cannot open a generation's files.
 //!
 //! The database is its canonical stream path ([`canonical_path`]): scheme, host, port and userinfo
 //! are transport, so every host alias of a deployment shares one root. A generation is built in
-//! `gen-<lineage>.tmp`, fsynced, and published by one rename, and its first log segment names the
-//! generation it supersedes, so a crash that leaves two is finished at the next open
-//! ([`Root::finish_leftovers`]). A superseded generation is renamed to `gen-<lineage>.trash`
-//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory.
+//! `gen-<id32>.tmp`, fsynced, and published by one rename, and its first log segment names the
+//! generation directory it supersedes by id, so a crash that leaves two is finished at the next
+//! open ([`Root::finish_leftovers`]). A superseded generation is renamed to `gen-<id32>.trash`
+//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory. A
+//! generation is published with page 1 written and marked, the page 1 of an empty database when
+//! nothing was applied ([`marker::empty_page_one`]), so no published db file is ever empty or
+//! unmarked.
 
 use std::fs::File;
 use std::fs::{self};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::codec::marker;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
 use crate::codec::segment::scan;
+use crate::ids::GenId;
 use crate::ids::Lineage;
 use crate::replog::Log;
 use crate::replog::LogError;
@@ -183,13 +194,19 @@ pub(crate) enum GenerationError {
     },
     #[error("generation {}: no log segment", .dir.display())]
     NoSegment { dir: PathBuf },
-    #[error("{}: generations {lineages:?}, none superseding the others", .root.display())]
-    Ambiguous {
-        root: PathBuf,
-        lineages: Vec<Lineage>,
-    },
-    #[error("{}: a generation of this lineage exists", .path.display())]
+    #[error(
+        "{}: generations {}, none superseding the others",
+        .root.display(),
+        .ids.iter().map(GenId::hex).collect::<Vec<_>>().join(", ")
+    )]
+    Ambiguous { root: PathBuf, ids: Vec<GenId> },
+    #[error("{}: a generation of this id exists", .path.display())]
     Exists { path: PathBuf },
+    #[error("a generation id from {}: {source}", crate::ids::URANDOM)]
+    Random {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> GenerationError {
@@ -197,37 +214,12 @@ fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Generatio
     move |source| GenerationError::Io { op, path, source }
 }
 
-fn hex(lineage: Lineage) -> String {
-    lineage.0.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Whether `path` is a file directly inside a generation directory (`gen-<lineage>`, built or
-/// being built): a main db there opens only while bound (the guard M2's page-1 marker replaces).
-pub(crate) fn in_generation(path: &Path) -> bool {
-    path.parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix(GEN))
-        .map(|rest| rest.strip_suffix(TMP).unwrap_or(rest))
-        .is_some_and(|hex| parse_hex(hex).is_some())
-}
-
-fn parse_hex(s: &str) -> Option<Lineage> {
-    if s.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, o) in out.iter_mut().enumerate() {
-        let at = i.checked_mul(2)?;
-        *o = u8::from_str_radix(s.get(at..at.checked_add(2)?)?, 16).ok()?;
-    }
-    Some(Lineage(out))
-}
-
-/// A generation: one local lineage, its db, WAL and log.
+/// A generation: its directory and the directory's id, its lineage (from its log), its db, WAL
+/// and log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Generation {
     pub(crate) dir: PathBuf,
+    pub(crate) id: GenId,
     pub(crate) lineage: Lineage,
 }
 
@@ -236,10 +228,16 @@ impl Generation {
         self.dir.join("db")
     }
 
-    /// The WAL, under SQLite's own name in M1 (M2 renames it `db-uwal`, a name SQLite never
-    /// probes, with the page-1 marker).
+    /// The WAL: `db-uwal`, a name SQLite never probes. The VFS opens it in place of `db-wal` for a
+    /// bound db, and maps SQLite's own `xAccess` and `xDelete` of `db-wal` to it.
     pub(crate) fn wal(&self) -> PathBuf {
-        self.dir.join("db-wal")
+        self.dir.join("db-uwal")
+    }
+
+    /// Files SQLite outside the extension would write next to the db, which no generation keeps:
+    /// a WAL under SQLite's own name and a rollback journal.
+    pub(crate) fn strays(&self) -> [PathBuf; 2] {
+        [self.dir.join("db-wal"), self.dir.join("db-journal")]
     }
 
     pub(crate) fn shm(&self) -> PathBuf {
@@ -251,24 +249,49 @@ impl Generation {
     }
 
     /// The header of the generation's first log segment.
+    #[cfg(test)]
     fn first_header(&self) -> Result<SegmentHeader, GenerationError> {
-        let log = self.log_dir();
-        let mut segments: Vec<PathBuf> = fs::read_dir(&log)
-            .map_err(io("list", &log))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "usl"))
-            .collect();
-        segments.sort();
-        let first = segments.first().ok_or_else(|| GenerationError::NoSegment {
-            dir: self.dir.clone(),
-        })?;
-        let bytes = fs::read(first).map_err(io("read", first))?;
-        scan(&bytes)
-            .map(|s| s.header)
-            .map_err(|source| GenerationError::Header {
-                dir: self.dir.clone(),
-                source,
-            })
+        first_header(&self.dir)
+    }
+}
+
+/// The header of the first log segment of the generation in `dir`.
+fn first_header(dir: &Path) -> Result<SegmentHeader, GenerationError> {
+    let log = dir.join("log");
+    let mut segments: Vec<PathBuf> = fs::read_dir(&log)
+        .map_err(io("list", &log))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "usl"))
+        .collect();
+    segments.sort();
+    let first = segments.first().ok_or_else(|| GenerationError::NoSegment {
+        dir: dir.to_owned(),
+    })?;
+    let bytes = fs::read(first).map_err(io("read", first))?;
+    scan(&bytes)
+        .map(|s| s.header)
+        .map_err(|source| GenerationError::Header {
+            dir: dir.to_owned(),
+            source,
+        })
+}
+
+/// A generation directory in a root, its log not read yet.
+#[derive(Debug)]
+struct Dir {
+    path: PathBuf,
+    id: GenId,
+}
+
+impl Dir {
+    /// The generation, its lineage read from its first log segment's header.
+    fn generation(self) -> Result<Generation, GenerationError> {
+        let lineage = first_header(&self.path)?.lineage;
+        Ok(Generation {
+            dir: self.path,
+            id: self.id,
+            lineage,
+        })
     }
 }
 
@@ -313,24 +336,24 @@ impl Root {
         })
     }
 
-    /// The generations, temporary ones apart.
-    fn generations(&self) -> Result<Vec<Generation>, GenerationError> {
+    /// The generation directories, temporary ones apart, by id.
+    fn generations(&self) -> Result<Vec<Dir>, GenerationError> {
         let mut gens = Vec::new();
         for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
             let entry = entry.map_err(io("list", &self.dir))?;
             let name = entry.file_name();
-            let lineage = name
+            let id = name
                 .to_str()
                 .and_then(|n| n.strip_prefix(GEN))
-                .and_then(parse_hex);
-            if let Some(lineage) = lineage {
-                gens.push(Generation {
-                    dir: entry.path(),
-                    lineage,
+                .and_then(GenId::parse_hex);
+            if let Some(id) = id {
+                gens.push(Dir {
+                    path: entry.path(),
+                    id,
                 });
             }
         }
-        gens.sort_by_key(|g| g.lineage);
+        gens.sort_by_key(|g| g.id);
         Ok(gens)
     }
 
@@ -365,29 +388,29 @@ impl Root {
             let mut superseded = Vec::new();
             let mut unreadable = Vec::new();
             for g in &gens {
-                match g.first_header() {
+                match first_header(&g.path) {
                     Ok(h) => superseded.extend(h.supersedes),
-                    Err(e) => unreadable.push((g.lineage, e)),
+                    Err(e) => unreadable.push((g.id, e)),
                 }
             }
             if let Some((_, e)) = unreadable
                 .into_iter()
-                .find(|(lineage, _)| !superseded.contains(lineage))
+                .find(|(id, _)| !superseded.contains(id))
             {
                 return Err(e);
             }
-            for g in gens.iter().filter(|g| superseded.contains(&g.lineage)) {
+            for g in gens.iter().filter(|g| superseded.contains(&g.id)) {
                 self.discard(g)?;
             }
         }
         Ok(())
     }
 
-    /// Deletes a superseded generation: renamed to `gen-<lineage>.trash` and the root fsynced
+    /// Deletes a superseded generation: renamed to `gen-<id32>.trash` and the root fsynced
     /// first, so a crash midway leaves only trash, then deleted and the root fsynced again.
-    fn discard(&self, g: &Generation) -> Result<(), GenerationError> {
-        let trash = self.dir.join(format!("{GEN}{}{TRASH}", hex(g.lineage)));
-        fs::rename(&g.dir, &trash).map_err(io("rename", &g.dir))?;
+    fn discard(&self, g: &Dir) -> Result<(), GenerationError> {
+        let trash = self.dir.join(format!("{GEN}{}{TRASH}", g.id.hex()));
+        fs::rename(&g.path, &trash).map_err(io("rename", &g.path))?;
         sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
         fs::remove_dir_all(&trash).map_err(io("remove", &trash))?;
         sync_dir(&self.dir).map_err(io("fsync", &self.dir))
@@ -395,22 +418,28 @@ impl Root {
 
     /// The current generation, if any. Two left after [`Root::finish_leftovers`] are an error.
     pub(crate) fn current(&self) -> Result<Option<Generation>, GenerationError> {
+        self.current_dir()?.map(Dir::generation).transpose()
+    }
+
+    /// The current generation directory, if any, its log not read.
+    fn current_dir(&self) -> Result<Option<Dir>, GenerationError> {
         let mut gens = self.generations()?;
         match gens.len() {
             0 | 1 => Ok(gens.pop()),
             _ => Err(GenerationError::Ambiguous {
                 root: self.dir.clone(),
-                lineages: gens.iter().map(|g| g.lineage).collect(),
+                ids: gens.iter().map(|g| g.id).collect(),
             }),
         }
     }
 
-    /// Starts building the generation of `h.lineage` in `gen-<lineage>.tmp`: its log, with `h`
-    /// naming the current generation as the one it supersedes, and an empty db.
+    /// Starts building the generation of `h.lineage` in a fresh `gen-<id32>.tmp`: its log, with
+    /// `h` naming the current generation directory as the one it supersedes, and an empty db.
     pub(crate) fn build(&self, mut h: SegmentHeader) -> Result<Building, GenerationError> {
-        let supersedes = self.current()?;
-        h.supersedes = supersedes.as_ref().map(|g| g.lineage);
-        let name = format!("{GEN}{}", hex(h.lineage));
+        let supersedes = self.current_dir()?;
+        h.supersedes = supersedes.as_ref().map(|g| g.id);
+        let id = GenId::random().map_err(|source| GenerationError::Random { source })?;
+        let name = format!("{GEN}{}", id.hex());
         let target = self.dir.join(&name);
         let tmp = self.dir.join(format!("{name}{TMP}"));
         if target.exists() {
@@ -419,6 +448,7 @@ impl Root {
         fs::create_dir(&tmp).map_err(io("create", &tmp))?;
         let generation = Generation {
             dir: tmp.clone(),
+            id,
             lineage: h.lineage,
         };
         let log = Log::create(&generation.log_dir(), h)?;
@@ -433,6 +463,7 @@ impl Root {
             root: self.dir.clone(),
             tmp,
             target,
+            id,
             lineage: generation.lineage,
             log,
             db,
@@ -459,14 +490,16 @@ pub(crate) struct Building {
     root: PathBuf,
     tmp: PathBuf,
     target: PathBuf,
+    id: GenId,
     lineage: Lineage,
     pub(crate) log: Log,
     pub(crate) db: File,
-    supersedes: Option<Generation>,
+    supersedes: Option<Dir>,
 }
 
 impl Building {
-    /// Publishes the generation: fsyncs the db, the log and the directory, renames it into place,
+    /// Publishes the generation: writes the page 1 of an empty database into a db file nothing was
+    /// applied to (design D7), fsyncs the db, the log and the directory, renames it into place,
     /// fsyncs the root, deletes the generation it supersedes and fsyncs the root again.
     pub(crate) fn publish(self) -> Result<Generation, GenerationError> {
         self.publish_steps(usize::MAX)
@@ -478,6 +511,7 @@ impl Building {
     fn publish_steps(mut self, steps: usize) -> Result<(Generation, usize), GenerationError> {
         let generation = Generation {
             dir: self.target.clone(),
+            id: self.id,
             lineage: self.lineage,
         };
         let mut plan = vec![
@@ -502,6 +536,13 @@ impl Building {
             match step {
                 Step::FsyncDb => {
                     let db_path = self.db_path();
+                    let len = self.db.metadata().map_err(io("stat", &db_path))?.len();
+                    if len == 0 {
+                        let page = marker::empty_page_one(self.lineage);
+                        self.db
+                            .write_all_at(page.as_slice(), 0)
+                            .map_err(io("write", &db_path))?;
+                    }
                     self.db.sync_all().map_err(io("fsync", &db_path))?;
                 }
                 Step::FsyncLog => self.log.sync()?,
@@ -513,7 +554,7 @@ impl Building {
                 Step::TrashSuperseded => {
                     if let Some(old) = &self.supersedes {
                         let trash = self.trash(old);
-                        fs::rename(&old.dir, &trash).map_err(io("rename", &old.dir))?;
+                        fs::rename(&old.path, &trash).map_err(io("rename", &old.path))?;
                     }
                 }
                 Step::RemoveTrash => {
@@ -533,8 +574,8 @@ impl Building {
         self.publish_steps(steps).map(|(_, done)| done)
     }
 
-    fn trash(&self, old: &Generation) -> PathBuf {
-        self.root.join(format!("{GEN}{}{TRASH}", hex(old.lineage)))
+    fn trash(&self, old: &Dir) -> PathBuf {
+        self.root.join(format!("{GEN}{}{TRASH}", old.id.hex()))
     }
 
     /// Deletes the generation being built, its `.tmp` and everything in it.
