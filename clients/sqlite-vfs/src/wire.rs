@@ -434,13 +434,23 @@ impl RawAnswer {
         )
     )]
     pub(crate) fn parse(&self, request: &Request) -> Answer {
+        // A client asking for the body's first bytes reads no more, whether the server honored
+        // `Range` (`206`) or not (`200`), as the HTTP transport does.
+        let body = match request.head_bytes {
+            Some(n) => self
+                .body
+                .get(..usize::try_from(n).unwrap_or(usize::MAX))
+                .unwrap_or(&self.body)
+                .to_vec(),
+            None => self.body.clone(),
+        };
         parse_answer(
             request,
             self.status,
             self.headers
                 .iter()
                 .map(|(name, value)| (*name, value.as_bytes())),
-            self.body.clone(),
+            body,
         )
     }
 }

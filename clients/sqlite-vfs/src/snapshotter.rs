@@ -698,6 +698,8 @@ fn durable_ack(
         return Err(SnapshotFailure::Reset);
     }
     let written = match b.handle.log() {
+        // Never lower the log's ACK: one at or past `k` only needs its fsync.
+        Ok(mut log) if log.acked() >= k => log.sync(),
         Ok(mut log) => log
             .append(&RecordBody::Ack {
                 acked: k,

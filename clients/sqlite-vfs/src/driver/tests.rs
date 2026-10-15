@@ -1198,6 +1198,51 @@ fn a_410_with_our_lineages_snapshot_past_the_durable_ack_rebuilds() {
     );
 }
 
+// A fresh open whose HEAD is overtaken: a frame lands and a snapshot past the HEAD's tail moves
+// retention before the build's own HEAD. The build reads up to the tail its HEAD names, from that
+// snapshot, and the open succeeds well within its deadline.
+#[test]
+fn a_fresh_open_overtaken_by_a_snapshot_past_its_head_builds_from_it() {
+    let dir_b = TempDir::new("driver-overtaken-b");
+    let dir_c = TempDir::new("driver-overtaken-c");
+    let mut w = World::new();
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    commit_pages(&mut w, b, &bound_b, 2, &[1, 2], 4);
+    w.run_for(1_000);
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        let frame = frame::encode_commit(
+            CommitId {
+                lineage: crate::ids::Lineage([0x6b; 16]),
+                position: Position(1),
+            },
+            &CommitRecord {
+                db_pages_after: 3,
+                pages: vec![(3, Box::new([8; 4096]))],
+            },
+        )
+        .unwrap();
+        server.foreign_append(PATH, &frame).unwrap();
+        snapshot_and_retain(server);
+    }));
+    let started = w.now;
+    let c = w.core();
+    let bound_c = w.open(c, spec(dir_c.path(), 3));
+    assert!(w.now - started < 30_000, "{} ms", w.now - started);
+    let expected = image_of(w.server.frames(PATH).unwrap());
+    assert_eq!(expected.len(), 3 * 4096);
+    assert_eq!(
+        std::fs::read(bound_c.handle.generation.db()).unwrap(),
+        expected
+    );
+    // One HEAD for the open and one for the build: no restart loop.
+    let heads = w.sent[..]
+        .iter()
+        .filter(|s| s.core == c && s.request.method == Method::Head)
+        .count();
+    assert_eq!(heads, 2);
+}
+
 #[test]
 fn a_410_at_a_takeover_with_a_pending_commit_rebuilds_from_the_snapshot() {
     let dir_a = TempDir::new("driver-gone-pending-a");

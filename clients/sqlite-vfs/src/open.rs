@@ -178,6 +178,11 @@ pub(crate) enum StreamState {
     Undecodable,
     /// A read answered a range other than the one it names.
     Contradiction,
+    /// Retention kept passing what a build installed, over every restart it makes: the frames
+    /// from `from` are below retention.
+    BelowRetention {
+        from: Offset,
+    },
     /// The stream changed history while the open read it.
     HistoryChanged,
 }
@@ -383,6 +388,11 @@ impl Fetch {
         self.stream.done()
     }
 
+    /// Reads up to `end` instead, before anything was read.
+    fn extend_to(&mut self, end: Offset) {
+        self.stream = FrameStream::new(self.stream.at(), end, MAX_BATCH_BYTES);
+    }
+
     /// The next read, under the precondition.
     pub(crate) fn request(&self) -> Request {
         let at = self.stream.at();
@@ -457,7 +467,12 @@ pub(crate) struct Build {
     retry: Retry,
     /// The next attempt's flags, after a failure.
     attempt: Attempt,
+    /// Restarts after a `410` so far, at most [`MAX_BUILD_RESTARTS`].
+    restarts: u32,
 }
+
+/// The restarts a build makes after a `410` before it gives up.
+const MAX_BUILD_RESTARTS: u32 = 8;
 
 /// What a build reads next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +483,8 @@ enum BuildStage {
     Snapshot { snapshot: SnapshotRef, limit: u64 },
     /// The frames after the snapshot (or from the start), up to the end.
     Tail,
+    /// A `410` met the tail: after the backoff, start over ([`Build::restart`]).
+    Restarting,
 }
 
 /// What a build does next.
@@ -509,6 +526,7 @@ impl Build {
             fetch: Fetch::new(incarnation, Offset::ZERO, end, None),
             retry: Retry::default(),
             attempt: Attempt::default(),
+            restarts: 0,
         }
     }
 
@@ -523,6 +541,7 @@ impl Build {
             ),
             BuildStage::Tail if self.fetch.done() => return BuildStep::Done,
             BuildStage::Tail => self.fetch.request(),
+            BuildStage::Restarting => return BuildStep::Restart,
         };
         BuildStep::Send {
             request,
@@ -558,16 +577,25 @@ impl Build {
                 if head.incarnation() != self.fetch.incarnation {
                     return BuildStep::Fail(OpenError::StreamState(StreamState::HistoryChanged));
                 }
-                self.stage = match head.snapshot() {
-                    Some(snapshot)
-                        if snapshot.offset > Offset::ZERO
-                            && snapshot.offset <= self.fetch.stream.end() =>
-                    {
-                        BuildStage::Snapshot {
-                            snapshot,
-                            limit: snapshot_limit(&head),
+                // A fresh open's build reads up to the tail this HEAD names. A takeover's rebuild
+                // reads up to its claim: a snapshot past the claim means another owner wrote
+                // after it.
+                match self.header.claim {
+                    None => self.fetch.extend_to(head.next_offset()),
+                    Some(_) => {
+                        if head
+                            .snapshot()
+                            .is_some_and(|s| s.offset > self.fetch.stream.end())
+                        {
+                            return BuildStep::Fail(OpenError::Reset(ResetKind::Fenced));
                         }
                     }
+                }
+                self.stage = match head.snapshot() {
+                    Some(snapshot) if snapshot.offset > Offset::ZERO => BuildStage::Snapshot {
+                        snapshot,
+                        limit: snapshot_limit(&head),
+                    },
                     _ => BuildStage::Tail,
                 };
                 self.next()
@@ -589,6 +617,8 @@ impl Build {
             },
             (BuildStage::Head | BuildStage::Snapshot { .. }, None) => self.failed(exchange, now_ms),
             (BuildStage::Tail, _) => self.tail_answered(exchange, now_ms),
+            // No request is out.
+            (BuildStage::Restarting, _) => BuildStep::Fail(OpenError::Panicked),
         }
     }
 
@@ -671,8 +701,22 @@ impl Build {
                 }
             }
             // Retention passed what this build installed: it starts over in a fresh `.tmp`, from
-            // the snapshot the HEAD names then.
-            ReadDecision::Gone => BuildStep::Restart,
+            // the snapshot the HEAD names then, after the open's backoff, a few times at most.
+            ReadDecision::Gone => {
+                self.restarts = self.restarts.saturating_add(1);
+                if self.restarts > MAX_BUILD_RESTARTS {
+                    return BuildStep::Fail(OpenError::StreamState(StreamState::BelowRetention {
+                        from: self.fetch.stream.at(),
+                    }));
+                }
+                self.stage = BuildStage::Restarting;
+                match self.retry.policy.backoff(None, Attempt::default(), now_ms) {
+                    Next::Wait {
+                        at_ms, jitter_ms, ..
+                    } => BuildStep::Timer { at_ms, jitter_ms },
+                    Next::Resend(_) | Next::Head(_) | Next::Reset(_) => BuildStep::Restart,
+                }
+            }
             ReadDecision::Common(_) => self.failed(exchange, now_ms),
         }
     }
@@ -685,10 +729,15 @@ impl Build {
             root,
             header,
             fetch,
+            retry,
+            restarts,
             ..
         } = self;
         building.discard().map_err(local)?;
-        start_build(root, header, fetch.incarnation, fetch.stream.end())
+        let mut build = start_build(root, header, fetch.incarnation, fetch.stream.end())?;
+        build.retry = retry;
+        build.restarts = restarts;
+        Ok(build)
     }
 
     /// Disk job: logs, acknowledges, fsyncs and applies one read's frames.
@@ -969,12 +1018,22 @@ impl Opening {
     /// The timer fired: send again what failed.
     pub(crate) fn tick(mut self: Box<Self>) -> OpenStep {
         let resend = self.resend.take();
+        if resend.is_none() {
+            let phase = std::mem::replace(&mut self.phase, Phase::Head);
+            if let Phase::Reading {
+                build,
+                cluster_id,
+                head,
+            } = phase
+            {
+                // The build's next step: a read, or a restart after its backoff.
+                let step = build.next();
+                return self.build_step(build, step, cluster_id, head);
+            }
+            self.phase = phase;
+        }
         let (request, attempt) = match (resend, &self.phase) {
             (Some(resend), _) => resend,
-            (None, Phase::Reading { build, .. }) => match build.next() {
-                BuildStep::Send { request, attempt } => (request, attempt),
-                _ => (head_request(), Attempt::default()),
-            },
             (None, Phase::Create) => (create_request(), Attempt::default()),
             (None, _) => (head_request(), Attempt::default()),
         };

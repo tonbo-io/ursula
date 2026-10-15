@@ -907,6 +907,9 @@ impl World {
         if owner.log.incarnation != self.token() {
             return;
         }
+        // A boundary at or below `rebuilt_through` is published unchecked: the frames the rebuild
+        // brought in take no positions in this model (the driver logs each at the next one), so
+        // nothing here names the frame that ends at its receipt.
         let record = owner
             .log
             .commits
@@ -921,18 +924,10 @@ impl World {
                 .filter(|(_, w)| *w == &record.frame[..])
                 .map(|(i, _)| i + record.frame.len())
                 .any(|after| {
-                    // Frames this model caught up take no log positions here (the driver logs
-                    // each at the next one): they are passed over like claims.
-                    let range = stream.get(after..end).unwrap_or_default();
                     after <= end
-                        && decode_all(range).iter().all(|(at, len, f)| {
-                            matches!(f, Some(Frame::Claim { .. }))
-                                || owner
-                                    .log
-                                    .applied
-                                    .iter()
-                                    .any(|a| range.get(*at..*at + *len) == Some(&a[..]))
-                        })
+                        && decode_all(stream.get(after..end).unwrap_or_default())
+                            .iter()
+                            .all(|(_, _, f)| matches!(f, Some(Frame::Claim { .. })))
                 });
             if !holds {
                 self.violation(format!(
