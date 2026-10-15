@@ -1085,6 +1085,7 @@ fn commit_pages(w: &mut World, core: usize, bound: &Bound, size: u32, pgnos: &[u
         })
         .unwrap();
         handle.record_commit(position);
+        handle.add_pending(frame.len() as u64);
         Pending {
             id,
             frame: Arc::from(frame),
@@ -1241,6 +1242,118 @@ fn a_fresh_open_overtaken_by_a_snapshot_past_its_head_builds_from_it() {
         .filter(|s| s.core == c && s.request.method == Method::Head)
         .count();
     assert_eq!(heads, 2);
+}
+
+/// Appends a commit of another writer, so the tail moves.
+fn foreign_commit(server: &mut ModelServer, salt: u8) {
+    let frame = frame::encode_commit(
+        CommitId {
+            lineage: crate::ids::Lineage([0x6c; 16]),
+            position: Position(u64::from(salt)),
+        },
+        &CommitRecord {
+            db_pages_after: 1,
+            pages: vec![(1, Box::new([salt; 4096]))],
+        },
+    )
+    .unwrap();
+    server.foreign_append(PATH, &frame).unwrap();
+}
+
+// A takeover's rebuild whose HEAD names a snapshot past its claim: another owner wrote after the
+// claim, so the open fails with a fenced reset instead of reading the stream.
+#[test]
+fn a_rebuild_facing_a_snapshot_past_its_claim_is_fenced() {
+    let dir_a = TempDir::new("driver-rebuild-fenced-a");
+    let dir_b = TempDir::new("driver-rebuild-fenced-b");
+    let mut w = World::new();
+    let a = w.core();
+    let bound = w.open(a, spec(dir_a.path(), 1));
+    w.commit(a, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.down[a] = true;
+    w.commit(a, &bound, 2).unwrap();
+    drop(bound);
+    w.crash(a);
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    w.commit(b, &bound_b, 3).unwrap();
+    w.run_for(1_000);
+    // The reopen diverges and rebuilds; before the rebuild's HEAD, the stream moves on past its
+    // claim and a snapshot there moves retention.
+    w.hold = Some(|job| matches!(job, DiskJob::NewBuild(_)));
+    let a2 = w.core();
+    let now = w.now;
+    let open = OpenId(w.id());
+    let ios = w.c(a2).open(open, spec(dir_a.path(), 3), now);
+    w.queue_ios(a2, ios);
+    w.run_for(5_000);
+    assert_eq!(w.held.len(), 1, "the rebuild started");
+    foreign_commit(&mut w.server, 4);
+    snapshot_and_retain(&mut w.server);
+    w.release_held();
+    w.run_for(5_000);
+    let e = kind(w.c(a2).take_opened(open).expect("resolved"));
+    assert!(matches!(*e, OpenError::Reset(ResetKind::Fenced)), "{e}");
+}
+
+// Retention passing every snapshot a fresh build installs: the build restarts after the open's
+// backoff (virtual time moves), at most 8 times, then fails with `BelowRetention`.
+#[test]
+fn a_build_that_keeps_meeting_410s_gives_up_after_its_restarts() {
+    let dir_b = TempDir::new("driver-restart-cap-b");
+    let dir_c = TempDir::new("driver-restart-cap-c");
+    let mut w = World::new();
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    w.commit(b, &bound_b, 1).unwrap();
+    w.run_for(1_000);
+    snapshot_and_retain(&mut w.server);
+    foreign_commit(&mut w.server, 9);
+    let c = w.core();
+    let started = w.now;
+    let open = OpenId(w.id());
+    let ios = w.c(c).open(open, spec(dir_c.path(), 3), started);
+    w.queue_ios(c, ios);
+    let mut installs = 0;
+    let mut result = None;
+    for salt in 10..200u8 {
+        w.hold = Some(|job| matches!(job, DiskJob::Install { .. }));
+        w.run_for(100);
+        if let Some(r) = w.c(c).take_opened(open) {
+            result = Some(r);
+            break;
+        }
+        if !w.held.is_empty() {
+            // Retention passes the snapshot being installed before its tail is read, and a
+            // frame follows the new one, so the next build has a tail to read too.
+            installs += 1;
+            foreign_commit(&mut w.server, salt);
+            snapshot_and_retain(&mut w.server);
+            foreign_commit(&mut w.server, salt.wrapping_add(100));
+            w.release_held();
+        }
+    }
+    let e = kind(result.expect("the open resolved"));
+    assert!(
+        matches!(
+            *e,
+            OpenError::StreamState(StreamState::BelowRetention { .. })
+        ),
+        "{e}"
+    );
+    assert_eq!(installs, 9, "one install, then 8 restarts");
+    assert!(
+        w.now > started + 900,
+        "restarts back off: {} ms",
+        w.now - started
+    );
+    let heads = w
+        .sent
+        .iter()
+        .filter(|s| s.core == c && s.request.method == Method::Head)
+        .count();
+    assert_eq!(heads, 10, "the open's HEAD and one per build");
 }
 
 #[test]
