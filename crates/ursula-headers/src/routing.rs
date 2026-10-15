@@ -95,12 +95,17 @@ pub enum RoutingAnswer {
     /// `503 Service Unavailable` with `Retry-After`: no leader of `group` is
     /// known.
     NoLeader { group: RaftGroup },
+    /// `307 Temporary Redirect` from a node that hosts no replica of
+    /// `group`, to a node that does. It names no leader and no term, since
+    /// the node knows neither: the target answers as any replica would,
+    /// with the write or a [`Self::NotLeader`] redirect.
+    NotHosted { group: RaftGroup },
 }
 
 impl RoutingAnswer {
     pub fn status(&self) -> u16 {
         match self {
-            Self::NotLeader { .. } => 307,
+            Self::NotLeader { .. } | Self::NotHosted { .. } => 307,
             Self::NoLeader { .. } => 503,
         }
     }
@@ -108,7 +113,9 @@ impl RoutingAnswer {
     /// The group the answer is about.
     pub fn group(&self) -> RaftGroup {
         match self {
-            Self::NotLeader { group, .. } | Self::NoLeader { group } => *group,
+            Self::NotLeader { group, .. }
+            | Self::NoLeader { group }
+            | Self::NotHosted { group } => *group,
         }
     }
 
@@ -124,7 +131,9 @@ impl RoutingAnswer {
                 emit(names::X_URSULA_RAFT_GROUP, &group.to_string());
                 emit(names::X_URSULA_RAFT_TERM, &term.to_string());
             }
-            Self::NoLeader { group } => emit(names::X_URSULA_RAFT_GROUP, &group.to_string()),
+            Self::NoLeader { group } | Self::NotHosted { group } => {
+                emit(names::X_URSULA_RAFT_GROUP, &group.to_string());
+            }
         }
     }
 
@@ -132,7 +141,8 @@ impl RoutingAnswer {
     /// any other status, for a `307` without Ursula's routing headers (a
     /// redirect of another layer), and for a `503` without
     /// `x-ursula-raft-group` (pressure, not routing). A `307` with some but
-    /// not all of the three headers is [`HeaderError::Missing`].
+    /// not all of the three headers is [`HeaderError::Missing`], except a
+    /// `307` that names the group alone: [`Self::NotHosted`].
     pub fn parse<'a, I>(status: u16, headers: I) -> Result<Option<Self>, HeaderError>
     where I: IntoIterator<Item = (&'a str, &'a [u8])> {
         if !matches!(status, 307 | 503) {
@@ -156,6 +166,7 @@ impl RoutingAnswer {
                 group,
                 term,
             })),
+            (None, Some(group), None) => Ok(Some(Self::NotHosted { group })),
             (None, ..) => Err(HeaderError::Missing {
                 name: names::X_URSULA_RAFT_LEADER_ID,
             }),
@@ -200,6 +211,9 @@ mod tests {
             RoutingAnswer::NoLeader {
                 group: RaftGroup::from_u32(0),
             },
+            RoutingAnswer::NotHosted {
+                group: RaftGroup::from_u32(9),
+            },
         ] {
             let mut pairs = Vec::new();
             answer.render(|name, value| pairs.push((name, value.to_owned())));
@@ -225,6 +239,19 @@ mod tests {
             ("x-ursula-raft-group", "5".to_owned()),
             ("x-ursula-raft-term", "9".to_owned()),
         ]);
+    }
+
+    #[test]
+    fn a_redirect_that_names_the_group_alone_is_not_hosted() {
+        assert_eq!(
+            parse(307, &[
+                ("location", "http://n2/s"),
+                ("x-ursula-raft-group", "3")
+            ]),
+            Ok(Some(RoutingAnswer::NotHosted {
+                group: RaftGroup::from_u32(3)
+            }))
+        );
     }
 
     #[test]

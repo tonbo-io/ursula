@@ -66,6 +66,7 @@ use tracing::debug;
 use tracing::error;
 use ursula_headers::SizeLimit;
 use ursula_headers::lowered_request_limit;
+use ursula_headers::names;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 
@@ -98,7 +99,6 @@ use crate::usage::UsageClass;
 use crate::usage::UsageCollector;
 use crate::usage::UsageKey;
 
-const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 const LONG_POLL_RESPONSE_HEADER_GRACE: Duration = Duration::from_secs(2);
@@ -910,7 +910,13 @@ impl Gateway {
             // follows itself, stays client-facing: strip the internal host so
             // the client reconnects through the gateway, not directly to the
             // Ursula node.
-            headers.remove(HEADER_URSULA_RAFT_LEADER_ID);
+            for name in [
+                names::X_URSULA_RAFT_LEADER_ID,
+                names::X_URSULA_RAFT_GROUP,
+                names::X_URSULA_RAFT_TERM,
+            ] {
+                headers.remove(name);
+            }
             if let Some(location) = headers
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
@@ -1198,13 +1204,16 @@ impl Chain {
     }
 }
 
-/// A Raft leader redirect: a `307` that names the leader, which the gateway
-/// follows itself (an upstream's other redirects reach the client).
+/// A Raft routing redirect, which the gateway follows itself (an upstream's
+/// other redirects reach the client): a `307` that names the leader, or the
+/// group alone, from a node that hosts no replica of it
+/// ([`ursula_headers::RoutingAnswer::NotHosted`]). The gateway uses no term,
+/// so a leader redirect whose term the node did not know counts too.
 fn is_raft_redirect(response: &reqwest::Response) -> bool {
     response.status() == StatusCode::TEMPORARY_REDIRECT
-        && response
-            .headers()
-            .contains_key(HEADER_URSULA_RAFT_LEADER_ID)
+        && [names::X_URSULA_RAFT_LEADER_ID, names::X_URSULA_RAFT_GROUP]
+            .iter()
+            .any(|name| response.headers().contains_key(*name))
 }
 
 /// Per-request context available once access control has classified and
@@ -1329,10 +1338,7 @@ fn lower_request_limit(headers: &mut HeaderMap, limit: u64) {
             limit
         }
     };
-    headers.insert(
-        ursula_headers::names::URSULA_MAX_REQUEST_BYTES,
-        HeaderValue::from(lowered),
-    );
+    headers.insert(names::URSULA_MAX_REQUEST_BYTES, HeaderValue::from(lowered));
 }
 
 /// How [`drain`] ended.

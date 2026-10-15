@@ -1389,7 +1389,10 @@ fn raft_redirect(location: &str, mut headers: HeaderMap) -> (StatusCode, HeaderM
         LOCATION,
         HeaderValue::from_str(location).expect("redirect target"),
     );
-    headers.insert(HEADER_URSULA_RAFT_LEADER_ID, HeaderValue::from_static("1"));
+    headers.insert(
+        names::X_URSULA_RAFT_LEADER_ID,
+        HeaderValue::from_static("1"),
+    );
     (StatusCode::TEMPORARY_REDIRECT, headers)
 }
 
@@ -1637,6 +1640,29 @@ async fn a_chain_of_redirects_reaches_the_answering_node() {
         let learned = status.is_success().then(|| leader.url());
         assert_eq!(cached_route(&gateway), learned, "{name}");
     }
+}
+
+/// A redirect from a node that hosts no replica of the group names the
+/// group alone (#581 section 5.7). The gateway follows it as a leader
+/// redirect, and the client never sees it.
+#[tokio::test]
+async fn the_gateway_follows_a_redirect_from_a_node_that_hosts_no_replica() {
+    let (outsider, replica) = (Scripted::spawn().await, Scripted::spawn().await);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("{}/bucket/stream", replica.url())).unwrap(),
+    );
+    headers.insert(names::X_URSULA_RAFT_GROUP, HeaderValue::from_static("3"));
+    outsider.answers((StatusCode::TEMPORARY_REDIRECT, headers));
+    replica.answers((StatusCode::OK, HeaderMap::new()));
+    let gateway = gateway_starting_at(&[&outsider, &replica]);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!((outsider.hits(), replica.hits()), (1, 1));
+    assert_eq!(gateway.metrics_snapshot().leader_redirects, 1);
 }
 
 /// A redirect whose `Location` is not one of the upstreams (`--upstream`
