@@ -85,8 +85,10 @@ impl StreamStateMachine {
     ///    genesis is empty.
     /// 3. The restore replaces the whole state. Producer records keep the
     ///    history they were claimed in, so each is history-fenced (G2).
-    ///    Each stream names the source's history as the one its current
-    ///    history began from, with its restored tail (W5).
+    ///    Each stream names the history its current one began from: the
+    ///    source's, with the restored tail, or for a stream not written
+    ///    since the source's latest event, the history it was last written
+    ///    in (W5).
     /// 4. The new history starts in the same entry, so no restored stream
     ///    is ever served under an earlier token.
     pub(crate) fn import_snapshot(
@@ -132,13 +134,17 @@ impl StreamStateMachine {
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         let mut snapshot = snapshot;
-        // A source stream not written since the source's own latest history
-        // event still names the history before it. The source served its
-        // bytes under its current token too, and that is the token a client
-        // of the source holds, so the import names it.
+        // A source stream written since the source's latest history event
+        // inherits from the source's current history: its token there, with
+        // the restored tail. One not written since keeps naming the history
+        // it was last written in, so two rewrites with no write between them
+        // report the token from before both, as any other pair of events
+        // does (#581 section 4.8, extensions section 2.4).
         let source_history = snapshot.history.map_or(0, |source| source.id.get());
         for entry in &mut snapshot.streams {
-            entry.history = source_history;
+            if super::history::written_since_event(entry.history, source_history) {
+                entry.history = source_history;
+            }
         }
         match Self::restore(snapshot) {
             Ok(mut restored) => {

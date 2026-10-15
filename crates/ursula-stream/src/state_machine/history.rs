@@ -22,6 +22,16 @@ use super::StreamStateMachine;
 use crate::history::InheritedReport;
 use crate::history::incarnation_token;
 
+/// Whether a stream whose bytes last changed in history `stream_history`
+/// was written since its group's latest history event, `group_history`. A
+/// stream not written since keeps naming the history it was last written
+/// in, through any number of events: its whole tail is inherited from that
+/// history (W5). The one rule `HEAD`, the first write after an event and an
+/// import all follow (#581 section 4.8, extensions section 2.4).
+pub(super) fn written_since_event(stream_history: u64, group_history: u64) -> bool {
+    stream_history == group_history
+}
+
 impl StreamStateMachine {
     /// The group's latest history event; `None` before its genesis.
     pub fn history(&self) -> Option<HistoryEvent> {
@@ -75,7 +85,7 @@ impl StreamStateMachine {
     pub fn stream_inherited(&self, stream_id: &BucketStreamId) -> Option<InheritedReport> {
         let slot = self.stream_slot(stream_id)?;
         let created_at_ms = slot.metadata.created_at_ms;
-        let (history, offset) = if slot.history != self.history_id() {
+        let (history, offset) = if !written_since_event(slot.history, self.history_id()) {
             // No write since the event: the whole stream is inherited.
             (slot.history, slot.metadata.tail_offset)
         } else {
@@ -102,7 +112,7 @@ impl StreamSlot {
     /// The first write after a history event: no byte changed since the
     /// event, so the tail now is the tail at the event.
     pub(super) fn inherit_history(&mut self, group: u64) {
-        if self.history != group {
+        if !written_since_event(self.history, group) {
             self.inherited = Some(InheritedHistory {
                 history: self.history,
                 offset: self.metadata.tail_offset,

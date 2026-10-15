@@ -546,11 +546,11 @@ fn two_events_report_the_history_the_stream_was_last_written_in() {
 fn an_import_reports_the_source_token_and_the_restored_tail() {
     let mut source = group(1);
     let stream_id = create(&mut source, "s");
-    append(&mut source, &stream_id, b"abc", None);
-    // The source itself went through an event without a write since: the
-    // import still names the source's current token, which its clients
-    // hold.
+    append(&mut source, &stream_id, b"ab", None);
+    // A write after an event: the source's current token is what the
+    // import names, with the restored tail.
     new_history(&mut source, 10, 2, 0);
+    append(&mut source, &stream_id, b"c", None);
     let source_token = token(&source, &stream_id);
     let mut target = genesis_only(9);
     import(&mut target, 5, source.snapshot(), 21, 1);
@@ -559,6 +559,86 @@ fn an_import_reports_the_source_token_and_the_restored_tail() {
         Some(InheritedReport {
             previous_incarnation: source_token,
             offset: 3,
+        })
+    );
+}
+
+/// #581 section 4.8 and extensions section 2.4: two rewrites with no write
+/// between them report the token from before both. The source went through
+/// an event and was not written since: the import names the token before
+/// that event, as a second event on the source itself would.
+#[test]
+fn an_import_of_a_stream_not_written_since_the_sources_event_names_the_token_before_it() {
+    let mut source = group(1);
+    let stream_id = create(&mut source, "s");
+    append(&mut source, &stream_id, b"abc", None);
+    let before = token(&source, &stream_id);
+    new_history(&mut source, 10, 2, 0);
+    let mut target = genesis_only(9);
+    import(&mut target, 5, source.snapshot(), 21, 1);
+    assert_eq!(
+        target.stream_inherited(&stream_id),
+        Some(InheritedReport {
+            previous_incarnation: before,
+            offset: 3,
+        })
+    );
+    // The same as the source's own second event.
+    new_history(&mut source, 11, 3, 0);
+    assert_eq!(
+        source.stream_inherited(&stream_id),
+        target.stream_inherited(&stream_id)
+    );
+}
+
+/// A double restore with no write between: the backup of a node that was
+/// itself restored names the token from before the first restore, A, with
+/// the offset X it inherited.
+#[test]
+fn a_double_restore_without_a_write_between_names_the_first_token() {
+    let mut source = group(1);
+    let stream_id = create(&mut source, "s");
+    append(&mut source, &stream_id, b"abc", None);
+    let a = token(&source, &stream_id);
+    let mut restored = genesis_only(9);
+    import(&mut restored, 5, source.snapshot(), 21, 1);
+    assert_eq!(
+        restored.stream_inherited(&stream_id),
+        Some(InheritedReport {
+            previous_incarnation: a,
+            offset: 3,
+        })
+    );
+    let mut again = genesis_only(8);
+    import(&mut again, 5, restored.snapshot(), 22, 2);
+    assert_ne!(token(&again, &stream_id), token(&restored, &stream_id));
+    assert_eq!(
+        again.stream_inherited(&stream_id),
+        Some(InheritedReport {
+            previous_incarnation: a,
+            offset: 3,
+        })
+    );
+}
+
+/// A double restore with a write between: the second restore names the
+/// token the first restore's node served the write under, B, with its tail.
+#[test]
+fn a_double_restore_with_a_write_between_names_the_restored_token() {
+    let mut source = group(1);
+    let stream_id = create(&mut source, "s");
+    append(&mut source, &stream_id, b"abc", None);
+    let mut restored = genesis_only(9);
+    import(&mut restored, 5, source.snapshot(), 21, 1);
+    append(&mut restored, &stream_id, b"d", None);
+    let b = token(&restored, &stream_id);
+    let mut again = genesis_only(8);
+    import(&mut again, 5, restored.snapshot(), 22, 2);
+    assert_eq!(
+        again.stream_inherited(&stream_id),
+        Some(InheritedReport {
+            previous_incarnation: b,
+            offset: 4,
         })
     );
 }
