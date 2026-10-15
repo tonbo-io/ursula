@@ -66,9 +66,9 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "h
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 
-# Accept the loss of one group's unsynced tail on this node, naming the log its metrics show (see Recovering after a host crash)
+# Send one group's recovery plan to this node, naming the log its metrics show (see Recovering after a host crash)
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -H "content-type: application/json" \
-  -d '{"expected_last_log_index": 1234, "expected_current_term": 7}' \
+  -d '{"leader": 2, "point": 1234, "cut": false, "expected": {"last_log_index": 1230, "last_log_term": 7, "current_term": 8}}' \
   -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
 
 ```
@@ -176,76 +176,64 @@ Leadership handoffs (draining, balancing, a node that sheds its leaderships, the
 
 While at most a minority of a group's voters lost their tail, the other voters hold every acknowledged write and nothing is lost. Wait for every group to open the gate on a node before you stop another voter.
 
-**A majority of a group's voters lost their tail at once.** If the group's leader kept its log, it stays leader and its barrier opens the gated replicas as above. Otherwise the gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that. For each stalled group:
+**A majority of a group's voters lost their tail at once.** If the group's leader kept its log, it stays leader and its barrier opens the gated replicas as above. Otherwise the gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that, with a recovery plan. The plan elects one replica as the group's leader, and that leader starts a new history of the group: every stream of the group gets a new `Stream-Incarnation`, and every producer epoch claimed before is closed (see [history rewrites](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation)). For each stalled group:
 
-1. On every voter, read the group's gate under `recovery_gates.gated` in `GET /__ursula/metrics` (a group missing there is open), and its `last_log_term`, `last_log_index` and `current_term` under `raft_groups`. The call below succeeds only on a replica that reports the group `stalled`.
-2. Rank the stalled replicas by last log id, as a Raft election does: highest `last_log_term` first, then highest `last_log_index`. An empty log (`null`) ranks last. On the first, run the call below through its admin listener. Its body names the `last_log_index` and `current_term` you read on that replica. Repeat down the ranking until the replicas whose gate is open form a majority of the voters. A replica that was not gated counts as open.
-3. The group elects a leader among the open replicas, the one with the most up-to-date log, and the remaining gated replicas catch up from it and open their gates.
+1. On every voter, read `GET /__ursula/metrics`: the group's gate under `recovery_gates.gated` (a group missing there is open), and under `raft_groups` its `last_log_term`, `last_log_index`, `current_term`, `committed_index` and `recovery`. Go on only when a majority of the group's voters answer, and only while no replica's gate is `awaiting_barrier` or `catching_up`: such a replica may still open through a leader's barrier without losing anything.
+2. Compute the plan from the replicas that answered:
+   - `floor`: the highest `current_term` among the replicas whose gate is not open or whose `recovery` is not `null`.
+   - The leader: the replica with the greatest last log id, highest `last_log_term` first, then highest `last_log_index`. An empty log (`null`) ranks last. Its `last_log_index` is the plan's `point`, and `cut` is `false`.
+   - When the group has more than one voter and that replica's `last_log_term` is below `floor`, its log may hold an entry that a lost leader overwrote. Then `cut` is `true`, the leader is the replica with the greatest `committed_index`, and its `committed_index` is the `point`. Every replica then keeps only the entries it knew were committed.
+3. Send the plan to every replica that answered, the leader last: `{"leader", "point", "cut", "expected": {"last_log_index", "last_log_term", "current_term"}}`, where `expected` is what you read on that replica.
+4. Each answers its `outcome`: `leads`, `follows`, or `restart_to_cut` when the plan cuts its log. Restart every node that answered `restart_to_cut`. The cut runs at its next start, before the group starts. The node then leads or follows as the plan says.
 
-Stop once the open replicas form a majority, even if the election takes a while. A replica that was not gated may hold the longest log, and then only it can win. Accepting the loss on one more gated replica can let two replicas with shorter logs elect each other and discard the writes only that replica holds.
-
-A voter that was never gated does not report `recovery_stalled`. Its readiness answers `503` with `raft_replica_unready`, and `raft_maintenance.group_issues` shows `leader_unknown` for the group.
-
-Replicas with the same last log id (`last_log_term` and `last_log_index`) hold identical logs, so either one may go first. Raft's log matching property guarantees it: two logs that hold an entry with the same term and index are identical up to that entry.
+A replica that holds a plan votes only for the plan's leader. Once elected, the leader proposes the group's history event before anything else and answers `503` with `Retry-After` to writes and reads until the event applies. On each replica the plan is satisfied once it applied the event: `history.event_index` above the plan's `point` and `recovery` back to `null` in its metrics. The plan is recorded in the node's metadata, so a restart keeps it until then. Leaders after that hold the event, so a later leader change starts no new history.
 
 ```bash
-# group 42 on this node
-metrics=$(curl --fail http://127.0.0.1:4438/__ursula/metrics)
-process_incarnation=$(jq -er .process_incarnation <<<"${metrics}")
-expected=$(jq -ec '.raft_groups[] | select(.raft_group_id == 42)
-  | {expected_last_log_index: .last_log_index, expected_current_term: .current_term}' <<<"${metrics}")
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -H "content-type: application/json" \
-  -d "${expected}" -X POST http://127.0.0.1:4438/__ursula/raft/42/recovery/accept-unsynced-loss
+# group 42: one admin URL per voter, through your forwards
+admins=(http://127.0.0.1:5441 http://127.0.0.1:5442 http://127.0.0.1:5443)
+for admin in "${admins[@]}"; do
+  curl -sS --fail "${admin}/__ursula/metrics" | jq -c --arg admin "${admin}" '
+    .process_incarnation as $incarnation | (.recovery_gates.gated // {}) as $gated
+    | .raft_groups[] | select(.raft_group_id == 42)
+    | {admin: $admin, process_incarnation: $incarnation, node_id, voters: (.voter_ids | length),
+       gate: ($gated[.raft_group_id | tostring] // "open"), recovery, committed_index,
+       expected: {last_log_index, last_log_term, current_term}}'
+done > replicas.jsonl
+
+jq -sc 'select(length * 2 > .[0].voters)
+  | (map(select(.gate != "open" or .recovery != null) | .expected.current_term) | max // 0) as $floor
+  | (max_by([.expected.last_log_term // -1, .expected.last_log_index // -1, .node_id])) as $longest
+  | ((.[0].voters > 1) and (($longest.expected.last_log_term // 0) < $floor)) as $cut
+  | (if $cut then max_by([.committed_index // -1, .node_id]) else $longest end) as $leader
+  | {leader: $leader.node_id, cut: $cut,
+     point: (if $cut then $leader.committed_index else $leader.expected.last_log_index end // 0)} as $plan
+  | sort_by(.node_id == $leader.node_id)[] | . + {plan: ($plan + {expected})}' replicas.jsonl > plan.jsonl
+
+# Review plan.jsonl, then send it, the leader last. Stop at the first refusal and observe again.
+while read -r replica; do
+  curl -sS --fail -w '\n' -H "x-ursula-process-incarnation: $(jq -r .process_incarnation <<<"${replica}")" \
+    -H "content-type: application/json" -d "$(jq -c .plan <<<"${replica}")" \
+    -X POST "$(jq -r .admin <<<"${replica}")/__ursula/raft/42/recovery/accept-unsynced-loss" || break
+done < plan.jsonl
 ```
 
-It answers `{"raft_group_id": 42, "node_id": 1, "outcome": "gate_opened", "last_log_index": 1234, "current_term": 7}`, or `"already_open"` when the gate was open. The open gate is recorded, so a restart does not close it again. A replica that led the group before the crash rejoins as a follower, also when it restarts after the call.
+The script plans one group. For many stalled groups, as after a rack power loss, run it for each, one group at a time.
 
 The call is refused with `409 Conflict`, and changes nothing, when:
 
 - the replica lost its vote and has not established a durable vote floor. Restore connectivity to an intact quorum so it can obtain a fresh barrier. Accepting unsynced data loss cannot authorize a replica to acknowledge an unknown leader.
-- the replica's gate is closed but not stalled. It may still open through a leader's barrier without losing anything. Wait for `recovery_stalled`.
-- the replica no longer holds the log the body names, because it moved since you read the metrics. Read the metrics again and decide again.
+- the replica leads the group with a quorum that acknowledged it within the last 3 seconds, or its gate awaits or applies a leader's barrier. The group has a live leader or may still recover without loss.
+- the replica no longer holds the log `expected` names, because it moved since you read the metrics. Read the metrics again and plan again.
+- the replica committed or applied an entry above the plan's `point`. The plan picked the wrong leader: read the metrics again and plan again.
+- the plan cuts and the replica knows no committed entry.
 
-**Many stalled groups at once.** A rack power loss can stall many groups together. The script below runs the steps above for every stalled group from one machine, through a forward to each voter's admin plane (see [ursulactl's operation providers](/docs/cli#the-admin-plane)). It skips a group while one of its voters does not answer or one of its gated replicas is not stalled yet. Review `plan.jsonl` before the last step, and run the script again until no group is stalled.
+A body of the 0.7 form answers `422`. A second plan replaces a first one that was never satisfied, as long as `floor` counts the replicas the first one holds.
 
-```bash
-# One admin URL per voter, through your forwards.
-admins=(http://127.0.0.1:5441 http://127.0.0.1:5442 http://127.0.0.1:5443)
-
-# 1. Observe every replica of every group once.
-for admin in "${admins[@]}"; do
-  curl -sS --fail "${admin}/__ursula/metrics" | jq -c --arg admin "${admin}" '
-    .process_incarnation as $incarnation | (.recovery_gates.gated // {}) as $gated
-    | .raft_groups[]
-    | {admin: $admin, process_incarnation: $incarnation, raft_group_id, node_id,
-       voters: (.voter_ids | length), gate: ($gated[.raft_group_id | tostring] // "open"),
-       last_log_term, expected_last_log_index: .last_log_index,
-       expected_current_term: .current_term}'
-done > replicas.jsonl
-
-# 2. For each group with a stalled replica, plan the stalled replicas to open,
-#    highest last log id first (last_log_term, then last_log_index), until the open
-#    replicas form a majority.
-jq -sc 'group_by(.raft_group_id)[]
-  | select(length == .[0].voters and any(.gate == "stalled")
-      and all(.gate == "open" or .gate == "stalled"))
-  | ((.[0].voters / 2 | floor) + 1 - (map(select(.gate == "open")) | length)) as $needed
-  | map(select(.gate == "stalled"))
-  | sort_by([.last_log_term // -1, .expected_last_log_index // -1]) | reverse
-  | .[:([$needed, 0] | max)][]' replicas.jsonl > plan.jsonl
-
-# 3. Accept the loss on each planned replica. Stop at the first refusal and observe again.
-while read -r replica; do
-  curl -sS --fail -w '\n' -H "x-ursula-process-incarnation: $(jq -r .process_incarnation <<<"${replica}")" \
-    -H "content-type: application/json" \
-    -d "$(jq -c '{expected_last_log_index, expected_current_term}' <<<"${replica}")" \
-    -X POST "$(jq -r '"\(.admin)/__ursula/raft/\(.raft_group_id)/recovery/accept-unsynced-loss"' <<<"${replica}")" || break
-done < plan.jsonl
-```
+A voter that was never gated does not report `recovery_stalled`. Its readiness answers `503` with `raft_replica_unready`, and `raft_maintenance.group_issues` shows `leader_unknown` for the group.
 
 With `fsync = "always"`, acknowledged appends survive a host crash, but the newest journal segment can still hold bytes written after the last `fsync`: an unacknowledged batch, or a commit or truncate marker. Recovery refuses damage in sealed segments. In the newest segment it removes an incomplete final frame without gating anything. A complete frame that fails verification, such as a hole, a zero-filled tail or a torn sector inside an unacknowledged batch, looks the same as media corruption of an acknowledged write. Recovery therefore records the recovery gate of every group on that core before it cuts the frame, and those groups rejoin as described above.
 
-A single-voter group has no other replica to recover from, so it needs this call after every host crash under `never`, once its gate reports the group stalled. Under `always` it needs the call only after a host crash that leaves a complete invalid frame in the newest segment. So does a group whose voters lose power together, for example in a rack power loss, when that gates a majority of them. No acknowledged write is lost in these cases, but only an operator can open the gates.
+A single-voter group has no other replica to recover from, so it needs a plan after every host crash under `never`, once its gate reports the group stalled, and every such plan gives every stream of the group a new `Stream-Incarnation`. `Stream-Previous-Incarnation` and `Stream-Inherited-Offset` on `HEAD` then tell clients how much of each stream survived. Use `fsync = "always"` for single-voter groups whose clients keep state. Under `always` it needs the call only after a host crash that leaves a complete invalid frame in the newest segment. So does a group whose voters lose power together, for example in a rack power loss, when that gates a majority of them. No acknowledged write is lost in these cases, but only an operator can open the gates.
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 
@@ -335,6 +323,7 @@ The recovery contract:
 - **Consistency boundary.** Each group export is the deterministic state-machine snapshot the raft snapshot path persists: internally consistent per group while writes continue. Cross-group consistency is not promised. The boundary is per stream. Acknowledged writes in the exporting replica's applied state are included whether or not they were cold-flushed, so **RPO is bounded by export time**, not by the cold-flush interval. `backup-create` asks every node and keeps the reply with the highest group commit index.
 - **Keep the cluster id.** Give the target cluster the source cluster's `server.cluster_id` (Helm `server.clusterId`) before its first start. Clients keep the id with their state and treat a different id as another deployment, so a restore under a new id looks to them like a move to another cluster, not a restore. A target node whose WAL was created with another id refuses to start, so set it before the nodes first run.
 - **Fresh identity on restore.** Restore replays each snapshot as one replicated write on the target cluster, which keeps its own raft membership and log identity. Nothing from the source cluster's raft metadata is reused. Groups that already hold buckets refuse the import with `409`, and group-count mismatches fail closed before the first import. Group commit indexes and per-stream append counters restart under the new identity. Stream bytes, offsets, close/TTL state, published snapshots, retention floors, and producer dedup states are preserved exactly.
+- **A restore is a new history.** Each group's import starts a new history of the group, so every restored stream answers with a new `Stream-Incarnation`. A client that holds a stream's token from the source cluster gets `412` with the new token, and `HEAD` names the source token as `Stream-Previous-Incarnation` with the restored tail as `Stream-Inherited-Offset`: what the client derived from bytes below it still holds. Every producer epoch claimed on the source is closed: a producer's next new write of it answers `403` with `Producer-Outcome: epoch-closed;by=history` and the last seq the backup kept, and the producer claims a new epoch. The import requires `x-ursula-backup-blake3`, the BLAKE3 digest of the group's backup object, which `ursulactl restore` sends. A repeat of an import that applied answers `200` with `"already": true` and starts no second history, so a restore interrupted by a timeout or a leader change can run again.
 - **Cold objects are part of the backup set.** Snapshots reference cold-tier chunks, cold-index pages and external payloads by object key. The backup holds the references, not the objects. The restored cluster's cold store must hold the same objects under the same keys: point it at a copy (see [Copying cold objects](#copying-cold-objects)). `backup-verify` validates snapshots but does not dereference cold objects. `restore` asks the target cluster, before the first import, to check every group's references against its own cold store (`POST /__ursula/backup/group/{group}/cold-check`). If any object is missing, it stops with nothing imported and prints how many are missing and the first keys.
 - **Format compatibility.** The backup format is the format epoch: `format_version` 4 in the manifest and in `/__ursula/backup/info`, and `format_epoch` 4 in every group object. A backup restores only into a cluster of the format epoch that wrote it. `ursulactl` refuses a manifest or a target cluster of another version before the first import, and a server refuses to import a group of another format epoch (`400`).
 - **RTO** is dominated by transferring and importing the group snapshots. Each import is a single replicated write per group.

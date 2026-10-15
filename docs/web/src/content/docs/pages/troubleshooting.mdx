@@ -165,14 +165,12 @@ A gated group on this node has seen no leader barrier and applied nothing for
 leader and refuses writes. The groups are listed under
 `recovery_stalled_groups`. Restore connectivity to a healthy quorum first.
 If the stalled replicas retain their voting history, an operator can accept
-the loss of writes acknowledged after the last `fsync`, with
-`POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on the gated
-replicas with the most up-to-date last log id (highest `last_log_term`, then
-highest `last_log_index`), until the open replicas form a majority. A replica without a durable vote floor refuses this call and still
-needs a fresh quorum proof. The request body names the replica's
-`last_log_index` and `current_term` from `/__ursula/metrics`. A voter of the
-group that was never gated does not report `recovery_stalled`. It answers
-`raft_replica_unready` with `leader_unknown` for the group. See
+the loss of writes acknowledged after the last `fsync` with a recovery plan,
+sent through `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` to
+every replica that answers, the leader last. The plan starts a new history of
+the group, so every stream of the group gets a new `Stream-Incarnation`. A
+voter of the group that was never gated does not report `recovery_stalled`. It
+answers `raft_replica_unready` with `leader_unknown` for the group. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### `accept-unsynced-loss` answers `409 Conflict`
@@ -181,11 +179,21 @@ Nothing changed. A replica that lost its voting history must first obtain a
 durable vote floor from a fresh quorum proof, and the call cannot replace that
 proof. Restore connectivity to intact voters.
 
-The call also refuses when the replica's recovery gate is not
-stalled, so it may still open through a leader's barrier without losing
-anything, or the replica no longer holds the `last_log_index` and
-`current_term` the request names. Wait for `recovery_stalled`, read
-`/__ursula/metrics` on the replica again, and decide again with what it shows.
+The call also refuses when the replica leads the group with a live quorum, when
+its gate awaits or applies a leader's barrier (it may still open without losing
+anything), when the replica no longer holds the log the plan's `expected` names,
+or when it committed or applied an entry above the plan's `point`. Read
+`/__ursula/metrics` on every replica again and plan again with what it shows.
+A body of the 0.7 form answers `422`.
+
+### Writes and reads answer `503` after a recovery plan
+
+The plan's leader serves nothing until the group's new history event applies.
+It proposes the event once it is elected and has applied its first entry, so
+this normally clears within a second. If it persists, check that the plan's
+leader is running and that every other replica that holds the plan can reach
+it: a replica with a plan votes only for the plan's leader. A replica that
+answered `restart_to_cut` takes part only after its restart.
 
 ### I/O error on `raft.wal.path`
 
