@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import hashlib
 import re
 import subprocess
 import tomllib
@@ -15,7 +14,12 @@ def render_config(*values: str) -> str:
 
 
 def render_chart(*values: str) -> str:
-    return subprocess.check_output(["helm", "template", "test", "charts/ursula", *values], text=True)
+    # A cluster of more than one replica must be named; tests that check the
+    # id itself pass their own, which overrides this one.
+    return subprocess.check_output(
+        ["helm", "template", "test", "charts/ursula", "--set", "server.clusterId=test", *values],
+        text=True,
+    )
 
 
 def deployment_contract_values() -> tuple[str, ...]:
@@ -409,15 +413,28 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "0.0.0.0:4438")
 
-    def test_cluster_id_derives_from_the_namespace_and_release(self) -> None:
-        rendered = subprocess.check_output(
-            ["helm", "template", "rel", "charts/ursula", "--namespace", "prod", "--set", "s3.bucket=bkt"],
+    def test_cluster_id_is_required_with_more_than_one_replica(self) -> None:
+        unnamed = subprocess.run(
+            ["helm", "template", "rel", "charts/ursula", "--set", "s3.bucket=bkt"],
+            capture_output=True,
             text=True,
         )
-        match = re.search(r'cluster_id = "(?P<id>[^"]*)"', rendered)
-        assert match is not None
-        digest = hashlib.sha256(b"prod/rel").hexdigest()[:32]
-        self.assertEqual(match.group("id"), f"u{digest}")
+        self.assertNotEqual(unnamed.returncode, 0)
+        self.assertIn("server.clusterId is required", unnamed.stderr)
+        single = subprocess.check_output(
+            [
+                "helm",
+                "template",
+                "rel",
+                "charts/ursula",
+                "--set",
+                "s3.bucket=bkt",
+                "--set",
+                "server.replicaCount=1",
+            ],
+            text=True,
+        )
+        self.assertNotIn("cluster_id", single)
 
     def test_cluster_id_can_be_set_and_is_validated(self) -> None:
         config = render_config("--set", "s3.bucket=bkt", "--set", "server.clusterId=prod-eu-1")

@@ -310,7 +310,7 @@
         "clusterId": {
           "type": "string",
           "pattern": "^([A-Za-z0-9._-]{1,64})?$",
-          "description": "server.cluster_id, sent as Ursula-Cluster-Id on every HEAD. Empty derives it from the release: u followed by the first 32 hex digits of sha256(\"<namespace>/<release name>\"). Keep it when a restore replaces the deployment."
+          "description": "server.cluster_id, sent as Ursula-Cluster-Id on every HEAD. Required with more than one replica: name the environment and region. A single replica may leave it empty and generates one. Keep it when a restore replaces the deployment."
         },
         "service": {
           "type": "object",
