@@ -42,8 +42,9 @@ For an `application/json` stream the offset must be a message boundary: a `Strea
 | `410` | Snapshot offset is older than the retained stream history. |
 | `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. Nothing was published; the response's `Stream-Incarnation` is the current token. |
 | `413` | The body is above `Ursula-Max-Request-Bytes`, which the response names. For a commit of parts, the assembled snapshot is above `Ursula-Max-Snapshot-Bytes`, which the response names instead. |
-| `502` | The cold backend failed while storing the body. |
-| `503` | JSON stream only: Ursula could not read the byte before the offset to check the boundary. Nothing was published; retry. |
+| `501` | A commit of parts on a node without a cold backend. |
+| `502` | The cold backend failed while storing the body or copying the parts. |
+| `503` | Retry after `Retry-After`. Nothing was published. The JSON `error` names the cause: `SnapshotCommitsBusy` (every copy slot taken, or no room in the in-flight budget beside a request), `SnapshotCommitInProgress` (this commit runs now), `IngressBodyBytesLimitReached`, `WalDiskPressure` or `RaftLogPressure`. A plain-text `503` means no leader is known, or, on a JSON stream, that Ursula could not read the byte before the offset to check the boundary. |
 
 A `204` carries `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Incarnation`. A publish is keyed by its offset and digest. Repeating the same offset, content type, and body returns the same digest while that snapshot is the latest. Reusing an offset with different content returns `409`.
 
@@ -75,7 +76,7 @@ The orphan sweep reclaims a part that no commit used once it is older than its g
 
 A stream deleted and created again while its commit copies is not published to. A commit that sent `Stream-Incarnation` then answers `412`. One that did not answers `400` for an unknown part, as a commit sent after the new create does.
 
-A node copies at most two commits at once. Another answers `503` with `Retry-After` and `{"error":"SnapshotCommitsBusy"}`. A copy is charged against `server.http_inflight_body_size` while it runs: 56 MiB at the default 256 MiB, 32 MiB on a node of 64 MiB, which reads fewer pieces ahead.
+A node copies at most two commits at once, and starts a copy only while a request of the full 32 MiB limit still fits in `server.http_inflight_body_size` beside it. Another commit answers `503` with `Retry-After` and `{"error":"SnapshotCommitsBusy"}`. A copy is charged against the budget while it runs: 56 MiB at the default 256 MiB, 32 MiB on a node of 64 MiB, which reads fewer pieces ahead and so copies one commit at a time.
 
 <Note>
 The node owns a commit once it starts copying. A client that goes away, or a gateway that times out, cancels none of it: the copy, the publish and the deletion of the parts run to their end. A repeat while the commit runs answers `503` with `Retry-After` and `{"error":"SnapshotCommitInProgress"}`, and a repeat after it answers `204` from the key. A copy takes time in proportion to the snapshot's size and the number of parts. On S3, 256 MiB in eight 32 MiB parts took about 3 seconds. Through `ursulagw`, whose `--response-header-timeout` is 30 seconds by default, a commit of many small parts can outlast the timeout. Repeat it until it answers, or send larger parts.
