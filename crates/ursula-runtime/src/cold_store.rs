@@ -750,6 +750,19 @@ impl ColdStore {
     }
 
     pub async fn delete_chunk(&self, path: &str) -> io::Result<()> {
+        self.begin_delete(path).await?;
+        self.operator
+            .delete(path)
+            .await
+            .map_err(|err| cold_store_io_error(path, err))?;
+        self.complete_delete(path);
+        Ok(())
+    }
+
+    /// The checks and events before an object is deleted, one policy for
+    /// [`Self::delete_chunk`] and [`Self::delete_objects`]: the empty-path
+    /// guard, `DeleteChunkBegin`, and the `DeleteChunk` fault policy.
+    async fn begin_delete(&self, path: &str) -> io::Result<()> {
         if path.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -772,17 +785,18 @@ impl ColdStore {
                 cached: None,
             })
             .await?;
-        self.operator
-            .delete(path)
-            .await
-            .map_err(|err| cold_store_io_error(path, err))?;
+        Ok(())
+    }
+
+    /// What follows a deleted object: its cached blocks go, and
+    /// `DeleteChunkComplete`.
+    fn complete_delete(&self, path: &str) {
         if let Some(cache) = &self.read_cache {
             cache.invalidate_path(path);
         }
         self.notify(ColdStoreEvent::DeleteChunkComplete {
             path: path.to_owned(),
         });
-        Ok(())
     }
 
     pub async fn remove_all(&self, path: &str) -> io::Result<()> {
@@ -871,13 +885,32 @@ impl ColdStore {
         Ok(names)
     }
 
-    /// Deletes `paths`, in batches where the backend has them (S3's
-    /// `DeleteObjects`). A missing object counts as deleted.
+    /// Deletes `paths` with the checks and events of
+    /// [`Self::delete_chunk`] for each, in one batched call where the
+    /// backend has one (S3's `DeleteObjects`). A path the checks refuse is
+    /// kept; the others are deleted all the same, and the first refusal is
+    /// returned. A missing object counts as deleted.
     pub async fn delete_objects(&self, paths: Vec<String>) -> io::Result<()> {
-        self.operator
-            .delete_iter(paths)
-            .await
-            .map_err(|err| cold_store_io_error("batch delete", err))
+        let mut refused = None;
+        let mut admitted = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.begin_delete(&path).await {
+                Ok(()) => admitted.push(path),
+                Err(err) => {
+                    refused.get_or_insert(err);
+                }
+            }
+        }
+        if !admitted.is_empty() {
+            self.operator
+                .delete_iter(admitted.clone())
+                .await
+                .map_err(|err| cold_store_io_error("batch delete", err))?;
+            for path in &admitted {
+                self.complete_delete(path);
+            }
+        }
+        refused.map_or(Ok(()), Err)
     }
 
     /// Proves that the object store has no file below `path`. Tenant purge
