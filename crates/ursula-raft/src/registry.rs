@@ -561,6 +561,38 @@ impl RaftGroupHandleRegistry {
         }
     }
 
+    /// The address each active group's effective membership records for
+    /// `node_id`, read from the group's Raft core. Peers dial these addresses,
+    /// not the configured ones, once a group is initialized. A group whose
+    /// membership does not name the node, or whose core stopped, is left out.
+    pub async fn recorded_node_addresses(&self, node_id: u64) -> Vec<(RaftGroupId, String)> {
+        let groups = self
+            .groups
+            .load()
+            .iter()
+            .filter_map(|(id, entry)| entry.active().map(|active| (*id, active.raft().clone())))
+            .collect::<Vec<_>>();
+        join_all(groups.into_iter().map(|(id, raft)| async move {
+            let address = raft
+                .with_raft_state(move |state| {
+                    state
+                        .membership_state
+                        .effective()
+                        .membership()
+                        .get_node(&node_id)
+                        .map(|node| node.addr.clone())
+                })
+                .await
+                .ok()
+                .flatten();
+            address.map(|address| (RaftGroupId(id), address))
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub(crate) fn subscribe_transport_shutdown(&self) -> watch::Receiver<bool> {
         self.transport_shutdown.subscribe()
     }

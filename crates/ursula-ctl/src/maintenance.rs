@@ -624,6 +624,7 @@ mod tests {
                 host: address.to_string(),
                 http_url: Some(url),
                 metrics_url: None,
+                client_url: None,
             });
         }
         (nodes, cluster)
@@ -638,6 +639,7 @@ mod tests {
             host: host.to_owned(),
             http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
             metrics_url: None,
+            client_url: None,
         }
     }
 

@@ -329,6 +329,20 @@ async fn init_state(
         }
     }
 
+    // Peers dial the address a group recorded at its initialization, so a
+    // node whose Raft url moved since (such as a new cluster port) would
+    // serve Raft where no peer dials it.
+    if let Some(registry) = spawned.raft_registry.as_ref()
+        && let Some(own) = config
+            .raft
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == config.raft.node_id)
+    {
+        crate::bootstrap::check_own_recorded_address(registry, config.raft.node_id, &own.url)
+            .await?;
+    }
+
     let state = if raft_peers.is_empty() {
         match spawned.raft_registry {
             Some(registry) => HttpState::with_raft_registry(runtime, registry),
@@ -338,15 +352,28 @@ async fn init_state(
         let registry = spawned
             .raft_registry
             .expect("static grpc topology returns registry");
+        // Leader redirects send clients to a peer's client plane, which is
+        // not its Raft `url` when the cluster plane listens apart.
+        let client_peers = config
+            .raft
+            .peers
+            .iter()
+            .map(|peer| (peer.node_id, peer.client_base_url().to_owned()));
         HttpState::with_static_raft_cluster_topology(
             runtime,
             registry,
             config.raft.node_id,
-            raft_peers,
+            client_peers,
             per_group_voters,
         )
     };
+    let planes = if config.server.cluster_listen.is_some() {
+        crate::PeerPlanes::Split
+    } else {
+        crate::PeerPlanes::Shared
+    };
     let mut state = state
+        .with_peer_planes(planes)
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
         .with_configured_cluster_id(config.server.cluster_id.clone())
@@ -668,6 +695,7 @@ mod tests {
             .map(|node_id| RaftPeerConfig {
                 node_id,
                 url: format!("http://node-{node_id}:50051"),
+                client_url: None,
             })
             .collect();
         super::validate_startup_topology(&config).expect("a three-voter cell must be accepted");

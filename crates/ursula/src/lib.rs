@@ -87,6 +87,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
+pub use bootstrap::PeerAddressChanged;
 pub use bootstrap::Persistence;
 pub use bootstrap::SpawnRuntimeError;
 pub use bootstrap::SpawnedRuntime;
@@ -551,6 +552,16 @@ impl HttpState {
     /// Apply runtime-level config (memory monitor, payload threshold) derived
     /// from the typed configuration.  Replaces the hard-coded defaults set by
     /// the constructors.
+    /// Tells the leader router whether peers' Raft addresses serve their
+    /// client plane ([`PeerPlanes`]).
+    #[must_use]
+    pub fn with_peer_planes(mut self, planes: PeerPlanes) -> Self {
+        self.client_write_router = self
+            .client_write_router
+            .map(|router| router.with_planes(planes));
+        self
+    }
+
     pub fn with_runtime_config(mut self, config: &ursula_config::RuntimeConfig) -> Self {
         self.node_memory = NodeMemoryMonitor::new(config);
         if let Some(min_size) = &config.external_payload_min_size {
@@ -624,16 +635,27 @@ struct HttpMetricsSnapshot {
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
-/// redirect. `peers` maps raft node id to that node's configured peer URL:
-/// `server.listen` when `server.cluster_listen` is unset, or the separate
-/// `server.cluster_listen` address when it is set. Peer URLs are also used as
-/// HTTP leader-redirect targets, so clients and gateways must be able to reach
-/// them too.
+/// redirect. `peers` maps raft node id to that node's client-plane base URL
+/// ([`ursula_config::RaftPeerConfig::client_base_url`]): its `client_url`, or
+/// its Raft `url` when the node serves both planes on `server.listen`.
+/// Clients and gateways must be able to reach these URLs.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
+    planes: PeerPlanes,
+}
+
+/// Whether a node's Raft address also serves its client plane, which decides
+/// if a leader hint's Raft address may be a redirect target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerPlanes {
+    /// The planes share `server.listen`: a Raft address is a client URL.
+    Shared,
+    /// The cluster plane listens on `server.cluster_listen`: a Raft address
+    /// serves no client route, so only a configured `client_url` is a target.
+    Split,
 }
 
 impl ClientWriteLeaderRouter {
@@ -655,15 +677,29 @@ impl ClientWriteLeaderRouter {
             ),
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
+            planes: PeerPlanes::Shared,
         }
     }
 
-    /// The base URL of `leader_id`: its configured peer URL, else
-    /// `address`. `None` for this node itself.
+    /// The router of a node whose peers serve their planes as `planes` says.
+    #[must_use]
+    pub fn with_planes(mut self, planes: PeerPlanes) -> Self {
+        self.planes = planes;
+        self
+    }
+
+    /// The base URL of `leader_id`: its configured client URL, else, while
+    /// the planes share a listener, the Raft `address` of the leader hint.
+    /// `None` for this node itself, and for a leader with no client URL, which
+    /// the caller answers with a retryable `503`.
     fn peer_base(&self, leader_id: u64, address: Option<&str>) -> Option<String> {
         if Some(leader_id) == self.node_id {
             return None;
         }
+        let address = match self.planes {
+            PeerPlanes::Shared => address,
+            PeerPlanes::Split => None,
+        };
         let base = self.peers.get(&leader_id).map(String::as_str).or(address)?;
         Some(base.trim_end_matches('/').to_owned())
     }
@@ -1262,6 +1298,7 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
             raft_grpc_service(state.clone(), raft_registry),
         )
         .route(LEADERSHIP_SHED_PATH, get(leadership_shed_status))
+        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -1281,7 +1318,8 @@ pub(crate) const LEADERSHIP_SHED_PATH: &str = "/__ursula/leadership-shed";
 pub(crate) const READINESS_PATH: &str = "/__ursula/ready";
 
 /// Probe target: drain the body (so the sender's full egress traverses the
-/// cluster plane) and answer 200. Bypasses ingress admission.
+/// cluster plane) and answer 200. The cluster plane runs no ingress
+/// admission, so a node under write pressure still answers its peers.
 async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
 }
@@ -1413,7 +1451,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/metrics", get(metrics))
         .route(READINESS_PATH, get(readiness))
         .route("/__ursula/usage", get(bucket_usage))
-        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
         // The bare path (the removed latest-snapshot redirect and the removed
         // record-addressed publish) answers 405 to every method, not a 404
@@ -4684,9 +4721,9 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
-    // Peer URLs are the configured client-reachable leader addresses
-    // (`server.listen` when shared, or `server.cluster_listen` when split), so
-    // they are valid redirect targets for reads and writes alike. 307 preserves
+    // The router holds each peer's client-plane URL (its `client_url`, or its
+    // Raft `url` when the planes share `server.listen`), so they are valid
+    // redirect targets for reads and writes alike. 307 preserves
     // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.

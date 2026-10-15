@@ -82,8 +82,10 @@ pub struct UrsulaConfig {
 pub struct ServerConfig {
     /// Public HTTP client API bind address.
     pub listen: String,
-    /// Optional separate bind for the cluster / Raft gRPC plane.
-    /// When omitted, both planes share `listen`.
+    /// Optional separate bind for the cluster plane (Raft gRPC, the
+    /// peers' egress probe and leadership-shed state). When omitted, both
+    /// planes share `listen`. When set, every `[[raft.peers]]` `url` names a
+    /// peer's cluster listener and every peer needs a `client_url`.
     pub cluster_listen: Option<String>,
     /// Admin-plane bind for mutating operator endpoints (raft ops,
     /// maintenance drain, cold-flush trigger). Loopback by default so nodes
@@ -373,8 +375,21 @@ impl Default for WalConfig {
 pub struct RaftPeerConfig {
     /// Peer node ID.
     pub node_id: u64,
-    /// Peer gRPC URL.
+    /// URL peers dial for the cluster plane: the peer's `server.listen`, or
+    /// its `server.cluster_listen` when it splits the cluster plane off.
     pub url: String,
+    /// URL clients reach the peer's client plane at, the target of leader
+    /// redirects. Required when `server.cluster_listen` is set, because `url`
+    /// then serves no client route. Defaults to `url` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_url: Option<String>,
+}
+
+impl RaftPeerConfig {
+    /// The base URL of the peer's client plane: `client_url`, else `url`.
+    pub fn client_base_url(&self) -> &str {
+        self.client_url.as_deref().unwrap_or(&self.url)
+    }
 }
 
 /// Per-group voter assignment for heterogeneous static clusters.

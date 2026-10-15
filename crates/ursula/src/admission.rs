@@ -20,7 +20,6 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use ursula_headers::SizeLimit;
 
-use crate::CLUSTER_PROBE_PATH;
 use crate::MAX_HTTP_BODY_BYTES;
 use crate::front_door;
 use crate::limits;
@@ -131,9 +130,6 @@ pub(crate) async fn ingress_admission_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if request.uri().path() == CLUSTER_PROBE_PATH {
-        return next.run(request).await;
-    }
     let Some(body_bytes) = request_write_body_bytes(&request) else {
         return next.run(request).await;
     };

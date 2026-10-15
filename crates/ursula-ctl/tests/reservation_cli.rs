@@ -180,6 +180,7 @@ fn run_host_cli(interrupt_candidate: bool) {
                 .unwrap(),
             http_url: None,
             metrics_url: None,
+            client_url: None,
             expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),
             expected_maintenance_fence: None,
         })
@@ -557,6 +558,7 @@ fn proposal_is_not_a_receipt_and_conflicting_committed_state_cannot_be_adopted()
                 .unwrap(),
             http_url: None,
             metrics_url: None,
+            client_url: None,
             expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),
             expected_maintenance_fence: None,
         })

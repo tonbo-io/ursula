@@ -326,6 +326,53 @@ fn leader_redirect_never_points_at_this_node() {
     );
 }
 
+// A leader that `[[raft.peers]]` does not name has only its Raft address in
+// the hint. With split planes that address is a cluster listener, so no
+// redirect names it, and the leader-router and `leader_url` both give up.
+#[test]
+fn split_planes_never_redirect_to_a_raft_address() {
+    let router = || {
+        ClientWriteLeaderRouter::with_static_topology(
+            Some(2),
+            [
+                (1, "http://node-1:4437".to_owned()),
+                (2, "http://node-2:4437".to_owned()),
+            ],
+            BTreeMap::new(),
+        )
+    };
+    let unlisted = RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(4),
+        error: GroupEngineError::forward_to_leader_before_proposal(
+            "not leader",
+            Some(9),
+            Some("http://node-9:4439".to_owned()),
+        )
+        .with_leader_term(Some(7)),
+    };
+
+    let shared = router()
+        .redirect_response(&unlisted, "/b/s")
+        .expect("a shared plane redirects to the Raft address");
+    assert_eq!(shared.headers()[LOCATION], "http://node-9:4439/b/s");
+
+    let split = router().with_planes(PeerPlanes::Split);
+    assert!(split.redirect_response(&unlisted, "/b/s").is_none());
+    assert!(
+        split
+            .leader_url(9, Some("http://node-9:4439"), "/b/s")
+            .is_none()
+    );
+    assert_eq!(
+        split.leader_url(1, Some("http://node-1:4439"), "/b/s"),
+        Some("http://node-1:4437/b/s".to_owned())
+    );
+    // Without a redirect the hint is a forward to an unknown leader, which
+    // the client plane answers with a retryable 503.
+    assert!(super::is_forward_to_leader(&unlisted));
+}
+
 /// The routing answer of a `307` or a routing `503`, as clients parse it.
 /// Every redirect a node sends parses (#581 section 5.7).
 #[track_caller]
@@ -2085,6 +2132,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         admin_url: format!("http://{addr}").parse().unwrap(),
         http_url: None,
         metrics_url: None,
+        client_url: None,
         expected_process_incarnation: None,
         expected_maintenance_fence: None,
     };
@@ -2194,6 +2242,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
             admin_url: endpoint.parse().unwrap(),
             http_url: Some(endpoint.parse().unwrap()),
             metrics_url: Some(endpoint.parse().unwrap()),
+            client_url: None,
             host: endpoint.clone(),
         })
         .collect::<Vec<_>>();
@@ -3135,6 +3184,7 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
             admin_url: base.parse().unwrap(),
             http_url: Some(base.parse().unwrap()),
             metrics_url: Some(base.parse().unwrap()),
+            client_url: None,
             host: base.clone(),
         })
         .collect::<Vec<_>>();
@@ -5548,6 +5598,75 @@ async fn cluster_router_does_not_expose_client_plane_routes() {
         404,
         "client-plane route leaked into cluster router"
     );
+}
+
+// Peers probe each other's egress at their Raft URL, which names the cluster
+// listener when a node splits its planes, so the probe is a cluster route.
+#[tokio::test]
+async fn cluster_router_answers_the_egress_probe() {
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let cluster = cluster_router_from_state(state);
+    let response = http_post(
+        &cluster,
+        crate::CLUSTER_PROBE_PATH,
+        &[],
+        Body::from(vec![0_u8; 64 * 1024]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+// With one listener the cluster routes merge into the client router after
+// its admission layer, so a node out of body budget still answers a peer's
+// probe and is not judged to have lost its egress.
+#[tokio::test]
+async fn a_shared_listener_answers_the_egress_probe_under_write_pressure() {
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let server = ursula_config::ServerConfig {
+        http_inflight_body_size: ursula_config::HumanSize::kib(1),
+        ..ursula_config::ServerConfig::default()
+    };
+    let shared = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::new(&server),
+    ));
+    // The client plane refuses a 64 KiB write body for the budget.
+    let refused = http_put(
+        &shared,
+        "/pressured-bucket",
+        &[("content-length", "65536")],
+        Body::from(vec![0_u8; 64 * 1024]),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = http_post(
+        &shared,
+        crate::CLUSTER_PROBE_PATH,
+        &[("content-length", "65536")],
+        Body::from(vec![0_u8; 64 * 1024]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -11532,6 +11651,7 @@ async fn cli_uses_saved_executor_identity_and_never_refreshes_after_takeover() {
         admin_url: format!("http://{address}").parse().unwrap(),
         http_url: None,
         metrics_url: None,
+        client_url: None,
         expected_process_incarnation: Some(state.process_incarnation.clone()),
         expected_maintenance_fence: Some(executor_token(1)),
     };
@@ -11603,6 +11723,7 @@ async fn explicit_replacement_binding_preserves_token_and_rejects_another_execut
         admin_url: format!("http://{address}").parse().unwrap(),
         http_url: None,
         metrics_url: None,
+        client_url: None,
         expected_process_incarnation: Some(ProcessIncarnation::from_bits(0)),
         expected_maintenance_fence: Some(executor_token(1)),
     };
@@ -11901,6 +12022,7 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
             admin_url: endpoint.parse().unwrap(),
             http_url: Some(endpoint.parse().unwrap()),
             metrics_url: Some(endpoint.parse().unwrap()),
+            client_url: None,
             host: endpoint.clone(),
         })
         .collect::<Vec<_>>();

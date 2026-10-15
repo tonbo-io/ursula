@@ -281,6 +281,7 @@ fn synthetic_node_info(node_id: u64) -> NodeInfo {
         host: format!("node-{node_id}"),
         http_url: None,
         metrics_url: None,
+        client_url: None,
     }
 }
 

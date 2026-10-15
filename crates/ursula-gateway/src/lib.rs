@@ -615,7 +615,7 @@ impl Gateway {
     /// - A redirect sends the request to the upstream its `Location` names,
     ///   unless the request already went to that upstream in this chain.
     /// - Otherwise, and when the `Location` names no upstream (`--upstream`
-    ///   names the nodes otherwise than their peer URLs), the request goes to
+    ///   names the nodes otherwise than their client URLs), the request goes to
     ///   an upstream it has not tried yet, the next after the one that
     ///   redirected in the configured order. Such a search hop that cannot
     ///   connect sent nothing, so the search goes on to the next one.

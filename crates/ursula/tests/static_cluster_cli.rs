@@ -561,6 +561,215 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     drop(children);
 }
 
+/// A cluster whose nodes serve the cluster plane on `server.cluster_listen`:
+/// Raft replicates over the cluster ports, the peers' egress probe finds
+/// them healthy, and a follower redirects a client to the leader's client
+/// port, never to its cluster port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI split-plane test");
+        return;
+    };
+    let planes: Vec<SplitPlanePorts> = (1_u64..=3)
+        .map(|node_id| SplitPlanePorts {
+            node_id,
+            client: free_port(),
+            cluster: free_port(),
+        })
+        .collect();
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let mut children = vec![
+        spawn_split_plane_node(binary, &planes, 2, false, wal_root.path()),
+        spawn_split_plane_node(binary, &planes, 3, false, wal_root.path()),
+        spawn_split_plane_node(binary, &planes, 1, true, wal_root.path()),
+    ];
+
+    let client = reqwest::Client::new();
+    for plane in &planes {
+        wait_until_ready(&client, &plane.client_url(), &mut children).await;
+    }
+    put_until_created(&client, &format!("{}/split/plane", planes[1].client_url())).await;
+
+    // Writes route before their body, so a follower answers a create with a
+    // redirect to the group's leader.
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client without redirects");
+    let client_urls: Vec<String> = planes.iter().map(SplitPlanePorts::client_url).collect();
+    let mut locations = Vec::new();
+    for _ in 0..200 {
+        locations.clear();
+        for plane in &planes {
+            let response = no_redirect
+                .put(format!("{}/split/plane", plane.client_url()))
+                .header("content-type", "text/plain")
+                .send()
+                .await
+                .expect("send create");
+            if response.status() == reqwest::StatusCode::TEMPORARY_REDIRECT {
+                let location = response.headers()["location"]
+                    .to_str()
+                    .expect("location header")
+                    .to_owned();
+                locations.push(location);
+            }
+        }
+        if locations.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(locations.len(), 2, "two followers redirect: {locations:?}");
+    for location in &locations {
+        assert!(
+            client_urls
+                .iter()
+                .any(|base| *location == format!("{base}/split/plane")),
+            "a redirect names a client port, not a cluster port: {location}"
+        );
+    }
+
+    let appended = put_with_body_until_created(
+        &client,
+        &format!("{}/split/replicated", planes[2].client_url()),
+        "split-plane-payload",
+    )
+    .await;
+    assert!(appended.status().is_success());
+    let payload = read_until_replicated(
+        &client,
+        &format!(
+            "{}/split/replicated?offset=0&max_bytes=64",
+            planes[0].client_url()
+        ),
+    )
+    .await;
+    assert_eq!(payload, b"split-plane-payload");
+
+    // The egress gate sheds after two failed 500 ms ticks. Give it several,
+    // then every node must still be allowed to campaign: its peers answered
+    // the probe on their cluster ports.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for plane in &planes {
+        let status: ursula_proto::admin::LeadershipShedStatus = client
+            .get(format!("{}/__ursula/leadership-shed", plane.cluster_url()))
+            .send()
+            .await
+            .expect("request leadership-shed state")
+            .error_for_status()
+            .expect("leadership-shed state on the cluster port")
+            .json()
+            .await
+            .expect("decode leadership-shed state");
+        assert!(
+            status.should_campaign,
+            "node {} sheds: {status:?}",
+            plane.node_id
+        );
+        let probe = client
+            .post(format!("{}/__ursula/cluster-probe", plane.cluster_url()))
+            .body(vec![0_u8; 1024])
+            .send()
+            .await
+            .expect("send egress probe");
+        assert_eq!(probe.status(), reqwest::StatusCode::OK);
+        // Neither plane serves the other's routes.
+        let append = client
+            .put(format!("{}/split/cluster-port", plane.cluster_url()))
+            .header("content-type", "text/plain")
+            .send()
+            .await
+            .expect("send create to the cluster port");
+        assert_eq!(append.status(), reqwest::StatusCode::NOT_FOUND);
+        let shed = client
+            .get(format!("{}/__ursula/leadership-shed", plane.client_url()))
+            .send()
+            .await
+            .expect("request leadership-shed state on the client port");
+        assert_ne!(shed.status(), reqwest::StatusCode::OK);
+        let client_probe = client
+            .post(format!("{}/__ursula/cluster-probe", plane.client_url()))
+            .body(vec![0_u8; 1024])
+            .send()
+            .await
+            .expect("send egress probe to the client port");
+        assert_ne!(client_probe.status(), reqwest::StatusCode::OK);
+    }
+
+    drop(children);
+}
+
+/// A node whose groups recorded its Raft url at their initialization refuses
+/// to start once that url moved to a new cluster port, since its peers would
+/// keep dialing the recorded one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_refuses_a_cluster_port_moved_after_initialization() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI cluster-port test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("test root");
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let config = root.path().join("server.toml");
+    write_single_node_cluster_config(&config, port, 1, 2, &base, true, &root.path().join("wal"));
+    let mut command = Command::new(binary);
+    command.arg("server").arg("--config").arg(&config);
+    let mut children = vec![spawn_child(command, "shared-port".to_owned())];
+    let client = reqwest::Client::new();
+    wait_until_ready(&client, &base, &mut children).await;
+    put_until_created(&client, &format!("{base}/moved/port")).await;
+    sigterm_and_wait_for_clean_exit(&mut children[0]).await;
+    drop(children);
+
+    let cluster_port = free_port();
+    let shared = std::fs::read_to_string(&config).expect("read node config");
+    let listen = format!("listen = \"127.0.0.1:{port}\"");
+    let peer_url = format!("url = \"{base}\"");
+    assert!(
+        shared.contains(&listen) && shared.contains(&peer_url),
+        "{shared}"
+    );
+    let split = shared
+        .replace(
+            &listen,
+            &format!("{listen}\ncluster_listen = \"127.0.0.1:{cluster_port}\""),
+        )
+        .replace(
+            &peer_url,
+            &format!("url = \"http://127.0.0.1:{cluster_port}\"\nclient_url = \"{base}\""),
+        );
+    std::fs::write(&config, split).expect("write split-plane config");
+    let mut command = Command::new(binary);
+    command.arg("server").arg("--config").arg(&config);
+    let mut moved = spawn_child(command, "moved-port".to_owned());
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    let status = loop {
+        if let Some(status) = moved.child.try_wait().expect("poll child") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a moved cluster port must refuse to start: {}",
+            child_report(&moved)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(!status.success(), "{}", child_report(&moved));
+    let stderr = child_stderr_tail(&moved);
+    assert!(
+        stderr.contains(&format!("records node 1 at {base}"))
+            && stderr.contains("cannot change after its groups are initialized"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_restart() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -2906,6 +3115,7 @@ fn ctl_node(node_id: u64, admin_port: u16, public_url: &str) -> ursula_ctl::Node
         host: "127.0.0.1".to_owned(),
         http_url: Some(url::Url::parse(public_url).expect("public url")),
         metrics_url: None,
+        client_url: None,
     }
 }
 
@@ -3089,6 +3299,95 @@ fn spawn_node(
     let mut command = Command::new(binary);
     command.arg("server").arg("--config").arg(&config_path);
     let mut guard = spawn_child(command, format!("node-{node_id}-{port}"));
+    guard.config_path = Some(config_path);
+    guard
+}
+
+/// The client and cluster ports of one node of a split-plane cluster.
+struct SplitPlanePorts {
+    node_id: u64,
+    client: u16,
+    cluster: u16,
+}
+
+impl SplitPlanePorts {
+    fn client_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.client)
+    }
+
+    fn cluster_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.cluster)
+    }
+}
+
+/// Spawns node `node_id` of `planes` with `server.cluster_listen` set: its
+/// peers dial the cluster ports and redirect clients to the client ports.
+fn spawn_split_plane_node(
+    binary: &str,
+    planes: &[SplitPlanePorts],
+    node_id: u64,
+    init_membership: bool,
+    wal_root: &Path,
+) -> ChildGuard {
+    use std::fmt::Write;
+
+    let own = planes
+        .iter()
+        .find(|plane| plane.node_id == node_id)
+        .expect("node in planes");
+    let admin_port = free_port();
+    let mut config = format!(
+        r#"[server]
+listen = "127.0.0.1:{client}"
+cluster_listen = "127.0.0.1:{cluster}"
+admin_listen = "127.0.0.1:{admin_port}"
+cluster_id = "static-cluster-cli"
+
+[runtime]
+core_count = 1
+
+[raft]
+node_id = {node_id}
+group_count = 4
+init_membership = {init_membership}
+init_membership_per_group = false
+
+[raft.wal]
+path = "{wal}"
+
+[storage.cold]
+backend = "memory"
+"#,
+        client = own.client,
+        cluster = own.cluster,
+        wal = node_wal_dir(wal_root, node_id).display(),
+    );
+    for plane in planes {
+        writeln!(
+            config,
+            r#"
+[[raft.peers]]
+node_id = {}
+url = "{}"
+client_url = "{}""#,
+            plane.node_id,
+            plane.cluster_url(),
+            plane.client_url()
+        )
+        .unwrap();
+    }
+    let config_path = std::env::temp_dir().join(format!(
+        "ursula-split-node-{node_id}-{}-{}.toml",
+        own.client,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::write(&config_path, config).expect("write split-plane node config");
+    let mut command = Command::new(binary);
+    command.arg("server").arg("--config").arg(&config_path);
+    let mut guard = spawn_child(command, format!("split-node-{node_id}-{}", own.client));
     guard.config_path = Some(config_path);
     guard
 }
