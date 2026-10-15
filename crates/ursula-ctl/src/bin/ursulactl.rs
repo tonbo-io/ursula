@@ -88,6 +88,34 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
+    /// Accept the unsynced loss of one stalled group: plan it from every
+    /// reachable replica, send the plan to its leader first and then to the
+    /// other members, and wait until its history event applied. A plan that
+    /// wedges is planned again.
+    RecoverGroup(RecoverGroupArgs),
+}
+
+#[derive(Args, Debug)]
+struct RecoverGroupArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// The stalled raft group.
+    #[arg(long)]
+    group: u64,
+    /// Plans to send at most, the first included.
+    #[arg(long, default_value_t = 3)]
+    max_plans: usize,
+    /// Seconds one plan may take to be satisfied.
+    #[arg(long, default_value_t = 120)]
+    settle_timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Print the plan and send nothing.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -673,6 +701,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
+        Command::RecoverGroup(args) => run_recover_group_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
@@ -1095,6 +1124,34 @@ async fn run_drain_subcommand(args: DrainArgs) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let options = ursula_ctl::recovery::RecoverOptions {
+        max_plans: args.max_plans,
+        settle_timeout: Duration::from_secs(args.settle_timeout_secs),
+        poll_interval: Duration::from_secs(args.poll_interval_secs),
+        dry_run: args.dry_run,
+    };
+    match ursula_ctl::recovery::recover_group(&client, &nodes, args.group, &options).await? {
+        ursula_ctl::recovery::RecoverOutcome::Healthy => {
+            println!(
+                "group {}: it has a leader and no replica holds a plan",
+                args.group
+            );
+        }
+        ursula_ctl::recovery::RecoverOutcome::DryRun(plan) => println!(
+            "group {}: would plan leader {} at point {} (cut: {})",
+            args.group, plan.leader, plan.point, plan.cut
+        ),
+        ursula_ctl::recovery::RecoverOutcome::Satisfied { plan, plans_sent } => println!(
+            "group {}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
+            args.group, plan.leader, plan.point, plan.cut
+        ),
+    }
+    Ok(())
 }
 
 async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {
