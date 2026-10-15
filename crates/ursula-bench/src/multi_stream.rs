@@ -64,6 +64,15 @@ pub struct MultiStreamArgs {
     /// HTTP request timeout in seconds.
     #[arg(long, default_value_t = 30)]
     pub request_timeout_secs: u64,
+
+    /// Send each stream's `Stream-Incarnation` (read once with a HEAD) on
+    /// every append, as a tokened producer (the SQLite VFS) does.
+    #[arg(long, default_value_t = false)]
+    pub tokened: bool,
+
+    /// Speak HTTP/2 with prior knowledge (h2c) instead of HTTP/1.1.
+    #[arg(long, default_value_t = false)]
+    pub http2: bool,
 }
 
 #[derive(Serialize)]
@@ -91,7 +100,16 @@ pub struct ErrorCount {
 }
 
 pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
-    let client = build_client(args.request_timeout_secs)?;
+    let client = if args.http2 {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(args.request_timeout_secs))
+            .tcp_nodelay(true)
+            .http2_prior_knowledge()
+            .build()
+            .context("build HTTP/2 reqwest client")?
+    } else {
+        build_client(args.request_timeout_secs)?
+    };
     let backend = Backend::new(args.api_style, &args.target, &args.bucket, client);
 
     tracing::info!(
@@ -127,9 +145,11 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
         let hist = hist.clone();
         let rate = args.rate_per_stream;
         let producer_id = format!("bench-{idx}");
+        let tokened = args.tokened;
         workers.push(tokio::spawn(async move {
             run_writer(
                 backend,
+                tokened,
                 idx,
                 stream,
                 payload,
@@ -197,6 +217,7 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
 )]
 async fn run_writer(
     backend: Backend,
+    tokened: bool,
     base_idx: usize,
     stream: String,
     payload: Arc<Vec<u8>>,
@@ -211,6 +232,21 @@ async fn run_writer(
 ) {
     let epoch: u64 = 0;
     let mut seq: u64 = 0;
+    let incarnation = if tokened {
+        match backend.head_request(base_idx, &stream).send().await {
+            Ok(head) => head
+                .headers()
+                .get("stream-incarnation")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            Err(e) => {
+                record_error(&errors, reqwest_error_chain(&e)).await;
+                None
+            }
+        }
+    } else {
+        None
+    };
     // A zero rate means as fast as possible: no pacing interval.
     let interval = 1_000_000u64
         .checked_div(rate_per_stream)
@@ -231,16 +267,17 @@ async fn run_writer(
             epoch,
             seq,
         });
-        let resp = backend
-            .append_request(
-                base_idx,
-                &stream,
-                &payload,
-                producer,
-                "application/octet-stream",
-            )
-            .send()
-            .await;
+        let mut request = backend.append_request(
+            base_idx,
+            &stream,
+            &payload,
+            producer,
+            "application/octet-stream",
+        );
+        if let Some(incarnation) = &incarnation {
+            request = request.header("stream-incarnation", incarnation);
+        }
+        let resp = request.send().await;
         match resp {
             Ok(r) => {
                 let status = r.status();

@@ -20,7 +20,7 @@ clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
 hdrhistogram = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
+reqwest = { workspace = true, features = ["rustls-tls", "stream", "json", "http2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

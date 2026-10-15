@@ -928,27 +928,23 @@ impl CoreWorker {
         response
     }
 
-    /// Plain leadership check with no quorum round trip, for background
-    /// leader-side work (cold compaction) that does not serve a client read.
+    /// The answer to a tokened producer write that its head alone decides
+    /// (#581 section 2.5), from the group's applied state. A read-only
+    /// lookup, so it stays out of the engine execution histogram, which
+    /// times commands that apply.
     pub(crate) async fn producer_early_answer(
         group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
         request: ProducerEarlyAnswerRequest,
         placement: ShardPlacement,
     ) -> Result<Option<ursula_stream::ProducerEarlyAnswer>, RuntimeError> {
-        let exec_started_at = Instant::now();
-        let response = group
+        group
             .producer_early_answer(request, placement)
             .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        response
+            .map_err(|err| RuntimeError::group_engine(placement, err))
     }
 
+    /// Plain leadership check with no quorum round trip, for background
+    /// leader-side work (cold compaction) that does not serve a client read.
     pub(crate) async fn accepts_local_writes(
         group: &mut Box<dyn GroupEngine>,
     ) -> Result<bool, RuntimeError> {

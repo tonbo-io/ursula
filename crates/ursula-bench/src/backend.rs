@@ -158,6 +158,15 @@ impl Backend {
         req
     }
 
+    pub fn head_request(&self, base_idx: usize, stream: &str) -> reqwest::RequestBuilder {
+        let base = self.base_for(base_idx);
+        let url = match self.kind {
+            ApiStyle::Ursula => format!("{base}/{}/{}", self.bucket, stream),
+            ApiStyle::Durable => format!("{base}/v1/stream/{stream}"),
+        };
+        self.client.head(&url)
+    }
+
     pub fn sse_url_for(&self, base_idx: usize, stream: &str) -> (String, HeaderMap) {
         let base = self.base_for(base_idx);
         let url = match self.kind {

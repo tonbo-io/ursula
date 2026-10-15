@@ -207,7 +207,7 @@ macro_rules! runtime_operations {
                 fields { request: ProducerEarlyAnswerRequest }
                 reply { response_tx: Option<ursula_stream::ProducerEarlyAnswer> }
                 guard { none }
-                handle { call producer_early_answer(engine, metrics, request, placement) }
+                handle { call producer_early_answer(engine, request, placement) }
                 client { pub stream fn producer_early_answer }
             }
             op AcceptsLocalWrites {
