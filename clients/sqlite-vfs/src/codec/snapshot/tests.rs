@@ -196,6 +196,29 @@ fn an_image_that_changes_between_reads_is_refused() {
     }
 }
 
+// An image compressed with a window above 4 MiB is refused.
+#[test]
+fn an_image_with_a_larger_window_is_refused() {
+    let image = vec![0u8; 2048 * PAGE];
+    let mut z = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    z.window_log(23).unwrap();
+    z.include_contentsize(true).unwrap();
+    z.set_pledged_src_size(Some(image.len() as u64)).unwrap();
+    std::io::Write::write_all(&mut z, &image).unwrap();
+    let compressed = z.finish().unwrap();
+    let header = SnapshotHeader {
+        fields: fields(),
+        pages: 2048,
+        crc: crc32c::crc32c(&image),
+    };
+    let mut out = Vec::new();
+    assert!(matches!(
+        read_image(&header, &mut &compressed[..], &mut out),
+        Err(SnapshotError::Zstd(_))
+    ));
+    assert!(out.is_empty());
+}
+
 // A body of another format fails closed and names what it found.
 #[test]
 fn another_format_is_refused_by_its_magic() {

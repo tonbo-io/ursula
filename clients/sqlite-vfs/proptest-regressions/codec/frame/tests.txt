@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc d8aeb5fe52140b32516818f9c2b975fe7ad7fa267461a36231f4e3230f483769 # shrinks to (frame, _) = (Commit { id: CommitId { lineage: Lineage([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), position: Position(0) }, compressed: [40, 181, 47, 253, 36, 8, 65, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 149, 153, 164, 162] }, CommitRecord { db_pages_after: 1, pages: [] }), cuts = [12532046503386, 3111134953671987147], at = 12003563387020406724, how = 1

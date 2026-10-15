@@ -35,6 +35,9 @@ const MAGIC: &[u8; 4] = b"USQ2";
 /// Magic, kind, body length and checksum.
 const HEADER: usize = 13;
 const ZSTD_LEVEL: i32 = 3;
+/// The largest zstd window a reader accepts (4 MiB): a frame asking for more is refused, so a
+/// damaged or foreign frame cannot make the decoder allocate a large window.
+pub(crate) const ZSTD_WINDOW_LOG_MAX: u32 = 22;
 
 const CLAIM: u8 = 1;
 const COMMIT: u8 = 2;
@@ -109,6 +112,8 @@ pub enum FrameError {
     PartIndex { index: u32, count: u32 },
     #[error("a frame body or commit record of {len} bytes is too large")]
     TooLarge { len: u64 },
+    #[error("a commit record of {pages} pages, above the 2^32 - 1 a record holds")]
+    TooManyPages { pages: u64 },
     #[error("a frame body of {len} bytes, above the limit of {max}")]
     BodyTooLarge { len: u64, max: u64 },
     #[error("commit record: page {pgno} after page {previous}, pages go in ascending order")]
@@ -220,19 +225,21 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     }
 }
 
-/// The record's length in bytes for `pages` pages.
-fn record_len(pages: u64) -> Option<u64> {
-    pages
-        .checked_mul(ENTRY as u64)
-        .and_then(|b| b.checked_add(RECORD_HEAD as u64))
+/// The record's length in bytes for `pages` pages: at most 8 + (2^32 - 1) x 4100, so it never
+/// saturates.
+fn record_len(pages: u32) -> u64 {
+    u64::from(pages)
+        .saturating_mul(ENTRY as u64)
+        .saturating_add(RECORD_HEAD as u64)
 }
 
 /// The COMMIT frame of `record`. Pages must ascend and lie within the database. The zstd frame
 /// declares its content size and carries a content checksum.
 pub fn encode_commit(id: CommitId, record: &CommitRecord) -> Result<Vec<u8>, FrameError> {
-    let n = record.pages.len() as u64;
-    let size = record_len(n).ok_or(FrameError::TooLarge { len: u64::MAX })?;
-    let count = u32::try_from(n).map_err(|_too_many| FrameError::TooLarge { len: size })?;
+    let n = record.pages.len();
+    let count =
+        u32::try_from(n).map_err(|_too_many| FrameError::TooManyPages { pages: n as u64 })?;
+    let size = record_len(count);
     let mut z =
         zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).map_err(FrameError::Compress)?;
     z.include_checksum(true).map_err(FrameError::Compress)?;
@@ -392,6 +399,8 @@ pub struct RecordReader<'a> {
 impl<'a> RecordReader<'a> {
     pub fn new(compressed: &'a [u8]) -> Result<Self, FrameError> {
         let mut z = zstd::stream::read::Decoder::new(compressed).map_err(FrameError::Decompress)?;
+        z.window_log_max(ZSTD_WINDOW_LOG_MAX)
+            .map_err(FrameError::Decompress)?;
         let head_short = FrameError::RecordShort {
             pages: 0,
             expected: RECORD_HEAD as u64,
@@ -407,8 +416,7 @@ impl<'a> RecordReader<'a> {
         let (Some(db_pages_after), Some(pages)) = (t.u32(), t.u32()) else {
             return Err(head_short);
         };
-        // At most 8 + (2^32 - 1) x 4100 bytes: no overflow.
-        let expected = record_len(u64::from(pages)).unwrap_or(u64::MAX);
+        let expected = record_len(pages);
         if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(compressed)
             && declared != expected
         {
@@ -434,7 +442,7 @@ impl<'a> RecordReader<'a> {
     }
 
     fn expected(&self) -> u64 {
-        record_len(u64::from(self.header.pages)).unwrap_or(u64::MAX)
+        record_len(self.header.pages)
     }
 
     /// The next page's number, its image written to `image`, or `None` after the last page.
@@ -479,8 +487,9 @@ impl<'a> RecordReader<'a> {
     }
 }
 
-/// The whole commit record, for callers that hold it anyway. Pages are allocated as they are
-/// read, never from a declared size.
+/// The whole commit record in memory, for tests and tooling only. Production applies records
+/// page by page through [`RecordReader`], so it never holds a whole record. Pages are allocated
+/// as they are read, never from a declared size.
 pub fn decompress(compressed: &[u8]) -> Result<CommitRecord, FrameError> {
     let mut reader = RecordReader::new(compressed)?;
     let mut pages = Vec::new();

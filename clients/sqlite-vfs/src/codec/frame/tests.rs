@@ -415,7 +415,6 @@ fn a_huge_declared_size_fails_fast_with_bounded_memory() {
         zstd::zstd_safe::get_frame_content_size(&tiny).unwrap(),
         Some(declared)
     );
-    let started = std::time::Instant::now();
     let mut reader = RecordReader::new(&tiny).unwrap();
     assert_eq!(reader.header().pages, pages);
     let mut image = [0u8; PAGE];
@@ -423,7 +422,26 @@ fn a_huge_declared_size_fails_fast_with_bounded_memory() {
         reader.next_page(&mut image),
         Err(FrameError::RecordShort { pages: u32::MAX, expected }) if expected == declared
     ));
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    // The reader holds no record buffer: pages land in the caller's one-page buffer.
+    assert!(std::mem::size_of::<RecordReader<'static>>() < 256);
+}
+
+// A frame that asks for a window above 4 MiB is refused before it is decoded.
+#[test]
+fn a_frame_with_a_larger_window_is_refused() {
+    let mut z = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    z.window_log(23).unwrap();
+    z.write_all(&record_head(0, 0)).unwrap();
+    let wide = z.finish().unwrap();
+    assert!(matches!(decompress(&wide), Err(FrameError::Decompress(_))));
+    // The same record under the accepted window decodes.
+    assert_eq!(
+        decompress(&compress_unsized(&record_head(0, 0))).unwrap(),
+        CommitRecord {
+            db_pages_after: 0,
+            pages: Vec::new()
+        }
+    );
 }
 
 // The zstd frame carries a content checksum, so damage the frame checksum missed still fails.

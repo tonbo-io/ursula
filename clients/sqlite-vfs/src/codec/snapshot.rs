@@ -264,6 +264,8 @@ pub fn read_image(
     }
     let mut z =
         zstd::stream::read::Decoder::new(head.chain(compressed)).map_err(SnapshotError::Zstd)?;
+    z.window_log_max(super::frame::ZSTD_WINDOW_LOG_MAX)
+        .map_err(SnapshotError::Zstd)?;
     // One byte past the image is read to tell a longer image from an exact one.
     let (len, crc) = copy_crc(&mut z, out, expected.saturating_add(1), SnapshotError::Zstd)?;
     if len != expected {
