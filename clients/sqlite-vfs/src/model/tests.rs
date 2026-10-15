@@ -626,31 +626,40 @@ fn addendum_4_an_empty_write_on_an_applied_key_gets_its_row() {
     assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
 }
 
-#[test]
-fn addendum_4_content_checks_refuse_only_a_write_that_would_apply() {
+/// Sends `refused`, the next write after a claim with its content type changed by `change`, and
+/// returns its answer, after checking that nothing applied.
+fn content_refusal(change: impl Fn(&mut Request)) -> Answer {
     let world = World::new();
     let token = world.create();
     world.producer(&write(tokened(token), 1, 0, b"claim"));
     let next = write(tokened(token), 1, 1, b"commit");
-    for refused in [
-        Request {
-            content_type: None,
-            ..next.clone()
-        },
-        Request {
-            content_type: Some("text/plain".to_owned()),
-            ..next.clone()
-        },
-        with_body(&next, b"another body"),
-    ] {
-        let answer = world.send(&refused);
-        assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
-    }
+    let mut refused = next.clone();
+    change(&mut refused);
+    let answer = world.send(&refused);
     // Nothing applied: the same seq still applies.
     assert!(matches!(world.producer(&next), ProducerAnswer::Receipt {
         delivery: Delivery::Applied,
         ..
     }));
+    answer
+}
+
+#[test]
+fn addendum_4_a_missing_content_type_on_a_write_that_would_apply_is_400() {
+    let answer = content_refusal(|request| request.content_type = None);
+    assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+}
+
+#[test]
+fn addendum_4_another_content_type_on_a_write_that_would_apply_is_409() {
+    let answer = content_refusal(|request| request.content_type = Some("text/plain".to_owned()));
+    assert_eq!((answer.status, answer.typed), (409, Ok(Typed::Untyped)));
+}
+
+#[test]
+fn addendum_4_a_body_that_does_not_match_its_digest_on_a_write_that_would_apply_is_400() {
+    let answer = content_refusal(|request| request.body = Arc::from(&b"another body"[..]));
+    assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
 }
 
 #[test]

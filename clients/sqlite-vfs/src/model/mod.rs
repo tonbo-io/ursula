@@ -509,9 +509,9 @@ impl ModelServer {
     /// 3. The rows of §2.3.1, keyed by the `Producer-Digest` header, never by the body. Every
     ///    refusal and every repeat is answered here.
     /// 4. Only a write that would apply meets the closed stream (`409 Stream-Closed`).
-    /// 5. Only a write that would apply meets the content checks (`400`): `Content-Type` present
-    ///    and the stream's, a body unless the write closes the stream, and the body matching
-    ///    `Producer-Digest`.
+    /// 5. Only a write that would apply meets the content checks: `Content-Type` present (`400`)
+    ///    and the stream's (`409`), a body unless the write closes the stream (`400`), and the body
+    ///    matching `Producer-Digest` (`400`).
     ///
     /// A close-only write applies, keyed or not. An append that also closes is not modeled
     /// (`501`): the VFS never closes its stream.
@@ -726,15 +726,20 @@ impl ModelServer {
     }
 }
 
-/// The content checks of a write that would apply (#581 addendum 4, step 5), each a `400`:
-/// `Content-Type` present and the stream's, a body unless the write only closes the stream, and the
-/// body matching its `Producer-Digest`. A close-only write carries neither body nor content type.
+/// The content checks of a write that would apply (#581 addendum 4, step 5): `Content-Type`
+/// present (`400`) and the stream's (`409`, the base protocol's mismatch), then, each a `400`, a
+/// body unless the write only closes the stream and the body matching its `Producer-Digest`. A
+/// close-only write is never refused for its content type (base protocol §5.2).
 fn content_refusal(stream: &Stream, request: &Request, close_only: bool) -> Option<RawAnswer> {
-    let content_type_ok = close_only
-        || request
-            .content_type
-            .as_deref()
-            .is_some_and(|content_type| content_type == stream.content_type);
+    if !close_only {
+        match request.content_type.as_deref() {
+            None => return Some(RawAnswer::new(400)),
+            Some(content_type) if content_type != stream.content_type => {
+                return Some(RawAnswer::new(409));
+            }
+            Some(_) => {}
+        }
+    }
     let body_ok = close_only || !request.body.is_empty();
     let digest_ok = request
         .keys
@@ -742,7 +747,7 @@ fn content_refusal(stream: &Stream, request: &Request, close_only: bool) -> Opti
         .as_ref()
         .and_then(|write| write.digest)
         .is_none_or(|digest| digest == producer_digest(&request.body));
-    (!(content_type_ok && body_ok && digest_ok)).then(|| RawAnswer::new(400))
+    (!(body_ok && digest_ok)).then(|| RawAnswer::new(400))
 }
 
 /// A producer answer, rendered.

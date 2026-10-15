@@ -382,7 +382,7 @@ fn addendum_4_the_order_is_the_same_over_http_and_in_process() {
         statuses.push(answer.status);
     }
     assert_eq!(statuses, [
-        201, 200, 200, 403, 403, 204, 204, 400, 400, 400, 501, 200, 204, 409
+        201, 200, 200, 403, 403, 204, 204, 400, 409, 400, 501, 200, 204, 409
     ]);
 }
 
