@@ -32,9 +32,9 @@ pub(crate) struct ProducerRecord {
     pub(crate) newest_digest: Option<BodyDigest>,
     /// The group's history id when the claim of the current epoch applied (G2).
     pub(crate) history: u64,
-    /// Whether the claim of the current epoch claimed at or below the stream's floor, which only
-    /// an untokened claim can: tokened writes on such a record are refused (the floor decision on
-    /// #592).
+    /// Whether the record was opened at or below the stream's floor, which only an untokened claim
+    /// can do, and no claim above the floor has applied since: tokened writes on such a record are
+    /// refused (the floor decision on #592).
     pub(crate) below_floor: bool,
     pub(crate) last_seen_ms: u64,
 }
@@ -139,8 +139,9 @@ impl Evaluation {
 /// tokened write is refused `producer-expired` when it has no record and its epoch is at or below
 /// the floor, or when its record was claimed at or below the floor, unless it claims above the
 /// floor. An untokened writer keeps the base protocol's rule that a forgotten producer is new, so
-/// its claim may open a record at or below the floor, marked as such. A live record claiming a
-/// later epoch is not checked against the floor (row 6 or 7).
+/// its claim may open a record at or below the floor, marked as such. A record opened above the
+/// floor stays so: its claims of later epochs are not checked against the floor (row 6 or 7). A
+/// marked record is cleared only by a claim above the floor, tokened or not.
 pub(crate) fn evaluate(
     record: Option<&ProducerRecord>,
     watermark: Option<Epoch>,
@@ -151,10 +152,12 @@ pub(crate) fn evaluate(
 ) -> Evaluation {
     let (e, n, d) = (write.epoch, write.seq, write.digest);
     let at_or_below_floor = watermark.is_some_and(|w| e <= w);
-    let claims_above_floor = n == Seq::ZERO && !at_or_below_floor;
     let expired = match record {
         None => at_or_below_floor,
-        Some(r) => r.below_floor && !claims_above_floor,
+        Some(r) => {
+            let claims_above_floor = n == Seq::ZERO && e > r.epoch.epoch() && !at_or_below_floor;
+            r.below_floor && !claims_above_floor
+        }
     };
     if let Some(w) = watermark.filter(|_| tokened && expired) {
         return Evaluation::answer(1, ProducerAnswer::ProducerExpired { epoch: w });
@@ -185,7 +188,7 @@ pub(crate) fn evaluate(
                     epoch: current,
                     seq: r.last,
                 }),
-                at_or_below_floor,
+                r.below_floor && at_or_below_floor,
             );
         }
         return Evaluation::answer(7, ProducerAnswer::EpochNotClaimed);
@@ -394,6 +397,22 @@ mod tests {
                 false
             )
         );
+        // An untokened claim keeps the marker at or below the floor and clears it above.
+        for (e, below_floor) in [(6, true), (7, true), (8, false)] {
+            let evaluation = eval_untokened(Some(&below), Some(7), &write(e, 0, digest(3)));
+            assert_eq!(evaluation.row, 6, "epoch {e}");
+            assert_eq!(
+                evaluation.decision,
+                applied(
+                    Some(ClosedEpoch {
+                        epoch: epoch(5),
+                        seq: seq(2),
+                    }),
+                    below_floor
+                ),
+                "epoch {e}"
+            );
+        }
         // Untokened, the record is an ordinary one.
         assert_eq!(
             eval_untokened(Some(&below), Some(7), &write(5, 3, None)).row,
@@ -408,8 +427,8 @@ mod tests {
     #[test]
     fn floor_decision_a_live_record_claims_a_later_epoch_without_the_floor_check() {
         // Another producer's retirement raised the floor to 7, above this record's epoch 5.
-        // Row 6 applies, marking the record when the epoch is at or below the floor.
-        for (e, below_floor) in [(6, true), (7, true), (8, false)] {
+        // Row 6 applies, and the record stays opened above the floor.
+        for (e, below_floor) in [(6, false), (7, false), (8, false)] {
             let evaluation = eval(Some(&record(2)), Some(7), &write(e, 0, digest(3)));
             assert_eq!(evaluation.row, 6, "epoch {e}");
             assert_eq!(
