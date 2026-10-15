@@ -140,7 +140,6 @@ pub(crate) enum ResetKind {
     Rewound,
     Deleted,
     /// Raised by the driver (a failed fsync, a lost WAL page, an uncuttable log write).
-    #[cfg_attr(test, expect(dead_code, reason = "the driver (PR5) raises it"))]
     LocalDamage,
     StreamState,
     Internal,
@@ -164,9 +163,9 @@ pub(crate) enum Event {
     Tick,
     /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11).
     Boundary(Position),
-    /// `synced()` with ticket `ticket`: `target` is the last logged position at the call. The
-    /// ticket waits for every commit at or below `target`, whatever record sits at `target`, so
-    /// the driver delivers `Logged(p)` before any `Sync` whose target is at or above `p`.
+    /// `synced()` with ticket `ticket`: `target` is at most the last COMMIT position at the call.
+    /// The ticket waits for every commit at or below `target`, whatever record sits at `target`,
+    /// so the driver delivers `Logged(p)` before any `Sync` whose target is at or above `p`.
     Sync { ticket: u64, target: Position },
     /// Takeover: the driver carried out an [`Action::Apply`] or [`Action::Rebuild`]. Every record
     /// it logged is at or below `last`, and `last` is at or above the last position logged
@@ -264,6 +263,9 @@ pub(crate) struct LocalState {
     pub(crate) max_request_bytes: u64,
     /// `URSULA_VFS_MAX_REQUEST_BYTES`.
     pub(crate) configured_max_request_bytes: Option<u64>,
+    /// The db file's size: a takeover's catch-up in place whose frames grow past it rebuilds
+    /// instead (design §5.6).
+    pub(crate) db_bytes: u64,
 }
 
 /// The request limit `L` (design §4.6): the latest HEAD's, any limit a typed `413` named since,
@@ -317,6 +319,8 @@ pub(crate) struct Ctx {
     pub(crate) tickets: Tickets,
     pub(crate) sent: Vec<SentBatch>,
     pub(crate) condition: Option<Condition>,
+    /// The db file's size at the start.
+    pub(crate) db_bytes: u64,
     /// `Producer-Id`, checked once when the replicator starts.
     producer: ProducerId,
     next_id: u64,
@@ -350,6 +354,7 @@ impl Ctx {
             tickets: Tickets::default(),
             sent: Vec::new(),
             condition: None,
+            db_bytes: local.db_bytes,
             producer,
             next_id: 0,
             #[cfg(test)]
@@ -505,8 +510,15 @@ pub(crate) enum Step {
         reconcile: Box<Reconcile>,
         link: Link,
     },
-    /// Takeover: the driver carries out an [`Action::Apply`] or [`Action::Rebuild`] and answers
-    /// with [`Event::CaughtUp`].
+    /// Takeover, nothing pending: the driver applies one read's foreign frames
+    /// ([`Action::Apply`]) and answers with [`Event::CaughtUp`] before the next read goes out.
+    /// `end` is the stream offset after the last of them.
+    Applying {
+        reconcile: Box<Reconcile>,
+        end: Offset,
+    },
+    /// Takeover: the driver carries out an [`Action::Rebuild`] and answers with
+    /// [`Event::CaughtUp`].
     CatchingUp(Box<Done>),
 }
 
@@ -714,7 +726,9 @@ fn activating(
     now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
-    if matches!(step, Step::CatchingUp(_)) && matches!(event, Event::Logged(_)) {
+    if matches!(step, Step::CatchingUp(_) | Step::Applying { .. })
+        && matches!(event, Event::Logged(_))
+    {
         // The catch-up takes the next positions: a commit logged meanwhile breaks them.
         return reset(ResetKind::Internal, actions);
     }
@@ -820,6 +834,36 @@ fn activating(
             | Event::Stop => Replicator::Activating {
                 kind,
                 step: Step::Reconcile { reconcile, link },
+                ctx,
+            },
+        },
+        Step::Applying { reconcile, end } => match event {
+            Event::CaughtUp { last, log_bytes } => {
+                if last < ctx.logged {
+                    return reset(ResetKind::Internal, actions);
+                }
+                // The read's frames hold positions up to `last`, acknowledged up to `end`.
+                ctx.logged = last;
+                ctx.acknowledge(last, end);
+                ctx.log_bytes = log_bytes;
+                if reconcile.complete() {
+                    return finish(kind, *reconcile, ctx, now_ms, actions);
+                }
+                let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
+                Replicator::Activating {
+                    kind,
+                    step: Step::Reconcile { reconcile, link },
+                    ctx,
+                }
+            }
+            Event::Tick
+            | Event::Answer { .. }
+            | Event::Logged(_)
+            | Event::Boundary(_)
+            | Event::Sync { .. }
+            | Event::Stop => Replicator::Activating {
+                kind,
+                step: Step::Applying { reconcile, end },
                 ctx,
             },
         },
@@ -941,18 +985,31 @@ fn claim_answered(
     }
 }
 
-/// After a read of the reconcile.
+/// After a read of the reconcile: a takeover with nothing pending first applies the read's
+/// foreign frames, or rebuilds once they would grow past the database.
 fn reconciled(
     kind: ClaimKind,
-    reconcile: Box<Reconcile>,
+    mut reconcile: Box<Reconcile>,
     fed: Fed,
     mut ctx: Box<Ctx>,
     now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
+    if !matches!(fed, Fed::Reset(_))
+        && let Some(frames) = reconcile.take_chunk(&mut ctx)
+    {
+        let end = frames.last().map_or(ctx.acked_offset, |f| f.end_offset);
+        actions.push(Action::Apply(frames));
+        return Replicator::Activating {
+            kind,
+            step: Step::Applying { reconcile, end },
+            ctx,
+        };
+    }
     match fed {
         Fed::Reset(kind) => reset(kind, actions),
         Fed::Done => finish(kind, *reconcile, ctx, now_ms, actions),
+        Fed::More if reconcile.complete() => finish(kind, *reconcile, ctx, now_ms, actions),
         Fed::More => {
             let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
             Replicator::Activating {
@@ -976,14 +1033,6 @@ fn finish(
     let done = reconcile.into_done();
     match &done.catch_up {
         CatchUp::Nothing => bind(done, ctx, now_ms, actions),
-        CatchUp::Apply(frames) => {
-            actions.push(Action::Apply(frames.clone()));
-            Replicator::Activating {
-                kind,
-                step: Step::CatchingUp(Box::new(done)),
-                ctx,
-            }
-        }
         CatchUp::Rebuild { discard_from } => {
             if let Some(from) = *discard_from {
                 ctx.tickets.abandon_from(from, actions);

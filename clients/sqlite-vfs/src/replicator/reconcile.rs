@@ -7,8 +7,6 @@
 //! every frame applied before the claim, so each pending record has landed or never will. The
 //! records that remain go out under the new epoch from seq 1, same bytes.
 
-use std::sync::Arc;
-
 use ursula_headers::ClosedEpoch;
 use ursula_headers::Epoch;
 use ursula_headers::Offset;
@@ -22,7 +20,9 @@ use super::ResetKind;
 use crate::codec::frame;
 use crate::codec::frame::Decoded;
 use crate::codec::frame::Frame;
-use crate::codec::frame::PartRun;
+use crate::codec::stream::FrameStream;
+use crate::codec::stream::StreamError;
+use crate::codec::stream::StreamFrame;
 use crate::ids::Position;
 
 /// The reconcile's column: a takeover at open, or a continuation while bound.
@@ -95,13 +95,13 @@ pub(crate) struct Done {
     pub(crate) catch_up: CatchUp,
 }
 
-/// How a takeover brings its generation up to the claim (design §5.6).
+/// How a takeover brings its generation up to the claim (design §5.6), once the reads are done.
+/// Foreign commits found with nothing pending are applied in place read by read
+/// ([`Reconcile::take_chunk`]), never collected here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CatchUp {
-    /// The stream before the claim held only our frames and claims.
+    /// Nothing left to bring in.
     Nothing,
-    /// Foreign commits, with nothing pending: applied in place, in order.
-    Apply(Vec<ForeignFrame>),
     /// A divergence (from the first pending record discarded) or a `410` (frames below retention
     /// cannot be read): the generation is rebuilt from the stream up to the claim.
     Rebuild { discard_from: Option<Position> },
@@ -112,17 +112,25 @@ pub(crate) struct Reconcile {
     mode: Mode,
     epoch: Epoch,
     claim: Option<RequestId>,
-    /// The claim's start: the reconcile reads up to here.
-    end: Offset,
     after_claim: Offset,
     closed: Option<ClosedEpoch>,
-    /// The next offset to read.
-    at: Offset,
-    /// Bytes read and not yet decoded, starting at `buf_start`.
-    buf: Vec<u8>,
-    buf_start: Offset,
-    parts: PartRun,
+    /// The frames from the acknowledged offset up to the claim's start.
+    stream: FrameStream,
     catch_up: CatchUp,
+    /// The current read's foreign commits, to apply in place before the next read.
+    chunk: Vec<ForeignFrame>,
+    /// The compressed bytes applied in place so far.
+    applied_bytes: u64,
+}
+
+/// The compressed record bytes of `frames`.
+fn record_bytes(frames: &[ForeignFrame]) -> u64 {
+    frames.iter().fold(0u64, |sum, f| match &f.frame {
+        Frame::Commit { compressed, .. } => {
+            sum.saturating_add(u64::try_from(compressed.len()).unwrap_or(u64::MAX))
+        }
+        Frame::Claim { .. } | Frame::Part { .. } => sum,
+    })
 }
 
 impl Reconcile {
@@ -138,24 +146,22 @@ impl Reconcile {
             mode,
             epoch,
             claim,
-            end: receipt.start(),
             after_claim: receipt.next(),
             closed,
-            at: from,
-            buf: Vec::new(),
-            buf_start: from,
-            parts: PartRun::default(),
+            stream: FrameStream::new(from, receipt.start(), MAX_BATCH_BYTES),
             catch_up: CatchUp::Nothing,
+            chunk: Vec::new(),
+            applied_bytes: 0,
         }
     }
 
     pub(crate) fn at(&self) -> Offset {
-        self.at
+        self.stream.at()
     }
 
     /// Nothing (more) to read.
     pub(crate) fn complete(&self) -> bool {
-        self.at >= self.end && self.buf.is_empty()
+        self.stream.done()
     }
 
     pub(crate) fn into_done(self) -> Done {
@@ -165,6 +171,25 @@ impl Reconcile {
             after_claim: self.after_claim,
             catch_up: self.catch_up,
         }
+    }
+
+    /// The current read's foreign commits to apply in place, if any. Once everything applied in
+    /// place would grow past the database, the takeover rebuilds instead (design §5.6): `None`,
+    /// and the reconcile is done with a rebuild.
+    pub(crate) fn take_chunk(&mut self, ctx: &mut Ctx) -> Option<Vec<ForeignFrame>> {
+        if self.chunk.is_empty() || matches!(self.catch_up, CatchUp::Rebuild { .. }) {
+            self.chunk.clear();
+            return None;
+        }
+        let applied = self.applied_bytes.saturating_add(record_bytes(&self.chunk));
+        if applied > ctx.db_bytes {
+            self.chunk.clear();
+            // Nothing is pending (a catch-up in place), so nothing is discarded.
+            self.start_rebuild(ctx);
+            return None;
+        }
+        self.applied_bytes = applied;
+        Some(std::mem::take(&mut self.chunk))
     }
 
     /// `410`: the frames below retention cannot be read.
@@ -178,53 +203,31 @@ impl Reconcile {
 
     /// A read's bytes from [`Reconcile::at`] up to `next`.
     pub(crate) fn feed(&mut self, body: &[u8], next: Offset, ctx: &mut Ctx) -> Fed {
-        let wanted = self.end.get().saturating_sub(self.at.get());
-        let got = next.get().saturating_sub(self.at.get());
-        if next <= self.at || u64::try_from(body.len()).ok() != Some(got) {
+        let (frames, error) = self.stream.feed(body, next);
+        if let Some(StreamError::Range { .. }) = error {
             // No progress short of the claim, or a body that is not the range it names: the
             // stream contradicts the claim's receipt.
             return Fed::Reset(ResetKind::StreamState);
         }
-        let take = usize::try_from(got.min(wanted)).unwrap_or(usize::MAX);
-        self.buf.extend_from_slice(body.get(..take).unwrap_or(body));
-        self.at = Offset::from_u64(self.at.get().saturating_add(got.min(wanted)));
-        loop {
-            match frame::decode(&self.buf, MAX_BATCH_BYTES) {
-                Ok(Decoded::Partial) => break,
-                Err(_undecodable) => return self.row(FrameClass::Undecodable, None, ctx),
-                Ok(Decoded::Frame { frame, len }) => {
-                    let raw: Arc<[u8]> = Arc::from(self.buf.get(..len).unwrap_or_default());
-                    self.buf.drain(..len.min(self.buf.len()));
-                    let end = Offset::from_u64(
-                        self.buf_start
-                            .get()
-                            .saturating_add(u64::try_from(len).unwrap_or(u64::MAX)),
-                    );
-                    self.buf_start = end;
-                    let fed = self.frame(frame, raw, end, ctx);
-                    if fed != Fed::More {
-                        return fed;
-                    }
-                }
+        for frame in frames {
+            let fed = self.frame(frame, ctx);
+            if fed != Fed::More {
+                return fed;
             }
         }
-        if self.at < self.end {
-            return Fed::More;
-        }
-        if !self.buf.is_empty() {
-            // A frame runs into the claim.
+        if error.is_some() {
+            // Undecodable bytes, a broken PART run, or a frame running into the claim.
             return self.row(FrameClass::Undecodable, None, ctx);
         }
-        Fed::Done
+        if self.stream.done() {
+            Fed::Done
+        } else {
+            Fed::More
+        }
     }
 
-    fn frame(&mut self, frame: Frame, raw: Arc<[u8]>, end: Offset, ctx: &mut Ctx) -> Fed {
-        let direct = matches!(frame, Frame::Commit { .. });
-        let frame = match self.parts.push(frame) {
-            Err(_bad_part) => return self.row(FrameClass::Undecodable, None, ctx),
-            Ok(None) => return Fed::More,
-            Ok(Some(frame)) => frame,
-        };
+    fn frame(&mut self, read: StreamFrame, ctx: &mut Ctx) -> Fed {
+        let StreamFrame { frame, bytes, end } = read;
         match frame {
             Frame::Claim { activation, .. } => {
                 let class = if ctx.owns_activation(activation) {
@@ -235,14 +238,6 @@ impl Reconcile {
                 self.row(class, None, ctx)
             }
             Frame::Commit { id, .. } => {
-                let bytes = if direct {
-                    raw
-                } else {
-                    match frame::encode(&frame) {
-                        Ok(bytes) => Arc::from(bytes),
-                        Err(_unencodable) => return self.row(FrameClass::Undecodable, None, ctx),
-                    }
-                };
                 let next = ctx
                     .pending
                     .front()
@@ -279,18 +274,11 @@ impl Reconcile {
                 let Some((frame, end)) = commit else {
                     return self.rebuild(ctx);
                 };
-                match &mut self.catch_up {
-                    CatchUp::Nothing => {
-                        self.catch_up = CatchUp::Apply(vec![ForeignFrame {
-                            frame,
-                            end_offset: end,
-                        }]);
-                    }
-                    CatchUp::Apply(frames) => frames.push(ForeignFrame {
+                if matches!(self.catch_up, CatchUp::Nothing) {
+                    self.chunk.push(ForeignFrame {
                         frame,
                         end_offset: end,
-                    }),
-                    CatchUp::Rebuild { .. } => {}
+                    });
                 }
                 Fed::More
             }
@@ -303,12 +291,16 @@ impl Reconcile {
     /// the stream, which reads what is left itself, so the reconcile ends here and any frames
     /// collected for a catch-up in place are dropped.
     fn rebuild(&mut self, ctx: &mut Ctx) -> Fed {
+        self.start_rebuild(ctx);
+        Fed::Done
+    }
+
+    fn start_rebuild(&mut self, ctx: &mut Ctx) {
         let discard_from = ctx.pending.front().map(|first| first.id.position);
         ctx.pending.clear();
         self.catch_up = CatchUp::Rebuild { discard_from };
-        self.at = self.end;
-        self.buf.clear();
-        Fed::Done
+        self.chunk.clear();
+        self.stream.finish();
     }
 
     /// Whether `position` went out in a batch of the epoch the claim closed, above its last

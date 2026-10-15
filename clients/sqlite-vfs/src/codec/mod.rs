@@ -9,11 +9,13 @@
 //! - [`segment`]: `USL1` local log segments, a header and a chain of records.
 //! - [`snapshot`]: `USS3` snapshot bodies, streamed between readers and writers.
 //! - [`digest`]: the producer digest of an append body and the server's snapshot digest.
+//! - [`stream`]: `USQ2` frames read out of a stream range, read by read.
 
 pub mod digest;
 pub mod frame;
 pub mod segment;
 pub mod snapshot;
+pub mod stream;
 
 /// A SQLite page: the VFS requires 4 KiB pages.
 pub const PAGE: usize = 4096;

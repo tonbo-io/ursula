@@ -103,6 +103,7 @@ pub(crate) fn local(pending: Vec<Pending>, acked_offset: u64) -> LocalState {
         highest_epoch: None,
         max_request_bytes: 32 << 20,
         configured_max_request_bytes: None,
+        db_bytes: u64::MAX,
     }
 }
 
