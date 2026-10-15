@@ -164,7 +164,8 @@ unsafe fn fn_open(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut f
 }
 
 /// `ursula_synced(path, timeout_ms)` (design §8.2): `{synced, ticket, target, acknowledged}`; with
-/// `synced` false the ticket resolves later (`ursula_events`). A reset fails it.
+/// `synced` false the ticket resolves later, when a `synced` event of its path reaches `through` it
+/// (`ursula_events`). A reset fails it.
 unsafe fn fn_synced(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -180,7 +181,16 @@ unsafe fn fn_synced(
         }
         // The last commit logged at the call (design §8.2): every commit a reader can see.
         let target = Some(b.handle.last_commit());
-        let ticket = driver().sync(b.id, target)?;
+        // With timeout 0 the outcome comes from `ursula_events` alone, and nothing is kept for it.
+        let ticket = driver().sync(b.id, target, timeout > 0)?;
+        if timeout == 0 {
+            return Ok(status::synced_json(
+                false,
+                ticket.0,
+                target,
+                b.handle.acked(),
+            ));
+        }
         match driver().wait(ticket, Duration::from_millis(timeout)) {
             None => Ok(status::synced_json(
                 false,
@@ -226,7 +236,9 @@ unsafe fn fn_events(
     unsafe { result(ctx, "ursula_events", outcome.as_ref().map(Clone::clone)) };
 }
 
-/// `ursula_cancel(request)`: gives up an open in progress.
+/// `ursula_cancel(request)`: gives up an open in progress, and returns what it ended with
+/// (`{kind, action, message}`: the last condition it met, or `cancelled` when it met none), or
+/// `null` when it had bound already.
 unsafe fn fn_cancel(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -235,7 +247,7 @@ unsafe fn fn_cancel(
     // SAFETY: SQLite calls the function with its arguments.
     let outcome = unsafe { arg_count(argc, argv, 0, "request") }
         .and_then(|request| db::cancel(OpenId(request)))
-        .map(|()| String::new());
+        .map(|ended| ended.map_or_else(|| "null".to_owned(), |e| status::error_json(&e)));
     // SAFETY: SQLite calls the function with its context.
     unsafe { result(ctx, "ursula_cancel", outcome.as_ref().map(Clone::clone)) };
 }

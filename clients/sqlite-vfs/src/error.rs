@@ -215,8 +215,6 @@ pub(crate) enum Error {
     OpenOutside { path: String },
     #[error(transparent)]
     DriverGone(#[from] DriverGone),
-    #[error("a takeover discarded the commits synced() waited for")]
-    Abandoned,
     #[error("{entry} panicked")]
     Panicked { entry: &'static str },
 }
@@ -231,7 +229,6 @@ impl Error {
             Error::Host(e) => e.kind(),
             Error::OpenOutside { .. } => ErrorKind::InUse,
             Error::DriverGone(_) | Error::Panicked { .. } => ErrorKind::Internal,
-            Error::Abandoned => ErrorKind::Reset(ResetKind::Stale),
         }
     }
 }
@@ -240,7 +237,6 @@ impl From<SyncError> for Error {
     fn from(e: SyncError) -> Self {
         match e {
             SyncError::Reset(kind) => Error::Reset(kind),
-            SyncError::Abandoned => Error::Abandoned,
             SyncError::NotBound => Error::Reset(ResetKind::Internal),
         }
     }

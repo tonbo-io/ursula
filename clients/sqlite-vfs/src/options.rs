@@ -16,6 +16,9 @@ pub(crate) struct OpenOptions {
     pub(crate) token: Option<String>,
     /// The SDK's User-Agent token, accepted and unused until M3's transport.
     pub(crate) agent: Option<String>,
+    /// How long an open started with `timeout_ms` 0 may take: the caller's deadline, 30 s when
+    /// absent.
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 impl Default for OpenOptions {
@@ -25,6 +28,7 @@ impl Default for OpenOptions {
             activation: None,
             token: None,
             agent: None,
+            timeout_ms: None,
         }
     }
 }
@@ -78,15 +82,25 @@ impl TryFrom<&str> for OpenOptions {
                         expected: "32 hex digits",
                     })?);
                 }
+                ("timeout_ms", Value::Number(n)) => {
+                    options.timeout_ms =
+                        Some(whole(n).filter(|&ms| ms > 0).ok_or(OptionsError::Type {
+                            name: "timeout_ms",
+                            expected: "a positive whole number of milliseconds",
+                        })?);
+                }
                 ("token", Value::Text(token)) => options.token = Some(token),
                 ("agent", Value::Text(agent)) => options.agent = Some(agent),
                 ("read_only", Value::Bool(false)) | ("recreate", Value::Bool(false)) => {}
                 ("read_only", Value::Bool(true)) => return Err(OptionsError::NotYet("read_only")),
                 ("recreate", Value::Bool(true)) => return Err(OptionsError::NotYet("recreate")),
-                (name @ ("max_pending_bytes" | "activation" | "token" | "agent"), _) => {
+                (
+                    name @ ("max_pending_bytes" | "timeout_ms" | "activation" | "token" | "agent"),
+                    _,
+                ) => {
                     return Err(OptionsError::Type {
                         name: known(name),
-                        expected: if name == "max_pending_bytes" {
+                        expected: if matches!(name, "max_pending_bytes" | "timeout_ms") {
                             "a number"
                         } else {
                             "a string"
@@ -109,6 +123,7 @@ impl TryFrom<&str> for OpenOptions {
 fn known(name: &str) -> &'static str {
     [
         "max_pending_bytes",
+        "timeout_ms",
         "activation",
         "token",
         "agent",
@@ -336,7 +351,8 @@ mod tests {
     fn every_option() {
         let o = OpenOptions::try_from(
             r#"{"max_pending_bytes": 1048576, "activation": "000102030405060708090a0b0c0d0e0f",
-                "token": "t1\"x", "agent": "sdk/1", "read_only": false, "recreate": null}"#,
+                "token": "t1\"x", "agent": "sdk/1", "read_only": false, "recreate": null,
+                "timeout_ms": 60000}"#,
         )
         .unwrap();
         assert_eq!(o.max_pending_bytes, 1 << 20);
@@ -348,6 +364,7 @@ mod tests {
         );
         assert_eq!(o.token.as_deref(), Some("t1\"x"));
         assert_eq!(o.agent.as_deref(), Some("sdk/1"));
+        assert_eq!(o.timeout_ms, Some(60_000));
     }
 
     #[test]
@@ -375,6 +392,10 @@ mod tests {
             err(r#"{"max_pending_bytes": "1"}"#),
             OptionsError::Type { .. }
         ));
+        assert!(matches!(err(r#"{"timeout_ms": 0}"#), OptionsError::Type {
+            name: "timeout_ms",
+            ..
+        }));
         assert!(matches!(
             err(r#"{"activation": "abc"}"#),
             OptionsError::Type {

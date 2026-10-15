@@ -5,6 +5,7 @@
 //! Tests of the driver: [`Core`]s against the model server in a virtual-time world with real log
 //! and generation files in a temp dir, and the runtime over the model in process.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -109,6 +110,8 @@ struct World {
     /// Runs on the server after the next HEAD it answers.
     after_head: Option<ServerHook>,
     next_id: u64,
+    /// The binding of each ticket `sync_to` handed out.
+    tickets: HashMap<Ticket, BindingId>,
 }
 
 impl World {
@@ -125,6 +128,7 @@ impl World {
             hold: None,
             held: Vec::new(),
             next_id: 1,
+            tickets: HashMap::new(),
         }
     }
 
@@ -317,6 +321,7 @@ impl World {
         })
         .unwrap();
         handle.record_commit(position);
+        handle.add_pending(frame.len() as u64);
         drop(log);
         Some(Pending {
             id,
@@ -350,6 +355,7 @@ impl World {
     fn sync_to(&mut self, core: usize, binding: BindingId, target: Option<Position>) -> Ticket {
         let now = self.now;
         let ticket = Ticket(self.id());
+        self.tickets.insert(ticket, binding);
         let ios = self.c(core).sync(ticket, binding, target, now);
         self.queue_ios(core, ios);
         self.deliver();
@@ -365,10 +371,20 @@ impl World {
         self.run_for(1_000);
     }
 
+    /// The ticket's outcome: its binding's watermark reaching it, its own failure, or its
+    /// binding's reset.
     fn outcome(&self, core: usize, ticket: Ticket) -> Option<Result<(), SyncError>> {
+        let of = self.tickets.get(&ticket).copied();
         self.events(core).into_iter().find_map(|e| match e {
-            DriverEvent::Synced { ticket: t } if t == ticket => Some(Ok(())),
+            DriverEvent::Synced { binding, through }
+                if Some(binding) == of && through >= ticket =>
+            {
+                Some(Ok(()))
+            }
             DriverEvent::SyncFailed { ticket: t, error } if t == ticket => Some(Err(error)),
+            DriverEvent::Reset { binding, cause } if Some(binding) == of => {
+                Some(Err(SyncError::Reset(cause)))
+            }
             _ => None,
         })
     }
@@ -452,6 +468,68 @@ fn log_records(gen_dir: &Path) -> Vec<RecordBody> {
         .flat_map(|s| scan(&std::fs::read(s).unwrap()).unwrap().records)
         .map(|r| r.body)
         .collect()
+}
+
+// Thousands of `synced()` calls resolve through one watermark event of their binding, which
+// stays one event in the queue however many tickets it covers, so a reader never loses them.
+#[test]
+fn tickets_resolve_in_order_through_one_watermark() {
+    let dir = TempDir::new("driver-watermark");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    let tickets: Vec<Ticket> = (0..5_000).map(|_| w.sync(c, bound.binding)).collect();
+    w.run_for(1_000);
+    for &ticket in &tickets {
+        assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    }
+    let watermarks: Vec<Ticket> = w
+        .events(c)
+        .into_iter()
+        .filter_map(|e| match e {
+            DriverEvent::Synced { through, .. } => Some(through),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        watermarks,
+        tickets.last().copied().into_iter().collect::<Vec<_>>()
+    );
+}
+
+// Admission (design §4.4) counts a commit from its log write: back-to-back commits that the driver
+// thread has not heard of yet are refused at the bound, and admitted again once acknowledged.
+#[test]
+fn admission_counts_commits_the_driver_thread_has_not_seen() {
+    let dir = TempDir::new("driver-admission");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, OpenSpec {
+        max_pending_bytes: 6_000,
+        ..spec(dir.path(), 1)
+    });
+    // Pages that do not compress: each frame takes about 4 KiB, so two do not fit.
+    let page = |seed: u64| {
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut page = Box::new([0u8; 4096]);
+        for byte in page.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = x.to_le_bytes()[0];
+        }
+        page
+    };
+    // The driver thread is stalled: it hears of no commit (no `Logged`).
+    let first = World::append(&bound, page(1)).unwrap();
+    assert!(bound.handle.pending_bytes() > 4_000);
+    assert!(World::append(&bound, page(2)).is_none());
+    assert!(World::append(&bound, page(3)).is_none());
+    w.logged(c, &bound, first);
+    w.run_for(1_000);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    assert!(World::append(&bound, page(4)).is_some());
 }
 
 #[test]
@@ -1145,7 +1223,10 @@ fn the_event_log_coalesces_acks_and_reports_what_it_dropped() {
         ..
     }]));
     for n in 0..super::EVENTS as u64 + 10 {
-        log.push(DriverEvent::Synced { ticket: Ticket(n) });
+        log.push(DriverEvent::SyncFailed {
+            ticket: Ticket(n),
+            error: SyncError::NotBound,
+        });
     }
     let (events, _) = log.since(cursor);
     assert!(matches!(events[0], DriverEvent::Gap { dropped } if dropped > 0));
@@ -1189,7 +1270,7 @@ fn the_runtime_opens_replicates_and_waits_for_synced() {
             frame: Arc::from(frame.clone()),
         })
         .unwrap();
-    let ticket = driver.sync(bound.binding, Some(position)).unwrap();
+    let ticket = driver.sync(bound.binding, Some(position), true).unwrap();
     assert_eq!(driver.wait(ticket, Duration::from_secs(10)), Some(Ok(())));
     let (events, cursor) = driver.events(0, Duration::from_secs(1));
     assert!(
@@ -1814,6 +1895,6 @@ fn a_runtime_cancel_racing_the_result_retires_the_binding() {
         .expect("the open resolved")
         .unwrap();
     driver.cancel(open).unwrap();
-    let ticket = driver.sync(bound.binding, None).unwrap();
+    let ticket = driver.sync(bound.binding, None, true).unwrap();
     assert_eq!(driver.wait(ticket, Duration::from_secs(10)), Some(Ok(())));
 }

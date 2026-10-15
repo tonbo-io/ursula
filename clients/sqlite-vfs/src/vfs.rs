@@ -734,8 +734,10 @@ unsafe fn commit(
     let body = RecordBody::Commit { frame };
     let appended = log.append(&body);
     if let Ok(position) = appended {
-        // Under the log's lock: `synced()` targets it from now on.
+        // Under the log's lock: `synced()` targets it from now on, and admission counts it.
         b.handle.record_commit(position);
+        b.handle
+            .add_pending(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
     drop(log);
     let log_time = logging.elapsed();

@@ -8,7 +8,9 @@ use crate::db::Opened;
 use crate::db::by_id;
 use crate::driver::DriverEvent;
 use crate::driver::Life;
+use crate::driver::SyncError;
 use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::error::reset_action;
 use crate::ids::Position;
 use crate::open::OpenError;
@@ -205,7 +207,8 @@ pub(crate) fn synced_json(
     ])
 }
 
-fn error_json(e: &OpenError) -> String {
+/// An open's failure: `{kind, action, message}`.
+pub(crate) fn error_json(e: &OpenError) -> String {
     let kind = e.error_kind();
     object(&[
         ("kind", json_str(kind.as_str())),
@@ -252,12 +255,17 @@ pub(crate) fn events_json(events: &[DriverEvent], cursor: u64) -> String {
                 ("kind", json_str(cause.kind())),
                 ("action", json_str(reset_action(*cause).as_str())),
             ]),
-            DriverEvent::Synced { ticket } => object(&[
+            DriverEvent::Synced { binding, through } => object(&[
                 ("event", json_str("synced")),
-                ("ticket", ticket.0.to_string()),
+                ("path", path(*binding)),
+                ("through", through.0.to_string()),
             ]),
             DriverEvent::SyncFailed { ticket, error } => {
-                let kind = Error::from(*error).kind();
+                // A binding that is not bound (retired) is `not_bound`, not a reset.
+                let kind = match error {
+                    SyncError::NotBound => ErrorKind::NotBound,
+                    error => Error::from(*error).kind(),
+                };
                 object(&[
                     ("event", json_str("sync_failed")),
                     ("ticket", ticket.0.to_string()),

@@ -184,7 +184,16 @@ struct Binding {
     /// catch-up or rebuild logged.
     last_commit: Position,
     acks: Acks,
+    /// `synced()` tickets not resolved yet. They arrive in ticket order, with targets that never
+    /// decrease, so they resolve in ticket order (a prefix of them at a time) and
+    /// [`DriverEvent::Synced`] can report one watermark per binding.
     tickets: BTreeSet<Ticket>,
+    /// The highest target a ticket of this binding was given.
+    last_target: Position,
+    /// Every ticket of this binding up to this one resolved.
+    synced_through: Option<Ticket>,
+    /// The highest ticket that resolved.
+    resolved_max: Ticket,
     /// `synced()` calls whose target is past `last_commit`, waiting for its `Logged`.
     held: Vec<(Ticket, Position)>,
     max_pending_bytes: u64,
@@ -479,6 +488,9 @@ impl Core {
             last_commit,
             acks: Acks::default(),
             tickets: BTreeSet::new(),
+            last_target: Position::default(),
+            synced_through: None,
+            resolved_max: Ticket(0),
             held: Vec::new(),
             max_pending_bytes: spec.max_pending_bytes,
             unconnected_since: None,
@@ -583,8 +595,10 @@ impl Core {
                 Action::Synced { ticket } => {
                     self.resolve(binding, Ticket(ticket), Ok(()));
                 }
-                Action::Abandoned { ticket } => {
-                    self.resolve(binding, Ticket(ticket), Err(SyncError::Abandoned));
+                // A continuation claim discarded commits a `synced()` waits for: the binding is
+                // stale, and its reset event fails every ticket with that one kind.
+                Action::Abandoned { .. } => {
+                    return self.reset(binding, ResetKind::Stale, now_ms);
                 }
                 Action::Timer { at_ms, jitter_ms } => {
                     let at = at_ms.saturating_add(self.rng.up_to(jitter_ms));
@@ -749,15 +763,30 @@ impl Core {
         }
     }
 
-    /// Resolves a ticket.
+    /// Resolves a ticket. A success moves the binding's watermark ([`DriverEvent::Synced`]) up to
+    /// the ticket, or to just below the first ticket still waiting; a failure is reported alone.
     fn resolve(&mut self, binding: BindingId, ticket: Ticket, outcome: Result<(), SyncError>) {
-        if let Some(b) = self.bindings.get_mut(&binding) {
-            b.tickets.remove(&ticket);
+        match (outcome, self.bindings.get_mut(&binding)) {
+            (Ok(()), Some(b)) => {
+                b.tickets.remove(&ticket);
+                b.resolved_max = b.resolved_max.max(ticket);
+                let through = match b.tickets.first() {
+                    Some(&Ticket(first)) => Ticket(b.resolved_max.0.min(first.saturating_sub(1))),
+                    None => b.resolved_max,
+                };
+                if b.synced_through.is_none_or(|before| through > before) {
+                    b.synced_through = Some(through);
+                    self.events.push(DriverEvent::Synced { binding, through });
+                }
+            }
+            (Ok(()), None) => {}
+            (Err(error), b) => {
+                if let Some(b) = b {
+                    b.tickets.remove(&ticket);
+                }
+                self.events.push(DriverEvent::SyncFailed { ticket, error });
+            }
         }
-        self.events.push(match outcome {
-            Ok(()) => DriverEvent::Synced { ticket },
-            Err(error) => DriverEvent::SyncFailed { ticket, error },
-        });
     }
 
     fn local_damage(&mut self, binding: BindingId, e: &LocalFailure, now_ms: u64) {
@@ -786,9 +815,8 @@ impl Core {
                 ("error", &e),
             ]);
         }
-        for ticket in std::mem::take(&mut b.tickets) {
-            self.resolve(binding, ticket, Err(SyncError::Reset(kind)));
-        }
+        // Its waiting tickets fail with the binding's one `Reset` event.
+        b.tickets.clear();
         match b.stage {
             Stage::Opening { open, .. } => self.opened(open, Err(OpenError::Reset(kind))),
             Stage::Bound { handle } => {
@@ -1170,11 +1198,11 @@ impl Core {
         let Some(b) = self.bindings.get_mut(&binding) else {
             return ios;
         };
-        let Some(handle) = b.handle() else {
+        if b.handle().is_none() {
             return ios;
-        };
+        }
+        // The commit path charged it to the pending bytes already.
         let len = u64::try_from(rec.frame.len()).unwrap_or(u64::MAX);
-        handle.add_pending(len);
         b.unacked.push_back((rec.id.position, len));
         b.last_commit = b.last_commit.max(rec.id.position);
         let last_commit = b.last_commit;
@@ -1200,8 +1228,9 @@ impl Core {
     /// `synced()` with ticket `ticket` (design §8.2): it waits for every commit at or below
     /// `target`, taken at most as the last COMMIT position the commit path recorded on the handle
     /// ([`BindingHandle::last_commit`], also the default). A target past the last commit this core
-    /// was told of waits for its `Logged`. The outcome comes as [`DriverEvent::Synced`] or
-    /// [`DriverEvent::SyncFailed`].
+    /// was told of waits for its `Logged`. The outcome comes as the binding's watermark
+    /// ([`DriverEvent::Synced`]), as [`DriverEvent::SyncFailed`], or as the binding's
+    /// [`DriverEvent::Reset`]. Tickets must arrive in ticket order ([`super::runtime::Driver::sync`]).
     pub(crate) fn sync(
         &mut self,
         ticket: Ticket,
@@ -1223,7 +1252,11 @@ impl Core {
         let recorded = b
             .handle()
             .map_or(b.last_commit, |handle| handle.last_commit());
-        let target = target.map_or(recorded, |target| target.min(recorded));
+        // Never below an earlier ticket's target: tickets resolve in ticket order.
+        let target = target
+            .map_or(recorded, |target| target.min(recorded))
+            .max(b.last_target);
+        b.last_target = target;
         b.tickets.insert(ticket);
         if target > b.last_commit {
             b.held.push((ticket, target));
@@ -1292,8 +1325,9 @@ impl Core {
         self.reset(binding, kind, now_ms);
     }
 
-    /// Gives up an open: one that has not resolved fails `cancelled` (once its disk job, if any,
-    /// returned), and a result nobody took goes, its binding retiring.
+    /// Gives up an open: one that has not resolved fails with the last condition it met, or
+    /// `cancelled` when it met none (once its disk job, if any, returned), and a result nobody took
+    /// goes, its binding retiring.
     pub(crate) fn cancel(&mut self, open: OpenId, now_ms: u64) -> Vec<Io> {
         if let Some(result) = self.opened.remove(&open) {
             if let Ok(bound) = result {
@@ -1304,11 +1338,12 @@ impl Core {
             return Vec::new();
         }
         if let Some(slot) = self.opens.get_mut(&open) {
+            let given_up = slot.opening.given_up();
             if slot.busy {
-                slot.failing.get_or_insert(OpenError::Cancelled);
+                slot.failing.get_or_insert(given_up);
             } else {
                 self.opens.remove(&open);
-                self.opened(open, Err(OpenError::Cancelled));
+                self.opened(open, Err(given_up));
             }
             return Vec::new();
         }
@@ -1317,7 +1352,24 @@ impl Core {
             _ => None,
         });
         if let Some(binding) = binding {
-            self.fail_open(binding, OpenError::Cancelled);
+            let given_up = self
+                .bindings
+                .get(&binding)
+                .map_or(OpenError::Cancelled, |b| {
+                    let seen = match &b.stage {
+                        Stage::Opening {
+                            local: Local::Rebuilding { build, .. },
+                            ..
+                        } => build.seen(),
+                        _ => b
+                            .replicator
+                            .ctx()
+                            .and_then(|ctx| ctx.condition.as_ref())
+                            .map(Unavailable::from),
+                    };
+                    seen.map_or(OpenError::Cancelled, OpenError::Unavailable)
+                });
+            self.fail_open(binding, given_up);
         }
         Vec::new()
     }

@@ -114,8 +114,6 @@ impl ResetKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncError {
     Reset(ResetKind),
-    /// A takeover's divergence discarded the target.
-    Abandoned,
     /// No such binding, or it retired.
     NotBound,
 }
@@ -267,15 +265,27 @@ impl BindingHandle {
         }
     }
 
-    fn add_pending(&self, len: u64) {
-        // Only the driver thread changes it, so a load and a store do.
-        let now = self.pending_bytes().saturating_add(len);
-        self.pending_bytes.store(now, Ordering::Release);
+    /// The commit path logged a frame of `len` bytes, under the log's lock: admission counts it at
+    /// once, before the driver thread hears of it, so a burst of commits never outruns the bound.
+    pub(crate) fn add_pending(&self, len: u64) {
+        // The closure always answers, so the update always applies.
+        let _before = self
+            .pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_add(len))
+            })
+            .unwrap_or_else(|unchanged| unchanged);
     }
 
+    /// The driver thread saw frames of `len` bytes acknowledged.
     fn remove_pending(&self, len: u64) {
-        let now = self.pending_bytes().saturating_sub(len);
-        self.pending_bytes.store(now, Ordering::Release);
+        // The closure always answers, so the update always applies.
+        let _before = self
+            .pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(len))
+            })
+            .unwrap_or_else(|unchanged| unchanged);
     }
 
     pub(crate) fn max_frame_bytes(&self) -> u64 {
@@ -477,10 +487,7 @@ pub(crate) enum DriverEvent {
     },
     /// Every record up to `acked` is acknowledged. Coalesced: only the latest one of a binding
     /// stays in the queue.
-    Acked {
-        binding: BindingId,
-        acked: Position,
-    },
+    Acked { binding: BindingId, acked: Position },
     Condition {
         binding: BindingId,
         condition: Option<Condition>,
@@ -489,21 +496,17 @@ pub(crate) enum DriverEvent {
         binding: BindingId,
         cause: ResetKind,
     },
-    Synced {
-        ticket: Ticket,
-    },
-    SyncFailed {
-        ticket: Ticket,
-        error: SyncError,
-    },
+    /// Every `synced()` ticket of the binding up to `through` resolved, except those a
+    /// [`DriverEvent::SyncFailed`] before it failed. Coalesced like [`DriverEvent::Acked`]: the
+    /// latest watermark covers the earlier ones, so a reader that falls behind loses none.
+    Synced { binding: BindingId, through: Ticket },
+    /// A ticket that failed alone: its commits were abandoned by a takeover, or its binding was
+    /// not bound. A reset fails a binding's tickets with its [`DriverEvent::Reset`] instead.
+    SyncFailed { ticket: Ticket, error: SyncError },
     /// The binding is gone from the driver. Its root unlocks once the last handle drops.
-    Retired {
-        binding: BindingId,
-    },
+    Retired { binding: BindingId },
     /// `dropped` events fell out of the bounded queue before this reader saw them.
-    Gap {
-        dropped: u64,
-    },
+    Gap { dropped: u64 },
 }
 
 /// The bounded queue of events, read by cursor: each event has a sequence number, and a reader
@@ -518,11 +521,20 @@ pub(crate) struct EventLog {
 
 impl EventLog {
     pub(crate) fn push(&mut self, event: DriverEvent) {
-        if let DriverEvent::Acked { binding, .. } = &event {
-            let binding = *binding;
-            self.events.retain(
-                |(_, e)| !matches!(e, DriverEvent::Acked { binding: b, .. } if *b == binding),
-            );
+        match &event {
+            DriverEvent::Acked { binding, .. } => {
+                let binding = *binding;
+                self.events.retain(
+                    |(_, e)| !matches!(e, DriverEvent::Acked { binding: b, .. } if *b == binding),
+                );
+            }
+            DriverEvent::Synced { binding, .. } => {
+                let binding = *binding;
+                self.events.retain(
+                    |(_, e)| !matches!(e, DriverEvent::Synced { binding: b, .. } if *b == binding),
+                );
+            }
+            _ => {}
         }
         self.events.push_back((self.next, event));
         self.next = self.next.saturating_add(1);

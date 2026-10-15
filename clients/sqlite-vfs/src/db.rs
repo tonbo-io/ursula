@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -162,16 +163,54 @@ struct Registry {
     names: HashMap<String, Arc<Binding>>,
     /// By db file path.
     paths: HashMap<String, Arc<Binding>>,
-    /// Opens in progress, by canonical stream name, and the URL each was asked with.
-    opens: HashMap<String, (OpenId, String)>,
+    /// Opens in progress, by canonical stream name.
+    opens: HashMap<String, OpenEntry>,
+    /// Streams whose open resolved and whose binding one caller is registering ([`register`]):
+    /// another open of one waits on [`registered`] until it is in `names`.
+    registering: HashSet<String>,
+}
+
+/// An open in progress, and who asked for it.
+struct OpenEntry {
+    open: OpenId,
+    /// The URL it was asked with.
+    url: String,
+    /// Blocking `ursula_open` calls waiting for it now.
+    waiting: usize,
+    /// A call that returned at once asked for it: it comes back for the result, so no blocking
+    /// call's timeout gives the open up.
+    returned: bool,
+}
+
+/// Marks a stream registering until dropped, a panic in [`register`] included.
+struct Registering<'a>(&'a str);
+
+impl Drop for Registering<'_> {
+    fn drop(&mut self) {
+        registry().registering.remove(self.0);
+        registered().notify_all();
+    }
+}
+
+fn registry_lock() -> &'static Mutex<Registry> {
+    static R: OnceLock<Mutex<Registry>> = OnceLock::new();
+    R.get_or_init(Default::default)
 }
 
 fn registry() -> MutexGuard<'static, Registry> {
-    static R: OnceLock<Mutex<Registry>> = OnceLock::new();
-    R.get_or_init(Default::default)
+    registry_lock()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
+
+/// Signalled when a registration ends.
+fn registered() -> &'static Condvar {
+    static C: OnceLock<Condvar> = OnceLock::new();
+    C.get_or_init(Condvar::new)
+}
+
+/// How long an open waits for another caller's registration of the same stream: local work only.
+const REGISTERING_MS: u64 = 10_000;
 
 /// The binding of the db file `path` (as SQLite names it), for the VFS.
 pub(crate) fn lookup(path: &str) -> Option<Arc<Binding>> {
@@ -211,67 +250,127 @@ pub(crate) fn open(
     if let Some(token) = &options.token {
         crate::auth::set_token(Some(token));
     }
-    let open = {
-        let mut reg = registry();
-        if let Some(b) = reg.names.get(name.as_str()).cloned() {
-            if b.reset_kind().is_none() && b.handle.revive() {
-                handed_out(&b);
-                return Ok(Opened::Bound(b));
+    loop {
+        let open = {
+            let mut reg = registry();
+            // Another caller registers the binding of this stream: it is local work.
+            let deadline = Instant::now().checked_add(Duration::from_millis(REGISTERING_MS));
+            while reg.registering.contains(name.as_str()) {
+                let left = deadline
+                    .and_then(|d| d.checked_duration_since(Instant::now()))
+                    .unwrap_or_default();
+                if left.is_zero() {
+                    return Err(Error::Open(Arc::new(crate::open::OpenError::InUse {
+                        root: PathBuf::from(name.as_str()),
+                    })));
+                }
+                reg = registered()
+                    .wait_timeout(reg, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
-            // Reset, or retired: a new open (refused `in_use` while old handles hold its root).
-            reg.names.remove(name.as_str());
-            reg.paths.remove(&b.path);
-        }
-        match reg.opens.get(name.as_str()) {
-            Some((open, _)) => *open,
-            None => {
-                let spec = OpenSpec {
-                    url: url.to_owned(),
-                    dir: dir.map_or_else(default_dir, PathBuf::from),
-                    activation: options.activation.unwrap_or_else(process_activation),
-                    max_pending_bytes: options.max_pending_bytes,
-                    max_request_bytes: crate::config::max_request_bytes(),
-                    timeout_ms: if timeout_ms == 0 {
-                        DEFAULT_OPEN_MS
+            if let Some(b) = reg.names.get(name.as_str()).cloned() {
+                if b.reset_kind().is_none() && b.handle.revive() {
+                    handed_out(&b);
+                    return Ok(Opened::Bound(b));
+                }
+                // Reset, or retired: a new open (refused `in_use` while old handles hold its root).
+                reg.names.remove(name.as_str());
+                reg.paths.remove(&b.path);
+            }
+            let blocking = timeout_ms > 0;
+            match reg.opens.get_mut(name.as_str()) {
+                Some(entry) => {
+                    if blocking {
+                        entry.waiting = entry.waiting.saturating_add(1);
                     } else {
-                        timeout_ms
-                    },
-                };
-                let open = driver().open(spec)?;
-                reg.opens
-                    .insert(name.as_str().to_owned(), (open, url.to_owned()));
-                open
+                        entry.returned = true;
+                    }
+                    entry.open
+                }
+                None => {
+                    let spec = OpenSpec {
+                        url: url.to_owned(),
+                        dir: dir.map_or_else(default_dir, PathBuf::from),
+                        activation: options.activation.unwrap_or_else(process_activation),
+                        max_pending_bytes: options.max_pending_bytes,
+                        max_request_bytes: crate::config::max_request_bytes(),
+                        timeout_ms: if timeout_ms == 0 {
+                            options.timeout_ms.unwrap_or(DEFAULT_OPEN_MS)
+                        } else {
+                            timeout_ms
+                        },
+                    };
+                    let open = driver().open(spec)?;
+                    reg.opens.insert(name.as_str().to_owned(), OpenEntry {
+                        open,
+                        url: url.to_owned(),
+                        waiting: usize::from(blocking),
+                        returned: !blocking,
+                    });
+                    open
+                }
             }
+        };
+        if let Some(opened) = take(name.as_str(), open, timeout_ms)? {
+            return Ok(opened);
         }
-    };
-    take(open, timeout_ms)
+        // Another caller took the open's result: its registration, or a new open, is next.
+    }
 }
 
 /// How much longer than the open's own deadline `ursula_open` waits, so the driver's failure (the
 /// last condition) is what it reports.
 const DEADLINE_GRACE_MS: u64 = 1_000;
 
-/// The outcome of open `open`: with `timeout_ms` 0 if it resolved, without waiting; otherwise
-/// waiting for it (the open's own deadline is `timeout_ms`). Bound, it is registered.
-fn take(open: OpenId, timeout_ms: u64) -> Result<Opened, Error> {
-    let outcome = if timeout_ms == 0 {
-        driver().try_open(open)
-    } else {
-        driver().wait_open(
-            open,
-            Duration::from_millis(timeout_ms.saturating_add(DEADLINE_GRACE_MS)),
-        )
-    };
-    let Some(outcome) = outcome else {
-        if timeout_ms == 0 {
-            return Ok(Opened::Pending(open));
+/// The outcome of open `open` of stream `name`: with `timeout_ms` 0 if it resolved, without
+/// waiting; otherwise waiting for it (the open's own deadline is `timeout_ms`). Bound, it is
+/// registered. The result is taken under the registry lock, which marks the stream registering,
+/// so a concurrent open of it waits for the registration instead of opening again. `None` when
+/// another caller took the result.
+fn take(name: &str, open: OpenId, timeout_ms: u64) -> Result<Option<Opened>, Error> {
+    if timeout_ms > 0 {
+        let wait = Duration::from_millis(timeout_ms.saturating_add(DEADLINE_GRACE_MS));
+        if !driver().wait_resolved(open, wait) {
+            // Given up only when no other caller still waits for it, or comes back for it.
+            let alone = {
+                let mut reg = registry();
+                match reg.opens.get_mut(name) {
+                    Some(entry) if entry.open == open => {
+                        entry.waiting = entry.waiting.saturating_sub(1);
+                        let alone = entry.waiting == 0 && !entry.returned;
+                        if alone {
+                            reg.opens.remove(name);
+                        }
+                        alone
+                    }
+                    _ => false,
+                }
+            };
+            if alone && driver().cancel(open).is_err() {
+                log::emit(Level::Warn, "driver_gone", &[]);
+            }
+            return Err(Error::Open(Arc::new(crate::open::OpenError::Cancelled)));
         }
-        forget(open);
-        return Err(Error::Open(Arc::new(crate::open::OpenError::Cancelled)));
+    }
+    let mut reg = registry();
+    let Some(outcome) = driver().try_open(open) else {
+        let ours = reg.opens.get(name).is_some_and(|entry| entry.open == open);
+        return Ok(ours.then_some(Opened::Pending(open)));
     };
-    let url = forget(open).unwrap_or_default();
-    let bound = outcome.map_err(Error::Open)?;
-    register(bound, url).map(Opened::Bound)
+    let url = reg
+        .opens
+        .remove(name)
+        .map(|entry| entry.url)
+        .unwrap_or_default();
+    let bound = match outcome {
+        Ok(bound) => bound,
+        Err(e) => return Err(Error::Open(e)),
+    };
+    reg.registering.insert(name.to_owned());
+    drop(reg);
+    let _registering = Registering(name);
+    register(bound, url).map(|b| Some(Opened::Bound(b)))
 }
 
 /// A database the driver bound: its empty db file gets WAL format, and it joins the registry.
@@ -331,12 +430,16 @@ fn handed_out(b: &Binding) {
 
 /// `ursula_cancel(request)`: gives up an open in progress. One that bound meanwhile and was not
 /// taken retires (the driver's cancel).
-pub(crate) fn cancel(open: OpenId) -> Result<(), Error> {
+pub(crate) fn cancel(open: OpenId) -> Result<Option<Arc<crate::open::OpenError>>, Error> {
     if forget(open).is_none() {
         return Err(Error::NoRequest { request: open.0 });
     }
-    Ok(driver().cancel(open)?)
+    Ok(driver().cancel_reporting(open, Duration::from_millis(CANCEL_REPORT_MS))?)
 }
+
+/// How long `ursula_cancel` waits for what the open ended with. The driver answers a cancel at
+/// once unless a disk job of the open runs.
+const CANCEL_REPORT_MS: u64 = 1_000;
 
 /// Drops open `open` from the opens in progress: the URL it was asked with.
 fn forget(open: OpenId) -> Option<String> {
@@ -344,9 +447,9 @@ fn forget(open: OpenId) -> Option<String> {
     let name = reg
         .opens
         .iter()
-        .find(|(_, (o, _))| *o == open)
+        .find(|(_, entry)| entry.open == open)
         .map(|(name, _)| name.clone())?;
-    reg.opens.remove(&name).map(|(_, url)| url)
+    reg.opens.remove(&name).map(|entry| entry.url)
 }
 
 /// The default cache root (design §5.1): `<user cache>/sqlite-ursula/0.8`.
