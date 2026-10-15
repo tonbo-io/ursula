@@ -141,7 +141,8 @@ impl Evaluation {
 /// floor. An untokened writer keeps the base protocol's rule that a forgotten producer is new, so
 /// its claim may open a record at or below the floor, marked as such. A record opened above the
 /// floor stays so: its claims of later epochs are not checked against the floor (row 6 or 7). A
-/// marked record is cleared only by a claim above the floor, tokened or not.
+/// marked record is cleared only by a claim above the floor, tokened or not, and a claim on a
+/// marked record closes no epoch.
 pub(crate) fn evaluate(
     record: Option<&ProducerRecord>,
     watermark: Option<Epoch>,
@@ -182,14 +183,13 @@ pub(crate) fn evaluate(
     }
     if e > current {
         if n == Seq::ZERO {
-            return Evaluation::apply(
-                6,
-                Some(ClosedEpoch {
-                    epoch: current,
-                    seq: r.last,
-                }),
-                r.below_floor && at_or_below_floor,
-            );
+            // A claim on a record opened below the floor closes nothing: the epoch it would close
+            // may be one the stream forgot, so no answer reports it as closed (#592).
+            let closes = (!r.below_floor).then_some(ClosedEpoch {
+                epoch: current,
+                seq: r.last,
+            });
+            return Evaluation::apply(6, closes, r.below_floor && at_or_below_floor);
         }
         return Evaluation::answer(7, ProducerAnswer::EpochNotClaimed);
     }
@@ -387,31 +387,12 @@ mod tests {
         // A claim above the floor applies and clears the marker (row 6).
         let evaluation = eval(Some(&below), Some(7), &write(8, 0, digest(3)));
         assert_eq!(evaluation.row, 6);
-        assert_eq!(
-            evaluation.decision,
-            applied(
-                Some(ClosedEpoch {
-                    epoch: epoch(5),
-                    seq: seq(2),
-                }),
-                false
-            )
-        );
+        assert_eq!(evaluation.decision, applied(None, false));
         // An untokened claim keeps the marker at or below the floor and clears it above.
         for (e, below_floor) in [(6, true), (7, true), (8, false)] {
             let evaluation = eval_untokened(Some(&below), Some(7), &write(e, 0, digest(3)));
             assert_eq!(evaluation.row, 6, "epoch {e}");
-            assert_eq!(
-                evaluation.decision,
-                applied(
-                    Some(ClosedEpoch {
-                        epoch: epoch(5),
-                        seq: seq(2),
-                    }),
-                    below_floor
-                ),
-                "epoch {e}"
-            );
+            assert_eq!(evaluation.decision, applied(None, below_floor), "epoch {e}");
         }
         // Untokened, the record is an ordinary one.
         assert_eq!(
@@ -422,6 +403,41 @@ mod tests {
             eval_untokened(Some(&below), Some(7), &write(5, 2, digest(9))).row,
             9
         );
+    }
+
+    #[test]
+    fn a_below_floor_claim_closes_no_epoch() {
+        // #592: tokened or not, a claim on a record opened below the floor closes nothing, so the
+        // record it leaves names no closed epoch and a resend in the replaced epoch is stale.
+        let mut below = record(2);
+        below.below_floor = true;
+        for evaluation in [
+            eval(Some(&below), Some(7), &write(8, 0, digest(3))),
+            eval_untokened(Some(&below), Some(7), &write(6, 0, digest(3))),
+        ] {
+            let Decision::Apply {
+                closes,
+                below_floor,
+            } = evaluation.decision
+            else {
+                panic!("{evaluation:?}");
+            };
+            assert_eq!((evaluation.row, closes), (6, None));
+            let claimed = ProducerRecord::claimed(
+                &write(8, 0, digest(3)),
+                closes,
+                below_floor,
+                receipt(120, 130),
+                HISTORY,
+                0,
+            );
+            assert_eq!(claimed.epoch.closed_epoch(), None);
+            let resend = eval_untokened(Some(&claimed), Some(7), &write(5, 3, None));
+            assert_eq!(resend.row, 5);
+            assert_eq!(answered(&resend), &ProducerAnswer::StaleEpoch {
+                epoch: epoch(8)
+            });
+        }
     }
 
     #[test]

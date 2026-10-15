@@ -400,6 +400,30 @@ fn floor_decision_the_floor_binds_only_tokened_writes() {
 }
 
 #[test]
+fn a_below_floor_claim_closes_no_epoch() {
+    // #592: the claim that lifts a record opened below the floor names no closed epoch, and a
+    // resend in the replaced epoch answers stale-epoch, never epoch-closed.
+    let world = World::new();
+    let token = world.create();
+    world.producer(&write(tokened(token), 5, 0, b"claim"));
+    world.server().advance(IDLE_RETIREMENT_MS);
+    // The untokened claim retires the record (floor 5) and opens one below the floor.
+    world.producer(&write(None, 2, 0, b"base claim"));
+    world.producer(&write(None, 2, 1, b"base next"));
+    let lift = write(tokened(token), 6, 0, b"above the floor");
+    for request in [&lift, &lift] {
+        let ProducerAnswer::Receipt { epoch: current, .. } = world.producer(request) else {
+            panic!("no receipt");
+        };
+        assert_eq!(current.closed_epoch(), None);
+    }
+    assert_eq!(
+        world.producer(&write(None, 2, 2, b"resend")),
+        ProducerAnswer::StaleEpoch { epoch: epoch(6) }
+    );
+}
+
+#[test]
 fn a_token_mismatch_answers_412_for_writes_and_reads() {
     let world = World::new();
     let token = world.create();
