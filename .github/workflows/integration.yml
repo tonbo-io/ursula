@@ -3,14 +3,15 @@ name: Integration
 # Verification that the main CI workflow (ci.yml) does not already run: every Rust integration test
 # target, and the sqlite-vfs extension (lint, units, build) with its TypeScript e2e suite against a
 # release `ursula` built once per run, on a single node and on 3 nodes + gateway + S3. S3 is real
-# AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork PRs. Lint,
-# unit tests and the DST seeds run in ci.yml.
+# AWS S3 through OIDC (.github/actions/ci-s3) on same-repo PRs and main, MinIO for fork PRs and
+# release/** pushes. Lint, unit tests and the DST seeds run in ci.yml.
 
 on:
   pull_request:
   push:
     branches:
       - main
+      - release/**
 
 permissions:
   contents: read
