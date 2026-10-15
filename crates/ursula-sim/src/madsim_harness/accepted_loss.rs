@@ -30,8 +30,9 @@
 //!   the scenario passing ([`Controls::DEFERRED_CUT`],
 //!   [`Controls::NO_LOG_GUARD`]).
 //! - [`Controls::LEADER_LAST`] sends the plan as the tool did before the
-//!   second review: to the members first, without the leader's plan term,
-//!   and to the leader last. A member that took the plan elects `A` before
+//!   second review: to the members first, with the vote term read on each
+//!   instead of the leader's plan term, and to the leader last, with the
+//!   members' log guard off too. A member that took the plan elects `A` before
 //!   `A` took it, and `A` leads without the plan.
 
 use std::time::Duration;
@@ -130,8 +131,13 @@ impl Controls {
         replication_fence_off: true,
         ..Self::NONE
     };
+    /// Both defences against an unplanned leader: the leader-first order
+    /// with its plan term, and the members' log guard, which refuses the
+    /// unplanned survivor's uncut entry above the point (N1 of the second
+    /// review).
     pub(super) const LEADER_LAST: Self = Self {
         leader_last: true,
+        log_guard_off: true,
         ..Self::NONE
     };
 }
@@ -364,7 +370,12 @@ async fn recover_group_slowly(
         .filter(|member| member.node_id != plan.leader)
     {
         watch_leaders(cluster, group, plan.point, pause, trace, after).await;
-        let follow = request(member, PlanStep::Follow { leader_term: 0 });
+        // No plan term exists before the leader took the plan: the term a
+        // hand-built body names is the one read on the member, which the
+        // server's lower bound lets through.
+        let follow = request(member, PlanStep::Follow {
+            leader_term: member.log.current_term,
+        });
         if let Err(error) = cluster
             .accept_recovery_plan(group, member.node_id, &follow)
             .await
@@ -586,6 +597,7 @@ pub(super) async fn run_recovery_plan_inner(
     let mut points = Vec::new();
     let mut leader = a;
     let mut cut = false;
+    let mut uncut_leader = false;
     for group in JOURNAL_GROUPS {
         if leader_by_state(&cluster, group).is_some() {
             continue;
@@ -605,6 +617,15 @@ pub(super) async fn run_recovery_plan_inner(
             }
         };
         let (plan_leader, point, plan_cut) = (taken.leader, taken.point, taken.cut);
+        // Whether the plan's leader still holds an entry above the point at
+        // or below the plan term: the stale suffix, uncut.
+        if let Some(record) = cluster.engines[&(group, plan_leader)].history().plan() {
+            let held = member_view(&cluster, group, plan_leader).await.log;
+            uncut_leader |= held.last_log_index.is_some_and(|index| index > point)
+                && held
+                    .last_log_term
+                    .is_some_and(|term| term <= record.leader_term);
+        }
         if shape == Shape::SurvivorCampaigns {
             wait_satisfied_watching(&cluster, group, point, &mut trace, &context).await;
         }
@@ -641,6 +662,7 @@ pub(super) async fn run_recovery_plan_inner(
         cut,
         stale_writes,
         restarts,
+        uncut_leader,
     });
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
@@ -731,15 +753,64 @@ mod tests {
         );
     }
 
-    /// Either defence of B1 alone keeps the scenario passing: the cut in
-    /// the accept job, or the members' log guard, under which the uncut
-    /// leader waits for its next start and its cut.
+    /// Either defence of B1 alone keeps the scenario passing, and each run
+    /// shows that the remaining one fired. Without the log guard, the cut
+    /// in the accept job leaves the plan's leader no stale suffix. With the
+    /// cut deferred, the leader keeps its stale suffix after the plan, and
+    /// the members' log guard keeps it from winning until its own start
+    /// runs the cut.
     #[test]
     fn either_defence_against_a_stale_suffix_alone_suffices() {
         let _guard = sim_test_guard();
         let scenario = SimScenario::RecoveryPlanCutUnderRestarts;
-        for controls in [Controls::DEFERRED_CUT, Controls::NO_LOG_GUARD] {
-            for seed in 385..=389 {
+        let verified = |controls: Controls, seed: u64| {
+            let report = ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
+                config(seed, scenario),
+                scenario,
+                controls,
+            );
+            report
+                .outcome
+                .trace
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    crate::madsim_harness::SimEvent::RecoveryPlanVerified {
+                        cut,
+                        uncut_leader,
+                        ..
+                    } => Some((*cut, *uncut_leader)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("seed {seed} {controls:?}: no plan verified"))
+        };
+        let (mut cut_ran, mut guard_fired) = (false, false);
+        for seed in 385..=389 {
+            let (cut, uncut_leader) = verified(Controls::NO_LOG_GUARD, seed);
+            assert!(!uncut_leader, "seed {seed}: the cut left a stale suffix");
+            cut_ran |= cut;
+            let (_, uncut_leader) = verified(Controls::DEFERRED_CUT, seed);
+            guard_fired |= uncut_leader;
+        }
+        assert!(cut_ran, "no seed cut: the cut alone was never shown");
+        assert!(
+            guard_fired,
+            "no seed left the plan's leader uncut: the log guard alone was never shown"
+        );
+    }
+
+    /// Either defence of N1 alone keeps the survivor scenario passing: the
+    /// leader-first order with its plan term, or the members' log guard.
+    #[test]
+    fn either_defence_against_an_unplanned_leader_alone_suffices() {
+        let _guard = sim_test_guard();
+        let scenario = SimScenario::RecoveryPlanSurvivorCampaigns;
+        let leader_last_only = Controls {
+            log_guard_off: false,
+            ..Controls::LEADER_LAST
+        };
+        for controls in [leader_last_only, Controls::NO_LOG_GUARD] {
+            for seed in 390..=394 {
                 ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
                     config(seed, scenario),
                     scenario,
@@ -749,9 +820,6 @@ mod tests {
         }
     }
 
-    /// N1 of the second #581 review, against the order the tool used: a
-    /// member that took the plan elects the survivor before the survivor
-    /// took it, and it leads without the plan.
     #[test]
     fn negative_control_a_plan_sent_leader_last_elects_an_unplanned_leader() {
         let _guard = sim_test_guard();

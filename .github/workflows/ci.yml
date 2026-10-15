@@ -134,8 +134,10 @@ jobs:
       - name: Test Raft units under madsim
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft --lib
 
-      # Each negative control switches off exactly one defence and asserts
-      # that its scenario then fails the invariant the defence keeps.
+      # A negative control switches off the defences one bug needs gone and
+      # asserts that its scenario then fails the invariant they keep. Where
+      # two defences each stop the bug alone, an either-defence check runs
+      # with each off and shows the other one fired.
       - name: Run DST negative controls
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- negative_control either_defence
 

@@ -653,12 +653,15 @@ pub enum SimEvent {
     /// loss, a recovery plan elected `leader`, cutting every log when `cut`;
     /// no replica applied the `stale_writes` writes the cut-off leader held
     /// uncommitted, and every replica applied the plan's history event
-    /// across `restarts` member restarts.
+    /// across `restarts` member restarts. `uncut_leader` when the plan's
+    /// leader still held the stale suffix after the plan was sent: the
+    /// members' log guard, not the cut, kept it from winning.
     RecoveryPlanVerified {
         leader: u64,
         cut: bool,
         stale_writes: u64,
         restarts: u64,
+        uncut_leader: bool,
     },
     LeaderReadObserved {
         phase: String,
