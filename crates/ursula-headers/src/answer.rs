@@ -56,6 +56,7 @@ pub enum Outcome {
     EpochClosed(ClosedBy),
     KeyConflict,
     ProducerExpired,
+    StaleEpoch,
 }
 
 impl Outcome {
@@ -80,6 +81,7 @@ impl Outcome {
             ("epoch-closed", Some(by)) => Ok(Self::EpochClosed(by)),
             ("key-conflict", None) => Ok(Self::KeyConflict),
             ("producer-expired", None) => Ok(Self::ProducerExpired),
+            ("stale-epoch", None) => Ok(Self::StaleEpoch),
             _ => Err(HeaderError::InvalidOutcome),
         }
     }
@@ -91,6 +93,7 @@ impl Outcome {
             Self::EpochClosed(ClosedBy::History) => "epoch-closed;by=history",
             Self::KeyConflict => "key-conflict",
             Self::ProducerExpired => "producer-expired",
+            Self::StaleEpoch => "stale-epoch",
         }
     }
 }
@@ -132,6 +135,10 @@ pub enum ProducerAnswer {
     /// epoch. `epoch` is the producer's current epoch, or the stream's epoch
     /// floor.
     ProducerExpired { epoch: u64 },
+    /// `403 stale-epoch`: the write's epoch is below the producer's current
+    /// epoch `epoch` (the base protocol's stale epoch). Every producer `403`
+    /// names its outcome, so a `403` without one is not a producer answer.
+    StaleEpoch { epoch: u64 },
     /// `409`: the epoch expects `expected` next; the request carried
     /// `received`.
     SeqGap { expected: u64, received: u64 },
@@ -152,9 +159,10 @@ impl ProducerAnswer {
                 ..
             }
             | Self::ReceiptEvicted { .. } => 204,
-            Self::EpochClosed { .. } | Self::KeyConflict { .. } | Self::ProducerExpired { .. } => {
-                403
-            }
+            Self::EpochClosed { .. }
+            | Self::KeyConflict { .. }
+            | Self::ProducerExpired { .. }
+            | Self::StaleEpoch { .. } => 403,
             Self::SeqGap { .. } => 409,
             Self::EpochNotClaimed => 400,
         }
@@ -200,6 +208,10 @@ impl ProducerAnswer {
             Self::ProducerExpired { epoch } => {
                 integer(emit, names::PRODUCER_EPOCH, *epoch);
                 emit(names::PRODUCER_OUTCOME, Outcome::ProducerExpired.as_str());
+            }
+            Self::StaleEpoch { epoch } => {
+                integer(emit, names::PRODUCER_EPOCH, *epoch);
+                emit(names::PRODUCER_OUTCOME, Outcome::StaleEpoch.as_str());
             }
             Self::SeqGap { expected, received } => {
                 integer(emit, names::PRODUCER_EXPECTED_SEQ, *expected);
@@ -258,10 +270,24 @@ impl ProducerAnswer {
         )?
         .map(|(epoch, seq)| ClosedEpoch { epoch, seq });
         let required = fields::required;
+        // A response that carries any producer header is a producer answer,
+        // so it must name the epoch: one without is malformed, never a plain
+        // success or an authorizer's refusal.
+        let producer_answer =
+            seq.is_some() || outcome.is_some() || closed_epoch.is_some() || closed_seq.is_some();
+        let unkeyed = || {
+            if producer_answer {
+                Err(HeaderError::Missing {
+                    name: names::PRODUCER_EPOCH,
+                })
+            } else {
+                Ok(None)
+            }
+        };
         match status {
             200 | 204 => {
                 let Some(epoch) = epoch else {
-                    return Ok(None);
+                    return unkeyed();
                 };
                 let seq = required(
                     names::PRODUCER_SEQ,
@@ -308,7 +334,7 @@ impl ProducerAnswer {
             }
             403 => {
                 let Some(epoch) = epoch else {
-                    return Ok(None);
+                    return unkeyed();
                 };
                 match outcome {
                     None => Err(HeaderError::Missing {
@@ -323,6 +349,7 @@ impl ProducerAnswer {
                     })),
                     Some(Outcome::KeyConflict) => Ok(Some(Self::KeyConflict { epoch })),
                     Some(Outcome::ProducerExpired) => Ok(Some(Self::ProducerExpired { epoch })),
+                    Some(Outcome::StaleEpoch) => Ok(Some(Self::StaleEpoch { epoch })),
                     Some(Outcome::ReceiptEvicted) => {
                         Err(HeaderError::OutcomeStatusMismatch { status })
                     }
@@ -453,12 +480,42 @@ mod tests {
             },
             ProducerAnswer::KeyConflict { epoch: 2 },
             ProducerAnswer::ProducerExpired { epoch: 11 },
+            ProducerAnswer::StaleEpoch { epoch: 12 },
             ProducerAnswer::SeqGap {
                 expected: 4,
                 received: 6,
             },
             ProducerAnswer::EpochNotClaimed,
         ]
+    }
+
+    #[test]
+    fn a_producer_header_without_an_epoch_is_malformed() {
+        let missing = Err(HeaderError::Missing {
+            name: crate::names::PRODUCER_EPOCH,
+        });
+        assert_eq!(parse(403, &[("producer-outcome", "key-conflict")]), missing);
+        assert_eq!(
+            parse(204, &[("producer-outcome", "receipt-evicted")]),
+            missing
+        );
+        assert_eq!(parse(200, &[("producer-seq", "3")]), missing);
+        // Without any producer header the response is not a producer answer.
+        assert_eq!(parse(403, &[]), Ok(None));
+        assert_eq!(
+            parse(200, &[("stream-next-offset", "00000000000000000012")]),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_producer_403_without_an_outcome_is_malformed() {
+        assert_eq!(
+            parse(403, &[("producer-epoch", "4")]),
+            Err(HeaderError::Missing {
+                name: crate::names::PRODUCER_OUTCOME,
+            })
+        );
     }
 
     #[test]
@@ -476,7 +533,9 @@ mod tests {
     #[test]
     fn statuses_keep_the_base_protocol_codes() {
         let statuses: Vec<u16> = every_answer().iter().map(ProducerAnswer::status).collect();
-        assert_eq!(statuses, [200, 204, 204, 204, 403, 403, 403, 403, 409, 400]);
+        assert_eq!(statuses, [
+            200, 204, 204, 204, 403, 403, 403, 403, 403, 409, 400
+        ]);
     }
 
     #[test]
@@ -486,6 +545,7 @@ mod tests {
             Outcome::EpochClosed(ClosedBy::Claim),
             Outcome::EpochClosed(ClosedBy::History),
             Outcome::KeyConflict,
+            Outcome::StaleEpoch,
             Outcome::ProducerExpired,
         ] {
             assert_eq!(Outcome::parse(outcome.as_str()), Ok(outcome));
