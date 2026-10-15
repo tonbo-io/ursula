@@ -142,13 +142,19 @@ pub(crate) fn evaluate(
     }
     if key.epoch > record.epoch {
         // Rows 6 and 7. A record opened above the floor stays above it; one
-        // opened below rises above only with a claim above the floor.
+        // opened below rises above only with a claim above the floor. A
+        // claim on a record opened below the floor closes nothing: the
+        // epoch it would close may be one the stream forgot, whose seqs may
+        // belong to another writer, so no answer may report it as closed.
         return if key.seq == 0 {
             Evaluation::Claim {
-                closes: Some(ClosedEpoch {
-                    epoch: record.epoch,
-                    seq: record.last_seq,
-                }),
+                closes: match record.opened {
+                    Opened::AboveFloor => Some(ClosedEpoch {
+                        epoch: record.epoch,
+                        seq: record.last_seq,
+                    }),
+                    Opened::BelowFloor => None,
+                },
                 opened: if record.opened == Opened::AboveFloor || !at_or_below(floor, key.epoch) {
                     Opened::AboveFloor
                 } else {

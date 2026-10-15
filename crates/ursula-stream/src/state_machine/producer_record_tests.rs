@@ -342,7 +342,8 @@ fn a_live_record_claims_past_a_floor_other_producers_raised() {
 }
 
 #[test]
-fn a_record_opened_below_the_floor_refuses_tokened_writes_until_it_claims_above() {
+fn a_record_opened_below_the_floor_refuses_tokened_writes_until_it_claims_above_and_closes_nothing()
+{
     // `p` at epoch 3 retires: the floor is 3. Without the token, the base
     // protocol treats `p` as new, and its claim of the forgotten epoch 3
     // opens a record below the floor. A tokened write on that record is
@@ -388,10 +389,24 @@ fn a_record_opened_below_the_floor_refuses_tokened_writes_until_it_claims_above(
         &stream_id,
         Write::new("p", 4, 0).tokened().at(idle),
     ));
-    assert_eq!(claim.closed_epoch, Some(ClosedEpoch { epoch: 3, seq: 1 }));
+    // The lifting claim closes nothing: epoch 3 may be the forgotten one,
+    // and its seqs may be another writer's.
+    assert_eq!(claim.closed_epoch, None);
     assert_eq!(
         record(&machine, &stream_id, "p").unwrap().opened,
         Opened::AboveFloor
+    );
+    // The original writer's lost 3:1 is stale, never reported as closed.
+    assert_eq!(
+        producer_refusal(send(
+            &mut machine,
+            &stream_id,
+            Write::new("p", 3, 1).tokened().at(idle)
+        )),
+        (
+            StreamErrorCode::ProducerEpochStale,
+            ProducerRefusal::StaleEpoch { epoch: 4 }
+        )
     );
     applied(send(
         &mut machine,
@@ -1299,6 +1314,10 @@ struct Ledger {
     /// Epochs a claim closed or a retirement forgot, per producer (G2b:
     /// none of them may ever apply a tokened write again).
     dead: std::collections::HashSet<(String, u64)>,
+    /// Epochs a retirement forgot, per producer, apart from those a claim
+    /// closed: no answer may report one of them as closed, since its seqs
+    /// may belong to another writer.
+    forgotten: std::collections::HashSet<(String, u64)>,
 }
 
 impl Ledger {
@@ -1306,6 +1325,7 @@ impl Ledger {
     /// repeated, and its epoch is dead to tokened writes.
     fn retire(&mut self, producer: &str, epoch: u64) {
         self.dead.insert((producer.to_owned(), epoch));
+        self.forgotten.insert((producer.to_owned(), epoch));
         self.applied.retain(|(id, _, _), _| id != producer);
     }
 }
@@ -1346,6 +1366,26 @@ fn check_answer(
     let tail_before = before.tail;
     let id = write.id.to_owned();
     let key = (id.clone(), write.epoch, write.seq);
+    // No answer reports a forgotten epoch as closed: a closure tells the
+    // writer which of its writes applied, and the stream no longer knows.
+    let reported = match &response {
+        StreamResponse::Error { context, .. } => context.iter().find_map(|context| match context {
+            StreamErrorContext::Producer(ProducerRefusal::EpochClosed { closed, .. }) => {
+                Some(*closed)
+            }
+            _ => None,
+        }),
+        other => producer_ack(other).and_then(|ack| ack.closed_epoch),
+    };
+    if let Some(closed) = reported {
+        prop_assert!(
+            !ledger.forgotten.contains(&(id.clone(), closed.epoch)),
+            "{:?} reported forgotten epoch {} of {} as closed",
+            write,
+            closed.epoch,
+            id
+        );
+    }
     if let Some(ack) = producer_ack(&response) {
         match ack.delivery {
             ProducerDelivery::Applied(receipt) => {
