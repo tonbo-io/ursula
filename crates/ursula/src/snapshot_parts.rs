@@ -152,6 +152,9 @@ fn copy_plan(capacity: u64) -> (usize, u64) {
 pub(crate) struct SnapshotCommits {
     slots: Arc<tokio::sync::Semaphore>,
     running: Arc<Mutex<HashSet<CommitKey>>>,
+    /// Test pause point: how many commits have ended.
+    #[cfg(test)]
+    ended: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl Default for SnapshotCommits {
@@ -159,6 +162,8 @@ impl Default for SnapshotCommits {
         Self {
             slots: Arc::new(tokio::sync::Semaphore::new(SNAPSHOT_ASSEMBLIES)),
             running: Arc::default(),
+            #[cfg(test)]
+            ended: Arc::new(tokio::sync::watch::Sender::new(0)),
         }
     }
 }
@@ -178,7 +183,15 @@ impl SnapshotCommits {
         running.insert(key.clone()).then(|| RunningCommit {
             running: Arc::clone(&self.running),
             key,
+            #[cfg(test)]
+            ended: Arc::clone(&self.ended),
         })
+    }
+
+    /// How many commits have ended, for a test to wait on.
+    #[cfg(test)]
+    pub(crate) fn ended(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ended.subscribe()
     }
 }
 
@@ -186,6 +199,8 @@ impl SnapshotCommits {
 struct RunningCommit {
     running: Arc<Mutex<HashSet<CommitKey>>>,
     key: CommitKey,
+    #[cfg(test)]
+    ended: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl Drop for RunningCommit {
@@ -194,6 +209,9 @@ impl Drop for RunningCommit {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.key);
+        #[cfg(test)]
+        self.ended
+            .send_modify(|ended| *ended = ended.saturating_add(1));
     }
 }
 

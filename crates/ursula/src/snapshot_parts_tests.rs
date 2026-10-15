@@ -69,6 +69,17 @@ use super::*;
 const OCTET: &str = "application/octet-stream";
 const MIB: usize = 1 << 20;
 
+fn cold_state() -> (HttpState, Arc<ColdStore>) {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    (HttpState::new(runtime), cold_store)
+}
+
 fn cold_app() -> (Router, Arc<ColdStore>) {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
@@ -1013,10 +1024,14 @@ async fn one_copy_and_one_full_request_fit_the_smallest_budget() {
 
 /// M1 of the #618 review: a repeat whose key check ran while the original
 /// still copied, and whose parts the original deleted after it published,
-/// answers `204` from its key again, not `400` for an unknown part.
+/// answers `204` from its key again, not `400` for an unknown part. The
+/// steps are ordered by signals, not by time: the repeat's first poll of its
+/// manifest (its key check is behind it), and the original's end.
 #[tokio::test]
 async fn a_repeat_that_raced_the_original_answers_from_the_key() {
-    let (app, cold_store) = cold_app();
+    let (state, cold_store) = cold_state();
+    let app = router_with_http_state(state.clone());
+    let mut ended = state.snapshot_commits.ended();
     create(&app, "/parts/s").await;
     let parts = vec![stage(&app, "/parts/s", b"part".to_vec()).await];
     let digest = digest_of(b"part");
@@ -1027,27 +1042,28 @@ async fn a_repeat_that_raced_the_original_answers_from_the_key() {
     );
     gate.reached(1).await;
 
-    // The repeat passes its key check now, then waits for its manifest.
+    // The repeat passes its key check, then asks for its manifest and waits.
     let mut repeat = commit_request("/parts/s", &parts, digest);
     let manifest = std::mem::replace(repeat.body_mut(), Body::empty());
     let manifest = to_bytes(manifest, usize::MAX).await.unwrap();
+    let (asked, asked_for_manifest) = tokio::sync::oneshot::channel::<()>();
     let (send_manifest, manifest_sent) = tokio::sync::oneshot::channel::<Bytes>();
     *repeat.body_mut() = Body::from_stream(futures_util::stream::once(async move {
+        // The test awaits this signal, so its receiver is alive.
+        asked.send(()).expect("the test waits for the signal");
         Ok::<_, std::convert::Infallible>(manifest_sent.await.unwrap_or_default())
     }));
     let repeat = tokio::spawn(app.clone().oneshot(repeat));
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    asked_for_manifest.await.unwrap();
 
     gate.open();
     assert_eq!(
         original.await.unwrap().unwrap().status(),
         StatusCode::NO_CONTENT
     );
-    while !part_names(&cold_store).await.is_empty() {
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    // The original's task ends right after its deletions.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The original's task deletes its parts, then ends.
+    ended.wait_for(|ended| *ended >= 1).await.unwrap();
+    assert!(part_names(&cold_store).await.is_empty());
     send_manifest.send(manifest).unwrap();
     let response = repeat.await.unwrap().unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1055,6 +1071,50 @@ async fn a_repeat_that_raced_the_original_answers_from_the_key() {
         SnapshotPublishAnswer::parse(204, pairs(&response)),
         Ok(Some(SnapshotPublishAnswer::Published { .. }))
     ));
+}
+
+/// #618 review: a part whose deletion the `DeleteChunk` fault policy
+/// refuses stays, the commit's answer does not change, and the orphan sweep
+/// reclaims the part later.
+#[tokio::test]
+async fn a_part_that_fails_to_delete_is_swept_later() {
+    let (state, cold_store) = cold_state();
+    let app = router_with_http_state(state.clone());
+    let mut ended = state.snapshot_commits.ended();
+    create(&app, "/parts/s").await;
+    let parts = vec![stage(&app, "/parts/s", b"part".to_vec()).await];
+    cold_store.set_fault_policy(|context| {
+        (context.operation == ursula_runtime::ColdStoreOperation::DeleteChunk
+            && context.path.contains("/_parts/"))
+        .then(|| ursula_runtime::ColdStoreFaultEffect::fail("injected: delete refused"))
+    });
+    let events = crate::staging_cleanup_tests::observe(&cold_store);
+    let response = send(&app, commit_request("/parts/s", &parts, digest_of(b"part"))).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    ended.wait_for(|ended| *ended >= 1).await.unwrap();
+    assert_eq!(part_names(&cold_store).await.len(), 1, "the part stays");
+    let begun = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            matches!(event, ursula_runtime::ColdStoreEvent::DeleteChunkBegin { path } if path.contains("/_parts/"))
+        })
+        .count();
+    assert_eq!(begun, 1, "the batch delete goes through the delete hooks");
+
+    cold_store.clear_fault_policy();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let swept = state
+        .runtime
+        .sweep_cold_orphans_group_once(ursula_shard::RaftGroupId(0), 16, 0)
+        .await
+        .expect("sweep");
+    assert_eq!(swept.orphans_deleted, 1);
+    assert!(
+        part_names(&cold_store).await.is_empty(),
+        "the sweep reclaims it"
+    );
 }
 
 /// m4: a part that goes away during the copy re-checks the key: a later
