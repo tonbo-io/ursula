@@ -257,6 +257,88 @@ fn a_later_segment_of_another_version_is_refused_not_cut() {
     assert!(segments[1].exists());
 }
 
+/// A log of three segments of one commit each.
+fn three_segments(log_dir: &std::path::Path) -> (Log, Vec<std::path::PathBuf>) {
+    let mut log = Log::create(log_dir, header()).unwrap();
+    log.set_roll_bytes(100);
+    for n in 0..3 {
+        log.append(&commit(n, 200)).unwrap();
+    }
+    let segments = log.segment_paths();
+    assert_eq!(segments.len(), 3);
+    (log, segments)
+}
+
+#[test]
+fn a_later_segment_never_written_after_its_roll_is_cut() {
+    let dir = TempDir::new("log-zero-magic");
+    let log_dir = dir.path().join("log");
+    let (log, segments) = three_segments(&log_dir);
+    drop(log);
+    // The roll's header block was allocated but its bytes never reached the disk.
+    let len = fs::metadata(&segments[2]).unwrap().len() as usize;
+    fs::write(&segments[2], vec![0u8; len]).unwrap();
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(
+        r.cut,
+        Some(super::Cut {
+            segment: segments[2].clone(),
+            at: 0
+        })
+    );
+    assert_eq!(log.segment_paths(), segments[..2].to_vec());
+    assert_eq!(log.next_position(), Position(3));
+    drop(log);
+    // A foreign magic is refused, not cut.
+    let (log, segments) = {
+        let dir = dir.path().join("foreign");
+        let (log, segments) = three_segments(&dir);
+        drop(log);
+        let mut bytes = fs::read(&segments[2]).unwrap();
+        bytes[..4].copy_from_slice(b"XXXX");
+        fs::write(&segments[2], bytes).unwrap();
+        (Log::open(&dir), segments)
+    };
+    assert!(matches!(log.unwrap_err(), LogError::Segment {
+        source: crate::codec::segment::SegmentError::Magic { .. },
+        ..
+    }));
+    assert!(segments[2].exists());
+}
+
+#[test]
+fn a_failed_unlink_in_a_trim_keeps_the_log_contiguous() {
+    let dir = TempDir::new("log-trim-fail");
+    let log_dir = dir.path().join("log");
+    let (mut log, _) = three_segments(&log_dir);
+    log.append(&RecordBody::Ack {
+        acked: Position(3),
+        acked_offset: Offset::from_u64(30),
+        log_bytes: 0,
+    })
+    .unwrap();
+    log.append(&RecordBody::Base {
+        position: Position(3),
+    })
+    .unwrap();
+    let segments = log.segment_paths();
+    assert_eq!(segments.len(), 5);
+    log.fail_next_unlink = true;
+    assert!(matches!(log.trim().unwrap_err(), LogError::Io {
+        op: "remove",
+        ..
+    }));
+    assert_eq!(log.segment_paths(), segments);
+    assert!(segments.iter().all(|s| s.exists()));
+    // Positions 1 to 3 lie at or below min(base, acked) = 3: their segments go.
+    assert_eq!(log.trim().unwrap(), 3);
+    assert_eq!(log.segment_paths(), segments[3..].to_vec());
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(log.next_position(), Position(6));
+    assert_eq!(r.cut, None);
+}
+
 #[test]
 fn a_log_missing_records_it_still_needs_is_refused() {
     let dir = TempDir::new("log-prefix");
@@ -268,8 +350,13 @@ fn a_log_missing_records_it_still_needs_is_refused() {
     }
     let segments = log.segment_paths();
     drop(log);
-    // Base and acked are 0: every record is needed, but the oldest segment is gone.
+    // Base and acked are 0: every record is needed, but the oldest segment is gone. The last
+    // segment's torn tail is left as it is: the refusal comes before any cut.
     fs::remove_file(&segments[0]).unwrap();
+    let last = segments.last().unwrap();
+    let mut bytes = fs::read(last).unwrap();
+    bytes.extend_from_slice(&[1, 2, 3]);
+    fs::write(last, &bytes).unwrap();
     assert!(matches!(
         Log::open(&log_dir).unwrap_err(),
         LogError::MissingPrefix {
@@ -277,6 +364,7 @@ fn a_log_missing_records_it_still_needs_is_refused() {
             ..
         }
     ));
+    assert_eq!(fs::read(last).unwrap(), bytes);
 }
 
 #[test]

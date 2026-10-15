@@ -197,6 +197,18 @@ fn a_close_after_a_logged_commit_leaves_it_unconfirmed() {
 }
 
 #[test]
+fn a_second_commit_logged_under_one_write_lock_keeps_the_lock() {
+    let mut s = HandleState::Idle;
+    s.on(Call::LockWrite);
+    s.on(Call::Logged(Position(1)));
+    assert_eq!(
+        s.on(Call::Logged(Position(2))),
+        Verdict::Unconfirmed(Position(1))
+    );
+    assert_eq!(s, HandleState::Writing);
+}
+
+#[test]
 fn a_new_write_lock_before_phase_two_leaves_the_commit_unconfirmed() {
     let mut s = HandleState::Idle;
     s.on(Call::LockWrite);

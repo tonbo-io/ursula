@@ -97,7 +97,8 @@ impl HandleState {
             // A commit logged without the WRITE lock, or a second one under it: capture never
             // does either, and neither position may be forgotten.
             (HandleState::Logged(q), Call::Logged(_)) => {
-                *self = HandleState::Idle;
+                // The WRITE lock is still held.
+                *self = HandleState::Writing;
                 Verdict::Unconfirmed(q)
             }
             (HandleState::Idle, Call::Logged(p)) => Verdict::Unconfirmed(p),

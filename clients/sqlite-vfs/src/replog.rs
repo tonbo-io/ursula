@@ -203,6 +203,9 @@ pub(crate) struct Log {
     /// Test hook: the next append writes this many bytes of its record, then fails.
     #[cfg(test)]
     pub(crate) fail_next_append: Option<usize>,
+    /// Test hook: the next unlink in a trim fails.
+    #[cfg(test)]
+    pub(crate) fail_next_unlink: bool,
 }
 
 fn io(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> LogError {
@@ -251,13 +254,15 @@ fn foreign(frame: &[u8], ours: Lineage) -> bool {
     )
 }
 
-/// A segment header error a crash during a roll leaves: cut short or not verifying. Any other is a
-/// header of another format or version.
+/// A segment header error a crash during a roll leaves: cut short, not verifying, or a magic that
+/// starts with a zero byte (a block allocated but never written before the roll's fsync). A
+/// non-zero foreign magic or another version is a header of another format, refused.
 fn torn_header(e: &SegmentError) -> bool {
-    matches!(
-        e,
-        SegmentError::HeaderTruncated { .. } | SegmentError::HeaderChecksum { .. }
-    )
+    match e {
+        SegmentError::HeaderTruncated { .. } | SegmentError::HeaderChecksum { .. } => true,
+        SegmentError::Magic { found } => found.first().is_none_or(|&b| b == 0),
+        _ => false,
+    }
 }
 
 /// Brings the carried-over fields of `state` past `body`.
@@ -305,6 +310,8 @@ impl Log {
             roll_bytes: SEGMENT_BYTES,
             #[cfg(test)]
             fail_next_append: None,
+            #[cfg(test)]
+            fail_next_unlink: false,
         })
     }
 
@@ -431,6 +438,19 @@ impl Log {
                 dir: dir.to_owned(),
             });
         };
+        // Checked before the cut changes anything.
+        let min = state.base.min(state.acked);
+        // Trim deletes only segments whose records all lie at or below `min`: a log starting later
+        // lost records it still needs.
+        if let Some(first) = kept.first()
+            && first.first.0 > min.0.saturating_add(1)
+        {
+            return Err(LogError::MissingPrefix {
+                path: first.path.clone(),
+                first: first.first,
+                needed: Position(min.0.saturating_add(1)),
+            });
+        }
         let file = File::options()
             .read(true)
             .write(true)
@@ -457,18 +477,6 @@ impl Log {
         // The current segment's identity with the state at the end of the log.
         state.first_position = header.first_position;
         state.supersedes = header.supersedes;
-        let min = state.base.min(state.acked);
-        // Trim deletes only segments whose records all lie at or below `min`: a log starting later
-        // lost records it still needs.
-        if let Some(first) = kept.first()
-            && first.first.0 > min.0.saturating_add(1)
-        {
-            return Err(LogError::MissingPrefix {
-                path: first.path.clone(),
-                first: first.first,
-                needed: Position(min.0.saturating_add(1)),
-            });
-        }
         records.retain(|r| r.position > min);
         let recovered = Recovered {
             base: state.base,
@@ -496,6 +504,8 @@ impl Log {
             roll_bytes: SEGMENT_BYTES,
             #[cfg(test)]
             fail_next_append: None,
+            #[cfg(test)]
+            fail_next_unlink: false,
         };
         Ok((log, recovered))
     }
@@ -620,11 +630,21 @@ impl Log {
                 |w| matches!(w, [_, next] if next.first.0 <= durable_min.0.saturating_add(1)),
             )
             .count();
-        // From the front, oldest first, each unlink durable before the next.
+        // From the front, oldest first, each unlink durable before the next, and a segment leaves
+        // the list only once it is gone for good: a failed step leaves both as they were.
         for _ in 0..removable {
-            let segment = self.segments.remove(0);
+            let Some(segment) = self.segments.first() else {
+                break;
+            };
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_unlink) {
+                return Err(io("remove", &segment.path)(std::io::Error::other(
+                    "injected unlink failure",
+                )));
+            }
             fs::remove_file(&segment.path).map_err(io("remove", &segment.path))?;
             sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
+            self.segments.remove(0);
         }
         Ok(removable)
     }
