@@ -310,7 +310,8 @@ longer.
 with a body that the gateway handled this way, and `refusal_drains_cut`, those
 whose body it did not read to the end: one over the limit, one that stopped
 arriving for 5 s or was still arriving after 30 s, one that failed, or one
-whose request went away while the gateway read it. They count the refusals
+whose request went away while the gateway read it, and `refusal_drain_bytes`,
+the bytes of those bodies it read and dropped. They count the refusals
 of [Request Body Budget](#request-body-budget) too, which a gateway without
 access control also sends. A gateway with access
 control answers the metrics path `404` unless `--auth-public-metrics` is set,
@@ -432,9 +433,11 @@ Nothing](#refusals-that-applied-nothing)). `/__ursula/gateway/metrics`
 reports `upload_refusals_tenant_bytes`, `upload_refusals_tenant_uploads`,
 `upload_refusals_budget` and `upload_refusals_too_slow`, the refusals by
 reason, `upload_budget_bytes`, the budget in effect, `upload_reserved_bytes`,
-the bytes reserved now with each body's share rounded up to whole KiB, and
+the bytes reserved now with each body's share rounded up to whole KiB,
 `upload_tenants`, the buckets with a large body under way under an upload
-limit now.
+limit now, and `body_bytes_buffered`, the bytes of bodies the gateway read to
+forward them, a body cut or refused part way included. The rest of a body
+refused part way counts in `refusal_drain_bytes`.
 
 The defaults suit a 512 MiB pod with the default 32 MiB per-request limit.
 The 256 MiB budget is half of the pod, leaving the rest to response streams,

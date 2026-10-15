@@ -181,6 +181,8 @@ struct GatewayMetrics {
     upstream_ejections: AtomicU64,
     refusal_drains: AtomicU64,
     refusal_drains_cut: AtomicU64,
+    refusal_drain_bytes: AtomicU64,
+    body_bytes_buffered: AtomicU64,
     upload_refusals_tenant_bytes: AtomicU64,
     upload_refusals_tenant_uploads: AtomicU64,
     upload_refusals_budget: AtomicU64,
@@ -223,6 +225,14 @@ struct GatewayMetricsSnapshot {
     /// closes after the refusal, and a client still sending the body may see
     /// that instead of the refusal.
     refusal_drains_cut: u64,
+    /// Bytes of the bodies of refused requests that the gateway read and
+    /// dropped ([`Gateway::refuse_unread`]), counted as each chunk arrives.
+    refusal_drain_bytes: u64,
+    /// Bytes of the bodies of requests the gateway may forward that it read
+    /// to buffer them ([`Gateway::buffer`]), counted as each chunk arrives,
+    /// also of a body cut or refused part way. The rest of a body refused
+    /// part way counts in `refusal_drain_bytes`.
+    body_bytes_buffered: u64,
     /// Requests refused because their bucket's large bodies being read would
     /// have gone past [`TenantLimits::max_upload_bytes`] with theirs.
     upload_refusals_tenant_bytes: u64,
@@ -577,6 +587,9 @@ impl Gateway {
                 Ok(None) => break,
                 Err(end) => return Err(self.cut_short(end, buffered.len())),
             };
+            self.metrics
+                .body_bytes_buffered
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
             let len = buffered.len().saturating_add(chunk.len() as u64);
             if len > limit {
                 // Past the bucket's own limit, within the gateway's: the
@@ -842,7 +855,7 @@ impl Gateway {
             cut: &self.metrics.refusal_drains_cut,
             whole: false,
         };
-        let drained = reader.discard().await;
+        let drained = reader.discard(&self.metrics.refusal_drain_bytes).await;
         cut.whole = drained == ReadEnd::Whole;
         debug!(?drained, "read the body of a refused request");
         refusal.into_response()
@@ -1340,6 +1353,8 @@ impl Gateway {
             upstream_ejected: self.ejections.active(Instant::now()),
             refusal_drains: self.metrics.refusal_drains.load(Ordering::Relaxed),
             refusal_drains_cut: self.metrics.refusal_drains_cut.load(Ordering::Relaxed),
+            refusal_drain_bytes: self.metrics.refusal_drain_bytes.load(Ordering::Relaxed),
+            body_bytes_buffered: self.metrics.body_bytes_buffered.load(Ordering::Relaxed),
             upload_refusals_tenant_bytes: self
                 .metrics
                 .upload_refusals_tenant_bytes
@@ -1883,11 +1898,13 @@ impl BodyReader {
     }
 
     /// Reads the rest of the body to its end, dropping each chunk as it
-    /// arrives.
-    async fn discard(mut self) -> ReadEnd {
+    /// arrives and counting its bytes in `read`.
+    async fn discard(mut self, read: &AtomicU64) -> ReadEnd {
         loop {
             match self.chunk().await {
-                Ok(Some(_dropped)) => {}
+                Ok(Some(dropped)) => {
+                    read.fetch_add(dropped.len() as u64, Ordering::Relaxed);
+                }
                 Ok(None) => return ReadEnd::Whole,
                 Err(end) => return end,
             }

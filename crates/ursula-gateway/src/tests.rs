@@ -4126,8 +4126,10 @@ mod refused_bodies {
             Announce::Length(LARGE_BODY),
             CHUNK,
         ));
+        // Each read restarts the stall timeout: the clock moves only once the
+        // gateway has read every byte sent.
         assert!(
-            until(|| gateway.metrics_snapshot().refusal_drains == 1).await,
+            until(|| gateway.metrics_snapshot().refusal_drain_bytes == CHUNK as u64).await,
             "the gateway reads the body"
         );
         let almost = REFUSED_BODY_STALL_TIMEOUT.saturating_sub(Duration::from_millis(1));
@@ -4544,17 +4546,12 @@ mod refused_bodies {
         )
         .await
         .expect("send the start of the body");
+        // Each read restarts the stall timeout: the clock moves only once the
+        // gateway has read every byte sent.
         assert!(
-            until(|| gateway.metrics_snapshot().upload_reserved_bytes == LARGE_BODY as u64).await,
+            until(|| gateway.metrics_snapshot().body_bytes_buffered == CHUNK as u64).await,
             "the gateway reads the body"
         );
-        // The reservation comes before the first chunk is read, and the
-        // gateway may still be reading the bytes sent so far, each read
-        // restarting the stall timeout. Let it read them, in real time with
-        // the clock held still, before the clock moves.
-        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(200)))
-            .await
-            .expect("the wait");
         let client = tokio::spawn(async move {
             let answered = read_answer(&mut connection).await;
             let mut rest = [0_u8; 16];
@@ -5327,11 +5324,17 @@ mod uploads {
         let (chunks, body) = declared(8 << 20);
         let upload = send(&gateway, post("/tenant-a/orders", body));
         assert!(until_reserved(&gateway, 8 << 20).await);
-        for _ in 0..128 {
+        for sent in 1..=128_u64 {
             chunks
                 .send(Bytes::from(vec![0_u8; 64 << 10]))
                 .await
                 .expect("the gateway reads the body");
+            // The chunk counts in its window once the gateway reads it.
+            assert!(
+                until(&gateway, |metrics| metrics.body_bytes_buffered
+                    == sent << 16)
+                .await
+            );
             tokio::time::advance(Duration::from_secs(1)).await;
         }
         drop(chunks);
