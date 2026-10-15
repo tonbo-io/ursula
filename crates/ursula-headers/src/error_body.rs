@@ -236,6 +236,18 @@ error_codes! {
     RateLimited = "RATE_LIMITED", "the request rate limit is spent";
     /// The tenant holds as many live reads as it may (`429`).
     LiveReadsExhausted = "LIVE_READS_EXHAUSTED", "the live-read limit is spent";
+    /// The bucket has as many large request bodies arriving as it may
+    /// (`429`, with `Retry-After`).
+    UploadsExhausted = "UPLOADS_EXHAUSTED", "the bucket's concurrent upload limit is spent; retry";
+    /// The bucket's large request bodies arriving hold as many bytes as
+    /// they may (`429`, with `Retry-After`).
+    UploadBytesExhausted = "UPLOAD_BYTES_EXHAUSTED", "the bucket's upload bytes limit is spent; retry";
+    /// The gateway's budget for buffered request bodies stayed spent
+    /// (`503`, with `Retry-After`).
+    UploadBudgetExhausted = "UPLOAD_BUDGET_EXHAUSTED", "the gateway's request body budget is spent; retry";
+    /// The request body stopped arriving, or arrived below the gateway's
+    /// floor, and was cut before anything of it was forwarded (`408`).
+    BodyTooSlow = "BODY_TOO_SLOW", "the request body arrived too slowly";
     /// The gateway has no upstream (`503`).
     NoUpstream = "NO_UPSTREAM", "no upstream is configured";
     /// No upstream could be reached (`503`, with `Retry-After`).
@@ -666,6 +678,10 @@ mod tests {
             ),
             (ErrorCode::RateLimited, "RATE_LIMITED"),
             (ErrorCode::LiveReadsExhausted, "LIVE_READS_EXHAUSTED"),
+            (ErrorCode::UploadsExhausted, "UPLOADS_EXHAUSTED"),
+            (ErrorCode::UploadBytesExhausted, "UPLOAD_BYTES_EXHAUSTED"),
+            (ErrorCode::UploadBudgetExhausted, "UPLOAD_BUDGET_EXHAUSTED"),
+            (ErrorCode::BodyTooSlow, "BODY_TOO_SLOW"),
             (ErrorCode::NoUpstream, "NO_UPSTREAM"),
             (ErrorCode::UpstreamUnreachable, "UPSTREAM_UNREACHABLE"),
             (ErrorCode::UpstreamTimeout, "UPSTREAM_TIMEOUT"),

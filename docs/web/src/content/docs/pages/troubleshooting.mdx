@@ -304,12 +304,31 @@ fix the cold backend. `RAFT_UNCOMMITTED_BACKPRESSURE` means that the group's
 write bytes that are proposed but not yet applied would exceed
 `raft.max_uncommitted_size_per_group`.
 
+`UPLOAD_BUDGET_EXHAUSTED` comes from `ursulagw`: its request body budget
+(`--body-budget-bytes`) stayed spent for `--body-budget-wait-ms`, so it sent
+nothing on. Bodies of at most `--small-body-max-bytes` have headroom of their
+own, so this hits large bodies under heavy upload load. Writes resume once the
+uploads under way end. The gateway's `upload_refusals_budget` counter shows
+these refusals. See the gateway's Request Body Budget.
+
 A `503` also answers a write while the group has no known leader, for example
 during an election, and on a node that does not host the stream's group and
 knows no node that does.
 
 A client resolves a `503` like any unknown outcome: it repeats the write with
 its producer key. See [write outcomes](/docs/api/overview#write-outcomes).
+
+### `408` with `BODY_TOO_SLOW` from the gateway
+
+No byte of the body reached `ursulagw` for `--body-stall-timeout`, or less
+than `--body-min-bytes-per-sec` arrived over one such window, so the gateway
+cut the body and sent nothing on. With the defaults (30 s, 1 KiB/s) this does
+not happen to a SQLite commit, since the extension gives up on a commit after
+10 s. Over HTTP/1.1 the gateway closes the connection with the `408`, so a
+client still sending usually meets the closed connection instead. Keep
+`--body-stall-timeout` above 10 s, or a commit still being sent can meet that
+closed connection on every attempt. The gateway's `upload_refusals_too_slow`
+counter shows the cuts.
 
 ### `409 Conflict` with `producer-expected-seq` / `producer-received-seq`
 
@@ -409,7 +428,7 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `payment_required` | A layer in front of the stream answered `402` | Settle what the layer asks for. `refused_reason` carries its explanation |
 | `unauthorized` | The token was refused (`401`) until `URSULA_VFS_RETRY_MS` ran out | Set a fresh token with `setToken`, or fix the file `URSULA_VFS_TOKEN_FILE` names |
 | `forbidden` | The gateway's authorizer denied the write with a `403` | Allow the write in the authorizer |
-| `rate_limited` | `429` until `URSULA_VFS_RETRY_MS` ran out | Lower the write rate, or raise the bucket's request rate on the gateway |
+| `rate_limited` | `429` until `URSULA_VFS_RETRY_MS` ran out | With the code `RATE_LIMITED` in `refused_reason`, lower the write rate or raise the bucket's `requests_per_sec` in the gateway's `--quota-policy`. With `UPLOADS_EXHAUSTED` or `UPLOAD_BYTES_EXHAUSTED`, the bucket's large bodies under way reached its `max_concurrent_uploads` or `max_upload_bytes` there: raise them, or keep commits at or below the gateway's `--small-body-max-bytes` (1 MiB by default), which never count |
 | `too_large` | The transaction's commit frame is over `URSULA_VFS_MAX_FRAME_BYTES` (32 MiB by default), so the extension never sent it. Or a lower limit in front of the stream, such as the gateway's `--max-request-body-bytes` or a bucket's body limit, refused it with a `413` | Split the transaction. Other commits succeed as usual, and the next one that does clears the refusal. See [Rules](/docs/examples/sqlite-vfs#rules) |
 | `unreachable` | From 0.7.4: until `URSULA_VFS_RETRY_MS` ran out, every attempt failed before any byte of it went out, or was refused as above, and the last one failed before it went out. The stream URL's host did not resolve, or no connection to it was made: refused, timed out, or a failed TLS handshake. Nothing of the commit was sent | Check that the stream URL's host resolves from the client and that the gateway or the server behind it is up and reachable, through the proxy in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` when one is set (`NO_PROXY` excludes hosts). A failed TLS handshake shows in `refused_reason` as rustls reports it. `io: invalid peer certificate: UnknownIssuer` means the client does not trust the endpoint's certificate authority: point `URSULA_VFS_CA_FILE` at it. `io: invalid peer certificate: certificate not valid for name ...` means the stream URL names a host the certificate does not cover: use one it covers. `io: received corrupt message of type InvalidContentType` means an `https://` URL points at a port that speaks plain HTTP. `io: received fatal alert: ...` means the endpoint refused the handshake, for example over its TLS versions or cipher suites. Commits succeed again once the endpoint is reachable |
 

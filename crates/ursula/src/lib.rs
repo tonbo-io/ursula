@@ -3377,7 +3377,7 @@ async fn answer_before_body(
     if version >= Version::HTTP_2 || expects_continue || body.is_end_stream() {
         return response;
     }
-    if ursula_gateway::drain(body, MAX_HTTP_BODY_BYTES).await != ursula_gateway::Drained::Whole {
+    if ursula_gateway::drain(body, MAX_HTTP_BODY_BYTES).await != ursula_gateway::ReadEnd::Whole {
         response.headers_mut().insert(
             axum::http::header::CONNECTION,
             HeaderValue::from_static("close"),
