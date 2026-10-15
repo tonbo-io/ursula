@@ -200,23 +200,9 @@ pub mod snapshot;
 mod snapshotter;
 mod stats;
 mod status;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 mod transport;
 mod vfs;
 mod wal;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 mod wire;
 
 pub use extension::sqlite3_extension_init;

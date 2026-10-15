@@ -14,12 +14,26 @@ use crate::wire::NoAnswer;
 use crate::wire::Request;
 
 /// One stream of a shared [`ModelServer`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 #[derive(Debug, Clone)]
 pub(crate) struct ModelTransport {
     server: Arc<Mutex<ModelServer>>,
     path: String,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 impl ModelTransport {
     /// The transport of the stream at `path` on `server`.
     pub(crate) fn new(server: Arc<Mutex<ModelServer>>, path: impl Into<String>) -> Self {

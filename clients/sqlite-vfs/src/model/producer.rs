@@ -117,21 +117,26 @@ impl Evaluation {
 }
 
 /// Evaluates producer write `write` (`(P, E, N)` with digest `d`) against P's record after idle
-/// retirement, the stream's epoch floor `watermark`, whether the write is tokened, and the group's
-/// history id. `incarnation` is the stream's token, which receipts carry. Rows match in order.
+/// retirement, the stream's epoch floor `watermark` and the group's history id. `incarnation` is
+/// the stream's token, which receipts carry. Rows match in order.
+///
+/// Addendum 3 to #581 settles three rows. Row 1, the floor, binds every write of an epoch the
+/// record does not hold, tokened or not, with or without a record: no record is ever created or
+/// moved to an epoch at or below the floor. Row 5 answers `stale-epoch`. `producer-expired` means
+/// the floor only.
 pub(crate) fn evaluate(
     record: Option<&ProducerRecord>,
     watermark: Option<Epoch>,
     write: &ProducerWrite,
-    tokened: bool,
     group_history: u64,
     incarnation: Incarnation,
 ) -> Evaluation {
     let (e, n, d) = (write.epoch, write.seq, write.digest);
+    let opens = record.is_none_or(|r| e > r.epoch.epoch());
+    if let Some(w) = watermark.filter(|w| opens && e <= *w) {
+        return Evaluation::answer(1, ProducerAnswer::ProducerExpired { epoch: w });
+    }
     let Some(r) = record else {
-        if let Some(w) = watermark.filter(|w| tokened && e <= *w) {
-            return Evaluation::answer(1, ProducerAnswer::ProducerExpired { epoch: w });
-        }
         if n == Seq::ZERO {
             return Evaluation::apply(2, None);
         }
@@ -147,7 +152,7 @@ pub(crate) fn evaluate(
                 .expect("the record's epoch is above the epoch its claim closed");
             return Evaluation::answer(4, ProducerAnswer::EpochClosed(closure));
         }
-        return Evaluation::answer(5, ProducerAnswer::ProducerExpired { epoch: current });
+        return Evaluation::answer(5, ProducerAnswer::StaleEpoch { epoch: current });
     }
     if e > current {
         if n == Seq::ZERO {
@@ -276,16 +281,8 @@ mod tests {
         record: Option<&ProducerRecord>,
         watermark: Option<u64>,
         write: &ProducerWrite,
-        tokened: bool,
     ) -> Evaluation {
-        evaluate(
-            record,
-            watermark.map(epoch),
-            write,
-            tokened,
-            HISTORY,
-            token(),
-        )
+        evaluate(record, watermark.map(epoch), write, HISTORY, token())
     }
 
     fn answered(evaluation: &Evaluation) -> &ProducerAnswer {
@@ -296,38 +293,61 @@ mod tests {
     }
 
     #[test]
-    fn row_1_the_floor_refuses_tokened_claims_and_appends() {
+    fn row_1_the_floor_refuses_every_write_of_an_epoch_at_or_below_it() {
         for n in [0, 3] {
             for e in [2, 3] {
-                let evaluation = eval(None, Some(3), &write(e, n, digest(1)), true);
+                let evaluation = eval(None, Some(3), &write(e, n, digest(1)));
                 assert_eq!(evaluation.row, 1);
                 assert_eq!(answered(&evaluation), &ProducerAnswer::ProducerExpired {
                     epoch: epoch(3)
                 });
             }
         }
-        // Above the floor, a tokened claim opens an epoch the stream never forgot (row 2).
-        assert_eq!(eval(None, Some(3), &write(4, 0, digest(1)), true).row, 2);
+        // Above the floor, a claim opens an epoch the stream never forgot (row 2).
+        assert_eq!(eval(None, Some(3), &write(4, 0, digest(1))).row, 2);
     }
 
     #[test]
-    fn row_1_binds_only_tokened_writes() {
-        // An untokened claim at the floor keeps the base protocol's rule: a new producer (row 2).
-        let evaluation = eval(None, Some(3), &write(3, 0, digest(1)), false);
-        assert_eq!(evaluation.row, 2);
-        assert_eq!(evaluation.decision, Decision::Apply { closes: None });
+    fn row_1_binds_untokened_claims_too() {
+        // Addendum 3 item 3: with or without the token, no record is created at or below the
+        // floor. `evaluate` takes no tokened flag: both reach it alike.
+        let evaluation = eval(None, Some(3), &write(3, 0, None));
+        assert_eq!(evaluation.row, 1);
+        assert_eq!(answered(&evaluation), &ProducerAnswer::ProducerExpired {
+            epoch: epoch(3)
+        });
+    }
+
+    #[test]
+    fn row_1_binds_a_record_moving_to_a_later_epoch() {
+        // The floor is per stream: another producer's retirement raised it above this record's
+        // epoch 5. A claim of 6 or 7 would move the record to a forgotten epoch.
+        for e in [6, 7] {
+            let evaluation = eval(Some(&record(2)), Some(7), &write(e, 0, digest(3)));
+            assert_eq!(evaluation.row, 1, "epoch {e}");
+        }
+        assert_eq!(
+            eval(Some(&record(2)), Some(7), &write(8, 0, digest(3))).row,
+            6
+        );
+        // A write in the record's own epoch, below the floor, still applies or repeats.
+        assert_eq!(eval(Some(&record(2)), Some(7), &write(5, 3, None)).row, 12);
+        assert_eq!(
+            eval(Some(&record(2)), Some(7), &write(5, 2, digest(9))).row,
+            9
+        );
     }
 
     #[test]
     fn row_2_a_first_claim_applies() {
-        let evaluation = eval(None, None, &write(0, 0, None), true);
+        let evaluation = eval(None, None, &write(0, 0, None));
         assert_eq!(evaluation.row, 2);
         assert_eq!(evaluation.decision, Decision::Apply { closes: None });
     }
 
     #[test]
     fn row_3_a_seq_without_a_record_expects_seq_0() {
-        let evaluation = eval(None, None, &write(1, 4, None), true);
+        let evaluation = eval(None, None, &write(1, 4, None));
         assert_eq!(evaluation.row, 3);
         assert_eq!(answered(&evaluation), &ProducerAnswer::SeqGap {
             expected: Seq::ZERO,
@@ -338,7 +358,7 @@ mod tests {
     #[test]
     fn row_4_the_closed_epoch_reports_its_last_seq() {
         for n in [0, 6, 7] {
-            let evaluation = eval(Some(&record(2)), None, &write(4, n, digest(1)), true);
+            let evaluation = eval(Some(&record(2)), None, &write(4, n, digest(1)));
             assert_eq!(evaluation.row, 4);
             let ProducerAnswer::EpochClosed(closure) = answered(&evaluation) else {
                 panic!("{evaluation:?}");
@@ -353,17 +373,20 @@ mod tests {
     }
 
     #[test]
-    fn row_5_an_epoch_two_claims_old_is_expired() {
-        let evaluation = eval(Some(&record(2)), None, &write(3, 1, None), true);
-        assert_eq!(evaluation.row, 5);
-        assert_eq!(answered(&evaluation), &ProducerAnswer::ProducerExpired {
-            epoch: epoch(5)
-        });
+    fn row_5_an_older_epoch_is_stale() {
+        // Addendum 3 item 1: an epoch below the record's, other than the one its claim closed.
+        for n in [0, 1] {
+            let evaluation = eval(Some(&record(2)), None, &write(3, n, None));
+            assert_eq!(evaluation.row, 5);
+            assert_eq!(answered(&evaluation), &ProducerAnswer::StaleEpoch {
+                epoch: epoch(5)
+            });
+        }
     }
 
     #[test]
     fn row_6_a_later_claim_closes_the_epoch_at_its_last_seq() {
-        let evaluation = eval(Some(&record(2)), None, &write(9, 0, digest(3)), true);
+        let evaluation = eval(Some(&record(2)), None, &write(9, 0, digest(3)));
         assert_eq!(evaluation.row, 6);
         assert_eq!(evaluation.decision, Decision::Apply {
             closes: Some(ClosedEpoch {
@@ -375,7 +398,7 @@ mod tests {
 
     #[test]
     fn row_7_a_seq_of_an_unclaimed_later_epoch_expects_seq_0() {
-        let evaluation = eval(Some(&record(2)), None, &write(6, 1, None), true);
+        let evaluation = eval(Some(&record(2)), None, &write(6, 1, None));
         assert_eq!(evaluation.row, 7);
         assert_eq!(answered(&evaluation), &ProducerAnswer::EpochNotClaimed);
     }
@@ -384,7 +407,7 @@ mod tests {
     fn row_8_another_identity_under_a_kept_key_conflicts() {
         // The claim's identity (digest 1), against another digest and against none.
         for d in [digest(2), None] {
-            let evaluation = eval(Some(&record(2)), None, &write(5, 0, d), true);
+            let evaluation = eval(Some(&record(2)), None, &write(5, 0, d));
             assert_eq!(evaluation.row, 8, "{d:?}");
             assert_eq!(answered(&evaluation), &ProducerAnswer::KeyConflict {
                 epoch: epoch(5)
@@ -393,7 +416,7 @@ mod tests {
         // The newest write's identity (digest 9).
         for d in [digest(1), None] {
             assert_eq!(
-                eval(Some(&record(2)), None, &write(5, 2, d), true).row,
+                eval(Some(&record(2)), None, &write(5, 2, d)).row,
                 8,
                 "{d:?}"
             );
@@ -402,16 +425,13 @@ mod tests {
         let mut bare = record(0);
         bare.claim = None;
         bare.newest_digest = None;
-        assert_eq!(
-            eval(Some(&bare), None, &write(5, 0, digest(1)), true).row,
-            8
-        );
-        assert_eq!(eval(Some(&bare), None, &write(5, 0, None), true).row, 9);
+        assert_eq!(eval(Some(&bare), None, &write(5, 0, digest(1))).row, 8);
+        assert_eq!(eval(Some(&bare), None, &write(5, 0, None)).row, 9);
     }
 
     #[test]
     fn row_9_a_repeat_of_the_newest_write_gets_its_receipt() {
-        let evaluation = eval(Some(&record(2)), None, &write(5, 2, digest(9)), true);
+        let evaluation = eval(Some(&record(2)), None, &write(5, 2, digest(9)));
         assert_eq!(evaluation.row, 9);
         assert_eq!(answered(&evaluation), &ProducerAnswer::Receipt {
             delivery: Delivery::Repeat,
@@ -424,7 +444,7 @@ mod tests {
 
     #[test]
     fn row_9_a_repeated_claim_reports_what_it_closed() {
-        let evaluation = eval(Some(&record(0)), None, &write(5, 0, digest(1)), true);
+        let evaluation = eval(Some(&record(0)), None, &write(5, 0, digest(1)));
         assert_eq!(evaluation.row, 9);
         let ProducerAnswer::Receipt { epoch: current, .. } = answered(&evaluation) else {
             panic!("{evaluation:?}");
@@ -440,7 +460,7 @@ mod tests {
 
     #[test]
     fn row_10_an_older_write_is_receipt_evicted() {
-        let evaluation = eval(Some(&record(4)), None, &write(5, 2, digest(7)), true);
+        let evaluation = eval(Some(&record(4)), None, &write(5, 2, digest(7)));
         assert_eq!(evaluation.row, 10);
         assert_eq!(answered(&evaluation), &ProducerAnswer::ReceiptEvicted {
             epoch: CurrentEpoch::new(epoch(5)),
@@ -448,7 +468,7 @@ mod tests {
             incarnation: token(),
         });
         // The claim's repeat, once later seqs applied, still reports what it closed.
-        let claim = eval(Some(&record(4)), None, &write(5, 0, digest(1)), true);
+        let claim = eval(Some(&record(4)), None, &write(5, 0, digest(1)));
         assert_eq!(claim.row, 10);
         assert_eq!(answered(&claim), &ProducerAnswer::ReceiptEvicted {
             epoch: record(4).epoch,
@@ -461,7 +481,7 @@ mod tests {
     fn row_11_a_history_event_closes_the_epoch_at_its_last_seq() {
         let mut fenced = record(4);
         fenced.history = HISTORY + 1;
-        let evaluation = eval(Some(&fenced), None, &write(5, 5, digest(9)), true);
+        let evaluation = eval(Some(&fenced), None, &write(5, 5, digest(9)));
         assert_eq!(evaluation.row, 11);
         let ProducerAnswer::EpochClosed(closure) = answered(&evaluation) else {
             panic!("{evaluation:?}");
@@ -472,23 +492,20 @@ mod tests {
             seq: seq(4),
         });
         // Rows 9 and 10 still answer a fenced record: those writes applied in the surviving history.
-        assert_eq!(
-            eval(Some(&fenced), None, &write(5, 4, digest(9)), true).row,
-            9
-        );
-        assert_eq!(eval(Some(&fenced), None, &write(5, 3, None), true).row, 10);
+        assert_eq!(eval(Some(&fenced), None, &write(5, 4, digest(9))).row, 9);
+        assert_eq!(eval(Some(&fenced), None, &write(5, 3, None)).row, 10);
     }
 
     #[test]
     fn row_12_the_next_seq_applies() {
-        let evaluation = eval(Some(&record(2)), None, &write(5, 3, None), true);
+        let evaluation = eval(Some(&record(2)), None, &write(5, 3, None));
         assert_eq!(evaluation.row, 12);
         assert_eq!(evaluation.decision, Decision::Apply { closes: None });
     }
 
     #[test]
     fn row_13_a_seq_past_the_next_one_names_the_expected_seq() {
-        let evaluation = eval(Some(&record(2)), None, &write(5, 5, None), true);
+        let evaluation = eval(Some(&record(2)), None, &write(5, 5, None));
         assert_eq!(evaluation.row, 13);
         assert_eq!(answered(&evaluation), &ProducerAnswer::SeqGap {
             expected: seq(3),
@@ -501,9 +518,6 @@ mod tests {
         // A write of the closed epoch at a seq it applied is refused (row 4), never a duplicate.
         let mut closed_at = record(0);
         closed_at.newest_digest = digest(1);
-        assert_eq!(
-            eval(Some(&closed_at), None, &write(4, 6, None), true).row,
-            4
-        );
+        assert_eq!(eval(Some(&closed_at), None, &write(4, 6, None)).row, 4);
     }
 }

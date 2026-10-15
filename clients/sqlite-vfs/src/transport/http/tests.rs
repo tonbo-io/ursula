@@ -3,6 +3,7 @@
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use ursula_headers::ClusterId;
 use ursula_headers::Incarnation;
@@ -11,6 +12,8 @@ use ursula_headers::Offset;
 use ursula_headers::ProducerRequestHeaders;
 
 use super::HttpTransport;
+use super::Timeouts;
+use super::no_answer_from;
 use crate::client::mock::answer;
 use crate::client::mock::refusing;
 use crate::client::mock::request_header;
@@ -111,6 +114,12 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
                 offset: Offset::from_u64(5),
             })
         },
+        24 => Request {
+            keys: keys(token()),
+            ..Request::new(Method::Put, Target::Retention {
+                offset: Offset::from_u64(6),
+            })
+        },
         20 => {
             let mut stale = write(token(), 2, 1, b"x");
             stale.keys.precondition = Some(IncarnationPrecondition {
@@ -165,7 +174,7 @@ fn model_answers_round_trip_through_http() {
     }
     assert_eq!(statuses, [
         404, 201, 200, 200, 200, 204, 403, 204, 409, 400, 200, 403, 403, 400, 200, 200, 204, 409,
-        200, 204, 412, 413, 200, 409
+        200, 204, 412, 413, 200, 409, 409
     ]);
 }
 
@@ -235,4 +244,54 @@ fn every_body_carries_content_length() {
         Some("0".to_owned()),
         Some("5".to_owned())
     ]);
+}
+
+#[test]
+fn only_a_proven_unsent_failure_is_not_sent() {
+    // rustls reports a bad record on an open connection, one that may have carried the whole
+    // request, as `InvalidData`: lost. So is a refusal ureq reports without `net`'s proof.
+    for kind in [
+        std::io::ErrorKind::InvalidData,
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset,
+    ] {
+        let lost = no_answer_from(ureq::Error::Io(kind.into()));
+        assert!(matches!(lost, NoAnswer::Lost { .. }), "{kind:?}: {lost:?}");
+    }
+}
+
+#[test]
+fn time_limits_scale_with_the_body_and_the_answer() {
+    let small = Timeouts::new(0, 0, 256);
+    assert_eq!(small.connect, Duration::from_secs(5));
+    assert_eq!(small.send_body, Duration::from_secs(5));
+    assert_eq!(small.recv_response, Duration::from_secs(15));
+    assert_eq!(small.recv_body, Duration::from_secs(10));
+    // 4 MiB at 256 KiB/s is 16 s; at 1 MiB/s, 4 s.
+    let batch = Timeouts::new(4 << 20, 4 << 20, 256);
+    assert_eq!(batch.send_body, Duration::from_secs(21));
+    assert_eq!(batch.recv_body, Duration::from_secs(26));
+    assert_eq!(
+        Timeouts::new(4 << 20, 0, 1024).send_body,
+        Duration::from_secs(9)
+    );
+    assert_eq!(Timeouts::new(1024, 0, 0).send_body, Duration::from_secs(6));
+}
+
+#[test]
+fn the_model_front_types_its_413_with_the_configured_limit() {
+    let (server, url) = served();
+    server.lock().unwrap().set_limits(Limits {
+        max_request_bytes: 3,
+        ..Limits::default()
+    });
+    let exchange = HttpTransport::new(url).send(&write(None, 1, 0, b"four"), Attempt::default());
+    let Exchange::Answered(answer) = exchange else {
+        panic!("{exchange:?}");
+    };
+    assert_eq!(answer.status, 413);
+    assert_eq!(
+        answer.typed,
+        Ok(Typed::TooLarge(Some(ursula_headers::SizeLimit::Request(3))))
+    );
 }

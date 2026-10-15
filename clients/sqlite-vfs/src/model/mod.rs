@@ -449,9 +449,9 @@ impl ModelServer {
         answer
     }
 
-    /// `PUT {stream}`, keyed by its configuration (#581 §3): `201` when this request created the
-    /// stream, `200` when one with this configuration exists, `409` otherwise, `400` with producer
-    /// headers.
+    /// `PUT {stream}`, keyed by its configuration, content type and closure (#581 §3): `201` when
+    /// this request created the stream, `200` when one with this configuration exists, `409`
+    /// otherwise, `400` with producer headers.
     fn create(&mut self, path: &str, request: &Request) -> RawAnswer {
         if request.keys.producer.is_some() {
             return RawAnswer::new(400);
@@ -462,7 +462,7 @@ impl ModelServer {
             .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned());
         let history = self.history;
         if let Some(stream) = self.streams.get(path) {
-            if stream.content_type != content_type {
+            if stream.content_type != content_type || stream.closed != request.closes {
                 return RawAnswer::new(409);
             }
             return created(200, stream, history);
@@ -473,25 +473,58 @@ impl ModelServer {
         if !request.body.is_empty() {
             stream.append(&request.body, history);
         }
+        if request.closes {
+            stream.close(history);
+        }
         let answer = created(201, &stream, history);
         self.streams.insert(path.to_owned(), stream);
         answer
     }
 
-    /// `POST {stream}`: the stream checks, then the producer rules of §2.3.1, or an unkeyed append.
+    /// `POST {stream}`, in the server's order (#581 §2.5, §6.1, addendum 3 item 4):
+    ///
+    /// 1. A tokened producer write whose token is the stream's, decided by rows 8 to 10, is
+    ///    answered from the headers before the body: a repeat or a key conflict.
+    /// 2. The body is read, and `Producer-Digest` checked against it (`400`).
+    /// 3. At apply: the stream (`404`), the precondition (`412`), idle retirement and the rows of
+    ///    §2.3.1. Every refusal of a row comes here.
+    /// 4. Only a write that would apply meets the closed stream (`409 Stream-Closed`) and the
+    ///    content checks (`409` for another content type, `400` for an empty body).
     fn append(&mut self, path: &str, request: &Request) -> RawAnswer {
         let (history, now_ms) = (self.history, self.clock_ms);
+        if let Some(answer) = self.early_answer(path, request) {
+            return producer_answer(&answer);
+        }
+        if let Some(write) = &request.keys.producer
+            && write
+                .digest
+                .is_some_and(|digest| digest != producer_digest(&request.body))
+        {
+            return RawAnswer::new(400);
+        }
         let stream = match self.stream(path, request) {
             Ok(stream) => stream,
             Err(answer) => return answer,
         };
-        let content_type = request
-            .content_type
-            .as_deref()
-            .unwrap_or(DEFAULT_CONTENT_TYPE);
-        if content_type != stream.content_type {
-            return RawAnswer::new(409);
-        }
+        let token = stream.token_in(history);
+        let applying = match &request.keys.producer {
+            None => None,
+            Some(write) => {
+                let id = write.id.as_str();
+                stream.retire_idle(id, now_ms);
+                let evaluation = evaluate(
+                    stream.producers.get(id),
+                    stream.watermark,
+                    write,
+                    history,
+                    token,
+                );
+                match evaluation.decision {
+                    Decision::Answer(answer) => return producer_answer(&answer),
+                    Decision::Apply { closes } => Some((write, closes)),
+                }
+            }
+        };
         if stream.closed {
             let mut answer = RawAnswer::new(StreamClosedConflict::STATUS);
             StreamClosedConflict {
@@ -500,61 +533,64 @@ impl ModelServer {
             .render(answer.emit());
             return answer;
         }
+        let content_type = request
+            .content_type
+            .as_deref()
+            .unwrap_or(DEFAULT_CONTENT_TYPE);
+        if content_type != stream.content_type {
+            return RawAnswer::new(409);
+        }
         if request.body.is_empty() {
             return RawAnswer::new(400);
         }
-        let Some(write) = &request.keys.producer else {
-            let (_, next) = stream.append(&request.body, history);
+        if request.closes {
+            // A closing append is not modeled: the VFS never closes its stream.
+            return RawAnswer::new(501);
+        }
+        let (start, next) = stream.append(&request.body, history);
+        let Some((write, closes)) = applying else {
             let mut answer = RawAnswer::new(204);
             answer.header(names::STREAM_NEXT_OFFSET, next.to_string());
             return answer;
         };
-        if write
-            .digest
-            .is_some_and(|digest| digest != producer_digest(&request.body))
-        {
-            return RawAnswer::new(400);
-        }
-        let token = stream.token_in(history);
         let id = write.id.as_str();
-        stream.retire_idle(id, now_ms);
-        let evaluation = evaluate(
-            stream.producers.get(id),
-            stream.watermark,
-            write,
-            request.keys.precondition.is_some(),
-            history,
-            token,
-        );
-        let answer = match evaluation.decision {
-            Decision::Answer(answer) => answer,
-            Decision::Apply { closes } => {
-                let (start, next) = stream.append(&request.body, history);
-                let receipt =
-                    Receipt::new(start, next, false).expect("an append ends after it starts");
-                let epoch = if write.is_claim() {
-                    let record = ProducerRecord::claimed(write, closes, receipt, history, now_ms);
-                    let epoch = record.epoch;
-                    stream.producers.insert(id.to_owned(), record);
-                    epoch
-                } else {
-                    if let Some(record) = stream.producers.get_mut(id) {
-                        record.advanced(write, receipt, now_ms);
-                    }
-                    CurrentEpoch::new(write.epoch)
-                };
-                ProducerAnswer::Receipt {
-                    delivery: Delivery::Applied,
-                    epoch,
-                    seq: write.seq,
-                    receipt,
-                    incarnation: token,
-                }
+        let receipt = Receipt::new(start, next, false).expect("an append ends after it starts");
+        let epoch = if write.is_claim() {
+            let record = ProducerRecord::claimed(write, closes, receipt, history, now_ms);
+            let epoch = record.epoch;
+            stream.producers.insert(id.to_owned(), record);
+            epoch
+        } else {
+            if let Some(record) = stream.producers.get_mut(id) {
+                record.advanced(write, receipt, now_ms);
             }
+            CurrentEpoch::new(write.epoch)
         };
-        let mut raw = RawAnswer::new(answer.status());
-        answer.render(raw.emit());
-        raw
+        producer_answer(&ProducerAnswer::Receipt {
+            delivery: Delivery::Applied,
+            epoch,
+            seq: write.seq,
+            receipt,
+            incarnation: token,
+        })
+    }
+
+    /// The answer a node gives before the body (#581 §2.5): rows 8 to 10 for a tokened producer
+    /// write whose token is the stream's, read from the applied state without changing it.
+    fn early_answer(&self, path: &str, request: &Request) -> Option<ProducerAnswer> {
+        let write = request.keys.producer.as_ref()?;
+        let precondition = request.keys.precondition?;
+        let stream = self.streams.get(path)?;
+        let token = stream.token_in(self.history);
+        if precondition.incarnation != token {
+            return None;
+        }
+        let (record, watermark) = stream.retired_view(write.id.as_str(), self.clock_ms);
+        let evaluation = evaluate(record, watermark, write, self.history, token);
+        match evaluation.decision {
+            Decision::Answer(answer) if matches!(evaluation.row, 8..=10) => Some(answer),
+            Decision::Answer(_) | Decision::Apply { .. } => None,
+        }
     }
 
     /// `GET {stream}?offset=`: up to a chunk of bytes from `from`, `410` below retention.
@@ -664,20 +700,38 @@ impl ModelServer {
     }
 
     /// `PUT {stream}/retention/{offset}`, monotonic (#581 §3): `204` with the retained offset, at
-    /// or above `offset`.
+    /// or above `offset`, and `409` for a boundary past the latest snapshot.
     fn retain(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
+        let history = self.history;
         let stream = match self.stream(path, request) {
             Ok(stream) => stream,
             Err(answer) => return answer,
         };
-        if offset > stream.tail() {
-            return RawAnswer::new(400);
+        // Extensions §2.2: a boundary newer than the latest published snapshot is refused, so is
+        // any boundary of a stream without one.
+        if stream
+            .snapshot
+            .as_ref()
+            .is_none_or(|latest| offset > latest.snapshot.offset)
+        {
+            return RawAnswer::new(409);
         }
         stream.retained = stream.retained.max(offset);
         let mut answer = RawAnswer::new(204);
         answer.header(names::STREAM_RETAINED_OFFSET, stream.retained.to_string());
+        answer.header(
+            names::STREAM_INCARNATION,
+            stream.token_in(history).to_string(),
+        );
         answer
     }
+}
+
+/// A producer answer, rendered.
+fn producer_answer(answer: &ProducerAnswer) -> RawAnswer {
+    let mut raw = RawAnswer::new(answer.status());
+    answer.render(raw.emit());
+    raw
 }
 
 /// The answer to a create that found or made `stream`.

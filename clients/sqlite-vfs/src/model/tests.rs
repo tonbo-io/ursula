@@ -341,12 +341,20 @@ fn idle_expiry_raises_the_floor() {
             ..
         }
     ));
-    // An untokened claim skips row 1 (the G2 boundary).
+    // Addendum 3 item 3: the floor binds untokened claims too, and claims with no record.
     world.server().advance(IDLE_RETIREMENT_MS);
-    assert!(matches!(
+    assert_eq!(
         world.producer(&write(None, 2, 0, b"base client")),
-        ProducerAnswer::Receipt { .. }
-    ));
+        ProducerAnswer::ProducerExpired { epoch: epoch(5) }
+    );
+    assert_eq!(
+        world.producer(&write(tokened(token), 3, 0, b"zombie")),
+        ProducerAnswer::ProducerExpired { epoch: epoch(5) }
+    );
+    assert_eq!(
+        world.producer(&write(None, 2, 3, b"no record")),
+        ProducerAnswer::ProducerExpired { epoch: epoch(5) }
+    );
 }
 
 #[test]
@@ -422,6 +430,25 @@ fn create_is_keyed_by_its_configuration() {
         ..create()
     };
     assert_eq!(world.send(&keyed).status, 400);
+    // The key includes closure.
+    let closed = Request {
+        closes: true,
+        ..create()
+    };
+    assert_eq!(world.send(&closed).status, 409);
+}
+
+#[test]
+fn a_closed_create_is_another_configuration() {
+    let world = World::new();
+    let closed = Request {
+        closes: true,
+        ..create()
+    };
+    assert_eq!(world.send(&closed).status, 201);
+    assert!(world.stream_head().closed());
+    assert_eq!(world.send(&closed).status, 200);
+    assert_eq!(world.send(&create()).status, 409);
 }
 
 #[test]
@@ -435,19 +462,92 @@ fn a_recreated_stream_has_a_new_token() {
 }
 
 #[test]
-fn a_closed_stream_refuses_appends_with_its_final_offset() {
+fn a_closed_stream_refuses_only_writes_that_would_apply() {
+    // Addendum 3 item 4: the producer rows come before the closed stream.
     let world = World::new();
     let token = world.create();
-    world.server().foreign_append(PATH, b"abc").unwrap();
+    world.producer(&write(tokened(token), 1, 0, b"claim"));
+    let newest = write(tokened(token), 1, 1, b"commit");
+    world.producer(&newest);
     world.server().close(PATH).unwrap();
-    let answer = world.send(&write(tokened(token), 1, 0, b"claim"));
+    let tail = world.stream_head().next_offset();
+    // A repeat of the newest write gets its receipt (row 9), even with another content type.
+    assert!(matches!(world.producer(&newest), ProducerAnswer::Receipt {
+        delivery: Delivery::Repeat,
+        ..
+    }));
+    let other_type = Request {
+        content_type: Some("text/plain".to_owned()),
+        ..newest.clone()
+    };
+    assert!(matches!(
+        world.producer(&other_type),
+        ProducerAnswer::Receipt { .. }
+    ));
+    // Every producer refusal comes before 409 Stream-Closed: rows 5 and 13.
+    assert_eq!(
+        world.producer(&write(tokened(token), 0, 1, b"x")),
+        ProducerAnswer::StaleEpoch { epoch: epoch(1) }
+    );
+    assert_eq!(
+        world.producer(&write(tokened(token), 1, 5, b"x")),
+        ProducerAnswer::SeqGap {
+            expected: seq(2),
+            received: seq(5),
+        }
+    );
+    // Only a write that would apply (row 12) meets the closed stream.
+    let answer = world.send(&write(tokened(token), 1, 2, b"next"));
     assert_eq!(answer.status, 409);
     assert_eq!(
         answer.typed,
         Ok(Typed::StreamClosed(StreamClosedConflict {
-            final_offset: Offset::from_u64(3),
+            final_offset: tail
         }))
     );
+}
+
+#[test]
+fn idle_retirement_happens_on_a_closed_stream_too() {
+    let world = World::new();
+    let token = world.create();
+    world.producer(&write(tokened(token), 5, 0, b"claim"));
+    world.server().close(PATH).unwrap();
+    world.server().advance(IDLE_RETIREMENT_MS);
+    // The record retires at this write, which raises the floor to 5 (row 1), closed or not.
+    assert_eq!(
+        world.producer(&write(tokened(token), 5, 1, b"late")),
+        ProducerAnswer::ProducerExpired { epoch: epoch(5) }
+    );
+}
+
+#[test]
+fn early_answers_skip_the_body_checks() {
+    // #581 §2.5: a tokened repeat or key conflict is decided from the headers, before the body.
+    let world = World::new();
+    let token = world.create();
+    let claim = write(tokened(token), 1, 0, b"claim");
+    world.producer(&claim);
+    for body in [&b"another body"[..], b""] {
+        let repeat = Request {
+            body: Arc::from(body),
+            ..claim.clone()
+        };
+        assert!(matches!(world.producer(&repeat), ProducerAnswer::Receipt {
+            delivery: Delivery::Repeat,
+            ..
+        }));
+    }
+    // Untokened, the body is read first: its digest mismatch is 400.
+    let untokened = Request {
+        keys: ProducerRequestHeaders {
+            precondition: None,
+            ..claim.keys.clone()
+        },
+        body: Arc::from(&b"another body"[..]),
+        ..claim.clone()
+    };
+    assert_eq!(world.send(&untokened).status, 400);
 }
 
 #[test]
@@ -618,6 +718,10 @@ fn retention_is_monotonic() {
             offset: Offset::from_u64(offset),
         })
     };
+    // Without a snapshot, and past the latest one, a boundary is refused (extensions §2.2).
+    assert_eq!(retain(60).status, 409);
+    assert_eq!(world.send(&publish(token, 70, b"image").0).status, 204);
+    assert_eq!(retain(71).status, 409);
     assert_eq!(retain(60).typed, retained(60));
     // A repeat, and an offset below the current one, succeed with the current one.
     assert_eq!(retain(60).typed, retained(60));

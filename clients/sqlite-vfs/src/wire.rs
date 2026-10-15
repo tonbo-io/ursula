@@ -32,20 +32,62 @@ use ursula_headers::StreamHead;
 use ursula_headers::names;
 
 /// `Producer-Id` of every keyed write: constant for the `USQ2` format (design §4.6).
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 pub(crate) const PRODUCER_ID: &str = "sqlite-ursula-vfs/2";
 
 /// `Content-Type` header name.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 pub(crate) const CONTENT_TYPE: &str = "content-type";
 
 /// `Retry-After` header name.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 pub(crate) const RETRY_AFTER: &str = "retry-after";
 
 /// `Location` header name.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 pub(crate) const LOCATION: &str = "location";
 
 /// The base protocol's read offset for the start of a stream.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 const START: &str = "-1";
 
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Method {
     Head,
@@ -54,6 +96,13 @@ pub(crate) enum Method {
     Post,
 }
 
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 impl Method {
     pub(crate) fn parse(text: &str) -> Option<Self> {
         match text {
@@ -72,6 +121,13 @@ impl Method {
 }
 
 /// What a request addresses, relative to the stream URL.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
     /// The stream: `HEAD`, create (`PUT`), append (`POST`).
@@ -87,6 +143,13 @@ pub(crate) enum Target {
 
 impl Target {
     /// The path and query that follow the stream URL.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+        )
+    )]
     pub(crate) fn suffix(&self) -> String {
         match self {
             Self::Stream => String::new(),
@@ -102,6 +165,13 @@ impl Target {
 
     /// Splits a request target (path and query) into the stream's path and the [`Target`]: the
     /// inverse of [`Target::suffix`]. A `GET` of the stream's path is a read.
+    #[cfg_attr(
+        not(any(test, feature = "model")),
+        expect(
+            dead_code,
+            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+        )
+    )]
     pub(crate) fn split(method: Method, target: &str) -> Result<(&str, Self), WireError> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         for (marker, build) in [
@@ -131,16 +201,37 @@ impl Target {
         Ok((path, Self::Read { from, leader }))
     }
 
+    #[cfg_attr(
+        not(any(test, feature = "model")),
+        expect(
+            dead_code,
+            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+        )
+    )]
     fn snapshot(offset: Offset) -> Self {
         Self::Snapshot { offset }
     }
 
+    #[cfg_attr(
+        not(any(test, feature = "model")),
+        expect(
+            dead_code,
+            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+        )
+    )]
     fn retention(offset: Offset) -> Self {
         Self::Retention { offset }
     }
 }
 
 /// A request that a transport cannot carry, or that the model server cannot read.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WireError {
     #[error("malformed header: {0}")]
@@ -151,6 +242,13 @@ pub(crate) enum WireError {
 
 /// One request to a stream. The transport adds the stream URL, `Content-Length`, the bearer token
 /// and `User-Agent`.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Request {
     pub(crate) method: Method,
@@ -160,11 +258,23 @@ pub(crate) struct Request {
     pub(crate) content_type: Option<String>,
     /// `Stream-Snapshot-Digest` of a snapshot publish.
     pub(crate) snapshot_digest: Option<SnapshotDigest>,
+    /// `Stream-Closed: true`: a create of a closed stream, or a closing append.
+    pub(crate) closes: bool,
     pub(crate) body: Arc<[u8]>,
+    /// The largest answer body the caller expects (a read's chunk, a snapshot): it scales the
+    /// time the answer's body may take. Not sent.
+    pub(crate) answer_bytes: u64,
 }
 
 impl Request {
     /// A request without headers or body.
+    #[cfg_attr(
+        not(any(test, feature = "model")),
+        expect(
+            dead_code,
+            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+        )
+    )]
     pub(crate) fn new(method: Method, target: Target) -> Self {
         Self {
             method,
@@ -172,11 +282,20 @@ impl Request {
             keys: ProducerRequestHeaders::default(),
             content_type: None,
             snapshot_digest: None,
+            closes: false,
             body: Arc::from(Vec::new()),
+            answer_bytes: 0,
         }
     }
 
     /// Emits every header of the request this module owns, as `(lowercase name, value)`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+        )
+    )]
     pub(crate) fn render_headers(&self, mut emit: impl FnMut(&'static str, &str)) {
         if let Some(content_type) = &self.content_type {
             emit(CONTENT_TYPE, content_type);
@@ -185,10 +304,20 @@ impl Request {
         if let Some(digest) = &self.snapshot_digest {
             emit(names::STREAM_SNAPSHOT_DIGEST, &digest.to_string());
         }
+        if self.closes {
+            emit(names::STREAM_CLOSED, "true");
+        }
     }
 
     /// The request a server reads from `method`, `target`, the `(name, value)` header pairs and
     /// the body: the inverse of [`Request::render_headers`].
+    #[cfg_attr(
+        not(any(test, feature = "model")),
+        expect(
+            dead_code,
+            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+        )
+    )]
     pub(crate) fn parse<'a, I>(
         method: Method,
         target: Target,
@@ -200,6 +329,7 @@ impl Request {
     {
         let keys = ProducerRequestHeaders::parse(headers.clone())?;
         let content_type = text(headers.clone(), CONTENT_TYPE)?.map(str::to_owned);
+        let closes = flag(headers.clone(), names::STREAM_CLOSED)?;
         let snapshot_digest = text(headers, names::STREAM_SNAPSHOT_DIGEST)?
             .map(|digest| SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest))
             .transpose()?;
@@ -209,12 +339,21 @@ impl Request {
             keys,
             content_type,
             snapshot_digest,
+            closes,
             body: Arc::from(body),
+            answer_bytes: 0,
         })
     }
 }
 
 /// What an answer says in the headers `ursula_headers` types, read in the light of the request.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Typed {
     /// No typed header applies: the status alone speaks.
@@ -252,6 +391,13 @@ pub(crate) enum Typed {
 }
 
 /// An answer, parsed.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
@@ -265,6 +411,13 @@ pub(crate) struct Answer {
 }
 
 /// What came of one attempt of a request.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Exchange {
     Answered(Box<Answer>),
@@ -272,6 +425,13 @@ pub(crate) enum Exchange {
 }
 
 /// An attempt that got no answer.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NoAnswer {
     /// Nothing of the request went out: the host did not resolve, or no connection was made.
@@ -281,6 +441,13 @@ pub(crate) enum NoAnswer {
 }
 
 /// An answer as it travels: what the model server renders and the transports parse.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawAnswer {
     pub(crate) status: u16,
@@ -288,6 +455,13 @@ pub(crate) struct RawAnswer {
     pub(crate) body: Vec<u8>,
 }
 
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 impl RawAnswer {
     pub(crate) fn new(status: u16) -> Self {
         Self {
@@ -308,6 +482,13 @@ impl RawAnswer {
     }
 
     /// The answer as the client reads it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+        )
+    )]
     pub(crate) fn parse(&self, request: &Request) -> Answer {
         parse_answer(
             request,
@@ -321,6 +502,13 @@ impl RawAnswer {
 }
 
 /// Reads an answer to `request` from its status, `(name, value)` header pairs and body.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 pub(crate) fn parse_answer<'a, I>(
     request: &Request,
     status: u16,
@@ -343,6 +531,13 @@ where
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 fn typed<'a, I>(request: &Request, status: u16, headers: I) -> Result<Typed, HeaderError>
 where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
     if let Some(routing) = RoutingAnswer::parse(status, headers.clone())? {
@@ -374,6 +569,12 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
             };
             match producer {
                 Some(answer) => Typed::Producer(answer),
+                // A success to a keyed write is always a typed producer answer (#581 §2.4).
+                None if request.keys.producer.is_some() && (200..300).contains(&status) => {
+                    return Err(HeaderError::Missing {
+                        name: names::PRODUCER_EPOCH,
+                    });
+                }
                 None => StreamClosedConflict::parse(status, headers)?
                     .map_or(Typed::Untyped, Typed::StreamClosed),
             }
@@ -403,6 +604,13 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
 /// The value of header `name` as text, trimmed of field whitespace: `None` when absent, an error
 /// when repeated or not visible ASCII. The rules of `ursula_headers`' own field reader, which the
 /// crate does not export.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 fn text<'a, I>(headers: I, name: &'static str) -> Result<Option<&'a str>, HeaderError>
 where I: IntoIterator<Item = (&'a str, &'a [u8])> {
     let mut found = None;
@@ -428,6 +636,13 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> {
 }
 
 /// Header `name`, which the answer requires, parsed with the crate's value type.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+    )
+)]
 fn required<'a, I, T>(
     name: &'static str,
     headers: I,
@@ -441,6 +656,13 @@ where
 }
 
 /// A flag header: absent, or exactly `true`.
+#[cfg_attr(
+    not(any(test, feature = "model")),
+    expect(
+        dead_code,
+        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
+    )
+)]
 fn flag<'a, I>(headers: I, name: &'static str) -> Result<bool, HeaderError>
 where I: IntoIterator<Item = (&'a str, &'a [u8])> {
     match text(headers, name)? {
@@ -531,6 +753,7 @@ mod tests {
             },
             content_type: Some("application/vnd.ursula.sqlite-vfs.v2".to_owned()),
             snapshot_digest: Some(SnapshotDigest::from_bytes([9; 32])),
+            closes: true,
             body: Arc::from(b"frame".to_vec()),
             ..Request::new(Method::Post, Target::Stream)
         };
@@ -574,6 +797,35 @@ mod tests {
                 identity: None,
                 stream: None
             })
+        );
+    }
+
+    #[test]
+    fn a_success_to_a_keyed_write_without_producer_headers_is_malformed() {
+        let keyed = Request {
+            keys: ProducerRequestHeaders {
+                producer: Some(ProducerWrite {
+                    id: ProducerId::new(PRODUCER_ID).unwrap(),
+                    epoch: Epoch::ZERO,
+                    seq: Seq::ZERO,
+                    digest: None,
+                }),
+                precondition: None,
+            },
+            ..Request::new(Method::Post, Target::Stream)
+        };
+        for status in [200, 204] {
+            assert_eq!(
+                RawAnswer::new(status).parse(&keyed).typed,
+                Err(HeaderError::Missing {
+                    name: "producer-epoch"
+                })
+            );
+        }
+        let unkeyed = Request::new(Method::Post, Target::Stream);
+        assert_eq!(
+            RawAnswer::new(204).parse(&unkeyed).typed,
+            Ok(Typed::Untyped)
         );
     }
 

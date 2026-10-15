@@ -3,7 +3,9 @@
 //! Stream requests are read into [`Request`]s with the shared `wire` code (producer headers
 //! through `ursula_headers`) and answered by [`ModelServer::exchange`]. A `PUT` or `POST` must
 //! carry `Content-Length` (`411` otherwise, chunked bodies are refused with `501`), as the
-//! client's transport always sends it.
+//! client's transport always sends it. A stream request whose `Content-Length` exceeds the
+//! model's request limit (`/__model/limits`) gets the typed `413` before its body is read, and the
+//! connection closes.
 //!
 //! Control routes, under `/__model/` (query values are taken verbatim, not percent-decoded):
 //!
@@ -12,8 +14,8 @@
 //! - `POST /__model/checkpoint`: saves every stream; answers the checkpoint id.
 //! - `POST /__model/history[?restore=<id>]`: a history event, restoring a checkpoint if named.
 //! - `POST /__model/faults[?times=<n>][&method=<METHOD>]`, body one fault line (`faults`).
-//! - `PUT /__model/limits?max_request_bytes=<n>&max_snapshot_bytes=<n|cold|none>` (`cold`: a cold store's 1 GiB).
-//!   `|none>`.
+//! - `PUT /__model/limits?max_request_bytes=<n>&max_snapshot_bytes=<n|cold|none>`, where `cold`
+//!   stands for a cold store's 1 GiB.
 //! - `POST /__model/foreign?path=<stream path>`, body: an unkeyed append by another writer.
 //! - `POST /__model/claim?path=<stream path>&epoch=<e>`, body: a claim by another claimant.
 //! - `POST /__model/close?path=<stream path>`, `POST /__model/delete?path=<stream path>`.
@@ -34,6 +36,7 @@ use std::time::Duration;
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
 use ursula_headers::HeaderError;
+use ursula_headers::SizeLimit;
 
 use super::CheckpointId;
 use super::Delivered;
@@ -53,8 +56,9 @@ use crate::wire::WireError;
 /// The largest request head read.
 const MAX_HEAD_BYTES: usize = 64 << 10;
 
-/// The largest request body read; a larger one closes the connection after its answer.
-const MAX_BODY_BYTES: u64 = 64 << 20;
+/// The largest body of a control request read; a larger one closes the connection after its
+/// answer.
+const MAX_CONTROL_BODY_BYTES: u64 = 64 << 20;
 
 /// Why the model server stopped.
 #[derive(Debug, thiserror::Error)]
@@ -113,7 +117,7 @@ fn connection_loop(connection: TcpStream, server: &Mutex<ModelServer>) -> io::Re
     let mut reader = BufReader::new(connection.try_clone()?);
     let mut writer = connection;
     loop {
-        let incoming = match read_request(&mut reader)? {
+        let incoming = match read_request(&mut reader, server)? {
             Ok(Some(incoming)) => incoming,
             Ok(None) => return Ok(()),
             Err(answer) => {
@@ -137,7 +141,10 @@ fn connection_loop(connection: TcpStream, server: &Mutex<ModelServer>) -> io::Re
 
 /// Reads one request: `Ok(None)` when the client closed the connection between requests,
 /// `Err(answer)` for one that cannot be served (the connection closes after the answer).
-fn read_request(reader: &mut impl BufRead) -> io::Result<Result<Option<Incoming>, RawAnswer>> {
+fn read_request(
+    reader: &mut impl BufRead,
+    server: &Mutex<ModelServer>,
+) -> io::Result<Result<Option<Incoming>, RawAnswer>> {
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -186,11 +193,22 @@ fn read_request(reader: &mut impl BufRead) -> io::Result<Result<Option<Incoming>
     if header("transfer-encoding").is_some() {
         return Ok(Err(RawAnswer::new(501)));
     }
+    let limit = if target.starts_with("/__model/") {
+        SizeLimit::Request(MAX_CONTROL_BODY_BYTES)
+    } else {
+        SizeLimit::Request(lock(server).limits().max_request_bytes)
+    };
     let length = match header("content-length").map(|v| v.parse::<u64>()) {
         None if matches!(method, "PUT" | "POST") => return Ok(Err(RawAnswer::new(411))),
         None => 0,
-        Some(Ok(length)) if length <= MAX_BODY_BYTES => length,
-        Some(_) => return Ok(Err(RawAnswer::new(413))),
+        Some(Ok(length)) if length <= limit.bytes() => length,
+        // Decided from `Content-Length`, before the body (#581 §6.4).
+        Some(Ok(_)) => {
+            let mut answer = RawAnswer::new(SizeLimit::STATUS);
+            limit.render(answer.emit());
+            return Ok(Err(answer));
+        }
+        Some(Err(_not_a_length)) => return Ok(Err(RawAnswer::new(400))),
     };
     let mut body = Vec::new();
     reader.take(length).read_to_end(&mut body)?;
