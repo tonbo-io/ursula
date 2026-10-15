@@ -97,6 +97,11 @@ impl Link {
         }
     }
 
+    /// Whether an attempt of the request itself is out (not waiting, not parked on a HEAD).
+    pub(crate) fn in_flight(&self) -> bool {
+        matches!(self.state, LinkState::InFlight(_))
+    }
+
     /// Whether a resend is due at `now_ms`.
     #[cfg(test)]
     pub(crate) fn due(&self, now_ms: u64) -> bool {

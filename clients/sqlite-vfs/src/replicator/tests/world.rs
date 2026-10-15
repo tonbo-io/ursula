@@ -3,7 +3,8 @@
 //! deliveries, losses (before apply, after apply, of the answer), late duplicates, scripted
 //! `5xx`/`429`/`408`/`307`/`401`/`402`/`403` and untyped `413` answers, a lowered request limit
 //! (typed `413`), the clock moved past idle expiry, rewinds with and without inheritance, foreign
-//! appends and claims, clones, restarts, takeovers by new owners and `synced()` calls, then a
+//! appends and claims, retention (and with it `410`s), clones, restarts, takeovers by new owners
+//! and `synced()` calls, then a
 //! `Heal` phase with a perfect network.
 //!
 //! The monitors check, as the run goes:
@@ -18,7 +19,11 @@
 //! 8. of two divergent clone commits, at most one is acknowledged (commits at one commit id with
 //!    other bytes diverge unless the later one was made after catching the earlier one up);
 //! 9. `Synced` never fires while a pre-call foreign frame sits past the acknowledged offset, nor
-//!    for a target later discarded.
+//!    for a target later discarded;
+//! 10. the bytes between an owner's consecutive acknowledged offsets are its own frames, frames
+//!     it caught up, or (in a takeover's reconcile) foreign claims, unless it rebuilt;
+//! 11. after `Heal`, every ticket of an owner that ends acknowledged resolved or was abandoned;
+//! 12. no append carries a frame the owner caught up.
 //!
 //! Two negative controls must fail them: the model with digest comparison off (requests reach it
 //! without `Producer-Digest`), and a replicator that re-seals its in-flight batch on resend.
@@ -42,6 +47,7 @@ use ursula_headers::ProducerAnswer;
 use ursula_headers::Seq;
 
 use super::cluster;
+use crate::codec::digest::SnapshotDigester;
 use crate::codec::digest::producer_digest;
 use crate::codec::frame;
 use crate::codec::frame::CONTENT_TYPE;
@@ -114,11 +120,15 @@ enum Op {
     Tick(u8),
     Rewind(bool),
     Checkpoint,
-    ForeignAppend(bool),
+    /// Retention moves to an owner's acknowledged offset, as its snapshot thread would.
+    Retain(u8),
+    /// An unkeyed append by another writer: garbage (0), a COMMIT (1) or a CLAIM frame (2).
+    ForeignAppend(u8),
     ForeignClaim(bool),
     Clone(u8),
     Restart(u8, u8),
-    Takeover,
+    /// A new owner on a fresh host takes over; with `true` its build lags, from offset 0.
+    Takeover(bool),
     Sync(u8),
 }
 
@@ -150,11 +160,12 @@ fn op() -> impl Strategy<Value = Op> {
         6 => (0u8..8).prop_map(Op::Tick),
         1 => proptest::bool::ANY.prop_map(Op::Rewind),
         1 => Just(Op::Checkpoint),
-        1 => proptest::bool::weighted(0.8).prop_map(Op::ForeignAppend),
+        2 => (0u8..8).prop_map(Op::Retain),
+        2 => (0u8..3).prop_map(Op::ForeignAppend),
         1 => proptest::bool::ANY.prop_map(Op::ForeignClaim),
         1 => (0u8..8).prop_map(Op::Clone),
         2 => ((0u8..8), (0u8..3)).prop_map(|(o, lag)| Op::Restart(o, lag)),
-        1 => Just(Op::Takeover),
+        1 => proptest::bool::ANY.prop_map(Op::Takeover),
         5 => (0u8..8).prop_map(Op::Sync),
     ]
 }
@@ -180,6 +191,10 @@ struct LogModel {
     next_position: u64,
     /// Every frame a catch-up applied.
     applied: Vec<Arc<[u8]>>,
+    /// ACK records from this index on are durable: a catch-up fsyncs its ACK.
+    durable_acks: usize,
+    /// The next ACK record is a catch-up's.
+    catching_up: bool,
 }
 
 impl LogModel {
@@ -208,6 +223,8 @@ struct Instance {
     acked_offset: Offset,
     calls: BTreeMap<u64, Call>,
     discards: Vec<Position>,
+    /// A rebuild read the stream up to the next acknowledged offset.
+    rebuilt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -298,7 +315,7 @@ impl World {
             acked_frames: HashMap::new(),
             violations: Vec::new(),
         };
-        world.takeover();
+        world.takeover(false);
         world
     }
 
@@ -341,6 +358,7 @@ impl World {
             acked_offset,
             calls: BTreeMap::new(),
             discards: Vec::new(),
+            rebuilt: false,
         };
         (inst, actions)
     }
@@ -350,7 +368,7 @@ impl World {
     }
 
     /// A new owner on a fresh host: it built the stream up to its tail and takes over.
-    fn takeover(&mut self) {
+    fn takeover(&mut self, lagging: bool) {
         if self.owners.len() >= MAX_OWNERS {
             return;
         }
@@ -358,7 +376,11 @@ impl World {
         let family = self.next_family;
         self.next_family += 1;
         let lineage = Lineage([u8::try_from(family % 250).unwrap() + 1; 16]);
-        let tail = Offset::from_u64(u64::try_from(self.stream().len()).unwrap());
+        let tail = if lagging {
+            Offset::ZERO
+        } else {
+            Offset::from_u64(u64::try_from(self.stream().len()).unwrap())
+        };
         let log = LogModel {
             lineage,
             commits: BTreeMap::new(),
@@ -367,6 +389,8 @@ impl World {
             incarnation: self.token(),
             next_position: 1,
             applied: Vec::new(),
+            durable_acks: 0,
+            catching_up: false,
         };
         let local = LocalState {
             activation,
@@ -398,12 +422,15 @@ impl World {
         let activation = self.activation();
         let owner = &self.owners[index];
         let log = owner.log.clone();
-        let (acked, acked_offset, log_bytes) = log
+        let lagged = log
             .acks
             .len()
-            .checked_sub(1 + usize::from(lag))
-            .and_then(|i| log.acks.get(i).copied())
-            .or_else(|| log.acks.first().copied())
+            .saturating_sub(1 + usize::from(lag))
+            .max(log.durable_acks.saturating_sub(1));
+        let (acked, acked_offset, log_bytes) = log
+            .acks
+            .get(lagged)
+            .copied()
             .expect("a log starts with the ACK of its build");
         let pending: Vec<Pending> = log
             .commits
@@ -513,9 +540,13 @@ impl World {
             Replicator::Streaming { epoch, .. } => Some(*epoch),
             _ => None,
         };
+        let takeover = matches!(self.owners[index].inst.replicator, Replicator::Activating {
+            kind: ClaimKind::Takeover { .. },
+            ..
+        });
         let now = self.now();
         let actions = self.owners[index].inst.replicator.on(event, now);
-        self.process(index, actions, before);
+        self.process_in(index, actions, before, takeover);
     }
 
     fn violation(&mut self, what: String) {
@@ -524,8 +555,23 @@ impl World {
 
     /// Carries out an owner's actions and checks them.
     fn process(&mut self, index: usize, actions: Vec<Action>, streaming_epoch: Option<Epoch>) {
+        self.process_in(index, actions, streaming_epoch, true);
+    }
+
+    fn process_in(
+        &mut self,
+        index: usize,
+        actions: Vec<Action>,
+        streaming_epoch: Option<Epoch>,
+        takeover: bool,
+    ) {
+        let mut caught_up = false;
         let fenced = actions.contains(&Action::Reset(ResetKind::Fenced));
-        let discarded = actions.iter().any(|a| matches!(a, Action::Discard { .. }));
+        let discarded = actions.iter().any(|a| {
+            matches!(a, Action::Rebuild {
+                discard_from: Some(_)
+            })
+        });
         if fenced && discarded {
             self.violation("property 6: a fence discarded pending records".to_owned());
         }
@@ -542,12 +588,18 @@ impl World {
                             acked,
                             acked_offset,
                             log_bytes,
-                        } => log.acks.push((acked, acked_offset, log_bytes)),
+                        } => {
+                            log.acks.push((acked, acked_offset, log_bytes));
+                            if log.catching_up {
+                                log.catching_up = false;
+                                log.durable_acks = log.acks.len();
+                            }
+                        }
                         crate::codec::segment::RecordBody::Commit { .. }
                         | crate::codec::segment::RecordBody::Base { .. } => {}
                     }
                 }
-                Action::Wake { acked, offset } => self.woken(index, acked, offset),
+                Action::Wake { acked, offset } => self.woken(index, acked, offset, takeover),
                 Action::Synced { ticket } => self.synced(index, ticket),
                 Action::Abandoned { ticket } => {
                     self.owners[index].inst.calls.remove(&ticket);
@@ -556,26 +608,55 @@ impl World {
                     self.owners[index].inst.timer = Some(at_ms.saturating_add(jitter_ms));
                 }
                 Action::Condition(_) => {}
-                // A catch-up logs every frame it applies, so later commits take later positions.
+                // A catch-up logs every frame it applies as a COMMIT record at the next
+                // positions, then the ACK covering them.
                 Action::Apply(frames) => {
+                    if !takeover {
+                        self.violation("property 6: a catch-up outside a takeover".to_owned());
+                    }
                     let log = &mut self.owners[index].log;
-                    log.next_position += u64::try_from(frames.len()).unwrap();
-                    log.applied.extend(frames.into_iter().map(|f| f.frame));
+                    for frame in frames {
+                        let id = match frame::decode(&frame.frame, u64::MAX) {
+                            Ok(Decoded::Frame {
+                                frame: Frame::Commit { id, .. },
+                                ..
+                            }) => id,
+                            _ => panic!("a catch-up applies COMMIT frames"),
+                        };
+                        log.commits.insert(log.next_position, Pending {
+                            id,
+                            frame: Arc::clone(&frame.frame),
+                        });
+                        log.next_position += 1;
+                        log.applied.push(frame.frame);
+                    }
+                    caught_up = true;
                 }
-                Action::Discard { from } => {
-                    if streaming_epoch.is_some() {
-                        self.violation("property 6: a discard outside a takeover".to_owned());
+                Action::Rebuild { discard_from } => {
+                    if !takeover {
+                        self.violation("property 6: a rebuild outside a takeover".to_owned());
                     }
                     let owner = &mut self.owners[index];
-                    owner.log.commits.retain(|p, _| *p < from.0);
-                    owner.inst.discards.push(from);
-                    // The generation is rebuilt with a new lineage.
-                    let mut lineage = owner.log.lineage.0;
-                    lineage[0] = lineage[0].wrapping_add(101);
+                    if let Some(from) = discard_from {
+                        owner.log.commits.retain(|p, _| *p < from.0);
+                        owner.inst.discards.push(from);
+                    }
+                    owner.inst.rebuilt = true;
+                    // The generation is rebuilt with a new random lineage.
+                    let mut lineage = [0x7a; 16];
+                    lineage[..8].copy_from_slice(&self.next_uid.to_le_bytes());
                     owner.log.lineage = Lineage(lineage);
+                    self.next_uid += 1;
+                    caught_up = true;
                 }
                 Action::Reset(_) | Action::Refuse(_) => {}
             }
+        }
+        if caught_up {
+            let log = &mut self.owners[index].log;
+            log.catching_up = true;
+            let last = log.last_logged();
+            self.event(index, Event::CaughtUp { last });
         }
     }
 
@@ -589,6 +670,14 @@ impl World {
                 self.violation(format!(
                     "property 3: owner {family} sent two bodies under {key:?}"
                 ));
+            }
+            let applied = &self.owners[index].log.applied;
+            if write.seq != Seq::ZERO
+                && applied
+                    .iter()
+                    .any(|f| request.body.windows(f.len()).any(|w| w == &f[..]))
+            {
+                self.violation("property 12: an append carries a caught-up frame".to_owned());
             }
             if write.seq == Seq::ZERO
                 && let Some(own) = streaming
@@ -609,7 +698,8 @@ impl World {
         });
     }
 
-    fn woken(&mut self, index: usize, acked: Position, offset: Offset) {
+    fn woken(&mut self, index: usize, acked: Position, offset: Offset, takeover: bool) {
+        self.between_acks(index, offset, takeover);
         let (was, start) = (
             self.owners[index].inst.acked,
             self.owners[index].inst.start_acked,
@@ -666,6 +756,42 @@ impl World {
         let inst = &mut self.owners[index].inst;
         inst.acked = inst.acked.max(acked);
         inst.acked_offset = offset;
+    }
+
+    /// Property 10: what lies between the previous acknowledged offset and `offset`.
+    fn between_acks(&mut self, index: usize, offset: Offset, takeover: bool) {
+        let owner = &mut self.owners[index];
+        let rebuilt = std::mem::take(&mut owner.inst.rebuilt);
+        let previous = owner.inst.acked_offset;
+        if rebuilt
+            || offset <= previous
+            || owner.log.incarnation != self.server.token(PATH).unwrap()
+        {
+            return;
+        }
+        let owner = self.owners[index].clone();
+        let stream = self.stream();
+        let range = stream
+            .get(usize::try_from(previous.get()).unwrap()..usize::try_from(offset.get()).unwrap())
+            .unwrap_or_default();
+        let own_frames: Vec<&[u8]> = owner.log.commits.values().map(|p| &p.frame[..]).collect();
+        for (start, len, frame) in decode_all(range) {
+            let bytes = range.get(start..start + len).unwrap_or_default();
+            let fine = match frame {
+                Some(Frame::Claim { activation, .. }) => {
+                    takeover || owner.log.claims.iter().any(|(_, a)| *a == activation)
+                }
+                Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
+                _ => false,
+            };
+            if !fine {
+                self.violation(format!(
+                    "property 10: owner {index} acknowledged past a foreign frame at {}",
+                    previous.get() + u64::try_from(start).unwrap()
+                ));
+                return;
+            }
+        }
     }
 
     fn synced(&mut self, index: usize, ticket: u64) {
@@ -935,22 +1061,42 @@ impl World {
                 };
                 self.server.history_event(event).unwrap();
             }
+            Op::Retain(o) => {
+                let i = self.owner(o);
+                let offset = self.owners[i].inst.acked_offset;
+                // A snapshot at the offset first: retention never passes the latest snapshot.
+                let body: Arc<[u8]> = Arc::from(b"snapshot".to_vec());
+                let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+                digester.update(&body);
+                let publish = Request {
+                    content_type: Some(CONTENT_TYPE.to_owned()),
+                    snapshot_digest: Some(digester.finalize()),
+                    body,
+                    ..Request::new(Method::Put, Target::Snapshot { offset })
+                };
+                drop(self.server.handle(PATH, &publish));
+                let request = Request::new(Method::Put, Target::Retention { offset });
+                drop(self.server.handle(PATH, &request));
+            }
             Op::Checkpoint => {
                 let id = self.server.checkpoint();
                 self.checkpoints.push((id, self.max_claimed));
             }
-            Op::ForeignAppend(valid) => {
-                let bytes = if valid {
-                    frame::encode(&Frame::Commit {
+            Op::ForeignAppend(kind) => {
+                let bytes = match kind {
+                    0 => b"garbage, not a frame".to_vec(),
+                    1 => frame::encode(&Frame::Commit {
                         id: CommitId {
                             lineage: Lineage([0xee; 16]),
                             position: Position(self.next_ticket),
                         },
                         compressed: vec![0xee; 6],
                     })
-                    .unwrap()
-                } else {
-                    b"garbage, not a frame".to_vec()
+                    .unwrap(),
+                    _ => frame::encode_claim(
+                        Epoch::try_from(self.max_epoch).unwrap(),
+                        Activation([0xfd; 16]),
+                    ),
                 };
                 drop(self.server.foreign_append(PATH, &bytes));
             }
@@ -989,7 +1135,7 @@ impl World {
                 let i = self.owner(o);
                 self.restart(i, lag);
             }
-            Op::Takeover => self.takeover(),
+            Op::Takeover(lagging) => self.takeover(lagging),
             Op::Sync(o) => {
                 let i = self.owner(o);
                 self.sync(i);
@@ -1028,8 +1174,17 @@ impl World {
         }
         for index in 0..self.owners.len() {
             let ending = ending(&self.owners[index].inst);
-            if let Err(state) = ending {
-                self.violation(format!("property 7: owner {index} ends stuck: {state}"));
+            match ending {
+                Err(state) => {
+                    self.violation(format!("property 7: owner {index} ends stuck: {state}"));
+                }
+                Ok("acknowledged") if !self.owners[index].inst.calls.is_empty() => {
+                    let calls: Vec<u64> = self.owners[index].inst.calls.keys().copied().collect();
+                    self.violation(format!(
+                        "property 11: owner {index} ends acknowledged with tickets {calls:?} waiting"
+                    ));
+                }
+                Ok(_) => {}
             }
         }
     }
@@ -1056,13 +1211,13 @@ fn ending(inst: &Instance) -> Result<&'static str, String> {
             match work {
                 Work::Idle => "idle",
                 Work::Append { .. } => "an append outstanding",
-                Work::Probe { .. } => "a probe outstanding",
                 Work::Oversized { .. } => "an oversized frame",
             }
         )),
         Replicator::Activating { step, .. } => Err(format!("activating, {}", match step {
             Step::Claim { .. } => "claiming",
             Step::Reconcile { .. } => "reconciling",
+            Step::CatchingUp(_) => "catching up",
         })),
         Replicator::Reset(_) | Replicator::Refused(_) | Replicator::Stopped => Ok("reset"),
     }
@@ -1195,4 +1350,28 @@ fn negative_controls_fail_the_proptest_too() {
     ] {
         assert!(check(knobs, 256).is_err(), "{knobs:?} passed");
     }
+}
+
+/// A host whose build lags reconciles from below retention: the `410` rebuilds, never skips the
+/// frames it cannot read.
+#[test]
+fn a_lagging_takeover_below_retention_rebuilds() {
+    let ops = vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::Retain(0),
+        Op::Takeover(true),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1);
+    for op in &ops {
+        world.step(op);
+    }
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+    assert!(matches!(
+        world.owners[1].inst.replicator,
+        Replicator::Streaming { .. }
+    ));
 }

@@ -52,7 +52,11 @@ fn sealed() -> Sealed {
 }
 
 fn keyed(s: u64) -> Request {
-    Ctx::new(local(Vec::new(), 0)).write_request(epoch(3), seq(s), Arc::from(b"batch".to_vec()))
+    Ctx::new(local(Vec::new(), 0)).unwrap().write_request(
+        epoch(3),
+        seq(s),
+        Arc::from(b"batch".to_vec()),
+    )
 }
 
 fn answered(raw: &RawAnswer, s: u64) -> Exchange {

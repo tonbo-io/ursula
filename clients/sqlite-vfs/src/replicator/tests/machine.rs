@@ -412,16 +412,16 @@ fn synced_waits_for_a_round_trip_that_started_after_the_call() {
 }
 
 #[test]
-fn a_probe_that_finds_a_foreign_claim_fences_and_a_foreign_append_resets() {
+fn a_probe_that_finds_a_frame_fences_and_undecodable_bytes_reset_stream_state() {
     for (bytes, kind) in [
         (
             frame::encode_claim(epoch(2), Activation([9; 16])),
             ResetKind::Fenced,
         ),
-        (
-            commit(super::LINEAGE, 50, 3).frame.to_vec(),
-            ResetKind::StreamState,
-        ),
+        // A copy's claim or commit under our activation and lineage fences too (design §7).
+        (frame::encode_claim(epoch(2), ACTIVATION), ResetKind::Fenced),
+        (commit(LINEAGE, 50, 3).frame.to_vec(), ResetKind::Fenced),
+        (b"not a frame".to_vec(), ResetKind::StreamState),
     ] {
         let mut h = streaming(0);
         h.on(Event::Sync {
@@ -433,6 +433,57 @@ fn a_probe_that_finds_a_foreign_claim_fences_and_a_foreign_append_resets() {
         assert_eq!(reset_of(&actions), Some(kind));
         assert!(!actions.contains(&Action::Synced { ticket: 1 }));
     }
+}
+
+#[test]
+fn a_ticket_covered_by_acks_probes_while_the_next_append_is_blocked() {
+    let mut h = streaming(1);
+    let len = u64::try_from(h.last_request().body.len()).unwrap();
+    h.answer(&producer(&receipt(
+        Delivery::Applied,
+        1,
+        1,
+        37,
+        37 + len,
+        None,
+    )));
+    // Record 2 is logged and its append blocked by a 402.
+    h.on(Event::Logged(commit(LINEAGE, 2, 1)));
+    h.on(Event::Sync {
+        ticket: 9,
+        target: Position(1),
+    });
+    let actions = h.answer(&RawAnswer::new(402));
+    // The ticket for record 1 does not wait on record 2's append: a probe goes out.
+    let probes: Vec<_> = sends(&actions)
+        .into_iter()
+        .filter(|r| r.method == Method::Get)
+        .collect();
+    assert_eq!(probes.len(), 1, "{actions:?}");
+    let actions = h.answer(&read(&[], 37 + len));
+    assert!(
+        actions.contains(&Action::Synced { ticket: 9 }),
+        "{actions:?}"
+    );
+    // Only the in-flight batch is kept for the closed-seq cross-check.
+    assert_eq!(h.replicator.ctx().unwrap().sent.len(), 1);
+}
+
+#[test]
+fn a_probe_that_finds_our_own_batch_waits_for_its_answer() {
+    let mut h = streaming(1);
+    let batch = h.last_request().body.clone();
+    let len = u64::try_from(batch.len()).unwrap();
+    h.on(Event::Sync {
+        ticket: 4,
+        target: Position(0),
+    });
+    // The batch's answer is lost, so the probe goes out while its resend waits.
+    let actions = h.lose();
+    assert_eq!(sends(&actions).len(), 1, "{actions:?}");
+    let actions = h.answer(&read(&batch, 37 + len));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert!(!actions.contains(&Action::Synced { ticket: 4 }));
 }
 
 #[test]

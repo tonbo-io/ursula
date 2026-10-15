@@ -25,6 +25,7 @@ use crate::ids::Lineage;
 use crate::ids::Position;
 use crate::replicator::Action;
 use crate::replicator::ClaimKind;
+use crate::replicator::Event;
 use crate::replicator::ForeignFrame;
 use crate::replicator::Refusal;
 use crate::replicator::Replicator;
@@ -180,17 +181,21 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
             decide_frame(Mode::Takeover, FrameClass::ForeignCommit),
             RowDecision::Diverge
         );
-        let (h, actions) = reconcile(KINDS[0], &stream, None);
-        assert!(streaming(&h), "{actions:?}");
-        let discard = actions
-            .iter()
-            .position(|a| matches!(a, Action::Discard { from } if *from == discard_from));
-        let apply = actions
-            .iter()
-            .position(|a| matches!(a, Action::Apply(frames) if !frames.is_empty()));
-        assert!(discard.is_some() && apply.is_some(), "{actions:?}");
-        assert!(discard < apply, "the discard comes before the catch-up");
-        // Nothing of the discarded tail goes out.
+        let (mut h, actions) = reconcile(KINDS[0], &stream, None);
+        // A discarded tail always rebuilds, and nothing is applied in place.
+        assert!(
+            actions.contains(&Action::Rebuild {
+                discard_from: Some(discard_from)
+            }),
+            "{actions:?}"
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::Apply(_))));
+        assert!(sends(&actions).is_empty(), "{actions:?}");
+        // The replicator binds once the driver caught up.
+        assert!(!streaming(&h));
+        let actions = h.on(Event::CaughtUp { last: Position(7) });
+        assert!(streaming(&h));
+        assert_eq!(acked(&actions), Some(Position(7)));
         assert!(sends(&actions).is_empty(), "{actions:?}");
 
         assert_eq!(
@@ -200,7 +205,7 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
         let (_, actions) = reconcile(KINDS[1], &stream, None);
         assert_eq!(reset_of(&actions), Some(ResetKind::Stale));
     }
-    // With nothing pending a takeover catches up in place: no discard.
+    // With nothing pending a takeover catches up in place: no rebuild.
     let (mut h, _) = Harness::activate(KINDS[0], local(Vec::new(), 0));
     let end = u64::try_from(foreign.frame.len()).unwrap();
     h.answer(&producer(&receipt(
@@ -211,12 +216,29 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
         end + 37,
         None,
     )));
+    h.on(Event::Sync {
+        ticket: 3,
+        target: Position(0),
+    });
     let actions = h.answer(&read(&foreign.frame, end));
-    assert!(!actions.iter().any(|a| matches!(a, Action::Discard { .. })));
-    assert!(actions.contains(&Action::Apply(vec![ForeignFrame {
+    assert!(!actions.iter().any(|a| matches!(a, Action::Rebuild { .. })));
+    assert_eq!(actions, vec![Action::Apply(vec![ForeignFrame {
         end: off(end),
         frame: Arc::clone(&foreign.frame),
-    }])));
+    }])]);
+    // The caught-up frame took position 1, acknowledged: the ticket (called after the claim went
+    // out) needs only a probe, not a commit.
+    let actions = h.on(Event::CaughtUp { last: Position(1) });
+    assert_eq!(acked(&actions), Some(Position(1)));
+    assert_eq!(sends(&actions).len(), 1, "{actions:?}");
+    let actions = h.answer(&read(&[], end + 37));
+    assert!(
+        actions.contains(&Action::Synced { ticket: 3 }),
+        "{actions:?}"
+    );
+    // Later commits take later positions.
+    let actions = h.on(Event::Logged(commit(LINEAGE, 1, 1)));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Internal));
 }
 
 #[test]
@@ -241,16 +263,18 @@ fn row_5_undecodable_bytes_refuse_a_takeover_and_reset_a_continuation() {
 }
 
 #[test]
-fn row_6_a_410_at_the_start_diverges_a_takeover_and_resets_a_continuation_stale() {
+fn row_6_a_410_at_the_start_rebuilds_a_takeover_and_resets_a_continuation_stale() {
     let p1 = commit(LINEAGE, 1, 1);
     assert_eq!(
         decide_frame(Mode::Takeover, FrameClass::Gone),
         RowDecision::Diverge
     );
     let (h, actions) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
-    assert!(streaming(&h));
+    assert!(!streaming(&h));
     assert!(
-        actions.contains(&Action::Discard { from: Position(1) }),
+        actions.contains(&Action::Rebuild {
+            discard_from: Some(Position(1))
+        }),
         "{actions:?}"
     );
     assert_eq!(
@@ -259,6 +283,40 @@ fn row_6_a_410_at_the_start_diverges_a_takeover_and_resets_a_continuation_stale(
     );
     let (_, actions) = reconcile(KINDS[1], &p1.frame, Some(RawAnswer::new(410)));
     assert_eq!(reset_of(&actions), Some(ResetKind::Stale));
+}
+
+#[test]
+fn row_6_a_410_with_nothing_pending_still_rebuilds() {
+    let (mut h, _) = Harness::activate(KINDS[0], local(Vec::new(), 0));
+    h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 500, 537, None)));
+    let actions = h.answer(&RawAnswer::new(410));
+    assert_eq!(actions, vec![Action::Rebuild { discard_from: None }]);
+    let actions = h.on(Event::CaughtUp { last: Position(4) });
+    assert!(streaming(&h));
+    assert!(actions.contains(&Action::Wake {
+        acked: Position(4),
+        offset: off(537),
+    }));
+}
+
+#[test]
+fn a_410_after_frames_were_collected_rebuilds_and_drops_them() {
+    let foreign = commit(OTHER_LINEAGE, 9, 9);
+    let (mut h, _) = Harness::activate(KINDS[0], local(Vec::new(), 0));
+    let len = u64::try_from(foreign.frame.len()).unwrap();
+    h.answer(&producer(&receipt(
+        Delivery::Applied,
+        1,
+        0,
+        2 * len,
+        2 * len + 37,
+        None,
+    )));
+    // The first read returns one foreign commit, the next finds it retained away.
+    let actions = h.answer(&read(&foreign.frame, len));
+    assert_eq!(sends(&actions).len(), 1);
+    let actions = h.answer(&RawAnswer::new(410));
+    assert_eq!(actions, vec![Action::Rebuild { discard_from: None }]);
 }
 
 fn mode(kind: ClaimKind) -> Mode {

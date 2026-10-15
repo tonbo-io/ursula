@@ -60,6 +60,8 @@ use self::backoff::Hit;
 use self::backoff::Link;
 use self::batch::SealError;
 use self::batch::Sealed;
+use self::reconcile::CatchUp;
+use self::reconcile::Done;
 use self::reconcile::Fed;
 use self::reconcile::Mode;
 use self::reconcile::Reconcile;
@@ -171,6 +173,9 @@ pub(crate) enum Event {
     Boundary(Position),
     /// `synced()` with ticket `ticket`: `target` is the last logged position at the call.
     Sync { ticket: u64, target: Position },
+    /// Takeover: the driver logged every frame an [`Action::Apply`] or [`Action::Rebuild`]
+    /// brought in, the last at `last`, wrote an ACK covering them and fsynced.
+    CaughtUp { last: Position },
     /// The binding retires.
     Stop,
 }
@@ -204,12 +209,14 @@ pub(crate) enum Action {
         jitter_ms: u64,
     },
     Condition(Option<Condition>),
-    /// Takeover only: catch these frames up, in order, after any discard.
+    /// Takeover only, nothing pending: catch these frames up in place, in order, then answer
+    /// with [`Event::CaughtUp`].
     Apply(Vec<ForeignFrame>),
-    /// Takeover only: drop every record from `from` on and rebuild the generation from the stream
-    /// up to the claim (design §5.6: a discarded tail always rebuilds).
-    Discard {
-        from: Position,
+    /// Takeover only: drop every record from `discard_from` on, if any, and rebuild the
+    /// generation from the stream up to the claim (design §5.6: a divergence, or a `410`), then
+    /// answer with [`Event::CaughtUp`].
+    Rebuild {
+        discard_from: Option<Position>,
     },
     Reset(ResetKind),
     Refuse(Refusal),
@@ -290,6 +297,8 @@ pub(crate) struct Ctx {
     pub(crate) tickets: Tickets,
     pub(crate) sent: Vec<SentBatch>,
     pub(crate) condition: Option<Condition>,
+    /// `Producer-Id`, checked once when the replicator starts.
+    producer: ProducerId,
     next_id: u64,
     /// Negative control: re-seal the in-flight batch when resending it, so one key carries two
     /// bodies. The proptest checks that its properties catch this.
@@ -298,8 +307,10 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
-    fn new(local: LocalState) -> Self {
-        Self {
+    /// `None` when [`PRODUCER_ID`] is not a valid `Producer-Id`.
+    fn new(local: LocalState) -> Option<Self> {
+        let producer = ProducerId::new(PRODUCER_ID).ok()?;
+        Some(Self {
             activation: local.activation,
             cluster_id: local.cluster_id,
             incarnation: local.incarnation,
@@ -319,10 +330,11 @@ impl Ctx {
             tickets: Tickets::default(),
             sent: Vec::new(),
             condition: None,
+            producer,
             next_id: 0,
             #[cfg(test)]
             renumber: false,
-        }
+        })
     }
 
     /// The id of the next attempt.
@@ -387,15 +399,15 @@ impl Ctx {
 
     /// A keyed append of `body` under `(epoch, seq)`.
     pub(crate) fn write_request(&self, epoch: Epoch, seq: Seq, body: Arc<[u8]>) -> Request {
-        let producer = ProducerId::new(PRODUCER_ID).ok().map(|id| ProducerWrite {
-            id,
+        let producer = ProducerWrite {
+            id: self.producer.clone(),
             epoch,
             seq,
             digest: Some(producer_digest(&body)),
-        });
+        };
         Request {
             keys: ProducerRequestHeaders {
-                producer,
+                producer: Some(producer),
                 precondition: self.precondition(),
             },
             content_type: Some(CONTENT_TYPE.to_owned()),
@@ -429,6 +441,8 @@ impl Ctx {
         self.acked_offset = offset;
         let acked = self.acked;
         self.boundaries.retain(|b| *b > acked);
+        // An acknowledged batch is at or below any closed seq: only the in-flight one is kept.
+        self.sent.retain(|b| b.last > acked);
     }
 
     fn ack_actions(&self, actions: &mut Vec<Action>) {
@@ -461,19 +475,33 @@ pub(crate) enum Step {
         reconcile: Box<Reconcile>,
         link: Link,
     },
+    /// Takeover: the driver carries out an [`Action::Apply`] or [`Action::Rebuild`] and answers
+    /// with [`Event::CaughtUp`].
+    CatchingUp(Box<Done>),
 }
 
-/// What a streaming replicator is doing.
+/// What a streaming replicator's append slot is doing.
 #[derive(Debug, Clone)]
 pub(crate) enum Work {
     /// Nothing outstanding.
     Idle,
-    /// One sealed batch in flight until a definite answer.
-    Append { sealed: Sealed, link: Link },
-    /// A leader read at the expected tail, for `synced()` (design §8.2).
-    Probe { from: Offset, link: Link },
+    /// One sealed batch until a definite answer. `probed`: a probe found the batch at the
+    /// expected tail while its answer was outstanding, so no other probe is sent for it.
+    Append {
+        sealed: Sealed,
+        link: Box<Link>,
+        probed: bool,
+    },
     /// The first pending frame is above the batch limit; checked again at `at_ms`.
     Oversized { at_ms: u64 },
+}
+
+/// A leader read at the expected tail, for `synced()` (design §8.2). It goes out beside the
+/// append slot, so tickets covered by acknowledgements do not wait on a blocked append.
+#[derive(Debug, Clone)]
+pub(crate) struct Probe {
+    from: Offset,
+    link: Box<Link>,
 }
 
 /// The replicator (design §4.10). Every non-terminal state carries the [`Ctx`].
@@ -490,6 +518,7 @@ pub(crate) enum Replicator {
         epoch: Epoch,
         seq: Seq,
         work: Work,
+        probe: Option<Probe>,
         ctx: Box<Ctx>,
     },
     Reset(ResetKind),
@@ -503,8 +532,12 @@ const OVERSIZED_RETRY_MS: u64 = backoff::BLOCKED_RETRY_MS;
 impl Replicator {
     /// Starts claiming: the CLAIM record, then the claim.
     pub(crate) fn activate(kind: ClaimKind, local: LocalState) -> (Self, Vec<Action>) {
-        let mut ctx = Box::new(Ctx::new(local));
         let mut actions = Vec::new();
+        let Some(ctx) = Ctx::new(local) else {
+            actions.push(Action::Reset(ResetKind::Internal));
+            return (Self::Reset(ResetKind::Internal), actions);
+        };
+        let mut ctx = Box::new(ctx);
         let epoch = match kind {
             ClaimKind::Takeover { .. } => ctx.takeover_epoch(),
             ClaimKind::Continuation { own } => next_epoch(own),
@@ -558,8 +591,20 @@ impl Replicator {
                 epoch,
                 seq,
                 work,
+                probe,
                 ctx,
-            } => streaming(epoch, seq, work, ctx, event, now_ms, &mut actions),
+            } => streaming(
+                Stream {
+                    epoch,
+                    seq,
+                    work,
+                    probe,
+                    ctx,
+                },
+                event,
+                now_ms,
+                &mut actions,
+            ),
         };
         *self = next;
         actions
@@ -627,7 +672,7 @@ fn common_event(
             Ok(None)
         }
         Event::Stop => Err(Terminal::Stopped),
-        Event::Answer { .. } | Event::Tick => Ok(Some(event)),
+        Event::Answer { .. } | Event::Tick | Event::CaughtUp { .. } => Ok(Some(event)),
     }
 }
 
@@ -670,13 +715,15 @@ fn activating(
                 },
                 Hit::Main => claim_answered(kind, epoch, link, ctx, id, &exchange, now_ms, actions),
             },
-            Event::Logged(_) | Event::Boundary(_) | Event::Sync { .. } | Event::Stop => {
-                Replicator::Activating {
-                    kind,
-                    step: Step::Claim { epoch, link },
-                    ctx,
-                }
-            }
+            Event::Logged(_)
+            | Event::Boundary(_)
+            | Event::Sync { .. }
+            | Event::CaughtUp { .. }
+            | Event::Stop => Replicator::Activating {
+                kind,
+                step: Step::Claim { epoch, link },
+                ctx,
+            },
         },
         Step::Reconcile {
             mut reconcile,
@@ -732,13 +779,34 @@ fn activating(
                     }
                 },
             },
-            Event::Logged(_) | Event::Boundary(_) | Event::Sync { .. } | Event::Stop => {
-                Replicator::Activating {
-                    kind,
-                    step: Step::Reconcile { reconcile, link },
-                    ctx,
-                }
+            Event::Logged(_)
+            | Event::Boundary(_)
+            | Event::Sync { .. }
+            | Event::CaughtUp { .. }
+            | Event::Stop => Replicator::Activating {
+                kind,
+                step: Step::Reconcile { reconcile, link },
+                ctx,
+            },
+        },
+        Step::CatchingUp(done) => match event {
+            Event::CaughtUp { last } => {
+                // The caught-up frames hold positions up to `last`, acknowledged.
+                ctx.logged = ctx.logged.max(last);
+                let offset = ctx.acked_offset;
+                ctx.acknowledge(last, offset);
+                bind(*done, ctx, now_ms, actions)
             }
+            Event::Tick
+            | Event::Answer { .. }
+            | Event::Logged(_)
+            | Event::Boundary(_)
+            | Event::Sync { .. }
+            | Event::Stop => Replicator::Activating {
+                kind,
+                step: Step::CatchingUp(done),
+                ctx,
+            },
         },
     }
 }
@@ -788,7 +856,7 @@ fn claim_answered(
                 ctx.acked_offset,
             ));
             if reconcile.complete() {
-                return finish(*reconcile, ctx, now_ms, actions);
+                return finish(kind, *reconcile, ctx, now_ms, actions);
             }
             let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
             Replicator::Activating {
@@ -850,7 +918,7 @@ fn reconciled(
             actions.push(Action::Refuse(refusal));
             Replicator::Refused(refusal)
         }
-        Fed::Done => finish(*reconcile, ctx, now_ms, actions),
+        Fed::Done => finish(kind, *reconcile, ctx, now_ms, actions),
         Fed::More => {
             let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
             Replicator::Activating {
@@ -862,21 +930,44 @@ fn reconciled(
     }
 }
 
-/// The reconcile is complete: the pending tail goes out under the new epoch from seq 1.
+/// The reconcile is complete. A takeover that must catch up waits for [`Event::CaughtUp`] first;
+/// otherwise the pending tail goes out under the new epoch from seq 1.
 fn finish(
+    kind: ClaimKind,
     reconcile: Reconcile,
     mut ctx: Box<Ctx>,
     now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
     let done = reconcile.into_done();
-    if let Some(from) = done.discard_from {
-        actions.push(Action::Discard { from });
-        ctx.tickets.abandon_from(from, actions);
+    match &done.catch_up {
+        CatchUp::Nothing => bind(done, ctx, now_ms, actions),
+        CatchUp::Apply(frames) => {
+            actions.push(Action::Apply(frames.clone()));
+            Replicator::Activating {
+                kind,
+                step: Step::CatchingUp(Box::new(done)),
+                ctx,
+            }
+        }
+        CatchUp::Rebuild { discard_from } => {
+            if let Some(from) = *discard_from {
+                ctx.tickets.abandon_from(from, actions);
+            }
+            actions.push(Action::Rebuild {
+                discard_from: *discard_from,
+            });
+            Replicator::Activating {
+                kind,
+                step: Step::CatchingUp(Box::new(done)),
+                ctx,
+            }
+        }
     }
-    if !done.foreign.is_empty() {
-        actions.push(Action::Apply(done.foreign));
-    }
+}
+
+/// Streams under the claimed epoch: the ACK, the tickets, then the first batch.
+fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
     ctx.acked_offset = done.after_claim;
     ctx.ack_actions(actions);
     ctx.sent.clear();
@@ -884,70 +975,15 @@ fn finish(
         ctx.tickets.prove(claim);
     }
     ctx.tickets.settle(ctx.acked, actions);
-    let mut work = Work::Idle;
-    kick(done.epoch, Seq::ZERO, &mut work, &mut ctx, now_ms, actions);
-    Replicator::Streaming {
+    let mut stream = Stream {
         epoch: done.epoch,
         seq: Seq::ZERO,
-        work,
+        work: Work::Idle,
+        probe: None,
         ctx,
-    }
-}
-
-/// With nothing outstanding: send the next batch, or probe for waiting tickets.
-fn kick(
-    epoch: Epoch,
-    seq: Seq,
-    work: &mut Work,
-    ctx: &mut Ctx,
-    now_ms: u64,
-    actions: &mut Vec<Action>,
-) {
-    if !matches!(work, Work::Idle) {
-        return;
-    }
-    if !ctx.pending.is_empty() {
-        let Some(next) = seq
-            .get()
-            .checked_add(1)
-            .and_then(|next| Seq::try_from(next).ok())
-        else {
-            // The epoch is exhausted: only a claim moves on.
-            return;
-        };
-        match batch::seal(epoch, next, ctx) {
-            Ok(sealed) => {
-                let request = ctx.write_request(epoch, next, Arc::clone(&sealed.body));
-                ctx.sent.push(SentBatch {
-                    epoch,
-                    seq: next,
-                    first: sealed.first,
-                    last: sealed.last,
-                });
-                let link = Link::send(request, ctx, actions);
-                *work = Work::Append { sealed, link };
-            }
-            Err(SealError::Empty) => {}
-            Err(SealError::TooLarge { .. }) => {
-                ctx.set_condition(
-                    Some(Condition::Blocked(BlockedReason::RequestTooLarge)),
-                    actions,
-                );
-                let at_ms = now_ms.saturating_add(OVERSIZED_RETRY_MS);
-                actions.push(Action::Timer {
-                    at_ms,
-                    jitter_ms: 0,
-                });
-                *work = Work::Oversized { at_ms };
-            }
-        }
-        return;
-    }
-    if ctx.tickets.wants_probe(ctx.acked) {
-        let from = ctx.acked_offset;
-        let link = Link::send(ctx.read_request(from), ctx, actions);
-        *work = Work::Probe { from, link };
-    }
+    };
+    stream.kick(now_ms, actions);
+    stream.into()
 }
 
 /// The renumbering negative control: a due resend seals the batch again with what is pending
@@ -966,154 +1002,270 @@ fn renumber(epoch: Epoch, sealed: &mut Sealed, link: &mut Link, ctx: &Ctx, now_m
 #[cfg(not(test))]
 fn renumber(_epoch: Epoch, _sealed: &mut Sealed, _link: &mut Link, _ctx: &Ctx, _now_ms: u64) {}
 
-fn streaming(
+/// The fields of [`Replicator::Streaming`], while an event is handled.
+struct Stream {
     epoch: Epoch,
     seq: Seq,
-    mut work: Work,
-    mut ctx: Box<Ctx>,
+    work: Work,
+    probe: Option<Probe>,
+    ctx: Box<Ctx>,
+}
+
+impl From<Stream> for Replicator {
+    fn from(stream: Stream) -> Self {
+        Self::Streaming {
+            epoch: stream.epoch,
+            seq: stream.seq,
+            work: stream.work,
+            probe: stream.probe,
+            ctx: stream.ctx,
+        }
+    }
+}
+
+impl Stream {
+    /// Sends the next batch when the append slot is idle, and a probe for tickets that wait only
+    /// for a round trip, unless an append in flight will be that round trip.
+    fn kick(&mut self, now_ms: u64, actions: &mut Vec<Action>) {
+        let ctx = &mut self.ctx;
+        if matches!(self.work, Work::Idle)
+            && !ctx.pending.is_empty()
+            && let Some(next) = self
+                .seq
+                .get()
+                .checked_add(1)
+                .and_then(|next| Seq::try_from(next).ok())
+        {
+            // An exhausted epoch sends nothing: only a claim moves on.
+            match batch::seal(self.epoch, next, ctx) {
+                Ok(sealed) => {
+                    let request = ctx.write_request(self.epoch, next, Arc::clone(&sealed.body));
+                    ctx.sent.push(SentBatch {
+                        epoch: self.epoch,
+                        seq: next,
+                        first: sealed.first,
+                        last: sealed.last,
+                    });
+                    let link = Link::send(request, ctx, actions);
+                    self.work = Work::Append {
+                        sealed,
+                        link: Box::new(link),
+                        probed: false,
+                    };
+                }
+                Err(SealError::Empty) => {}
+                Err(SealError::TooLarge { .. }) => {
+                    ctx.set_condition(
+                        Some(Condition::Blocked(BlockedReason::RequestTooLarge)),
+                        actions,
+                    );
+                    let at_ms = now_ms.saturating_add(OVERSIZED_RETRY_MS);
+                    actions.push(Action::Timer {
+                        at_ms,
+                        jitter_ms: 0,
+                    });
+                    self.work = Work::Oversized { at_ms };
+                }
+            }
+        }
+        let append_answers = match &self.work {
+            Work::Append { link, probed, .. } => link.in_flight() || *probed,
+            Work::Idle | Work::Oversized { .. } => false,
+        };
+        if self.probe.is_none() && !append_answers && ctx.tickets.wants_probe(ctx.acked) {
+            let from = ctx.acked_offset;
+            let link = Box::new(Link::send(ctx.read_request(from), ctx, actions));
+            self.probe = Some(Probe { from, link });
+        }
+    }
+
+    fn on(mut self, event: Event, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
+        match event {
+            Event::Tick => {
+                match &mut self.work {
+                    Work::Append { sealed, link, .. } => {
+                        renumber(self.epoch, sealed, link, &self.ctx, now_ms);
+                        link.tick(now_ms, &mut self.ctx, actions);
+                    }
+                    Work::Oversized { at_ms } if now_ms >= *at_ms => self.work = Work::Idle,
+                    Work::Oversized { at_ms } => actions.push(Action::Timer {
+                        at_ms: *at_ms,
+                        jitter_ms: 0,
+                    }),
+                    Work::Idle => {}
+                }
+                if let Some(probe) = &mut self.probe {
+                    probe.link.tick(now_ms, &mut self.ctx, actions);
+                }
+                self.kick(now_ms, actions);
+                self.into()
+            }
+            Event::Answer { id, exchange } => {
+                if let Some(probe) = &self.probe
+                    && probe.link.hit(id) != Hit::None
+                {
+                    return self.probe_answered(id, &exchange, now_ms, actions);
+                }
+                if let Work::Append { link, .. } = &self.work
+                    && link.hit(id) != Hit::None
+                {
+                    return self.append_answered(id, &exchange, now_ms, actions);
+                }
+                self.into()
+            }
+            Event::Logged(_)
+            | Event::Boundary(_)
+            | Event::Sync { .. }
+            | Event::CaughtUp { .. }
+            | Event::Stop => {
+                self.kick(now_ms, actions);
+                self.into()
+            }
+        }
+    }
+
+    fn append_answered(
+        mut self,
+        id: RequestId,
+        exchange: &Exchange,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let Work::Append {
+            sealed,
+            mut link,
+            probed,
+        } = mem::replace(&mut self.work, Work::Idle)
+        else {
+            return self.into();
+        };
+        let ctx = &mut self.ctx;
+        if link.hit(id) == Hit::Head {
+            if let Err(kind) = link.head_answer(exchange, now_ms, ctx, actions) {
+                return reset(kind, actions);
+            }
+            self.work = Work::Append {
+                sealed,
+                link,
+                probed,
+            };
+            self.kick(now_ms, actions);
+            return self.into();
+        }
+        if let Exchange::Answered(answer) = exchange
+            && let Ok(crate::wire::Typed::Producer(producer)) = &answer.typed
+        {
+            ctx.see(producer);
+        }
+        match decide_append(&sealed, exchange) {
+            AppendDecision::Acknowledge { next, delivery } => {
+                ctx.set_condition(None, actions);
+                ctx.acknowledge(sealed.last, next);
+                ctx.ack_actions(actions);
+                // Only a write applied by an attempt that started after the call is at the
+                // tail: a repeat's bytes may have others after them.
+                if delivery == Delivery::Applied {
+                    ctx.tickets.prove(id);
+                }
+                ctx.tickets.settle(ctx.acked, actions);
+                self.seq = sealed.seq;
+                self.kick(now_ms, actions);
+                self.into()
+            }
+            AppendDecision::ContinuationClaim => {
+                ctx.set_condition(None, actions);
+                let Some(next) = next_epoch(self.epoch) else {
+                    return reset(ResetKind::Internal, actions);
+                };
+                let mut ctx = self.ctx;
+                let link = claim(&mut ctx, next, actions);
+                Replicator::Activating {
+                    kind: ClaimKind::Continuation { own: self.epoch },
+                    step: Step::Claim { epoch: next, link },
+                    ctx,
+                }
+            }
+            AppendDecision::Common(common) => {
+                if let Err(kind) = link.common(common, retry_after(exchange), now_ms, ctx, actions)
+                {
+                    return reset(kind, actions);
+                }
+                self.work = Work::Append {
+                    sealed,
+                    link,
+                    probed,
+                };
+                self.kick(now_ms, actions);
+                self.into()
+            }
+        }
+    }
+
+    fn probe_answered(
+        mut self,
+        id: RequestId,
+        exchange: &Exchange,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let Some(Probe { from, mut link }) = self.probe.take() else {
+            return self.into();
+        };
+        let ctx = &mut self.ctx;
+        if link.hit(id) == Hit::Head {
+            if let Err(kind) = link.head_answer(exchange, now_ms, ctx, actions) {
+                return reset(kind, actions);
+            }
+            self.probe = Some(Probe { from, link });
+            return self.into();
+        }
+        match decide_read(exchange) {
+            ReadDecision::Bytes { next } => {
+                let body = match exchange {
+                    Exchange::Answered(answer) => answer.body.as_slice(),
+                    Exchange::NoAnswer(_) => &[],
+                };
+                if body.is_empty() && next == from {
+                    ctx.tickets.prove(id);
+                    ctx.tickets.settle(ctx.acked, actions);
+                } else if let Work::Append { sealed, probed, .. } = &mut self.work
+                    && sealed.expected_start == from
+                    && (sealed.body.starts_with(body) || body.starts_with(&sealed.body))
+                {
+                    // Our own batch landed at the expected tail while its answer is
+                    // outstanding: that answer decides, and proves nothing about the tail.
+                    *probed = true;
+                } else {
+                    return reset(reconcile::past_tail(body), actions);
+                }
+                self.kick(now_ms, actions);
+                self.into()
+            }
+            ReadDecision::Gone => reset(ResetKind::StreamState, actions),
+            ReadDecision::Common(common) => {
+                if let Err(kind) = link.common(common, retry_after(exchange), now_ms, ctx, actions)
+                {
+                    return reset(kind, actions);
+                }
+                self.probe = Some(Probe { from, link });
+                self.into()
+            }
+        }
+    }
+}
+
+fn streaming(
+    mut stream: Stream,
     event: Event,
     now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
-    let event = match common_event(&mut ctx, event, actions) {
-        Err(terminal) => return terminal.into(),
+    match common_event(&mut stream.ctx, event, actions) {
+        Err(terminal) => terminal.into(),
         Ok(None) => {
-            kick(epoch, seq, &mut work, &mut ctx, now_ms, actions);
-            return Replicator::Streaming {
-                epoch,
-                seq,
-                work,
-                ctx,
-            };
+            stream.kick(now_ms, actions);
+            stream.into()
         }
-        Ok(Some(event)) => event,
-    };
-    let keep = |work, ctx| Replicator::Streaming {
-        epoch,
-        seq,
-        work,
-        ctx,
-    };
-    match (work, event) {
-        (Work::Idle, _) => {
-            let mut work = Work::Idle;
-            kick(epoch, seq, &mut work, &mut ctx, now_ms, actions);
-            keep(work, ctx)
-        }
-        (Work::Oversized { at_ms }, Event::Tick) if now_ms >= at_ms => {
-            let mut work = Work::Idle;
-            kick(epoch, seq, &mut work, &mut ctx, now_ms, actions);
-            keep(work, ctx)
-        }
-        (Work::Oversized { at_ms }, Event::Tick) => {
-            actions.push(Action::Timer {
-                at_ms,
-                jitter_ms: 0,
-            });
-            keep(Work::Oversized { at_ms }, ctx)
-        }
-        (
-            Work::Append {
-                mut sealed,
-                mut link,
-            },
-            Event::Tick,
-        ) => {
-            renumber(epoch, &mut sealed, &mut link, &ctx, now_ms);
-            link.tick(now_ms, &mut ctx, actions);
-            keep(Work::Append { sealed, link }, ctx)
-        }
-        (Work::Probe { from, mut link }, Event::Tick) => {
-            link.tick(now_ms, &mut ctx, actions);
-            keep(Work::Probe { from, link }, ctx)
-        }
-        (Work::Append { sealed, mut link }, Event::Answer { id, exchange }) => match link.hit(id) {
-            Hit::None => keep(Work::Append { sealed, link }, ctx),
-            Hit::Head => match link.head_answer(&exchange, now_ms, &mut ctx, actions) {
-                Err(kind) => reset(kind, actions),
-                Ok(()) => keep(Work::Append { sealed, link }, ctx),
-            },
-            Hit::Main => {
-                if let Exchange::Answered(answer) = &exchange
-                    && let Ok(crate::wire::Typed::Producer(producer)) = &answer.typed
-                {
-                    ctx.see(producer);
-                }
-                match decide_append(&sealed, &exchange) {
-                    AppendDecision::Acknowledge { next, delivery } => {
-                        ctx.set_condition(None, actions);
-                        ctx.acknowledge(sealed.last, next);
-                        ctx.ack_actions(actions);
-                        // Only a write applied by an attempt that started after the call is
-                        // at the tail: a repeat's bytes may have others after them.
-                        if delivery == Delivery::Applied {
-                            ctx.tickets.prove(id);
-                        }
-                        ctx.tickets.settle(ctx.acked, actions);
-                        let mut work = Work::Idle;
-                        kick(epoch, sealed.seq, &mut work, &mut ctx, now_ms, actions);
-                        Replicator::Streaming {
-                            epoch,
-                            seq: sealed.seq,
-                            work,
-                            ctx,
-                        }
-                    }
-                    AppendDecision::ContinuationClaim => {
-                        ctx.set_condition(None, actions);
-                        let Some(next) = next_epoch(epoch) else {
-                            return reset(ResetKind::Internal, actions);
-                        };
-                        let link = claim(&mut ctx, next, actions);
-                        Replicator::Activating {
-                            kind: ClaimKind::Continuation { own: epoch },
-                            step: Step::Claim { epoch: next, link },
-                            ctx,
-                        }
-                    }
-                    AppendDecision::Common(common) => {
-                        match link.common(common, retry_after(&exchange), now_ms, &mut ctx, actions)
-                        {
-                            Err(kind) => reset(kind, actions),
-                            Ok(()) => keep(Work::Append { sealed, link }, ctx),
-                        }
-                    }
-                }
-            }
-        },
-        (Work::Probe { from, mut link }, Event::Answer { id, exchange }) => match link.hit(id) {
-            Hit::None => keep(Work::Probe { from, link }, ctx),
-            Hit::Head => match link.head_answer(&exchange, now_ms, &mut ctx, actions) {
-                Err(kind) => reset(kind, actions),
-                Ok(()) => keep(Work::Probe { from, link }, ctx),
-            },
-            Hit::Main => match decide_read(&exchange) {
-                ReadDecision::Bytes { next } => {
-                    ctx.set_condition(None, actions);
-                    let body = match &exchange {
-                        Exchange::Answered(answer) => answer.body.as_slice(),
-                        Exchange::NoAnswer(_) => &[],
-                    };
-                    if !body.is_empty() || next != from {
-                        return reset(reconcile::past_tail(body, &ctx), actions);
-                    }
-                    ctx.tickets.prove(id);
-                    ctx.tickets.settle(ctx.acked, actions);
-                    let mut work = Work::Idle;
-                    kick(epoch, seq, &mut work, &mut ctx, now_ms, actions);
-                    keep(work, ctx)
-                }
-                ReadDecision::Gone => reset(ResetKind::StreamState, actions),
-                ReadDecision::Common(common) => {
-                    match link.common(common, retry_after(&exchange), now_ms, &mut ctx, actions) {
-                        Err(kind) => reset(kind, actions),
-                        Ok(()) => keep(Work::Probe { from, link }, ctx),
-                    }
-                }
-            },
-        },
-        (work @ (Work::Append { .. } | Work::Probe { .. } | Work::Oversized { .. }), _) => {
-            keep(work, ctx)
-        }
+        Ok(Some(event)) => stream.on(event, now_ms, actions),
     }
 }

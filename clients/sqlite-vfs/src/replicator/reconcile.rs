@@ -95,8 +95,19 @@ pub(crate) struct Done {
     pub(crate) claim: Option<RequestId>,
     /// Where the next write starts: the claim's end.
     pub(crate) after_claim: Offset,
-    pub(crate) discard_from: Option<Position>,
-    pub(crate) foreign: Vec<ForeignFrame>,
+    pub(crate) catch_up: CatchUp,
+}
+
+/// How a takeover brings its generation up to the claim (design §5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatchUp {
+    /// The stream before the claim held only our frames and claims.
+    Nothing,
+    /// Foreign commits, with nothing pending: applied in place, in order.
+    Apply(Vec<ForeignFrame>),
+    /// A divergence (from the first pending record discarded) or a `410` (frames below retention
+    /// cannot be read): the generation is rebuilt from the stream up to the claim.
+    Rebuild { discard_from: Option<Position> },
 }
 
 #[derive(Debug, Clone)]
@@ -114,11 +125,7 @@ pub(crate) struct Reconcile {
     buf: Vec<u8>,
     buf_start: Offset,
     parts: PartRun,
-    discard_from: Option<Position>,
-    /// Takeover: the pending tail was discarded, or there was none, so every later commit is
-    /// caught up.
-    diverged: bool,
-    foreign: Vec<ForeignFrame>,
+    catch_up: CatchUp,
 }
 
 impl Reconcile {
@@ -141,9 +148,7 @@ impl Reconcile {
             buf: Vec::new(),
             buf_start: from,
             parts: PartRun::default(),
-            discard_from: None,
-            diverged: false,
-            foreign: Vec::new(),
+            catch_up: CatchUp::Nothing,
         }
     }
 
@@ -161,21 +166,14 @@ impl Reconcile {
             epoch: self.epoch,
             claim: self.claim,
             after_claim: self.after_claim,
-            discard_from: self.discard_from,
-            foreign: self.foreign,
+            catch_up: self.catch_up,
         }
     }
 
     /// `410`: the frames below retention cannot be read.
     pub(crate) fn gone(&mut self, ctx: &mut Ctx) -> Fed {
         match decide_frame(self.mode, FrameClass::Gone) {
-            RowDecision::Diverge => {
-                self.discard(ctx);
-                // The rebuild reads from the latest snapshot: nothing more to sort here.
-                self.at = self.end;
-                self.buf.clear();
-                Fed::Done
-            }
+            RowDecision::Diverge => self.rebuild(ctx),
             RowDecision::Reset(kind) => Fed::Reset(kind),
             RowDecision::Refuse(refusal) => Fed::Refuse(refusal),
             RowDecision::Skip | RowDecision::Acknowledge => Fed::Reset(ResetKind::Internal),
@@ -249,11 +247,10 @@ impl Reconcile {
                         Err(_unencodable) => return self.row(FrameClass::Undecodable, None, ctx),
                     }
                 };
-                let next = !self.diverged
-                    && ctx
-                        .pending
-                        .front()
-                        .is_some_and(|p| p.id == id && p.frame == bytes);
+                let next = ctx
+                    .pending
+                    .front()
+                    .is_some_and(|p| p.id == id && p.frame == bytes);
                 let class = if next {
                     FrameClass::NextPending
                 } else {
@@ -286,32 +283,45 @@ impl Reconcile {
                 ctx.acknowledge(position, end);
                 Fed::More
             }
-            RowDecision::Diverge => {
-                self.discard(ctx);
-                if let Some((frame, end)) = commit {
-                    self.foreign.push(ForeignFrame { end, frame });
+            RowDecision::Diverge if ctx.pending.is_empty() => {
+                // Nothing pending to discard: a catch-up in place.
+                let Some((frame, end)) = commit else {
+                    return self.rebuild(ctx);
+                };
+                match &mut self.catch_up {
+                    CatchUp::Nothing => {
+                        self.catch_up = CatchUp::Apply(vec![ForeignFrame { end, frame }]);
+                    }
+                    CatchUp::Apply(frames) => frames.push(ForeignFrame { end, frame }),
+                    CatchUp::Rebuild { .. } => {}
                 }
                 Fed::More
             }
+            RowDecision::Diverge => self.rebuild(ctx),
             RowDecision::Reset(kind) => Fed::Reset(kind),
             RowDecision::Refuse(refusal) => Fed::Refuse(refusal),
         }
     }
 
-    /// Takeover: the remaining pending records are dropped (a no-op when there are none, which is
-    /// a catch-up in place).
-    fn discard(&mut self, ctx: &mut Ctx) {
-        if !self.diverged {
-            self.diverged = true;
-            if let Some(first) = ctx.pending.front() {
-                self.discard_from = Some(first.id.position);
-                ctx.pending.clear();
-            }
-        }
+    /// Takeover: the remaining pending records are dropped and the generation is rebuilt from
+    /// the stream, which reads what is left itself, so the reconcile ends here and any frames
+    /// collected for a catch-up in place are dropped.
+    fn rebuild(&mut self, ctx: &mut Ctx) -> Fed {
+        let discard_from = ctx.pending.front().map(|first| first.id.position);
+        ctx.pending.clear();
+        self.catch_up = CatchUp::Rebuild { discard_from };
+        self.at = self.end;
+        self.buf.clear();
+        Fed::Done
     }
 
     /// Whether `position` went out in a batch of the epoch the claim closed, above its last
     /// applied seq: that batch must not be in the stream (design §4.8).
+    ///
+    /// Dead in M1, kept for the continuations of M2 and M3: a takeover binds afresh (nothing
+    /// sent), and M1's only continuation follows `producer-expired`, which the server sends only
+    /// at or below the epoch floor, where the producer's record was retired, so the claim closes
+    /// no epoch. Re-keys and re-cuts claim over a live record and make it live.
     fn above_closed_seq(&self, position: Position, ctx: &Ctx) -> bool {
         let Some(closed) = self.closed else {
             return false;
@@ -324,14 +334,12 @@ impl Reconcile {
     }
 }
 
-/// The reset for bytes a `synced()` probe found past the acknowledged tail: a foreign claim
-/// fences, anything else is a foreign append.
-pub(crate) fn past_tail(body: &[u8], ctx: &Ctx) -> ResetKind {
+/// The reset for bytes a `synced()` probe found past the acknowledged tail: a valid frame (a
+/// claim, a copy's commit or claim under our activation) fences, undecodable bytes are a foreign
+/// append (design §7).
+pub(crate) fn past_tail(body: &[u8]) -> ResetKind {
     match frame::decode(body, MAX_BATCH_BYTES) {
-        Ok(Decoded::Frame {
-            frame: Frame::Claim { activation, .. },
-            ..
-        }) if !ctx.owns_activation(activation) => ResetKind::Fenced,
-        _ => ResetKind::StreamState,
+        Ok(Decoded::Frame { .. }) => ResetKind::Fenced,
+        Ok(Decoded::Partial) | Err(_) => ResetKind::StreamState,
     }
 }
