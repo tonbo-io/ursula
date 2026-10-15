@@ -118,6 +118,7 @@ pub use routing::NodeId;
 pub use routing::RaftGroup;
 pub use routing::RaftTerm;
 pub use routing::RoutingAnswer;
+pub use snapshot::MAX_MANIFEST_BYTES;
 pub use snapshot::MAX_SNAPSHOT_PARTS;
 pub use snapshot::PART_ID_MAX_BYTES;
 pub use snapshot::PartCount;

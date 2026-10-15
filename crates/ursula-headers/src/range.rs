@@ -56,19 +56,25 @@ impl ByteRange {
     }
 
     /// The answer to this range on a body of `total` bytes: the bytes it
-    /// selects, or `416` when it selects none.
-    pub fn resolve(self, total: u64) -> ContentRange {
+    /// selects, `416` when it selects none, or `None` for the whole body as
+    /// `200`. A nonzero suffix of an empty body is satisfiable (RFC 9110
+    /// section 14.1.1), but no `206` can express it, so it gets the empty
+    /// body whole.
+    pub fn resolve(self, total: u64) -> Option<ContentRange> {
         let unsatisfied = ContentRange::Unsatisfied { total };
         let Some(end) = total.checked_sub(1) else {
-            return unsatisfied;
+            return match self {
+                Self::Suffix { len } if len > 0 => None,
+                _ => Some(unsatisfied),
+            };
         };
         let (first, last) = match self {
             Self::Bounded { first, last } => (first, last.min(end)),
             Self::From { first } => (first, end),
-            Self::Suffix { len: 0 } => return unsatisfied,
+            Self::Suffix { len: 0 } => return Some(unsatisfied),
             Self::Suffix { len } => (total.saturating_sub(len), end),
         };
-        ByteSpan::new(first, last, total).map_or(unsatisfied, ContentRange::Partial)
+        Some(ByteSpan::new(first, last, total).map_or(unsatisfied, ContentRange::Partial))
     }
 
     /// Emits the `Range` header that asks for this range.
@@ -290,12 +296,14 @@ mod tests {
             (ByteRange::From { first: 0 }, 0, ContentRange::Unsatisfied {
                 total: 0,
             }),
-            (ByteRange::Suffix { len: 1 }, 0, ContentRange::Unsatisfied {
+            (ByteRange::Suffix { len: 0 }, 0, ContentRange::Unsatisfied {
                 total: 0,
             }),
         ] {
-            assert_eq!(range.resolve(total), expected, "{range:?} of {total}");
+            assert_eq!(range.resolve(total), Some(expected), "{range:?} of {total}");
         }
+        // A nonzero suffix of an empty body selects it whole.
+        assert_eq!(ByteRange::Suffix { len: 1 }.resolve(0), None);
     }
 
     #[test]

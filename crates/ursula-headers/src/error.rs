@@ -88,6 +88,8 @@ pub enum HeaderError {
     ManifestUnterminated,
     /// Line `line` (from 1) of a parts manifest is not a part id.
     InvalidManifestLine { line: usize },
+    /// Line `line` (from 1) of a parts manifest repeats an earlier id.
+    DuplicateManifestPart { line: usize },
     /// A parts manifest lists another number of parts than its commit's
     /// `Stream-Snapshot-Parts`.
     ManifestPartCount { declared: PartCount },
@@ -233,6 +235,12 @@ impl fmt::Display for HeaderError {
                  `bytes */total` on a 416",
                 names::CONTENT_RANGE
             ),
+            Self::DuplicateManifestPart { line } => {
+                write!(
+                    f,
+                    "line {line} of a parts manifest repeats an earlier part id"
+                )
+            }
             Self::ManifestPartCount { declared } => write!(
                 f,
                 "a parts manifest must list exactly {declared} parts, as {} says",
