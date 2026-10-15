@@ -658,7 +658,7 @@ fn a_restore_of_the_token_before_a_rekey_never_re_keys_over_a_caught_up_commit()
 }
 
 /// A takeover with commits pending meets an inheriting history: it resets `rewound` before its
-/// log rolls, so the next open finds the old token and refuses with the files kept.
+/// log rolls, so the next open finds the old token and salvages the generation.
 #[test]
 fn a_takeover_with_commits_pending_resets_before_it_re_keys() {
     let kind = ClaimKind::Takeover {
@@ -731,5 +731,62 @@ fn a_416_on_a_read_sends_head() {
         crate::replicator::answer::ReadDecision::Common(crate::replicator::answer::Common::Head(
             crate::replicator::answer::HeadReason::Precondition
         ))
+    );
+}
+
+/// A takeover re-keyed at open whose reconcile finds a foreign commit where its pending commit
+/// should be discards the pending tail only with a salvage of the generation (design §6.2): the
+/// open re-keys only with nothing pending, so this is the defence behind that gate. A takeover
+/// that did not re-key rebuilds with no salvage.
+#[test]
+fn a_rebuild_that_discards_after_a_rekey_at_open_salvages() {
+    let foreign = commit(crate::ids::Lineage([0x22; 16]), 1, 9).frame;
+    let n = u64::try_from(foreign.len()).unwrap();
+    let rebuild = |actions: &[Action]| {
+        actions.iter().find_map(|a| match a {
+            Action::Rebuild {
+                discard_from,
+                salvage,
+                ..
+            } => Some((*discard_from, *salvage)),
+            _ => None,
+        })
+    };
+    let (mut h, e) = rekeyed_takeover(vec![commit(LINEAGE, 1, 1)]);
+    h.answer(&receipt_under(
+        t(8),
+        Delivery::Applied,
+        e,
+        0,
+        n,
+        n + 37,
+        None,
+    ));
+    let actions = h.answer(&read(&foreign, n));
+    assert_eq!(
+        rebuild(&actions),
+        Some((Some(Position(1)), true)),
+        "{actions:?}"
+    );
+
+    let kind = ClaimKind::Takeover {
+        round: 1,
+        rekeyed: false,
+    };
+    let (mut h, actions) = Harness::activate(kind, local(vec![commit(LINEAGE, 1, 1)], 0));
+    let e = claim_sent(&actions).unwrap().0;
+    h.answer(&producer(&receipt(
+        Delivery::Applied,
+        e,
+        0,
+        n,
+        n + 37,
+        None,
+    )));
+    let actions = h.answer(&read(&foreign, n));
+    assert_eq!(
+        rebuild(&actions),
+        Some((Some(Position(1)), false)),
+        "{actions:?}"
     );
 }

@@ -24,7 +24,7 @@ import { errorOf, UrsulaError, UrsulaSetupError, UrsulaUnavailableError } from "
 import { pump } from "./pump.ts";
 
 export { loadUrsulaVfs } from "./control.ts";
-export { type ResetListener, UrsulaDatabase, type UrsulaStatus } from "./database.ts";
+export { type ResetListener, UrsulaDatabase, type UrsulaSalvage, type UrsulaStatus } from "./database.ts";
 export {
 	type ResetKind,
 	type SetupKind,
@@ -49,6 +49,12 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	readonly signal?: AbortSignal | undefined;
 	/** How many bytes of compressed commits may wait for the stream before writes fail with `backlog_full`. By default 64 MiB. */
 	readonly maxPendingBytes?: number | undefined;
+	/**
+	 * When the stream is missing and the local cache holds data: create the stream again, moving the
+	 * cache aside into the cache root's `salvage/` (reason `recreated`), instead of failing with
+	 * `not_found`. By default `false`.
+	 */
+	readonly recreate?: boolean | undefined;
 }
 
 /** `ursula_open`'s answer. */
@@ -82,7 +88,7 @@ const byAbort = new WeakSet<object>();
  * the open met, or `cancelled` when it met none.
  */
 export async function open(url: string | URL, options: OpenOptions = {}): Promise<UrsulaDatabase> {
-	const { dir, token, signal, maxPendingBytes, timeout, ...rest } = options;
+	const { dir, token, signal, maxPendingBytes, recreate, timeout, ...rest } = options;
 	const stream = String(url);
 	const settings: Record<string, unknown> = { timeout_ms: EXTENSION_OPEN_MS };
 	if (token !== undefined) settings.token = token;
@@ -91,6 +97,12 @@ export async function open(url: string | URL, options: OpenOptions = {}): Promis
 			throw new UrsulaSetupError(`invalid_argument: maxPendingBytes must be a whole number of bytes, not ${maxPendingBytes}`, "invalid_argument");
 		}
 		settings.max_pending_bytes = maxPendingBytes;
+	}
+	if (recreate !== undefined) {
+		if (typeof recreate !== "boolean") {
+			throw new UrsulaSetupError(`invalid_argument: recreate must be a boolean, not ${String(recreate)}`, "invalid_argument");
+		}
+		settings.recreate = recreate;
 	}
 	const json = JSON.stringify(settings);
 	const sqlite = { ...rest, timeout: timeout ?? DEFAULT_BUSY_MS };

@@ -29,6 +29,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
@@ -46,6 +47,10 @@ use crate::open::OpenError;
 use crate::replicator::Condition;
 use crate::replicator::ResetKind;
 use crate::replog::Log;
+use crate::salvage;
+use crate::salvage::Reason;
+use crate::salvage::SalvageError;
+use crate::salvage::Salvaged;
 use crate::snapshotter::Snapshots;
 use crate::transport::Attempt;
 use crate::wire::Request;
@@ -155,6 +160,8 @@ pub(crate) struct BindingHandle {
     pub(crate) snapshots: Snapshots,
     /// Where the open got the local database.
     pub(crate) attach: Attach,
+    /// The root's salvages, read once: none come or go while the binding holds the root's lock.
+    salvage: OnceLock<Arc<[Salvaged]>>,
 }
 
 /// Where a binding stands between its connections and the driver.
@@ -237,7 +244,18 @@ impl BindingHandle {
             root: Mutex::new(Some(root)),
             snapshots: Snapshots::default(),
             attach: bind.attach,
+            salvage: OnceLock::new(),
         }
+    }
+
+    /// The salvages of the root the binding's generation is in (`status().salvage`).
+    pub(crate) fn salvage(&self) -> Result<Arc<[Salvaged]>, SalvageError> {
+        if let Some(listed) = self.salvage.get() {
+            return Ok(Arc::clone(listed));
+        }
+        let dir = &self.generation.dir;
+        let listed: Arc<[Salvaged]> = salvage::list(dir.parent().unwrap_or(dir))?.into();
+        Ok(Arc::clone(self.salvage.get_or_init(|| listed)))
     }
 
     /// The stream's token: the requests of the snapshot thread carry it.
@@ -520,8 +538,12 @@ pub(crate) enum Attach {
     /// re-keyed (design §6.2).
     ReKeyed,
     /// A generation built from the stream: from its latest snapshot at `snapshot` and the tail
-    /// after it, or from its start when `snapshot` is `None`.
-    Built { snapshot: Option<Offset> },
+    /// after it, or from its start when `snapshot` is `None`. `salvaged` names why the local
+    /// generation it replaced was salvaged, if it was.
+    Built {
+        snapshot: Option<Offset>,
+        salvaged: Option<Reason>,
+    },
 }
 
 /// A database bound by an open.

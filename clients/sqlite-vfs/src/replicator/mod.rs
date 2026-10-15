@@ -32,8 +32,10 @@
 //! history-fenced and the next append would be refused (#581 §2.3.1 rows 9 and 11): one more
 //! continuation claim follows. A takeover re-keys only with nothing pending
 //! ([`answer::takeover_may_rekey`]): otherwise it resets `rewound` before the log rolls, and the
-//! next open refuses with the files kept, since the log's acknowledged offset may trail
-//! acknowledgements the pending tail holds (salvage comes later in M2).
+//! next open salvages the generation, since the log's acknowledged offset may trail
+//! acknowledgements the pending tail holds. A rebuild that discards pending records after a
+//! re-key at open salvages the generation it replaces ([`Action::Rebuild`]'s `salvage`), so a
+//! history change never discards a local commit without a salvage.
 //!
 //! Left for later milestones: resume (M4), re-cut and PART sending (M3) and the provisional
 //! deferred claim (M2).
@@ -293,10 +295,13 @@ pub(crate) enum Action {
     /// generation from the stream (its latest snapshot and tail) up to `to`, the claim's end
     /// (design §5.6: a divergence, or a `410`). The rebuilt generation's first segment names
     /// `incarnation` and `cluster_id`, its positions continue above the last one logged, and
-    /// it holds the CLAIM record of `(epoch, activation)`. Then answer with
-    /// [`Event::CaughtUp`].
+    /// it holds the CLAIM record of `(epoch, activation)`. With `salvage`, the generation it
+    /// replaces is salvaged (`history_changed`) rather than trashed: the takeover re-keyed it at
+    /// open and the pending records it discards may hold commits acknowledged under the old
+    /// token (design §6.2). Then answer with [`Event::CaughtUp`].
     Rebuild {
         discard_from: Option<Position>,
+        salvage: bool,
         to: Offset,
         epoch: Epoch,
         activation: Activation,
@@ -452,6 +457,8 @@ pub(crate) struct Knobs {
     pub(crate) misroute_as_deleted: bool,
     /// Take a HEAD of another cluster's stream for a history that inherits the generation.
     pub(crate) misroute_as_rekey: bool,
+    /// Re-key a takeover whose log holds commits after its latest ACK: the #611 B2 gate undone.
+    pub(crate) rekey_with_pending: bool,
 }
 
 impl Ctx {
@@ -927,7 +934,10 @@ fn rekey(
     } else {
         Unacked::Commits
     };
-    if matches!(kind, ClaimKind::Takeover { .. }) && !takeover_may_rekey(unacked) {
+    if matches!(kind, ClaimKind::Takeover { .. })
+        && !takeover_may_rekey(unacked)
+        && !rekeys_with_pending(&ctx)
+    {
         // Before the log rolls: the next open finds the old token and refuses the same way.
         return reset(ResetKind::Rewound, actions);
     }
@@ -1629,6 +1639,17 @@ fn claim_answered(
     }
 }
 
+/// Whether a takeover re-keys with commits pending: never, but under the negative control.
+#[cfg(test)]
+fn rekeys_with_pending(ctx: &Ctx) -> bool {
+    ctx.knobs.rekey_with_pending
+}
+
+#[cfg(not(test))]
+fn rekeys_with_pending(_ctx: &Ctx) -> bool {
+    false
+}
+
 /// Whether a repeat receipt for a claim sent again after a re-key binds without the claim after
 /// it: never, but under the negative control that leaves that claim out.
 #[cfg(test)]
@@ -1693,8 +1714,10 @@ fn finish(
             if let Some(from) = *discard_from {
                 ctx.tickets.abandon_from(from, actions);
             }
+            let rekeyed = matches!(kind, ClaimKind::Takeover { rekeyed: true, .. });
             actions.push(Action::Rebuild {
                 discard_from: *discard_from,
+                salvage: rekeyed && discard_from.is_some(),
                 to: done.after_claim,
                 epoch: done.epoch,
                 activation: ctx.activation,

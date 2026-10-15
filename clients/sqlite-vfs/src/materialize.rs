@@ -2,12 +2,13 @@
 //! log before any connection opens it.
 //!
 //! [`materialize`] runs at every open of a trusted generation: check page 1 (a db file that is not
-//! this generation's, an empty one included, is refused before anything is written), open the log
-//! (its torn tail cut), fsync it, delete the WAL and `-shm` unread (and a `db-wal` or `db-journal`
-//! SQLite outside the extension may have left), re-apply the COMMIT records after the latest BASE
-//! (final images per batch, cutting first, so a crash midway replays again), fsync the db, append
-//! a BASE. By L3 the db holds every commit up to the BASE and otherwise only pages from records
-//! after it, so the result is exactly the state at the end of the valid log; the WAL plays no part.
+//! this generation's, an empty one included, is refused before anything is written, and the open
+//! salvages it as found), open the log (its torn tail cut), fsync it, delete the WAL and `-shm`
+//! unread (and a `db-wal` or `db-journal` SQLite outside the extension may have left), re-apply
+//! the COMMIT records after the latest BASE (final images per batch, cutting first, so a crash
+//! midway replays again), fsync the db, append a BASE. By L3 the db holds every commit up to the
+//! BASE and otherwise only pages from records after it, so the result is exactly the state at the
+//! end of the valid log; the WAL plays no part.
 //!
 //! [`catch_up`] applies frames a takeover found on the stream after the log: each COMMIT is logged
 //! with an ACK, the log fsynced, the frames applied, the db fsynced, a BASE appended.
@@ -105,12 +106,11 @@ pub(crate) enum LocalError {
         .found.escape_ascii()
     )]
     Replaced { db: PathBuf, found: Vec<u8> },
-    /// Page 1 holds SQLite's own magic: a cache written before 0.8 marked page 1, or a file
-    /// SQLite wrote outside the extension.
+    /// Page 1 holds SQLite's own magic: a plain SQLite file copied over the db, or a cache
+    /// written before page 1 was marked.
     #[error(
-        "{}: page 1 holds SQLite's own header, not the page-1 marker: a cache written before the \
-         0.8 cache format marked page 1 (an earlier 0.8 build), or a file SQLite wrote outside the \
-         extension, which this version does not open",
+        "{}: page 1 holds SQLite's own header, not the page-1 marker: a plain SQLite file, not \
+         this generation's db",
         .db.display()
     )]
     Unmarked { db: PathBuf },
@@ -121,6 +121,14 @@ impl LocalError {
     /// is not a SQLite database's.
     pub(crate) fn is_stream_content(&self) -> bool {
         matches!(self, LocalError::Apply(ApplyError::PageOne { .. }))
+    }
+
+    /// The db file is not the generation's: the open salvages the generation as `replaced`.
+    pub(crate) fn is_replaced(&self) -> bool {
+        matches!(
+            self,
+            LocalError::Replaced { .. } | LocalError::Unmarked { .. }
+        )
     }
 }
 
@@ -160,6 +168,16 @@ pub(crate) struct Materialized {
     pub(crate) db: File,
     /// What the log held at open.
     pub(crate) recovered: Recovered,
+}
+
+/// Whether a trusted generation holds data a missing stream or a history change would lose
+/// (design D2): its db file is longer than one page (every published db holds page 1), or its
+/// valid log holds a COMMIT record. A generation without data is replaced with no salvage.
+pub(crate) fn holds_data(m: &Materialized) -> bool {
+    let longer =
+        m.db.metadata()
+            .map_or(true, |meta| meta.len() > PAGE as u64);
+    longer || m.recovered.any_commit
 }
 
 /// A frame read from the stream after the log: a CLAIM, or a COMMIT (a PART run joined), and the

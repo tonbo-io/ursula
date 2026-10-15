@@ -60,8 +60,8 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
     PANIC_IN_FOR_TESTS.set(entry);
 }
 
-/// A step of the commit path, of a checkpoint or of a re-key that `URSULA_VFS_ABORT_AT` can stop
-/// the process at (design §4.1, §4.3, §6.2).
+/// A step of the commit path, of a checkpoint, of a re-key or of a generation's publish that
+/// `URSULA_VFS_ABORT_AT` can stop the process at (design §4.1, §4.3, §5.1, §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     /// A write transaction's first WAL write, admitted.
@@ -92,6 +92,14 @@ pub(crate) enum Step {
     RekeyRolled,
     /// A re-key: the CLAIM record fsynced in the new segment, before the claim goes out.
     RekeyClaimed,
+    /// A publish that salvages: the manifest fsynced into the superseded generation, before the
+    /// new one is renamed into place.
+    SalvageMarked,
+    /// A publish: the new generation renamed into place and the root fsynced.
+    PublishRenamed,
+    /// A publish that salvages: the superseded generation moved into `salvage/`, before its magic
+    /// is restored.
+    SalvageMoved,
 }
 
 impl Step {
@@ -111,6 +119,9 @@ impl Step {
             Step::Based => "based",
             Step::RekeyRolled => "rekey_rolled",
             Step::RekeyClaimed => "rekey_claimed",
+            Step::SalvageMarked => "salvage_marked",
+            Step::PublishRenamed => "publish_renamed",
+            Step::SalvageMoved => "salvage_moved",
         }
     }
 }

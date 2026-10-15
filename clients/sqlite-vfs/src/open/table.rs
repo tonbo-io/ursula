@@ -1,21 +1,31 @@
 //! The open table of design §5.5 as one pure function: what the open does with the local
-//! generation it materialized and the HEAD it got. [`decide`] does no I/O; the open carries out its
+//! generation it found and the HEAD it got. [`decide`] does no I/O; the open carries out its
 //! [`OpenRow`].
 //!
 //! | local generation | HEAD | row |
 //! | --- | --- | --- |
 //! | any | no `Ursula-Protocol: 2` | refuse `server_too_old` |
 //! | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
-//! | none | `404` | create |
-//! | trusted | `404` | refuse `not_found` |
+//! | none, replaced | `404` | create |
+//! | trusted, holding no data | `404` | create |
+//! | trusted, holding data | `404` | refuse `not_found`, or create with `recreate` |
 //! | any | another content type | refuse `stream_format` |
 //! | any | closed | refuse `stream_state` |
 //! | none | `200` | build |
+//! | replaced | `200` | build, the generation salvaged (`replaced`) |
 //! | trusted, same token | `200` | resume |
 //! | trusted, other token, inheriting, nothing pending | `200` | re-key ([`inherits`]) |
-//! | trusted, other token, otherwise | `200` | refuse `stream_state` (salvage comes later in M2) |
+//! | trusted, other token, otherwise, holding data | `200` | build, the generation salvaged |
+//! | trusted, other token, otherwise, holding no data | `200` | build, the generation trashed |
 //!
-//! Rows match in order, so a refusal sends nothing and moves no file.
+//! Rows match in order, so a refusal sends nothing and moves no file. A generation is replaced
+//! when its db file is not its own (page 1) or its log's first segment header is unreadable; it
+//! is salvaged as found, then the open goes on as with none. A generation salvaged after a
+//! token change is `recreated` when this open created the stream (`recreate`), and
+//! `history_changed` otherwise. A generation whose history inherits it while its log holds
+//! commits after the latest ACK is salvaged too, never re-keyed: an ACK record trails the
+//! stream's acknowledgements, so those commits may include acknowledged ones the history lost, and
+//! a re-keyed log names the new token, so a later open would resume it and discard them.
 
 use ursula_headers::ClusterId;
 use ursula_headers::Incarnation;
@@ -30,6 +40,7 @@ use crate::codec::frame::CONTENT_TYPE;
 use crate::replicator::answer::Unacked;
 use crate::replicator::answer::inherits;
 use crate::replicator::answer::takeover_may_rekey;
+use crate::salvage::Reason;
 
 /// What the open knows of its trusted local generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +53,28 @@ pub(crate) struct LocalSummary {
     pub(crate) acked_offset: Offset,
     /// Whether the log holds a commit of the generation after its latest ACK.
     pub(crate) pending: Unacked,
+    /// Whether the generation holds data ([`crate::materialize::holds_data`], design D2).
+    pub(crate) holds_data: bool,
+}
+
+/// The local generation the open found: `L` the value the rows carry for a trusted one, `R` for a
+/// replaced one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Local<L, R> {
+    None,
+    /// A generation whose db file is not its own, or whose log's first segment header is
+    /// unreadable: salvaged as found (`replaced`), then as none.
+    Replaced(R),
+    Trusted(LocalSummary, L),
+}
+
+/// What the caller asked, and what the open did so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Asked {
+    /// `recreate`: a missing stream is created again over a generation holding data.
+    pub(crate) recreate: bool,
+    /// This open created the stream.
+    pub(crate) created: bool,
 }
 
 /// What a HEAD without a precondition answered (`200` or `404`).
@@ -53,15 +86,45 @@ pub(crate) struct HeadSeen<'a> {
     pub(crate) content_type: Option<&'a str>,
 }
 
+/// What becomes of the local generation a build replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Superseded<L, R> {
+    /// There is none.
+    Nothing,
+    /// A trusted generation holding no data: trashed.
+    Trash(L),
+    /// A trusted generation holding data, salvaged for `why`.
+    Salvage { why: Why, local: L },
+    /// A replaced generation, salvaged as found (`replaced`).
+    Replaced(R),
+}
+
+/// Why a build salvages a trusted generation: never `replaced`, which only a replaced one is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Why {
+    HistoryChanged,
+    Recreated,
+}
+
+impl From<Why> for Reason {
+    fn from(why: Why) -> Self {
+        match why {
+            Why::HistoryChanged => Reason::HistoryChanged,
+            Why::Recreated => Reason::Recreated,
+        }
+    }
+}
+
 /// What the open does, carrying what it does it with: the local generation `L` when a row uses
 /// it, and the stream's identity and head when a row needs a stream. No row can pair with the
 /// wrong local state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OpenRow<L> {
-    /// No stream and no local generation: create it, then HEAD again.
-    Create,
-    /// No local generation: build one from the stream.
+pub(crate) enum OpenRow<L, R> {
+    /// Create the stream, then HEAD again: the local generation stays as found, for that HEAD.
+    Create { local: Local<L, R> },
+    /// Build a generation from the stream, replacing the local one as `superseded` says.
     Build {
+        superseded: Superseded<L, R>,
         cluster_id: ClusterId,
         head: StreamHead,
     },
@@ -79,8 +142,11 @@ pub(crate) enum OpenRow<L> {
         cluster_id: ClusterId,
         head: StreamHead,
     },
-    /// Refused: the local generation, if any, stays as it was.
-    Refuse { refused: Refused, local: Option<L> },
+    /// Refused: the local generation stays as it was found.
+    Refuse {
+        refused: Refused,
+        local: Local<L, R>,
+    },
 }
 
 /// Why the open refuses. Each keeps the local files and sends nothing.
@@ -93,18 +159,12 @@ pub(crate) enum Refused {
         local: String,
         stream: ClusterId,
     },
-    /// The stream is missing and the generation is trusted.
+    /// The stream is missing and the trusted generation holds data.
     NotFound,
     ContentType {
         found: Option<String>,
     },
     Closed,
-    /// Another token whose history does not inherit the generation, or one that does while the
-    /// log holds commits after its latest ACK.
-    TokenChanged {
-        local: Incarnation,
-        stream: Incarnation,
-    },
 }
 
 impl From<Refused> for OpenError {
@@ -117,40 +177,59 @@ impl From<Refused> for OpenError {
                 Self::StreamFormat(StreamFormat::ContentType { found })
             }
             Refused::Closed => Self::StreamState(StreamState::Closed),
-            Refused::TokenChanged { local, stream } => {
-                Self::StreamState(StreamState::TokenChanged { local, stream })
-            }
         }
     }
 }
 
-/// The table of design §5.5 for an owner's open, on the trusted local generation `local` (its
-/// summary and the value the rows carry) and the HEAD the open got.
-pub(crate) fn decide<L>(local: Option<(LocalSummary, L)>, head: HeadSeen<'_>) -> OpenRow<L> {
-    let refuse = |refused, local: Option<(LocalSummary, L)>| OpenRow::Refuse {
-        refused,
-        local: local.map(|(_, l)| l),
-    };
-    let identity = match head.identity {
+/// Whether the open re-keys the trusted generation `summary` to the history `head` names: the
+/// history inherits it and its log holds nothing after its latest ACK.
+pub(crate) fn rekeys(summary: &LocalSummary, head: &StreamHead) -> bool {
+    inherits(head, summary.incarnation, summary.acked_offset) && takeover_may_rekey(summary.pending)
+}
+
+/// The table of design §5.5 for an owner's open, on the local generation it found, what was
+/// asked, and the HEAD it got.
+/// The identity a HEAD named, checked (design §6.3): protocol 2, and the cluster id `ours` when a
+/// generation names one. The open table and a build's HEADs share it.
+pub(crate) fn check_identity<'a>(
+    identity: Option<&'a ServerIdentity>,
+    ours: Option<&str>,
+) -> Result<&'a ServerIdentity, Refused> {
+    let identity = match identity {
         Some(identity) if identity.protocol == ursula_headers::PROTOCOL_VERSION => identity,
         other => {
             let protocol = other.map(|i| i.protocol);
-            return refuse(Refused::ServerTooOld { protocol }, local);
+            return Err(Refused::ServerTooOld { protocol });
         }
     };
-    if let Some((summary, _)) = &local
-        && summary.cluster_id != identity.cluster_id.as_str()
-    {
-        let refused = Refused::WrongCluster {
-            local: summary.cluster_id.clone(),
+    match ours {
+        Some(ours) if ours != identity.cluster_id.as_str() => Err(Refused::WrongCluster {
+            local: ours.to_owned(),
             stream: identity.cluster_id.clone(),
-        };
-        return refuse(refused, local);
+        }),
+        Some(_) | None => Ok(identity),
     }
+}
+
+pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>) -> OpenRow<L, R> {
+    let refuse = |refused, local| OpenRow::Refuse { refused, local };
+    let ours = match &local {
+        Local::Trusted(summary, _) => Some(summary.cluster_id.as_str()),
+        Local::None | Local::Replaced(_) => None,
+    };
+    let identity = match check_identity(head.identity, ours) {
+        Ok(identity) => identity,
+        Err(refused) => return refuse(refused, local),
+    };
     let Some(stream) = head.stream else {
-        return match local {
-            Some(_) => refuse(Refused::NotFound, local),
-            None => OpenRow::Create,
+        let not_found = matches!(
+            &local,
+            Local::Trusted(summary, _) if summary.holds_data && !asked.recreate
+        );
+        return if not_found {
+            refuse(Refused::NotFound, local)
+        } else {
+            OpenRow::Create { local }
         };
     };
     if head.content_type != Some(CONTENT_TYPE) {
@@ -162,8 +241,22 @@ pub(crate) fn decide<L>(local: Option<(LocalSummary, L)>, head: HeadSeen<'_>) ->
     }
     let cluster_id = identity.cluster_id.clone();
     let head = *stream;
-    let Some((summary, value)) = local else {
-        return OpenRow::Build { cluster_id, head };
+    let (summary, value) = match local {
+        Local::None => {
+            return OpenRow::Build {
+                superseded: Superseded::Nothing,
+                cluster_id,
+                head,
+            };
+        }
+        Local::Replaced(replaced) => {
+            return OpenRow::Build {
+                superseded: Superseded::Replaced(replaced),
+                cluster_id,
+                head,
+            };
+        }
+        Local::Trusted(summary, value) => (summary, value),
     };
     if summary.incarnation == head.incarnation() {
         return OpenRow::Resume {
@@ -172,9 +265,7 @@ pub(crate) fn decide<L>(local: Option<(LocalSummary, L)>, head: HeadSeen<'_>) ->
             head,
         };
     }
-    if inherits(&head, summary.incarnation, summary.acked_offset)
-        && takeover_may_rekey(summary.pending)
-    {
+    if rekeys(&summary, &head) {
         return OpenRow::ReKey {
             local: value,
             from: summary.incarnation,
@@ -182,12 +273,20 @@ pub(crate) fn decide<L>(local: Option<(LocalSummary, L)>, head: HeadSeen<'_>) ->
             head,
         };
     }
-    OpenRow::Refuse {
-        refused: Refused::TokenChanged {
-            local: summary.incarnation,
-            stream: head.incarnation(),
-        },
-        local: Some(value),
+    let superseded = if summary.holds_data {
+        let why = if asked.created {
+            Why::Recreated
+        } else {
+            Why::HistoryChanged
+        };
+        Superseded::Salvage { why, local: value }
+    } else {
+        Superseded::Trash(value)
+    };
+    OpenRow::Build {
+        superseded,
+        cluster_id,
+        head,
     }
 }
 
@@ -200,13 +299,21 @@ mod tests {
     use ursula_headers::ServerIdentity;
     use ursula_headers::StreamHead;
 
+    use super::Asked;
     use super::HeadSeen;
+    use super::Local;
     use super::LocalSummary;
     use super::OpenRow;
     use super::Refused;
+    use super::Superseded;
+    use super::Why;
     use super::decide;
     use crate::codec::frame::CONTENT_TYPE;
     use crate::replicator::answer::Unacked;
+
+    /// A local generation of the tests: a trusted one carries `"gen"`, a replaced one `"bad"`.
+    type Found = Local<&'static str, &'static str>;
+    type Row = OpenRow<&'static str, &'static str>;
 
     fn token(n: u64) -> Incarnation {
         Incarnation::try_from((1 << 52) | n).unwrap()
@@ -230,27 +337,27 @@ mod tests {
             .unwrap()
     }
 
-    /// A trusted generation of token `t` with nothing pending, acknowledged up to
-    /// `acked_offset`; the rows carry `"gen"`.
-    fn local(t: u64, acked_offset: u64) -> Option<(LocalSummary, &'static str)> {
-        with_pending(t, acked_offset, Unacked::Nothing)
+    /// A trusted generation of token `t` holding data, nothing pending, acknowledged up to
+    /// `acked_offset`.
+    fn local(t: u64, acked_offset: u64) -> Found {
+        trusted(t, acked_offset, Unacked::Nothing, true)
     }
 
-    fn with_pending(
-        t: u64,
-        acked_offset: u64,
-        pending: Unacked,
-    ) -> Option<(LocalSummary, &'static str)> {
-        Some((
+    fn trusted(t: u64, acked_offset: u64, pending: Unacked, holds_data: bool) -> Found {
+        Local::Trusted(
             LocalSummary {
                 cluster_id: "cluster-a".to_owned(),
                 incarnation: token(t),
                 acked_offset: Offset::from_u64(acked_offset),
                 pending,
+                holds_data,
             },
             "gen",
-        ))
+        )
     }
+
+    const NONE: Found = Local::None;
+    const REPLACED: Found = Local::Replaced("bad");
 
     fn seen<'a>(identity: &'a ServerIdentity, stream: Option<&'a StreamHead>) -> HeadSeen<'a> {
         HeadSeen {
@@ -260,8 +367,30 @@ mod tests {
         }
     }
 
-    fn refused(refused: Refused, local: Option<&'static str>) -> OpenRow<&'static str> {
+    fn ask() -> Asked {
+        Asked::default()
+    }
+
+    const RECREATE: Asked = Asked {
+        recreate: true,
+        created: false,
+    };
+
+    /// The refusal of `local`, which the row hands back as found.
+    fn refused(refused: Refused, local: Found) -> Row {
         OpenRow::Refuse { refused, local }
+    }
+
+    fn build(superseded: Superseded<&'static str, &'static str>, head: StreamHead) -> Row {
+        OpenRow::Build {
+            superseded,
+            cluster_id: cluster("cluster-a"),
+            head,
+        }
+    }
+
+    fn salvaged(why: Why) -> Superseded<&'static str, &'static str> {
+        Superseded::Salvage { why, local: "gen" }
     }
 
     #[test]
@@ -273,11 +402,12 @@ mod tests {
             content_type: Some(CONTENT_TYPE),
         };
         let too_old = Refused::ServerTooOld { protocol: None };
-        assert_eq!(
-            decide(local(1, 0), seen),
-            refused(too_old.clone(), Some("gen"))
-        );
-        assert_eq!(decide::<&str>(None, seen), refused(too_old, None));
+        for found in [local(1, 0), NONE, REPLACED] {
+            assert_eq!(
+                decide(found.clone(), ask(), seen),
+                refused(too_old.clone(), found)
+            );
+        }
     }
 
     #[test]
@@ -289,17 +419,18 @@ mod tests {
             stream: cluster("cluster-b"),
         };
         assert_eq!(
-            decide(local(1, 0), seen(&id, Some(&head))),
-            refused(wrong.clone(), Some("gen"))
+            decide(local(1, 0), ask(), seen(&id, Some(&head))),
+            refused(wrong.clone(), local(1, 0))
         );
         assert_eq!(
-            decide(local(1, 0), seen(&id, None)),
-            refused(wrong, Some("gen"))
+            decide(local(1, 0), RECREATE, seen(&id, None)),
+            refused(wrong, local(1, 0))
         );
         // A fresh host has nothing to compare.
         assert_eq!(
-            decide::<&str>(None, seen(&id, Some(&head))),
+            decide(NONE, ask(), seen(&id, Some(&head))),
             OpenRow::Build {
+                superseded: Superseded::Nothing,
                 cluster_id: cluster("cluster-b"),
                 head
             }
@@ -307,13 +438,21 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_stream_is_created_without_a_generation_and_refused_with_one() {
+    fn a_missing_stream_is_created_unless_a_trusted_generation_holds_data() {
         let id = identity("cluster-a");
-        assert_eq!(decide::<&str>(None, seen(&id, None)), OpenRow::Create);
+        let none = seen(&id, None);
+        for found in [NONE, REPLACED, trusted(1, 0, Unacked::Nothing, false)] {
+            assert_eq!(decide(found.clone(), ask(), none), OpenRow::Create {
+                local: found
+            });
+        }
         assert_eq!(
-            decide(local(1, 0), seen(&id, None)),
-            refused(Refused::NotFound, Some("gen"))
+            decide(local(1, 0), ask(), none),
+            refused(Refused::NotFound, local(1, 0))
         );
+        assert_eq!(decide(local(1, 0), RECREATE, none), OpenRow::Create {
+            local: local(1, 0)
+        });
     }
 
     #[test]
@@ -325,18 +464,18 @@ mod tests {
             ..seen(&id, Some(&head))
         };
         assert_eq!(
-            decide::<&str>(None, other),
+            decide(NONE, ask(), other),
             refused(
                 Refused::ContentType {
                     found: Some("application/octet-stream".to_owned())
                 },
-                None
+                NONE
             )
         );
         let closed = head.with_closed(true);
         assert_eq!(
-            decide(local(1, 0), seen(&id, Some(&closed))),
-            refused(Refused::Closed, Some("gen"))
+            decide(local(1, 0), ask(), seen(&id, Some(&closed))),
+            refused(Refused::Closed, local(1, 0))
         );
     }
 
@@ -345,14 +484,11 @@ mod tests {
         let id = identity("cluster-a");
         let head = stream(1, 40, None);
         assert_eq!(
-            decide::<&str>(None, seen(&id, Some(&head))),
-            OpenRow::Build {
-                cluster_id: cluster("cluster-a"),
-                head
-            }
+            decide(NONE, ask(), seen(&id, Some(&head))),
+            build(Superseded::Nothing, head)
         );
         assert_eq!(
-            decide(local(1, 40), seen(&id, Some(&head))),
+            decide(local(1, 40), ask(), seen(&id, Some(&head))),
             OpenRow::Resume {
                 local: "gen",
                 cluster_id: cluster("cluster-a"),
@@ -362,11 +498,22 @@ mod tests {
         // Pending commits resume under the same token.
         assert!(matches!(
             decide(
-                with_pending(1, 40, Unacked::Commits),
+                trusted(1, 40, Unacked::Commits, true),
+                ask(),
                 seen(&id, Some(&head))
             ),
             OpenRow::Resume { .. }
         ));
+    }
+
+    #[test]
+    fn a_replaced_generation_is_salvaged_and_built_over() {
+        let id = identity("cluster-a");
+        let head = stream(1, 40, None);
+        assert_eq!(
+            decide(REPLACED, ask(), seen(&id, Some(&head))),
+            build(Superseded::Replaced("bad"), head)
+        );
     }
 
     #[test]
@@ -375,7 +522,7 @@ mod tests {
         let head = stream(2, 50, Some((1, 40)));
         for acked in [40, 12] {
             assert_eq!(
-                decide(local(1, acked), seen(&id, Some(&head))),
+                decide(local(1, acked), ask(), seen(&id, Some(&head))),
                 OpenRow::ReKey {
                     local: "gen",
                     from: token(1),
@@ -387,44 +534,56 @@ mod tests {
     }
 
     #[test]
-    fn an_inheriting_history_is_refused_while_the_log_holds_pending_commits() {
+    fn an_inheriting_history_salvages_a_generation_with_pending_commits() {
         let id = identity("cluster-a");
         let head = stream(2, 50, Some((1, 40)));
         assert_eq!(
             decide(
-                with_pending(1, 40, Unacked::Commits),
+                trusted(1, 40, Unacked::Commits, true),
+                ask(),
                 seen(&id, Some(&head))
             ),
-            refused(
-                Refused::TokenChanged {
-                    local: token(1),
-                    stream: token(2),
-                },
-                Some("gen")
-            )
+            build(salvaged(Why::HistoryChanged), head)
         );
     }
 
     #[test]
-    fn another_token_that_does_not_inherit_is_refused() {
+    fn another_token_that_does_not_inherit_salvages_or_trashes() {
         let id = identity("cluster-a");
-        let changed = |stream: u64| {
-            refused(
-                Refused::TokenChanged {
-                    local: token(1),
-                    stream: token(stream),
-                },
-                Some("gen"),
-            )
-        };
         // The history lost bytes this generation acknowledged.
         let lossy = stream(2, 50, Some((1, 39)));
-        assert_eq!(decide(local(1, 40), seen(&id, Some(&lossy))), changed(2));
+        assert_eq!(
+            decide(local(1, 40), ask(), seen(&id, Some(&lossy))),
+            build(salvaged(Why::HistoryChanged), lossy)
+        );
         // It began from another token's history.
         let other = stream(3, 50, Some((2, 50)));
-        assert_eq!(decide(local(1, 40), seen(&id, Some(&other))), changed(3));
-        // It names no history it began from (a recreate).
+        assert_eq!(
+            decide(local(1, 40), ask(), seen(&id, Some(&other))),
+            build(salvaged(Why::HistoryChanged), other)
+        );
+        // It names no history it began from: a recreate, by this open or another.
         let recreated = stream(4, 0, None);
-        assert_eq!(decide(local(1, 0), seen(&id, Some(&recreated))), changed(4));
+        assert_eq!(
+            decide(local(1, 0), ask(), seen(&id, Some(&recreated))),
+            build(salvaged(Why::HistoryChanged), recreated)
+        );
+        let created = Asked {
+            recreate: true,
+            created: true,
+        };
+        assert_eq!(
+            decide(local(1, 0), created, seen(&id, Some(&recreated))),
+            build(salvaged(Why::Recreated), recreated)
+        );
+        // A generation holding no data loses nothing.
+        assert_eq!(
+            decide(
+                trusted(1, 0, Unacked::Nothing, false),
+                ask(),
+                seen(&id, Some(&recreated))
+            ),
+            build(Superseded::Trash("gen"), recreated)
+        );
     }
 }

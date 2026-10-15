@@ -14,6 +14,7 @@ use crate::host::HostError;
 use crate::open::OpenError;
 use crate::options::OptionsError;
 use crate::replicator::ResetKind;
+use crate::salvage::SalvageError;
 
 /// What a caller does about an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +213,9 @@ pub(crate) enum Error {
     DriverGone(#[from] DriverGone),
     #[error("{entry} panicked")]
     Panicked { entry: &'static str },
+    /// The root's `salvage/` could not be listed.
+    #[error(transparent)]
+    Salvage(#[from] SalvageError),
 }
 
 impl Error {
@@ -223,6 +227,7 @@ impl Error {
             Error::InvalidArgument { .. } | Error::Options(_) => ErrorKind::InvalidArgument,
             Error::Host(e) => e.kind(),
             Error::DriverGone(_) | Error::Panicked { .. } => ErrorKind::Internal,
+            Error::Salvage(_) => ErrorKind::LocalSetup,
         }
     }
 }

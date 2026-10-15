@@ -20,6 +20,9 @@
 //!   1 of an empty database. Its WAL is `db-uwal`, a name SQLite never probes. SQLite in another
 //!   process, a connection opened before the extension loaded, `?vfs=unix` and the `sqlite3` shell
 //!   fail with `SQLITE_NOTADB`, reads and writes alike, and change no file.
+//! * A local generation that a history change, a replaced db file or a recreate (`recreate` in
+//!   `options_json`) would discard is moved whole into the root's `salvage/`, as a plain SQLite
+//!   database with a `manifest.json`, and never read or deleted again: `ursula_status` lists it.
 //! * `SELECT ursula_synced(path, timeout_ms)` resolves once every commit logged before the call is
 //!   acknowledged and a round trip that started after it found this owner still the owner.
 //! * `SELECT ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions, resets.
@@ -61,18 +64,20 @@
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
 //! - [`ids`]: lineages, generation directory ids, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and a private connection.
+//! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests).
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
 //!   frames from the stream.
 //! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
 //!   the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
-//! - `open`: opening a stream (design §5.5, the rows M1 supports) up to its takeover, run by the
-//!   driver.
+//! - `open`: opening a stream (design §5.5) up to its takeover, run by the driver.
 //! - `options`: `ursula_open`'s `options_json`.
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle.
 //! - `replicator`: the replicator state machine of one bound database.
 //! - `replog`: the commit log, `USL1` segments in a generation's `log/`.
+//! - `salvage`: generations a history change, a replaced db file or a recreate would discard,
+//!   moved aside into the root's `salvage/` with a `manifest.json`.
 //! - `snapshotter`: the snapshot thread of a bound database: snapshots keyed by offset and digest,
 //!   retention one snapshot behind.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
@@ -95,6 +100,7 @@ mod generation;
 mod guard;
 mod host;
 pub mod ids;
+mod json;
 mod log;
 mod materialize;
 #[cfg(any(test, feature = "model"))]
@@ -105,6 +111,7 @@ mod options;
 mod publication;
 mod replicator;
 mod replog;
+mod salvage;
 mod snapshotter;
 mod stats;
 mod status;

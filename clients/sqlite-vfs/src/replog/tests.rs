@@ -682,3 +682,135 @@ fn trim_deletes_segments_across_a_rekey() {
     assert_eq!(r.header.incarnation, token(2));
     assert_eq!(r.claim, Some((epoch(2), Activation([2; 16]))));
 }
+
+/// A COMMIT record of a stream frame from another lineage, as a catch-up logs it.
+fn caught_up(n: u8) -> RecordBody {
+    let frame = crate::codec::frame::encode(&crate::codec::frame::Frame::Commit {
+        id: crate::ids::CommitId {
+            lineage: Lineage([9; 16]),
+            position: Position(u64::from(n)),
+        },
+        compressed: vec![n; 40],
+    })
+    .unwrap();
+    RecordBody::Commit { frame }
+}
+
+/// Stream frames a catch-up logged with no ACK after them were never applied (the catch-up
+/// applies them once that ACK is fsynced): the open cuts them like a torn tail, across segments,
+/// and the log goes on from the first of them. Frames an ACK follows, and the generation's own
+/// pending commits, stay.
+#[test]
+fn caught_up_frames_no_ack_follows_are_cut() {
+    let dir = TempDir::new("log-cut-caught-up");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.set_roll_bytes(200);
+    let ack = |acked: u64| RecordBody::Ack {
+        acked: Position(acked),
+        acked_offset: Offset::from_u64(acked * 10),
+        log_bytes: 0,
+    };
+    for body in [
+        caught_up(1),
+        ack(1),
+        caught_up(2),
+        caught_up(3),
+        caught_up(4),
+    ] {
+        log.append(&body).unwrap();
+    }
+    log.sync().unwrap();
+    let segments = log.segment_paths().len();
+    assert!(segments > 1, "the unacknowledged run crosses a roll");
+    drop(log);
+    let (mut log, r) = Log::open(&log_dir).unwrap();
+    assert!(r.cut.is_some());
+    assert_eq!(records(&r), vec![
+        (Position(1), caught_up(1)),
+        (Position(2), ack(1))
+    ]);
+    assert!(r.any_commit);
+    assert_eq!(log.next_position(), Position(3));
+    assert!(log.segment_paths().len() < segments);
+    // The log goes on from the cut, and reopens contiguous.
+    log.append(&commit(5, 10)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.cut, None);
+    assert_eq!(log.next_position(), Position(4));
+    assert_eq!(r.pending().len(), 1);
+}
+
+/// The generation's own commit after the ACK is pending, never cut.
+#[test]
+fn own_commits_after_the_ack_are_kept() {
+    let dir = TempDir::new("log-keep-own");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.append(&commit(1, 10)).unwrap();
+    log.sync().unwrap();
+    drop(log);
+    let (_, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.cut, None);
+    assert_eq!(r.pending().len(), 1);
+}
+
+/// The generation's own pending commits stay when caught-up frames no ACK follows come after
+/// them: only the trailing run of caught-up frames goes.
+#[test]
+fn own_pending_commits_before_a_trailing_caught_up_run_stay() {
+    let dir = TempDir::new("log-cut-after-own");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    for body in [commit(1, 10), commit(2, 10), caught_up(3), caught_up(4)] {
+        log.append(&body).unwrap();
+    }
+    log.sync().unwrap();
+    drop(log);
+    let (log, r) = Log::open(&log_dir).unwrap();
+    assert!(r.cut.is_some());
+    assert_eq!(records(&r), vec![
+        (Position(1), commit(1, 10)),
+        (Position(2), commit(2, 10))
+    ]);
+    assert_eq!(r.pending().len(), 2);
+    assert_eq!(log.next_position(), Position(3));
+}
+
+/// A cut across an empty segment a re-key rolled to brings back the state carried to the cut
+/// point: the later segments the log rolls to name the token before the re-key.
+#[test]
+fn a_cut_across_a_re_key_segment_restores_the_token_before_it() {
+    let dir = TempDir::new("log-cut-rekey");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    for body in [
+        commit(1, 10),
+        RecordBody::Ack {
+            acked: Position(1),
+            acked_offset: Offset::from_u64(10),
+            log_bytes: 0,
+        },
+        caught_up(2),
+    ] {
+        log.append(&body).unwrap();
+    }
+    log.roll_to(token(2)).unwrap();
+    drop(log);
+    let (mut log, r) = Log::open(&log_dir).unwrap();
+    assert!(r.cut.is_some());
+    assert_eq!(r.header.incarnation, header().incarnation);
+    assert_eq!(log.segment_paths().len(), 1);
+    // A roll after the cut carries the restored token.
+    log.set_roll_bytes(1);
+    log.append(&commit(3, 10)).unwrap();
+    log.append(&commit(4, 10)).unwrap();
+    log.sync().unwrap();
+    assert!(log.segment_paths().len() > 1);
+    drop(log);
+    let (_, r) = Log::open(&log_dir).unwrap();
+    assert_eq!(r.header.incarnation, header().incarnation);
+    assert_eq!(r.pending().len(), 2);
+}

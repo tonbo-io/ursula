@@ -158,7 +158,9 @@ describe("a fresh cache", () => {
 		await db.exec("CREATE TABLE pad(i INTEGER PRIMARY KEY, b BLOB)");
 		for (let i = 1; i <= 8; i++) await db.run("INSERT INTO pad VALUES (?, randomblob(3000))", i);
 		// With snapshots due every 4 KiB, more keep coming while the owner commits: wait until the
-		// owner's latest published snapshot is the one HEAD names and no other is due.
+		// owner's latest published snapshot is the one HEAD names and no other is due. Not
+		// `log_bytes === 0`: the bytes after the last snapshot stay below the threshold, so no
+		// snapshot is due for them and they never drop to 0.
 		const head = async (): Promise<{ snapshot: number | null; next: number }> => {
 			const r = await fetch(`${directUrl()}${name}`, { method: "HEAD" });
 			const snapshot = r.headers.get("stream-snapshot-offset");

@@ -126,8 +126,11 @@ pub fn is_marked(head: &[u8], lineage: Lineage) -> bool {
 /// The bytes are those SQLite writes for a new database (`sqlite3BtreeNewDb`), then WAL mode: a
 /// 4096-byte page, file format versions 2 and 2 (WAL), the default payload fractions, one page,
 /// change counter 1, schema format 0 and text encoding 0 (SQLite sets both at the first `CREATE`),
-/// and an empty table b-tree leaf for `sqlite_schema` at byte 100. It is not a commit: the first
-/// commit writes page 1 again (every schema change does), so the stream holds it.
+/// and an empty table b-tree leaf for `sqlite_schema` at byte 100. Bytes 96 to 99, the
+/// `SQLITE_VERSION_NUMBER` of the library that last wrote the file, are deliberately 0: no
+/// library wrote this page, SQLite reads nothing from them, and the first commit writes its own.
+/// It is not a commit: the first commit writes page 1 again (every schema change does), so the
+/// stream holds it.
 pub fn empty_page_one(lineage: Lineage) -> Box<[u8; PAGE]> {
     let mut page = Box::new([0u8; PAGE]);
     let mut put = |at: usize, bytes: &[u8]| {

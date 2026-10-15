@@ -32,6 +32,8 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use ursula_headers::Incarnation;
+
 use super::ACK_INTERVAL_MS;
 use super::Attach;
 use super::Bind;
@@ -58,6 +60,7 @@ use super::disk::NewBuild;
 use super::disk::caught_up;
 use crate::codec::segment::RecordBody;
 use crate::generation::CanonicalPath;
+use crate::generation::Fate;
 use crate::generation::Root;
 use crate::guard;
 use crate::ids::Lineage;
@@ -73,8 +76,10 @@ use crate::open::OpenError;
 use crate::open::OpenSpec;
 use crate::open::OpenStep;
 use crate::open::Opening;
+use crate::open::Published;
 use crate::open::Takeover;
 use crate::open::Unavailable;
+use crate::open::salvage_manifest;
 use crate::replicator::Action;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
@@ -86,6 +91,7 @@ use crate::replicator::RequestId;
 use crate::replicator::ResetKind;
 use crate::replog::Log;
 use crate::replog::LogError;
+use crate::salvage::Reason;
 use crate::transport::Attempt;
 use crate::wire::Exchange;
 use crate::wire::Request;
@@ -648,6 +654,7 @@ impl Core {
                 Action::Apply(frames) => self.apply(binding, frames, now_ms, ios),
                 Action::Rebuild {
                     discard_from,
+                    salvage,
                     to,
                     epoch,
                     activation,
@@ -655,8 +662,14 @@ impl Core {
                     cluster_id,
                 } => {
                     let lineage = self.lineage();
-                    self.rebuild(binding, discard_from, now_ms, ios, |root, name, first| {
-                        NewBuild {
+                    let salvage = salvage.then_some(incarnation);
+                    self.rebuild(
+                        binding,
+                        discard_from,
+                        salvage,
+                        now_ms,
+                        ios,
+                        |root, name, first, fate| NewBuild {
                             root,
                             name,
                             lineage,
@@ -665,8 +678,9 @@ impl Core {
                             first,
                             claim: Some((epoch, activation)),
                             end: to,
-                        }
-                    });
+                            fate,
+                        },
+                    );
                 }
                 Action::Bound { .. } => bound = true,
                 Action::Reset(kind) => return self.reset(binding, kind, now_ms),
@@ -719,14 +733,16 @@ impl Core {
     /// The old generation stays whole until that rename. A rebuild begins only once it is decided:
     /// the replicator found the pending tail diverged from the stream (it is discarded whatever
     /// happens next), or the stream no longer holds what catching it up would read. A failed
-    /// build fails the open and leaves the old generation as it was.
+    /// build fails the open and leaves the old generation as it was. With `salvage` (the stream's
+    /// token), the publish salvages the old generation (`history_changed`) instead of trashing it.
     fn rebuild(
         &mut self,
         binding: BindingId,
         discard_from: Option<Position>,
+        salvage: Option<Incarnation>,
         now_ms: u64,
         ios: &mut Vec<Io>,
-        job: impl FnOnce(Arc<Root>, CanonicalPath, Position) -> NewBuild,
+        job: impl FnOnce(Arc<Root>, CanonicalPath, Position, Fate) -> NewBuild,
     ) {
         let Some(b) = self.bindings.get_mut(&binding) else {
             return;
@@ -743,9 +759,15 @@ impl Core {
         };
         // Positions continue above the last one logged.
         let first = old.log.next_position();
+        let fate = match salvage {
+            Some(stream) => {
+                Fate::Salvage(salvage_manifest(&old, Reason::HistoryChanged, Some(stream)))
+            }
+            None => Fate::Trash,
+        };
         // Its files stay; only this handle on them closes.
         drop(old);
-        let job = job(Arc::clone(root), name, first);
+        let job = job(Arc::clone(root), name, first, fate);
         if let Some(from) = discard_from {
             b.unacked.retain(|(position, _)| *position < from);
         }
@@ -796,6 +818,11 @@ impl Core {
             BuildStep::Done => {
                 *local = Local::Busy;
                 self.disk(Owner::Disk(binding), DiskJob::Publish(build), ios);
+            }
+            // A rebuild reads under its claim: it fails `deleted` instead, so this never comes.
+            BuildStep::Missing => {
+                *local = Local::Idle;
+                self.fail_open(binding, OpenError::Reset(ResetKind::Deleted));
             }
             BuildStep::Fail(e) => {
                 *local = Local::Idle;
@@ -1142,7 +1169,7 @@ impl Core {
                 let step = build.next();
                 self.build_step(binding, build, step, ios);
             }
-            DiskDone::Published(Ok((m, _highest, attach))) => {
+            DiskDone::Published(Ok(Published { m, attach, .. })) => {
                 b.attach = attach;
                 let (last, log_bytes) = caught_up(&m);
                 let lineage = m.generation.lineage;

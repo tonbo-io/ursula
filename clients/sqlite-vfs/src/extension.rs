@@ -261,7 +261,7 @@ unsafe fn fn_status(
 ) {
     // SAFETY: SQLite calls the function with its arguments.
     let path = unsafe { arg(argc, argv, 0) };
-    let outcome = db::bound(&path).map(|b| status::status_json(&b));
+    let outcome = db::bound(&path).and_then(|b| status::status_json(&b));
     // SAFETY: SQLite calls the function with its context.
     unsafe { result(ctx, "ursula_status", outcome.as_ref().map(Clone::clone)) };
 }

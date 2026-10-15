@@ -6,7 +6,10 @@
 //! warning, whatever follows the first broken record: after a power loss the filesystem may keep
 //! later unsynced records and lose an earlier one, and a database user can store bytes that look
 //! like a record inside a commit. That keeps L3, since pages reach the db only after F1 fsyncs the
-//! log, so every record whose pages could be there is in the durable prefix. A gap or a malformed
+//! log, so every record whose pages could be there is in the durable prefix. Stream frames a
+//! catch-up logged with no ACK after them are cut the same way: a catch-up applies its frames only
+//! once that ACK is fsynced, so they were never applied, and the valid log then holds no COMMIT
+//! record after its latest ACK but the generation's own pending ones. A gap or a malformed
 //! record under valid chains fails (`internal`: the extension wrote them), and so does a segment
 //! header of another format or version. Segments are removed from the front (trim, oldest first)
 //! and cut from the back (open deletes the later segments before it truncates), each step made
@@ -22,7 +25,7 @@
 //! there, fsynced. A crash before the CLAIM leaves a latest segment that names the new token, which
 //! the next open reads as the generation's token. A clean close or a reset after the roll and
 //! before the claim lands leaves the same, not only a crash: two history events with no write
-//! between them then name a token from before the roll, and the next open refuses a generation
+//! between them then name a token from before the roll, and the next open salvages a generation
 //! that lost nothing (G18, accepted). A current segment with no record has its header
 //! replaced instead (a temp file renamed over it), since a roll would start at the same position.
 
@@ -158,13 +161,16 @@ pub(crate) struct Recovered {
     pub(crate) claims: Vec<(Epoch, Activation)>,
     /// Every record after `min(base, acked)`, in log order.
     pub(crate) records: Vec<LogRecord>,
+    /// Whether the valid log holds a COMMIT record, at or below `min(base, acked)` included.
+    pub(crate) any_commit: bool,
     /// Where open cut the log, if it did.
     pub(crate) cut: Option<Cut>,
 }
 
 impl Recovered {
-    /// Whether a COMMIT record, the generation's own or a caught-up one, follows the latest ACK:
-    /// materialize applied it, so the db may hold pages past the acknowledged offset.
+    /// Whether a COMMIT record, the generation's own or a caught-up one, follows the latest ACK.
+    /// [`Log::open`] cuts caught-up ones no ACK follows, so only the generation's own remain, but
+    /// a caller deciding whether the history may have lost one checks both.
     pub(crate) fn commit_after_ack(&self) -> bool {
         self.records
             .iter()
@@ -172,7 +178,8 @@ impl Recovered {
     }
 
     /// This generation's COMMIT records after the latest ACK: logged, not acknowledged. Stream
-    /// frames a catch-up logged carry another lineage and are never pending.
+    /// frames a catch-up logged carry another lineage and are never pending: an ACK follows them,
+    /// or [`Log::open`] cut them.
     pub(crate) fn pending(&self) -> Vec<(Position, Arc<[u8]>)> {
         self.records
             .iter()
@@ -371,6 +378,11 @@ impl Log {
         let mut next = Position(0);
         let mut cut: Option<Cut> = None;
         let mut removed = Vec::new();
+        // Per record: the index of its segment in `kept`, where it starts, and the chain before it.
+        let mut marks: Vec<(usize, u64, u32)> = Vec::new();
+        // Per kept segment: its header and the header's length.
+        let mut heads: Vec<(SegmentHeader, u64)> = Vec::new();
+        let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         for segment in listed {
             if cut.is_some() {
                 removed.push(segment);
@@ -419,6 +431,7 @@ impl Log {
             let mut end = scanned.header_len;
             next = scanned.header.first_position;
             for r in scanned.records {
+                marks.push((kept.len(), to_u64(end), chain));
                 carry(&mut carried, &r.body);
                 if let RecordBody::Claim { epoch, activation } = r.body {
                     claims.push((epoch, activation));
@@ -431,7 +444,6 @@ impl Log {
                     body: r.body,
                 });
             }
-            let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
             match scanned.tail {
                 Tail::Clean => {}
                 Tail::Torn { at } => {
@@ -460,6 +472,7 @@ impl Log {
                     });
                 }
             }
+            heads.push((scanned.header.clone(), to_u64(scanned.header_len)));
             current = Some((
                 scanned.header,
                 to_u64(end),
@@ -468,6 +481,49 @@ impl Log {
             ));
             state = Some(carried);
             kept.push(segment);
+        }
+        // Stream frames a catch-up logged with no ACK after them were never applied: a catch-up
+        // applies its frames only once the ACK after them is fsynced, and nothing logs a record
+        // between them. They are the log's last records, and go like a torn tail, so the log
+        // holds no COMMIT record after its latest ACK but the generation's own pending ones. The
+        // state carried to the cut point comes back with them: a later segment (an empty one a
+        // re-key rolled to, say) may name another token.
+        if let Some((acked, lineage)) = state.as_ref().map(|st| (st.acked, st.lineage)) {
+            let unapplied = |r: &LogRecord| {
+                r.position > acked
+                    && matches!(&r.body, RecordBody::Commit { frame } if foreign(frame, lineage))
+            };
+            let keep = records
+                .iter()
+                .rposition(|r| !unapplied(r))
+                .map_or(0, |i| i.saturating_add(1));
+            if let (Some(&(seg, start, before)), Some(first)) =
+                (marks.get(keep), records.get(keep).map(|r| r.position))
+                && let (Some((h, header_len)), Some(path)) = (
+                    heads.get(seg).cloned(),
+                    kept.get(seg).map(|k| k.path.clone()),
+                )
+            {
+                let later = kept.split_off(seg.saturating_add(1));
+                removed.splice(0..0, later);
+                let mut carried = h.clone();
+                for (r, _) in records
+                    .iter()
+                    .zip(&marks)
+                    .take(keep)
+                    .filter(|(_, m)| m.0 == seg)
+                {
+                    carry(&mut carried, &r.body);
+                }
+                state = Some(carried);
+                current = Some((h, start, header_len, before));
+                next = first;
+                records.truncate(keep);
+                cut = Some(Cut {
+                    segment: path,
+                    at: start,
+                });
+            }
         }
         let (Some((header, len, header_len, chain)), Some(mut state), Some(last)) =
             (current, state, kept.last())
@@ -515,6 +571,9 @@ impl Log {
         // The current segment's identity with the state at the end of the log.
         state.first_position = header.first_position;
         state.supersedes = header.supersedes;
+        let any_commit = records
+            .iter()
+            .any(|r| matches!(r.body, RecordBody::Commit { .. }));
         records.retain(|r| r.position > min);
         let recovered = Recovered {
             base: state.base,
@@ -524,6 +583,7 @@ impl Log {
             claim: state.claim,
             claims,
             records,
+            any_commit,
             cut,
             header,
         };
