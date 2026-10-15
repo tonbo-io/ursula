@@ -77,6 +77,11 @@ type ChunkGuard = (String, (u64, u64), Vec<(u64, u64)>);
 /// covered, the first uncovered range (RT6).
 type ExternalGuard = (String, Option<(u64, u64)>);
 
+/// The most snapshot parts a cycle lists in one part directory. A tenant
+/// can stage parts cheaply, so a cycle bounds what it lists and handles;
+/// the rest wait for the next cycle.
+pub const COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR: usize = 4096;
+
 /// Default age below which the sweep never deletes an object.
 pub const COLD_ORPHAN_SWEEP_GRACE_MS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -137,7 +142,11 @@ impl ShardRuntime {
         // its stream lives or not: no state ever references one (#581
         // section 3.1).
         for dir in &listing_plan.part_dirs {
-            for name in cold_store.list_file_names(dir).await.map_err(cold_io)? {
+            for name in cold_store
+                .list_file_names_up_to(dir, COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR)
+                .await
+                .map_err(cold_io)?
+            {
                 if is_snapshot_part_object_name(&name) {
                     aged.push((format!("{dir}{name}"), name));
                 }

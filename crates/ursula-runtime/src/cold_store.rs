@@ -819,6 +819,13 @@ impl ColdStore {
     /// in `/`), without recursing into subdirectories. Stream GC uses it so a
     /// sweep never reaches another stream's namespace (F14g).
     pub async fn list_file_names(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.list_file_names_up_to(dir, usize::MAX).await
+    }
+
+    /// The names of at most `max` files directly in `dir`, sorted. The
+    /// listing stops at `max`, page by page, so a directory a tenant can
+    /// grow costs a bounded listing.
+    pub async fn list_file_names_up_to(&self, dir: &str, max: usize) -> io::Result<Vec<String>> {
         self.count_list_request();
         let mut lister = self
             .operator
@@ -826,10 +833,11 @@ impl ColdStore {
             .await
             .map_err(|err| cold_store_io_error(dir, err))?;
         let mut names = Vec::new();
-        while let Some(entry) = lister
-            .try_next()
-            .await
-            .map_err(|err| cold_store_io_error(dir, err))?
+        while names.len() < max
+            && let Some(entry) = lister
+                .try_next()
+                .await
+                .map_err(|err| cold_store_io_error(dir, err))?
         {
             if entry.metadata().mode() != EntryMode::FILE {
                 continue;
@@ -1759,12 +1767,13 @@ pub fn snapshot_part_path(
     owner.update(b"\0");
     owner.update(&incarnation.to_le_bytes());
     let digest = owner.finalize();
-    let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(digest.as_bytes().get(..8).unwrap_or(&[0; 8]));
+    let owner = digest
+        .as_bytes()
+        .first_chunk::<8>()
+        .map_or(0, |prefix| u64::from_be_bytes(*prefix));
     format!(
-        "{}{:016x}-{id}",
+        "{}{owner:016x}-{id}",
         snapshot_part_dir(&stream_id.bucket_id, raft_group_id),
-        u64::from_be_bytes(prefix)
     )
 }
 
