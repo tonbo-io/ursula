@@ -52,7 +52,13 @@ use crate::wire::RawAnswer;
 /// first batch is in flight.
 fn streaming(n: u64) -> Harness {
     let pending = (1..=n).map(|p| commit(LINEAGE, p, 1)).collect();
-    let (mut h, actions) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(pending, 0));
+    let (mut h, actions) = Harness::activate(
+        ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        },
+        local(pending, 0),
+    );
     assert!(matches!(actions.first(), Some(Action::PersistClaim { .. })));
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, 37, None)));
     assert!(matches!(h.replicator, Replicator::Streaming { .. }));
@@ -108,7 +114,13 @@ fn a_batch_ends_exactly_at_a_boundary_and_within_the_limit() {
         u64::try_from(pending[0].frame.len() + pending[1].frame.len() + pending[2].frame.len())
             .unwrap(),
     );
-    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, state);
+    let (mut h, _) = Harness::activate(
+        ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        },
+        state,
+    );
     h.on(Event::Boundary(Position(2)));
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, 37, None)));
     let body = h.last_request().body.clone();
@@ -354,7 +366,13 @@ fn producer_expired_claims_exactly_own_plus_one_after_persisting_it() {
 
 #[test]
 fn a_takeover_retries_above_every_epoch_seen_then_gives_up() {
-    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(Vec::new(), 0));
+    let (mut h, _) = Harness::activate(
+        ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        },
+        local(Vec::new(), 0),
+    );
     let actions = h.answer(&producer(&ProducerAnswer::ProducerExpired {
         epoch: epoch(40),
     }));
@@ -541,7 +559,13 @@ fn an_oversized_first_frame_blocks_without_sending() {
     let pending = vec![commit(LINEAGE, 1, 1)];
     let mut state = local(pending, 0);
     state.configured_max_request_bytes = Some(4);
-    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, state);
+    let (mut h, _) = Harness::activate(
+        ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        },
+        state,
+    );
     let actions = h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, 37, None)));
     assert!(sends(&actions).is_empty());
     assert_eq!(
@@ -602,7 +626,13 @@ fn a_stale_probe_never_reads_our_own_acknowledged_batch_as_foreign() {
 fn a_ticket_on_a_claim_or_ack_position_waits_only_for_the_commits_below_it() {
     // Records 1 and 3 are commits; position 4 is, say, the ACK after them.
     let pending = vec![commit(LINEAGE, 1, 1), commit(LINEAGE, 3, 1)];
-    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(pending, 0));
+    let (mut h, _) = Harness::activate(
+        ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        },
+        local(pending, 0),
+    );
     h.on(Event::Sync {
         ticket: 2,
         target: Position(2),
@@ -675,6 +705,51 @@ fn a_probe_that_succeeds_beside_a_blocked_append_keeps_its_condition() {
     );
 }
 
+/// The probe meets a history that inherits everything acknowledged: its HEAD re-keys the
+/// generation, the blocked append and the probe go, and a continuation claims `own + 1` under the
+/// new token (design §6.2).
+#[test]
+fn a_probe_whose_head_names_an_inheriting_history_re_keys() {
+    let (mut h, tail) = blocked_with_a_probe();
+    let new = ursula_headers::Incarnation::try_from((1 << 52) | 8).unwrap();
+    let mut mismatch = RawAnswer::new(IncarnationMismatch::STATUS);
+    IncarnationMismatch { current: Some(new) }.render(mismatch.emit());
+    h.answer(&mismatch);
+    assert_eq!(h.last_request().method, Method::Head);
+    let mut inheriting = RawAnswer::new(200);
+    ServerIdentity::current(cluster()).render(inheriting.emit());
+    StreamHead::new(new, off(tail), off(0), 1 << 20)
+        .unwrap()
+        .with_inherited(Some(ursula_headers::Inherited {
+            previous_incarnation: token(),
+            offset: off(tail),
+        }))
+        .unwrap()
+        .render(inheriting.emit());
+    let actions = h.answer(&inheriting);
+    // The blocked condition clears, and the CLAIM record is logged before the claim goes.
+    assert_eq!(
+        actions.first(),
+        Some(&Action::Condition(None)),
+        "{actions:?}"
+    );
+    assert_eq!(
+        actions.get(1),
+        Some(&Action::ReKey {
+            incarnation: new,
+            epoch: epoch(2),
+            activation: ACTIVATION,
+        }),
+        "{actions:?}"
+    );
+    let claim = h.last_request().keys.producer.clone().unwrap();
+    assert_eq!((claim.epoch, claim.seq), (epoch(2), super::seq(0)));
+    assert!(matches!(h.replicator, Replicator::Activating {
+        kind: ClaimKind::Continuation { .. },
+        ..
+    }));
+}
+
 #[test]
 fn a_probe_that_fails_beside_a_blocked_append_keeps_its_condition() {
     let (mut h, _) = blocked_with_a_probe();
@@ -715,7 +790,13 @@ fn a_410_on_a_fresh_probe_fences() {
 
 #[test]
 fn a_commit_logged_while_catching_up_resets_internal() {
-    let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(Vec::new(), 0));
+    let (mut h, _) = Harness::activate(
+        ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        },
+        local(Vec::new(), 0),
+    );
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 500, 537, None)));
     h.answer(&RawAnswer::new(410));
     let actions = h.answer(&super::head_naming(None, 537));

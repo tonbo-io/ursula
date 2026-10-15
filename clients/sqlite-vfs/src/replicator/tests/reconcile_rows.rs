@@ -46,9 +46,16 @@ use crate::wire::Target;
 const FOREIGN: Activation = Activation([0xf0; 16]);
 const OTHER_LINEAGE: Lineage = Lineage([0x22; 16]);
 
-const KINDS: [ClaimKind; 2] = [ClaimKind::Takeover { round: 1 }, ClaimKind::Continuation {
-    own: ursula_headers::Epoch::ZERO,
-}];
+const KINDS: [ClaimKind; 2] = [
+    ClaimKind::Takeover {
+        round: 1,
+        rekeyed: false,
+    },
+    ClaimKind::Continuation {
+        own: ursula_headers::Epoch::ZERO,
+        rekeyed: false,
+    },
+];
 
 /// Activates `kind` with pending records 1 and 2 from offset 0, wins the claim at the end of
 /// `stream`, and answers the reconcile's read with `read_answer` (the stream by default).

@@ -2,9 +2,12 @@
 //! request itself (design §4.6, §4.7). It resends the identical request after backoff, doubling
 //! from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped at
 //! 60 s); retries a blocked request every 30 s; and parks the request while a HEAD checks the
-//! stream's token, cluster and limit.
+//! stream's token, cluster and limit. A HEAD naming a history that inherits the generation hands
+//! the re-key to the replicator ([`HeadOutcome::ReKey`]).
 
 use std::time::Duration;
+
+use ursula_headers::Incarnation;
 
 use super::Action;
 use super::BlockedReason;
@@ -15,7 +18,6 @@ use super::ResetKind;
 use super::answer::Common;
 use super::answer::HeadDecision;
 use super::answer::HeadReason;
-use super::answer::decide_head;
 use crate::transport::Attempt;
 use crate::wire::Exchange;
 use crate::wire::Method;
@@ -50,6 +52,29 @@ pub(crate) enum Hit {
     Head,
     /// Neither: a late or duplicate answer, ignored.
     None,
+}
+
+/// What the answer to the HEAD a request waits on leads to (design §4.7, §6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadOutcome {
+    /// The request waits: retried after backoff, blocked, or the HEAD itself is retried.
+    Waiting,
+    /// The stream has another token whose history inherits the generation: the replicator
+    /// re-keys to it, and this request goes.
+    ReKey {
+        to: Incarnation,
+        from: Incarnation,
+    },
+    Reset(ResetKind),
+}
+
+impl From<Result<(), ResetKind>> for HeadOutcome {
+    fn from(result: Result<(), ResetKind>) -> Self {
+        match result {
+            Ok(()) => Self::Waiting,
+            Err(kind) => Self::Reset(kind),
+        }
+    }
 }
 
 /// The retry rules of one request, without the replicator's state: backoff doubling from 25 ms to
@@ -273,26 +298,40 @@ impl Link {
         self.carry(next, ctx, actions)
     }
 
-    /// The answer to the HEAD this request waits on. `Err` is a reset.
+    /// The answer to the HEAD this request waits on.
     pub(crate) fn head_answer(
         &mut self,
         exchange: &Exchange,
         now_ms: u64,
         ctx: &mut Ctx,
         actions: &mut Vec<Action>,
-    ) -> Result<(), ResetKind> {
+    ) -> HeadOutcome {
         let LinkState::Checking { head, reason } = &mut self.state else {
-            return Ok(());
+            return HeadOutcome::Waiting;
         };
         let reason = *reason;
-        match decide_head(exchange, &ctx.cluster_id, ctx.incarnation) {
-            HeadDecision::Rewound => Err(ResetKind::Rewound),
-            HeadDecision::Deleted => Err(ResetKind::Deleted),
-            HeadDecision::WrongCluster => self.carry(
-                Policy::block(BlockedReason::WrongCluster, now_ms),
-                ctx,
-                actions,
-            ),
+        match ctx.head_decision(exchange) {
+            HeadDecision::Rewound => HeadOutcome::Reset(ResetKind::Rewound),
+            HeadDecision::Deleted => HeadOutcome::Reset(ResetKind::Deleted),
+            HeadDecision::WrongCluster => self
+                .carry(
+                    Policy::block(BlockedReason::WrongCluster, now_ms),
+                    ctx,
+                    actions,
+                )
+                .into(),
+            HeadDecision::ReKey {
+                incarnation,
+                from,
+                max_request_bytes,
+            } => {
+                ctx.limits.head = max_request_bytes;
+                ctx.limits.named = None;
+                HeadOutcome::ReKey {
+                    to: incarnation,
+                    from,
+                }
+            }
             HeadDecision::Same { max_request_bytes } => {
                 ctx.limits.head = max_request_bytes;
                 ctx.limits.named = None;
@@ -304,7 +343,7 @@ impl Link {
                     // No re-cut in M1, whatever the advertised limit.
                     HeadReason::TooLarge => Policy::block(BlockedReason::RequestTooLarge, now_ms),
                 };
-                self.carry(next, ctx, actions)
+                self.carry(next, ctx, actions).into()
             }
             HeadDecision::Common(common) => {
                 // The HEAD's own failure: a HEAD never waits on another HEAD.
@@ -322,6 +361,7 @@ impl Link {
                     Exchange::NoAnswer(_) => None,
                 };
                 head.common(common, retry_after, now_ms, ctx, actions)
+                    .into()
             }
         }
     }

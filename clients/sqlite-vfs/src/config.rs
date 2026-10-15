@@ -60,8 +60,8 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
     PANIC_IN_FOR_TESTS.set(entry);
 }
 
-/// A step of the commit path or of a checkpoint that `URSULA_VFS_ABORT_AT` can stop the process at
-/// (design §4.1, §4.3).
+/// A step of the commit path, of a checkpoint or of a re-key that `URSULA_VFS_ABORT_AT` can stop
+/// the process at (design §4.1, §4.3, §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     /// A write transaction's first WAL write, admitted.
@@ -88,6 +88,10 @@ pub(crate) enum Step {
     BaseSynced,
     /// F2: the BASE record written.
     Based,
+    /// A re-key: the log rolled to the segment naming the new token, before its CLAIM record.
+    RekeyRolled,
+    /// A re-key: the CLAIM record fsynced in the new segment, before the claim goes out.
+    RekeyClaimed,
 }
 
 impl Step {
@@ -105,6 +109,8 @@ impl Step {
             Step::BaseStart => "base_start",
             Step::BaseSynced => "base_synced",
             Step::Based => "based",
+            Step::RekeyRolled => "rekey_rolled",
+            Step::RekeyClaimed => "rekey_claimed",
         }
     }
 }

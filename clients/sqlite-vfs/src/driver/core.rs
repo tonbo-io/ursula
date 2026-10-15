@@ -6,10 +6,13 @@
 //! back through [`Core::disk_done`]. [`Core::tick`] runs whatever [`Core::next_deadline`] named.
 //! The core carries out the replicator's actions in order:
 //!
-//! - A CLAIM record is appended and fsynced before anything after it, its send among them.
+//! - A CLAIM record is appended and fsynced before anything after it, its send among them. A
+//!   re-key rolls the log to a segment naming the new token first, and the binding's token
+//!   follows it (design §6.2).
 //! - ACK records are written lazily, at most once a second ([`ACK_INTERVAL_MS`]), and whenever a
-//!   binding resets or retires; during an open they are written at once. After an ACK, a log of
-//!   more than one segment is trimmed (F3).
+//!   binding resets or retires; during an open they are written at once. A `rewound` reset also
+//!   fsyncs its ACK, so the next open tests inheritance against the exact acknowledged offset.
+//!   After an ACK, a log of more than one segment is trimmed (F3).
 //! - A takeover's catch-up in place and its rebuild (after a divergence or a `410`) are disk jobs;
 //!   then [`Event::CaughtUp`] names the last position the frames took, and the replicator binds
 //!   ([`Action::Bound`]). A catch-up in place goes read by read, each answered before the
@@ -475,7 +478,11 @@ impl Core {
         // Everything up to the acknowledged position is a commit or older; the pending commits
         // follow it.
         let last_commit = local.pending.last().map_or(local.acked, |p| p.id.position);
-        let (replicator, actions) = Replicator::activate(ClaimKind::Takeover { round: 1 }, local);
+        let kind = ClaimKind::Takeover {
+            round: 1,
+            rekeyed: false,
+        };
+        let (replicator, actions) = Replicator::activate(kind, local);
         let binding = BindingId(self.id());
         self.bindings.insert(binding, Binding {
             url: Arc::from(spec.url.as_str()),
@@ -574,6 +581,20 @@ impl Core {
                     });
                     if let Err(e) = written {
                         return self.local_damage(binding, &e, now_ms);
+                    }
+                }
+                Action::ReKey {
+                    incarnation,
+                    epoch,
+                    activation,
+                } => {
+                    // Durable before any later action, its send among them.
+                    let rekeyed = b.with_log(|log| log.rekey(incarnation, epoch, activation));
+                    if let Err(e) = rekeyed {
+                        return self.local_damage(binding, &e, now_ms);
+                    }
+                    if let Some(handle) = b.handle() {
+                        handle.set_incarnation(incarnation);
                     }
                 }
                 Action::PersistAck {
@@ -819,22 +840,54 @@ impl Core {
 
     /// The binding resets: its latest ACK is written, its tickets fail, and it retires. Its root
     /// unlocks once the last handle drops. During an open, the open fails.
+    ///
+    /// A `rewound` reset also fsyncs the log, so the next open tests inheritance against the exact
+    /// acknowledged offset (design §6.2, D5): an ACK lost to a power loss would let it re-key a
+    /// generation that lost data. When that fsync fails the reset is `local_damage` instead.
     fn reset(&mut self, binding: BindingId, kind: ResetKind, now_ms: u64) {
-        if matches!(
-            self.bindings.get(&binding).map(|b| &b.stage),
-            Some(Stage::Opening { .. })
-        ) {
+        let Some(b) = self.bindings.get_mut(&binding) else {
+            return;
+        };
+        let opening = matches!(b.stage, Stage::Opening { .. });
+        let written = if opening {
+            // An open writes its ACKs at once. A disk job that holds the log fsyncs it before it
+            // returns.
+            match kind {
+                ResetKind::Rewound => match b.with_log(Log::sync) {
+                    Err(LocalFailure::Busy) => Ok(()),
+                    other => other,
+                },
+                _ => Ok(()),
+            }
+        } else {
+            b.write_ack(now_ms).and_then(|()| match kind {
+                ResetKind::Rewound => b.with_log(Log::sync),
+                _ => Ok(()),
+            })
+        };
+        let kind = match written {
+            Ok(()) => kind,
+            Err(e) if kind == ResetKind::Rewound => {
+                log::emit(Level::Error, "local_damage", &[
+                    ("binding", &binding.0),
+                    ("error", &e),
+                ]);
+                ResetKind::LocalDamage
+            }
+            Err(e) => {
+                log::emit(Level::Warn, "ack_lost", &[
+                    ("binding", &binding.0),
+                    ("error", &e),
+                ]);
+                kind
+            }
+        };
+        if opening {
             return self.fail_open(binding, OpenError::Reset(kind));
         }
         let Some(mut b) = self.bindings.remove(&binding) else {
             return;
         };
-        if let Err(e) = b.write_ack(now_ms) {
-            log::emit(Level::Warn, "ack_lost", &[
-                ("binding", &binding.0),
-                ("error", &e),
-            ]);
-        }
         // Its waiting tickets fail with the binding's one `Reset` event.
         b.tickets.clear();
         match b.stage {

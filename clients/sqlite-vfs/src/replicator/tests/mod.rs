@@ -4,12 +4,13 @@
 )]
 //! Tests of the replicator: one per row of both answer tables of design §4.7
 //! ([`answer_rows`]), one per row of the reconcile table of §4.9 ([`reconcile_rows`]), the
-//! machine's own rules ([`machine`]), and the proptest world against the model server
-//! ([`world`]).
+//! machine's own rules ([`machine`]), re-keys across a history the stream inherits ([`rekey`]),
+//! and the proptest world against the model server ([`world`]).
 
 mod answer_rows;
 mod machine;
 mod reconcile_rows;
+mod rekey;
 mod world;
 
 use std::sync::Arc;
@@ -112,6 +113,12 @@ pub(crate) fn local(pending: Vec<Pending>, acked_offset: u64) -> LocalState {
         max_request_bytes: 32 << 20,
         configured_max_request_bytes: None,
         db_bytes: u64::MAX,
+        rekey_from: None,
+        unacked: if logged > acked {
+            crate::replicator::answer::Unacked::Commits
+        } else {
+            crate::replicator::answer::Unacked::Nothing
+        },
     }
 }
 

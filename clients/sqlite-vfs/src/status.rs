@@ -120,6 +120,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
     ]);
     let attach = match h.attach {
         Attach::Resumed => object(&[("local", json_str("resumed")), ("snapshot_offset", null())]),
+        Attach::ReKeyed => object(&[("local", json_str("rekeyed")), ("snapshot_offset", null())]),
         Attach::Built { snapshot } => object(&[
             ("local", json_str("built")),
             (
@@ -166,7 +167,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
             replication.epoch.map_or_else(null, |e| e.to_string()),
         ),
         ("cluster_id", json_str(&h.cluster_id)),
-        ("incarnation", json_str(&h.incarnation.to_string())),
+        ("incarnation", json_str(&h.incarnation().to_string())),
         ("lineage", json_str(&lineage)),
         ("commits", commits),
         ("replication", repl),

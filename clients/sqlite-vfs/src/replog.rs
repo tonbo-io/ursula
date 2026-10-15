@@ -17,6 +17,14 @@
 //! record goes there, so no record of a later segment outlives an earlier one's. [`Log::trim`]
 //! deletes the segments whose records are all at or below `min(base, acked)` (F3), after an fsync
 //! that makes those records durable, and does nothing (no fsync) when no segment would go.
+//! [`Log::rekey`] re-keys the generation to a new stream token (design §5.2, §6.2): the log rolls to
+//! a segment whose header names the token, and the CLAIM record of the claim that follows goes
+//! there, fsynced. A crash before the CLAIM leaves a latest segment that names the new token, which
+//! the next open reads as the generation's token. A clean close or a reset after the roll and
+//! before the claim lands leaves the same, not only a crash: two history events with no write
+//! between them then name a token from before the roll, and the next open refuses a generation
+//! that lost nothing (G18, accepted). A current segment with no record has its header
+//! replaced instead (a temp file renamed over it), since a roll would start at the same position.
 
 use std::fs::File;
 use std::fs::{self};
@@ -26,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ursula_headers::Epoch;
+use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 
 use crate::codec::frame::Decoded;
@@ -38,6 +47,8 @@ use crate::codec::segment::Tail;
 use crate::codec::segment::encode_header;
 use crate::codec::segment::encode_record;
 use crate::codec::segment::scan;
+use crate::config::Step;
+use crate::config::abort_at;
 use crate::ids::Activation;
 use crate::ids::Lineage;
 use crate::ids::Position;
@@ -152,6 +163,14 @@ pub(crate) struct Recovered {
 }
 
 impl Recovered {
+    /// Whether a COMMIT record, the generation's own or a caught-up one, follows the latest ACK:
+    /// materialize applied it, so the db may hold pages past the acknowledged offset.
+    pub(crate) fn commit_after_ack(&self) -> bool {
+        self.records
+            .iter()
+            .any(|r| r.position > self.acked && matches!(r.body, RecordBody::Commit { .. }))
+    }
+
     /// This generation's COMMIT records after the latest ACK: logged, not acknowledged. Stream
     /// frames a catch-up logged carry another lineage and are never pending.
     pub(crate) fn pending(&self) -> Vec<(Position, Arc<[u8]>)> {
@@ -621,13 +640,72 @@ impl Log {
         Ok(())
     }
 
+    /// Re-keys the generation to `incarnation` (design §6.2): a new segment naming it, holding the
+    /// CLAIM record of `(epoch, activation)`, fsynced before this returns. A current segment with
+    /// no record has its header replaced instead, atomically. Returns the CLAIM's position.
+    pub(crate) fn rekey(
+        &mut self,
+        incarnation: Incarnation,
+        epoch: Epoch,
+        activation: Activation,
+    ) -> Result<Position, LogError> {
+        if self.broken {
+            return Err(LogError::Broken {
+                dir: self.dir.clone(),
+            });
+        }
+        if self.len > self.header_len {
+            self.roll_to(incarnation)?;
+        } else {
+            self.replace_header(incarnation)?;
+        }
+        abort_at(Step::RekeyRolled);
+        let position = self.append(&RecordBody::Claim { epoch, activation })?;
+        self.sync()?;
+        abort_at(Step::RekeyClaimed);
+        Ok(position)
+    }
+
+    /// Replaces the header of the current segment, which holds no record, by one naming
+    /// `incarnation`: written to a temp file, fsynced, renamed over the segment, and the directory
+    /// fsynced. A crash leaves the old header or the new one, and at most a temp file, which no
+    /// listing reads.
+    fn replace_header(&mut self, incarnation: Incarnation) -> Result<(), LogError> {
+        let path = self.current_path();
+        let temp = path.with_extension("usl.tmp");
+        let mut h = self.state.clone();
+        h.incarnation = incarnation;
+        match fs::remove_file(&temp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io("remove", &temp)(e)),
+        }
+        let (file, header_len, seed) = write_segment(&temp, &h)?;
+        fs::rename(&temp, &path).map_err(io("rename", &path))?;
+        sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
+        self.file = file;
+        self.len = header_len;
+        self.header_len = header_len;
+        self.chain = seed;
+        self.state = h;
+        self.dirty = false;
+        Ok(())
+    }
+
     /// Starts a new segment at the next position, carrying the state over: the segment left is
     /// fdatasynced first, the new one and the directory fsynced before it takes a record.
     fn roll(&mut self) -> Result<(), LogError> {
+        let incarnation = self.state.incarnation;
+        self.roll_to(incarnation)
+    }
+
+    /// [`Log::roll`] to a segment whose header names `incarnation`.
+    fn roll_to(&mut self, incarnation: Incarnation) -> Result<(), LogError> {
         self.sync()?;
         let mut h = self.state.clone();
         h.first_position = self.next;
         h.supersedes = None;
+        h.incarnation = incarnation;
         let segment = Segment {
             first: self.next,
             path: segment_path(&self.dir, self.next),

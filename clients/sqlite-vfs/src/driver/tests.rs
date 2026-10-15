@@ -5,9 +5,11 @@
 //! Tests of the driver: [`Core`]s against the model server in a virtual-time world with real log
 //! and generation files in a temp dir, and the runtime over the model in process.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -131,6 +133,9 @@ struct World {
     held: Vec<(usize, DiskIo)>,
     /// Runs on the server after the next HEAD it answers.
     after_head: Option<ServerHook>,
+    /// Another deployment, which every request reaches while `misrouted`.
+    other: ModelServer,
+    misrouted: bool,
     next_id: u64,
     /// The binding of each ticket `sync_to` handed out.
     tickets: HashMap<Ticket, BindingId>,
@@ -147,6 +152,8 @@ impl World {
             sent: Vec::new(),
             legacy: false,
             after_head: None,
+            other: ModelServer::new(ClusterId::new("cluster-b").unwrap(), 9),
+            misrouted: false,
             hold: None,
             held: Vec::new(),
             next_id: 1,
@@ -189,6 +196,13 @@ impl World {
         }
         if self.legacy && request.method == Method::Head {
             return Exchange::Answered(Box::new(RawAnswer::new(200).parse(request)));
+        }
+        if self.misrouted {
+            let delivered = self.other.exchange(PATH, request);
+            let Delivered::Answered { answer, .. } = delivered else {
+                panic!("the other deployment answers");
+            };
+            return Exchange::Answered(Box::new(answer.parse(request)));
         }
         let delivered = self.server.exchange(PATH, request);
         if request.method == Method::Head
@@ -476,6 +490,19 @@ fn kind(result: Result<Bound, Arc<OpenError>>) -> Arc<OpenError> {
         Ok(_) => panic!("the open succeeded"),
         Err(e) => e,
     }
+}
+
+/// The token each log segment of the generation at `dir` names, in order.
+fn segment_tokens(gen_dir: &Path) -> Vec<ursula_headers::Incarnation> {
+    let mut segments: Vec<_> = std::fs::read_dir(gen_dir.join("log"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    segments.sort();
+    segments
+        .iter()
+        .map(|s| scan(&std::fs::read(s).unwrap()).unwrap().header.incarnation)
+        .collect()
 }
 
 /// The records of every log segment of the generation at `dir`.
@@ -960,9 +987,12 @@ fn publish_file(
     let transport = ModelTransport::new(Arc::clone(server), PATH);
     let snapper = crate::snapshotter::Snapper::default();
     crate::snapshotter::publish(&crate::snapshotter::Publish {
-        transport: &transport,
-        snapper: &snapper,
-        incarnation: token,
+        remote: crate::snapshotter::Remote {
+            transport: &transport,
+            snapper: &snapper,
+            cluster_id: "cluster-a",
+            incarnation: token,
+        },
         request_limit,
         offset: body.offset,
         digest: body.digest,
@@ -1492,12 +1522,168 @@ fn reset_after(change: impl FnOnce(&mut ModelServer)) -> Vec<ResetKind> {
     resets
 }
 
+/// A history event that loses nothing while bound: the append meets the new token, the HEAD
+/// shows the history inherits the generation, and it re-keys (design §6.2). The log rolls to a
+/// segment naming the new token with the claim of `own + 1`, the binding takes the token, the
+/// pending commit is resent under the new epoch, and `synced()` resolves with no reset.
 #[test]
-fn a_412_confirmed_by_head_resets_rewound() {
+fn an_inheriting_history_re_keys_without_a_reset() {
+    let dir = TempDir::new("driver-rekey");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let c1 = w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let before = bound.handle.incarnation();
+    let own = *w.claims(c).last().unwrap();
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let c2 = w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(10_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(w.resets(c).is_empty());
+    let token = w.server.token(PATH).unwrap();
+    assert_ne!(token, before);
+    assert_eq!(bound.handle.incarnation(), token);
+    assert_eq!(w.claims(c), vec![
+        own,
+        Epoch::try_from(own.get() + 1).unwrap()
+    ]);
+    assert_eq!(w.stream_commits(), vec![c1, c2.clone()]);
+    // The resent commit went out under the new epoch, from seq 1.
+    let (epoch, seq, body) = w.appends(c).last().cloned().unwrap();
+    assert_eq!((epoch.get(), seq, body), (own.get() + 1, 1, c2));
+    assert_eq!(segment_tokens(&bound.handle.generation.dir), vec![
+        before, token
+    ]);
+}
+
+/// A restore that lost an acknowledged commit resets the binding `rewound` once its HEAD shows
+/// the history does not inherit the generation, and its latest ACK names the exact acknowledged
+/// offset, fsynced, so the next open's test fails the same way (design §6.2, D5).
+#[test]
+fn a_lossy_restore_resets_rewound_and_the_reopen_is_refused() {
+    let dir = TempDir::new("driver-rewound");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let checkpoint = w.server.checkpoint();
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let acked = bound.handle.acked();
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(10_000);
+    assert_eq!(w.resets(c), vec![ResetKind::Rewound]);
     assert_eq!(
-        reset_after(|s| s.history_event(HistoryEvent::NewHistory).unwrap()),
-        vec![ResetKind::Rewound]
+        w.outcome(c, ticket),
+        Some(Err(SyncError::Reset(ResetKind::Rewound)))
     );
+    let generation = bound.handle.generation.dir.clone();
+    let last_ack = log_records(&generation)
+        .into_iter()
+        .rev()
+        .find_map(|r| match r {
+            RecordBody::Ack { acked, .. } => Some(acked),
+            _ => None,
+        });
+    assert_eq!(last_ack, Some(acked));
+    drop(bound);
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(
+        matches!(
+            &*e,
+            OpenError::StreamState(StreamState::TokenChanged { .. })
+        ),
+        "{e}"
+    );
+    assert!(generation.exists());
+}
+
+/// A misrouted request meets another deployment: the HEAD names another cluster, the binding
+/// blocks `wrong_cluster` with no reset, nothing applies there, and the binding resumes once the
+/// route is fixed (design §6.3).
+#[test]
+fn a_misroute_blocks_and_then_resumes() {
+    let dir = TempDir::new("driver-misroute");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.misrouted = true;
+    let c2 = w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(5_000);
+    let condition = bound.handle.replication().condition;
+    assert_eq!(
+        condition,
+        Some(crate::replicator::Condition::Blocked(
+            crate::replicator::BlockedReason::WrongCluster
+        ))
+    );
+    assert!(w.resets(c).is_empty());
+    assert_eq!(w.outcome(c, ticket), None);
+    assert!(w.other.frames(PATH).is_none());
+    w.misrouted = false;
+    w.run_for(31_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert!(w.resets(c).is_empty());
+    assert_eq!(bound.handle.replication().condition, None);
+    assert_eq!(w.stream_commits().last(), Some(&c2));
+}
+
+/// After a re-key the binding's token is the new one, and a snapshot publish under it succeeds;
+/// one under the old token, or answered as another deployment, fails without stopping snapshots
+/// (design §6.2, G9).
+#[test]
+fn snapshots_publish_under_the_new_token_and_a_stale_token_is_transient() {
+    let (server, old) = published_world();
+    server
+        .lock()
+        .unwrap()
+        .history_event(HistoryEvent::NewHistory)
+        .unwrap();
+    let new = server.lock().unwrap().token(PATH).unwrap();
+    let body = body_file(tail_of(&server), 1);
+    let stale = publish_file(&server, old, 1 << 20, &body).unwrap_err();
+    assert!(
+        matches!(stale, crate::snapshotter::SnapshotFailure::TokenChanged),
+        "{stale}"
+    );
+    assert!(!stale.stops());
+    let transport = ModelTransport::new(Arc::clone(&server), PATH);
+    let snapper = crate::snapshotter::Snapper::default();
+    let misrouted = crate::snapshotter::publish(&crate::snapshotter::Publish {
+        remote: crate::snapshotter::Remote {
+            transport: &transport,
+            snapper: &snapper,
+            cluster_id: "cluster-b",
+            incarnation: new,
+        },
+        request_limit: 1 << 20,
+        offset: body.offset,
+        digest: body.digest,
+        body: &body.path,
+        len: body.len,
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            misrouted,
+            crate::snapshotter::SnapshotFailure::WrongCluster { .. }
+        ),
+        "{misrouted}"
+    );
+    assert!(!misrouted.stops());
+    let published = publish_file(&server, new, 1 << 20, &body).unwrap();
+    assert!(matches!(
+        published,
+        crate::snapshotter::Outcome::Published { .. }
+    ));
 }
 
 #[test]
@@ -1662,11 +1848,211 @@ fn reopen_after(
     (result, generation, dir)
 }
 
+/// A clean close leaves every commit acknowledged; the stream then changes history and loses
+/// nothing. The reopen re-keys the trusted generation (`rekeyed`): the log rolls to a segment
+/// naming the new token, nothing is resent, and the next commit goes out under the new token.
 #[test]
-fn a_generation_of_another_token_is_refused_and_kept() {
-    let (result, generation, _dir) =
-        reopen_after(|w, _| w.server.history_event(HistoryEvent::NewHistory).unwrap());
-    let e = kind(result);
+fn a_reopen_after_an_inheriting_history_re_keys_a_generation_with_nothing_pending() {
+    let dir = TempDir::new("driver-reopen-rekey");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let acked = w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let generation = bound.handle.generation.dir.clone();
+    let before = bound.handle.incarnation();
+    w.retire(c, &bound);
+    drop(bound);
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let c2 = w.core();
+    let bound = w.open(c2, spec(dir.path(), 2));
+    assert_eq!(bound.handle.generation.dir, generation);
+    assert_eq!(bound.handle.attach, super::Attach::ReKeyed);
+    let token = w.server.token(PATH).unwrap();
+    assert_eq!(bound.handle.incarnation(), token);
+    let next = w.commit(c2, &bound, 2).unwrap();
+    let ticket = w.sync(c2, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c2, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits(), vec![acked, next.clone()]);
+    let sent: Vec<_> = w
+        .appends(c2)
+        .into_iter()
+        .filter(|(_, seq, _)| *seq > 0)
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(sent, vec![next]);
+    let tokens = segment_tokens(&generation);
+    assert_eq!(tokens.first(), Some(&before));
+    assert_eq!(tokens.last(), Some(&token));
+}
+
+/// A crash leaves a commit pending; the stream then changes history and loses nothing. The log's
+/// ACK may trail what the stream acknowledged, so the reopen refuses `stream_state` and keeps the
+/// files, sending nothing and rolling nothing (salvage comes later in M2).
+#[test]
+fn a_reopen_after_an_inheriting_history_is_refused_while_commits_are_pending() {
+    let dir = TempDir::new("driver-reopen-rekey-pending");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.server.inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::DropRequest,
+        times: 1,
+    });
+    w.commit(c, &bound, 2).unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    let before = bound.handle.incarnation();
+    drop(bound);
+    w.crash(c);
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(
+        matches!(
+            &*e,
+            OpenError::StreamState(StreamState::TokenChanged { .. })
+        ),
+        "{e}"
+    );
+    assert!(w.claims(c2).is_empty(), "a refusal sends nothing");
+    assert_eq!(segment_tokens(&generation), vec![before]);
+}
+
+/// A crash leaves a commit pending, and a history event that loses nothing lands right after the
+/// reopen's HEAD: the takeover's claim meets the new token with a commit pending, so the open fails
+/// `rewound` before the log rolls (its ACK fsynced, D5), and the next open refuses with the files
+/// kept.
+#[test]
+fn a_takeover_meeting_an_inheriting_history_with_commits_pending_fails_before_the_roll() {
+    let dir = TempDir::new("driver-takeover-rekey-pending");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.server.inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::DropRequest,
+        times: 1,
+    });
+    w.commit(c, &bound, 2).unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    let before = bound.handle.incarnation();
+    drop(bound);
+    w.crash(c);
+    w.after_head = Some(Box::new(|server: &mut ModelServer| {
+        server.history_event(HistoryEvent::NewHistory).unwrap();
+    }));
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(matches!(&*e, OpenError::Reset(ResetKind::Rewound)), "{e}");
+    assert_eq!(segment_tokens(&generation), vec![before]);
+    let c3 = w.core();
+    let e = kind(w.open_result(c3, spec(dir.path(), 3)));
+    assert!(
+        matches!(
+            &*e,
+            OpenError::StreamState(StreamState::TokenChanged { .. })
+        ),
+        "{e}"
+    );
+    assert_eq!(segment_tokens(&generation), vec![before]);
+}
+
+/// Every file under `dir` with its bytes.
+fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// A commit acknowledged inside the ACK lag, a crash, a restore to before it that still inherits
+/// by the lagging ACK, and a foreign commit in the new history. The acknowledged commit is pending
+/// in the log, so every reopen refuses and the generation, that commit included, stays whole:
+/// re-keying would roll the log, and a later open would resume it and discard the commit.
+#[test]
+fn an_acknowledged_commit_behind_a_lagging_ack_keeps_the_generation_refused() {
+    let dir = TempDir::new("driver-rekey-lagging-ack");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let checkpoint = w.server.checkpoint();
+    let c1 = w.commit(c, &bound, 1).unwrap();
+    // Acknowledged by the stream, within the ACK interval: no ACK record covers it yet.
+    w.run_for(200);
+    assert!(w.stream_commits().contains(&c1));
+    let generation = bound.handle.generation.dir.clone();
+    let before = bound.handle.incarnation();
+    drop(bound);
+    w.crash(c);
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    foreign_commit(&mut w.server, 7);
+    let mut kept = None;
+    for n in 2..5 {
+        let core = w.core();
+        let e = kind(w.open_result(core, spec(dir.path(), n)));
+        assert!(
+            matches!(
+                &*e,
+                OpenError::StreamState(StreamState::TokenChanged { .. })
+            ),
+            "reopen {n}: {e}"
+        );
+        assert!(w.claims(core).is_empty(), "reopen {n} sent a claim");
+        assert_eq!(segment_tokens(&generation), vec![before]);
+        let holds_c1 = log_records(&generation)
+            .iter()
+            .any(|r| matches!(r, RecordBody::Commit { .. }));
+        assert!(holds_c1, "reopen {n} lost the acknowledged commit");
+        // The first reopen materialized the generation; the later ones change nothing.
+        let now = files(dir.path());
+        if let Some(kept) = &kept {
+            assert_eq!(&now, kept, "reopen {n} changed the files");
+        }
+        kept = Some(now);
+    }
+    assert!(!w.stream_commits().contains(&c1));
+}
+
+/// A history that lost a commit the generation acknowledged is refused at open, its files kept
+/// (salvage comes later in M2).
+#[test]
+fn a_reopen_after_a_lossy_history_is_still_refused_and_kept() {
+    let dir = TempDir::new("driver-reopen-lossy");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let checkpoint = w.server.checkpoint();
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let now = w.now;
+    assert!(bound.handle.disconnect());
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
     assert!(
         matches!(
             &*e,
@@ -1675,6 +2061,7 @@ fn a_generation_of_another_token_is_refused_and_kept() {
         "{e}"
     );
     assert!(generation.exists());
+    assert!(w.claims(c2).is_empty(), "a refusal sends nothing");
 }
 
 #[test]
@@ -2500,4 +2887,96 @@ fn a_runtime_cancel_racing_the_result_retires_the_binding() {
     driver.cancel(open).unwrap();
     let ticket = driver.sync(bound.binding, None, true).unwrap();
     assert_eq!(driver.wait(ticket, Duration::from_secs(10)), Some(Ok(())));
+}
+
+/// A closed owner's generation, a checkpoint of the stream, then another writer's commit of page
+/// 2 that a catch-up in place logged with its ACK lost to a crash: the db holds that page past
+/// the log's acknowledged offset. Returns the generation, the checkpoint and the frame.
+fn caught_up_after_the_ack(
+    w: &mut World,
+    dir: &Path,
+) -> (PathBuf, crate::model::CheckpointId, Vec<u8>) {
+    let c = w.core();
+    let bound = w.open(c, spec(dir, 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let now = w.now;
+    assert!(bound.handle.disconnect());
+    let ios = w.c(c).retire(bound.binding, now);
+    w.queue_ios(c, ios);
+    w.run_for(1_000);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    let checkpoint = w.server.checkpoint();
+    let frame = frame::encode_commit(
+        CommitId {
+            lineage: crate::ids::Lineage([0x6d; 16]),
+            position: Position(1),
+        },
+        &CommitRecord {
+            db_pages_after: 2,
+            pages: vec![(2, Box::new([0x5a; 4096]))],
+        },
+    )
+    .unwrap();
+    w.server.foreign_append(PATH, &frame).unwrap();
+    let (mut log, _) = crate::replog::Log::open(&generation.join("log")).unwrap();
+    log.append(&RecordBody::Commit {
+        frame: frame.clone(),
+    })
+    .unwrap();
+    log.sync().unwrap();
+    (generation, checkpoint, frame)
+}
+
+/// A caught-up record after the log's ACK, and a restore of a checkpoint from before it, which
+/// inherits by that ACK: the db holds a page the restored history lacks, so the open refuses and
+/// keeps the files.
+#[test]
+fn a_caught_up_record_after_the_ack_is_refused_at_open() {
+    let dir = TempDir::new("driver-foreign-after-ack");
+    let mut w = World::new();
+    let (generation, checkpoint, frame) = caught_up_after_the_ack(&mut w, dir.path());
+    w.server
+        .history_event(HistoryEvent::Restore(checkpoint))
+        .unwrap();
+    assert!(
+        !w.server
+            .frames(PATH)
+            .unwrap()
+            .windows(frame.len())
+            .any(|x| x == frame.as_slice())
+    );
+    let before = segment_tokens(&generation);
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(
+        matches!(
+            &*e,
+            OpenError::StreamState(StreamState::TokenChanged { .. })
+        ),
+        "{e}"
+    );
+    assert!(w.claims(c2).is_empty());
+    assert_eq!(segment_tokens(&generation), before);
+}
+
+/// The same with the restore right after the open's HEAD: the open resumes, its takeover's claim
+/// meets the new token whose history inherits by the log's ACK, and it fails `rewound` before the
+/// log rolls instead of re-keying.
+#[test]
+fn a_caught_up_record_after_the_ack_fails_a_takeover_that_meets_a_restore() {
+    let dir = TempDir::new("driver-foreign-mid-open");
+    let mut w = World::new();
+    let (generation, checkpoint, _) = caught_up_after_the_ack(&mut w, dir.path());
+    let before = segment_tokens(&generation);
+    w.after_head = Some(Box::new(move |server: &mut ModelServer| {
+        server
+            .history_event(HistoryEvent::Restore(checkpoint))
+            .unwrap();
+    }));
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
+    assert!(matches!(&*e, OpenError::Reset(ResetKind::Rewound)), "{e}");
+    assert_eq!(segment_tokens(&generation), before);
 }

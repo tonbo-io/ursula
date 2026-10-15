@@ -25,7 +25,12 @@
 //! 8. moves retention to the snapshot the stream held before, one behind, monotonic.
 //!
 //! A failed attempt waits before the next ([`SnapshotFailing`]): from 100 ms, doubling, up to five
-//! minutes, or an hour when the body is too large.
+//! minutes, or an hour when the body is too large. Requests carry the binding's token as it is
+//! when they go out, so snapshots go on under the new token after a re-key (design §6.2). A HEAD
+//! or a publish that finds another token, and a HEAD of another cluster, are failures like any
+//! other: the binding re-keys, resets or blocks meanwhile, and the next attempt finds out which.
+//! Each attempt sends its HEAD before the checkpoint, so a binding left idle across a history
+//! change copies and compresses nothing, and a token found changed makes the replicator probe.
 
 use std::collections::hash_map::RandomState;
 use std::fs::File;
@@ -48,6 +53,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
+use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationPrecondition;
@@ -57,6 +63,7 @@ use ursula_headers::RoutingAnswer;
 use ursula_headers::SnapshotDigest;
 use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
+use ursula_headers::StreamHead;
 
 use crate::codec::PAGE;
 use crate::codec::digest::SnapshotDigester;
@@ -473,8 +480,14 @@ pub(crate) enum SnapshotFailure {
     Status { what: &'static str, status: u16 },
     #[error("the stream answered the {what} with malformed headers")]
     Malformed { what: &'static str },
-    #[error("the stream is another incarnation now")]
-    Recreated,
+    /// The stream answered under another token: the binding re-keys or resets meanwhile, and the
+    /// next attempt runs under the token it has then.
+    #[error("the stream answered under another token")]
+    TokenChanged,
+    /// A HEAD answered as another deployment: the binding blocks `wrong_cluster` until a routing
+    /// fix (design §6.3).
+    #[error("wrong_cluster: the stream answers as cluster {found}, not {expected}")]
+    WrongCluster { expected: String, found: ClusterId },
     #[error("unavailable: the {what} got no definite answer: {cause}")]
     Outage {
         what: &'static str,
@@ -498,11 +511,8 @@ impl SnapshotFailure {
 
     /// Whether snapshots stop for this binding: it reset, or the stream holds another snapshot
     /// at the offset this one would take.
-    fn stops(&self) -> bool {
-        matches!(
-            self,
-            Self::Reset | Self::Conflict { .. } | Self::Recreated | Self::Driver(_)
-        )
+    pub(crate) fn stops(&self) -> bool {
+        matches!(self, Self::Reset | Self::Conflict { .. } | Self::Driver(_))
     }
 
     fn retry_after(&self) -> Option<Duration> {
@@ -576,6 +586,22 @@ impl Drop for Temp {
 /// One snapshot attempt (see the module docs).
 fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
     let snapper = &b.handle.snapshots.snapper;
+    let transport = driver().transport(&b.url);
+    let remote = Remote {
+        transport: transport.as_ref(),
+        snapper,
+        cluster_id: &b.handle.cluster_id,
+        incarnation: b.handle.incarnation(),
+    };
+    // Before the checkpoint, the copy and the compression: an idle binding learns of a history
+    // change or a misroute only when it sends, so the HEAD finds out first, and a probe makes the
+    // replicator re-key, reset or block meanwhile.
+    if let Err(e) = remote.head() {
+        if matches!(e, SnapshotFailure::TokenChanged) {
+            driver().sync(b.id, None, false)?;
+        }
+        return Err(e);
+    }
     let conn = match Private::open(&b.path) {
         Ok(conn) => conn,
         // No connection of the host holds the binding: it is retiring, nothing to snapshot.
@@ -670,10 +696,12 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
     let (len, digest) = write_snapshot(&fields, &mut image, &body_path.0)?;
     drop(image);
     drop(image_path);
+    // The token as it is now: the binding may have re-keyed meanwhile.
     let published = publish(&Publish {
-        transport: driver().transport(&b.url).as_ref(),
-        snapper,
-        incarnation: b.handle.incarnation,
+        remote: Remote {
+            incarnation: b.handle.incarnation(),
+            ..remote
+        },
         request_limit: b.handle.replication().request_limit,
         offset,
         digest,
@@ -801,12 +829,19 @@ pub(crate) fn write_snapshot(
     Ok((out.len, out.digester.finalize()))
 }
 
-/// A publish of a snapshot body written to a file.
-pub(crate) struct Publish<'a> {
+/// The stream as the snapshot thread reaches it: under the binding's cluster and token.
+pub(crate) struct Remote<'a> {
     pub(crate) transport: &'a dyn Transport,
     /// Ends the retries once stopped, and sleeps between them.
     pub(crate) snapper: &'a Snapper,
+    /// The deployment the binding's generation was built on.
+    pub(crate) cluster_id: &'a str,
     pub(crate) incarnation: Incarnation,
+}
+
+/// A publish of a snapshot body written to a file.
+pub(crate) struct Publish<'a> {
+    pub(crate) remote: Remote<'a>,
     /// The replicator's request limit `L` (the latest HEAD's, a typed `413`'s, the configured).
     pub(crate) request_limit: u64,
     pub(crate) offset: Offset,
@@ -818,12 +853,38 @@ pub(crate) struct Publish<'a> {
 /// Attempts per request before a publish fails as an outage.
 const PUBLISH_ATTEMPTS: u32 = 6;
 
-impl Publish<'_> {
+impl Remote<'_> {
     fn keys(&self) -> ProducerRequestHeaders {
         ProducerRequestHeaders {
             producer: None,
             precondition: Some(IncarnationPrecondition {
                 incarnation: self.incarnation,
+            }),
+        }
+    }
+
+    /// The stream's HEAD, when it answers as the binding's cluster under the binding's token.
+    pub(crate) fn head(&self) -> Result<StreamHead, SnapshotFailure> {
+        let head = self.send("HEAD", &Request::new(Method::Head, Target::Stream))?;
+        match &head.typed {
+            Ok(Typed::Head {
+                identity: Some(identity),
+                ..
+            }) if identity.cluster_id.as_str() != self.cluster_id => {
+                Err(SnapshotFailure::WrongCluster {
+                    expected: self.cluster_id.to_owned(),
+                    found: identity.cluster_id.clone(),
+                })
+            }
+            Ok(Typed::Head {
+                stream: Some(head), ..
+            }) if head.incarnation() == self.incarnation => Ok(*head),
+            Ok(Typed::Head {
+                stream: Some(_), ..
+            }) => Err(SnapshotFailure::TokenChanged),
+            _ => Err(SnapshotFailure::Status {
+                what: "HEAD",
+                status: head.status,
             }),
         }
     }
@@ -880,21 +941,7 @@ impl Publish<'_> {
 
 /// Publishes the body (step 7 of the module docs) and moves retention one snapshot behind.
 pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
-    let head = p.send("HEAD", &Request::new(Method::Head, Target::Stream))?;
-    let head = match &head.typed {
-        Ok(Typed::Head {
-            stream: Some(head), ..
-        }) if head.incarnation() == p.incarnation => *head,
-        Ok(Typed::Head {
-            stream: Some(_), ..
-        }) => return Err(SnapshotFailure::Recreated),
-        _ => {
-            return Err(SnapshotFailure::Status {
-                what: "HEAD",
-                status: head.status,
-            });
-        }
-    };
+    let head = p.remote.head()?;
     let limit = p.request_limit.min(head.max_request_bytes());
     if p.len > limit {
         return Err(SnapshotFailure::TooLarge {
@@ -904,13 +951,13 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
     }
     let body = std::fs::read(p.body).map_err(io("read", p.body))?;
     let request = Request {
-        keys: p.keys(),
+        keys: p.remote.keys(),
         content_type: Some(CONTENT_TYPE.to_owned()),
         snapshot_digest: Some(p.digest),
         body: Arc::from(body),
         ..Request::new(Method::Put, Target::Snapshot { offset: p.offset })
     };
-    let answer = p.send("snapshot publish", &request)?;
+    let answer = p.remote.send("snapshot publish", &request)?;
     let ours = SnapshotRef {
         offset: p.offset,
         digest: p.digest,
@@ -936,7 +983,7 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
                 limit: limit.map(|l| l.bytes()),
             });
         }
-        Ok(Typed::IncarnationMismatch(_)) => return Err(SnapshotFailure::Recreated),
+        Ok(Typed::IncarnationMismatch(_)) => return Err(SnapshotFailure::TokenChanged),
         Err(_malformed) => {
             return Err(SnapshotFailure::Malformed {
                 what: "snapshot publish",
@@ -958,10 +1005,10 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
         .filter(|previous| *previous < p.offset && *previous > head.retained_offset());
     if let Some(previous) = previous {
         let request = Request {
-            keys: p.keys(),
+            keys: p.remote.keys(),
             ..Request::new(Method::Put, Target::Retention { offset: previous })
         };
-        match p.send("retention move", &request) {
+        match p.remote.send("retention move", &request) {
             // Moved, or already past it (monotonic).
             Ok(answer)
                 if matches!(answer.typed, Ok(Typed::Retained { .. })) || answer.status == 409 => {}
