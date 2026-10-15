@@ -594,6 +594,53 @@ async fn orphan_sweep_reclaims_the_parts_of_a_deleted_stream() {
     assert!(!exists(&cold_store, &part).await, "the part is reclaimed");
 }
 
+/// #581 section 3.1, M3 of the #618 review: a cycle lists at most 4096
+/// parts of a part directory, and the next cycle resumes after them, so
+/// young parts early in key order never hide an old one behind them.
+#[tokio::test]
+async fn orphan_sweep_reaches_old_parts_behind_young_ones() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    create(&runtime, &stream("parts-walk")).await;
+    let dir = crate::cold_store::snapshot_part_dir(BUCKET, GROUP.0);
+    let now_nanos = u128::from(crate::runtime::unix_time_ms()) * 1_000_000;
+    let day_nanos = 24 * 60 * 60 * 1_000 * 1_000_000_u128;
+    let young = crate::runtime::COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR + 1;
+    for seq in 0..young {
+        let name = format!("{:016x}-{now_nanos:032x}-{seq:016x}.part", 0);
+        cold_store
+            .write_chunk(&format!("{dir}{name}"), b"y")
+            .await
+            .expect("young part");
+    }
+    let old = format!(
+        "{dir}{:016x}-{:032x}-{:016x}.part",
+        u64::MAX,
+        now_nanos - 2 * day_nanos,
+        0
+    );
+    cold_store.write_chunk(&old, b"o").await.expect("old part");
+    let grace_ms = 24 * 60 * 60 * 1_000;
+    let first = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, grace_ms)
+        .await
+        .expect("first cycle");
+    assert_eq!(
+        first.orphans_deleted, 0,
+        "the first page holds young parts only"
+    );
+    assert!(exists(&cold_store, &old).await);
+    let second = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, grace_ms)
+        .await
+        .expect("second cycle");
+    assert_eq!(
+        second.orphans_deleted, 1,
+        "the next page holds the old part"
+    );
+    assert!(!exists(&cold_store, &old).await);
+}
+
 /// RT6: a page read-modify-write by a deposed leader can drop the entry of
 /// a committed exclusive chunk. The sweep must not delete that chunk once it
 /// is older than the grace: no other referenced object covers its retained

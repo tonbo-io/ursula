@@ -78,8 +78,11 @@ type ChunkGuard = (String, (u64, u64), Vec<(u64, u64)>);
 type ExternalGuard = (String, Option<(u64, u64)>);
 
 /// The most snapshot parts a cycle lists in one part directory. A tenant
-/// can stage parts cheaply, so a cycle bounds what it lists and handles;
-/// the rest wait for the next cycle.
+/// can stage parts cheaply, so a cycle bounds what it lists and handles.
+/// The next cycle lists the page after it, from a cursor per directory, so
+/// young parts early in key order never hide older ones behind them: every
+/// part is visited within `parts / COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR + 1`
+/// cycles.
 pub const COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR: usize = 4096;
 
 /// Default age below which the sweep never deletes an object.
@@ -142,11 +145,8 @@ impl ShardRuntime {
         // its stream lives or not: no state ever references one (#581
         // section 3.1).
         for dir in &listing_plan.part_dirs {
-            for name in cold_store
-                .list_file_names_up_to(dir, COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR)
-                .await
-                .map_err(cold_io)?
-            {
+            let names = self.list_part_page(cold_store, dir).await?;
+            for name in names {
                 if is_snapshot_part_object_name(&name) {
                     aged.push((format!("{dir}{name}"), name));
                 }
@@ -333,6 +333,42 @@ impl ShardRuntime {
             }
         }
         report
+    }
+
+    /// The next page of a part directory's walk: the names after its
+    /// cursor. A short page ends the walk, and the next cycle starts over.
+    async fn list_part_page(
+        &self,
+        cold_store: &ColdStoreHandle,
+        dir: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let after = self
+            .cold_part_sweep
+            .lock()
+            .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
+                message: "cold part sweep cursor lock poisoned".to_owned(),
+            })?
+            .get(dir)
+            .cloned();
+        let names = cold_store
+            .list_file_names_after(dir, after.as_deref(), COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR)
+            .await
+            .map_err(cold_io)?;
+        let mut cursors =
+            self.cold_part_sweep
+                .lock()
+                .map_err(|_poisoned| RuntimeError::ColdStoreConfig {
+                    message: "cold part sweep cursor lock poisoned".to_owned(),
+                })?;
+        match names.last() {
+            Some(last) if names.len() >= COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR => {
+                cursors.insert(dir.to_owned(), last.clone());
+            }
+            _ => {
+                cursors.remove(dir);
+            }
+        }
+        Ok(names)
     }
 
     fn set_cold_orphan_sweep_cursor(

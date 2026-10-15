@@ -826,14 +826,28 @@ impl ColdStore {
     /// listing stops at `max`, page by page, so a directory a tenant can
     /// grow costs a bounded listing.
     pub async fn list_file_names_up_to(&self, dir: &str, max: usize) -> io::Result<Vec<String>> {
+        self.list_file_names_after(dir, None, max).await
+    }
+
+    /// The first `max` names of files directly in `dir` that sort after
+    /// `start_after`, sorted: one page of a walk that resumes where the last
+    /// one stopped. A backend that lists from a key (S3) starts there; any
+    /// other is listed whole and filtered.
+    pub async fn list_file_names_after(
+        &self,
+        dir: &str,
+        start_after: Option<&str>,
+        max: usize,
+    ) -> io::Result<Vec<String>> {
         self.count_list_request();
-        let mut lister = self
-            .operator
-            .lister_with(dir)
-            .await
-            .map_err(|err| cold_store_io_error(dir, err))?;
+        let ordered = self.operator.info().full_capability().list_with_start_after;
+        let mut lister = self.operator.lister_with(dir);
+        if ordered && let Some(after) = start_after {
+            lister = lister.start_after(&format!("{dir}{after}"));
+        }
+        let mut lister = lister.await.map_err(|err| cold_store_io_error(dir, err))?;
         let mut names = Vec::new();
-        while names.len() < max
+        while (!ordered || names.len() < max)
             && let Some(entry) = lister
                 .try_next()
                 .await
@@ -845,12 +859,25 @@ impl ColdStore {
             let Some(name) = entry.path().strip_prefix(dir) else {
                 continue;
             };
-            if !name.is_empty() && !name.contains('/') {
+            if !name.is_empty()
+                && !name.contains('/')
+                && start_after.is_none_or(|after| name > after)
+            {
                 names.push(name.to_owned());
             }
         }
         names.sort();
+        names.truncate(max);
         Ok(names)
+    }
+
+    /// Deletes `paths`, in batches where the backend has them (S3's
+    /// `DeleteObjects`). A missing object counts as deleted.
+    pub async fn delete_objects(&self, paths: Vec<String>) -> io::Result<()> {
+        self.operator
+            .delete_iter(paths)
+            .await
+            .map_err(|err| cold_store_io_error("batch delete", err))
     }
 
     /// Proves that the object store has no file below `path`. Tenant purge
