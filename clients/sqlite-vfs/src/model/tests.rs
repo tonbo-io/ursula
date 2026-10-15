@@ -30,6 +30,7 @@ use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
+use ursula_headers::names;
 
 use super::CheckpointId;
 use super::HistoryEvent;
@@ -518,33 +519,271 @@ fn idle_retirement_happens_on_a_closed_stream_too() {
     );
 }
 
+/// `request` with `body` in place of its own, keeping its `Producer-Digest`.
+pub(crate) fn with_body(request: &Request, body: &[u8]) -> Request {
+    Request {
+        body: Arc::from(body),
+        ..request.clone()
+    }
+}
+
+/// A keyed close-only write `(e, n)`: no body, no content type, the digest of the empty body.
+pub(crate) fn close_only(precondition: Option<IncarnationPrecondition>, e: u64, n: u64) -> Request {
+    Request {
+        content_type: None,
+        closes: true,
+        ..write(precondition, e, n, b"")
+    }
+}
+
 #[test]
-fn early_answers_skip_the_body_checks() {
-    // #581 §2.5: a tokened repeat or key conflict is decided from the headers, before the body.
+fn addendum_4_a_digest_that_does_not_match_the_body_on_a_held_key_is_key_conflict() {
+    // Rows 8 to 10 compare the `Producer-Digest` header and come before the body is checked, so
+    // the answer is the same with or without the token: 403 key-conflict.
     let world = World::new();
     let token = world.create();
-    let claim = write(tokened(token), 1, 0, b"claim");
-    world.producer(&claim);
-    for body in [&b"another body"[..], b""] {
-        let repeat = Request {
-            body: Arc::from(body),
-            ..claim.clone()
+    world.producer(&write(tokened(token), 0, 0, b"claim"));
+    world.producer(&write(tokened(token), 0, 1, b"b1"));
+    let mut conflicting = write(tokened(token), 0, 1, b"another body");
+    conflicting.body = Arc::from(&b"b1"[..]);
+    for precondition in [tokened(token), None] {
+        let request = Request {
+            keys: ProducerRequestHeaders {
+                precondition,
+                ..conflicting.keys.clone()
+            },
+            ..conflicting.clone()
         };
-        assert!(matches!(world.producer(&repeat), ProducerAnswer::Receipt {
+        assert_eq!(
+            world.producer(&request),
+            ProducerAnswer::KeyConflict { epoch: epoch(0) },
+            "{precondition:?}"
+        );
+    }
+    // A repeat whose body disagrees with its own digest is a repeat: its body is never read.
+    assert!(matches!(
+        world.producer(&with_body(&write(tokened(token), 0, 1, b"b1"), b"other")),
+        ProducerAnswer::Receipt {
+            delivery: Delivery::Repeat,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn addendum_4_a_repeat_without_a_content_type_gets_its_receipt() {
+    for untokened in [false, true] {
+        let world = World::new();
+        let token = world.create();
+        world.producer(&write(tokened(token), 1, 0, b"claim"));
+        // Rows 8 to 10 answer alike with the token and without it.
+        let p = if untokened { None } else { tokened(token) };
+        let commit = write(p, 1, 1, b"commit");
+        let applied = receipt_of(&world.producer(&commit));
+        let bare = Request {
+            content_type: None,
+            ..commit.clone()
+        };
+        let answer = world.producer(&bare);
+        assert!(matches!(answer, ProducerAnswer::Receipt {
             delivery: Delivery::Repeat,
             ..
         }));
+        assert_eq!(receipt_of(&answer), applied);
     }
-    // Untokened, the body is read first: its digest mismatch is 400.
-    let untokened = Request {
-        keys: ProducerRequestHeaders {
-            precondition: None,
-            ..claim.keys.clone()
-        },
-        body: Arc::from(&b"another body"[..]),
-        ..claim.clone()
+}
+
+#[test]
+fn addendum_4_an_empty_write_on_an_applied_key_gets_its_row() {
+    for untokened in [false, true] {
+        let world = World::new();
+        let token = world.create();
+        world.producer(&write(tokened(token), 1, 0, b"claim"));
+        // Rows 8 to 10 answer alike with the token and without it.
+        let p = if untokened { None } else { tokened(token) };
+        let commit = write(p, 1, 1, b"commit");
+        world.producer(&commit);
+        // Row 9: the digest names the newest write, the empty body is never read.
+        assert!(matches!(
+            world.producer(&with_body(&commit, b"")),
+            ProducerAnswer::Receipt {
+                delivery: Delivery::Repeat,
+                ..
+            }
+        ));
+        // Row 10: the claim, once a later seq applied.
+        assert!(matches!(
+            world.producer(&with_body(&write(p, 1, 0, b"claim"), b"")),
+            ProducerAnswer::ReceiptEvicted { .. }
+        ));
+        // Row 8: the empty body's digest under the newest write's key.
+        assert_eq!(
+            world.producer(&write(p, 1, 1, b"")),
+            ProducerAnswer::KeyConflict { epoch: epoch(1) }
+        );
+        // Row 13 refuses before the content checks.
+        assert_eq!(
+            world.producer(&write(p, 1, 5, b"")),
+            ProducerAnswer::SeqGap {
+                expected: seq(2),
+                received: seq(5),
+            }
+        );
+        // Row 12 would apply: only then is the empty body refused.
+        let answer = world.send(&write(p, 1, 2, b""));
+        assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+    }
+}
+
+/// Sends `refused`, the next write after a claim with its content type changed by `change`, and
+/// returns its answer, after checking that nothing applied.
+fn content_refusal(change: impl Fn(&mut Request)) -> Answer {
+    let world = World::new();
+    let token = world.create();
+    world.producer(&write(tokened(token), 1, 0, b"claim"));
+    let next = write(tokened(token), 1, 1, b"commit");
+    let mut refused = next.clone();
+    change(&mut refused);
+    let answer = world.send(&refused);
+    // Nothing applied: the same seq still applies.
+    assert!(matches!(world.producer(&next), ProducerAnswer::Receipt {
+        delivery: Delivery::Applied,
+        ..
+    }));
+    answer
+}
+
+#[test]
+fn addendum_4_a_missing_content_type_on_a_write_that_would_apply_is_400() {
+    let answer = content_refusal(|request| request.content_type = None);
+    assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+}
+
+#[test]
+fn addendum_4_another_content_type_on_a_write_that_would_apply_is_409() {
+    let answer = content_refusal(|request| request.content_type = Some("text/plain".to_owned()));
+    assert_eq!((answer.status, answer.typed), (409, Ok(Typed::Untyped)));
+}
+
+#[test]
+fn addendum_4_a_body_that_does_not_match_its_digest_on_a_write_that_would_apply_is_400() {
+    let answer = content_refusal(|request| request.body = Arc::from(&b"another body"[..]));
+    assert_eq!((answer.status, answer.typed), (400, Ok(Typed::Untyped)));
+}
+
+#[test]
+fn addendum_4_an_empty_write_that_would_apply_is_400_whatever_its_content_type() {
+    // Base protocol §5.2: a write without a body is never refused for its content type.
+    for content_type in [None, Some("text/plain"), Some(CONTENT_TYPE)] {
+        let answer = content_refusal(|request| {
+            request.body = Arc::from(&b""[..]);
+            request.content_type = content_type.map(str::to_owned);
+        });
+        assert_eq!(
+            (answer.status, answer.typed),
+            (400, Ok(Typed::Untyped)),
+            "{content_type:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unkeyed_close_only_write_closes_and_its_repeat_gets_204() {
+    // Base protocol §5.2: close-only writes are idempotent.
+    let world = World::new();
+    world.create();
+    world.server().foreign_append(PATH, b"frame").unwrap();
+    let tail = world.stream_head().next_offset();
+    let close = Request {
+        closes: true,
+        ..Request::new(Method::Post, Target::Stream)
     };
-    assert_eq!(world.send(&untokened).status, 400);
+    for _ in 0..2 {
+        // The rendered answer, since a parsed unkeyed `204` keeps no headers.
+        let answer = world.server().handle(PATH, &close);
+        assert_eq!(answer.status, 204);
+        assert_eq!(answer.headers, [
+            (names::STREAM_NEXT_OFFSET, tail.to_string()),
+            (names::STREAM_CLOSED, "true".to_owned()),
+        ]);
+        assert!(world.stream_head().closed());
+    }
+    // An append still meets the closed stream.
+    let append = Request {
+        content_type: Some(CONTENT_TYPE.to_owned()),
+        body: Arc::from(&b"late"[..]),
+        ..Request::new(Method::Post, Target::Stream)
+    };
+    assert_eq!(
+        world.send(&append).typed,
+        Ok(Typed::StreamClosed(StreamClosedConflict {
+            final_offset: tail
+        }))
+    );
+}
+
+#[test]
+fn addendum_4_a_keyed_close_only_write_applies_with_a_receipt_and_its_repeat_gets_204() {
+    let world = World::new();
+    let token = world.create();
+    world.producer(&write(tokened(token), 1, 0, b"claim"));
+    let tail = world.stream_head().next_offset();
+    let close = close_only(tokened(token), 1, 1);
+    let answer = world.send(&close);
+    assert_eq!(answer.status, 200);
+    let Ok(Typed::Producer(applied)) = answer.typed else {
+        panic!("{answer:?}");
+    };
+    let receipt = receipt_of(&applied);
+    assert_eq!((receipt.start(), receipt.next()), (tail, tail));
+    assert!(receipt.closes_stream());
+    assert!(world.stream_head().closed());
+    let repeat = world.send(&close);
+    assert_eq!(repeat.status, 204);
+    let Ok(Typed::Producer(repeated)) = repeat.typed else {
+        panic!("{repeat:?}");
+    };
+    assert_eq!(receipt_of(&repeated), receipt);
+    // The next seq would apply, so it meets the closed stream.
+    let answer = world.send(&close_only(tokened(token), 1, 2));
+    assert_eq!(
+        answer.typed,
+        Ok(Typed::StreamClosed(StreamClosedConflict {
+            final_offset: tail
+        }))
+    );
+}
+
+#[test]
+fn addendum_4_an_append_that_closes_is_501_only_after_the_rows() {
+    let world = World::new();
+    let token = world.create();
+    world.producer(&write(tokened(token), 1, 0, b"claim"));
+    let commit = write(tokened(token), 1, 1, b"commit");
+    world.producer(&commit);
+    let closing = |request: &Request| Request {
+        closes: true,
+        ..request.clone()
+    };
+    // A repeat and a refusal are answered by their rows.
+    assert!(matches!(
+        world.producer(&closing(&commit)),
+        ProducerAnswer::Receipt {
+            delivery: Delivery::Repeat,
+            ..
+        }
+    ));
+    assert!(matches!(
+        world.producer(&closing(&write(tokened(token), 1, 5, b"gap"))),
+        ProducerAnswer::SeqGap { .. }
+    ));
+    // Even without a content type, a write that would apply gets the marker.
+    let applying = Request {
+        content_type: None,
+        ..closing(&write(tokened(token), 1, 2, b"last"))
+    };
+    assert_eq!(world.send(&applying).status, 501);
+    assert!(!world.stream_head().closed());
 }
 
 #[test]

@@ -112,22 +112,6 @@ impl Stream {
         self.closed = true;
     }
 
-    /// Producer `id`'s record and the floor as they stand once an idle record is retired at
-    /// `now_ms`, without retiring it: what a node reads before the body (#581 §2.5).
-    pub(crate) fn retired_view(
-        &self,
-        id: &str,
-        now_ms: u64,
-    ) -> (Option<&ProducerRecord>, Option<Epoch>) {
-        match self.producers.get(id) {
-            Some(record) if idle(record, now_ms) => {
-                let epoch = record.epoch.epoch();
-                (None, Some(self.watermark.map_or(epoch, |w| w.max(epoch))))
-            }
-            record => (record, self.watermark),
-        }
-    }
-
     /// Retires producer `id`'s record when it is idle at `now_ms`, raising the floor to its epoch.
     pub(crate) fn retire_idle(&mut self, id: &str, now_ms: u64) {
         let idle = self.producers.get(id).is_some_and(|r| idle(r, now_ms));
