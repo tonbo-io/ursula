@@ -1,5 +1,6 @@
-//! The request and snapshot limits over HTTP (#581 section 6.4): HEAD
-//! advertises them and every `413` names the one it applied, as the shared
+//! Server metadata over HTTP (#581 sections 6.3 to 6.5): every HEAD answer
+//! carries the server's identity, a stream's HEAD advertises the request and
+//! snapshot limits, and every `413` names the one it applied, as the shared
 //! header crate parses them.
 
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use tower::ServiceExt;
+use ursula_headers::PROTOCOL_VERSION;
+use ursula_headers::ServerIdentity;
 use ursula_headers::SizeLimit;
 use ursula_headers::StreamHead;
 use ursula_headers::value::Offset;
@@ -101,6 +104,40 @@ fn chunked(length: usize) -> Body {
             vec![b'x'; take],
         ))))
     }))
+}
+
+#[tokio::test]
+async fn every_head_answer_carries_one_server_identity() {
+    let app = app();
+    create(&app, "/limits/s").await;
+    let mut ids = Vec::new();
+    for (uri, status) in [
+        ("/limits/s", StatusCode::OK),
+        ("/limits/missing", StatusCode::NOT_FOUND),
+        ("/__ursula/metrics", StatusCode::OK),
+    ] {
+        let response = send(
+            &app,
+            Request::head(uri).body(Body::empty()).expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), status, "{uri}");
+        let identity = ServerIdentity::parse(pairs(&response))
+            .expect("well-formed identity")
+            .expect("an identity");
+        assert_eq!(identity.protocol, PROTOCOL_VERSION, "{uri}");
+        ids.push(identity.cluster_id);
+    }
+    assert!(ids.windows(2).all(|pair| pair[0] == pair[1]), "{ids:?}");
+    // Other methods carry none.
+    let response = send(
+        &app,
+        Request::get("/limits/s")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(ServerIdentity::parse(pairs(&response)), Ok(None));
 }
 
 #[tokio::test]

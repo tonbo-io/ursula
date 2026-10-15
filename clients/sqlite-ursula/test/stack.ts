@@ -275,6 +275,7 @@ async function startCluster(): Promise<Stack> {
 				"[server]",
 				`listen = "127.0.0.1:${node.port}"`,
 				`admin_listen = "${node.admin.replace("http://", "")}"`,
+				'cluster_id = "sqlite-ursula-test"',
 				"",
 				"[runtime]",
 				`core_count = ${cores}`,

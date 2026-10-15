@@ -504,6 +504,27 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     .await;
     assert_eq!(payload, b"cli-forward-payload");
 
+    // Every node names the configured cluster on a HEAD, a missing stream's
+    // included.
+    for (_, base_url) in &peers {
+        for path in ["benchcmp/cli-follower-forward", "benchcmp/cli-missing"] {
+            let response = client
+                .head(format!("{base_url}/{path}"))
+                .send()
+                .await
+                .expect("send HEAD");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("ursula-cluster-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("static-cluster-cli"),
+                "{base_url}/{path}: {}",
+                response.status()
+            );
+        }
+    }
+
     let mut stream_sessions = 0_u64;
     let mut stream_requests = 0_u64;
     for (_, base_url) in &peers {
@@ -2595,6 +2616,7 @@ fn write_node_toml(
         r#"[server]
 listen = "127.0.0.1:{port}"
 admin_listen = "127.0.0.1:{admin_port}"
+cluster_id = "static-cluster-cli"
 "#
     )
     .unwrap();

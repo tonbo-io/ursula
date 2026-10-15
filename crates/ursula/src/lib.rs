@@ -6,6 +6,8 @@
 //! - [`admin_fence`]: process-local executor ordering for administrative mutations.
 //! - [`admission`]: client-plane ingress admission, which refuses writes before
 //!   they reach a handler and marks those refusals with `x-ursula-not-applied`.
+//! - [`identity`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on every HEAD
+//!   answer.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`limits`]: the request and snapshot limits HEAD advertises and every
@@ -18,6 +20,7 @@ mod admin_fence;
 mod admission;
 mod bootstrap;
 mod cold_snapshot;
+mod identity;
 pub mod json_text;
 mod limits;
 mod otel_metrics;
@@ -89,6 +92,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
+use ursula_headers::ClusterId;
 use ursula_headers::HeaderError as ProducerHeaderError;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::ProducerAnswer;
@@ -303,6 +307,9 @@ pub struct HttpState {
     /// A Raft protocol (format-epoch) mismatch seen since start: readiness
     /// answers 503 `format_epoch_mismatch` until restart.
     format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
+    /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
+    /// drawn for this process when the node runs without a WAL.
+    cluster_id: ClusterId,
 }
 
 impl HttpState {
@@ -387,6 +394,7 @@ impl HttpState {
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
+            cluster_id: ursula_raft::generate_cluster_id(),
         }
     }
 
@@ -408,6 +416,7 @@ impl HttpState {
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
+            cluster_id: ursula_raft::generate_cluster_id(),
         }
     }
 
@@ -450,6 +459,7 @@ impl HttpState {
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
+            cluster_id: ursula_raft::generate_cluster_id(),
         }
     }
 
@@ -476,9 +486,18 @@ impl HttpState {
 
     /// Record the node's Raft WAL, so the metrics JSON reports how it opened
     /// and the server shuts it down cleanly.
+    /// Sets the node's Raft WAL, whose root holds the cluster id.
     pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
+        if let Some(wal) = &raft_wal {
+            self.cluster_id = wal.cluster_id().clone();
+        }
         self.raft_wal = raft_wal;
         self
+    }
+
+    /// The id this node sends as `Ursula-Cluster-Id`.
+    pub fn cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
     }
 
     pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::RaftWal> {
@@ -1352,6 +1371,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             ingress_admission_middleware,
         ))
         .layer(middleware::from_fn(limits::name_size_refusals))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            identity::identify_head_answers,
+        ))
         .layer(response_compression)
         .with_state(state)
 }
@@ -4382,7 +4405,7 @@ mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
 #[cfg(test)]
-mod limits_tests;
+mod server_metadata_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
 #[cfg(test)]

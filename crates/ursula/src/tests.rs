@@ -2456,6 +2456,22 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     }
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
+    // A HEAD on the node redirects too, and the redirect names the server.
+    let head = no_redirect_client
+        .head(&target)
+        .send()
+        .await
+        .expect("HEAD on the non-voter");
+    assert_eq!(head.status(), StatusCode::TEMPORARY_REDIRECT);
+    let identity = ursula_headers::ServerIdentity::parse(
+        head.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("well-formed identity")
+    .expect("the identity on a redirect");
+    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_VERSION);
+
     for node in nodes {
         node.shutdown().await;
     }
@@ -3527,6 +3543,23 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
             .is_some_and(|location| location.starts_with(&peers[0].1)
                 && location.ends_with("/benchcmp/follower-forward?offset=now&live=sse"))
     );
+    // A follower's answer to a HEAD, which it serves from the leader,
+    // carries the server's identity too.
+    let follower_head = no_redirect_client
+        .head(format!("{}/benchcmp/follower-forward", peers[1].1))
+        .send()
+        .await
+        .expect("send follower HEAD");
+    assert_eq!(follower_head.status(), StatusCode::OK);
+    let identity = ursula_headers::ServerIdentity::parse(
+        follower_head
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("well-formed identity")
+    .expect("the identity on a follower's answer");
+    assert_eq!(identity.protocol, ursula_headers::PROTOCOL_VERSION);
 
     let forwarded_placement = nodes[0].runtime.locate(&forwarded_stream);
     for node in &nodes {
