@@ -179,10 +179,12 @@ Nothing changed. A replica that lost its voting history must first obtain a
 durable vote floor from a fresh quorum proof, and the call cannot replace that
 proof. Restore connectivity to intact voters.
 
-The call also refuses when the replica leads the group with a live quorum, when
+The call also refuses when the replica leads or follows a live leader, when
 its gate awaits or applies a leader's barrier (it may still open without losing
-anything), when the replica no longer holds the log the plan's `expected` names,
-or when it committed or applied an entry above the plan's `point`. Read
+anything), when the plan's leader is not a voter, when the replica no longer
+holds the log the plan's `expected` names, when it committed or applied an entry
+above the plan's `point`, or when it is the plan's leader and its log does not
+continue from the `point` or end at `leader_last_log_term`. Read
 `/__ursula/metrics` on every replica again and plan again with what it shows.
 A body of the 0.7 form answers `422`.
 
@@ -192,8 +194,9 @@ The plan's leader serves nothing until the group's new history event applies.
 It proposes the event once it is elected and has applied its first entry, so
 this normally clears within a second. If it persists, check that the plan's
 leader is running and that every other replica that holds the plan can reach
-it: a replica with a plan votes only for the plan's leader. A replica that
-answered `restart_to_cut` takes part only after its restart.
+it: a replica with a plan votes only for the plan's leader. If that leader
+lost entries it had replicated, the members refuse it and the group stalls
+again: plan again with the replicas' current metrics.
 
 ### I/O error on `raft.wal.path`
 

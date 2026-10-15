@@ -183,10 +183,10 @@ While at most a minority of a group's voters lost their tail, the other voters h
    - `floor`: the highest `current_term` among the replicas whose gate is not open or whose `recovery` is not `null`.
    - The leader: the replica with the greatest last log id, highest `last_log_term` first, then highest `last_log_index`. An empty log (`null`) ranks last. Its `last_log_index` is the plan's `point`, and `cut` is `false`.
    - When the group has more than one voter and that replica's `last_log_term` is below `floor`, its log may hold an entry that a lost leader overwrote. Then `cut` is `true`, the leader is the replica with the greatest `committed_index`, and its `committed_index` is the `point`. Every replica then keeps only the entries it knew were committed.
-3. Send the plan to every replica that answered, the leader last: `{"leader", "point", "cut", "expected": {"last_log_index", "last_log_term", "current_term"}}`, where `expected` is what you read on that replica.
-4. Each answers its `outcome`: `leads`, `follows`, or `restart_to_cut` when the plan cuts its log. Restart every node that answered `restart_to_cut`. The cut runs at its next start, before the group starts. The node then leads or follows as the plan says.
+3. Send the plan to every replica that answered, the leader last: `{"leader", "point", "cut", "leader_last_log_term", "expected": {"last_log_index", "last_log_term", "current_term"}}`, where `leader_last_log_term` is the leader's `last_log_term` and `expected` is what you read on that replica.
+4. Each answers its `outcome`: `leads` or `follows`. When the plan cuts, the replica first stops voting and taking replication, restarts its group in the process with the log cut back to its committed entry, and answers once the restarted group holds the plan.
 
-A replica that holds a plan votes only for the plan's leader. Once elected, the leader proposes the group's history event before anything else and answers `503` with `Retry-After` to writes and reads until the event applies. On each replica the plan is satisfied once it applied the event: `history.event_index` above the plan's `point` and `recovery` back to `null` in its metrics. The plan is recorded in the node's metadata, so a restart keeps it until then. Leaders after that hold the event, so a later leader change starts no new history.
+A replica that holds a plan votes only for the plan's leader, and when the plan cuts, only once the leader's log ends at the point or carries a term above `leader_last_log_term`, so the leader's stale entries never win an election. Once elected, the leader proposes the group's history event before anything else and answers `503` with `Retry-After` to writes and reads until the event applies. On each replica the plan is satisfied once it applied the event: `history.event_index` above the plan's `point` and `recovery` back to `null` in its metrics. The plan is recorded in the node's metadata, so a restart keeps it until then, and the leader serves nothing until its record is gone. A replica that lost power again after taking the plan keeps its vote restricted to the plan's leader across restarts, and once the event applies its gate stays closed until a leader's barrier opens it. Leaders after that hold the event, so a later leader change starts no new history. If the plan's leader loses entries it had replicated, for example in a crash right after its election, the members' logs are longer than its own and they elect no one: the gates report `planned` and the group stalls. Plan again; the new plan elects the member with the longest log.
 
 ```bash
 # group 42: one admin URL per voter, through your forwards
@@ -206,7 +206,8 @@ jq -sc 'select(length * 2 > .[0].voters)
   | ((.[0].voters > 1) and (($longest.expected.last_log_term // 0) < $floor)) as $cut
   | (if $cut then max_by([.committed_index // -1, .node_id]) else $longest end) as $leader
   | {leader: $leader.node_id, cut: $cut,
-     point: (if $cut then $leader.committed_index else $leader.expected.last_log_index end // 0)} as $plan
+     point: (if $cut then $leader.committed_index else $leader.expected.last_log_index end // 0),
+     leader_last_log_term: $leader.expected.last_log_term} as $plan
   | sort_by(.node_id == $leader.node_id)[] | . + {plan: ($plan + {expected})}' replicas.jsonl > plan.jsonl
 
 # Review plan.jsonl, then send it, the leader last. Stop at the first refusal and observe again.
@@ -222,10 +223,12 @@ The script plans one group. For many stalled groups, as after a rack power loss,
 The call is refused with `409 Conflict`, and changes nothing, when:
 
 - the replica lost its vote and has not established a durable vote floor. Restore connectivity to an intact quorum so it can obtain a fresh barrier. Accepting unsynced data loss cannot authorize a replica to acknowledge an unknown leader.
-- the replica leads the group with a quorum that acknowledged it within the last 3 seconds, or its gate awaits or applies a leader's barrier. The group has a live leader or may still recover without loss.
+- the replica leads the group with a quorum that acknowledged it within the last 3 seconds, or follows a leader whose replication reached it within the last 3 seconds, or its gate awaits or applies a leader's barrier. The group has a live leader or may still recover without loss.
+- the plan's leader is not one of the group's voters.
 - the replica no longer holds the log `expected` names, because it moved since you read the metrics. Read the metrics again and plan again.
 - the replica committed or applied an entry above the plan's `point`. The plan picked the wrong leader: read the metrics again and plan again.
-- the plan cuts and the replica knows no committed entry.
+- the replica is the plan's leader and its log does not continue from the `point` (its last log index, or its committed index when the plan cuts), or `leader_last_log_term` is not its last log term.
+- the plan cuts and the replica knows no committed entry, or no longer holds the committed entry it recorded.
 
 A body of the 0.7 form answers `422`. A second plan replaces a first one that was never satisfied, as long as `floor` counts the replicas the first one holds.
 
