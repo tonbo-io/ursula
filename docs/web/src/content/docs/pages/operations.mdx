@@ -378,7 +378,7 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes#070).
 
-0.7.5 upgrades 0.7.0, 0.7.1, 0.7.2, 0.7.3 or 0.7.4 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.7.5 release notes](/docs/release-notes#075).
+0.7.6 upgrades 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.7.4 or 0.7.5 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.7.6 release notes](/docs/release-notes#076).
 
 For a patch upgrade, upgrade gateways before nodes, and roll back nodes before gateways, so that clients keep the benefit of the `x-ursula-not-applied` marker throughout. The order is a recommendation, not a safety requirement. A client trusts the marker only together with the vouch that gateways from 0.7.3 on add, so whatever order a `helm upgrade` or `helm rollback` replaces gateways and voters in, no client counts a committed write as never applied. See [refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
 
