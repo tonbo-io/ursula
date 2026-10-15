@@ -34,9 +34,11 @@ use ursula_headers::RaftTerm;
 use ursula_headers::RoutingAnswer;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::RouteWriteRequest;
+use ursula_runtime::RoutedWrite;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::WriteRoute;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
 
 use crate::HttpState;
 use crate::admission::AdmissionPermit;
@@ -82,21 +84,34 @@ pub(crate) async fn route_before_body(
     admission: Option<DeferredAdmission>,
 ) -> HeadDecision {
     let incarnation = early_answer.as_ref().map(|query| query.incarnation);
-    let routed = match state
-        .runtime
-        .route_write(RouteWriteRequest {
-            stream_id: stream_id.clone(),
-            early_answer,
-        })
-        .await
-    {
-        Ok(routed) => routed,
-        // A node that hosts no replica of the group redirects to a voter.
-        Err(err) => {
-            return HeadDecision::Answer(
-                crate::runtime_error_or_leader_redirect_async(state, err, request_target).await,
-            );
-        }
+    let raft_group_id = state.runtime.locate(stream_id).raft_group_id;
+    // The leadership view decides without a trip through the group's core.
+    // Only a leader's early answer, and a group the view does not know,
+    // need the core.
+    let viewed = leadership_view(state, raft_group_id);
+    let routed = match viewed {
+        Some(WriteRoute::Leader { .. }) if early_answer.is_none() => return admit(admission),
+        Some(route @ (WriteRoute::Follower { .. } | WriteRoute::NoLeader)) => RoutedWrite {
+            raft_group_id,
+            route,
+        },
+        Some(WriteRoute::Leader { .. }) | None => match state
+            .runtime
+            .route_write(RouteWriteRequest {
+                stream_id: stream_id.clone(),
+                early_answer,
+            })
+            .await
+        {
+            Ok(routed) => routed,
+            // A node that hosts no replica of the group redirects to one
+            // that does.
+            Err(err) => {
+                return HeadDecision::Answer(
+                    crate::runtime_error_or_leader_redirect_async(state, err, request_target).await,
+                );
+            }
+        },
     };
     let group = RaftGroup::from_u32(routed.raft_group_id.0);
     match routed.route {
@@ -132,6 +147,37 @@ pub(crate) async fn route_before_body(
         }
         WriteRoute::Leader { .. } => admit(admission),
     }
+}
+
+/// This node's view of a group's leadership, from its Raft metrics. A node
+/// without replication leads every group. `None` when the node has no
+/// replica of the group registered: it may host none, or not have started
+/// it yet, and the group's core decides.
+fn leadership_view(state: &HttpState, raft_group_id: RaftGroupId) -> Option<WriteRoute> {
+    let Some(registry) = state.raft_registry() else {
+        return Some(WriteRoute::Leader { early_answer: None });
+    };
+    let leadership = registry.get(raft_group_id)?.leadership();
+    Some(match leadership.leader_id {
+        Some(leader) if leader == leadership.node_id => WriteRoute::Leader { early_answer: None },
+        Some(leader_id) => WriteRoute::Follower {
+            leader_id,
+            leader_address: leadership.leader_address,
+            term: leadership.term,
+        },
+        None => WriteRoute::NoLeader,
+    })
+}
+
+/// The term in which this node knows `leader` leads `raft_group_id`, from
+/// its leadership view. `None` when the view names another leader or none.
+pub(crate) fn leader_term(
+    state: &HttpState,
+    raft_group_id: RaftGroupId,
+    leader: u64,
+) -> Option<u64> {
+    let leadership = state.raft_registry()?.get(raft_group_id)?.leadership();
+    (leadership.leader_id == Some(leader)).then_some(leadership.term)
 }
 
 /// Runs the deferred pressure checks, if admission runs.

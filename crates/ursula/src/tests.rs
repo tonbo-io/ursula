@@ -298,9 +298,13 @@ fn leader_redirect_never_points_at_this_node() {
         ),
     };
 
-    assert!(router.redirect_response(&forward(2), "/b/s").is_none());
+    assert!(
+        router
+            .redirect_response(&forward(2), "/b/s", |_, _| None)
+            .is_none()
+    );
     let redirect = router
-        .redirect_response(&forward(1), "/b/s")
+        .redirect_response(&forward(1), "/b/s", |_, _| None)
         .expect("a hint naming a peer redirects");
     assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(redirect.headers()[LOCATION], "http://node-1/b/s");
@@ -1315,8 +1319,9 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"sse_data_events\":0"));
     assert!(body.contains("\"sse_control_events\":0"));
     assert!(body.contains("\"sse_error_events\":0"));
-    // Each write is routed before its body, then proposed: two requests.
-    assert!(body.contains("\"routed_requests\":6"));
+    // A write is routed from the leadership view, without a trip through
+    // its group's core: one request per write.
+    assert!(body.contains("\"routed_requests\":3"));
     assert!(body.contains("\"per_core_routed_requests\":["));
     assert!(body.contains("\"mailbox_send_wait_ns\":"));
     assert!(body.contains("\"per_core_mailbox_send_wait_ns\":["));
@@ -2469,6 +2474,21 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     for (write, response) in &writes {
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
         assert_no_not_applied_headers(response.headers(), write);
+        // The node knows no leader or term of the group: it names the group
+        // alone (#581 section 5.7).
+        assert_eq!(
+            ursula_headers::RoutingAnswer::parse(
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            ),
+            Ok(Some(ursula_headers::RoutingAnswer::NotHosted {
+                group: ursula_headers::RaftGroup::from_u32(1)
+            })),
+            "{write}"
+        );
     }
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
@@ -2505,7 +2525,7 @@ fn unpollable_body() -> Body {
 /// A write to a follower is routed before its body (#581 section 6.1): a
 /// create, an append and a snapshot publish each answer `307` to the leader
 /// with the leader, the group and the term, and the follower never polls
-/// the body.
+/// the body. Pressure comes after routing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_follower_routes_writes_before_their_body() {
     let mut listeners = Vec::new();
@@ -2609,6 +2629,53 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
             "{write}: {answer:?}"
         );
     }
+
+    // Pressure comes after routing: a follower whose WAL disk is under
+    // pressure redirects a write, and the leader under the same pressure
+    // refuses it with a retryable `503`.
+    let pressured = |node: &StaticGrpcTestNode, node_id: u64| {
+        let monitor = WalDiskMonitor::new(100, 200);
+        assert_eq!(
+            monitor.observe_available(99),
+            crate::wal_disk::WalDiskTransition::EnterPressure
+        );
+        let state = HttpState::with_static_raft_cluster_topology(
+            node.runtime.clone(),
+            node.registry.clone(),
+            Some(node_id),
+            peers.clone(),
+            BTreeMap::new(),
+        )
+        .with_wal_disk_monitor(monitor.clone());
+        client_router_with_admission(
+            state,
+            IngressAdmission::default().with_wal_disk_monitor(monitor),
+        )
+    };
+    let append = |app: Router| async move {
+        send(
+            &app,
+            "POST",
+            "/benchcmp/routed",
+            &[
+                (CONTENT_TYPE.as_str(), "text/plain"),
+                (CONTENT_LENGTH.as_str(), "3"),
+            ],
+            Body::from("abc"),
+        )
+        .await
+    };
+    let redirected = append(pressured(&nodes[1], 2)).await;
+    assert_eq!(redirected.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(redirected.headers().contains_key(names::X_URSULA_RAFT_TERM));
+    let refused = append(pressured(&nodes[0], 1)).await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        refused
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER)
+    );
+    assert!(!refused.headers().contains_key(names::X_URSULA_RAFT_GROUP));
 
     for node in nodes {
         node.shutdown().await;

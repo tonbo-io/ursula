@@ -9,12 +9,12 @@
 //!   meets after routing.
 //! - [`front_door`]: what a write's head decides before its body is read:
 //!   routing, early answers and deferred admission.
-//! - [`identity`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on every HEAD
-//!   answer.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`limits`]: the request and snapshot limits HEAD advertises and every
 //!   `413` names.
+//! - [`response_metadata`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on
+//!   every HEAD answer, and the request limit on a `413` that names none.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
@@ -24,7 +24,6 @@ mod admission;
 mod bootstrap;
 mod cold_snapshot;
 mod front_door;
-mod identity;
 pub mod json_text;
 mod limits;
 mod otel_metrics;
@@ -37,6 +36,7 @@ mod http_time {
 }
 mod removed_surface;
 mod render;
+mod response_metadata;
 mod wal_disk;
 
 use std::collections::BTreeMap;
@@ -53,7 +53,6 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 pub use admission::IngressAdmission;
-use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -103,6 +102,7 @@ use ursula_headers::IncarnationPrecondition;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
+use ursula_headers::RoutingAnswer;
 use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
@@ -162,7 +162,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use wal_disk::WalDiskMonitor;
 
-use crate::admission::DeferredAdmission;
+use crate::admission::PendingAdmission;
 use crate::admission::ingress_admission_middleware;
 use crate::front_door::BodyState;
 use crate::front_door::HeadDecision;
@@ -202,6 +202,8 @@ use crate::render::should_base64_encode_sse_data;
 use crate::render::snapshot_response;
 use crate::render::sse_safe_line;
 use crate::render::stream_head;
+use crate::response_metadata::IdentityHeaders;
+use crate::response_metadata::ResponseMetadataLayer;
 
 type BoxResponse = Box<Response>;
 
@@ -317,7 +319,7 @@ pub struct HttpState {
     format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
     /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
     /// drawn for this process when the node runs without a WAL.
-    cluster_id: ClusterId,
+    cluster_id: Arc<ClusterId>,
 }
 
 impl HttpState {
@@ -402,7 +404,7 @@ impl HttpState {
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
-            cluster_id: ursula_raft::generate_cluster_id(),
+            cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
     }
 
@@ -424,7 +426,7 @@ impl HttpState {
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
-            cluster_id: ursula_raft::generate_cluster_id(),
+            cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
     }
 
@@ -467,7 +469,7 @@ impl HttpState {
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
-            cluster_id: ursula_raft::generate_cluster_id(),
+            cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
     }
 
@@ -497,7 +499,7 @@ impl HttpState {
     /// Sets the node's Raft WAL, whose root holds the cluster id.
     pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
         if let Some(wal) = &raft_wal {
-            self.cluster_id = wal.cluster_id().clone();
+            self.cluster_id = Arc::new(wal.cluster_id().clone());
         }
         self.raft_wal = raft_wal;
         self
@@ -657,11 +659,9 @@ impl ClientWriteLeaderRouter {
             .map(|base| format!("{base}{request_target}"))
     }
 
-    fn hosted_group_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
-        let RuntimeError::GroupNotHosted { raft_group_id, .. } = err else {
-            return None;
-        };
-        let voters = self.per_group_voters.get(raft_group_id)?;
+    /// A node that hosts a replica of `raft_group_id`, other than this one.
+    fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<String> {
+        let voters = self.per_group_voters.get(&raft_group_id)?;
         voters
             .iter()
             .copied()
@@ -669,23 +669,56 @@ impl ClientWriteLeaderRouter {
             .find_map(|node_id| {
                 self.peers
                     .get(&node_id)
-                    .map(|base| (node_id, base.trim_end_matches('/').to_owned()))
+                    .map(|base| base.trim_end_matches('/').to_owned())
             })
     }
 
-    fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
-        let (leader_id, leader_base) = self
-            .leader_base(err)
-            .or_else(|| self.hosted_group_base(err))?;
+    /// The redirect for `err`, typed through `ursula-headers`: to the leader
+    /// its hint names, or, from a node that hosts no replica of the group,
+    /// to one that does ([`RoutingAnswer::NotHosted`]). `term` gives the term
+    /// in which this node knows a leader of a group. A leader hint whose term
+    /// this node does not know names the leader alone.
+    fn redirect_response(
+        &self,
+        err: &RuntimeError,
+        request_target: &str,
+        term: impl FnOnce(RaftGroupId, u64) -> Option<u64>,
+    ) -> Option<Response> {
+        let group = match err {
+            RuntimeError::GroupEngine { raft_group_id, .. }
+            | RuntimeError::GroupNotHosted { raft_group_id, .. } => Some(*raft_group_id),
+            _ => None,
+        };
+        let (base, answer) = if let Some((leader_id, base)) = self.leader_base(err) {
+            let answer = group.and_then(|group| {
+                term(group, leader_id).map(|term| RoutingAnswer::NotLeader {
+                    leader: ursula_headers::NodeId::from_u64(leader_id),
+                    group: ursula_headers::RaftGroup::from_u32(group.0),
+                    term: ursula_headers::RaftTerm::from_u64(term),
+                })
+            });
+            (base, answer.ok_or(leader_id))
+        } else {
+            let RuntimeError::GroupNotHosted { raft_group_id, .. } = err else {
+                return None;
+            };
+            (
+                self.hosted_group_base(*raft_group_id)?,
+                Ok(RoutingAnswer::NotHosted {
+                    group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
+                }),
+            )
+        };
         let mut headers = HeaderMap::new();
         insert_default_response_headers(&mut headers);
-        let leader_url = format!("{}{}", leader_base.trim_end_matches('/'), request_target);
-        if let Ok(value) = HeaderValue::from_str(&leader_url) {
-            headers.insert(LOCATION, value);
-        } else {
-            return None;
+        let location = HeaderValue::from_str(&format!("{base}{request_target}")).ok()?;
+        headers.insert(LOCATION, location);
+        match answer {
+            Ok(answer) => answer.render(|name, value| insert_header_str(&mut headers, name, value)),
+            Err(leader_id) => {
+                insert_u64_header(&mut headers, names::X_URSULA_RAFT_LEADER_ID, leader_id);
+            }
         }
-        insert_u64_header(&mut headers, names::X_URSULA_RAFT_LEADER_ID, leader_id);
         Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
     }
 }
@@ -1059,7 +1092,7 @@ fn admin_ops_router(state: HttpState) -> Router {
             require_admin_incarnation,
         ))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(middleware::from_fn(limits::name_size_refusals))
+        .layer(ResponseMetadataLayer::new(None))
         .with_state(state)
 }
 
@@ -1394,11 +1427,9 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             admission.with_cold_snapshots(state.runtime.has_cold_store()),
             ingress_admission_middleware,
         ))
-        .layer(middleware::from_fn(limits::name_size_refusals))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            identity::identify_head_answers,
-        ))
+        .layer(ResponseMetadataLayer::new(Some(IdentityHeaders::new(
+            state.cluster_id(),
+        ))))
         .layer(response_compression)
         .with_state(state)
 }
@@ -2774,7 +2805,7 @@ pub(crate) async fn create_stream(
     version: Version,
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
-    admission: Option<Extension<DeferredAdmission>>,
+    admission: PendingAdmission,
     body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
@@ -2782,14 +2813,8 @@ pub(crate) async fn create_stream(
     if let Err(response) = create_head_checks(&headers) {
         return answer_before_body(*response, version, &headers, body).await;
     }
-    let decision = front_door::route_before_body(
-        &state,
-        &stream_id,
-        &request_target,
-        None,
-        admission.map(|Extension(admission)| admission),
-    )
-    .await;
+    let decision =
+        front_door::route_before_body(&state, &stream_id, &request_target, None, admission.0).await;
     let _permit = match decision {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
@@ -2930,7 +2955,7 @@ pub(crate) async fn append_stream(
     version: Version,
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
-    admission: Option<Extension<DeferredAdmission>>,
+    admission: PendingAdmission,
     body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
@@ -2946,7 +2971,7 @@ pub(crate) async fn append_stream(
         &stream_id,
         &request_target,
         early_answer,
-        admission.map(|Extension(admission)| admission),
+        admission.0,
     )
     .await;
     let _permit = match decision {
@@ -3470,7 +3495,7 @@ pub(crate) async fn publish_snapshot(
     version: Version,
     Path(path): Path<SnapshotPath>,
     headers: HeaderMap,
-    admission: Option<Extension<DeferredAdmission>>,
+    admission: PendingAdmission,
     body: Body,
 ) -> Response {
     if let Err(response) = removed_surface::reject_removed_snapshot_headers(&headers) {
@@ -3485,14 +3510,8 @@ pub(crate) async fn publish_snapshot(
         return answer_before_body(*response, version, &headers, body).await;
     }
     let request_target = request_target(&uri);
-    let decision = front_door::route_before_body(
-        &state,
-        &stream_id,
-        &request_target,
-        None,
-        admission.map(|Extension(admission)| admission),
-    )
-    .await;
+    let decision =
+        front_door::route_before_body(&state, &stream_id, &request_target, None, admission.0).await;
     let _permit = match decision {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
@@ -4448,7 +4467,9 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.
-    if let Some(redirect) = router.redirect_response(&err, request_target) {
+    if let Some(redirect) = router.redirect_response(&err, request_target, |group, leader| {
+        front_door::leader_term(state, group, leader)
+    }) {
         return redirect;
     }
     // Forward-to-leader error whose leader is currently unknown (election in

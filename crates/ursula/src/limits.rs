@@ -6,11 +6,8 @@
 //! in one request until snapshots go up in parts, and its refusal names the
 //! snapshot limit.
 
-use axum::body::Body;
 use axum::http::HeaderMap;
-use axum::http::Request;
 use axum::http::StatusCode;
-use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use ursula_headers::SizeLimit;
@@ -56,23 +53,22 @@ fn insert_size_limit(headers: &mut HeaderMap, limit: SizeLimit) {
     limit.render(|name, value| insert_header_str(headers, name, value));
 }
 
-/// Adds the request limit to any `413` that names no limit: the bare `413`
+/// Adds the request limit to a `413` that names no limit: the bare `413`
 /// of axum's body limit, and any refusal a path added later forgets to
 /// type. A `413` whose limit headers are malformed is left alone, since no
 /// path of this crate renders one.
-pub(crate) async fn name_size_refusals(request: Request<Body>, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        let named = SizeLimit::parse(
-            SizeLimit::STATUS,
-            response
-                .headers()
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_bytes())),
-        );
-        if matches!(named, Ok(None)) {
-            insert_size_limit(response.headers_mut(), REQUEST_LIMIT);
-        }
+pub(crate) fn name_unnamed_size_refusal(response: &mut Response) {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return;
     }
-    response
+    let named = SizeLimit::parse(
+        SizeLimit::STATUS,
+        response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    );
+    if matches!(named, Ok(None)) {
+        insert_size_limit(response.headers_mut(), REQUEST_LIMIT);
+    }
 }

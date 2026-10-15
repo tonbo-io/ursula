@@ -229,6 +229,21 @@ pub(crate) struct DeferredAdmission {
     body_bytes: u64,
 }
 
+/// The [`DeferredAdmission`] the middleware left for a handler, taken out of
+/// the request rather than cloned. `None` when admission does not run.
+pub(crate) struct PendingAdmission(pub(crate) Option<DeferredAdmission>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PendingAdmission {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.extensions.remove::<DeferredAdmission>()))
+    }
+}
+
 impl DeferredAdmission {
     /// Runs the pressure checks: a refusal answers a retryable `503`,
     /// otherwise the permit is held until the answer.

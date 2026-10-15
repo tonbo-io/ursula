@@ -51,6 +51,7 @@ pub mod raft_internal_proto {
 }
 
 mod owner;
+pub use owner::GroupLeadership;
 pub use owner::OwnerRaftHandle;
 mod codec;
 mod election;
