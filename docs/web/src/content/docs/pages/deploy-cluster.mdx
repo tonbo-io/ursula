@@ -72,6 +72,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
 
 - Run three voters across three availability zones, each with its own zonal persistent volume for the Raft log. Never use ephemeral voter data in production. The chart always gives each voter pod a `raft-data` volume claim.
 - Shared S3 is required for any multi-node cluster: replicas must be able to read chunks flushed by any leader.
+- The chart sets `server.cluster_id`, the id every `HEAD` answer carries as `Ursula-Cluster-Id`, to `u` followed by the first 32 hex digits of sha256 of `<namespace>/<release name>`. Set `server.clusterId` to keep an existing id, for example when a restore replaces a deployment under another release name. Each node's WAL records the id, and a node whose configured id differs refuses to start.
 - Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private. Ursula itself has no TLS or auth (see [Security](/docs/security)).
 - Kubernetes rolling updates do not transfer Raft leaders on their own. For an operationally safe restart, wrap the platform's restart in [ursulactl's maintenance verbs](/docs/cli): `ursulactl drain` the node, let Kubernetes restart the pod, then `ursulactl wait --node N` and `undrain` before moving to the next one. See [Operations](/docs/operations) for day-2 work.
 - The StatefulSet readiness probe calls `GET /__ursula/ready` and removes a pod
@@ -106,6 +107,7 @@ The same static-membership model works by hand. Every node runs the same config 
 ```toml
 [server]
 listen = "0.0.0.0:4437"
+cluster_id = "prod-us-east-1"
 
 [raft]
 group_count = 256
@@ -141,7 +143,7 @@ Start each node with its own ID:
 ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 ```
 
-`init_membership_per_group = true` bootstraps each group on the first start of a fresh cluster. Keep it on every node across restarts: a replica that ever held its group never initializes it again, and an empty replica initializes a group only when every configured voter reports it empty and no leader (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Verify the cluster with a one-file manifest:
+`server.cluster_id` is required with `raft.peers`. Use the same value on every node and a different one for every deployment a client can reach, such as the environment and the region. `init_membership_per_group = true` bootstraps each group on the first start of a fresh cluster. Keep it on every node across restarts: a replica that ever held its group never initializes it again, and an empty replica initializes a group only when every configured voter reports it empty and no leader (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Verify the cluster with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'

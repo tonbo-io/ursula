@@ -44,6 +44,7 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | ---------- | ------- | ------- |
 | `server.listen` | `127.0.0.1:4437` | Client/API listener |
 | `server.cluster_listen` | none | Optional separate Raft/cluster listener |
+| `server.cluster_id` | none | The deployment's id, sent as `Ursula-Cluster-Id` on every `HEAD`: 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`. Required when `raft.peers` is set, the same on every node and different for every deployment a client can reach. A single node without it generates `u` followed by 32 hex digits at its first start and keeps it in its WAL. A single node without `raft.wal.path` gets a new one on every start. The WAL records the id, and a node whose configured id differs refuses to start |
 | `runtime.cpu_affinity` | automatic | On Linux, `true` forces pinning and `false` disables it; omitted pins only when cpuset size equals core_count |
 | `runtime.core_count` | `available_parallelism` | Owner worker threads; Linux automatically pins only when the allowed cpuset matches this count. Journal writers and the main Tokio runtime use additional threads |
 | `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
@@ -174,6 +175,7 @@ Three-node durable cluster (same file on each host, override the node ID per hos
 ```toml
 [server]
 listen = "0.0.0.0:4437"
+cluster_id = "prod-us-east-1"
 
 [runtime]
 core_count = 16

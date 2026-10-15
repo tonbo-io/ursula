@@ -92,6 +92,14 @@ replica.
 
 Every node of a static cluster keeps its Raft WAL in `raft.wal.path`. Set it to a directory on a persistent volume. Only a single node without `raft.peers` may omit it, and then its WAL lives in a temporary directory that is removed on clean shutdown.
 
+### `server.cluster_id is required when raft.peers is set`
+
+Every node of a static cluster names its deployment with `server.cluster_id`. Set the same value on every node, and a different one for every deployment a client can reach. The Helm chart sets it from the namespace and release name. See [Configuration](/docs/configuration#server-and-runtime).
+
+### `the WAL at … belongs to cluster …`
+
+The node's WAL records the cluster id of its first start, and the configured `server.cluster_id` differs. A disk does not move between clusters. Set `server.cluster_id` to the stored id the error names, or start the node on an empty WAL and let it rejoin as a [wiped node](/docs/operations#rejoining-a-wiped-node).
+
 ### `raft.node_id must be non-zero`
 
 Static Raft mode requires a unique `raft.node_id` in the config file or a `--node-id` override.

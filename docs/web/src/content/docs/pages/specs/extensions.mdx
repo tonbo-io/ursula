@@ -462,7 +462,14 @@ There is no client opt-in or opt-out: the stream's content type decides the enco
 
 ## 10. Server Metadata
 
-A server implementing this extension sends on every successful `HEAD` of a stream:
+A server implementing this extension sends on every answer to a `HEAD`, `404`, redirects and `503` included:
+
+- `Ursula-Protocol: 2`, the version of the contract that Sections 2.4, 5 and 10 define. A later breaking change to them raises it. A server that sends none speaks version 1. A client MAY refuse a server that sends a lower version or none.
+- `Ursula-Cluster-Id: <id>`: 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, naming the deployment that serves the request. It does not change across restarts, upgrades, leader changes or history events, and an operator keeps it when a restore replaces a deployment. Two deployments that one client can reach MUST NOT share an id. A client that keeps state across requests SHOULD keep the id with it, and treat a different id as a different deployment, not as a new history of the same stream.
+
+These two headers are route-level, so a client tells a host alias routed to another deployment from a deleted stream. Intermediaries pass them through.
+
+On every successful `HEAD` of a stream it also sends:
 
 - `Ursula-Max-Request-Bytes: <bytes>`: the largest request body that any request to the stream may carry, as far as the server and the intermediaries that implement this section know.
 - `Ursula-Max-Snapshot-Bytes: <bytes>`, when the server accepts snapshots larger than `Ursula-Max-Request-Bytes`: the largest snapshot it accepts.
@@ -473,4 +480,4 @@ Both values are canonical decimal integers: no sign and no leading zero.
 
 **Intermediaries.** An intermediary that limits request bodies and implements this section MUST replace `Ursula-Max-Request-Bytes` on every response that carries it with the smaller of the received value and its own limit for that request, and MUST answer its own size refusals as above. It leaves `Ursula-Max-Snapshot-Bytes` alone. A `413` without either header comes from a layer that does not implement this section, such as a proxy with its own body limit. It tells the client only that some layer refused the size.
 
-> **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes). With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in one request and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit.
+> **Note (informative).** An Ursula node accepts request bodies of up to 32 MiB (33,554,432 bytes). With a cold backend it accepts a snapshot of up to 1 GiB (1,073,741,824 bytes) in one request and sends `Ursula-Max-Snapshot-Bytes: 1073741824`. Without one it sends no `Ursula-Max-Snapshot-Bytes`. The Ursula gateway lowers `Ursula-Max-Request-Bytes` to the smaller of its `--max-request-body-bytes` and the tenant's `max_request_body_bytes`, and its own `413` names that limit. An Ursula cluster's id is set by its operator (`server.cluster_id`). A single node without one generates one at its first start and keeps it in its WAL.
