@@ -29,6 +29,7 @@ use crate::open::Prepared;
 use crate::open::Published;
 use crate::open::new_build;
 use crate::open::prepare;
+use crate::open::prepare_locked;
 
 /// A build to start: a fresh generation in `gen-<id32>.tmp`, read up to `end`.
 #[derive(Debug)]
@@ -67,7 +68,7 @@ pub(crate) enum DiskJob {
     /// A complete build, published.
     Publish(Box<Build>),
     /// A fresh build that found the stream missing, abandoned, then the open's local steps
-    /// again; done as a [`DiskDone::Prepared`].
+    /// again under the lock it held; done as a [`DiskDone::Prepared`].
     Abandon {
         build: Box<Build>,
         spec: OpenSpec,
@@ -123,7 +124,7 @@ impl DiskJob {
             }
             Self::Publish(build) => DiskDone::Published(build.publish()),
             Self::Abandon { build, spec } => {
-                DiskDone::Prepared(build.abandon().and_then(|()| prepare(&spec)))
+                DiskDone::Prepared(build.abandon().and_then(|root| prepare_locked(root, &spec)))
             }
             Self::CatchUp {
                 mut m,

@@ -101,6 +101,7 @@ use crate::open::table::Local;
 use crate::open::table::LocalSummary;
 use crate::open::table::OpenRow;
 use crate::open::table::Superseded;
+use crate::open::table::Why;
 use crate::open::table::decide;
 use crate::replicator::Action;
 use crate::replicator::BlockedReason;
@@ -118,7 +119,6 @@ use crate::replicator::Step;
 use crate::replicator::Work;
 use crate::replicator::answer::Unacked;
 use crate::replicator::answer::inherits;
-use crate::salvage::Reason;
 use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
@@ -407,9 +407,10 @@ struct World {
     salvaged: Vec<Arc<[u8]>>,
     /// Every commit frame an owner was told its stream acknowledged (property 19).
     acknowledged: Vec<Arc<[u8]>>,
-    /// The lineages of logs cloned: two copies commit at one commit id, and a takeover of one
-    /// may discard what the other had acknowledged (clones are outside property 19).
-    cloned: Vec<Lineage>,
+    /// The lineage of every log cloned, and its last position then: after it the copies commit at
+    /// one commit id, and a takeover of one may discard what the other had acknowledged, so
+    /// those commits are outside property 19.
+    cloned: Vec<(Lineage, Position)>,
     coverage: Arc<Coverage>,
 }
 
@@ -689,7 +690,7 @@ impl World {
             OpenRow::Build {
                 superseded:
                     Superseded::Salvage {
-                        reason: Reason::HistoryChanged,
+                        why: Why::HistoryChanged,
                         ..
                     },
                 cluster_id,
@@ -770,7 +771,7 @@ impl World {
         }
         let mut copy = self.owners[index].clone();
         let original = copy.inst.uid;
-        self.cloned.push(copy.log.lineage);
+        self.cloned.push((copy.log.lineage, copy.log.last_logged()));
         copy.family = self.next_family;
         self.next_family += 1;
         copy.salt = u8::try_from(copy.family % 250).unwrap();
@@ -803,6 +804,13 @@ impl World {
             }
         }
         self.owners.push(copy);
+    }
+
+    /// Whether a clone of the log of `id`'s lineage may have committed at `id` too.
+    fn after_a_clone(&self, id: CommitId) -> bool {
+        self.cloned
+            .iter()
+            .any(|(lineage, at)| *lineage == id.lineage && id.position > *at)
     }
 
     fn live(&self, index: usize) -> bool {
@@ -1193,17 +1201,15 @@ impl World {
             .take_while(|(p, _)| **p <= acked.0)
             .map(|(_, p)| p.clone())
             .collect();
-        // Property 19: the owner's own commits it was told are acknowledged, unless a clone
-        // shares their lineage.
+        // Property 19: the owner's own commits it was told are acknowledged, those a clone may
+        // also have committed at aside.
         let lineage = self.owners[index].log.lineage;
-        if !self.cloned.contains(&lineage) {
-            self.acknowledged.extend(
-                records
-                    .iter()
-                    .filter(|p| p.id.lineage == lineage)
-                    .map(|p| Arc::clone(&p.frame)),
-            );
-        }
+        let acknowledged: Vec<Arc<[u8]>> = records
+            .iter()
+            .filter(|p| p.id.lineage == lineage && !self.after_a_clone(p.id))
+            .map(|p| Arc::clone(&p.frame))
+            .collect();
+        self.acknowledged.extend(acknowledged);
         // Searched as bytes: foreign garbage may sit between frames. An answer that comes back
         // after a rewind is about the history it applied in, which the stream no longer shows.
         let stream = self.stream();
@@ -1624,7 +1630,8 @@ impl World {
         if let Some(last) = self.owners[index].inst.caught_up_due.take() {
             // A rebuild reads under its claim's token: a history change since, which an answer
             // from before it hid, fails the rebuild before it publishes, and the takeover resets
-            // `rewound` with the old generation whole (its ACK fsynced, D5).
+            // `rewound` with the old generation whole. Its ACK records stay as durable as they
+            // were: the rebuild let go of the old log, which the reset does not fsync.
             let token = self.token();
             let inst = &mut self.owners[index].inst;
             if inst.unpublished.is_some()
@@ -1636,8 +1643,6 @@ impl World {
                 inst.unpublished = None;
                 inst.rebuilt_bytes = None;
                 inst.replicator = Replicator::Reset(ResetKind::Rewound);
-                let log = &mut self.owners[index].log;
-                log.durable_acks = log.acks.len();
                 self.coverage.rewound.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1957,7 +1962,7 @@ impl World {
             Ok(Decoded::Frame {
                 frame: Frame::Commit { id, .. },
                 ..
-            }) => self.cloned.contains(&id.lineage),
+            }) => self.after_a_clone(id),
             _ => false,
         };
         let lost = self.acknowledged.iter().find(|frame| {

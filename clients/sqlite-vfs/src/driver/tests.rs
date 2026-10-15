@@ -145,6 +145,10 @@ struct World {
     /// Another deployment, which every request reaches while `misrouted`.
     other: ModelServer,
     misrouted: bool,
+    /// Every request reaches `other` once this many more HEADs were answered.
+    misroute_after_heads: Option<u32>,
+    /// Reads (GETs) reach `other`, the rest the server.
+    misroute_reads: bool,
     next_id: u64,
     /// The binding of each ticket `sync_to` handed out.
     tickets: HashMap<Ticket, BindingId>,
@@ -165,6 +169,8 @@ impl World {
             every_head: None,
             other: ModelServer::new(ClusterId::new("cluster-b").unwrap(), 9),
             misrouted: false,
+            misroute_after_heads: None,
+            misroute_reads: false,
             hold: None,
             held: Vec::new(),
             next_id: 1,
@@ -208,7 +214,16 @@ impl World {
         if self.legacy && request.method == Method::Head {
             return Exchange::Answered(Box::new(RawAnswer::new(200).parse(request)));
         }
-        if self.misrouted {
+        if self.misroute_after_heads == Some(0) {
+            self.misroute_after_heads = None;
+            self.misrouted = true;
+        }
+        if request.method == Method::Head
+            && let Some(n) = self.misroute_after_heads
+        {
+            self.misroute_after_heads = Some(n.saturating_sub(1));
+        }
+        if self.misrouted || (self.misroute_reads && request.method == Method::Get) {
             let delivered = self.other.exchange(PATH, request);
             let Delivered::Answered { answer, .. } = delivered else {
                 panic!("the other deployment answers");
@@ -3279,4 +3294,66 @@ fn a_generation_without_a_log_is_salvaged_as_replaced() {
     let bound = result.unwrap();
     assert_eq!(bound.handle.attach, salvaged_attach(Reason::Replaced));
     only_salvage(&generation, Reason::Replaced);
+}
+
+/// A create of the stream on `server`.
+fn create(server: &mut ModelServer) {
+    let create = Request {
+        content_type: Some(CONTENT_TYPE.to_owned()),
+        ..Request::new(Method::Put, Target::Stream)
+    };
+    assert_eq!(server.handle(PATH, &create).status, 201);
+}
+
+/// The route flips to another deployment, which serves the stream under its own token, while a
+/// fresh open builds: the tail read meets a `412`, and the HEAD after it names the other cluster.
+/// The build refuses `wrong_cluster` instead of starting over under that token, and nothing goes
+/// to the other deployment.
+#[test]
+fn a_build_whose_route_flips_to_another_deployment_is_refused() {
+    let mut w = World::new();
+    let _source = stream_with_a_commit(&mut w);
+    create(&mut w.other);
+    let before = w.other.frames(PATH).unwrap().len();
+    // The open's HEAD and the build's reach the server; the build's read and HEAD do not.
+    w.misroute_after_heads = Some(2);
+    let dir = TempDir::new("driver-build-misroute");
+    let b = w.core();
+    let e = kind(w.open_result(b, spec(dir.path(), 2)));
+    assert!(matches!(&*e, OpenError::WrongCluster { .. }), "{e}");
+    assert_eq!(w.other.frames(PATH).unwrap().len(), before);
+}
+
+/// The same with no stream on the other deployment: the read meets a `404`, and the HEAD's `404`
+/// names the other cluster. The build refuses `wrong_cluster` and creates nothing there.
+#[test]
+fn a_build_whose_route_flips_to_a_deployment_without_the_stream_is_refused() {
+    let mut w = World::new();
+    let _source = stream_with_a_commit(&mut w);
+    w.misroute_after_heads = Some(2);
+    let dir = TempDir::new("driver-build-misroute-404");
+    let b = w.core();
+    let e = kind(w.open_result(b, spec(dir.path(), 2)));
+    assert!(matches!(&*e, OpenError::WrongCluster { .. }), "{e}");
+    assert!(w.other.frames(PATH).is_none());
+}
+
+/// Reads keep meeting `412`s while the HEAD names the build's token (reads and HEADs reaching
+/// different nodes): each check waits the open's backoff, and the build gives up after its checks
+/// (or the open at its deadline) instead of looping.
+#[test]
+fn reads_and_heads_that_disagree_end_the_build_after_backoffs() {
+    let mut w = World::new();
+    let _source = stream_with_a_commit(&mut w);
+    create(&mut w.other);
+    w.misroute_reads = true;
+    let dir = TempDir::new("driver-build-disagree");
+    let b = w.core();
+    let start = w.now;
+    let e = kind(w.open_result(b, spec(dir.path(), 2)));
+    w.misroute_reads = false;
+    assert!(matches!(&*e, OpenError::Unavailable(_)), "{e}");
+    let heads = heads(&w, b);
+    assert!((3..=20).contains(&heads), "{heads} HEADs");
+    assert!(w.now - start >= 1_000, "{} ms", w.now - start);
 }

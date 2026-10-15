@@ -497,8 +497,12 @@ pub(crate) struct Build {
     retry: Retry,
     /// The next attempt's flags, after a failure.
     attempt: Attempt,
-    /// Restarts after a `410` so far, at most [`MAX_BUILD_RESTARTS`].
+    /// Restarts after a `410` or a history change so far, at most [`MAX_BUILD_RESTARTS`].
     restarts: u32,
+    /// HEADs a `412` or `404` on a read sent so far, at most [`MAX_BUILD_RECHECKS`].
+    rechecks: u32,
+    /// Their backoff: it grows across the HEADs that answer between them, until a read succeeds.
+    recheck: Policy,
     /// The offset of the snapshot this build installed, if any.
     installed: Option<Offset>,
     /// What becomes of the generation the publish supersedes.
@@ -520,6 +524,10 @@ pub(crate) struct Published {
 
 /// The restarts a build makes after a `410` or a history change before it gives up.
 const MAX_BUILD_RESTARTS: u32 = 8;
+
+/// The HEADs a build sends after a `412` or `404` on a read before it gives up (`unavailable`):
+/// each after the open's backoff, two per restart at most.
+const MAX_BUILD_RECHECKS: u32 = 2 * MAX_BUILD_RESTARTS;
 
 /// What a build reads next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,7 +562,8 @@ pub(crate) enum BuildStep {
     /// Everything is read and applied: publish (a disk job: [`Build::publish`]).
     Done,
     /// A fresh build found the stream missing: it is abandoned and the open goes back through
-    /// the open table (a disk job: [`Build::abandon`], then [`prepare`]).
+    /// the open table (a disk job: [`Build::abandon`], then [`prepare_locked`] under the lock it
+    /// held).
     Missing,
     Fail(OpenError),
 }
@@ -577,6 +586,8 @@ impl Build {
             retry: Retry::default(),
             attempt: Attempt::default(),
             restarts: 0,
+            rechecks: 0,
+            recheck: Policy::default(),
             installed: None,
             fate,
             head: None,
@@ -620,6 +631,15 @@ impl Build {
         };
         match (self.stage, answer) {
             (BuildStage::Head, Some(answer)) => {
+                // A HEAD of another deployment (a route that flipped) or of an older server decides
+                // nothing about this build's stream: refused, as the open table refuses it.
+                if let Ok(Typed::Head { identity, .. }) = &answer.typed
+                    && matches!(answer.status, 200 | 404)
+                    && let Err(refused) =
+                        table::check_identity(identity.as_ref(), Some(&self.header.cluster_id))
+                {
+                    return BuildStep::Fail(refused.into());
+                }
                 let head = match &answer.typed {
                     Ok(Typed::Head {
                         stream: Some(head), ..
@@ -701,11 +721,21 @@ impl Build {
                 self.attempt = attempt;
                 BuildStep::Timer { at_ms, jitter_ms }
             }
-            // A `412` or a `404`: the HEAD tells whether the history changed or the stream went.
-            // Only a changed history counts as a restart.
+            // A `412` or a `404`: after the open's backoff, the HEAD tells whether the history
+            // changed or the stream went. A changed history counts as a restart, and these checks
+            // count apart, so reads and HEADs that disagree (two nodes) do not loop.
             Failure::Restart => {
+                self.rechecks = self.rechecks.saturating_add(1);
+                if self.rechecks > MAX_BUILD_RECHECKS {
+                    return BuildStep::Fail(OpenError::Unavailable(Unavailable::Retrying));
+                }
                 self.stage = BuildStage::Head;
-                self.next()
+                match self.recheck.backoff(None, Attempt::default(), now_ms) {
+                    Next::Wait {
+                        at_ms, jitter_ms, ..
+                    } => BuildStep::Timer { at_ms, jitter_ms },
+                    Next::Resend(_) | Next::Head(_) | Next::Reset(_) => self.next(),
+                }
             }
             Failure::Closed => BuildStep::Fail(OpenError::StreamState(StreamState::Closed)),
         }
@@ -776,6 +806,7 @@ impl Build {
         match decide_read(exchange) {
             ReadDecision::Bytes { next } => {
                 self.retry.succeeded();
+                self.recheck = Policy::default();
                 self.attempt = Attempt::default();
                 let body = match exchange {
                     Exchange::Answered(answer) => answer.body.as_slice(),
@@ -818,6 +849,7 @@ impl Build {
             fetch,
             retry,
             restarts,
+            rechecks,
             fate,
             ..
         } = self;
@@ -825,15 +857,15 @@ impl Build {
         let mut build = start_build(root, header, fetch.stream.end(), fate)?;
         build.retry = retry;
         build.restarts = restarts;
+        build.rechecks = rechecks;
         Ok(build)
     }
 
-    /// Disk job: deletes what the build wrote, its `.tmp`, and lets go of the root.
-    pub(crate) fn abandon(self) -> Result<(), OpenError> {
+    /// Disk job: deletes what the build wrote, its `.tmp`, and hands back the root, still locked.
+    pub(crate) fn abandon(self) -> Result<Arc<Root>, OpenError> {
         let Self { building, root, .. } = self;
-        let discarded = building.discard().map_err(local);
-        drop(root);
-        discarded
+        building.discard().map_err(local)?;
+        Ok(root)
     }
 
     /// Disk job: logs, acknowledges, fsyncs and applies one read's frames.
@@ -954,6 +986,12 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
         GenerationError::InUse { root } => OpenError::InUse { root },
         other => local(other),
     })?;
+    prepare_locked(Arc::new(root), spec)
+}
+
+/// [`prepare`] in a root this open holds locked already.
+pub(crate) fn prepare_locked(root: Arc<Root>, spec: &OpenSpec) -> Result<Prepared, OpenError> {
+    let name = canonical_path(&spec.url)?;
     root.finish_leftovers().map_err(local)?;
     let found = match root.current_or_unreadable().map_err(local)? {
         None => Local::None,
@@ -994,10 +1032,7 @@ pub(crate) fn prepare(spec: &OpenSpec) -> Result<Prepared, OpenError> {
             Err(e) => return Err(local(e)),
         },
     };
-    Ok(Prepared {
-        root: Arc::new(root),
-        found,
-    })
+    Ok(Prepared { root, found })
 }
 
 /// What the open table reads of a trusted local generation.
@@ -1139,6 +1174,8 @@ pub(crate) struct Opening {
     resend: Option<(Request, Attempt)>,
     /// This open created the stream: a generation it salvages after is `recreated`.
     created: bool,
+    /// Builds that found the stream missing and went back through the open table.
+    missing: u32,
 }
 
 /// What an open does next.
@@ -1193,6 +1230,7 @@ impl Opening {
                 retry: Retry::default(),
                 resend: None,
                 created: false,
+                missing: 0,
             }),
             job,
         }
@@ -1362,8 +1400,13 @@ impl Opening {
                     job: DiskJob::Publish(build),
                 }
             }
-            // The open starts again from its local steps, its root lock let go first.
+            // The open starts again from its local steps, under the lock the build holds, a few
+            // times at most: a stream deleted again and again is not this open's to chase.
             BuildStep::Missing => {
+                self.missing = self.missing.saturating_add(1);
+                if self.missing > MAX_BUILD_RESTARTS {
+                    return OpenStep::Fail(OpenError::Unavailable(Unavailable::Retrying));
+                }
                 self.prepared = None;
                 self.phase = Phase::Preparing;
                 let spec = self.spec.clone();
@@ -1520,8 +1563,8 @@ impl Opening {
                 let stream = Some(head.incarnation());
                 let fate = match superseded {
                     Superseded::Nothing | Superseded::Trash(_) => Fate::Trash,
-                    Superseded::Salvage { reason, local } => {
-                        Fate::Salvage(salvage_manifest(&local, reason, stream))
+                    Superseded::Salvage { why, local } => {
+                        Fate::Salvage(salvage_manifest(&local, why.into(), stream))
                     }
                     Superseded::Replaced(replaced) => Fate::Salvage(Manifest {
                         reason: Reason::Replaced,

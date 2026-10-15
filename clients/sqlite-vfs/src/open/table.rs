@@ -93,11 +93,26 @@ pub(crate) enum Superseded<L, R> {
     Nothing,
     /// A trusted generation holding no data: trashed.
     Trash(L),
-    /// A trusted generation holding data, salvaged for `reason` (`history_changed` or
-    /// `recreated`).
-    Salvage { reason: Reason, local: L },
+    /// A trusted generation holding data, salvaged for `why`.
+    Salvage { why: Why, local: L },
     /// A replaced generation, salvaged as found (`replaced`).
     Replaced(R),
+}
+
+/// Why a build salvages a trusted generation: never `replaced`, which only a replaced one is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Why {
+    HistoryChanged,
+    Recreated,
+}
+
+impl From<Why> for Reason {
+    fn from(why: Why) -> Self {
+        match why {
+            Why::HistoryChanged => Reason::HistoryChanged,
+            Why::Recreated => Reason::Recreated,
+        }
+    }
 }
 
 /// What the open does, carrying what it does it with: the local generation `L` when a row uses
@@ -174,24 +189,38 @@ pub(crate) fn rekeys(summary: &LocalSummary, head: &StreamHead) -> bool {
 
 /// The table of design §5.5 for an owner's open, on the local generation it found, what was
 /// asked, and the HEAD it got.
-pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>) -> OpenRow<L, R> {
-    let refuse = |refused, local| OpenRow::Refuse { refused, local };
-    let identity = match head.identity {
+/// The identity a HEAD named, checked (design §6.3): protocol 2, and the cluster id `ours` when a
+/// generation names one. The open table and a build's HEADs share it.
+pub(crate) fn check_identity<'a>(
+    identity: Option<&'a ServerIdentity>,
+    ours: Option<&str>,
+) -> Result<&'a ServerIdentity, Refused> {
+    let identity = match identity {
         Some(identity) if identity.protocol == ursula_headers::PROTOCOL_VERSION => identity,
         other => {
             let protocol = other.map(|i| i.protocol);
-            return refuse(Refused::ServerTooOld { protocol }, local);
+            return Err(Refused::ServerTooOld { protocol });
         }
     };
-    if let Local::Trusted(summary, _) = &local
-        && summary.cluster_id != identity.cluster_id.as_str()
-    {
-        let refused = Refused::WrongCluster {
-            local: summary.cluster_id.clone(),
+    match ours {
+        Some(ours) if ours != identity.cluster_id.as_str() => Err(Refused::WrongCluster {
+            local: ours.to_owned(),
             stream: identity.cluster_id.clone(),
-        };
-        return refuse(refused, local);
+        }),
+        Some(_) | None => Ok(identity),
     }
+}
+
+pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>) -> OpenRow<L, R> {
+    let refuse = |refused, local| OpenRow::Refuse { refused, local };
+    let ours = match &local {
+        Local::Trusted(summary, _) => Some(summary.cluster_id.as_str()),
+        Local::None | Local::Replaced(_) => None,
+    };
+    let identity = match check_identity(head.identity, ours) {
+        Ok(identity) => identity,
+        Err(refused) => return refuse(refused, local),
+    };
     let Some(stream) = head.stream else {
         let not_found = matches!(
             &local,
@@ -245,15 +274,12 @@ pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>)
         };
     }
     let superseded = if summary.holds_data {
-        let reason = if asked.created {
-            Reason::Recreated
+        let why = if asked.created {
+            Why::Recreated
         } else {
-            Reason::HistoryChanged
+            Why::HistoryChanged
         };
-        Superseded::Salvage {
-            reason,
-            local: value,
-        }
+        Superseded::Salvage { why, local: value }
     } else {
         Superseded::Trash(value)
     };
@@ -280,10 +306,10 @@ mod tests {
     use super::OpenRow;
     use super::Refused;
     use super::Superseded;
+    use super::Why;
     use super::decide;
     use crate::codec::frame::CONTENT_TYPE;
     use crate::replicator::answer::Unacked;
-    use crate::salvage::Reason;
 
     /// A local generation of the tests: a trusted one carries `"gen"`, a replaced one `"bad"`.
     type Found = Local<&'static str, &'static str>;
@@ -363,11 +389,8 @@ mod tests {
         }
     }
 
-    fn salvaged(reason: Reason) -> Superseded<&'static str, &'static str> {
-        Superseded::Salvage {
-            reason,
-            local: "gen",
-        }
+    fn salvaged(why: Why) -> Superseded<&'static str, &'static str> {
+        Superseded::Salvage { why, local: "gen" }
     }
 
     #[test]
@@ -520,7 +543,7 @@ mod tests {
                 ask(),
                 seen(&id, Some(&head))
             ),
-            build(salvaged(Reason::HistoryChanged), head)
+            build(salvaged(Why::HistoryChanged), head)
         );
     }
 
@@ -531,19 +554,19 @@ mod tests {
         let lossy = stream(2, 50, Some((1, 39)));
         assert_eq!(
             decide(local(1, 40), ask(), seen(&id, Some(&lossy))),
-            build(salvaged(Reason::HistoryChanged), lossy)
+            build(salvaged(Why::HistoryChanged), lossy)
         );
         // It began from another token's history.
         let other = stream(3, 50, Some((2, 50)));
         assert_eq!(
             decide(local(1, 40), ask(), seen(&id, Some(&other))),
-            build(salvaged(Reason::HistoryChanged), other)
+            build(salvaged(Why::HistoryChanged), other)
         );
         // It names no history it began from: a recreate, by this open or another.
         let recreated = stream(4, 0, None);
         assert_eq!(
             decide(local(1, 0), ask(), seen(&id, Some(&recreated))),
-            build(salvaged(Reason::HistoryChanged), recreated)
+            build(salvaged(Why::HistoryChanged), recreated)
         );
         let created = Asked {
             recreate: true,
@@ -551,7 +574,7 @@ mod tests {
         };
         assert_eq!(
             decide(local(1, 0), created, seen(&id, Some(&recreated))),
-            build(salvaged(Reason::Recreated), recreated)
+            build(salvaged(Why::Recreated), recreated)
         );
         // A generation holding no data loses nothing.
         assert_eq!(
