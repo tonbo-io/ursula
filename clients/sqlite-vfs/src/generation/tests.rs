@@ -537,3 +537,23 @@ fn a_crash_during_a_copy_leaves_one_generation_current() {
         steps += 1;
     }
 }
+
+// A copy that fails deletes its `.tmp`: here the original's log is gone.
+#[test]
+fn a_failed_copy_leaves_no_tmp() {
+    let dir = TempDir::new("gen-copy-fail");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let old = with_records(&root, 2);
+    fs::remove_dir_all(old.log_dir()).unwrap();
+    assert!(matches!(
+        root.copy(&old),
+        Err(GenerationError::Log(_) | GenerationError::Io { .. })
+    ));
+    let entries: Vec<String> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n != "lock")
+        .collect();
+    assert_eq!(entries, vec![format!("gen-{}", old.id.hex())]);
+}

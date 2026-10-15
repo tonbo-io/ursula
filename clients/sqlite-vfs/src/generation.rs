@@ -196,6 +196,11 @@ pub(crate) fn root_name(p: &CanonicalPath) -> String {
     format!("{label}-{}", hash.as_str().get(..32).unwrap_or_default())
 }
 
+/// The root directory of stream `p` under the cache root `dir`.
+pub(crate) fn root_dir(dir: &Path, p: &CanonicalPath) -> PathBuf {
+    dir.join(root_name(p))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GenerationError {
     #[error("{}: another process holds the stream's local files", .root.display())]
@@ -363,7 +368,7 @@ impl Root {
     /// Creates `<dir>/<root_name>/` when missing and takes its `lock` (`InUse` if another process,
     /// or another open file of this one, holds it).
     pub(crate) fn lock(dir: &Path, p: &CanonicalPath) -> Result<Root, GenerationError> {
-        let root = dir.join(root_name(p));
+        let root = root_dir(dir, p);
         fs::create_dir_all(&root).map_err(io("create", &root))?;
         let path = root.join(LOCK);
         let lock = File::options()
@@ -414,7 +419,7 @@ impl Root {
     }
 
     /// Whether a binding of this process still holds generation `g`: a reset binding whose
-    /// connections are open.
+    /// connections are open (the only one that takes a hold).
     pub(crate) fn held(&self, g: &Generation) -> bool {
         self.holds()
             .iter()
@@ -443,7 +448,7 @@ impl Root {
         Ok(gens)
     }
 
-    #[cfg(test)]
+    /// The root directory.
     pub(crate) fn path(&self) -> &Path {
         &self.dir
     }
@@ -598,7 +603,8 @@ impl Root {
     /// generation it supersedes. Its WAL and wal-index stay behind: the WAL's commits are in the
     /// log, which materializing the copy re-applies. The copy is published like a build
     /// ([`Building::publish`], `from` trashed), and a crash before the rename leaves only a
-    /// `.tmp` that the next open deletes.
+    /// `.tmp` that the next open deletes. A failed copy deletes its `.tmp`. On a filesystem that
+    /// cannot clone files, the copy reads and writes the whole db file.
     pub(crate) fn copy(&self, from: &Generation) -> Result<Building, GenerationError> {
         let id = GenId::random().map_err(|source| GenerationError::Random { source })?;
         let name = format!("{GEN}{}", id.hex());
@@ -608,22 +614,37 @@ impl Root {
             return Err(GenerationError::Exists { path: target });
         }
         fs::create_dir(&tmp).map_err(io("create", &tmp))?;
-        let generation = Generation {
-            dir: tmp.clone(),
-            id,
-            lineage: from.lineage,
+        let files = || -> Result<(Log, File), GenerationError> {
+            let generation = Generation {
+                dir: tmp.clone(),
+                id,
+                lineage: from.lineage,
+            };
+            let db_path = generation.db();
+            fs::copy(from.db(), &db_path).map_err(io("copy", &from.db()))?;
+            abort_at(AbortStep::CopyDb);
+            replog::copy(&from.log_dir(), &generation.log_dir(), from.id)?;
+            abort_at(AbortStep::CopyLog);
+            let (log, _) = Log::open(&generation.log_dir())?;
+            let db = File::options()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .map_err(io("open", &db_path))?;
+            Ok((log, db))
         };
-        let db_path = generation.db();
-        fs::copy(from.db(), &db_path).map_err(io("copy", &from.db()))?;
-        abort_at(AbortStep::CopyDb);
-        replog::copy(&from.log_dir(), &generation.log_dir(), from.id)?;
-        abort_at(AbortStep::CopyLog);
-        let (log, _) = Log::open(&generation.log_dir())?;
-        let db = File::options()
-            .read(true)
-            .write(true)
-            .open(&db_path)
-            .map_err(io("open", &db_path))?;
+        let (log, db) = match files() {
+            Ok(files) => files,
+            Err(e) => {
+                if let Err(left) = fs::remove_dir_all(&tmp) {
+                    crate::log::emit(crate::log::Level::Warn, "copy_leftover", &[
+                        ("dir", &tmp.display()),
+                        ("error", &left),
+                    ]);
+                }
+                return Err(e);
+            }
+        };
         Ok(Building {
             root: self.dir.clone(),
             tmp,

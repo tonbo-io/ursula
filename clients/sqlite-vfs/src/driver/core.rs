@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -69,6 +70,7 @@ use crate::generation::CanonicalPath;
 use crate::generation::Fate;
 use crate::generation::Root;
 use crate::generation::canonical_path;
+use crate::generation::root_dir;
 use crate::guard;
 use crate::ids::Lineage;
 use crate::ids::Position;
@@ -331,11 +333,11 @@ pub(crate) struct Core {
     events: EventLog,
     /// Resolved opens not yet taken.
     opened: BTreeMap<OpenId, Result<Bound, Arc<OpenError>>>,
-    /// The roots this core's opens locked, by stream: the root of a stream stays locked while a
-    /// binding or an open holds it, a reset binding whose connections are open among them, and a
-    /// later open of the stream shares it instead of locking it again. Per core, so tests that
-    /// run several cores as several processes keep them apart.
-    roots: HashMap<CanonicalPath, Weak<Root>>,
+    /// The roots this core's opens locked, by directory: a root stays locked while a binding, an
+    /// open or a reset binding's connections hold it. An open of the stream shares it only when
+    /// nothing but reset bindings' connections hold it, and otherwise locks it anew (`in_use`).
+    /// Per core, so tests that run several cores as several processes keep them apart.
+    roots: HashMap<PathBuf, Weak<Root>>,
     /// Test hook: the next CLAIM record's write fails.
     #[cfg(test)]
     pub(crate) fail_next_claim: bool,
@@ -407,8 +409,11 @@ impl Core {
     /// Starts open `open` (design §5.5). Its outcome comes as [`DriverEvent::Opened`].
     ///
     /// A binding of the stream that its connections reset, and whose reset has not reached the
-    /// core yet, resets first, so its log takes no commit once the open may copy it (G8). Then the
-    /// open shares the stream's root when a reset binding's connections still hold it.
+    /// core yet, resets first, so its log takes no append once the open may copy it (G8). Then the
+    /// open shares the stream's root when only reset bindings' connections still hold it: with
+    /// any other binding or open of the stream left in the core (one still draining, or a
+    /// tombstone whose disk job is out), it locks the root anew and is refused `in_use`, so it
+    /// never runs beside a replicator or a job that writes the stream's files.
     pub(crate) fn open(&mut self, open: OpenId, spec: OpenSpec, now_ms: u64) -> Vec<Io> {
         let mut ios = Vec::new();
         let root = match canonical_path(&spec.url) {
@@ -422,7 +427,15 @@ impl Core {
                 for (binding, kind) in reset {
                     self.reset(binding, kind, now_ms);
                 }
-                self.roots.get(&name).and_then(Weak::upgrade)
+                let busy = self.bindings.values().any(|b| b.name == name)
+                    || self.opens.values().any(|slot| *slot.opening.name() == name);
+                if busy {
+                    None
+                } else {
+                    self.roots
+                        .get(&root_dir(&spec.dir, &name))
+                        .and_then(Weak::upgrade)
+                }
             }
             // The open fails on the URL itself.
             Err(_invalid) => None,
@@ -436,11 +449,11 @@ impl Core {
         ios
     }
 
-    /// The root an open of stream `name` locked, or shares: later opens of the stream share it
-    /// while anything holds it.
-    fn remember_root(&mut self, name: &CanonicalPath, root: &Arc<Root>) {
+    /// The root an open locked, or shares.
+    fn remember_root(&mut self, root: &Arc<Root>) {
         self.roots.retain(|_, held| held.strong_count() > 0);
-        self.roots.insert(name.clone(), Arc::downgrade(root));
+        self.roots
+            .insert(root.path().to_owned(), Arc::downgrade(root));
     }
 
     fn open_step(&mut self, open: OpenId, step: OpenStep, now_ms: u64, ios: &mut Vec<Io>) {
@@ -961,9 +974,10 @@ impl Core {
             Stage::Opening { open, .. } => self.opened(open, Err(OpenError::Reset(kind))),
             Stage::Bound { handle } => {
                 handle.mark_reset(kind);
-                // A barrier for the commit path, which checks the reset under the log's lock: a
-                // commit that took the lock before the mark has appended, and every later one is
-                // refused. So nothing lands in the log once an open may copy it (G8).
+                // A barrier for the connections, which check the reset under the log's lock
+                // (`Binding::log_unless_reset`): a COMMIT, ACK or BASE record whose append took the
+                // lock before the mark is written, and every later one is refused. The core itself
+                // appends nothing more, so the log is final once an open may copy it (G8).
                 drop(handle.log());
                 handle.reset_retired();
                 handle.snapshots.snapper.stop();
@@ -1161,7 +1175,7 @@ impl Core {
                         return ios;
                     }
                     if let DiskDone::Prepared(Ok(prepared)) = &done {
-                        self.remember_root(slot.opening.name(), prepared.root());
+                        self.remember_root(prepared.root());
                     }
                     let step = guard::contain(
                         "driver_open",

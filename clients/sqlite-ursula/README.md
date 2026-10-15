@@ -49,7 +49,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | `UrsulaUnavailableError` | `open()` when its signal fired first | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
 | `UrsulaSetupError` | `open()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
-After a reset, pending `synced()` calls reject first, then the `reset` listeners run once. Every statement of the database throws the reset, reads included, except in a read transaction it had open, which keeps its snapshot. `open()` the stream again, or stop when the action is `stop`. The new open need not wait for the old database to close: it works on a copy of the local cache, which carries every commit the old one made. Close the old database once you no longer need it.
+After a reset, pending `synced()` calls reject first, then the `reset` listeners run once. Every statement of the database throws the reset, reads included, except reads in a read transaction it had open, which keep its snapshot. A write in it still fails. `open()` the stream again, or stop when the action is `stop`. The new open need not wait for the old database to close: it works on a copy of the local cache, which carries every commit the old one made. Close the old database once you no longer need it.
 
 ## Pi Durable
 

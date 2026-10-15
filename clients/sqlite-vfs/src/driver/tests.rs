@@ -2394,6 +2394,45 @@ fn a_reopen_while_old_handles_live_builds_from_a_copy() {
     assert_eq!(bound.handle.generation.id, copy.handle.generation.id);
 }
 
+// A binding that drains after its last connection closed still drives its replicator: an open of
+// the stream in the same core never shares its root (no copy beside it), and is refused `in_use`.
+#[test]
+fn a_reopen_beside_a_draining_binding_is_in_use() {
+    let dir = TempDir::new("driver-draining");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.down[c] = true;
+    w.commit(c, &bound, 1).unwrap();
+    w.retire(c, &bound);
+    assert_eq!(bound.handle.life(), Life::Retiring);
+    assert!(bound.handle.holds_root());
+    let e = kind(w.open_result(c, spec(dir.path(), 1)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    assert_eq!(bound.handle.reset(), None);
+}
+
+// The roots a core shares are keyed by directory: a reopen beside a reset binding's connections
+// that names another cache root binds there, from the stream.
+#[test]
+fn a_reopen_in_another_dir_binds_there() {
+    let (dir_a, dir_b) = (TempDir::new("driver-dir-a"), TempDir::new("driver-dir-b"));
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir_a.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    let now = w.now;
+    w.c(c)
+        .reset_binding(bound.binding, ResetKind::LocalDamage, now);
+    let other = w.open(c, spec(dir_b.path(), 1));
+    assert!(other.handle.generation.dir.starts_with(dir_b.path()));
+    assert!(
+        bound.handle.generation.dir.exists(),
+        "the old one is not copied"
+    );
+}
+
 // A reset its connections marked, which the core has not heard of yet, is carried out before an
 // open of the stream copies the generation: the open never runs beside a binding the core still
 // drives.
@@ -2712,6 +2751,9 @@ fn an_open_timing_out_during_a_catch_up_keeps_the_root_until_the_job_returns() {
     let a3 = w.core();
     let e = kind(w.open_result(a3, spec(dir_a.path(), 4)));
     assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    // In the same core too: it never shares the root of the stalled job's tombstone.
+    let e = kind(w.open_result(a2, spec(dir_a.path(), 5)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
     // The job returns: the open resolves as timed out, and the root unlocks.
     w.release_held();
     let result = w
@@ -2821,11 +2863,14 @@ fn tombstone_at_open(hold: fn(&DiskJob) -> bool, ending: Ending) {
         "{ending:?}: resolved early"
     );
     if prepared {
-        // The root stays locked while the job may still write.
+        // The root stays locked while the job may still write, against this process too: an
+        // open in the same core never shares the root of a job still out.
         assert!(matches!(
             Root::lock(dir_a.path(), &canonical_path(URL).unwrap()),
             Err(crate::generation::GenerationError::InUse { .. })
         ));
+        let e = kind(w.open_result(a, spec(dir_a.path(), 4)));
+        assert!(matches!(*e, OpenError::InUse { .. }), "{ending:?}: {e}");
     }
     w.release_held();
     let e = kind(
@@ -2909,6 +2954,8 @@ fn an_open_timing_out_during_a_rebuild_keeps_the_old_generation_and_the_root() {
         Root::lock(dir_a.path(), &canonical_path(URL).unwrap()),
         Err(crate::generation::GenerationError::InUse { .. })
     ));
+    let e = kind(w.open_result(a2, spec(dir_a.path(), 5)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
     w.release_held();
     let e = kind(
         w.c(a2)

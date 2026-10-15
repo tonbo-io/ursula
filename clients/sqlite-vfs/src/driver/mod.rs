@@ -130,11 +130,12 @@ pub(crate) enum SyncError {
 
 /// A bound database's state that its connections share with the driver: the generation, the log
 /// the commit path appends to, the pending bytes admission reads (design §4.4), the reset the
-/// connections refuse their work on, what status reports of the replicator, the root and a hold
-/// on the generation. Both are released when the binding retires with no connection left, and
-/// otherwise (a reset) when its last connection closes. Until then the root stays locked against
-/// other processes, and a reopen in this process shares it and builds from a copy of the held
-/// generation, never materializing the files the old connections still read (design §5.6).
+/// connections refuse their work on, what status reports of the replicator, and the root. The
+/// root is released when the binding retires with no connection left. A binding that resets with
+/// connections open holds its generation ([`Root::hold`]) until the last of them closes, and the
+/// root with it: the root stays locked against other processes, and a reopen in this process
+/// shares it and builds from a copy of the held generation, never materializing the files the
+/// old connections still read (design §5.6).
 #[derive(Debug)]
 pub(crate) struct BindingHandle {
     pub(crate) generation: Generation,
@@ -156,9 +157,10 @@ pub(crate) struct BindingHandle {
     reset: AtomicU8,
     life: Mutex<Lifecycle>,
     replication: Mutex<Replication>,
-    /// The root and the hold on the generation: released when the binding retires with no
-    /// connection left, or when the last connection of a reset binding closes.
-    root: Mutex<Option<(Arc<Root>, Hold)>>,
+    /// The root, and the hold on the generation a reset with connections open takes: released
+    /// when the binding retires with no connection left, or when the last connection of a reset
+    /// binding closes.
+    root: Mutex<Option<(Arc<Root>, Option<Hold>)>>,
     /// The snapshot thread's wake-up, the receipts of its boundaries and its status.
     pub(crate) snapshots: Snapshots,
     /// Where the open got the local database.
@@ -228,7 +230,6 @@ pub(crate) struct LogPoisoned;
 
 impl BindingHandle {
     pub(crate) fn new(bind: Bind, root: Arc<Root>) -> Self {
-        let hold = root.hold(&bind.generation);
         Self {
             generation: bind.generation,
             name: bind.name,
@@ -247,7 +248,7 @@ impl BindingHandle {
             }),
             replication: Mutex::new(Replication::default()),
             last_commit: AtomicU64::new(0),
-            root: Mutex::new(Some((root, hold))),
+            root: Mutex::new(Some((root, None))),
             snapshots: Snapshots::default(),
             attach: bind.attach,
             salvage: OnceLock::new(),
@@ -475,13 +476,20 @@ impl BindingHandle {
         retiring
     }
 
-    /// The binding reset: it retires at once. With no connection open its root and hold go now,
-    /// otherwise when the last one closes.
+    /// The binding reset: it retires at once. With no connection open its root goes now.
+    /// Otherwise its connections hold the generation, and the root, until the last one closes.
     fn reset_retired(&self) {
         let mut l = self.life_lock();
         l.life = Life::Retired;
         if l.connections == 0 {
             self.release_root();
+        } else if let Some((root, hold)) = self
+            .root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            *hold = Some(root.hold(&self.generation));
         }
     }
 

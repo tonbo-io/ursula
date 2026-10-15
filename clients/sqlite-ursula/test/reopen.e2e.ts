@@ -4,7 +4,7 @@
 // and the new database carries every commit the old one logged. Another process still gets
 // `in_use` while either holds the cache, and a crash during the copy leaves one generation.
 import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, UrsulaResetError } from "../src/index.ts";
 import { Child, ext, freshDir, fromStream, killChildren, rejection, stream, thrown } from "./kit.ts";
@@ -21,11 +21,18 @@ interface Commits {
 	confirmed: number;
 }
 
-/** The generation directories of the one stream cached in `dir`. */
-function generations(dir: string): string[] {
+/** The root directory of the one stream cached in `dir`. */
+function rootOf(dir: string): string {
 	const [root, ...others] = readdirSync(dir);
 	expect(others).toEqual([]);
-	return readdirSync(join(dir, root as string)).filter((name) => name.startsWith("gen-"));
+	return join(dir, root as string);
+}
+
+/** What the root of the one stream cached in `dir` holds besides its lock, sorted. */
+function entries(dir: string): string[] {
+	return readdirSync(rootOf(dir))
+		.filter((name) => name !== "lock")
+		.sort();
 }
 
 /** Another process opening the cache in `dir` is refused `in_use`. */
@@ -78,6 +85,8 @@ describe("a reopen beside a reset database's connections", () => {
 		expect(commits.confirmed).toBe(commits.logged);
 		expect(again.prepare("SELECT x FROM t ORDER BY x").all()).toEqual([{ x: 1 }, { x: 2 }]);
 		expect(again.location()).not.toBe(owner.location());
+		// One generation remains, the copy: the original went to the trash under the old reader.
+		expect(entries(dir)).toEqual([basename(dirname(again.location() as string))]);
 		await refusedInUse(s.url, dir);
 
 		// The old read transaction still reads its snapshot. A write in it fails at its commit (778),
@@ -122,12 +131,18 @@ describe("a reopen beside a reset database's connections", () => {
 			const s = stream(step);
 			const dir = freshDir();
 			const child = await damaged(s.url, dir, { URSULA_VFS_ABORT_AT: step });
-			const [before] = generations(dir);
+			const [before] = entries(dir);
 			expect(await child.send({ reopen: true }).catch((error: unknown) => error)).toBeInstanceOf(Error);
 			expect(await child.exit).toMatchObject({ signal: "SIGKILL" });
+			// The generation, and the copy's `.tmp` as far as the copy got.
+			const left = entries(dir);
+			expect(left).toHaveLength(2);
+			const tmp = left.find((name) => name.endsWith(".tmp")) as string;
+			expect(left).toEqual([before, tmp].sort());
+			expect(readdirSync(join(rootOf(dir), tmp)).sort()).toEqual(step === "copy_db" ? ["db"] : ["db", "log"]);
 			const next = new Child(s.url, dir);
 			await next.opened();
-			expect(generations(dir)).toEqual([before]);
+			expect(entries(dir)).toEqual([before]);
 			expect(await next.rows("SELECT x FROM t")).toEqual([{ x: 1 }]);
 			expect((await next.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
 			await next.stop();

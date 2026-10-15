@@ -2,13 +2,14 @@
 //! runs it as a step machine: every request and every disk job goes out through the core, and
 //! their outcomes come back to [`Opening::answered`] and [`Opening::disk_done`].
 //!
-//! The first disk job ([`prepare`]) takes the stream's root lock (`in_use` when another process
-//! holds it), or shares the root a reset binding of this process still holds, finishes what a
-//! crash left, and materializes the current generation when there is one (a gap under valid
-//! checksums is `internal`). A generation the connections of a reset binding still hold is never
-//! materialized under them: the open copies it, publishes the copy in its place and materializes
-//! the copy ([`Root::copy`], design §5.6). A generation whose db file is not its own, or whose log's first segment header
-//! is unreadable, is left as found and salvaged as `replaced` by the build that replaces it. Then
+//! The first disk job ([`prepare`]) takes the stream's root lock (`in_use` when another process,
+//! or another binding or open of the stream in this one, holds it), or shares the root that only
+//! reset bindings' connections still hold, finishes what a crash left, and materializes the
+//! current generation when there is one (a gap under valid checksums is `internal`). A generation
+//! the connections of a reset binding still hold is never materialized under them: the open copies
+//! it, publishes the copy in its place and materializes the copy ([`Root::copy`], design §5.6). A
+//! generation whose db file is not its own, or whose log's first segment header is unreadable, is
+//! left as found and salvaged as `replaced` by the build that replaces it. Then
 //! a HEAD without a precondition decides, before any claim, by the table of design §5.5
 //! ([`table::decide`]): it creates the stream, builds a generation from the latest snapshot and the
 //! tail, takes over with the generation's token, re-keys a generation whose history the stream
@@ -243,7 +244,7 @@ pub(crate) enum LocalSetup {
 pub(crate) enum OpenError {
     #[error("invalid_url: {0}")]
     InvalidUrl(#[from] PathError),
-    #[error("in_use: {}: another process holds the stream's local files", .root.display())]
+    #[error("in_use: {}: another process, or another binding or open of the stream in this one, holds the stream's local files", .root.display())]
     InUse { root: PathBuf },
     #[error("local_setup: {0}")]
     LocalSetup(#[source] LocalSetup),

@@ -83,6 +83,7 @@ use crate::config::abort_at;
 use crate::config::fail_sync;
 use crate::db::Binding;
 use crate::db::Commit;
+use crate::db::LogRefused;
 use crate::db::Window;
 use crate::db::lookup;
 use crate::driver::runtime::driver;
@@ -772,9 +773,10 @@ unsafe fn base(b: &Binding, c: &mut Commit, before: &'static str) -> c_int {
     abort_at(Step::BaseSynced);
     if c.confirmed > c.based {
         let position = c.confirmed;
-        let appended = match b.handle.log() {
+        let appended = match b.log_unless_reset() {
             Ok(mut log) => log.append(&RecordBody::Base { position }).map(drop),
-            Err(_poisoned) => Err(LogError::Broken {
+            Err(LogRefused::Reset(_)) => return ffi::SQLITE_IOERR_WRITE,
+            Err(LogRefused::Poisoned(_)) => Err(LogError::Broken {
                 dir: b.handle.generation.log_dir(),
             }),
         };
@@ -791,21 +793,15 @@ unsafe fn base(b: &Binding, c: &mut Commit, before: &'static str) -> c_int {
     OK
 }
 
-/// The binding's log, for the commit point to append to: refused once the binding reset. The
-/// reset is checked under the log's lock (G8), and the driver takes that lock after it marks a
-/// reset, so no commit lands in the log once an open may copy the generation (design §5.6).
+/// The binding's log, for the commit point to append to: refused once the binding reset
+/// ([`Binding::log_unless_reset`]).
 fn commit_log(b: &Binding) -> Result<MutexGuard<'_, Log>, c_int> {
-    let log = match b.handle.log() {
-        Ok(log) => log,
-        Err(e) => {
+    b.log_unless_reset().map_err(|refused| {
+        if let LogRefused::Poisoned(e) = refused {
             b.reset(ResetKind::Internal, &e);
-            return Err(ffi::SQLITE_IOERR_WRITE);
         }
-    };
-    if b.reset_kind().is_some() {
-        return Err(ffi::SQLITE_IOERR_WRITE);
-    }
-    Ok(log)
+        ffi::SQLITE_IOERR_WRITE
+    })
 }
 
 /// The commit point (design §4.1): capture, encode, log, hand to the driver, forward.
