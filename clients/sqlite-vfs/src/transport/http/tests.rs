@@ -23,7 +23,9 @@ use crate::codec::frame::CONTENT_TYPE;
 use crate::model::Limits;
 use crate::model::ModelServer;
 use crate::model::http;
+use crate::model::tests::close_only;
 use crate::model::tests::create;
+use crate::model::tests::with_body;
 use crate::model::tests::write;
 use crate::transport::Attempt;
 use crate::transport::Transport;
@@ -326,4 +328,102 @@ fn a_fault_is_consumed_alike_before_a_too_large_body() {
         statuses.push(answer.status);
     }
     assert_eq!(statuses, [503, 413]);
+}
+
+// #581 addendum 4: one order on every path, so the model answers each rule alike over HTTP and
+// in process.
+#[test]
+fn addendum_4_the_order_is_the_same_over_http_and_in_process() {
+    let (over_http, url) = served();
+    let http = HttpTransport::new(url);
+    let in_process = model();
+    let local = ModelTransport::new(Arc::clone(&in_process), PATH);
+    let mut statuses = Vec::new();
+    for step in 0.. {
+        let token = tokened(&over_http);
+        assert_eq!(token, tokened(&in_process));
+        let request = match step {
+            0 => create(),
+            1 => write(token, 0, 0, b"claim"),
+            2 => write(token, 0, 1, b"b1"),
+            // The digest of another body with b1: a key conflict, tokened or not.
+            3 => with_body(&write(token, 0, 1, b"b2"), b"b1"),
+            4 => with_body(&write(None, 0, 1, b"b2"), b"b1"),
+            // A repeat without a content type, and an empty repeat.
+            5 => Request {
+                content_type: None,
+                ..write(token, 0, 1, b"b1")
+            },
+            6 => with_body(&write(token, 0, 1, b"b1"), b""),
+            // Writes that would apply meet the content checks.
+            7 => write(token, 0, 2, b""),
+            8 => Request {
+                content_type: Some("text/plain".to_owned()),
+                ..write(token, 0, 2, b"b3")
+            },
+            9 => with_body(&write(token, 0, 2, b"b3"), b"b4"),
+            10 => Request {
+                closes: true,
+                ..write(token, 0, 2, b"b3")
+            },
+            11 | 12 => close_only(token, 0, 2),
+            13 => close_only(token, 0, 3),
+            _ => break,
+        };
+        let remote = http.send(&request, Attempt::default());
+        assert_eq!(
+            remote,
+            local.send(&request, Attempt::default()),
+            "step {step}"
+        );
+        let Exchange::Answered(answer) = remote else {
+            panic!("step {step}: {remote:?}");
+        };
+        statuses.push(answer.status);
+    }
+    assert_eq!(statuses, [
+        201, 200, 200, 403, 403, 204, 204, 400, 400, 400, 501, 200, 204, 409
+    ]);
+}
+
+#[test]
+fn the_model_front_answers_expect_100_continue() {
+    use std::io::BufRead;
+    use std::io::BufReader;
+    use std::io::Read;
+    use std::io::Write;
+
+    let (_server, url) = served();
+    let http = HttpTransport::new(url.clone());
+    assert!(matches!(
+        http.send(&create(), Attempt::default()),
+        Exchange::Answered(_)
+    ));
+    let addr = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.strip_suffix(PATH))
+        .unwrap();
+    let mut connection = std::net::TcpStream::connect(addr).unwrap();
+    connection
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = b"frame";
+    write!(
+        connection,
+        "POST {PATH} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: {CONTENT_TYPE}\r\n\
+         content-length: {}\r\nexpect: 100-continue\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    let mut reader = BufReader::new(connection.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "\r\n");
+    connection.write_all(body).unwrap();
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(rest.starts_with("HTTP/1.1 204 "), "{rest}");
 }

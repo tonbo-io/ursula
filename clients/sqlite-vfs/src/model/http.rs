@@ -5,7 +5,9 @@
 //! carry `Content-Length` (`411` otherwise, chunked bodies are refused with `501`), as the
 //! client's transport always sends it. A stream request whose `Content-Length` exceeds the
 //! model's request limit (`/__model/limits`) gets the typed `413` before its body is read, and the
-//! connection closes.
+//! connection closes. `Expect: 100-continue` gets `100 Continue`, then the body is read: the model
+//! answers every write after its body, in the order of #581 addendum 4, which an early answer
+//! follows too, so the answer is the same.
 //!
 //! Control routes, under `/__model/` (query values are taken verbatim, not percent-decoded):
 //!
@@ -117,7 +119,7 @@ fn connection_loop(connection: TcpStream, server: &Mutex<ModelServer>) -> io::Re
     let mut reader = BufReader::new(connection.try_clone()?);
     let mut writer = connection;
     loop {
-        let incoming = match read_request(&mut reader, server)? {
+        let incoming = match read_request(&mut reader, &mut writer, server)? {
             Ok(Some(incoming)) => incoming,
             Ok(None) => return Ok(()),
             // Refused before the body: the connection closes after the answer.
@@ -145,6 +147,7 @@ fn connection_loop(connection: TcpStream, server: &Mutex<ModelServer>) -> io::Re
 /// `Err(reply)` for one refused before its body (the connection closes after the reply).
 fn read_request(
     reader: &mut impl BufRead,
+    writer: &mut impl Write,
     server: &Mutex<ModelServer>,
 ) -> io::Result<Result<Option<Incoming>, Reply>> {
     let mut head = Vec::new();
@@ -222,6 +225,11 @@ fn read_request(
         }
         Some(Err(_not_a_length)) => return Ok(Err(answer(RawAnswer::new(400)))),
     };
+    // A client that sent `Expect: 100-continue` waits for this before it sends the body.
+    if length > 0 && header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
+        writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        writer.flush()?;
+    }
     let mut body = Vec::new();
     reader.take(length).read_to_end(&mut body)?;
     if u64::try_from(body.len()).ok() != Some(length) {
