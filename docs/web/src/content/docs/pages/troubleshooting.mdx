@@ -94,7 +94,7 @@ Every node of a static cluster keeps its Raft WAL in `raft.wal.path`. Set it to 
 
 ### `server.cluster_id is required when raft.peers is set`
 
-Every node of a static cluster names its deployment with `server.cluster_id`. Set the same value on every node, and a different one for every deployment a client can reach. With the Helm chart, set `server.clusterId`. The chart refuses to render without it when it runs more than one replica. See [Configuration](/docs/configuration#server-and-runtime).
+Every node of a static cluster names its deployment with `server.cluster_id`. Set the same value on every node, and a different one for every deployment a client can reach. With the Helm chart, set `server.clusterId`. The chart refuses to render without it. See [Configuration](/docs/configuration#server-and-runtime).
 
 ### `the WAL at … belongs to cluster …`
 

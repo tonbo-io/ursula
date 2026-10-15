@@ -16,6 +16,7 @@ kubectl create namespace "${namespace}" >/dev/null
 common_values="
   --set fullnameOverride=${release}
   --set server.replicaCount=1
+  --set server.clusterId=helm-upgrade-test
   --set s3.bucket=unused
   --set gateway.enabled=false
   --set server.scheduling.nodeSelector.ursula-test=never
