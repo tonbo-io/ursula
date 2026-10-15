@@ -404,7 +404,8 @@ pub(crate) fn producer_refusal_answer(
         })()),
         StreamErrorContext::StreamClosed
         | StreamErrorContext::StaleColdFlushCandidate
-        | StreamErrorContext::StreamIncarnation { .. } => None,
+        | StreamErrorContext::StreamIncarnation { .. }
+        | StreamErrorContext::LatestSnapshot { .. } => None,
     })
 }
 

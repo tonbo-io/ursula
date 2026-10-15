@@ -204,6 +204,13 @@ pub enum StreamErrorContext {
     StreamIncarnation {
         incarnation: u64,
     },
+    /// The stream's latest snapshot, which a [`StreamErrorCode::SnapshotConflict`]
+    /// of a publish names: a later offset means the publish is superseded,
+    /// the same offset means another snapshot is there (#581 section 3).
+    LatestSnapshot {
+        offset: u64,
+        digest: String,
+    },
 }
 
 /// What closed an epoch, the `by` of `epoch-closed`.

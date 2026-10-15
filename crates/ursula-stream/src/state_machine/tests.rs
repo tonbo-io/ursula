@@ -3073,6 +3073,73 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
     );
 }
 
+/// #581 section 3: a refused publish names the latest snapshot, a repeat
+/// of the latest answers its digest, and retention only moves forward, so
+/// a boundary at or below the current one succeeds and changes nothing.
+#[test]
+fn a_publish_is_keyed_by_offset_and_digest_and_retention_is_monotonic() {
+    let mut machine = machine();
+    create_stream(&mut machine, "keyed");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("keyed"), b"abcdef", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    let latest =
+        |machine: &mut StreamStateMachine, offset: u64, payload: &[u8]| match machine.apply(
+            publish_snapshot_cmd(stream("keyed"), offset, OCTET, payload, 0),
+        ) {
+            StreamResponse::Error {
+                code: StreamErrorCode::SnapshotConflict,
+                context,
+                ..
+            } => context,
+            other => panic!("expected a snapshot conflict, got {other:?}"),
+        };
+    let published = machine.apply(publish_snapshot_cmd(stream("keyed"), 4, OCTET, b"four", 0));
+    let StreamResponse::SnapshotPublished {
+        snapshot_offset: 4,
+        snapshot_digest,
+    } = published
+    else {
+        panic!("expected a publish, got {published:?}");
+    };
+    assert_eq!(
+        machine.apply(publish_snapshot_cmd(stream("keyed"), 4, OCTET, b"four", 0)),
+        StreamResponse::SnapshotPublished {
+            snapshot_offset: 4,
+            snapshot_digest: snapshot_digest.clone(),
+        },
+        "a repeat of the latest answers its digest"
+    );
+    let named = vec![StreamErrorContext::LatestSnapshot {
+        offset: 4,
+        digest: snapshot_digest.clone(),
+    }];
+    assert_eq!(latest(&mut machine, 4, b"other"), named, "the same offset");
+    assert_eq!(latest(&mut machine, 2, b"two"), named, "an earlier offset");
+    // A publish beyond the tail is refused by another rule, which names no
+    // snapshot.
+    assert_eq!(latest(&mut machine, 7, b"seven"), Vec::new());
+
+    assert_eq!(
+        machine.apply(advance_retention_cmd(stream("keyed"), 3, 1)),
+        StreamResponse::RetentionAdvanced { retained_offset: 3 }
+    );
+    let before = machine.snapshot();
+    for at_or_below in [3, 1, 0] {
+        assert_eq!(
+            machine.apply(advance_retention_cmd(stream("keyed"), at_or_below, 1)),
+            StreamResponse::RetentionAdvanced { retained_offset: 3 },
+            "retention at {at_or_below}"
+        );
+    }
+    assert_eq!(machine.snapshot(), before, "a repeat changes nothing");
+    assert_error_code(
+        machine.apply(advance_retention_cmd(stream("keyed"), 5, 1)),
+        StreamErrorCode::SnapshotConflict,
+    );
+}
+
 #[test]
 fn checkpoint_publish_and_retention_advance_are_independent() {
     let mut machine = machine();
