@@ -532,12 +532,16 @@ impl ModelServer {
                     stream.producers.get(id),
                     stream.watermark,
                     write,
+                    request.keys.precondition.is_some(),
                     history,
                     token,
                 );
                 match evaluation.decision {
                     Decision::Answer(answer) => return producer_answer(&answer),
-                    Decision::Apply { closes } => Some((write, closes)),
+                    Decision::Apply {
+                        closes,
+                        below_floor,
+                    } => Some((write, closes, below_floor)),
                 }
             }
         };
@@ -566,7 +570,7 @@ impl ModelServer {
         } else {
             stream.append(&request.body, history)
         };
-        let Some((write, closes)) = applying else {
+        let Some((write, closes, below_floor)) = applying else {
             if close_only {
                 return closed_append(next);
             }
@@ -578,7 +582,8 @@ impl ModelServer {
         let receipt =
             Receipt::new(start, next, close_only).expect("a write ends at or after its start");
         let epoch = if write.is_claim() {
-            let record = ProducerRecord::claimed(write, closes, receipt, history, now_ms);
+            let record =
+                ProducerRecord::claimed(write, closes, below_floor, receipt, history, now_ms);
             let epoch = record.epoch;
             stream.producers.insert(id.to_owned(), record);
             epoch
