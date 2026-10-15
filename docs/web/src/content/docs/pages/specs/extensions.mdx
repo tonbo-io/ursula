@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, write keys with typed answers, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -26,6 +26,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [1. Buckets](#1-buckets)
 - [2. Snapshots](#2-snapshots)
 - [3. Bootstrap](#3-bootstrap)
+- [5. Write Keys and Typed Answers](#5-write-keys-and-typed-answers)
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
 - [9. Read Path](#9-read-path)
@@ -308,6 +309,76 @@ Bootstrap is one-shot only:
 - When a server returns `410 Gone` for a read (because retention has advanced), clients SHOULD call `/bootstrap` to rebuild state, then continue tailing from the returned `Stream-Next-Offset` through the ordinary read APIs.
 - If a server has begun returning `410 Gone` for a stream (i.e., earliest retained offset > `-1`), the server MUST ensure `/bootstrap` is available and can provide a snapshot covering that earliest retained offset.
 - Clients MUST parse `/bootstrap` as an ordered sequence of parts. For a JSON stream each update part is one message; for any other stream, clients MUST NOT treat a part boundary as a message boundary.
+
+---
+
+## 5. Write Keys and Typed Answers
+
+A write whose response is lost leaves its client unsure whether it applied. This section gives writes a key, so that repeating one is safe, and gives every repeat of a producer write a typed answer, so that a client never has to infer an outcome from a refusal.
+
+### 5.1. Keys
+
+| Request | Key | A repeated request |
+| --- | --- | --- |
+| Append or close with producer headers (base protocol Section 5.2.1), including a claim: the write at `Producer-Seq: 0` that opens an epoch | `(Producer-Id, Producer-Epoch, Producer-Seq)` within one stream incarnation (Section 2.4), with the write's identity (Section 5.2) | gets the answer of Section 5.3 for the write that holds the key |
+| Create | the URL and the configuration (base protocol Section 5.1) | `201` or `200` with the same `Stream-Incarnation`, or `409` |
+| Close without producer headers, and `DELETE` | the URL and `Stream-Incarnation` (Section 2.4) | a close answers the same `Stream-Next-Offset`; a delete answers `204`, or `404` or `412` once that incarnation is gone |
+| Snapshot publish | the URL, the offset, the content type and the body (Section 2.2) | the same `Stream-Snapshot-Digest`, or `409` |
+
+A create MUST NOT carry producer headers, and a server MUST reject such a request with `400 Bad Request`. A client creates the stream, then claims an epoch. Bytes that need a key are appended by a producer. A write without producer headers has no key: repeating it can apply it twice.
+
+### 5.2. Write Identity
+
+```
+Producer-Digest: <64 lowercase hexadecimal digits>
+```
+
+A producer write MAY carry `Producer-Digest`, the BLAKE3-256 hash of its body. A server that receives it MUST verify it against the body and reject a mismatch with `400 Bad Request`, applying nothing. The digest is part of the write's identity: a later write with the same key is the same write only when both carry the same digest, or neither carries one.
+
+When a write arrives whose key already applied with another identity, and the server still holds that identity, the server MUST refuse it with `403 Forbidden`, `Producer-Epoch` and `Producer-Outcome: key-conflict`, and apply nothing. A server MUST hold the identity of each producer's newest applied write, and of the claim of its current epoch for as long as that epoch is current. A repeat of an older write, whose identity the server no longer holds, is answered as a duplicate (Section 5.3), as the base protocol requires.
+
+Because a claim's identity is held for its epoch's lifetime, two claimants of one epoch whose claim bodies differ never both hold it: the later one gets `key-conflict`. A client that must tell its claim from another claimant's sends a claim body unique to it, with its `Producer-Digest`. Two claims of one epoch with the same body, or without digests, cannot be told apart, as in the base protocol.
+
+### 5.3. Producer Write Answers
+
+A server implementing this section answers producer writes with the base protocol's status codes, and adds:
+
+- Every response about an applied write, new (`200`) or repeated (`204`), carries the write's receipt: `Stream-Offset` (where its bytes start), `Stream-Next-Offset` (where they end), and `Stream-Closed: true` when it closed the stream. A server MAY keep the range of a producer's newest write only. A repeat of an older write is then answered `204` with `Producer-Outcome: receipt-evicted` and no range.
+- `Producer-Seq` on a `200` or `204` is the epoch's highest applied sequence number, as the base protocol defines it, while the receipt describes the request's own write.
+- A claim's response carries `Producer-Closed-Epoch` and `Producer-Closed-Seq` when the claim closed an earlier epoch of the same producer: every write of that epoch up to `Producer-Closed-Seq` applied, and no other write of it ever will. A repeat of the claim carries the same.
+- A write of an epoch older than the producer's current one is refused with `403 Forbidden` and `Producer-Epoch` (the current epoch), whether or not it applied before. When the write's epoch is the one that the current epoch's claim closed, the server adds `Producer-Outcome: epoch-closed;by=claim`, `Producer-Closed-Epoch` and `Producer-Closed-Seq`, which say whether the write applied. For any other older epoch it adds `Producer-Outcome: stale-epoch`: the server cannot say which writes of that epoch applied.
+- A write of an epoch the server no longer remembers is refused with `403 Forbidden`, `Producer-Epoch` and `Producer-Outcome: producer-expired` (Section 5.4): the server cannot say which writes of that epoch applied.
+- A write with a sequence number above 0 of an epoch that is not claimed yet carries `Producer-Expected-Seq: 0`, with `400` when the producer holds an older epoch, as the base protocol requires, or `409` with `Producer-Received-Seq` when the server holds no state for the producer. A pipelining client then resends in order.
+- Every `403` about a producer write carries `Producer-Epoch` and exactly one `Producer-Outcome`. A `403` without `Producer-Epoch` comes from a layer that enforces access, not from the producer rules.
+
+`Producer-Outcome` is a structured field [RFC9651]: a token, with an optional `by` parameter whose value is a token. `by` names what closed the epoch. This document defines one value, `claim`: a claim of a later epoch. `Producer-Closed-Epoch` and `Producer-Closed-Seq` are decimal integers up to 2^53 - 1, like the base protocol's producer headers.
+
+| `Producer-Outcome` | Status | Meaning |
+| --- | --- | --- |
+| absent | `200` or `204` | applied, with the receipt |
+| `receipt-evicted` | `204` | a write under this key applied; the server no longer keeps its range |
+| `epoch-closed;by=claim` | `403` | epoch `Producer-Closed-Epoch` is closed: every seq at or below `Producer-Closed-Seq` applied, and no seq above it ever will |
+| `stale-epoch` | `403` | the write's epoch is older than the one the current claim closed; the server cannot say which of its writes applied |
+| `key-conflict` | `403` | the key holds a write with another identity; this write did not apply and never will under this key |
+| `producer-expired` | `403` | the server forgot this producer and the epoch is at or below the stream's epoch floor (Section 5.4) |
+
+### 5.4. Epoch Floor
+
+A server that discards the state of idle producers SHOULD keep, per stream, the highest epoch of any producer state it discarded: the stream's epoch floor. A producer write that carries `Stream-Incarnation`, from a producer the server holds no state for, whose epoch is at or below the floor, MUST be refused with `403 Forbidden`, `Producer-Epoch: <floor>` and `Producer-Outcome: producer-expired`. A write without `Stream-Incarnation` keeps the base protocol's rule: a producer whose state expired is treated as new.
+
+A claim that carries `Stream-Incarnation` therefore never reopens an epoch the server forgot, and a stale writer that returns after its state expired cannot claim an old epoch again.
+
+### 5.5. Answers Before the Body
+
+A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). A client that sent `Expect: 100-continue` then sends no body.
+
+### 5.6. Client Rules
+
+- A client MUST NOT send the bytes of one write under two sequence numbers of the same epoch. After a response with `Producer-Expected-Seq`, it resends its unacknowledged writes from that number, in order, with their original numbers.
+- A client MUST NOT resend the bytes of a write under a new epoch until it knows that the write's epoch is closed above its last applied write (from `Producer-Closed-Seq` on an `epoch-closed` answer or on its own claim's response), or until it has read the stream after its claim applied and found the write absent. It then resends only the writes that did not apply, in order, after the claim.
+- When the outcome of a write is unknown, the client repeats the same write: the same key, body and `Producer-Digest`. A client MUST NOT conclude from a refusal's status or headers that a write did not apply, except from the answers of Section 5.3.
+
+> **Note (informative).** Ursula keeps a producer's state while the producer wrote within 7 days, and for at least 1 hour when the stream holds more than 4,096 producers. It keeps the range and identity of each producer's newest write and the identity of the claim of its current epoch. It answers a write of the epoch the current one replaced with `epoch-closed;by=claim`, and of older epochs with `stale-epoch`. Its epoch floor rises whenever it discards a producer's state: after 7 idle days, to admit a producer past the 4,096 cap, or when it tidies an idle stream. The leader answers a repeat or a key conflict before the body when the request's `Stream-Incarnation` equals the stream's current one. On HTTP/2 it does not read the body. On HTTP/1.1 without `Expect: 100-continue` it reads and discards the body, up to 32 MiB, 5 seconds without data and 30 seconds in all, and closes the connection past those bounds.
 
 ---
 

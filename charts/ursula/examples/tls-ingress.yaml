@@ -46,9 +46,8 @@ gateway:
       # the client with a path-only Location for it to follow, so the
       # controller must not rewrite or swallow redirects.
       nginx.ingress.kubernetes.io/proxy-redirect-from: "off"
-      # Never resend a request to another gateway pod. A resent write can be
-      # answered as never applied although the first attempt committed, which
-      # misleads clients that rely on x-ursula-not-applied
+      # Never resend a request to another gateway pod. A resent write without
+      # producer headers applies twice
       # (see /docs/api/overview#redirects-and-retries).
       nginx.ingress.kubernetes.io/proxy-next-upstream: "off"
     hosts:

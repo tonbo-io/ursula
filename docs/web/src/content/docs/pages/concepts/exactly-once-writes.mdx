@@ -13,22 +13,31 @@ Both epoch and seq are capped at `2^53 − 1` so they survive a round-trip throu
 
 ## How dedup works
 
-The server records an exact receipt for every accepted sequence in the current epoch from each `Producer-Id` per stream, within a per-stream receipt window of 1,024 items, and always keeps each producer's newest receipt. On an append:
+The server keeps one record per `Producer-Id` per stream: the current epoch, its highest applied sequence, and the receipt of the producer's newest write. On an append:
 
-- **Delayed duplicate** (same epoch and any seq already accepted): silently deduplicated. The response carries that sequence's original byte and record ranges, even when newer sequences have committed, as long as its receipt is in the window. The newest sequence always gets its ranges. An older duplicate whose receipt left the window is still deduplicated (never written twice) and answered `204` with `Producer-Seq` but without range headers.
-- **Next in sequence** (`seq = last_seq + 1`): accepted.
-- **Out of order** (seq skips ahead): rejected with `409`. The response carries `Producer-Expected-Seq`, the sequence the server wanted, and `Producer-Received-Seq`.
-- **Epoch regression** (epoch less than the last accepted one): rejected with `403 Forbidden`. The response's `Producer-Epoch` is the current epoch. A producer that gets `403` has been replaced by a newer instance and should stop writing.
+- **Next in sequence** (`seq = last_seq + 1`): accepted with `200`. The response carries the write's receipt: `Stream-Offset` where its bytes start, `Stream-Next-Offset` where they end, and `Stream-Closed: true` when it closed the stream.
+- **Repeat of the newest write**: deduplicated and answered `204` with the original receipt.
+- **Repeat of an older write of the epoch**: deduplicated (never written twice) and answered `204` with `Producer-Outcome: receipt-evicted` and no range headers.
+- **Out of order** (seq skips ahead): rejected with `409`. The response carries `Producer-Expected-Seq`, the sequence the server wanted, and `Producer-Received-Seq`. A seq above `0` of a later epoch that is not claimed yet answers `400` with `Producer-Expected-Seq: 0`.
+- **Older epoch**: rejected with `403 Forbidden`, whether or not the write applied before. The response's `Producer-Epoch` is the current epoch. For a write of the epoch that the current epoch's claim closed, `Producer-Outcome: epoch-closed;by=claim` comes with `Producer-Closed-Epoch` and `Producer-Closed-Seq`: every seq up to the closed seq applied, and none above it ever will. For any older epoch, `Producer-Outcome: stale-epoch` says the server cannot tell which of its writes applied. A producer that gets `403` has been replaced by a newer instance and should stop writing.
+
+On `200` and `204`, `Producer-Seq` is the highest applied sequence of the epoch, not the request's own seq. When the outcome of an append is unknown, for example after a timeout or a `5xx`, send the same append again, unchanged. The answer to the repeat says what happened.
+
+A write may also carry `Producer-Digest`, the BLAKE3-256 hash of its body as 64 lowercase hex digits. The server checks it against the body (`400` on a mismatch) and makes it part of the write's identity: a different body under the key of the newest write, or of the current epoch's claim, answers `403` with `Producer-Outcome: key-conflict` and applies nothing. Without a digest, a repeat with a different body is answered as a duplicate. The full set of answers is in [write keys and typed answers](/docs/specs/extensions#5-write-keys-and-typed-answers).
 
 ## Restart and epoch hygiene
 
-When a producer crashes and restarts, **bump `Producer-Epoch`**. Otherwise the server still expects the next contiguous seq within the old epoch, and the producer (which has lost its in-memory seq counter) will collide. A new epoch starts the seq counter back at `0`.
+When a producer crashes and restarts, **bump `Producer-Epoch`**. Otherwise the server still expects the next contiguous seq within the old epoch, and the producer (which has lost its in-memory seq counter) will collide. A new epoch starts the seq counter back at `0`. The write at seq `0` of a new epoch is its claim. When it closes an earlier epoch, its answer, and the answer to any repeat of it, carries `Producer-Closed-Epoch` and `Producer-Closed-Seq`, which say what of the old epoch applied.
+
+A create (`PUT`) with producer headers answers `400`. Create the stream, then claim an epoch.
 
 ## Per-stream state
 
 Dedup state is scoped per stream. The same `Producer-Id` writing to two different streams maintains two independent epoch/seq counters, so you do not have to elect a single global writer per producer.
 
-The server retains exact receipts for the current epoch per `(producer_id, stream)` pair, bounded by the stream's receipt window. Older epochs and their receipts are dropped once a higher epoch is observed. A producer that has not written to a stream for 7 days is forgotten: its next append must start at sequence `0` (a later sequence gets `409`), so bump the epoch or restart the sequence after long pauses. A stream holds at most 4,096 producers: a new producer beyond that replaces the least recently seen producer idle for at least an hour, and when none has been idle that long its append is rejected with `429` and a `producer_limit` body.
+The server keeps the receipt of each producer's newest write only, and forgets older epochs once a higher epoch is claimed. A producer that has not written to a stream for 7 days is forgotten. A stream holds at most 4,096 producers: a new producer beyond that replaces the least recently seen producer idle for at least an hour, and when none has been idle that long its append is rejected with `429` and a `producer_limit` body.
+
+When the server forgets a producer, it raises the stream's epoch floor to that producer's epoch. A forgotten producer's next append must start at sequence `0` (a later sequence gets `409`). An append that carries `Stream-Incarnation` with an epoch at or below the floor answers `403` with `Producer-Outcome: producer-expired` and the floor as `Producer-Epoch`, so claim an epoch above it. Without `Stream-Incarnation`, a forgotten producer is treated as new.
 
 ## When you don't need this
 

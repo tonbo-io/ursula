@@ -31,10 +31,6 @@ identifies the Raft leader.
 - Optionally classifies Durable Streams requests as an explicit
   `bucket/stream/action` resource before forwarding them to provider-neutral
   authentication and authorization hooks.
-- Marks its answers to requests that no node can have applied with the
-  `x-ursula-not-applied` response header, and sets
-  `x-ursula-not-applied-checked: 1` on every response. See
-  [Refusals That Applied Nothing](#refusals-that-applied-nothing).
 
 ## Upstream Selection
 
@@ -174,74 +170,17 @@ reduced to the path and query so redirect-following clients such as `curl -L`
 continue through the gateway instead of connecting to internal Ursula nodes
 directly.
 
-## Refusals That Applied Nothing
+## Proxies Around the Gateway
 
-The gateway sets the `x-ursula-not-applied` response header, the marker,
-when no node can have applied the request: on every request it refuses
-before forwarding it, on a request it could not send because the connection
-to its first upstream failed, and after redirects that were all marked
-(below). The value names the refusal:
+No response says that a write applied nothing. A client resolves an unknown
+outcome by repeating the write with its producer key. See
+[write outcomes](https://ursula.tonbo.io/docs/api/overview#write-outcomes).
 
-| Status | Token | Refusal |
-| ------ | ----- | ------- |
-| `404` | `NotFound` | Access control does not serve the route, or the authorizer concealed the resource |
-| `401` | `InvalidCredential` | The bearer credential is malformed or failed verification |
-| `503` | `AuthenticationUnavailable` | The credential could not be verified, for example because the token issuer is down |
-| `403` | `Forbidden` | The authorizer denied the request |
-| `503` | `AuthorizationUnavailable` | The authorizer could not decide |
-| `429` | `TenantRateLimited` | The bucket is over its request rate |
-| `429` | `TenantLiveReadsExhausted` | The bucket uses all of its live-read connections |
-| `413` | `RequestBodyTooLarge` | The body is over `--max-request-body-bytes` or the bucket's limit |
-| `400` | `RequestBodyUnreadable` | The request body could not be read |
-| `503` | `NoUpstream` | No upstream is configured |
-| `503` | `UpstreamUnreachable` | The connection to the first upstream failed, so the request was never sent. Or the connection to an upstream after redirects failed, and every redirect was marked |
-| `503` | `LeaderNotFound` | No upstream answered without redirecting within the [redirect limits](#redirects), and every redirect was marked |
-
-A node's marker passes through unchanged when the gateway sent the request
-to one node. After the gateway follows Raft leader redirects, it keeps the
-final answer's marker only if every redirect carried one too, because a node
-can redirect a write after it proposed it. A node marks only the redirects it
-sends before it proposes a write, so a leader's admission refusal reached
-through such redirects keeps its marker. The gateway's `503` for an upstream
-it could not connect to after redirects, and its `503` when it stops
-following redirects, are marked only when every redirect was marked. A hop
-that could not connect sent nothing, so it does not count against the
-marker. The other
-answers the gateway gives when an upstream fails carry no marker: the `502`,
-and the `504` for an upstream that sent no response headers in time.
-
-From 0.7.3 the gateway sets `x-ursula-not-applied-checked: 1`, the vouch, on
-every response it returns: forwarded responses, its own refusals and its own
-errors. It adds the vouch after the redirect rule above decided whether a
-node's marker stays, and drops any vouch that came from an upstream. Nodes
-never set it. A client counts an attempt as never applied only when the
-response carries both headers, or has the status `401`, `402` or `429`.
-Gateways before 0.7.3 never send the vouch, so clients ignore their markers,
-whatever order gateways and nodes are upgraded or rolled back in. Upgrading
-gateways first is still recommended, so that clients keep the benefit of the
-marker during a rollout. See
-[refusals that applied nothing](https://ursula.tonbo.io/docs/api/overview#refusals-that-applied-nothing).
-
-The vouch covers only the one request the gateway received. A proxy in front
-of the gateway must not resend writes, and a client must not let its HTTP
-library follow redirects or retry writes on its own.
-
-The vouch also covers only the exchanges the gateway makes itself, so point
-`--upstream` at the nodes themselves. A proxy, service-mesh sidecar or
-another gateway between the gateway and the nodes must not resend requests,
-or the gateway vouches for a marker from a later delivery. For example, a
-node can propose a write and then answer `503` without a marker. If a
-sidecar resends the request on that `503`, as Istio's default retry policy
-did before 1.24, and a node refuses the copy at admission with a marked
-`503`, the gateway sees only that refusal and vouches for it. For the same
-reason, a 0.7.3 gateway must not sit in front of an older gateway, which
-follows redirects itself and passes a leader's marker on after any of them.
-
-Nothing between the gateway and the nodes may answer `401`, `402` or `429`
-either, as a sidecar's local rate limit does. A client counts those
-statuses as never applied without the headers, and after a redirect without
-a marker the gateway returns the leader's status unchanged, although the
-node that redirected may have proposed the write.
+A proxy in front of the gateway must not resend writes, and a client must not
+let its HTTP library follow redirects or retry writes on its own: a resent
+write without producer headers applies twice. Point `--upstream` at the nodes
+themselves. A proxy, service-mesh sidecar or another gateway between the
+gateway and the nodes must not resend requests either.
 
 ## Refusals Before the Body
 
@@ -356,10 +295,8 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     leader redirect names the leader by its peer URL, and the gateway follows
     one that names another address only by trying the upstreams it has not
     tried yet. A proxy, service-mesh sidecar or another gateway in between
-    must not resend requests, or the gateway vouches for an
-    x-ursula-not-applied marker from a later delivery. Nor may it answer
-    401, 402 or 429, for example from a local rate limit: a client counts
-    those statuses as never applied.
+    must not resend requests: a resent write without producer headers
+    applies twice.
 
 --response-header-timeout <SECONDS>
     Timeout for sending the upstream request and receiving response headers.

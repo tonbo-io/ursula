@@ -239,12 +239,7 @@ groups. Set it to `1` to keep one build at a time, as before 0.7.4.
 leave too little of `server.http_inflight_body_size` for this one.
 
 `WalDiskPressure`, `RaftLogPressure` and `IngressBodyBytesLimitReached` are
-write admission refusals. Their responses also carry the code in
-`x-ursula-not-applied`: the node refused the request before it proposed
-anything of it. A client can count the attempt as never applied only when
-the response also carries `x-ursula-not-applied-checked`, which a gateway
-at 0.7.3 or newer adds. See
-[refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing).
+write admission refusals.
 
 Other `503`s come from the stream's Raft group, and their text names the
 cause. `ColdBackpressure` means that the group's hot ring would exceed
@@ -255,13 +250,12 @@ fix the cold backend. `RaftUncommittedBackpressure` means that the group's
 write bytes that are proposed but not yet applied would exceed
 `raft.max_uncommitted_size_per_group`.
 
-The node refuses both before it proposes the append, so from 0.7.3 their
-responses also carry the name in `x-ursula-not-applied`, like the admission
-refusals above. A `503` while the group has no known leader, for example
-during an election, carries `NotLeader` when the node found that before it
-proposed the append. A `503` from a node that does not host the stream's
-group and knows no node that does carries `GroupNotHosted`: the node refuses
-before any engine runs.
+A `503` also answers a write while the group has no known leader, for example
+during an election, and on a node that does not host the stream's group and
+knows no node that does.
+
+A client resolves a `503` like any unknown outcome: it repeats the write with
+its producer key. See [write outcomes](/docs/api/overview#write-outcomes).
 
 ### `409 Conflict` with `producer-expected-seq` / `producer-received-seq`
 
@@ -362,32 +356,16 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 | `unauthorized` | The token was refused (`401`) until `URSULA_VFS_RETRY_MS` ran out | Set a fresh token with `setToken`, or fix the file `URSULA_VFS_TOKEN_FILE` names |
 | `forbidden` | The gateway's authorizer denied the write with a `403` | Allow the write in the authorizer |
 | `rate_limited` | `429` until `URSULA_VFS_RETRY_MS` ran out | Lower the write rate, or raise the bucket's request rate on the gateway |
-| `not_applied` | Any other refusal marked `x-ursula-not-applied`, vouched for by `ursula gateway` 0.7.3 or later | See `refused_reason` below |
-| `too_large` | The transaction's commit frame is over `URSULA_VFS_MAX_FRAME_BYTES` (32 MiB by default), so the extension never sent it. Or a lower limit in front of the stream, such as the gateway's `--max-request-body-bytes` or a bucket's body limit, refused it with a `413` that carries both headers | Split the transaction. Other commits succeed as usual, and the next one that does clears the refusal. See [Rules](/docs/examples/sqlite-vfs#rules) |
+| `too_large` | The transaction's commit frame is over `URSULA_VFS_MAX_FRAME_BYTES` (32 MiB by default), so the extension never sent it. Or a lower limit in front of the stream, such as the gateway's `--max-request-body-bytes` or a bucket's body limit, refused it with a `413` | Split the transaction. Other commits succeed as usual, and the next one that does clears the refusal. See [Rules](/docs/examples/sqlite-vfs#rules) |
 | `unreachable` | From 0.7.4: until `URSULA_VFS_RETRY_MS` ran out, every attempt failed before any byte of it went out, or was refused as above, and the last one failed before it went out. The stream URL's host did not resolve, or no connection to it was made: refused, timed out, or a failed TLS handshake. Nothing of the commit was sent | Check that the stream URL's host resolves from the client and that the gateway or the server behind it is up and reachable, through the proxy in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` when one is set (`NO_PROXY` excludes hosts). A failed TLS handshake shows in `refused_reason` as rustls reports it. `io: invalid peer certificate: UnknownIssuer` means the client does not trust the endpoint's certificate authority: point `URSULA_VFS_CA_FILE` at it. `io: invalid peer certificate: certificate not valid for name ...` means the stream URL names a host the certificate does not cover: use one it covers. `io: received corrupt message of type InvalidContentType` means an `https://` URL points at a port that speaks plain HTTP. `io: received fatal alert: ...` means the endpoint refused the handshake, for example over its TLS versions or cipher suites. Commits succeed again once the endpoint is reachable |
 
-`refused_reason` is the refusing layer's response body, or the value of `x-ursula-not-applied` when the body is empty, and always that value for `not_applied`. For `too_large` it is the frame's size and the limit, such as `41943104-byte frame over the 33554432-byte frame limit`, or the value of the `413`'s `x-ursula-not-applied`. For `unreachable` it is the last attempt's failure, such as `timeout: resolve` or `io: Connection refused (os error 111)`. The values Ursula sends for `not_applied`:
+`refused_reason` is the refusing layer's response body. For `too_large` it is the frame's size and the limit, such as `41943104-byte frame over the 33554432-byte frame limit`. For `unreachable` it is the last attempt's failure, such as `timeout: resolve` or `io: Connection refused (os error 111)`.
 
-| `refused_reason` | Meaning |
-| ---------------- | ------- |
-| `RaftLogPressure` | The server's Raft log is over its hard limit under sustained write load. Writes resume once snapshots catch up |
-| `WalDiskPressure` | The server's WAL filesystem is below `raft.wal.min_available_size`. Free space or expand the volume |
-| `IngressBodyBytesLimitReached` | The server holds as many request bytes in flight as it admits |
-| `RaftUncommittedBackpressure` | The stream's Raft group holds more proposed but unapplied write bytes than `raft.max_uncommitted_size_per_group` allows |
-| `ColdBackpressure` | The stream's Raft group holds more hot bytes than `storage.cold.max_hot_size_per_group` allows, because cold flush is behind or the cold backend is slow |
-| `NotLeader` | A `503`: the server does not lead the stream's Raft group and knows no leader yet, for example during an election. For the same reason, the redirects it sends before it proposes a write carry the same marker, and the gateway follows them. Writes resume once the group has a leader |
-| `GroupNotHosted` | A `503`: the server does not host the stream's Raft group and knows no server that does. Its redirects to a server that does carry the same marker, and the gateway follows them |
-| `RequestBodyUnreadable` | The gateway could not read the request body, so it sent nothing on |
-| `NotFound` | The gateway's access policy does not serve the stream to these credentials: no token, or one the policy does not allow. The cause is the credentials or the policy, not load |
-| `AuthenticationUnavailable`, `AuthorizationUnavailable` | The gateway could not verify the token or reach a decision, for example while its token issuer is down |
-| `NoUpstream`, `UpstreamUnreachable` | The gateway could not reach a server, so it sent nothing on. After redirects, the nodes it reached before refused the write as not their own to propose |
-| `LeaderNotFound` | The gateway found no node that leads the stream's group among its upstreams within three hops and 5 s, and every node it reached refused the write before proposing it. Writes go through once the group has a leader. If it persists, check that `--upstream` reaches every voter, by its peer URL where possible |
-
-[Refusals that applied nothing](/docs/api/overview#refusals-that-applied-nothing) lists every value. A commit fails with 7178 only when every attempt of it was refused this way, or failed before any byte of it went out. One attempt that went out and got no answer, a `307`, or a `5xx` without both headers, poisons the file instead, because that attempt may have been applied.
+A commit fails with 7178 only when every attempt of it was refused this way, or failed before any byte of it went out. One attempt that went out and got no answer, a `307`, or a `5xx` poisons the file instead, because that attempt may have been applied.
 
 ### The file is poisoned at the commit after a refused one
 
-`status(file)` reports `poisoned: true` with a `reason` that starts with `a commit refused as never applied may have been applied after all`. A commit failed with 7178, refused with an answer that says nothing was applied (a `401`, `402` or `429`, or a refusal marked `x-ursula-not-applied` with the gateway's vouch). The next commit went out with the same producer sequence, and the stream answered it as a duplicate. So the stream holds a commit at that sequence that the file lacks: either the refused commit, applied after all, or the next commit, sent again by a layer in front of the stream. The answer does not tell which, so the extension poisoned the file instead of acknowledging a commit that may never have reached the stream.
+`status(file)` reports `poisoned: true` with a `reason` that starts with `a commit refused as never applied may have been applied after all`. A commit failed with 7178, refused with an answer that says nothing was applied (a `401`, `402` or `429`). The next commit went out with the same producer sequence, and the stream answered it as a duplicate. So the stream holds a commit at that sequence that the file lacks: either the refused commit, applied after all, or the next commit, sent again by a layer in front of the stream. The answer does not tell which, so the extension poisoned the file instead of acknowledging a commit that may never have reached the stream.
 
 Attach the file again. The attach replays whichever commit the stream holds. Check which of the two transactions the database then holds before you run either again. When it holds the refused one, although its commit failed, a layer broke the rule in [Writes refused before they reach the stream](/docs/examples/sqlite-vfs#writes-refused-before-they-reach-the-stream). Find it:
 
