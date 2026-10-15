@@ -53,7 +53,7 @@ const KINDS: [ClaimKind; 2] = [
     },
     ClaimKind::Continuation {
         own: ursula_headers::Epoch::ZERO,
-        rekeyed: false,
+        resent: false,
     },
 ];
 
@@ -338,16 +338,19 @@ fn gone_with_snapshot(kind: ClaimKind, last: CommitId) -> (Harness, Vec<Action>,
 }
 
 // A snapshot of our lineage at or below the acknowledged position: the stream holds that state
-// under our lineage and this copy acknowledged it, so the reconcile goes on from its offset (here
-// the claim's start, other claims having come between), and nothing is rebuilt.
+// under our lineage and this copy acknowledged it, so a takeover goes on from its offset (here the
+// claim's start, other claims having come between), and nothing is rebuilt. A continuation never
+// skips bytes it did not read: it goes on only from a snapshot where its reads are (N2), and
+// resets `stale` for one past them, whatever the bytes it would skip hold.
 #[test]
 fn row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked() {
-    for kind in KINDS {
+    // The continuation's snapshot sits at its acknowledged offset, and two claims of its own follow.
+    for (kind, from, w) in [(KINDS[0], 100, 200), (KINDS[1], 126, 126)] {
         for position in [1, 2] {
             let state = LocalState {
                 acked: Position(2),
                 logged: Position(2),
-                ..local(Vec::new(), 100)
+                ..local(Vec::new(), from)
             };
             let (mut h, _) = Harness::activate(kind, state);
             h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 200, 237, None)));
@@ -357,11 +360,15 @@ fn row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked() {
                 lineage: LINEAGE,
                 position: Position(position),
             };
-            let (body, snapshot) = snapshot_body(200, last);
+            let (body, snapshot) = snapshot_body(w, last);
             h.answer(&head_naming(Some(snapshot), 237));
             // Only the header is read.
             assert_eq!(h.last_request().head_bytes, Some(56));
-            let actions = h.answer(&snapshot_read(snapshot, body[..56].to_vec()));
+            let mut actions = h.answer(&snapshot_read(snapshot, body[..56].to_vec()));
+            if w < 200 {
+                let own = frame::encode_claim(epoch(1), ACTIVATION);
+                actions = h.answer(&read(&[own.clone(), own].concat(), 200));
+            }
             assert!(streaming(&h), "{kind:?} {position}: {actions:?}");
             assert!(!actions.iter().any(|a| matches!(a, Action::Rebuild { .. })));
             assert!(
@@ -373,6 +380,22 @@ fn row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked() {
             );
         }
     }
+    let state = LocalState {
+        acked: Position(2),
+        logged: Position(2),
+        ..local(Vec::new(), 100)
+    };
+    let (mut h, _) = Harness::activate(KINDS[1], state);
+    h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 200, 237, None)));
+    h.answer(&RawAnswer::new(410));
+    let last = CommitId {
+        lineage: LINEAGE,
+        position: Position(2),
+    };
+    let (body, snapshot) = snapshot_body(200, last);
+    h.answer(&head_naming(Some(snapshot), 237));
+    let actions = h.answer(&snapshot_read(snapshot, body[..56].to_vec()));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Stale), "{actions:?}");
 }
 
 // Another lineage's snapshot, or ours past what we logged, or one whose body does not match

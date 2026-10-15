@@ -1,7 +1,7 @@
 //! Re-keys (design §6.2, W5): a HEAD that names another token whose history inherits the
 //! generation rolls the log to the new token and claims under it, from streaming, during a
-//! continuation claim (D4's repeat rule) and during a takeover, and what the claim's reconcile
-//! finds after it.
+//! continuation claim (D4's repeat rule), during a takeover and during a provisional open's claim,
+//! and what the claim's reconcile finds after it.
 
 use ursula_headers::ClosedEpoch;
 use ursula_headers::Delivery;
@@ -395,7 +395,7 @@ fn a_rekey_during_a_continuation_claim_sends_the_same_claim_again() {
     assert!(matches!(h.replicator, Replicator::Activating {
         kind: ClaimKind::Continuation {
             own: _,
-            rekeyed: true
+            resent: true
         },
         ..
     }));
@@ -567,7 +567,8 @@ fn rekeyed_takeover(pending: Vec<crate::replicator::Pending>) -> (Harness, u64) 
 /// Bound under T0; event 1 (T1) re-keys and claims epoch 2, which applies under T1 with its
 /// answer lost. Event 2 (T2) names T1: the generation re-keys from T1 and resends epoch 2, a
 /// repeat, so D4 claims epoch 3, which is lost before it applies. Event 3 (T3) still names T1, the
-/// generation's own token with every acknowledged byte kept: it re-keys, never resets `rewound`.
+/// generation's own token with every acknowledged byte kept: it re-keys, never resets `rewound`,
+/// after a pre-check, since claim 2 was never streamed in.
 #[test]
 fn a_third_event_after_an_unknown_claim_outcome_re_keys_from_the_token_it_names() {
     let (mut h, batch) = streaming(1);
@@ -602,6 +603,16 @@ fn a_third_event_after_an_unknown_claim_outcome_re_keys_from_the_token_it_names(
     assert_eq!(claim_sent(&actions).map(|(e, _)| e), Some(3));
     h.answer(&mismatch(t(10)));
     let actions = h.answer(&head(t(10), tail2, Some((t(8), tail2))));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    // Claim 2 was never streamed in, and its frame lies past the acknowledged offset: the event
+    // may have lost it, so the re-key pre-checks under T3 first (design §7).
+    assert_eq!(rekey_of(&actions), None, "{actions:?}");
+    assert_eq!(h.last_request().method, Method::Head);
+    let actions = h.answer(&head(t(10), tail2, Some((t(8), tail2))));
+    assert_eq!(h.last_request().method, Method::Get, "{actions:?}");
+    let own = frame::encode_claim(epoch(2), ACTIVATION);
+    // The reads find the batch that applied with claim 2, then claim 2.
+    let actions = h.answer(&read(&[batch.clone(), own].concat(), tail2));
     assert_eq!(reset_of(&actions), None, "{actions:?}");
     assert_eq!(rekey_of(&actions), Some((t(10), 3)));
 }
@@ -789,4 +800,266 @@ fn a_rebuild_that_discards_after_a_rekey_at_open_salvages() {
         Some((Some(Position(1)), false)),
         "{actions:?}"
     );
+}
+/// The activation of the open that logged a provisional open's claim.
+const PRIOR: Activation = Activation([0x5a; 16]);
+
+/// A provisional open (design §5.5) of a generation whose log's latest claim is `(3, PRIOR)`,
+/// acknowledged up to the claim at `0..37`, with `pending`: its pre-check's HEAD goes out first.
+fn provisional(pending: Vec<crate::replicator::Pending>) -> Harness {
+    let mut state = local(pending, CLAIM);
+    state.claims = vec![(epoch(3), PRIOR)];
+    let (h, actions) = Harness::provisional(state, (epoch(3), PRIOR));
+    assert_eq!(sends(&actions).len(), 1);
+    assert_eq!(sends(&actions)[0].method, Method::Head);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::PersistClaim { .. } | Action::ReKey { .. })),
+        "nothing is logged before the stream answers: {actions:?}"
+    );
+    h
+}
+
+/// The claim among `actions`: its epoch and the activation its body names.
+fn claim_of(actions: &[Action]) -> Option<(u64, Activation)> {
+    sends(actions).into_iter().find_map(|r| {
+        let write = r.keys.producer.as_ref()?;
+        if write.seq.get() != 0 {
+            return None;
+        }
+        match frame::decode(&r.body, u64::MAX) {
+            Ok(frame::Decoded::Frame {
+                frame: frame::Frame::Claim { epoch, activation },
+                ..
+            }) => Some((epoch.get(), activation)),
+            _ => None,
+        }
+    })
+}
+
+/// The pre-check finds nothing foreign up to the tail: the log's latest claim goes out again,
+/// same body, its record already logged. A repeat means it applied before: one continuation claim
+/// of the next epoch follows, logged first, and binds.
+#[test]
+fn a_provisional_open_sends_its_logs_claim_again_after_the_pre_check() {
+    let mut h = provisional(Vec::new());
+    let own = frame::encode_claim(epoch(3), PRIOR);
+    let actions = h.answer(&head(token(), 2 * CLAIM, None));
+    assert_eq!(h.last_request().method, Method::Get, "{actions:?}");
+    let actions = h.answer(&read(&own, 2 * CLAIM));
+    assert_eq!(claim_of(&actions), Some((3, PRIOR)), "{actions:?}");
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::PersistClaim { .. })),
+        "{actions:?}"
+    );
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Repeat,
+        3,
+        0,
+        CLAIM,
+        2 * CLAIM,
+        None,
+    )));
+    assert!(actions.contains(&Action::PersistClaim {
+        epoch: epoch(4),
+        activation: ACTIVATION,
+    }));
+    assert_eq!(claim_of(&actions), Some((4, ACTIVATION)));
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        4,
+        0,
+        2 * CLAIM,
+        3 * CLAIM,
+        None,
+    )));
+    let actions = if actions.iter().any(|a| matches!(a, Action::Bound { .. })) {
+        actions
+    } else {
+        h.answer(&read(&own, 2 * CLAIM))
+    };
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Bound { .. })),
+        "{actions:?}"
+    );
+}
+
+/// `receipt-evicted` for the claim sent again: its digest is ours, and later writes under it
+/// evicted its receipt, so it applied before and the next epoch follows. `producer-expired` naming
+/// its epoch proves nothing about whose record retired: the claim loses, `fenced`.
+#[test]
+fn a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expiry_fences() {
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), CLAIM, None));
+    let actions = h.answer(&producer(&ProducerAnswer::ReceiptEvicted {
+        epoch: ursula_headers::CurrentEpoch::new(epoch(3)),
+        seq: seq(5),
+        incarnation: token(),
+    }));
+    assert_eq!(claim_of(&actions), Some((4, ACTIVATION)), "{actions:?}");
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), CLAIM, None));
+    let actions = h.answer(&producer(&ProducerAnswer::ProducerExpired {
+        epoch: epoch(3),
+    }));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Fenced), "{actions:?}");
+}
+
+/// The pre-check finds another owner's claim after the log's acknowledged offset: it resets
+/// `fenced` with nothing sent. One followed by a claim of its own is superseded (N1), and a foreign
+/// commit resets `stale`. A `410` (retention passed the acknowledged offset) resets `stale`.
+#[test]
+fn a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent() {
+    let foreign = frame::encode_claim(epoch(4), FOREIGN);
+    let own = frame::encode_claim(epoch(3), PRIOR);
+    let commit_frame = commit(crate::ids::Lineage([0x22; 16]), 1, 9).frame;
+    let cases: [(Vec<u8>, Option<ResetKind>); 3] = [
+        (foreign.clone(), Some(ResetKind::Fenced)),
+        ([foreign.clone(), own].concat(), None),
+        (commit_frame.to_vec(), Some(ResetKind::Stale)),
+    ];
+    for (body, reset) in cases {
+        let mut h = provisional(Vec::new());
+        let tail = CLAIM + u64::try_from(body.len()).unwrap();
+        h.answer(&head(token(), tail, None));
+        let actions = h.answer(&read(&body, tail));
+        assert_eq!(reset_of(&actions), reset, "{actions:?}");
+        assert_eq!(claim_of(&actions).is_some(), reset.is_none(), "{actions:?}");
+    }
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), 2 * CLAIM, None));
+    let actions = h.answer(&RawAnswer::new(410));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Stale), "{actions:?}");
+}
+
+/// The pre-check's HEAD names an inheriting history: the claim goes out again under the new
+/// token once the reads find nothing foreign, the log rolling first. Applied afresh under it, the
+/// epoch may carry writes of ours in the history before, so one more claim follows.
+#[test]
+fn a_provisional_pre_check_re_keys_and_claims_once_more_after_its_claim() {
+    let mut h = provisional(Vec::new());
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert_eq!(
+        actions.iter().find_map(|a| match a {
+            Action::ReKey {
+                incarnation,
+                epoch,
+                activation,
+            } => Some((*incarnation, epoch.get(), *activation)),
+            _ => None,
+        }),
+        Some((new_token(), 3, PRIOR)),
+        "{actions:?}"
+    );
+    assert_eq!(claim_of(&actions), Some((3, PRIOR)));
+    assert_eq!(h.last_request().keys.precondition, Some(precondition()));
+    let actions = h.answer(&receipt_new(
+        Delivery::Applied,
+        3,
+        0,
+        CLAIM,
+        2 * CLAIM,
+        None,
+    ));
+    assert_eq!(claim_of(&actions), Some((4, ACTIVATION)), "{actions:?}");
+}
+
+/// The B2 stopgap holds for a provisional open as for a takeover: its log's ACK may trail what
+/// the stream acknowledged of the commits after it, so an inheriting history resets `rewound`
+/// before anything is logged or sent.
+#[test]
+fn a_provisional_pre_check_with_commits_after_its_ack_resets_before_it_re_keys() {
+    let mut h = provisional(vec![commit(LINEAGE, 1, 1)]);
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Rewound));
+    assert!(sends(&actions).is_empty(), "{actions:?}");
+}
+
+/// A history event while the provisional claim is out: before its bind the binding acknowledged
+/// nothing the new history must keep, so it pre-checks again under the new token before its claim
+/// goes out again.
+#[test]
+fn a_re_key_before_a_provisional_bind_pre_checks_again() {
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), CLAIM, None));
+    assert_eq!(h.last_request().method, Method::Post);
+    h.answer(&mismatch(new_token()));
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert!(claim_of(&actions).is_none(), "{actions:?}");
+    assert_eq!(h.last_request().method, Method::Head, "{actions:?}");
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::ReKey { .. })),
+        "{actions:?}"
+    );
+    assert_eq!(claim_of(&actions), Some((3, PRIOR)));
+}
+
+/// Once the provisional claim applied and its reconcile completed, the acknowledged state is the
+/// stream's: a later history event while streaming re-keys, whatever the log held at the open.
+#[test]
+fn a_provisional_binding_that_went_live_re_keys_while_streaming() {
+    let pending = commit(LINEAGE, 1, 1);
+    let len = u64::try_from(pending.frame.len()).unwrap();
+    let mut h = provisional(vec![pending]);
+    h.answer(&head(token(), CLAIM, None));
+    h.answer(&producer(&receipt(
+        Delivery::Applied,
+        3,
+        0,
+        CLAIM,
+        2 * CLAIM,
+        None,
+    )));
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        4,
+        0,
+        2 * CLAIM,
+        3 * CLAIM,
+        None,
+    )));
+    let own = frame::encode_claim(epoch(3), PRIOR);
+    let actions = if actions.iter().any(|a| matches!(a, Action::Bound { .. })) {
+        actions
+    } else {
+        h.answer(&read(&own, 2 * CLAIM))
+    };
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Bound { .. })),
+        "{actions:?}"
+    );
+    let tail = 3 * CLAIM + len;
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        4,
+        1,
+        3 * CLAIM,
+        tail,
+        None,
+    )));
+    assert_eq!(acked(&actions), Some(Position(1)));
+    h.on(Event::Logged(commit(LINEAGE, 2, 1)));
+    h.answer(&mismatch(new_token()));
+    let actions = h.answer(&head(new_token(), tail, Some((token(), tail))));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(rekey_of(&actions), Some((new_token(), 5)));
+}
+
+/// The pre-check found the claim's own frame: it applied, so `producer-expired` naming its epoch
+/// is of its own retired record, and the next epoch follows (a continuation after idle expiry).
+#[test]
+fn a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry() {
+    let mut h = provisional(Vec::new());
+    let own = frame::encode_claim(epoch(3), PRIOR);
+    h.answer(&head(token(), 2 * CLAIM, None));
+    h.answer(&read(&own, 2 * CLAIM));
+    let actions = h.answer(&producer(&ProducerAnswer::ProducerExpired {
+        epoch: epoch(3),
+    }));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(claim_of(&actions), Some((4, ACTIVATION)));
 }

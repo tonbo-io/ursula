@@ -163,12 +163,13 @@ pub(crate) enum Unacked {
     Commits,
 }
 
-/// Whether a takeover may re-key a generation whose log holds `pending`: only with nothing
-/// pending. An ACK record trails the stream's acknowledgements, so a pending tail may hold
-/// acknowledged commits a history change lost, and a re-keyed log names the new token: a later
-/// open would resume it and discard that tail with no salvage. The open salvages such a
-/// generation instead, and a takeover resets `rewound` before its log rolls, so the next open
-/// salvages it.
+/// Whether a takeover, or a provisional open before its claim applied, may re-key a generation
+/// whose log holds `pending`: only with nothing pending. An ACK record trails the stream's
+/// acknowledgements, so a pending tail may hold acknowledged commits a history change lost, and a
+/// re-keyed log names the new token: a later open would resume it and discard that tail with no
+/// salvage. The open salvages such a generation instead. A takeover or a provisional binding
+/// resets `rewound` before its log rolls (a provisional one has live connections, so it cannot
+/// salvage under them), and the next open salvages it.
 pub(crate) fn takeover_may_rekey(pending: Unacked) -> bool {
     pending == Unacked::Nothing
 }

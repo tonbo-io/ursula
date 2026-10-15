@@ -85,6 +85,16 @@ const byAbort = new WeakSet<object>();
  * process acts on what you wrote or read. The connections of a binding share its files, so
  * node:sqlite's busy `timeout` is 5000 ms unless you pass one.
  *
+ * When the stream is unreachable (its first request fails before connecting: refused at once, or
+ * after the name lookup and the connect, each limited to 5 s), an open with a trusted local cache
+ * that claimed the stream before resolves then, `provisional` in `status()`: reads come from the
+ * cache, commits are local and pending, and `synced()` waits. Once the stream answers, the
+ * extension checks it from the cache's acknowledged state to its tail, claims it only when no
+ * other owner wrote or claimed there, and the database is `live`. If another owner took the
+ * stream meanwhile, the database resets (`fenced` or `stale`) with nothing sent, and no
+ * `synced()` ever resolved on the provisional state. Without such a cache the open waits for the
+ * stream until its signal fires.
+ *
  * Errors say what to do through `action`: {@link UrsulaSetupError} (`fix`, or `retry` for `in_use` and
  * `claim_races`), and {@link UrsulaUnavailableError} when the signal fired first: the last condition
  * the open met, or `cancelled` when it met none.

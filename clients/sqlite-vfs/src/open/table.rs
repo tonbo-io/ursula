@@ -26,8 +26,19 @@
 //! commits after the latest ACK is salvaged too, never re-keyed: an ACK record trails the
 //! stream's acknowledgements, so those commits may include acknowledged ones the history lost, and
 //! a re-keyed log names the new token, so a later open would resume it and discard them.
+//! Rows match in order, so a refusal sends nothing and moves no file.
+//!
+//! When the open's first HEAD got no answer with nothing sent (the stream is unreachable, design
+//! §5.5), [`decide_unreachable`] decides instead:
+//!
+//! | local generation | row |
+//! | --- | --- |
+//! | trusted, with a CLAIM record | open provisionally, the claim deferred behind a pre-check |
+//! | trusted, without one | wait: retry until the open's signal fires |
+//! | none | wait |
 
 use ursula_headers::ClusterId;
+use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 use ursula_headers::ServerIdentity;
@@ -37,6 +48,7 @@ use super::OpenError;
 use super::StreamFormat;
 use super::StreamState;
 use crate::codec::frame::CONTENT_TYPE;
+use crate::ids::Activation;
 use crate::replicator::answer::Unacked;
 use crate::replicator::answer::inherits;
 use crate::replicator::answer::takeover_may_rekey;
@@ -55,6 +67,9 @@ pub(crate) struct LocalSummary {
     pub(crate) pending: Unacked,
     /// Whether the generation holds data ([`crate::materialize::holds_data`], design D2).
     pub(crate) holds_data: bool,
+    /// The log's latest CLAIM record: the claim a provisional open sends again once the stream
+    /// answered and its pre-check found nothing foreign (design §7).
+    pub(crate) claim: Option<(Epoch, Activation)>,
 }
 
 /// The local generation the open found: `L` the value the rows carry for a trusted one, `R` for a
@@ -181,6 +196,37 @@ impl From<Refused> for OpenError {
     }
 }
 
+/// What the open does when its first HEAD got no answer and nothing went out: the stream is
+/// unreachable (design §5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnreachableRow<L, R> {
+    /// Open now on the trusted generation `local`, its claim deferred: once the stream answers
+    /// and the pre-check finds nothing foreign, the log's latest claim `claim` goes out again.
+    Provisional {
+        local: L,
+        claim: (Epoch, Activation),
+    },
+    /// Retry until the open's signal fires, the local generation as it was found: none, a
+    /// replaced one (salvaged by the build that replaces it, once the stream answers), or a
+    /// trusted one with no CLAIM record, which has no claim to continue.
+    Wait { local: Local<L, R> },
+}
+
+/// The unreachable rows of design §5.5, on the local generation the open found.
+pub(crate) fn decide_unreachable<L, R>(local: Local<L, R>) -> UnreachableRow<L, R> {
+    match local {
+        Local::Trusted(
+            LocalSummary {
+                claim: Some(claim), ..
+            },
+            local,
+        ) => UnreachableRow::Provisional { local, claim },
+        local @ (Local::None | Local::Replaced(_) | Local::Trusted(..)) => {
+            UnreachableRow::Wait { local }
+        }
+    }
+}
+
 /// Whether the open re-keys the trusted generation `summary` to the history `head` names: the
 /// history inherits it and its log holds nothing after its latest ACK.
 pub(crate) fn rekeys(summary: &LocalSummary, head: &StreamHead) -> bool {
@@ -293,6 +339,7 @@ pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>)
 #[cfg(test)]
 mod tests {
     use ursula_headers::ClusterId;
+    use ursula_headers::Epoch;
     use ursula_headers::Incarnation;
     use ursula_headers::Inherited;
     use ursula_headers::Offset;
@@ -306,9 +353,12 @@ mod tests {
     use super::OpenRow;
     use super::Refused;
     use super::Superseded;
+    use super::UnreachableRow;
     use super::Why;
     use super::decide;
+    use super::decide_unreachable;
     use crate::codec::frame::CONTENT_TYPE;
+    use crate::ids::Activation;
     use crate::replicator::answer::Unacked;
 
     /// A local generation of the tests: a trusted one carries `"gen"`, a replaced one `"bad"`.
@@ -351,6 +401,7 @@ mod tests {
                 acked_offset: Offset::from_u64(acked_offset),
                 pending,
                 holds_data,
+                claim: Some((Epoch::try_from(3).unwrap(), Activation([3; 16]))),
             },
             "gen",
         )
@@ -584,6 +635,46 @@ mod tests {
                 seen(&id, Some(&recreated))
             ),
             build(Superseded::Trash("gen"), recreated)
+        );
+    }
+
+    #[test]
+    fn an_unreachable_stream_opens_a_trusted_generation_with_a_claim_provisionally() {
+        assert_eq!(
+            decide_unreachable(local(1, 40)),
+            UnreachableRow::Provisional {
+                local: "gen",
+                claim: (Epoch::try_from(3).unwrap(), Activation([3; 16])),
+            }
+        );
+        // Pending commits wait for the claim with the rest.
+        assert!(matches!(
+            decide_unreachable(trusted(1, 40, Unacked::Commits, true)),
+            UnreachableRow::Provisional { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unreachable_stream_waits_without_a_generation_a_claim_to_continue_or_with_a_replaced_one()
+    {
+        for found in [NONE, REPLACED] {
+            assert_eq!(decide_unreachable(found.clone()), UnreachableRow::Wait {
+                local: found
+            });
+        }
+        let Local::Trusted(summary, value) = local(1, 40) else {
+            unreachable!("local() is trusted");
+        };
+        let unclaimed: Found = Local::Trusted(
+            LocalSummary {
+                claim: None,
+                ..summary
+            },
+            value,
+        );
+        assert_eq!(
+            decide_unreachable(unclaimed.clone()),
+            UnreachableRow::Wait { local: unclaimed }
         );
     }
 }

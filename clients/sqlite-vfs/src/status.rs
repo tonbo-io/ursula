@@ -39,6 +39,18 @@ fn condition(c: &Condition) -> &'static str {
     }
 }
 
+/// The `state` status reports (D9): a reset, else the binding's life, a live one `provisional`
+/// until a claim of it applied (design §5.5).
+fn state(reset: bool, life: Life, provisional: bool) -> &'static str {
+    match (reset, life) {
+        (true, _) => "reset",
+        (false, Life::Live) if provisional => "provisional",
+        (false, Life::Live) => "live",
+        (false, Life::Retiring) => "retiring",
+        (false, Life::Retired) => "retired",
+    }
+}
+
 /// `ursula_status` of a bound database. Fails only when the root's `salvage/` cannot be listed.
 pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
     let h = &b.handle;
@@ -137,12 +149,7 @@ pub(crate) fn status_json(b: &Binding) -> Result<String, Error> {
         ("role", json_str("owner")),
         (
             "state",
-            json_str(match (reset, h.life()) {
-                (Some(_), _) => "reset",
-                (None, Life::Live) => "live",
-                (None, Life::Retiring) => "retiring",
-                (None, Life::Retired) => "retired",
-            }),
+            json_str(state(reset.is_some(), h.life(), h.provisional())),
         ),
         (
             "epoch",
@@ -237,7 +244,14 @@ pub(crate) fn opened_json(opened: &Opened) -> String {
             ("done", "true".into()),
             ("path", json_str(&b.path)),
             ("name", json_str(b.handle.name.as_str())),
-            ("state", json_str("live")),
+            (
+                "state",
+                json_str(state(
+                    b.handle.reset().is_some(),
+                    b.handle.life(),
+                    b.handle.provisional(),
+                )),
+            ),
         ]),
         Opened::Pending(open) => {
             object(&[("done", "false".into()), ("request", open.0.to_string())])

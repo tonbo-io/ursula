@@ -31,6 +31,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -169,6 +170,9 @@ pub(crate) struct BindingHandle {
     /// salvages, and none runs beside a live binding of it in this process, nor in another while
     /// the root is locked. A reopen beside a reset binding may, so a reset binding lists them anew.
     salvage: OnceLock<Arc<[Salvaged]>>,
+    /// Opened on an unreachable stream (design §5.5) and no claim of it has applied yet: reads
+    /// come from files of unverified freshness, and `synced()` waits for the claim.
+    provisional: AtomicBool,
 }
 
 /// Where a binding stands between its connections and the driver.
@@ -252,6 +256,7 @@ impl BindingHandle {
             snapshots: Snapshots::default(),
             attach: bind.attach,
             salvage: OnceLock::new(),
+            provisional: AtomicBool::new(bind.provisional),
         }
     }
 
@@ -267,6 +272,18 @@ impl BindingHandle {
             return Ok(listed);
         }
         Ok(Arc::clone(self.salvage.get_or_init(|| listed)))
+    }
+
+    /// Whether the binding is still provisional: opened on an unreachable stream, no claim of it
+    /// applied yet.
+    pub(crate) fn provisional(&self) -> bool {
+        self.provisional.load(Ordering::Acquire)
+    }
+
+    /// A claim of the binding applied and its reconcile completed: it is live. True when it was
+    /// provisional until now.
+    fn set_live(&self) -> bool {
+        self.provisional.swap(false, Ordering::AcqRel)
     }
 
     /// The stream's token: the requests of the snapshot thread carry it.
@@ -546,6 +563,8 @@ pub(crate) struct Bind {
     pub(crate) max_frame_bytes: u64,
     pub(crate) acked: Position,
     pub(crate) attach: Attach,
+    /// Bound before its claim: the stream was unreachable at the open (design §5.5).
+    pub(crate) provisional: bool,
 }
 
 /// Where an open got its local database, as status reports it (design §9, `attach`).

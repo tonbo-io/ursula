@@ -6,6 +6,13 @@
 //! Once a claim at `E'` applies no older-epoch frame of the producer can apply, and the read sees
 //! every frame applied before the claim, so each pending record has landed or never will. The
 //! records that remain go out under the new epoch from seq 1, same bytes.
+//!
+//! A continuation reads from its log's acknowledged offset, which may trail the claims a takeover
+//! of this generation skipped (an ACK lost to a crash before the bind). So a foreign CLAIM fences
+//! a continuation only when no CLAIM of our own follows it in the range: one that does applied
+//! after it, and supersedes it. Foreign commits still reset `stale` there, since this generation
+//! never caught them up. The same reads, up to the tail a HEAD named, are a provisional
+//! open's pre-check before it sends its claim (design §7, [`Reconcile::pre_check`]).
 
 use ursula_headers::ClosedEpoch;
 use ursula_headers::Epoch;
@@ -23,6 +30,7 @@ use crate::codec::frame::Frame;
 use crate::codec::stream::FrameStream;
 use crate::codec::stream::StreamError;
 use crate::codec::stream::StreamFrame;
+use crate::ids::Activation;
 use crate::ids::Position;
 
 /// The reconcile's column: a takeover at open, or a continuation while bound.
@@ -77,6 +85,16 @@ pub(crate) fn decide_frame(mode: Mode, class: FrameClass) -> RowDecision {
     }
 }
 
+/// What a continuation read after the last CLAIM of its own: another owner's claim (and writes)
+/// with no claim of ours after them fences; an earlier owner's that a claim of ours superseded
+/// leaves its commits, which this generation never caught up, `stale`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Foreign {
+    Nothing,
+    Claim,
+    ClaimAndCommits,
+}
+
 /// What a read did to the reconcile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fed {
@@ -123,6 +141,10 @@ pub(crate) struct Reconcile {
     chunk: Vec<ForeignFrame>,
     /// The compressed bytes applied in place so far.
     applied_bytes: u64,
+    /// Continuation: what follows the last CLAIM of our own.
+    foreign: Foreign,
+    /// The CLAIM frames of our own the reads found.
+    own_claims: Vec<(Epoch, Activation)>,
 }
 
 /// The compressed record bytes of `frames`.
@@ -154,7 +176,37 @@ impl Reconcile {
             catch_up: CatchUp::Nothing,
             chunk: Vec::new(),
             applied_bytes: 0,
+            foreign: Foreign::Nothing,
+            own_claims: Vec::new(),
         }
+    }
+
+    /// A provisional open's pre-check (design §7): the continuation's reads from `from`, its log's
+    /// acknowledged offset, up to `to`, the tail a HEAD named, before any claim goes out. `epoch`
+    /// is the claim it will send.
+    pub(crate) fn pre_check(epoch: Epoch, from: Offset, to: Offset) -> Self {
+        Self {
+            mode: Mode::Continuation,
+            epoch,
+            claim: None,
+            after_claim: to,
+            closed: None,
+            stream: FrameStream::new(from, to, MAX_BATCH_BYTES),
+            catch_up: CatchUp::Nothing,
+            chunk: Vec::new(),
+            applied_bytes: 0,
+            foreign: Foreign::Nothing,
+            own_claims: Vec::new(),
+        }
+    }
+
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Whether the reads found the frame of claim `claim`, epoch and activation: it applied.
+    pub(crate) fn found_claim(&self, claim: (Epoch, Activation)) -> bool {
+        self.own_claims.contains(&claim)
     }
 
     pub(crate) fn at(&self) -> Offset {
@@ -239,33 +291,56 @@ impl Reconcile {
             // Undecodable bytes, a broken PART run, or a frame running into the claim.
             return self.row(FrameClass::Undecodable, None, ctx);
         }
-        if self.stream.done() {
-            Fed::Done
-        } else {
-            Fed::More
+        if !self.stream.done() {
+            return Fed::More;
+        }
+        // A foreign CLAIM no CLAIM of our own followed: another owner claimed after us.
+        match self.foreign {
+            Foreign::Claim | Foreign::ClaimAndCommits => {
+                self.row(FrameClass::ForeignClaim, None, ctx)
+            }
+            Foreign::Nothing => Fed::Done,
         }
     }
 
     fn frame(&mut self, read: StreamFrame, ctx: &mut Ctx) -> Fed {
         let StreamFrame { frame, bytes, end } = read;
         match frame {
-            Frame::Claim { activation, .. } => {
-                let class = if ctx.owns_activation(activation) {
-                    FrameClass::OwnClaim
-                } else {
-                    FrameClass::ForeignClaim
-                };
-                self.row(class, None, ctx)
+            Frame::Claim { epoch, activation } if ctx.owns_activation(activation) => {
+                self.own_claims.push((epoch, activation));
+                // Our own claim applied after any foreign one before it, but not after the commits
+                // that came with it.
+                if std::mem::replace(&mut self.foreign, Foreign::Nothing)
+                    == Foreign::ClaimAndCommits
+                {
+                    return self.row(FrameClass::ForeignCommit, Some((frame, end)), ctx);
+                }
+                self.row(FrameClass::OwnClaim, None, ctx)
             }
+            Frame::Claim { .. } if self.mode == Mode::Continuation => {
+                // Decided once the range shows whether a claim of our own follows it.
+                if self.foreign == Foreign::Nothing {
+                    self.foreign = Foreign::Claim;
+                }
+                Fed::More
+            }
+            Frame::Claim { .. } => self.row(FrameClass::ForeignClaim, None, ctx),
             Frame::Commit { id, .. } => {
                 let next = ctx
                     .pending
                     .front()
                     .is_some_and(|p| p.id == id && p.frame == bytes);
-                let class = if next {
-                    FrameClass::NextPending
-                } else {
-                    FrameClass::ForeignCommit
+                let class = match (next, self.foreign) {
+                    // Another owner's write after its claim: decided by whether a claim of our
+                    // own follows them.
+                    (false, Foreign::Claim | Foreign::ClaimAndCommits) => {
+                        self.foreign = Foreign::ClaimAndCommits;
+                        return Fed::More;
+                    }
+                    (false, Foreign::Nothing) => FrameClass::ForeignCommit,
+                    // Our commit after another owner's claim with none of ours between: fenced.
+                    (true, Foreign::Claim | Foreign::ClaimAndCommits) => FrameClass::ForeignClaim,
+                    (true, Foreign::Nothing) => FrameClass::NextPending,
                 };
                 self.row(class, Some((frame, end)), ctx)
             }

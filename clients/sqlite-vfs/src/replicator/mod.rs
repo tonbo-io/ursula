@@ -25,20 +25,41 @@
 //! §6.2) re-keys it: [`Action::ReKey`] rolls the log to a segment naming the new token with the
 //! CLAIM record of the claim that follows, and the replicator claims as after any fence. A
 //! takeover claims above every epoch seen. While bound, a continuation claims `own + 1` from
-//! streaming (or over a claim it holds and is reconciling), and an unconfirmed continuation claim
-//! is sent again, same epoch and body, under the new token: claiming higher at once would fence an
-//! owner that claimed `own + 1` meanwhile, since every owner shares the producer id. A repeat
-//! receipt for that claim means it applied before the history event, so the record stays
-//! history-fenced and the next append would be refused (#581 §2.3.1 rows 9 and 11): one more
-//! continuation claim follows. A takeover re-keys only with nothing pending
+//! streaming, and an unconfirmed continuation claim is sent again, same epoch and body, under the
+//! new token: claiming higher at once would fence an owner that claimed `own + 1` meanwhile, since
+//! every owner shares the producer id. A repeat receipt for that claim (or `receipt-evicted`)
+//! means it applied before the history event, so the record stays history-fenced and the next
+//! append would be refused (#581 §2.3.1 rows 9 and 11): one more continuation claim follows. A
+//! continuation whose latest claim applied past its acknowledged offset (its reconcile not done,
+//! a claim out over an epoch it never streamed in, or a provisional open before its bind) first
+//! pre-checks under the new token (a HEAD, then the
+//! reads from that offset to the tail): the new history may have lost that claim while an
+//! explicit open claimed in it, and a background claim must never fence that owner. A takeover
+//! re-keys only with nothing pending
 //! ([`answer::takeover_may_rekey`]): otherwise it resets `rewound` before the log rolls, and the
 //! next open salvages the generation, since the log's acknowledged offset may trail
 //! acknowledgements the pending tail holds. A rebuild that discards pending records after a
 //! re-key at open salvages the generation it replaces ([`Action::Rebuild`]'s `salvage`), so a
 //! history change never discards a local commit without a salvage.
 //!
-//! Left for later milestones: resume (M4), re-cut and PART sending (M3) and the provisional
-//! deferred claim (M2).
+//! A provisional open (design §5.5) defers its claim behind resume's sequence (design §7,
+//! [`Replicator::provisional`]): a HEAD first, which learns the token, the cluster and the
+//! request limit, then a pre-check that reads from the log's acknowledged offset to the tail the
+//! HEAD named. Any foreign frame there resets it with nothing sent (a `410` resets `stale`). Only
+//! then does it send its claim, and nothing is logged before: it sends again the log's latest
+//! claim, same epoch and body, as an unconfirmed claim is sent again after a re-key. A repeat
+//! receipt, or `receipt-evicted` (its digest checked), means the claim applied before, and one
+//! continuation claim of the next epoch follows. So a provisional open claims at most one above
+//! the latest claim of its own the stream applied, and never above an owner an explicit open
+//! installed before its pre-check read the tail. So does `producer-expired` naming the claim's
+//! epoch when the pre-check found that claim's frame. Any other answer loses, `fenced`, as for any
+//! continuation: without the frame, `producer-expired` is no proof the retired record was ours, so
+//! a provisional open of a stream left idle past expiry whose claim lies before its acknowledged
+//! offset resets, and the next open takes over with its pending commits. Until a claim of it applies, the acknowledged
+//! state is the log's, as a takeover's is, so a re-key follows the takeover's rule
+//! ([`answer::takeover_may_rekey`]).
+//!
+//! Left for later milestones: resume (M4), re-cut and PART sending (M3).
 //!
 //! Module map:
 //!
@@ -149,10 +170,11 @@ pub(crate) enum ClaimKind {
     /// claim, at most [`TAKEOVER_ROUNDS`] rounds. `round` counts from 1. `rekeyed`: the
     /// generation re-keyed in this open (design §6.2).
     Takeover { round: u8, rekeyed: bool },
-    /// After `producer-expired` or a re-key while bound: exactly `own + 1`, lost at the first
-    /// answer but its receipt. `rekeyed`: the claim went out again under a new token, so a repeat
-    /// receipt may be of an attempt that applied before the history event.
-    Continuation { own: Epoch, rekeyed: bool },
+    /// After `producer-expired`, a re-key while bound, or a provisional open's pre-check: exactly
+    /// `own + 1`, lost at the first answer but its receipt. `resent`: the claim went out again (under
+    /// a new token, or by a provisional open, which sends its log's latest claim `own` again), so a
+    /// repeat receipt may be of an attempt that applied before, and one more claim follows it.
+    Continuation { own: Epoch, resent: bool },
 }
 
 /// The claim a replicator holds or is making when it re-keys.
@@ -160,8 +182,12 @@ pub(crate) enum ClaimKind {
 enum Holding {
     /// The claim of this epoch is out, its outcome unknown.
     Claiming(Epoch),
-    /// The claim of this epoch applied (streaming, or reconciling after it).
+    /// The claim of this epoch applied and the replicator streams under it: its frame lies at or
+    /// before the acknowledged offset.
     Held(Epoch),
+    /// The claim of this epoch applied and its reconcile is not done: its frame lies past the
+    /// acknowledged offset.
+    Reconciling(Epoch),
 }
 
 /// Why requests wait for something other than the network to change (design §4.7).
@@ -426,12 +452,25 @@ pub(crate) struct Ctx {
     reached: Vec<BoundaryReceipt>,
     /// The db file's size at the start.
     pub(crate) db_bytes: u64,
-    /// Whether the log held a COMMIT record after its latest ACK when the open read it.
+    /// Whether the log held a COMMIT record after its latest ACK when the open read it, until a
+    /// claim of this replicator applies and its reconcile completes: from then on the
+    /// acknowledged state is the stream's, never the log's.
     unacked: Unacked,
     /// The token the generation re-keyed from, until a claim under the new one applies: a HEAD
     /// still inherits from it ([`HeadCheck::previous`]). Several re-keys with no write between
     /// them keep the first.
     pub(crate) rekey_from: Option<Incarnation>,
+    /// The epoch this replicator last bound and streamed in: its claim's frame lies at or before
+    /// the acknowledged offset.
+    streamed: Option<Epoch>,
+    /// The claim a pre-check sent again after finding its frame in the stream, while it is out: it
+    /// applied, so `producer-expired` naming its epoch is of its own retired record.
+    found_applied: Option<Epoch>,
+    /// The epoch of a provisional open's claim, its log's latest sent again, until the bind: writes
+    /// of ours under it may have gone out before (in a history since changed, or lost to a power
+    /// loss), so whatever its receipt one more claim follows it, and no key of that epoch is used
+    /// twice.
+    log_claim: Option<Epoch>,
     /// What the repeat before D4's follow-up claim said it closed: the epoch the binding streamed
     /// in, which the follow-up's own receipt (closing the repeated claim's epoch) no longer names.
     repeat_closed: Option<ClosedEpoch>,
@@ -459,6 +498,9 @@ pub(crate) struct Knobs {
     pub(crate) misroute_as_rekey: bool,
     /// Re-key a takeover whose log holds commits after its latest ACK: the #611 B2 gate undone.
     pub(crate) rekey_with_pending: bool,
+    /// Settle `synced()` tickets while activating too, as before #604: a claim's reconcile
+    /// acknowledges records before it announces them.
+    pub(crate) settle_while_activating: bool,
 }
 
 impl Ctx {
@@ -491,6 +533,9 @@ impl Ctx {
             rekey_from: local.rekey_from,
             unacked: local.unacked,
             repeat_closed: None,
+            log_claim: None,
+            streamed: None,
+            found_applied: None,
             producer,
             next_id: 0,
             #[cfg(test)]
@@ -728,6 +773,13 @@ pub(crate) enum Step {
     /// Takeover: the driver carries out an [`Action::Rebuild`] and answers with
     /// [`Event::CaughtUp`].
     CatchingUp(Box<Done>),
+    /// A provisional open's pre-check before it sends `claim`, its log's latest claim, again
+    /// (design §7): the HEAD, then the reads up to the tail it named.
+    PreCheck {
+        claim: (Epoch, Activation),
+        check: PreCheck,
+        link: Link,
+    },
     /// A read of the reconcile met a `410`: the rule of design §4.9 reads the latest snapshot's
     /// header. `snapshot` is `None` while the HEAD that names it is out, then the snapshot read.
     Gone {
@@ -735,6 +787,15 @@ pub(crate) enum Step {
         link: Box<Link>,
         snapshot: Option<SnapshotRef>,
     },
+}
+
+/// Where a provisional open's pre-check is.
+#[derive(Debug, Clone)]
+pub(crate) enum PreCheck {
+    /// The HEAD without a precondition.
+    Head,
+    /// The reads from the acknowledged offset to the tail the HEAD named.
+    Read(Box<Reconcile>),
 }
 
 /// What a streaming replicator's append slot is doing.
@@ -808,8 +869,8 @@ impl Replicator {
                 let kind = ClaimKind::Takeover { round, rekeyed };
                 (kind, ctx.takeover_epoch(), rekeyed)
             }
-            ClaimKind::Continuation { own, rekeyed } => {
-                let kind = ClaimKind::Continuation { own, rekeyed };
+            ClaimKind::Continuation { own, resent } => {
+                let kind = ClaimKind::Continuation { own, resent };
                 (kind, next_epoch(own), false)
             }
         };
@@ -825,6 +886,35 @@ impl Replicator {
         let state = Self::Activating {
             kind,
             step: Step::Claim { epoch, link },
+            ctx,
+        };
+        (state, actions)
+    }
+
+    /// A provisional open (design §5.5) of a generation whose log's latest claim is `claim`: the
+    /// pre-check of design §7 starts with a HEAD, and nothing is logged until the stream answered.
+    pub(crate) fn provisional(
+        local: LocalState,
+        claim: (Epoch, Activation),
+    ) -> (Self, Vec<Action>) {
+        let mut actions = Vec::new();
+        let Some(ctx) = Ctx::new(local) else {
+            actions.push(Action::Reset(ResetKind::Internal));
+            return (Self::Reset(ResetKind::Internal), actions);
+        };
+        let mut ctx = Box::new(ctx);
+        ctx.log_claim = Some(claim.0);
+        let link = Link::send(head_request(), &mut ctx, &mut actions);
+        let state = Self::Activating {
+            kind: ClaimKind::Continuation {
+                own: claim.0,
+                resent: true,
+            },
+            step: Step::PreCheck {
+                claim,
+                check: PreCheck::Head,
+                link,
+            },
             ctx,
         };
         (state, actions)
@@ -897,7 +987,7 @@ fn claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
 /// Re-keys the generation to `ctx.incarnation` with the CLAIM record of `epoch`, and sends that
 /// claim under the new token.
 fn rekey_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
-    let activation = ctx.activation;
+    let activation = claim_activation(ctx, epoch);
     if !ctx.claims.contains(&(epoch, activation)) {
         ctx.claims.push((epoch, activation));
     }
@@ -909,9 +999,19 @@ fn rekey_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
     send_claim(ctx, epoch, actions)
 }
 
+/// The activation of the claim of `epoch`: the latest CLAIM record of that epoch (a claim sent
+/// again keeps its body), else this activation's.
+fn claim_activation(ctx: &Ctx, epoch: Epoch) -> Activation {
+    ctx.claims
+        .iter()
+        .rev()
+        .find(|(e, _)| *e == epoch)
+        .map_or(ctx.activation, |(_, activation)| *activation)
+}
+
 /// Sends the claim of `epoch`, whose CLAIM record is logged.
 fn send_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
-    let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, ctx.activation));
+    let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, claim_activation(ctx, epoch)));
     let request = ctx.write_request(epoch, Seq::ZERO, body);
     Link::send(request, ctx, actions)
 }
@@ -929,15 +1029,7 @@ fn rekey(
     mut ctx: Box<Ctx>,
     actions: &mut Vec<Action>,
 ) -> Replicator {
-    let unacked = if ctx.pending.is_empty() {
-        ctx.unacked
-    } else {
-        Unacked::Commits
-    };
-    if matches!(kind, ClaimKind::Takeover { .. })
-        && !takeover_may_rekey(unacked)
-        && !rekeys_with_pending(&ctx)
-    {
+    if !may_rekey(matches!(kind, ClaimKind::Takeover { .. }), &ctx) {
         // Before the log rolls: the next open finds the old token and refuses the same way.
         return reset(ResetKind::Rewound, actions);
     }
@@ -947,6 +1039,37 @@ fn rekey(
     // write between names it again.
     ctx.rekey_from = Some(previous);
     ctx.incarnation = incarnation;
+    // A claim that applied past the acknowledged offset (one being reconciled, one a claim out
+    // continues that the replicator never streamed in, or any of a provisional open before its
+    // bind) may be lost with the old history while an explicit open
+    // claimed in the new one, which saw no claim of ours above the one before: the latest claim
+    // goes out again only after a pre-check under the new token found no other owner past that
+    // offset (design §7), so a background claim never fences that owner.
+    let past_acked = match (kind, holding) {
+        (_, Holding::Reconciling(_)) => true,
+        // A claim over the epoch it streamed in: that claim's frame is acknowledged.
+        (ClaimKind::Continuation { own, .. }, Holding::Claiming(_)) => ctx.streamed != Some(own),
+        (_, Holding::Held(_) | Holding::Claiming(_)) => false,
+    } || ctx.log_claim.is_some();
+    if let ClaimKind::Continuation { own, .. } = kind
+        && past_acked
+        && let Some(&claim) = ctx.claims.last()
+    {
+        log::emit(Level::Info, "rekey", &[
+            ("from", &from),
+            ("to", &incarnation),
+        ]);
+        let link = Link::send(head_request(), &mut ctx, actions);
+        return Replicator::Activating {
+            kind: ClaimKind::Continuation { own, resent: true },
+            step: Step::PreCheck {
+                claim,
+                check: PreCheck::Head,
+                link,
+            },
+            ctx,
+        };
+    }
     let (kind, epoch) = match (kind, holding) {
         (ClaimKind::Takeover { round, .. }, _) => (
             ClaimKind::Takeover {
@@ -956,12 +1079,12 @@ fn rekey(
             ctx.takeover_epoch(),
         ),
         (ClaimKind::Continuation { own, .. }, Holding::Claiming(epoch)) => {
-            (ClaimKind::Continuation { own, rekeyed: true }, Some(epoch))
+            (ClaimKind::Continuation { own, resent: true }, Some(epoch))
         }
-        (ClaimKind::Continuation { .. }, Holding::Held(epoch)) => (
+        (ClaimKind::Continuation { .. }, Holding::Held(epoch) | Holding::Reconciling(epoch)) => (
             ClaimKind::Continuation {
                 own: epoch,
-                rekeyed: true,
+                resent: true,
             },
             next_epoch(epoch),
         ),
@@ -1062,6 +1185,7 @@ fn common_event(
         Event::Sync { ticket, target } => {
             let after = ctx.upcoming_id();
             ctx.tickets.add(ticket, target, after);
+            settle_while_activating(ctx, actions);
             Ok(None)
         }
         Event::Stop => Err(Terminal::Stopped),
@@ -1142,7 +1266,7 @@ fn activating(
                 },
                 Hit::Head => {
                     let outcome = link.head_answer(&exchange, now_ms, &mut ctx, actions);
-                    let holding = Holding::Held(reconcile.epoch());
+                    let holding = Holding::Reconciling(reconcile.epoch());
                     let step = Step::Reconcile { reconcile, link };
                     activating_head(outcome, kind, holding, ctx, step, actions)
                 }
@@ -1266,6 +1390,43 @@ fn activating(
                 ctx,
             },
         },
+        Step::PreCheck {
+            claim,
+            check,
+            mut link,
+        } => {
+            let hit = match &event {
+                Event::Answer { id, .. } => link.hit(*id),
+                _ => Hit::None,
+            };
+            match (event, hit) {
+                (Event::Tick, _) => link.tick(now_ms, &mut ctx, actions),
+                (Event::Answer { exchange, .. }, Hit::Head) => {
+                    return match link.head_answer(&exchange, now_ms, &mut ctx, actions) {
+                        HeadOutcome::Waiting => Replicator::Activating {
+                            kind,
+                            step: Step::PreCheck { claim, check, link },
+                            ctx,
+                        },
+                        HeadOutcome::ReKey { to, from } => {
+                            pre_check_rekey(kind, claim, to, from, ctx, actions)
+                                .unwrap_or_else(|terminal| terminal.into())
+                        }
+                        HeadOutcome::Reset(kind) => reset(kind, actions),
+                    };
+                }
+                (Event::Answer { exchange, .. }, Hit::Main) => {
+                    let pre = PreChecking { kind, claim, link };
+                    return pre.answered(check, &exchange, ctx, now_ms, actions);
+                }
+                _ => {}
+            }
+            Replicator::Activating {
+                kind,
+                step: Step::PreCheck { claim, check, link },
+                ctx,
+            }
+        }
         Step::Gone {
             reconcile,
             mut link,
@@ -1279,7 +1440,7 @@ fn activating(
                 (Event::Tick, _) => link.tick(now_ms, &mut ctx, actions),
                 (Event::Answer { exchange, .. }, Hit::Head) => {
                     let outcome = link.head_answer(&exchange, now_ms, &mut ctx, actions);
-                    let holding = Holding::Held(reconcile.epoch());
+                    let holding = Holding::Reconciling(reconcile.epoch());
                     let step = Step::Gone {
                         reconcile,
                         link,
@@ -1314,6 +1475,249 @@ fn activating(
 /// A HEAD without a precondition.
 fn head_request() -> Request {
     Request::new(Method::Head, Target::Stream)
+}
+
+/// The tail a HEAD's `200` names.
+fn head_tail(exchange: &Exchange) -> Option<Offset> {
+    match exchange {
+        Exchange::Answered(answer) => match &answer.typed {
+            Ok(Typed::Head {
+                stream: Some(head), ..
+            }) => Some(head.next_offset()),
+            _ => None,
+        },
+        Exchange::NoAnswer(_) => None,
+    }
+}
+
+/// The pre-check's HEAD found another token whose history inherits the generation: a re-key
+/// waits for the claim, which rolls the log ([`Action::ReKey`]). Its log's ACK may trail what the
+/// stream acknowledged of commits after it, so with one it resets `rewound`, as a takeover does.
+fn re_key_for_pre_check(
+    incarnation: Incarnation,
+    from: Incarnation,
+    ctx: &mut Ctx,
+    actions: &mut Vec<Action>,
+) -> Result<(), Terminal> {
+    if !may_rekey(false, ctx) {
+        actions.push(Action::Reset(ResetKind::Rewound));
+        return Err(Terminal::Reset(ResetKind::Rewound));
+    }
+    ctx.set_condition(None, actions);
+    log::emit(Level::Info, "rekey", &[
+        ("from", &ctx.incarnation),
+        ("to", &incarnation),
+    ]);
+    ctx.rekey_from = Some(from);
+    ctx.incarnation = incarnation;
+    Ok(())
+}
+
+/// A HEAD of the pre-check's link named an inheriting history: the pre-check starts again under
+/// the new token, from its HEAD.
+fn pre_check_rekey(
+    kind: ClaimKind,
+    claim: (Epoch, Activation),
+    to: Incarnation,
+    from: Incarnation,
+    mut ctx: Box<Ctx>,
+    actions: &mut Vec<Action>,
+) -> Result<Replicator, Terminal> {
+    re_key_for_pre_check(to, from, &mut ctx, actions)?;
+    let link = Link::send(head_request(), &mut ctx, actions);
+    Ok(Replicator::Activating {
+        kind,
+        step: Step::PreCheck {
+            claim,
+            check: PreCheck::Head,
+            link,
+        },
+        ctx,
+    })
+}
+
+/// A provisional open's pre-check while its HEAD or a read is out.
+struct PreChecking {
+    kind: ClaimKind,
+    claim: (Epoch, Activation),
+    link: Link,
+}
+
+impl PreChecking {
+    fn waiting(self, check: PreCheck, ctx: Box<Ctx>) -> Replicator {
+        Replicator::Activating {
+            kind: self.kind,
+            step: Step::PreCheck {
+                claim: self.claim,
+                check,
+                link: self.link,
+            },
+            ctx,
+        }
+    }
+
+    /// Carries out what an answer that decides nothing about the pre-check decided.
+    fn common(
+        mut self,
+        check: PreCheck,
+        common: Common,
+        exchange: &Exchange,
+        mut ctx: Box<Ctx>,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        match self
+            .link
+            .common(common, retry_after(exchange), now_ms, &mut ctx, actions)
+        {
+            Err(kind) => reset(kind, actions),
+            Ok(()) => self.waiting(check, ctx),
+        }
+    }
+
+    /// The answer to the HEAD or to a read.
+    fn answered(
+        self,
+        check: PreCheck,
+        exchange: &Exchange,
+        mut ctx: Box<Ctx>,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let reconcile = match check {
+            PreCheck::Head => return self.head_answered(exchange, ctx, now_ms, actions),
+            PreCheck::Read(reconcile) => reconcile,
+        };
+        match decide_read(exchange) {
+            ReadDecision::Bytes { next } => {
+                ctx.set_condition(None, actions);
+                let body = match exchange {
+                    Exchange::Answered(answer) => answer.body.as_slice(),
+                    Exchange::NoAnswer(_) => &[],
+                };
+                let mut reconcile = reconcile;
+                match reconcile.feed(body, next, &mut ctx) {
+                    Fed::Reset(kind) => reset(kind, actions),
+                    Fed::More if !reconcile.complete() => self.read(reconcile, ctx, actions),
+                    Fed::More | Fed::Done => {
+                        if reconcile.found_claim(self.claim) {
+                            ctx.found_applied = Some(self.claim.0);
+                        }
+                        self.send(ctx, actions)
+                    }
+                }
+            }
+            // Retention passed the log's acknowledged offset: the stream moved on.
+            ReadDecision::Gone => reset(ResetKind::Stale, actions),
+            ReadDecision::Common(common) => self.common(
+                PreCheck::Read(reconcile),
+                common,
+                exchange,
+                ctx,
+                now_ms,
+                actions,
+            ),
+        }
+    }
+
+    fn head_answered(
+        self,
+        exchange: &Exchange,
+        mut ctx: Box<Ctx>,
+        now_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let tail = head_tail(exchange);
+        match (ctx.head_decision(exchange), tail) {
+            (HeadDecision::Same { max_request_bytes }, Some(tail)) => {
+                ctx.set_condition(None, actions);
+                ctx.limits.head = max_request_bytes;
+                self.start_reads(tail, ctx, actions)
+            }
+            (
+                HeadDecision::ReKey {
+                    incarnation,
+                    from,
+                    max_request_bytes,
+                },
+                Some(tail),
+            ) => {
+                ctx.limits.head = max_request_bytes;
+                if let Err(terminal) = re_key_for_pre_check(incarnation, from, &mut ctx, actions) {
+                    return terminal.into();
+                }
+                self.start_reads(tail, ctx, actions)
+            }
+            (HeadDecision::Rewound, _) => reset(ResetKind::Rewound, actions),
+            (HeadDecision::Deleted, _) => reset(ResetKind::Deleted, actions),
+            (HeadDecision::WrongCluster, _) => {
+                let common = Common::Blocked(BlockedReason::WrongCluster);
+                self.common(PreCheck::Head, common, exchange, ctx, now_ms, actions)
+            }
+            (HeadDecision::Common(common), _) => {
+                // A HEAD never waits on another HEAD.
+                let common = match (common, exchange) {
+                    (Common::Head(_), Exchange::Answered(answer)) => {
+                        Common::Blocked(BlockedReason::Rejected {
+                            status: answer.status,
+                        })
+                    }
+                    (other, _) => other,
+                };
+                self.common(PreCheck::Head, common, exchange, ctx, now_ms, actions)
+            }
+            // A `200` names its stream.
+            (HeadDecision::Same { .. } | HeadDecision::ReKey { .. }, None) => {
+                reset(ResetKind::Internal, actions)
+            }
+        }
+    }
+
+    /// Reads from the log's acknowledged offset to `tail`.
+    fn start_reads(self, tail: Offset, ctx: Box<Ctx>, actions: &mut Vec<Action>) -> Replicator {
+        if tail < ctx.acked_offset {
+            // The stream under this token holds less than this generation acknowledged.
+            return reset(ResetKind::StreamState, actions);
+        }
+        let reconcile = Box::new(Reconcile::pre_check(self.claim.0, ctx.acked_offset, tail));
+        if reconcile.complete() {
+            return self.send(ctx, actions);
+        }
+        self.read(reconcile, ctx, actions)
+    }
+
+    fn read(
+        self,
+        reconcile: Box<Reconcile>,
+        mut ctx: Box<Ctx>,
+        actions: &mut Vec<Action>,
+    ) -> Replicator {
+        let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
+        Self { link, ..self }.waiting(PreCheck::Read(reconcile), ctx)
+    }
+
+    /// Nothing foreign up to the tail: the log's latest claim goes out again, same epoch and
+    /// body, its CLAIM record already logged (the log rolls first after a re-key).
+    fn send(self, mut ctx: Box<Ctx>, actions: &mut Vec<Action>) -> Replicator {
+        let (epoch, activation) = self.claim;
+        if ctx.rekey_from.is_some() {
+            // Commits logged since the HEAD decided the re-key count too.
+            if !may_rekey(false, &ctx) {
+                return reset(ResetKind::Rewound, actions);
+            }
+            actions.push(Action::ReKey {
+                incarnation: ctx.incarnation,
+                epoch,
+                activation,
+            });
+        }
+        let link = send_claim(&mut ctx, epoch, actions);
+        Replicator::Activating {
+            kind: self.kind,
+            step: Step::Claim { epoch, link },
+            ctx,
+        }
+    }
 }
 
 /// The `410` rule of design §4.9 while its HEAD or snapshot read is out.
@@ -1401,7 +1805,7 @@ impl Gone {
                     max_request_bytes,
                 } => {
                     ctx.limits.head = max_request_bytes;
-                    let holding = Holding::Held(self.reconcile.epoch());
+                    let holding = Holding::Reconciling(self.reconcile.epoch());
                     rekey(self.kind, holding, incarnation, from, ctx, actions)
                 }
                 HeadDecision::Rewound => reset(ResetKind::Rewound, actions),
@@ -1469,12 +1873,20 @@ impl Gone {
     /// share a lineage, so a position above our acknowledged one may be another copy's commit
     /// with other bytes: never trusted, a divergence. Our own snapshot never runs ahead of the
     /// durable acknowledged position (the snapshot thread fsyncs ACK(k, W) before publishing).
+    ///
+    /// A continuation never skips bytes it did not read: the snapshot must sit where the reads
+    /// are. Our own snapshots never put it past the durable acknowledged offset, so one past it is
+    /// another copy's, and whatever it skipped may hold a claim or commit of another owner.
     fn covers(&self, ctx: &Ctx, header: &SnapshotHeader) -> bool {
         let last = header.fields.last;
         let offset = header.fields.offset;
+        let unread = match self.reconcile.mode() {
+            Mode::Takeover => self.reconcile.at() <= offset,
+            Mode::Continuation => self.reconcile.at() == offset,
+        };
         last.lineage == ctx.lineage
             && last.position <= ctx.acked
-            && self.reconcile.at() <= offset
+            && unread
             && offset <= self.reconcile.end()
     }
 
@@ -1544,12 +1956,16 @@ fn claim_answered(
             if receipt.start() < ctx.acked_offset {
                 return reset(ResetKind::StreamState, actions);
             }
-            if delivery == Delivery::Repeat
-                && matches!(kind, ClaimKind::Continuation { rekeyed: true, .. })
-                && !repeat_binds(&ctx)
-            {
+            let follow_up = match delivery {
+                Delivery::Repeat => !repeat_binds(&ctx),
+                // A provisional open never writes under the claim it sent again: writes of ours
+                // may have gone out under that epoch in a history before.
+                Delivery::Applied => ctx.log_claim == Some(epoch),
+            };
+            if follow_up && matches!(kind, ClaimKind::Continuation { resent: true, .. }) {
                 // The claim applied before the history event, so the record stays
-                // history-fenced: one more claim over it (design §6.2, D4).
+                // history-fenced: one more claim over it (design §6.2, D4). So does a provisional
+                // open's claim, whatever its receipt.
                 let Some(next) = next_epoch(epoch) else {
                     return reset(ResetKind::Internal, actions);
                 };
@@ -1558,7 +1974,7 @@ fn claim_answered(
                 return Replicator::Activating {
                     kind: ClaimKind::Continuation {
                         own: epoch,
-                        rekeyed: false,
+                        resent: false,
                     },
                     step: Step::Claim { epoch: next, link },
                     ctx,
@@ -1597,6 +2013,28 @@ fn claim_answered(
             Replicator::Activating {
                 kind,
                 step: Step::Reconcile { reconcile, link },
+                ctx,
+            }
+        }
+        // A claim sent again that applied before (its receipt evicted by later writes under it,
+        // or its record retired with its frame found in the pre-check): one continuation claim
+        // above it follows, as after a repeat (design §4.8).
+        ClaimDecision::Lost { epoch: Some(named) }
+            if named == epoch
+                && matches!(kind, ClaimKind::Continuation { resent: true, .. })
+                && applied_before(exchange, ctx.found_applied == Some(epoch)) =>
+        {
+            ctx.see_epoch(named);
+            let Some(next) = next_epoch(epoch) else {
+                return reset(ResetKind::Internal, actions);
+            };
+            let link = claim(&mut ctx, next, actions);
+            Replicator::Activating {
+                kind: ClaimKind::Continuation {
+                    own: epoch,
+                    resent: false,
+                },
+                step: Step::Claim { epoch: next, link },
                 ctx,
             }
         }
@@ -1639,6 +2077,19 @@ fn claim_answered(
     }
 }
 
+/// Whether the generation may re-key ([`answer::takeover_may_rekey`]): a takeover's pending
+/// records, and those a provisional open logged before its bind, count with the log's, since
+/// with any of them pending the next open must salvage. A bound continuation's acknowledged state
+/// is the stream's, exact.
+fn may_rekey(takeover: bool, ctx: &Ctx) -> bool {
+    let unacked = if (takeover || ctx.log_claim.is_some()) && !ctx.pending.is_empty() {
+        Unacked::Commits
+    } else {
+        ctx.unacked
+    };
+    takeover_may_rekey(unacked) || rekeys_with_pending(ctx)
+}
+
 /// Whether a takeover re-keys with commits pending: never, but under the negative control.
 #[cfg(test)]
 fn rekeys_with_pending(ctx: &Ctx) -> bool {
@@ -1648,6 +2099,33 @@ fn rekeys_with_pending(ctx: &Ctx) -> bool {
 #[cfg(not(test))]
 fn rekeys_with_pending(_ctx: &Ctx) -> bool {
     false
+}
+
+/// The negative control that settles tickets in every state, as before #604.
+#[cfg(test)]
+fn settle_while_activating(ctx: &mut Ctx, actions: &mut Vec<Action>) {
+    if ctx.knobs.settle_while_activating {
+        ctx.settle(actions);
+    }
+}
+
+#[cfg(not(test))]
+fn settle_while_activating(_ctx: &mut Ctx, _actions: &mut Vec<Action>) {}
+
+/// Whether `exchange` says a claim of ours applied before: `receipt-evicted`, whose digest check
+/// passed, so later writes under our claim evicted its receipt; or `producer-expired` naming its
+/// epoch when the pre-check found that claim's frame (`found`), so the retired record is ours.
+/// Otherwise `producer-expired` is no proof: the retired record of that epoch may be another
+/// claimant's.
+fn applied_before(exchange: &Exchange, found: bool) -> bool {
+    let Exchange::Answered(answer) = exchange else {
+        return false;
+    };
+    match &answer.typed {
+        Ok(Typed::Producer(ProducerAnswer::ReceiptEvicted { .. })) => true,
+        Ok(Typed::Producer(ProducerAnswer::ProducerExpired { .. })) => found,
+        _ => false,
+    }
 }
 
 /// Whether a repeat receipt for a claim sent again after a re-key binds without the claim after
@@ -1738,6 +2216,11 @@ fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -
     actions.push(Action::Bound { epoch: done.epoch });
     // A claim under the current token applied: the stream was written under it.
     ctx.rekey_from = None;
+    // The reconcile read what landed: the acknowledged state is the stream's from now on.
+    ctx.unacked = Unacked::Nothing;
+    ctx.log_claim = None;
+    ctx.found_applied = None;
+    ctx.streamed = Some(done.epoch);
     ctx.acked_offset = done.after_claim;
     ctx.ack_actions(actions);
     ctx.sent.clear();
@@ -1963,7 +2446,7 @@ impl Stream {
                 Replicator::Activating {
                     kind: ClaimKind::Continuation {
                         own: self.epoch,
-                        rekeyed: false,
+                        resent: false,
                     },
                     step: Step::Claim { epoch: next, link },
                     ctx,
@@ -1995,7 +2478,7 @@ impl Stream {
     ) -> Replicator {
         let kind = ClaimKind::Continuation {
             own: self.epoch,
-            rekeyed: false,
+            resent: false,
         };
         rekey(
             kind,

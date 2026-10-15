@@ -227,6 +227,21 @@ impl Harness {
         (harness, actions)
     }
 
+    /// A provisional open's replicator (design §5.5, §7) whose log's latest claim is `claim`.
+    pub(crate) fn provisional(
+        local: LocalState,
+        claim: (Epoch, Activation),
+    ) -> (Self, Vec<Action>) {
+        let (replicator, actions) = Replicator::provisional(local, claim);
+        let mut harness = Self {
+            replicator,
+            now_ms: 1_000,
+            last: None,
+        };
+        harness.note(&actions);
+        (harness, actions)
+    }
+
     fn note(&mut self, actions: &[Action]) {
         for action in actions {
             if let Action::Send { id, request, .. } = action {
