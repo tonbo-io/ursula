@@ -4,8 +4,9 @@
 //! publish) is decided from its head, in this order, before the node polls
 //! any of its body:
 //!
-//! 1. malformed headers (`400`), checked by each handler;
-//! 2. size (`413`), checked by ingress admission from `Content-Length`;
+//! 1. size (`413`), checked by ingress admission from `Content-Length`,
+//!    which runs before the handler;
+//! 2. malformed headers (`400`), checked by each handler;
 //! 3. routing: a node that does not lead the stream's group answers `307`
 //!    to the leader with `x-ursula-raft-leader-id`, `x-ursula-raft-group` and
 //!    `x-ursula-raft-term`, or `503` with `Retry-After` and
@@ -19,11 +20,11 @@
 //! redirects: a leadership change answers `503` with `Retry-After`
 //! ([`BodyState::Read`]), and the write's key resolves the outcome.
 
+use axum::extract::MatchedPath;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::Method;
 use axum::http::StatusCode;
-use axum::http::Uri;
 use axum::http::header::LOCATION;
 use axum::http::header::RETRY_AFTER;
 use axum::response::IntoResponse;
@@ -32,6 +33,7 @@ use ursula_headers::NodeId;
 use ursula_headers::RaftGroup;
 use ursula_headers::RaftTerm;
 use ursula_headers::RoutingAnswer;
+use ursula_headers::SizeLimit;
 use ursula_raft::GroupLeadership;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::RouteWriteRequest;
@@ -44,25 +46,48 @@ use ursula_shard::RaftGroupId;
 use crate::HttpState;
 use crate::admission::AdmissionPermit;
 use crate::admission::DeferredAdmission;
-use crate::cold_snapshot;
+use crate::limits;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 
-/// Whether a request is a write that is routed before its body: a create
-/// (`PUT {bucket}/{stream}`), an append or close (`POST {bucket}/{stream}`),
-/// or a snapshot publish.
-pub(crate) fn routes_before_body(method: &Method, uri: &Uri) -> bool {
-    if cold_snapshot::is_snapshot_publish(method, uri) {
-        return true;
+/// The route of a stream: create (`PUT`), append or close (`POST`), read,
+/// `HEAD` and delete.
+pub(crate) const STREAM_ROUTE: &str = "/{bucket}/{stream}";
+/// The route of a snapshot: publish (`PUT`) and read.
+pub(crate) const SNAPSHOT_ROUTE: &str = "/{bucket}/{stream}/snapshot/{snapshot_offset}";
+
+/// A write that is routed before its body, told by the route that matched
+/// ([`STREAM_ROUTE`] and [`SNAPSHOT_ROUTE`], which the router is built
+/// with), never by parsing the path again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyWrite {
+    /// A create, or an append or close.
+    Stream,
+    /// A snapshot publish. With a cold store, admission lets its body
+    /// exceed the request limit, up to the snapshot limit, and charges at
+    /// most the request limit against the in-flight budget, because a large
+    /// body is streamed to the cold store in bounded parts. The handler
+    /// enforces the limit again for a body without `Content-Length`.
+    SnapshotPublish,
+}
+
+impl BodyWrite {
+    pub(crate) fn of(method: &Method, route: Option<&MatchedPath>) -> Option<Self> {
+        match (method, route.map(MatchedPath::as_str)) {
+            (&Method::PUT | &Method::POST, Some(STREAM_ROUTE)) => Some(Self::Stream),
+            (&Method::PUT, Some(SNAPSHOT_ROUTE)) => Some(Self::SnapshotPublish),
+            _ => None,
+        }
     }
-    if !matches!(*method, Method::PUT | Method::POST) {
-        return false;
+
+    /// Admission's body limit for the write on a node with or without a
+    /// cold store.
+    pub(crate) fn limit(self, cold_store: bool) -> SizeLimit {
+        match self {
+            Self::Stream => limits::REQUEST_LIMIT,
+            Self::SnapshotPublish => limits::snapshot_publish_limit(cold_store),
+        }
     }
-    let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
-    matches!(
-        (segments.next(), segments.next(), segments.next()),
-        (Some(bucket), Some(_), None) if !bucket.starts_with("__ursula")
-    )
 }
 
 /// What a write's head decided.

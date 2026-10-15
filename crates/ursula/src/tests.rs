@@ -2754,44 +2754,26 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
     );
     assert!(!refused.headers().contains_key(names::X_URSULA_RAFT_GROUP));
 
+    // After the body is read a node never redirects. A router without the
+    // leadership view thinks this follower leads, reads the body, and its
+    // engine refuses the write: a retryable 503, no Location.
+    let unaware = Router::new().merge(client_router_with_admission(
+        HttpState::new(nodes[1].runtime.clone()),
+        IngressAdmission::default(),
+    ));
+    let late = append(unaware).await;
+    assert_eq!(late.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(late.headers().contains_key(axum::http::header::RETRY_AFTER));
+    assert!(!late.headers().contains_key(LOCATION));
+    assert_eq!(
+        typed_routing(&late),
+        ursula_headers::RoutingAnswer::NoLeader {
+            group: ursula_headers::RaftGroup::from_u32(0)
+        }
+    );
+
     for node in nodes {
         node.shutdown().await;
-    }
-}
-
-/// After the body is read, a node never redirects: a leadership refusal
-/// answers `503` with `Retry-After` (#581 section 6.1).
-#[tokio::test]
-async fn a_leadership_refusal_after_the_body_is_a_retryable_503() {
-    let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
-    );
-    for err in [
-        RuntimeError::GroupEngine {
-            core_id: ursula_shard::CoreId(0),
-            raft_group_id: RaftGroupId(0),
-            error: GroupEngineError::forward_to_leader_before_proposal("not leader", Some(1), None),
-        },
-        RuntimeError::GroupNotHosted {
-            core_id: ursula_shard::CoreId(0),
-            raft_group_id: RaftGroupId(0),
-        },
-    ] {
-        let response = super::runtime_error_after_body(&state, err);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers().get(axum::http::header::RETRY_AFTER),
-            Some(&axum::http::HeaderValue::from_static("1"))
-        );
-        assert!(!response.headers().contains_key(LOCATION));
     }
 }
 

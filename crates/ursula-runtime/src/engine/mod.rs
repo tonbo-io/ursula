@@ -277,16 +277,13 @@ pub trait GroupEngine: Send + 'static {
     /// this replica leads the group, and otherwise the leader and its term.
     /// A leader also answers a tokened producer write that its head alone
     /// decides (section 2.5, W7): a repeat of a write that applied under the
-    /// request's token, or a key conflict, from its applied state. The
-    /// default, for an engine without replication, leads and answers
-    /// nothing early.
+    /// request's token, or a key conflict, from its applied state. Every
+    /// engine routes: one without replication always leads.
     fn route_write<'a>(
         &'a mut self,
-        _request: RouteWriteRequest,
-        _placement: ShardPlacement,
-    ) -> GroupRouteWriteFuture<'a> {
-        Box::pin(async move { Ok(WriteRoute::Leader { early_answer: None }) })
-    }
+        request: RouteWriteRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a>;
 
     /// Per-bucket committed usage held by this group's replicated state.
     ///

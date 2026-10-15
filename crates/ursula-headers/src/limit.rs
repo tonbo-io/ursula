@@ -10,8 +10,9 @@ use crate::names;
 pub enum SizeLimit {
     /// `Ursula-Max-Request-Bytes`: a request body exceeded it.
     Request(u64),
-    /// `Ursula-Max-Snapshot-Bytes`: a snapshot assembled from parts exceeded
-    /// it.
+    /// `Ursula-Max-Snapshot-Bytes`: a snapshot exceeded it. Until snapshots
+    /// go up in parts, a node with a cold store applies it to a snapshot
+    /// published in one request; afterwards, to one assembled from parts.
     Snapshot(u64),
 }
 

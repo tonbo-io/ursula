@@ -2018,7 +2018,10 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         // in, from one view, so the front door can redirect typed.
         let hint = checked.leader_hint().expect("a leader hint");
         assert_eq!(hint.node_id, Some(new_leader), "{write:?}: {checked:?}");
-        assert!(hint.term.is_some_and(|term| term > 0), "{write:?}: {checked:?}");
+        assert!(
+            hint.term.is_some_and(|term| term > 0),
+            "{write:?}: {checked:?}"
+        );
         leader_id = new_leader;
     }
 

@@ -12,9 +12,7 @@ use std::io;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::http::HeaderValue;
-use axum::http::Method;
 use axum::http::StatusCode;
-use axum::http::Uri;
 use axum::http::header::CONTENT_LENGTH;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -42,38 +40,6 @@ const COLD_SNAPSHOT_READ_PIECE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) enum SnapshotUpload {
     Inline(Bytes),
     Cold(ColdSnapshotBody),
-}
-
-/// Whether a request publishes a snapshot (`PUT …/snapshot/{offset}`).
-/// With a cold store, admission lets these bodies exceed the inline cap, up
-/// to [`MAX_COLD_SNAPSHOT_BYTES`], and charges at most the inline cap
-/// against the in-flight budget, because a large body is streamed to the
-/// cold store in bounded parts. The handler enforces the limit again for a
-/// body without `Content-Length`.
-pub(crate) fn is_snapshot_publish(method: &Method, uri: &Uri) -> bool {
-    if *method != Method::PUT {
-        return false;
-    }
-    let segments = uri
-        .path()
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    match segments.as_slice() {
-        [bucket, ..] if bucket.starts_with("__ursula") => false,
-        [_, _, "snapshot", offset] => offset.parse::<u64>().is_ok(),
-        _ => false,
-    }
-}
-
-/// Admission's body limit for a write request on a node with or without a
-/// cold store.
-pub(crate) fn admitted_body_limit(method: &Method, uri: &Uri, cold_store: bool) -> SizeLimit {
-    if is_snapshot_publish(method, uri) {
-        limits::snapshot_publish_limit(cold_store)
-    } else {
-        limits::REQUEST_LIMIT
-    }
 }
 
 fn body_read_error(err: impl std::fmt::Display) -> Response {

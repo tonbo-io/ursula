@@ -22,7 +22,6 @@ use ursula_headers::SizeLimit;
 
 use crate::CLUSTER_PROBE_PATH;
 use crate::MAX_HTTP_BODY_BYTES;
-use crate::cold_snapshot;
 use crate::front_door;
 use crate::limits;
 use crate::render::insert_default_response_headers;
@@ -154,18 +153,20 @@ pub(crate) async fn ingress_admission_middleware(
         return next.run(request).await;
     };
     // Size first: the head alone decides it (#581 section 6.1).
-    let limit = cold_snapshot::admitted_body_limit(
+    let body_write = front_door::BodyWrite::of(
         request.method(),
-        request.uri(),
-        admission.cold_snapshots,
+        request.extensions().get::<axum::extract::MatchedPath>(),
     );
+    let limit = body_write.map_or(limits::REQUEST_LIMIT, |write| {
+        write.limit(admission.cold_snapshots)
+    });
     if body_bytes > limit.bytes() {
         return AdmissionRefusal::BodyTooLarge(limit).into_response();
     }
     // A write routed before its body meets pressure after routing and its
     // early answer: a follower redirects rather than refusing for its own
     // pressure, and a repeat of an applied write adds nothing to any log.
-    if front_door::routes_before_body(request.method(), request.uri()) {
+    if body_write.is_some() {
         request.extensions_mut().insert(DeferredAdmission {
             admission,
             body_bytes,
@@ -202,9 +203,8 @@ impl IngressAdmission {
         if body_bytes == 0 {
             return Ok(AdmissionPermit { _held: None });
         }
-        let Ok(permits) = u32::try_from(body_bytes) else {
-            return Err(AdmissionRefusal::BodyTooLarge(limits::REQUEST_LIMIT));
-        };
+        // At most the request limit, which fits.
+        let permits = u32::try_from(body_bytes).unwrap_or(u32::MAX);
         match self.body_bytes.clone().try_acquire_many_owned(permits) {
             Ok(permit) => Ok(AdmissionPermit {
                 _held: Some(permit),

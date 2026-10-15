@@ -30,12 +30,14 @@ use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
+use ursula_runtime::GroupRouteWriteFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngine;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
@@ -55,6 +57,14 @@ struct LostResponseEngine {
 }
 
 impl GroupEngine for LostResponseEngine {
+    fn route_write<'a>(
+        &'a mut self,
+        request: RouteWriteRequest,
+        placement: ShardPlacement,
+    ) -> GroupRouteWriteFuture<'a> {
+        self.inner.route_write(request, placement)
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,

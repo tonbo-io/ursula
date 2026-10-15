@@ -492,14 +492,23 @@ impl HttpState {
         self
     }
 
-    /// Record the node's Raft WAL, so the metrics JSON reports how it opened
-    /// and the server shuts it down cleanly.
-    /// Sets the node's Raft WAL, whose root holds the cluster id.
+    /// Records the node's Raft WAL: the metrics JSON reports how it opened,
+    /// the server shuts it down cleanly, and its root holds the cluster id.
     pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
         if let Some(wal) = &raft_wal {
             self.cluster_id = Arc::new(wal.cluster_id().clone());
         }
         self.raft_wal = raft_wal;
+        self
+    }
+
+    /// Sets the configured `server.cluster_id` of a node without a WAL. A
+    /// node with one takes the id its WAL root holds ([`Self::with_raft_wal`]),
+    /// which is the configured id when one is set.
+    pub fn with_configured_cluster_id(mut self, cluster_id: Option<ClusterId>) -> Self {
+        if let Some(cluster_id) = cluster_id {
+            self.cluster_id = Arc::new(cluster_id);
+        }
         self
     }
 
@@ -1387,7 +1396,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             axum::routing::any(removed_latest_snapshot),
         )
         .route(
-            "/{bucket}/{stream}/snapshot/{snapshot_offset}",
+            front_door::SNAPSHOT_ROUTE,
             put(publish_snapshot).get(read_snapshot),
         )
         .route(
@@ -1396,7 +1405,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
         .route(
-            "/{bucket}/{stream}",
+            front_door::STREAM_ROUTE,
             put(create_stream)
                 .post(append_stream)
                 .get(read_stream)
@@ -2791,9 +2800,10 @@ pub(crate) async fn create_stream(
 ) -> Response {
     let stream_id = path.into_stream_id();
     let request_target = request_target(&uri);
-    if let Err(response) = create_head_checks(&headers) {
-        return answer_before_body(*response, version, &headers, body).await;
-    }
+    let head = match CreateHead::parse(&headers) {
+        Ok(head) => head,
+        Err(response) => return answer_before_body(*response, version, &headers, body).await,
+    };
     let decision =
         front_door::route_before_body(&state, &stream_id, &request_target, None, admission.0).await;
     let _permit = match decision {
@@ -2806,17 +2816,32 @@ pub(crate) async fn create_stream(
         Ok(body) => body,
         Err(err) => return unreadable_body_response(&err),
     };
-    create_stream_by_id(state, stream_id, headers, body).await
+    create_stream_by_id(state, stream_id, headers, head, body).await
 }
 
-/// The checks of a create's head that answer `400`, which come before
-/// routing (#581 section 6.1). The late path runs them again.
-fn create_head_checks(headers: &HeaderMap) -> Result<(), Box<Response>> {
-    stream_lifetime(headers)?;
-    incarnation_precondition(headers)?;
-    stream_seq(headers)
-        .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
-    refuse_create_producer_headers(headers)
+/// A create's head, parsed once before routing (the checks that answer
+/// `400`, #581 section 6.1), and carried to the late path.
+pub(crate) struct CreateHead {
+    stream_ttl_seconds: Option<u64>,
+    stream_expires_at_ms: Option<u64>,
+    if_incarnation: Option<u64>,
+    stream_seq: Option<String>,
+}
+
+impl CreateHead {
+    fn parse(headers: &HeaderMap) -> Result<Self, Box<Response>> {
+        let (stream_ttl_seconds, stream_expires_at_ms) = stream_lifetime(headers)?;
+        let if_incarnation = incarnation_precondition(headers)?;
+        let stream_seq = stream_seq(headers)
+            .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+        refuse_create_producer_headers(headers)?;
+        Ok(Self {
+            stream_ttl_seconds,
+            stream_expires_at_ms,
+            if_incarnation,
+            stream_seq,
+        })
+    }
 }
 
 /// A create carries no producer headers (#581 section 3): keyed bytes
@@ -2843,18 +2868,17 @@ pub(crate) async fn create_stream_by_id(
     state: HttpState,
     stream_id: BucketStreamId,
     request_headers: HeaderMap,
+    head: CreateHead,
     body: Bytes,
 ) -> Response {
+    let CreateHead {
+        stream_ttl_seconds,
+        stream_expires_at_ms,
+        if_incarnation,
+        stream_seq,
+    } = head;
     let content_type_explicit = has_content_type(&request_headers);
     let content_type = request_content_type(&request_headers);
-    let (stream_ttl_seconds, stream_expires_at_ms) = match stream_lifetime(&request_headers) {
-        Ok(lifetime) => lifetime,
-        Err(response) => return *response,
-    };
-    let if_incarnation = match incarnation_precondition(&request_headers) {
-        Ok(if_incarnation) => if_incarnation,
-        Err(response) => return *response,
-    };
     let mut request = CreateStreamRequest::new(stream_id.clone(), content_type.clone());
     request.if_incarnation = if_incarnation;
     request.content_type_explicit = content_type_explicit;
@@ -2865,15 +2889,9 @@ pub(crate) async fn create_stream_by_id(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     request.close_after = stream_closed(&request_headers);
-    request.stream_seq = match stream_seq(&request_headers) {
-        Ok(stream_seq) => stream_seq,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
+    request.stream_seq = stream_seq;
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
-    if let Err(response) = refuse_create_producer_headers(&request_headers) {
-        return *response;
-    }
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
         return create_stream_external_by_id(state, request).await;
     }
@@ -3477,9 +3495,10 @@ pub(crate) async fn publish_snapshot(
         Ok(offset) => offset,
         Err(response) => return answer_before_body(*response, version, &headers, body).await,
     };
-    if let Err(response) = incarnation_precondition(&headers) {
-        return answer_before_body(*response, version, &headers, body).await;
-    }
+    let if_incarnation = match incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return answer_before_body(*response, version, &headers, body).await,
+    };
     let request_target = request_target(&uri);
     let decision =
         front_door::route_before_body(&state, &stream_id, &request_target, None, admission.0).await;
@@ -3494,7 +3513,8 @@ pub(crate) async fn publish_snapshot(
         request_target,
         stream_id,
         snapshot_offset,
-        headers,
+        request_content_type(&headers),
+        if_incarnation,
         body,
     )
     .await
@@ -3591,14 +3611,10 @@ async fn publish_snapshot_by_offset(
     request_target: String,
     stream_id: BucketStreamId,
     snapshot_offset: u64,
-    headers: HeaderMap,
+    content_type: String,
+    if_incarnation: Option<u64>,
     body: Body,
 ) -> Response {
-    let if_incarnation = match incarnation_precondition(&headers) {
-        Ok(if_incarnation) => if_incarnation,
-        Err(response) => return *response,
-    };
-    let content_type = request_content_type(&headers);
     let (payload, cold_body) =
         match cold_snapshot::receive_snapshot_body(&state, &stream_id, &content_type, body).await {
             Ok(cold_snapshot::SnapshotUpload::Inline(payload)) => (payload, None),
