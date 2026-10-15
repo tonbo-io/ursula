@@ -705,6 +705,7 @@ mod tests {
                     producer_epoch: epoch,
                     producer_seq: seq,
                     digest: digest.map(|digest| bytes::Bytes::copy_from_slice(&[digest; 32])),
+                    ..Default::default()
                 }),
                 now_ms,
             });

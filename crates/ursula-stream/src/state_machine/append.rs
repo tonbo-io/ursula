@@ -19,6 +19,8 @@ use super::StreamStateMachine;
 use super::StreamStatus;
 use super::WriteReceipt;
 use super::canonical_json_record_ends;
+use super::content_fault_response;
+use super::producer_content_fault;
 use super::producer_record::Evaluation;
 use super::producer_record::Refusal;
 use super::producer_record::WriteKey;
@@ -68,26 +70,21 @@ impl StreamStateMachine {
             };
             let gate = match gate {
                 ProducerGate::Repeat(ack) => {
-                    break 'append self.repeat_response(&stream_id, ack, payload.is_empty());
+                    break 'append self.repeat_response(
+                        &stream_id,
+                        ack,
+                        close_after && payload.is_empty(),
+                    );
                 }
                 ProducerGate::Unkeyed => None,
                 ProducerGate::Apply(key, advance) => Some((key, advance)),
             };
-
-            let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
-            let record_ends = match content_type {
-                Some(value) => match canonical_json_record_ends(value, payload) {
-                    Ok(record_ends) => record_ends,
-                    Err(_) => {
-                        break 'append StreamResponse::error(
-                            StreamErrorCode::InvalidRecordBoundaries,
-                            "application/json append payload must use canonical newline boundaries",
-                        );
-                    }
-                },
-                None => Vec::new(),
+            let fault = match producer.as_ref().map(producer_content_fault).transpose() {
+                Ok(fault) => fault.flatten(),
+                Err(response) => break 'append response,
             };
 
+            let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
             let Some(stream) = self.stream_metadata_mut(&stream_id) else {
                 unreachable!("stream existence checked before producer evaluation");
             };
@@ -110,6 +107,11 @@ impl StreamStateMachine {
                 );
             }
 
+            // Step 5 (#581 section 5.3): content checks, only for a write
+            // that would apply.
+            if let Some(fault) = fault {
+                break 'append content_fault_response(fault);
+            }
             if payload.is_empty() && !close_after {
                 break 'append StreamResponse::error(
                     StreamErrorCode::EmptyAppend,
@@ -135,6 +137,19 @@ impl StreamStateMachine {
                     );
                 }
             }
+
+            let record_ends = match content_type {
+                Some(value) => match canonical_json_record_ends(value, payload) {
+                    Ok(record_ends) => record_ends,
+                    Err(_) => {
+                        break 'append StreamResponse::error(
+                            StreamErrorCode::InvalidRecordBoundaries,
+                            "application/json append payload must use canonical newline boundaries",
+                        );
+                    }
+                },
+                None => Vec::new(),
+            };
 
             if let Err(response) = check_stream_seq(stream, stream_seq.as_deref()) {
                 break 'append response;
@@ -247,15 +262,14 @@ impl StreamStateMachine {
             Ok(ProducerGate::Apply(key, advance)) => Some((key, advance)),
             Err(response) => return response,
         };
+        let fault = match producer.as_ref().map(producer_content_fault).transpose() {
+            Ok(fault) => fault.flatten(),
+            Err(response) => return response,
+        };
 
         let Some(stream) = self.stream_metadata(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
         };
-        if let Err(response) =
-            validate_record_ends(&stream.content_type, payload.payload_len, &record_ends)
-        {
-            return response;
-        }
         if stream.status == StreamStatus::Closed {
             return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::StreamClosed,
@@ -263,6 +277,16 @@ impl StreamStateMachine {
                 stream.tail_offset,
                 vec![StreamErrorContext::StreamClosed],
             );
+        }
+        // Step 5 (#581 section 5.3): content checks, only for a write that
+        // would apply.
+        if let Some(fault) = fault {
+            return content_fault_response(fault);
+        }
+        if let Err(response) =
+            validate_record_ends(&stream.content_type, payload.payload_len, &record_ends)
+        {
+            return response;
         }
         let Some(content_type) = content_type else {
             return StreamResponse::error(
@@ -458,12 +482,12 @@ impl StreamStateMachine {
     }
 
     /// The answer to a repeat of a producer write that applied before: an
-    /// append's receipt, or a close's when the request carried no body.
+    /// append's receipt, or a close's when the request is close-only.
     fn repeat_response(
         &self,
         stream_id: &BucketStreamId,
         ack: ProducerAck,
-        empty_body: bool,
+        close_only: bool,
     ) -> StreamResponse {
         let receipt = match ack.delivery {
             ProducerDelivery::Applied(receipt) | ProducerDelivery::Repeat(receipt) => receipt,
@@ -481,7 +505,7 @@ impl StreamStateMachine {
                 }
             }
         };
-        if empty_body {
+        if close_only {
             return StreamResponse::Closed {
                 next_offset: receipt.next_offset,
                 producer: Some(ack),

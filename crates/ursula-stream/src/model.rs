@@ -28,6 +28,20 @@ pub struct StreamMetadata {
 
 pub type ProducerRequest = ProducerRequestV1;
 
+/// What the proposer found wrong with a keyed write's body. Apply answers
+/// it only for a write that would apply, after the producer rows and the
+/// closed check (#581 section 5.3, step 5), so a repeat of an applied key
+/// gets its receipt on every transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentFault {
+    /// A body without a `Content-Type`.
+    MissingContentType,
+    /// The body's BLAKE3-256 differs from the `Producer-Digest` header.
+    DigestMismatch,
+    /// A JSON body that is not valid JSON message text.
+    MalformedJson,
+}
+
 #[derive(Debug)]
 pub struct AppendStreamInput<'a> {
     pub stream_id: BucketStreamId,

@@ -98,6 +98,7 @@ impl<'a> Write<'a> {
             digest: self
                 .digest
                 .map(|digest| Bytes::copy_from_slice(&[digest; 32])),
+            ..Default::default()
         }
     }
 

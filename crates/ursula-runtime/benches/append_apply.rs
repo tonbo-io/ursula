@@ -223,6 +223,7 @@ fn producer_dedup(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
         producer_epoch: 1,
         producer_seq: 0,
         digest: None,
+        ..Default::default()
     };
     let first_tail = append(
         machine,

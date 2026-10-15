@@ -202,6 +202,7 @@ mod tests {
                     producer_epoch: 1,
                     producer_seq: seq,
                     digest: None,
+                    ..Default::default()
                 }),
             );
         }

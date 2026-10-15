@@ -138,6 +138,9 @@ pub enum StreamErrorCode {
     /// A producer write whose key holds a write with another identity (`403
     /// key-conflict`).
     ProducerKeyConflict,
+    /// A producer write that would apply, whose body does not match its
+    /// `Producer-Digest` (`400`).
+    ProducerDigestMismatch,
     ProducerSeqConflict,
     InvalidRetention,
     OffsetOutOfRange,

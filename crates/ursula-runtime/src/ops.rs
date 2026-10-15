@@ -53,8 +53,6 @@
 //!   - `VIS stream fn name`: route by `request.stream_id`,
 //!   - `VIS stream fn name, admit: EXPR`: same, and submit `EXPR` (over the
 //!     single `request` field) as the incoming-bytes admission debit,
-//!   - `VIS stream fn name, non_empty: FIELD, admit: EXPR`: same, rejecting
-//!     `request.FIELD.is_empty()` with `RuntimeError::EmptyAppend` first,
 //!   - `VIS group fn name`: route by an explicit `RaftGroupId` argument
 //!     followed by the `fields` in declaration order.
 //!
@@ -387,7 +385,6 @@ macro_rules! runtime_operations {
                 handle { actor handle_append(request, response_tx, raft_uncommitted) }
                 client {
                     pub stream fn append,
-                    non_empty: payload,
                     admit: request.payload_len()
                 }
             }

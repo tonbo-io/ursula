@@ -54,6 +54,7 @@ use crate::model::ColdFlushCandidate;
 use crate::model::ColdGcEntry;
 use crate::model::ColdGcPlanEntry;
 use crate::model::ColdGcTarget;
+use crate::model::ContentFault;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
 use crate::model::ObjectPayloadRef;
@@ -646,6 +647,46 @@ fn stream_ttl_renewal_due(stream: &StreamMetadata, now_ms: u64) -> bool {
 fn renew_stream_ttl(stream: &mut StreamMetadata, now_ms: u64) {
     if stream.stream_ttl_seconds.is_some() && stream.stream_expires_at_ms.is_none() {
         stream.last_ttl_touch_at_ms = stream.last_ttl_touch_at_ms.max(now_ms);
+    }
+}
+
+/// The content fault the proposer recorded on a producer write, if any.
+fn producer_content_fault(
+    producer: &ProducerRequest,
+) -> Result<Option<ContentFault>, StreamResponse> {
+    match ursula_proto::ContentFaultV1::try_from(producer.content_fault) {
+        Ok(ursula_proto::ContentFaultV1::ContentFaultNone) => Ok(None),
+        Ok(ursula_proto::ContentFaultV1::ContentFaultMissingContentType) => {
+            Ok(Some(ContentFault::MissingContentType))
+        }
+        Ok(ursula_proto::ContentFaultV1::ContentFaultDigestMismatch) => {
+            Ok(Some(ContentFault::DigestMismatch))
+        }
+        Ok(ursula_proto::ContentFaultV1::ContentFaultMalformedJson) => {
+            Ok(Some(ContentFault::MalformedJson))
+        }
+        Err(_unknown) => Err(StreamResponse::error(
+            StreamErrorCode::InvalidProducer,
+            format!("unknown producer content fault {}", producer.content_fault),
+        )),
+    }
+}
+
+/// The `400` a write that would apply gets for its content fault.
+fn content_fault_response(fault: ContentFault) -> StreamResponse {
+    match fault {
+        ContentFault::MissingContentType => StreamResponse::error(
+            StreamErrorCode::MissingContentType,
+            "append with a body must include content type",
+        ),
+        ContentFault::DigestMismatch => StreamResponse::error(
+            StreamErrorCode::ProducerDigestMismatch,
+            "producer-digest does not match the request body",
+        ),
+        ContentFault::MalformedJson => StreamResponse::error(
+            StreamErrorCode::InvalidRecordBoundaries,
+            "application/json body is not valid JSON message text",
+        ),
     }
 }
 

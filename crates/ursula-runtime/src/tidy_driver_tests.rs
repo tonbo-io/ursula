@@ -27,6 +27,7 @@ fn producer_append(stream: &BucketStreamId, seq: u64) -> AppendRequest {
         producer_epoch: 1,
         producer_seq: seq,
         digest: None,
+        ..Default::default()
     });
     request.now_ms = 1;
     request

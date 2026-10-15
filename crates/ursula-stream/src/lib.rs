@@ -45,6 +45,7 @@ pub use model::ColdFlushCandidate;
 pub use model::ColdGcEntry;
 pub use model::ColdGcPlanEntry;
 pub use model::ColdGcTarget;
+pub use model::ContentFault;
 pub use model::ExternalPayloadRef;
 pub use model::HotPayloadSegment;
 pub use model::MAX_COLD_SNAPSHOT_BYTES;

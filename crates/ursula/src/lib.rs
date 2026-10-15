@@ -94,6 +94,7 @@ use ursula_headers::ProducerWrite;
 use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
+use ursula_proto::ContentFaultV1;
 use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
 use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
@@ -1398,7 +1399,7 @@ pub(crate) async fn stage_external_payload(
 pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
     match err {
         RuntimeError::GroupEngine { error, .. } if error.code().is_some() => true,
-        RuntimeError::EmptyAppend | RuntimeError::InvalidRaftGroup { .. } => true,
+        RuntimeError::InvalidRaftGroup { .. } => true,
         other => refused_before_proposal(other),
     }
 }
@@ -1463,7 +1464,6 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     if let Some(ack) = response.producer.as_ref() {
         return producer_answer_response(
             producer_ack_answer(ack, response.incarnation),
-            response.incarnation,
             AnswerTo::Append,
         );
     }
@@ -1483,7 +1483,6 @@ pub(crate) fn close_http_response(response: &CloseStreamResponse) -> Response {
     if let Some(ack) = response.producer.as_ref() {
         return producer_answer_response(
             producer_ack_answer(ack, response.incarnation),
-            response.incarnation,
             AnswerTo::CloseOnly,
         );
     }
@@ -1506,12 +1505,12 @@ enum AnswerTo {
 }
 
 /// The one renderer of a producer answer, for the early and the late path:
-/// the answer's own headers (`Stream-Closed` only on a receipt of a write
-/// that closed the stream) and `Stream-Incarnation`, nothing else. A value
-/// outside the protocol's range answers `500`.
+/// the answer's own headers (`Stream-Incarnation` and the range on a
+/// receipt, `Stream-Closed` only on a receipt of a write that closed the
+/// stream), nothing else. A value outside the protocol's range answers
+/// `500`.
 fn producer_answer_response(
     answer: Result<ProducerAnswer, ProducerHeaderError>,
-    incarnation: u64,
     to: AnswerTo,
 ) -> Response {
     let answer = match answer {
@@ -1520,7 +1519,6 @@ fn producer_answer_response(
     };
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    insert_incarnation(&mut headers, incarnation);
     insert_producer_answer(&mut headers, &answer);
     let status = match (to, &answer) {
         (AnswerTo::CloseOnly, ProducerAnswer::Receipt { .. }) => StatusCode::NO_CONTENT,
@@ -2836,7 +2834,7 @@ pub(crate) async fn append_stream(
     body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    if early_answer_may_help(&headers, version, &body)
+    if early_answer_may_help(&headers, version)
         && let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await
     {
         return answer_before_body(answer, version, &headers, body).await;
@@ -2889,11 +2887,7 @@ async fn producer_early_answer(
     };
     // A repeat is `204` whether the request is a close or an append, so the
     // renderer needs no more than this.
-    Some(producer_answer_response(
-        answer,
-        incarnation,
-        AnswerTo::Append,
-    ))
+    Some(producer_answer_response(answer, AnswerTo::Append))
 }
 
 /// The smallest declared body for which an early answer is worth its lookup
@@ -2904,10 +2898,11 @@ const EARLY_ANSWER_MIN_BODY_BYTES: u64 = 64 * 1024;
 
 /// Whether to look for an early answer: only when it can save the upload
 /// (HTTP/2, `Expect: 100-continue`, or a declared body of at least
-/// [`EARLY_ANSWER_MIN_BODY_BYTES`]), and only after the header-only checks
-/// the late path runs pass, so an early answer never answers what the late
-/// path refuses with `400`.
-fn early_answer_may_help(headers: &HeaderMap, version: Version, body: &Body) -> bool {
+/// [`EARLY_ANSWER_MIN_BODY_BYTES`]), and only after the request-shape checks
+/// of step 1 (#581 section 5.3) pass, as on the late path. The content
+/// checks of step 5 come after the producer rows on both paths, so a repeat
+/// or a key conflict is answered whatever the body is.
+fn early_answer_may_help(headers: &HeaderMap, version: Version) -> bool {
     let expects_continue = headers
         .get(axum::http::header::EXPECT)
         .and_then(|value| value.to_str().ok())
@@ -2919,22 +2914,10 @@ fn early_answer_may_help(headers: &HeaderMap, version: Version, body: &Body) -> 
     let saves_upload = version >= Version::HTTP_2
         || expects_continue
         || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES);
-    if !saves_upload
-        || removed_surface::reject_removed_append_headers(headers).is_err()
-        || incarnation_precondition(headers).is_err()
-        || stream_seq(headers).is_err()
-    {
-        return false;
-    }
-    let empty = content_length == Some(0) || body.is_end_stream();
-    let close_after = stream_closed(headers);
-    // An empty write that does not close is `400 EmptyAppend`, and a body
-    // without a content type is `400` too.
-    if empty {
-        close_after
-    } else {
-        has_content_type(headers)
-    }
+    saves_upload
+        && removed_surface::reject_removed_append_headers(headers).is_ok()
+        && incarnation_precondition(headers).is_ok()
+        && stream_seq(headers).is_ok()
 }
 
 /// Sends an answer decided before the body was read (addendum A3 on #581).
@@ -3001,20 +2984,25 @@ pub(crate) async fn append_stream_by_id(
     };
     let close_after = stream_closed(&headers);
 
-    let producer = match producer_write(&headers, &body) {
+    let mut producer = match producer_write(&headers) {
         Ok(producer) => producer,
         Err(response) => return *response,
     };
-    if body.is_empty() && close_after {
-        let stream_seq = match stream_seq(&headers) {
-            Ok(stream_seq) => stream_seq,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
+    let stream_seq_header = match stream_seq(&headers) {
+        Ok(stream_seq) => stream_seq,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let content_type = request_content_type(&headers);
+    let payload = match content_checks(&headers, &content_type, body, producer.as_mut()) {
+        Ok(payload) => payload,
+        Err(response) => return *response,
+    };
+    if payload.is_empty() && close_after {
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
                 stream_id,
-                stream_seq,
+                stream_seq: stream_seq_header,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
                 if_incarnation,
@@ -3025,27 +3013,11 @@ pub(crate) async fn append_stream_by_id(
             Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         };
     }
-    if !body.is_empty() && !has_content_type(&headers) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "append with a body must include content type",
-        )
-            .into_response();
-    }
-
-    let content_type = request_content_type(&headers);
-    let payload = match normalize_http_write_payload(&content_type, body.clone(), false) {
-        Ok(payload) => payload,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
     request.if_incarnation = if_incarnation;
     request.close_after = close_after;
-    request.stream_seq = match stream_seq(&headers) {
-        Ok(stream_seq) => stream_seq,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
+    request.stream_seq = stream_seq_header;
     request.now_ms = state.unix_time_ms();
     request.producer = producer;
 
@@ -4199,6 +4171,7 @@ fn producer_request(write: ProducerWrite) -> ProducerRequest {
         digest: write
             .digest
             .map(|digest| Bytes::copy_from_slice(digest.as_bytes())),
+        content_fault: ContentFaultV1::ContentFaultNone.into(),
     }
 }
 
@@ -4206,25 +4179,65 @@ fn producer_request(write: ProducerWrite) -> ProducerRequest {
 /// `body`, the request body: `400` for malformed producer headers or a
 /// digest that does not match, so nothing is proposed. `None` for a write
 /// without a key.
+/// A write's producer key from its headers (step 1 of #581 section 5.3):
+/// `400` for malformed producer headers. `None` for a write without a key.
 pub(crate) fn producer_write(
     headers: &HeaderMap,
-    body: &[u8],
 ) -> Result<Option<ProducerRequest>, Box<Response>> {
-    let bad_request =
-        |message: String| Box::new((StatusCode::BAD_REQUEST, message).into_response());
-    let parsed = parse_producer_headers(headers).map_err(|err| bad_request(err.to_string()))?;
-    let Some(write) = parsed.producer else {
-        return Ok(None);
-    };
-    if let Some(digest) = write.digest
-        && blake3::hash(body).as_bytes() != digest.as_bytes()
+    let parsed = parse_producer_headers(headers)
+        .map_err(|err| Box::new((StatusCode::BAD_REQUEST, err.to_string()).into_response()))?;
+    Ok(parsed.producer.map(producer_request))
+}
+
+/// The content checks of a write's body (step 5 of #581 section 5.3) and
+/// the payload to propose. A keyed write carries its fault into apply,
+/// which answers it only when the write would apply, after the producer
+/// rows and the closed check; its raw body is proposed when it is not valid
+/// JSON. A write without a key has no rows, so its fault is answered here.
+fn content_checks(
+    headers: &HeaderMap,
+    content_type: &str,
+    body: Bytes,
+    producer: Option<&mut ProducerRequest>,
+) -> Result<Bytes, Box<Response>> {
+    let digest_mismatch = producer
+        .as_ref()
+        .and_then(|producer| producer.digest.as_ref())
+        .is_some_and(|digest| blake3::hash(&body).as_bytes().as_slice() != digest.as_ref());
+    let missing_content_type = !body.is_empty() && !has_content_type(headers);
+    let (payload, malformed) = match normalize_http_write_payload(content_type, body.clone(), false)
     {
-        return Err(bad_request(format!(
-            "{} does not match the request body",
-            ursula_headers::names::PRODUCER_DIGEST
-        )));
+        Ok(payload) => (payload, None),
+        Err(message) => (body, Some(message)),
+    };
+    let fault = if digest_mismatch {
+        Some(ContentFaultV1::ContentFaultDigestMismatch)
+    } else if missing_content_type {
+        Some(ContentFaultV1::ContentFaultMissingContentType)
+    } else if malformed.is_some() {
+        Some(ContentFaultV1::ContentFaultMalformedJson)
+    } else {
+        None
+    };
+    match (producer, fault) {
+        (_, None) => Ok(payload),
+        (Some(producer), Some(fault)) => {
+            producer.content_fault = fault.into();
+            Ok(payload)
+        }
+        (None, Some(fault)) => {
+            let message = match fault {
+                ContentFaultV1::ContentFaultMissingContentType => {
+                    "append with a body must include content type".to_owned()
+                }
+                ContentFaultV1::ContentFaultMalformedJson => malformed.unwrap_or_default(),
+                ContentFaultV1::ContentFaultDigestMismatch | ContentFaultV1::ContentFaultNone => {
+                    "producer-digest does not match the request body".to_owned()
+                }
+            };
+            Err(Box::new((StatusCode::BAD_REQUEST, message).into_response()))
+        }
     }
-    Ok(Some(producer_request(write)))
 }
 
 pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -4301,7 +4314,6 @@ fn refused_before_proposal(err: &RuntimeError) -> bool {
         RuntimeError::InvalidConfig(_)
         | RuntimeError::InvalidRaftGroup { .. }
         | RuntimeError::SnapshotPlacementMismatch { .. }
-        | RuntimeError::EmptyAppend
         | RuntimeError::ColdStoreConfig { .. }
         | RuntimeError::StaticMembershipConfig { .. }
         | RuntimeError::ColdStoreIo { .. }

@@ -129,6 +129,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                 producer_epoch: *e,
                 producer_seq: *s,
                 digest: None,
+                ..Default::default()
             };
             let now = smx::T0.saturating_add(n.saturating_mul(10));
             let record = payload::json_record(&mut rng, n, args.rec_bytes);
@@ -181,6 +182,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
                             producer_epoch: *e0,
                             producer_seq: retry_seq,
                             digest: None,
+                            ..Default::default()
                         }),
                         smx::T0.saturating_add(n.saturating_mul(10)),
                     );

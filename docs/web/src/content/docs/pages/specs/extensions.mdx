@@ -333,7 +333,7 @@ A create MUST NOT carry producer headers, and a server MUST reject such a reques
 Producer-Digest: <64 lowercase hexadecimal digits>
 ```
 
-A producer write MAY carry `Producer-Digest`, the BLAKE3-256 hash of its body. A server that receives it MUST verify it against the body before it applies the write, and reject a mismatch with `400 Bad Request`, applying nothing. An answer before the body (Section 5.5) applies nothing and reads no body, so it verifies nothing. The digest is part of the write's identity: a later write with the same key is the same write only when both carry the same digest, or neither carries one.
+A producer write MAY carry `Producer-Digest`, the BLAKE3-256 hash of its body. A server that receives it MUST verify it against the body before it applies the write, and reject a mismatch with `400 Bad Request`, applying nothing. It checks this last, for a write that would apply (Section 5.3, step 5): a repeat or a key conflict is decided by the header alone. An answer before the body (Section 5.5) applies nothing and reads no body, so it verifies nothing. The digest is part of the write's identity: a later write with the same key is the same write only when both carry the same digest, or neither carries one.
 
 When a write arrives whose key already applied with another identity, and the server still holds that identity, the server MUST refuse it with `403 Forbidden`, `Producer-Epoch` and `Producer-Outcome: key-conflict`, and apply nothing. A server MUST hold the identity of each producer's newest applied write, and of the claim of its current epoch for as long as that epoch is current. A repeat of an older write, whose identity the server no longer holds, is answered as a duplicate (Section 5.3), as the base protocol requires.
 
@@ -341,9 +341,17 @@ Because a claim's identity is held for its epoch's lifetime, two claimants of on
 
 ### 5.3. Producer Write Answers
 
-A server implementing this section answers producer writes with the base protocol's status codes, and adds:
+A server implementing this section evaluates every write in one order, whether it answers before or after reading the body (Section 5.5). The first step that refuses the write decides its answer:
 
-- Every response about an applied write, new (`200`) or repeated (`204`), carries the write's receipt: `Stream-Offset` (where its bytes start), `Stream-Next-Offset` (where they end), and `Stream-Closed: true` when it closed the stream. A close-only write (an empty body with `Stream-Closed: true`) answers `204` even when it applies now, as the base protocol requires. A server MAY keep the range of a producer's newest write only. A repeat of an older write is then answered `204` with `Producer-Outcome: receipt-evicted` and no range.
+1. Request shape, from the headers alone: malformed or unparseable headers, producer headers on a create, a sequence number without an epoch. These answer `400`.
+2. The stream: it exists and has not expired. Then idle producer state is discarded (Section 5.4).
+3. The producer rules of this section, keyed by `(Producer-Id, Producer-Epoch, Producer-Seq)` with the `Producer-Digest` header as the write's identity. The body is never consulted here, so a repeat gets its receipt and another identity gets `key-conflict` whatever the body is.
+4. A closed stream: a write that would apply answers `409` with `Stream-Closed: true`.
+5. Content, for a write that would apply: a `Content-Type` present and matching the stream, a non-empty body unless `Stream-Closed: true` is set (`400`), well-formed message text for a JSON stream, and the body against `Producer-Digest` (`400` on a mismatch).
+
+It answers producer writes with the base protocol's status codes, and adds:
+
+- Every response about an applied write, new (`200`) or repeated (`204`), carries the write's receipt: `Stream-Offset` (where its bytes start), `Stream-Next-Offset` (where they end), and `Stream-Closed: true` when it closed the stream. A close-only producer write (an empty body with `Stream-Closed: true`) answers `204` even when it applies now: the base protocol requires `204` for a close-only request, and its conformance suite checks it for a fresh producer close. A close without producer headers is answered as the base protocol defines. A server MAY keep the range of a producer's newest write only. A repeat of an older write is then answered `204` with `Producer-Outcome: receipt-evicted` and no range.
 - `Producer-Seq` on a `200` or `204` is the epoch's highest applied sequence number, as the base protocol defines it, while the receipt describes the request's own write.
 - A claim's response carries `Producer-Closed-Epoch` and `Producer-Closed-Seq` when the claim closed an earlier epoch of the same producer: every write of that epoch up to `Producer-Closed-Seq` applied, and no other write of it ever will. A repeat of the claim carries the same.
 - A write of an epoch older than the producer's current one is refused with `403 Forbidden` and `Producer-Epoch` (the current epoch), whether or not it applied before. When the write's epoch is the one that the current epoch's claim closed, the server adds `Producer-Outcome: epoch-closed;by=claim`, `Producer-Closed-Epoch` and `Producer-Closed-Seq`, which say whether the write applied. For any other older epoch it adds `Producer-Outcome: stale-epoch`: the server cannot say which writes of that epoch applied.
@@ -370,7 +378,7 @@ A closed or forgotten epoch therefore never opens again, and a stale writer that
 
 ### 5.5. Answers Before the Body
 
-A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). It answers early only what it would answer after reading the body: a request its headers alone make invalid gets the same `400` either way. A client that sent `Expect: 100-continue` then sends no body.
+A server MAY answer a producer write that carries `Stream-Incarnation` before reading its body when the answer does not depend on the body: a repeat of a write that applied under that token (`204`, Section 5.3), or a key conflict (`403`, Section 5.2). It follows the order of Section 5.3: step 1 runs before any early answer, and the early answers are steps 2 and 3, which never read the body. The content checks of step 5 apply only to a write that would apply, so an early answer and an answer after the body are the same for every request. A client that sent `Expect: 100-continue` then sends no body.
 
 A server MAY refuse a request for load (`503` with `Retry-After`) before it looks for an early answer. The refusal is retryable, and the retry gets the answer.
 

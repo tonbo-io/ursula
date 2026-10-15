@@ -62,9 +62,9 @@ const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
 
 pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
     match err {
-        RuntimeError::EmptyAppend
-        | RuntimeError::InvalidRaftGroup { .. }
-        | RuntimeError::SnapshotPlacementMismatch { .. } => StatusCode::BAD_REQUEST,
+        RuntimeError::InvalidRaftGroup { .. } | RuntimeError::SnapshotPlacementMismatch { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         RuntimeError::InvalidConfig(_)
         | RuntimeError::ColdStoreConfig { .. }
         | RuntimeError::StaticMembershipConfig { .. }
@@ -123,6 +123,7 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::ProducerKeyConflict => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         StreamErrorCode::InvalidBucketId
+        | StreamErrorCode::ProducerDigestMismatch
         | StreamErrorCode::InvalidStreamId
         | StreamErrorCode::MissingContentType
         | StreamErrorCode::EmptyAppend

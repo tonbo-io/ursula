@@ -1854,6 +1854,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
                 producer_epoch: epoch,
                 producer_seq: seq,
                 digest: None,
+                ..Default::default()
             });
             request.now_ms = now_ms;
             request

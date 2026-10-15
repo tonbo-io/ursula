@@ -143,6 +143,7 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_epoch: epoch,
         producer_seq: seq,
         digest: None,
+        ..Default::default()
     }
 }
 
@@ -1197,13 +1198,32 @@ async fn independent_streams_reach_all_cores_and_many_groups() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_append_is_rejected_before_routing() {
+async fn an_empty_append_is_refused_by_the_state_machine() {
+    // The emptiness check is a content check (#581 section 5.3, step 5),
+    // so it runs at apply after the stream checks.
     let runtime = runtime(2, 8);
-    let err = runtime
-        .append(AppendRequest::new(BucketStreamId::new("b", "s"), 0))
+    let stream = BucketStreamId::new("benchcmp", "empty-append");
+    let missing = runtime
+        .append(AppendRequest::new(stream.clone(), 0))
         .await
-        .expect_err("empty append rejected");
-    assert_eq!(err, RuntimeError::EmptyAppend);
+        .expect_err("empty append on a missing stream");
+    // The bucket does not exist yet either.
+    assert_eq!(
+        missing.stream_error_code(),
+        Some(StreamErrorCode::BucketNotFound)
+    );
+    runtime
+        .create_stream(CreateStreamRequest::new(
+            stream.clone(),
+            DEFAULT_CONTENT_TYPE,
+        ))
+        .await
+        .expect("create stream");
+    let err = runtime
+        .append(AppendRequest::new(stream, 0))
+        .await
+        .expect_err("empty append refused");
+    assert_eq!(err.stream_error_code(), Some(StreamErrorCode::EmptyAppend));
     assert_eq!(runtime.metrics().snapshot().accepted_appends, 0);
 }
 

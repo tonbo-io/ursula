@@ -1936,6 +1936,7 @@ pub(super) fn runtime_raft_network_producer_with_lane(
         producer_epoch: (seed % 7) + epoch_delta,
         producer_seq: seq,
         digest: None,
+        ..Default::default()
     }
 }
 

@@ -14,9 +14,23 @@ message ProducerRequestV1 {
   string producer_id = 1;
   uint64 producer_epoch = 2;
   uint64 producer_seq = 3;
-  // BLAKE3-256 of the write's body (Producer-Digest), 32 bytes, verified by
-  // the proposer. Part of the write's identity when present.
+  // BLAKE3-256 of the write's body as the Producer-Digest header names it,
+  // 32 bytes. Part of the write's identity when present.
   optional bytes digest = 4;
+  // What the proposer found wrong with the body. Apply answers it only for
+  // a write that would apply, after the producer rows and the closed check
+  // (#581 section 5.3, step 5), so a repeat still gets its receipt.
+  ContentFaultV1 content_fault = 5;
+}
+
+enum ContentFaultV1 {
+  CONTENT_FAULT_NONE = 0;
+  // A body without a Content-Type.
+  CONTENT_FAULT_MISSING_CONTENT_TYPE = 1;
+  // The body's BLAKE3-256 differs from the Producer-Digest header.
+  CONTENT_FAULT_DIGEST_MISMATCH = 2;
+  // A JSON body that is not valid JSON message text.
+  CONTENT_FAULT_MALFORMED_JSON = 3;
 }
 
 message ExternalPayloadRefV1 {

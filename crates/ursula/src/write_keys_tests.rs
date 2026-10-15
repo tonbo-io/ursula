@@ -89,6 +89,10 @@ struct Write<'a> {
     closes: bool,
     /// Declares the body's length in `Content-Length`.
     declared: bool,
+    /// The text whose digest `Producer-Digest` names, when not the body's.
+    digest_of: Option<&'a str>,
+    /// Sends no `Content-Type`.
+    untyped: bool,
 }
 
 impl<'a> Write<'a> {
@@ -102,6 +106,8 @@ impl<'a> Write<'a> {
             version: Version::HTTP_11,
             closes: false,
             declared: false,
+            digest_of: None,
+            untyped: false,
         }
     }
 
@@ -139,6 +145,22 @@ impl<'a> Write<'a> {
             ..self
         }
     }
+
+    /// `Producer-Digest` of `text` instead of the body.
+    fn digest_of(self, text: &'a str) -> Self {
+        Self {
+            digest: true,
+            digest_of: Some(text),
+            ..self
+        }
+    }
+
+    fn untyped(self) -> Self {
+        Self {
+            untyped: true,
+            ..self
+        }
+    }
 }
 
 /// Sends `write`, and returns its response and whether its body was polled.
@@ -148,14 +170,17 @@ async fn send(app: &Router, write: &Write<'_>) -> (Response, bool) {
         .method("POST")
         .uri(URI)
         .version(write.version)
-        .header(CONTENT_TYPE, "text/plain")
         .header("producer-id", "writer")
         .header("producer-epoch", write.epoch.to_string())
         .header("producer-seq", write.seq.to_string());
+    if !write.untyped {
+        request = request.header(CONTENT_TYPE, "text/plain");
+    }
     if write.digest {
+        let named = write.digest_of.unwrap_or(write.body);
         request = request.header(
             "producer-digest",
-            blake3::hash(write.body.as_bytes()).to_hex().to_string(),
+            blake3::hash(named.as_bytes()).to_hex().to_string(),
         );
     }
     if let Some(incarnation) = write.incarnation {
@@ -550,13 +575,121 @@ async fn early_and_late_answers_agree() {
         assert!(matches!(answer(&repeat), ProducerAnswer::Receipt { .. }));
     }
 
-    // An empty write that does not close is `400` on both paths, never an
-    // early `204`.
-    for write in [
+    // An empty write that does not close gets its key's row on both paths:
+    // a repeat of an applied key is its receipt, and only a write that would
+    // apply is `400 EmptyAppend` (#581 section 5.3, step 5).
+    assert_same_answer(
+        &app,
         Write::new(0, 1, "").tokened(&token).http2(),
         Write::new(0, 1, "").tokened(&token),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_same_answer(
+        &app,
+        Write::new(0, 2, "").tokened(&token).http2(),
+        Write::new(0, 2, "").tokened(&token),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
+/// Sends `early` (a request the early path takes) and `late` (a small
+/// HTTP/1.1 one), and checks that both get `status` with the same headers.
+async fn assert_same_answer(app: &Router, early: Write<'_>, late: Write<'_>, status: StatusCode) {
+    let (early_answer, _) = send(app, &early).await;
+    let (late_answer, late_polled) = send(app, &late).await;
+    assert!(late_polled, "the late path reads the body");
+    assert_eq!(
+        early_answer.status(),
+        status,
+        "early: {:?}",
+        early_answer.headers()
+    );
+    assert_eq!(
+        late_answer.status(),
+        status,
+        "late: {:?}",
+        late_answer.headers()
+    );
+    // A late refusal carries the state machine's message as its body.
+    let headers = |response: &Response| {
+        let mut headers = response.headers().clone();
+        headers.remove(CONTENT_TYPE);
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        headers
+    };
+    assert_eq!(headers(&early_answer), headers(&late_answer));
+}
+
+/// D1 and D2 of the evaluation order (#581 section 5.3): the producer rows
+/// use the `Producer-Digest` header and run before every content check, on
+/// every transport.
+#[tokio::test]
+async fn producer_rows_come_before_content_checks_on_both_paths() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let app = app(&now_ms);
+    let token = create(&app).await;
+    let (first, _) = send(&app, &Write::new(0, 0, "held").digest().tokened(&token)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let before = tail(&app).await;
+
+    // D1: another digest on the held key is a key conflict, whether the body
+    // matches its digest or not, never a `400`.
+    assert_same_answer(
+        &app,
+        Write::new(0, 0, "other").digest().tokened(&token).http2(),
+        Write::new(0, 0, "other").digest().tokened(&token),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    assert_same_answer(
+        &app,
+        Write::new(0, 0, "held")
+            .digest_of("other")
+            .tokened(&token)
+            .http2(),
+        Write::new(0, 0, "held").digest_of("other").tokened(&token),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let (conflict, _) = send(
+        &app,
+        &Write::new(0, 0, "x").digest_of("other").tokened(&token),
+    )
+    .await;
+    assert_eq!(answer(&conflict), ProducerAnswer::KeyConflict {
+        epoch: Epoch::ZERO
+    });
+
+    // D2: a repeat with no `Content-Type`, or with a body that does not match
+    // its own digest, still gets its receipt.
+    assert_same_answer(
+        &app,
+        Write::new(0, 0, "held")
+            .digest()
+            .untyped()
+            .tokened(&token)
+            .http2(),
+        Write::new(0, 0, "held").digest().untyped().tokened(&token),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let (repeat, _) = send(
+        &app,
+        &Write::new(0, 0, "held").digest().untyped().tokened(&token),
+    )
+    .await;
+    assert!(matches!(answer(&repeat), ProducerAnswer::Receipt { .. }));
+
+    // A write that would apply gets its content checks: no `Content-Type`,
+    // or a body that does not match its digest, is `400`.
+    for write in [
+        Write::new(0, 1, "next").untyped().tokened(&token),
+        Write::new(0, 1, "next").digest_of("other").tokened(&token),
     ] {
         let (refused, _) = send(&app, &write).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     }
+    assert_eq!(tail(&app).await, before);
 }

@@ -590,6 +590,7 @@ fn raft_group_command_round_trips_through_wire_codec() {
             producer_epoch: 7,
             producer_seq: 42,
             digest: None,
+            ..Default::default()
         }),
         now_ms: 123,
     });
@@ -2032,6 +2033,7 @@ async fn only_the_leader_answers_a_producer_write_early() {
         producer_epoch: 0,
         producer_seq: 0,
         digest: None,
+        ..Default::default()
     };
     let mut append = AppendRequest::from_bytes(stream_id.clone(), b"abc".to_vec());
     append.producer = Some(producer.clone());

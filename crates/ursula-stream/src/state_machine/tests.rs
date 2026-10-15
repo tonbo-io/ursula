@@ -800,6 +800,7 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_epoch: epoch,
         producer_seq: seq,
         digest: None,
+        ..Default::default()
     }
 }
 
