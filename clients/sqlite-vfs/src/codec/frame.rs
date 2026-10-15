@@ -506,12 +506,12 @@ pub fn decompress(compressed: &[u8]) -> Result<CommitRecord, FrameError> {
 /// Puts PART runs back together. Every frame read from the stream goes through [`PartRun::push`]
 /// in stream order: a complete run `0..count` of one commit comes out as that COMMIT, and any
 /// other frame inside a run voids it (its owner died mid-commit and resends the commit whole).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PartRun {
     run: Option<Run>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Run {
     id: CommitId,
     count: u32,
