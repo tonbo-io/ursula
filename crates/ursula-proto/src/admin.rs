@@ -390,6 +390,60 @@ mod tests {
         );
     }
 
+    /// Golden JSON (#581 sections 4.4 and 4.5): the recovery plan, its
+    /// report and the import's answer are the admin API between `ursulactl`
+    /// and the server, so their wire form never changes within a minor.
+    #[test]
+    fn recovery_plans_and_import_answers_keep_their_wire_form() {
+        use super::BackupImportResponse;
+        use super::RecoveryPlanOutcome;
+        use super::RecoveryPlanReport;
+        use super::RecoveryPlanRequest;
+        use super::ReplicaLogView;
+        let plan = RecoveryPlanRequest {
+            leader: 2,
+            point: 12,
+            cut: true,
+            leader_last_log_term: Some(3),
+            expected: ReplicaLogView {
+                last_log_index: Some(14),
+                last_log_term: Some(3),
+                current_term: 5,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&plan).unwrap(),
+            r#"{"leader":2,"point":12,"cut":true,"leader_last_log_term":3,"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+        );
+        let report = RecoveryPlanReport {
+            raft_group_id: 4,
+            node_id: 2,
+            outcome: RecoveryPlanOutcome::Follows,
+            leader: 2,
+            point: 12,
+        };
+        assert_eq!(
+            serde_json::to_string(&report).unwrap(),
+            r#"{"raft_group_id":4,"node_id":2,"outcome":"follows","leader":2,"point":12}"#
+        );
+        let answer = BackupImportResponse {
+            buckets: 1,
+            streams: 3,
+            group_commit_index: 9,
+            history: std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).unwrap(),
+            already: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&answer).unwrap(),
+            r#"{"buckets":1,"streams":3,"group_commit_index":9,"history":81985529216486895,"already":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<BackupImportResponse>(&serde_json::to_string(&answer).unwrap())
+                .unwrap(),
+            answer
+        );
+    }
+
     /// A recovery plan states every member's expected log, also when it is
     /// empty, and nothing else.
     #[test]

@@ -225,6 +225,7 @@ mod tests {
     use super::CoreMetadata;
     use super::GroupLogState;
     use super::GroupMetadata;
+    use super::RecoveryRecord;
     use super::core_metadata_path;
     use super::mark_core_recovering;
 
@@ -302,5 +303,37 @@ mod tests {
         let loaded = CoreMetadata::load(&path).expect("load");
         assert_eq!(loaded.group(1).log, GroupLogState::Recovering);
         assert_eq!(loaded.group(2).log, GroupLogState::Empty);
+    }
+
+    /// Golden bytes: a recovery record in a core metadata file (#581 section
+    /// 4.5) is part of the epoch-4 format, so its encoding never changes.
+    #[test]
+    fn a_recovery_record_matches_the_golden_metadata_file() {
+        const GOLDEN: &str = "555253574d45544104000000a800000082ae76657269666965645f65706f636800a667726f757073810383a4766f746582a96c65616465725f696482a47465726d07a76e6f64655f696402a9636f6d6d6974746564c3a36c6f67a5656d707479a87265636f7665727984a66c656164657202a5706f696e7413b1756e6375745f6c65616465725f7465726d06a96375745f616674657282a96c65616465725f696482a47465726d05a76e6f64655f696401a5696e64657811d37fae89";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = core_metadata_path(dir.path());
+        let mut metadata = CoreMetadata::default();
+        metadata.set_vote(3, openraft::Vote::new_committed(7, 2));
+        let record = RecoveryRecord {
+            leader: 2,
+            point: 19,
+            uncut_leader_term: Some(6),
+            cut_after: Some(openraft::LogId::new(
+                openraft::vote::RaftLeaderId::new(5, 1),
+                17,
+            )),
+        };
+        metadata.set_recovery(3, Some(record));
+        metadata.store(&path).expect("store");
+        let bytes = std::fs::read(&path).expect("read");
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, GOLDEN);
+        assert_eq!(
+            CoreMetadata::load(&path).expect("load").group(3).recovery,
+            Some(record)
+        );
     }
 }
