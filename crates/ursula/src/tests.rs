@@ -17,8 +17,6 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
-use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
-use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
@@ -36,6 +34,18 @@ use ursula_runtime::StreamErrorContext;
 use ursula_shard::RaftGroupId;
 
 use super::*;
+
+/// Headers 0.7 set on refusals that applied nothing, removed in 0.8 (#581
+/// section 6.6). No response may carry them.
+const REMOVED_NOT_APPLIED_HEADERS: [&str; 2] =
+    ["x-ursula-not-applied", "x-ursula-not-applied-checked"];
+
+#[track_caller]
+fn assert_no_not_applied_headers(headers: &HeaderMap, context: &str) {
+    for name in REMOVED_NOT_APPLIED_HEADERS {
+        assert!(!headers.contains_key(name), "{context}: {name}");
+    }
+}
 
 /// Sends one HTTP request through a cloned `Router` and returns the response.
 ///
@@ -2406,9 +2416,9 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     assert!(location.ends_with(&format!("/{}", stream_id)));
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
-    // The node hosts no replica of the group, so it refuses every write
-    // before any engine could propose it, a delete included, and marks the
-    // redirect. Only a gateway adds the vouch.
+    // The node hosts no replica of the group, so it redirects every write
+    // before any engine could propose it, a delete included. No answer says
+    // so.
     let target = format!("{}/{}", peers[0].1, stream_id);
     let writes = [
         ("create", response),
@@ -2442,18 +2452,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     ];
     for (write, response) in &writes {
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
-        assert_eq!(
-            response
-                .headers()
-                .get(NOT_APPLIED_HEADER)
-                .and_then(|value| value.to_str().ok()),
-            Some("GroupNotHosted"),
-            "{write}"
-        );
-        assert!(
-            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
-            "{write}"
-        );
+        assert_no_not_applied_headers(response.headers(), write);
     }
     assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
@@ -2462,15 +2461,12 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     }
 }
 
-/// A follower finds that it does not lead the group before it proposes an
-/// append or a close, so its redirect applied nothing and carries
-/// `x-ursula-not-applied`. A delete goes straight to `client_write`, and so
-/// does a create on these nodes, which run without cold admission. A forward
-/// that OpenRaft reports from there can follow a committed entry, so those
-/// redirects carry no marker, although here too nothing was proposed. No
-/// redirect carries the vouch: only a gateway adds it.
+/// A follower redirects an append and a close after its own leadership
+/// check, before it proposes them, and a create and a delete after
+/// OpenRaft forwards them. Nothing was proposed, and no redirect says so:
+/// 0.8 has no not-applied marker (#581 section 6.6).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
+async fn static_grpc_follower_redirects_writes_without_a_not_applied_marker() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
     for node_id in 1..=3u64 {
@@ -2523,12 +2519,6 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
         .build()
         .expect("build no-redirect reqwest client");
     let (leader, follower) = (&peers[0].1, &peers[1].1);
-    let not_applied = |response: &reqwest::Response| {
-        response
-            .headers()
-            .get(NOT_APPLIED_HEADER)
-            .map(|value| value.to_str().expect("an ASCII token").to_owned())
-    };
     let created = client
         .put(format!("{leader}/benchcmp/marked"))
         .header(CONTENT_TYPE, "text/plain")
@@ -2561,15 +2551,7 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
             Some(leader_target.as_str()),
             "{write}"
         );
-        assert_eq!(
-            not_applied(response).as_deref(),
-            Some("NotLeader"),
-            "{write}"
-        );
-        assert!(
-            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
-            "{write}"
-        );
+        assert_no_not_applied_headers(response.headers(), write);
     }
 
     let create = client
@@ -2597,11 +2579,7 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
             Some(target.as_str()),
             "{write}"
         );
-        assert_eq!(not_applied(response), None, "{write}");
-        assert!(
-            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
-            "{write}"
-        );
+        assert_no_not_applied_headers(response.headers(), write);
     }
 
     // The follower proposed none of them: the stream is still there, empty
@@ -2631,14 +2609,11 @@ async fn static_grpc_follower_marks_a_redirect_raised_before_proposal() {
     }
 }
 
-/// With cold admission on, the engine checks leadership before it proposes an
-/// inline create, so a follower's redirect of one applied nothing and carries
-/// `x-ursula-not-applied`. A create whose body goes to the cold tier is an
-/// external create, which the engine hands straight to `client_write`. A
-/// forward that OpenRaft reports from there can follow a committed entry, so
-/// that redirect carries no marker, although here too nothing was proposed.
+/// With cold admission on, a follower redirects an inline create after its
+/// own leadership check, and an external create (its body goes to the cold
+/// tier) after OpenRaft forwards it. Neither carries a not-applied marker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_follower_leaves_an_external_create_redirect_unmarked() {
+async fn static_grpc_follower_redirects_inline_and_external_creates() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
     for node_id in 1..=3u64 {
@@ -2698,10 +2673,7 @@ async fn static_grpc_follower_leaves_an_external_create_redirect_unmarked() {
     let (leader, follower) = (&peers[0].1, &peers[1].1);
     // At or above the 1 MiB external payload minimum, a create's body goes to
     // the cold tier.
-    for (name, body, marker) in [
-        ("inline", vec![7u8; 16], Some("NotLeader")),
-        ("external", vec![7u8; 1 << 20], None),
-    ] {
+    for (name, body) in [("inline", vec![7u8; 16]), ("external", vec![7u8; 1 << 20])] {
         let response = client
             .put(format!("{follower}/benchcmp/{name}"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -2718,18 +2690,7 @@ async fn static_grpc_follower_leaves_an_external_create_redirect_unmarked() {
             Some(format!("{leader}/benchcmp/{name}").as_str()),
             "{name}"
         );
-        assert_eq!(
-            response
-                .headers()
-                .get(NOT_APPLIED_HEADER)
-                .and_then(|value| value.to_str().ok()),
-            marker,
-            "{name}"
-        );
-        assert!(
-            !response.headers().contains_key(NOT_APPLIED_CHECKED_HEADER),
-            "{name}"
-        );
+        assert_no_not_applied_headers(response.headers(), name);
         let head = client
             .head(format!("{leader}/benchcmp/{name}"))
             .send()
@@ -5619,11 +5580,9 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header_str(&response, axum::http::header::RETRY_AFTER), "1");
-    // Refused before the handler ran: nothing was applied.
-    assert_eq!(
-        header_str(&response, NOT_APPLIED_HEADER),
-        "IngressBodyBytesLimitReached"
-    );
+    // Refused before the handler ran: nothing was applied, and nothing says
+    // so.
+    assert_no_not_applied_headers(response.headers(), "ingress budget");
     let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
         .await
         .expect("body");
@@ -6066,9 +6025,7 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     )
     .await;
     assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "WalDiskPressure");
-    // Only a gateway vouches for the marker.
-    assert!(!write.headers().contains_key(NOT_APPLIED_CHECKED_HEADER));
+    assert_no_not_applied_headers(write.headers(), "wal disk pressure");
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
@@ -6098,7 +6055,7 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     )
     .await;
     assert_eq!(write.status(), StatusCode::CREATED);
-    assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
+    assert_no_not_applied_headers(write.headers(), "write");
 }
 
 /// Format epoch 2 (E8): once a Raft protocol mismatch is recorded, readiness
@@ -6169,9 +6126,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
             .headers()
             .contains_key(axum::http::header::RETRY_AFTER)
     );
-    assert_eq!(header_str(&write, NOT_APPLIED_HEADER), "RaftLogPressure");
-    // Only a gateway vouches for the marker.
-    assert!(!write.headers().contains_key(NOT_APPLIED_CHECKED_HEADER));
+    assert_no_not_applied_headers(write.headers(), "raft log pressure");
     let body = body_bytes(write).await;
     assert!(
         std::str::from_utf8(&body)
@@ -6185,7 +6140,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
     );
     let bodiless = http_put(&app, "/benchcmp", &[], Body::empty()).await;
     assert_ne!(bodiless.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(!bodiless.headers().contains_key(NOT_APPLIED_HEADER));
+    assert_no_not_applied_headers(bodiless.headers(), "bodiless");
 
     assert_eq!(coordinator.observe_log_bytes(50, 200, 100), Some(false));
     // Admitted, the same write creates the stream.
@@ -6197,7 +6152,7 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
     )
     .await;
     assert_eq!(write.status(), StatusCode::CREATED);
-    assert!(!write.headers().contains_key(NOT_APPLIED_HEADER));
+    assert_no_not_applied_headers(write.headers(), "write");
 }
 
 /// Shared fixture for the governance unit-test modules below: one

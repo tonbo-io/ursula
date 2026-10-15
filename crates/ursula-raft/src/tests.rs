@@ -1898,10 +1898,10 @@ impl WriteToOpenRaft {
 /// it instead, and the deposed node cannot tell the two apart. That node's
 /// own leadership check now refuses before proposal, so running the check
 /// again after the hand-off, or reporting OpenRaft's forward as raised
-/// before proposal, would mark a write that may have committed. The HTTP
-/// layer marks as applying nothing exactly the engine's errors that
-/// [`GroupEngineError::refused_before_proposal`] reports, so no answer here
-/// may report one.
+/// before proposal, would treat a write that may have committed as never
+/// proposed. The HTTP layer deletes a staged external payload exactly after
+/// the engine's errors that [`GroupEngineError::is_refused_before_proposal`]
+/// reports, so no answer here may report one.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_down() {
@@ -1990,11 +1990,7 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
             let Err(error) = outcome else {
                 panic!("{write:?}: an entry the new leader replaced was applied");
             };
-            assert_eq!(
-                error.refused_before_proposal(),
-                None,
-                "{write:?}: {error:?}"
-            );
+            assert!(!error.is_refused_before_proposal(), "{write:?}: {error:?}");
             assert_eq!(
                 error.leader_hint().and_then(|hint| hint.node_id),
                 Some(new_leader),
@@ -2002,7 +1998,8 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
             );
         }
         // The deposed node now follows, so its own check refuses before
-        // proposal. Running it after the hand-off would mark the write.
+        // proposal. Running it after the hand-off would misclassify the
+        // write.
         let checked = engines[index(leader_id)]
             .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"abc"))
             .await

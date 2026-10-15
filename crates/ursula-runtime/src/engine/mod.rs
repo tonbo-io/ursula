@@ -1136,45 +1136,23 @@ impl GroupEngineError {
         self.infra().is_some_and(GroupInfraError::is_backpressure)
     }
 
-    /// The refusal a write's error reports when the runtime raised it before
-    /// the write's command was proposed, so that nothing of the write can
-    /// apply: the engine's own leadership check, the core worker's check of
+    /// Whether the runtime raised a write's error before the write's command
+    /// was proposed, so that nothing of the write can apply: the engine's own leadership check, the core worker's check of
     /// the group's unapplied bytes (before any engine sees the command), or
     /// the engine's cold-tier admission. Every other error, a forward OpenRaft
     /// reports after `client_write` among them, can follow a proposal or is no
     /// refusal to retry. It classifies a write's error only: a read's forward
     /// is raised before any proposal as well (on a follower, or on a leader
     /// that could not confirm it leads) and is no refusal of a write. The HTTP
-    /// layer marks exactly these answers to single-command writes as applying
-    /// nothing.
-    pub fn refused_before_proposal(&self) -> Option<RefusedBeforeProposal> {
-        if self.is_forward_before_proposal() {
-            return Some(RefusedBeforeProposal::NotLeader);
-        }
-        match self.infra()? {
-            GroupInfraError::RaftUncommittedBackpressure { .. } => {
-                Some(RefusedBeforeProposal::RaftUncommittedBackpressure)
-            }
-            GroupInfraError::ColdBackpressure { .. } => {
-                Some(RefusedBeforeProposal::ColdBackpressure)
-            }
-            _ => None,
-        }
+    /// layer deletes a staged external payload only after such a refusal.
+    pub fn is_refused_before_proposal(&self) -> bool {
+        self.is_forward_before_proposal()
+            || matches!(
+                self.infra(),
+                Some(
+                    GroupInfraError::RaftUncommittedBackpressure { .. }
+                        | GroupInfraError::ColdBackpressure { .. }
+                )
+            )
     }
-}
-
-/// What the runtime refused a write for before the write's command was
-/// proposed ([`GroupEngineError::refused_before_proposal`]). It classifies a
-/// write's error only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefusedBeforeProposal {
-    /// The engine's own leadership check found that the node does not lead
-    /// the group (RT1).
-    NotLeader,
-    /// The core worker found that the group's proposed but unapplied bytes
-    /// would exceed their limit, before any engine saw the command.
-    RaftUncommittedBackpressure,
-    /// The engine's cold-tier admission found that the group's hot bytes
-    /// would exceed their limit.
-    ColdBackpressure,
 }

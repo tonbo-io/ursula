@@ -128,7 +128,6 @@ use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
-use ursula_runtime::RefusedBeforeProposal;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
@@ -139,7 +138,6 @@ use ursula_shard::RaftGroupId;
 use wal_disk::WalDiskMonitor;
 
 use crate::admission::ingress_admission_middleware;
-use crate::admission::mark_not_applied;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
 use crate::render::http_read_content_type;
@@ -1388,9 +1386,9 @@ pub(crate) async fn stage_external_payload(
 /// deleted only when its append or create definitely did not commit. That is
 /// a typed stream error (apply, or a pre-proposal check, rejected it on every
 /// replica alike), a request the runtime refused before dispatch, or a refusal
-/// before proposal ([`PreProposalRefusal`]: a redirect raised by the local
-/// leadership check, a backpressure rejection, a group this node does not
-/// host). Every other failure (a lost response, a forward-to-leader reported
+/// before proposal ([`refused_before_proposal`]: a redirect raised by the
+/// local leadership check, a backpressure rejection, a group this node does
+/// not host). Every other failure (a lost response, a forward-to-leader reported
 /// by OpenRaft after `client_write` (RT1), a transport or storage error, an
 /// untyped engine error) may follow a committed proposal that references the
 /// object, so the object is kept. An orphan sweep or stream GC reclaims it if
@@ -1399,7 +1397,7 @@ pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> boo
     match err {
         RuntimeError::GroupEngine { error, .. } if error.code().is_some() => true,
         RuntimeError::EmptyAppend | RuntimeError::InvalidRaftGroup { .. } => true,
-        other => PreProposalRefusal::of(other).is_some(),
+        other => refused_before_proposal(other),
     }
 }
 
@@ -2726,7 +2724,7 @@ pub(crate) async fn create_stream_by_id(
             stream_expires_at_ms,
             producer: producer.as_ref(),
         }),
-        Err(err) => one_command_error_response(&state, err, &request_target).await,
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2768,7 +2766,7 @@ pub(crate) async fn create_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            one_command_error_response(&state, err, &request_target).await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
 }
@@ -2834,7 +2832,7 @@ pub(crate) async fn append_stream_by_id(
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
-            Err(err) => one_command_error_response(&state, err, &request_target).await,
+            Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         };
     }
     if !body.is_empty() && !has_content_type(&headers) {
@@ -2871,7 +2869,7 @@ pub(crate) async fn append_stream_by_id(
 
     match state.runtime.append(request).await {
         Ok(response) => append_http_response(response),
-        Err(err) => one_command_error_response(&state, err, &request_target).await,
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2901,7 +2899,7 @@ pub(crate) async fn append_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            one_command_error_response(&state, err, &request_target).await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
 }
@@ -2939,7 +2937,7 @@ pub(crate) async fn delete_stream_by_id(
             insert_default_response_headers(&mut headers);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => one_command_error_response(&state, err, &request_target).await,
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -4097,119 +4095,31 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     runtime_error_response(err)
 }
 
-/// A write the runtime refused before it proposed the write's command, so the
-/// command never reached the Raft log and nothing of the write can apply.
-/// Each is temporary: the answer is a redirect, or carries `Retry-After`. A
-/// handler that proposes one command for the request marks that answer with
-/// [`NOT_APPLIED_HEADER`] and the refusal's [`code`] (see
-/// [`one_command_error_response`]).
+/// Whether the runtime refused `err`'s write before it proposed the write's
+/// command, so the command never reached the Raft log: a group this node does
+/// not host, or what the engine refused before proposing
+/// ([`GroupEngineError::is_refused_before_proposal`]). Every other failure can
+/// follow a proposal (a forward or a lost response after `client_write`, a
+/// group that stopped applying, a storage error) or is no refusal to retry.
+/// Only the F5 staged-payload cleanup asks; no response says it.
 ///
-/// [`code`]: PreProposalRefusal::code
-/// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreProposalRefusal {
-    /// The engine found that the node does not lead the stream's group
-    /// before it proposed anything (RT1): a `307` to the leader, or, while
-    /// the node knows no leader, a `503` (a `500` on a node without peers).
-    /// The engine checks first for an append, with or without an external
-    /// payload, a close and, with cold admission on, an inline create. It
-    /// hands a delete, an external create and an inline create without cold
-    /// admission straight to `client_write`. A forward OpenRaft reports from
-    /// there is not one of these, because the entry may have committed, so
-    /// their redirects stay unmarked.
-    NotLeader,
-    /// The node does not host the stream's group: a `307` to a node that does,
-    /// or a `503` when it knows none. The core worker refuses before any
-    /// engine runs.
-    GroupNotHosted,
-    /// The group's proposed but unapplied bytes would exceed their limit
-    /// (`503`). The core worker checks the body of an inline create or
-    /// append before the group actor sees it.
-    RaftUncommittedBackpressure,
-    /// The group's hot bytes would exceed the cold-tier limit (`503`). The
-    /// engine checks an inline create or append before it proposes it.
-    ColdBackpressure,
-}
-
-impl From<RefusedBeforeProposal> for PreProposalRefusal {
-    fn from(refusal: RefusedBeforeProposal) -> Self {
-        match refusal {
-            RefusedBeforeProposal::NotLeader => Self::NotLeader,
-            RefusedBeforeProposal::RaftUncommittedBackpressure => Self::RaftUncommittedBackpressure,
-            RefusedBeforeProposal::ColdBackpressure => Self::ColdBackpressure,
-        }
+/// [`GroupEngineError::is_refused_before_proposal`]: ursula_runtime::GroupEngineError::is_refused_before_proposal
+fn refused_before_proposal(err: &RuntimeError) -> bool {
+    match err {
+        RuntimeError::GroupNotHosted { .. } => true,
+        RuntimeError::GroupEngine { error, .. } => error.is_refused_before_proposal(),
+        RuntimeError::InvalidConfig(_)
+        | RuntimeError::InvalidRaftGroup { .. }
+        | RuntimeError::SnapshotPlacementMismatch { .. }
+        | RuntimeError::EmptyAppend
+        | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::StaticMembershipConfig { .. }
+        | RuntimeError::ColdStoreIo { .. }
+        | RuntimeError::LiveReadBackpressure { .. }
+        | RuntimeError::MailboxClosed { .. }
+        | RuntimeError::ResponseDropped { .. }
+        | RuntimeError::SpawnCoreThread { .. } => false,
     }
-}
-
-impl PreProposalRefusal {
-    /// The refusal `err` reports, if the runtime raised it before it proposed
-    /// the failed command: a group this node does not host, or what the
-    /// engine refused before proposing
-    /// ([`GroupEngineError::refused_before_proposal`]). Every other failure
-    /// can follow a proposal (a forward or a lost response after
-    /// `client_write`, a group that stopped applying, a storage error) or is
-    /// no refusal to retry.
-    fn of(err: &RuntimeError) -> Option<Self> {
-        match err {
-            RuntimeError::GroupNotHosted { .. } => Some(Self::GroupNotHosted),
-            RuntimeError::GroupEngine { error, .. } => {
-                error.refused_before_proposal().map(Self::from)
-            }
-            RuntimeError::InvalidConfig(_)
-            | RuntimeError::InvalidRaftGroup { .. }
-            | RuntimeError::SnapshotPlacementMismatch { .. }
-            | RuntimeError::EmptyAppend
-            | RuntimeError::ColdStoreConfig { .. }
-            | RuntimeError::StaticMembershipConfig { .. }
-            | RuntimeError::ColdStoreIo { .. }
-            | RuntimeError::LiveReadBackpressure { .. }
-            | RuntimeError::MailboxClosed { .. }
-            | RuntimeError::ResponseDropped { .. }
-            | RuntimeError::SpawnCoreThread { .. } => None,
-        }
-    }
-
-    /// The refusal's token: the value of [`NOT_APPLIED_HEADER`].
-    ///
-    /// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
-    fn code(self) -> &'static str {
-        match self {
-            Self::NotLeader => "NotLeader",
-            Self::GroupNotHosted => "GroupNotHosted",
-            Self::RaftUncommittedBackpressure => "RaftUncommittedBackpressure",
-            Self::ColdBackpressure => "ColdBackpressure",
-        }
-    }
-}
-
-/// [`runtime_error_or_leader_redirect_async`] for a write that proposes one
-/// command for the request: a stream create, append, close or delete. When
-/// the runtime refused that command before proposing it
-/// ([`PreProposalRefusal`]), the request applied nothing, so the answer
-/// carries [`NOT_APPLIED_HEADER`], a redirect to the leader included. A
-/// request that can propose more than one command must not use this: a
-/// refusal of a later command says nothing about the earlier ones.
-///
-/// A close and an append with an external payload can still propose a
-/// `TouchStreamAccess` before their write: when the stream has expired, the
-/// engine proposes it after its leadership check to apply the expiry. That
-/// command can commit, so no refusal that [`PreProposalRefusal::of`]
-/// classifies may be raised after it. None is: the core worker refuses before
-/// any engine runs, the leadership check runs before the touch, and cold
-/// admission covers only inline creates and appends, which propose no touch.
-///
-/// [`NOT_APPLIED_HEADER`]: ursula_proto::headers::NOT_APPLIED_HEADER
-async fn one_command_error_response(
-    state: &HttpState,
-    err: RuntimeError,
-    request_target: &str,
-) -> Response {
-    let refusal = PreProposalRefusal::of(&err);
-    let mut response = runtime_error_or_leader_redirect_async(state, err, request_target).await;
-    if let Some(refusal) = refusal {
-        mark_not_applied(&mut response, refusal.code());
-    }
-    response
 }
 
 /// True when `err` is a group-engine error asking the caller to forward to the
@@ -4244,7 +4154,5 @@ mod tests;
 mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
-#[cfg(test)]
-mod not_applied_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;

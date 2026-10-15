@@ -15,17 +15,8 @@
 //! from `Location` so that redirect-following clients keep talking to the
 //! gateway.
 //!
-//! Every request the gateway refuses before forwarding it (access control,
-//! tenant admission, an oversized body), and a request whose first upstream
-//! it could not connect to, is answered with `x-ursula-not-applied`: no node
-//! received it. After redirects that all carried the marker, so that no node
-//! proposed the request, so is its `503` for an upstream it then could not
-//! connect to, or when it stops following the redirects. A node's
-//! `x-ursula-not-applied` passes through, unless the gateway followed a leader
-//! redirect that did not carry it. Every response
-//! carries `x-ursula-not-applied-checked: 1`, the gateway's vouch that it
-//! applied that rule. A client trusts the marker only together with the vouch
-//! (see [`ursula_proto::headers`]).
+//! No response says that a write applied nothing. A client resolves an
+//! unknown outcome by repeating a keyed write (#581 section 2).
 //!
 //! A refusal the gateway decides from a request's head alone (access control,
 //! tenant admission) goes out once it has read the request's body, up to
@@ -73,8 +64,6 @@ use percent_encoding::percent_decode_str;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
-use ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER;
-use ursula_proto::headers::NOT_APPLIED_HEADER;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 
@@ -313,10 +302,7 @@ impl Gateway {
         self
     }
 
-    /// Answers one client request. Every response leaves through here, so
-    /// each one carries the gateway's vouch, [`NOT_APPLIED_CHECKED_HEADER`],
-    /// added after the redirect rule decided whether a node's
-    /// [`NOT_APPLIED_HEADER`] stays.
+    /// Answers one client request.
     ///
     /// A refusal decided from the request's head alone (access control,
     /// tenant admission) is returned once the request's body has been read
@@ -325,11 +311,7 @@ impl Gateway {
     /// refusal (#540). The future can take that long, and the caller pays the
     /// body's ingress.
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
-        let mut response = self.handle_with_cors(req).await;
-        response
-            .headers_mut()
-            .insert(NOT_APPLIED_CHECKED_HEADER, HeaderValue::from_static("1"));
-        response
+        self.handle_with_cors(req).await
     }
 
     async fn handle_with_cors(&self, req: Request<Body>) -> AxumResponse {
@@ -692,10 +674,7 @@ impl Gateway {
             if let Some(key) = &pin_key {
                 self.forget_leader_if_matches(key, &target);
             }
-            chain.redirected(
-                response.headers().contains_key(NOT_APPLIED_HEADER),
-                Instant::now(),
-            );
+            chain.redirected(Instant::now());
             let named = self
                 .resolve_leader_upstream(response.headers())
                 .map(str::to_owned);
@@ -712,7 +691,6 @@ impl Gateway {
                 self.chain_ended(&chain, started);
                 return Err(GatewayError::LeaderNotFound {
                     followed: chain.redirects,
-                    applied_nothing: chain.applied_nothing,
                 });
             };
             self.followed(&target, &next, searching);
@@ -747,9 +725,7 @@ impl Gateway {
     }
 
     /// The client's answer from the upstream that ended the chain, which did
-    /// not redirect. Its marker stays only when every redirect before it was
-    /// marked too ([`Chain::applied_nothing`]): a node can redirect after it
-    /// proposed the request. A redirect's own marker never moves onto it.
+    /// not redirect.
     fn answer(
         &self,
         response: reqwest::Response,
@@ -777,11 +753,7 @@ impl Gateway {
                 self.remember_leader(key.to_owned(), chain.target.clone());
             }
         }
-        let mut response = Self::build_response(response, tail)?;
-        if !chain.applied_nothing {
-            response.headers_mut().remove(NOT_APPLIED_HEADER);
-        }
-        Ok(response)
+        Self::build_response(response, tail)
     }
 
     /// Counts the time a request spent on its hops, when it followed a
@@ -849,17 +821,13 @@ impl Gateway {
             // setup, or the connect timeout) or in the pool checkout. So this
             // attempt wrote nothing of the request. Any later failure, such
             // as an upstream that read the request and closed the connection
-            // without answering, stays unmarked. Inside one `send`, hyper
+            // without answering, is another error. Inside one `send`, hyper
             // retries only a request that a pooled connection gave back
             // unwritten, and reqwest only one that an HTTP/2 peer refused
             // unprocessed (`REFUSED_STREAM`, or a graceful `GOAWAY`).
             match (source.is_connect(), hop) {
                 (true, Hop::First) => GatewayError::UpstreamUnreachable { upstream, source },
-                (true, Hop::Followed { applied_nothing }) => GatewayError::LeaderUnreachable {
-                    upstream,
-                    source,
-                    applied_nothing,
-                },
+                (true, Hop::Followed) => GatewayError::LeaderUnreachable { upstream, source },
                 (false, _) => GatewayError::Upstream { upstream, source },
             }
         })
@@ -1160,11 +1128,8 @@ enum Hop {
     /// before it.
     First,
     /// An upstream after a Raft redirect: the leader the redirect named, or
-    /// an upstream the request has not tried yet. `applied_nothing`: every
-    /// redirect before this hop was marked `x-ursula-not-applied`, so no node
-    /// proposed the request before it (an earlier hop that could not connect
-    /// sent nothing). Otherwise one may have, before it redirected.
-    Followed { applied_nothing: bool },
+    /// an upstream the request has not tried yet.
+    Followed,
 }
 
 /// The hops of one forwarded request ([`Gateway::forward`]).
@@ -1177,11 +1142,6 @@ struct Chain {
     redirects: usize,
     /// Whether the hop under way goes to an upstream that no redirect named.
     searching: bool,
-    /// Whether every answer so far was a Raft redirect marked
-    /// `x-ursula-not-applied`, which a node raises only before it proposes
-    /// anything of the request. Then no node has applied anything of it, and
-    /// none can later. Only [`Chain::redirected`] changes it.
-    applied_nothing: bool,
     /// When the first redirect arrived: [`LEADER_REDIRECT_DEADLINE`] counts
     /// from it.
     first_redirect: Option<Instant>,
@@ -1194,7 +1154,6 @@ impl Chain {
             tried: vec![first.to_owned()],
             redirects: 0,
             searching: false,
-            applied_nothing: true,
             first_redirect: None,
         }
     }
@@ -1203,16 +1162,12 @@ impl Chain {
         if self.redirects == 0 {
             Hop::First
         } else {
-            Hop::Followed {
-                applied_nothing: self.applied_nothing,
-            }
+            Hop::Followed
         }
     }
 
-    /// Records a redirect, `marked` with `x-ursula-not-applied` or not, that
-    /// the hop under way got at `now`.
-    fn redirected(&mut self, marked: bool, now: Instant) {
-        self.applied_nothing &= marked;
+    /// Records a redirect that the hop under way got at `now`.
+    fn redirected(&mut self, now: Instant) {
         self.first_redirect.get_or_insert(now);
     }
 
@@ -1277,8 +1232,7 @@ fn principal_ref(principal: &VerifiedPrincipal) -> PrincipalRef {
 }
 
 /// A request the gateway answered itself, before forwarding it to any
-/// upstream. Nothing of it reached a stream, so every refusal carries
-/// [`NOT_APPLIED_HEADER`] with a token naming it.
+/// upstream.
 #[derive(Debug)]
 enum Refusal {
     /// Access control does not serve the route, or the authorizer concealed
@@ -1303,72 +1257,40 @@ enum Refusal {
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> AxumResponse {
-        let (mut response, reason) = match self {
-            Self::NotFound => (StatusCode::NOT_FOUND.into_response(), "NotFound"),
-            Self::Authentication(AuthenticationError::Unavailable) => (
-                StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                "AuthenticationUnavailable",
-            ),
+        match self {
+            Self::NotFound => StatusCode::NOT_FOUND.into_response(),
+            Self::Authentication(AuthenticationError::Unavailable) => {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
             Self::Authentication(
                 AuthenticationError::InvalidCredential
                 | AuthenticationError::Expired
                 | AuthenticationError::WrongAudience,
-            ) => (
-                (StatusCode::UNAUTHORIZED, [(
-                    WWW_AUTHENTICATE,
-                    HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-                )])
-                    .into_response(),
-                "InvalidCredential",
-            ),
-            Self::Forbidden => (StatusCode::FORBIDDEN.into_response(), "Forbidden"),
-            Self::Authorization(AuthorizationError::Unavailable) => (
-                StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                "AuthorizationUnavailable",
-            ),
+            ) => (StatusCode::UNAUTHORIZED, [(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+            )])
+                .into_response(),
+            Self::Forbidden => StatusCode::FORBIDDEN.into_response(),
+            Self::Authorization(AuthorizationError::Unavailable) => {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
             Self::Admission(AdmissionRejection::RateLimited { retry_after_secs }) => (
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(RETRY_AFTER, HeaderValue::from(retry_after_secs))],
-                    "tenant request rate limit exceeded",
-                )
-                    .into_response(),
-                "TenantRateLimited",
-            ),
+                StatusCode::TOO_MANY_REQUESTS,
+                [(RETRY_AFTER, HeaderValue::from(retry_after_secs))],
+                "tenant request rate limit exceeded",
+            )
+                .into_response(),
             Self::Admission(AdmissionRejection::LiveReadsExhausted) => (
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "tenant live-read connection limit exceeded",
-                )
-                    .into_response(),
-                "TenantLiveReadsExhausted",
-            ),
-            Self::BodyTooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-                "RequestBodyTooLarge",
-            ),
-            Self::BodyUnreadable => (
-                StatusCode::BAD_REQUEST.into_response(),
-                "RequestBodyUnreadable",
-            ),
-            Self::NoUpstream => (
-                StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                "NoUpstream",
-            ),
-        };
-        mark_not_applied(&mut response, reason);
-        response
+                StatusCode::TOO_MANY_REQUESTS,
+                "tenant live-read connection limit exceeded",
+            )
+                .into_response(),
+            Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            Self::BodyUnreadable => StatusCode::BAD_REQUEST.into_response(),
+            Self::NoUpstream => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
     }
-}
-
-/// Marks `response` as answering a request that no node can have applied,
-/// because none proposed anything of it, with `token` naming why. The only
-/// place the gateway sets [`NOT_APPLIED_HEADER`] itself. A node's marker
-/// reaches the client only through the redirect rule in [`Gateway::answer`].
-fn mark_not_applied(response: &mut AxumResponse, token: &'static str) {
-    response
-        .headers_mut()
-        .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(token));
 }
 
 /// How [`drain`] ended.
@@ -1655,11 +1577,6 @@ fn authentication_refusal(error: AuthenticationError) -> Refusal {
 // headers describe only the current TCP/HTTP connection, so the gateway must
 // let its HTTP client/server stack recreate them for the next connection.
 //
-// The vouch for `x-ursula-not-applied` is dropped too, in both directions. It
-// is this gateway's own statement, added to every response in
-// `Gateway::handle`, so one from an upstream never reaches the redirect rule
-// or the client.
-//
 // Request forwarding also drops Host so the client can set it from the upstream
 // URL. Use append, not insert, so repeated headers such as Set-Cookie survive.
 fn copy_forwarded_headers(src: &HeaderMap, drop_host: bool) -> HeaderMap {
@@ -1667,10 +1584,7 @@ fn copy_forwarded_headers(src: &HeaderMap, drop_host: bool) -> HeaderMap {
     let connection_tokens = connection_header_tokens(src);
     for (key, value) in src {
         let key_str = key.as_str();
-        if (drop_host && key_str == "host")
-            || key_str == NOT_APPLIED_CHECKED_HEADER
-            || is_hop_by_hop_header(key_str, &connection_tokens)
-        {
+        if (drop_host && key_str == "host") || is_hop_by_hop_header(key_str, &connection_tokens) {
             continue;
         }
         dst.append(key.clone(), value.clone());
@@ -1728,27 +1642,19 @@ pub enum GatewayError {
         source: reqwest::Error,
     },
     /// No connection to the upstream of a hop after a Raft redirect. The
-    /// request was never sent there. `applied_nothing`: every redirect before
-    /// it was marked, so no node proposed the request (a hop that could not
-    /// connect sent nothing). Otherwise a node that redirected may have.
+    /// request was never sent there.
     #[error("upstream {upstream} is unreachable after a redirect")]
     LeaderUnreachable {
         upstream: String,
         #[source]
         source: reqwest::Error,
-        applied_nothing: bool,
     },
     /// Every upstream that answered the request redirected it, and the
     /// gateway stopped following: after [`MAX_LEADER_REDIRECTS`] hops, after
     /// [`LEADER_REDIRECT_DEADLINE`], or with nowhere left to go. `followed`
     /// counts the hops after the first, search hops included.
-    /// `applied_nothing`: every redirect was marked, so no node proposed the
-    /// request.
     #[error("no leader found after {followed} further hops")]
-    LeaderNotFound {
-        followed: usize,
-        applied_nothing: bool,
-    },
+    LeaderNotFound { followed: usize },
     /// No response headers in time. The request may have reached the
     /// upstream.
     #[error("upstream {upstream} sent no response headers within {timeout:?}")]
@@ -1783,43 +1689,21 @@ impl GatewayError {
 
     /// The client's answer. An unreachable upstream is answered `503` with
     /// `Retry-After`, as Ursula answers while a group has no reachable
-    /// leader: the request was never sent there. The first upstream's answer
-    /// is marked, because no node received the request. One after a redirect
-    /// is marked only when every redirect before it was marked: a node that
-    /// redirected may have proposed the request otherwise. A request whose
-    /// redirects the gateway stopped following is answered the same way, and
-    /// marked on the same condition. The other failures may follow a request
-    /// the upstream received. The bodies name no internal address.
+    /// leader: the request was never sent there. A request whose redirects
+    /// the gateway stopped following is answered the same way. The other
+    /// failures may follow a request the upstream received. The bodies name
+    /// no internal address.
     fn into_response(self) -> AxumResponse {
         match self {
-            Self::UpstreamUnreachable { .. } => {
-                let mut response = unreachable_response();
-                mark_not_applied(&mut response, "UpstreamUnreachable");
-                response
+            Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => {
+                unreachable_response()
             }
-            Self::LeaderUnreachable {
-                applied_nothing, ..
-            } => {
-                let mut response = unreachable_response();
-                if applied_nothing {
-                    mark_not_applied(&mut response, "UpstreamUnreachable");
-                }
-                response
-            }
-            Self::LeaderNotFound {
-                applied_nothing, ..
-            } => {
-                let mut response = (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [(RETRY_AFTER, HeaderValue::from_static("1"))],
-                    "no leader found; retry",
-                )
-                    .into_response();
-                if applied_nothing {
-                    mark_not_applied(&mut response, "LeaderNotFound");
-                }
-                response
-            }
+            Self::LeaderNotFound { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(RETRY_AFTER, HeaderValue::from_static("1"))],
+                "no leader found; retry",
+            )
+                .into_response(),
             Self::UpstreamTimeout { .. } => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream sent no response in time",

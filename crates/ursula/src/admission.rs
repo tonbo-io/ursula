@@ -1,14 +1,7 @@
 //! Client-plane ingress admission: refuses a write before it reaches a
-//! handler, so nothing of a refused request is ever proposed.
-//!
-//! Every refusal carries [`NOT_APPLIED_HEADER`], set by [`mark_not_applied`],
-//! the only place the server sets it. The handlers of the writes that propose
-//! one command use it too, for the runtime's refusals raised before that
-//! command was proposed. The server never sets
-//! [`NOT_APPLIED_CHECKED_HEADER`]: only a gateway vouches for the marker,
-//! after it applied its redirect rule.
-//!
-//! [`NOT_APPLIED_CHECKED_HEADER`]: ursula_proto::headers::NOT_APPLIED_CHECKED_HEADER
+//! handler, so nothing of a refused request is ever proposed. A response
+//! never says so: a client resolves an unknown outcome by repeating a keyed
+//! write (#581 section 2).
 
 use std::sync::Arc;
 
@@ -25,7 +18,6 @@ use axum::http::header::CONTENT_TYPE;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
-use ursula_proto::headers::NOT_APPLIED_HEADER;
 
 use crate::CLUSTER_PROBE_PATH;
 use crate::MAX_HTTP_BODY_BYTES;
@@ -97,10 +89,7 @@ impl IngressAdmission {
 }
 
 /// Why ingress admission refused a write. Admission answers before the request
-/// reaches a handler, so nothing of a refused request was proposed or applied,
-/// and every refusal carries [`NOT_APPLIED_HEADER`] with its [`code`].
-///
-/// [`code`]: AdmissionRefusal::code
+/// reaches a handler, so nothing of a refused request was proposed or applied.
 #[derive(Debug, Clone, Copy)]
 enum AdmissionRefusal {
     /// The body is larger than admission admits on the route (`413`).
@@ -115,8 +104,7 @@ enum AdmissionRefusal {
 }
 
 impl AdmissionRefusal {
-    /// The refusal's token: the value of [`NOT_APPLIED_HEADER`], and the JSON
-    /// `error` of a `503`.
+    /// The refusal's token: the JSON `error` of a `503`.
     fn code(self) -> &'static str {
         match self {
             Self::BodyTooLarge => "RequestBodyTooLarge",
@@ -129,28 +117,15 @@ impl AdmissionRefusal {
 
 impl IntoResponse for AdmissionRefusal {
     fn into_response(self) -> Response {
-        let mut response = match self {
+        match self {
             Self::BodyTooLarge => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response()
             }
             Self::WalDiskPressure | Self::RaftLogPressure | Self::IngressBodyBytesLimitReached => {
                 retry_after_json(self.code())
             }
-        };
-        mark_not_applied(&mut response, self.code());
-        response
+        }
     }
-}
-
-/// Marks `response` as refusing a request of which nothing was proposed, with
-/// `token` naming the refusal. The only place the server sets
-/// [`NOT_APPLIED_HEADER`]. Call it only on a response sent before anything of
-/// the request was proposed: an admission refusal here, or a refusal the
-/// runtime raised before it proposed a write's one command.
-pub(crate) fn mark_not_applied(response: &mut Response, token: &'static str) {
-    response
-        .headers_mut()
-        .insert(NOT_APPLIED_HEADER, HeaderValue::from_static(token));
 }
 
 pub(crate) async fn ingress_admission_middleware(
