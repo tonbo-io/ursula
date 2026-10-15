@@ -1112,21 +1112,6 @@ impl GroupRejoin {
                 });
             }
         }
-        let cut_after = if plan.cut {
-            let committed =
-                committed_id.ok_or(RecoveryGateError::NothingCommitted { raft_group_id })?;
-            let held = store.log_id_at(committed.index());
-            if held != Some(committed) {
-                return Err(RecoveryGateError::CommittedEntryMissing {
-                    raft_group_id,
-                    committed,
-                    held,
-                });
-            }
-            Some(committed)
-        } else {
-            None
-        };
         let uncut_leader_term = if plan.cut {
             Some(
                 plan.leader_last_log_term
@@ -1139,14 +1124,38 @@ impl GroupRejoin {
         } else {
             None
         };
+        let restart = plan.cut
+            && !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::RecoveryCut);
+        // B1 (#581 review): from reading the entry the cut keeps until the
+        // restart, the replica neither votes, campaigns nor acknowledges an
+        // entry. No await comes between the read and the closed gate, so no
+        // inbound append runs in between.
+        let cut_after = if plan.cut {
+            let committed =
+                committed_id.ok_or(RecoveryGateError::NothingCommitted { raft_group_id })?;
+            let held = store.log_id_at(committed.index());
+            if held != Some(committed) {
+                return Err(RecoveryGateError::CommittedEntryMissing {
+                    raft_group_id,
+                    committed,
+                    held,
+                });
+            }
+            if restart {
+                *self.gate() = VoteGate::Cutting;
+                disable_elections();
+                self.changes.send_if_modified(|()| true);
+            }
+            Some(committed)
+        } else {
+            None
+        };
         let record = RecoveryRecord {
             leader: plan.leader,
             point: plan.point,
             uncut_leader_term,
             cut_after,
         };
-        let restart = plan.cut
-            && !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::RecoveryCut);
         let leads = plan.leader == self.node_id;
         // The plan accepts this replica's log as it is: the loss is
         // accepted. A later crash records the log recovering again, and
@@ -1159,14 +1168,6 @@ impl GroupRejoin {
                 raft_group_id,
                 source,
             })?;
-        if restart {
-            // B1 (#581 review): the uncut log never votes, campaigns or
-            // acknowledges an entry again: closed before the record names
-            // the entry the cut keeps.
-            *self.gate() = VoteGate::Cutting;
-            disable_elections();
-            self.changes.send_if_modified(|()| true);
-        }
         store
             .record_recovery(Some(record))
             .await

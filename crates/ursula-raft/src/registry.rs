@@ -1009,12 +1009,20 @@ impl RaftGroupHandleRegistry {
         let rejoin = entry.recovery.clone();
         raft.call(move |raft| async move {
             if let Some(rejoin) = rejoin {
+                // A recovery cut may have closed the replica since the check
+                // above: an entry it acknowledged now would be cut.
+                if rejoin.cutting() {
+                    return None;
+                }
                 rejoin.observe_inbound_append(&request);
             }
-            raft.append_entries(request).await
+            Some(raft.append_entries(request).await)
         })
         .await
         .map_err(crate::owner::owner_stopped)?
+        .ok_or(GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::RecoveryCutting { raft_group_id },
+        ))?
         .map_err(crate::owner::owner_raft_error)
     }
 
@@ -1058,6 +1066,7 @@ impl RaftGroupHandleRegistry {
         let serial = lock.lock_owned().await;
         let permit = self.snapshot_install.acquire().await?;
         let raft = entry.raft().clone();
+        let rejoin = entry.recovery.clone();
         let lifetime =
             entry
                 .snapshot_installs
@@ -1091,10 +1100,26 @@ impl RaftGroupHandleRegistry {
                     .await?
             };
             let _prefetch_guard = prefetched.guard;
+            let snapshot = prefetched.snapshot;
             let result = raft
-                .install_full_snapshot(vote, prefetched.snapshot)
+                .call(move |raft| async move {
+                    // A recovery cut may have closed the replica while the
+                    // install waited: it takes no replication until it has
+                    // restarted.
+                    if rejoin.as_ref().is_some_and(|rejoin| rejoin.cutting()) {
+                        return None;
+                    }
+                    Some(raft.install_full_snapshot(vote, snapshot).await)
+                })
                 .await
                 .map_err(crate::owner::owner_stopped)
+                .and_then(|installed| {
+                    installed
+                        .ok_or(GroupEngineError::Infra(
+                            ursula_runtime::GroupInfraError::RecoveryCutting { raft_group_id },
+                        ))?
+                        .map_err(crate::owner::owner_stopped)
+                })
                 .map_err(SnapshotInstallError::Group);
             drop(_prefetch_guard);
             // Object-store publication and its retry backoff must not monopolize
