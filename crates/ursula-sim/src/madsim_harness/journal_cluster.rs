@@ -17,8 +17,13 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
-use ursula_proto::admin::PlanStep;
-use ursula_proto::admin::RecoveryPlanOutcome;
+use ursula_ctl::recovery::GroupPlan;
+use ursula_ctl::recovery::PlanMember;
+use ursula_ctl::recovery::PlanTransport;
+use ursula_ctl::recovery::SendError;
+use ursula_ctl::recovery::plan_group;
+use ursula_ctl::recovery::send_plan;
+use ursula_proto::admin::RecoveryPlanRefused;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_proto::admin::ReplicaLogView;
@@ -631,148 +636,105 @@ pub(super) fn log_state(cluster: &JournalCluster, group: u32, node_id: u64) -> G
 }
 
 /// `node_id`'s replica of `group` as the recovery tool reads it from the
-/// metrics: its log, its vote term, its committed index and whether its
-/// gate restricts its vote.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct MemberView {
-    pub(super) node_id: u64,
-    pub(super) log: ReplicaLogView,
-    pub(super) committed: Option<u64>,
-    pub(super) restricted: bool,
-}
-
-pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u64) -> MemberView {
+/// metrics ([`PlanMember`]).
+pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u64) -> PlanMember {
     let mut store = cluster.wals[&node_id]
         .store(RaftGroupId(group))
         .expect("a running replica holds its store");
     let last = store.get_log_state().await.expect("log state").last_log_id;
     let vote = store.read_vote().await.expect("vote");
-    MemberView {
+    let replica = metrics(cluster, group, node_id);
+    let history = cluster.engines[&(group, node_id)].history();
+    PlanMember {
         node_id,
         log: ReplicaLogView {
             last_log_index: last.map(|last| last.index),
             last_log_term: last.map(|last| last.leader_id.term),
             current_term: vote.map_or(0, |vote| vote.leader_id().term()),
         },
-        committed: metrics(cluster, group, node_id)
-            .local_committed
-            .map(|committed| committed.index),
-        // A closed gate or an unsatisfied plan: the replica kept its vote
-        // while it may have lost entries (#581 section 4.5, `floor`).
-        restricted: gate(cluster, group, node_id) != RecoveryGateStatus::Open
-            || cluster.engines[&(group, node_id)]
-                .history()
-                .plan()
-                .is_some(),
+        committed: replica.local_committed.map(|committed| committed.index),
+        gate: gate(cluster, group, node_id),
+        plan_leader: history.plan().map(|plan| plan.leader),
+        history_event_index: history.applied().map(|event| event.event_index),
+        current_leader: replica.current_leader,
+        voter_ids: replica.membership_config.membership().voter_ids().collect(),
     }
 }
 
-/// The recovery tool's plan (#581 section 4.5) from the members it reached:
-/// the leader is the member with the greatest last log id; when its last
-/// log term is below the highest vote term a restricted member (a closed
-/// gate or an unsatisfied plan) holds, a stale entry is possible, so every
-/// member cuts its log to what it knew was committed and the leader is the
-/// member with the greatest committed index.
-pub(super) fn recovery_plan(members: &[MemberView]) -> (u64, u64, bool) {
-    let floor = members
-        .iter()
-        .filter(|member| member.restricted)
-        .map(|member| member.log.current_term)
-        .max()
-        .unwrap_or(0);
-    let longest = members
-        .iter()
-        .max_by_key(|member| {
-            (
-                member.log.last_log_term,
-                member.log.last_log_index,
-                member.node_id,
-            )
-        })
-        .expect("a reachable member");
-    let cut = members.len() > 1 && longest.log.last_log_term.unwrap_or(0) < floor;
-    if cut {
-        let leader = members
-            .iter()
-            .max_by_key(|member| (member.committed, member.node_id))
-            .expect("a reachable member");
-        (leader.node_id, leader.committed.unwrap_or(0), true)
-    } else {
-        (
-            longest.node_id,
-            longest.log.last_log_index.unwrap_or(0),
-            false,
-        )
+/// [`PlanTransport`] over each replica's production admin entry point
+/// ([`JournalCluster::accept_recovery_plan`]), with the refusal it answers
+/// typed as the node's HTTP route types it.
+pub(super) struct SimPlanTransport<'a> {
+    pub(super) cluster: &'a mut JournalCluster,
+    pub(super) group: u32,
+}
+
+impl SimPlanTransport<'_> {
+    pub(super) async fn accept(
+        &mut self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> Result<RecoveryPlanReport, SendError> {
+        let group = self.group;
+        self.cluster
+            .accept_recovery_plan(group, node_id, request)
+            .await
+            .map_err(|error| match error.refusal() {
+                Some(refusal) => SendError::Refused {
+                    node_id,
+                    refused: RecoveryPlanRefused {
+                        raft_group_id: u64::from(group),
+                        node_id,
+                        refusal,
+                        message: error.to_string(),
+                    },
+                },
+                None => SendError::Transport {
+                    node_id,
+                    source: Box::new(error),
+                },
+            })
     }
 }
 
-/// The recovery tool for `group` over the members in `reachable`: computes
-/// the plan and sends it through each member's production admin entry point,
-/// the leader first and then every other member with the leader's plan term
-/// (N1, #581 review). A plan that cuts restarts each replica inside its
-/// accept. Returns the leader's request.
+impl PlanTransport for SimPlanTransport<'_> {
+    fn send(
+        &mut self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> impl std::future::Future<Output = Result<RecoveryPlanReport, SendError>> {
+        self.accept(node_id, request)
+    }
+}
+
+/// The recovery tool for `group` over the members in `reachable`: the
+/// shipped planner and sender of `ursulactl recover-group`
+/// ([`ursula_ctl::recovery`], m5 of the #581 review), over each member's
+/// production admin entry point. The leader goes first, then every other
+/// member with the leader's plan term. A plan that cuts restarts each
+/// replica inside its accept. Returns the plan.
 pub(super) async fn recover_group(
     cluster: &mut JournalCluster,
     group: u32,
     reachable: &[u64],
     context: &str,
-) -> RecoveryPlanRequest {
+) -> GroupPlan {
     let mut members = Vec::new();
     for node_id in reachable {
         members.push(member_view(cluster, group, *node_id).await);
     }
-    let (leader, point, cut) = recovery_plan(&members);
-    cluster.plan_leaders.insert(leader);
-    let request = |member: &MemberView, step: PlanStep| RecoveryPlanRequest {
-        leader,
-        point,
-        cut,
-        step,
-        expected: member.log,
-    };
-    let leader_view = members
-        .iter()
-        .find(|member| member.node_id == leader)
-        .copied()
-        .expect("the plan's leader is reachable");
-    let lead = request(&leader_view, PlanStep::Lead);
-    let report: RecoveryPlanReport = cluster
-        .accept_recovery_plan(group, leader, &lead)
+    let plan = plan_group(&members)
+        .unwrap_or_else(|error| panic!("{context}: group {group}: no plan: {error}"));
+    cluster.plan_leaders.insert(plan.leader);
+    let sent = send_plan(&mut SimPlanTransport { cluster, group }, plan, &members)
         .await
-        .unwrap_or_else(|error| {
-            panic!("{context}: group {group}: the plan's leader {leader} refused {lead:?}: {error}")
-        });
-    assert_eq!(report.outcome, RecoveryPlanOutcome::Leads, "{context}");
-    for member in members.iter().filter(|member| member.node_id != leader) {
-        let follow = request(member, PlanStep::Follow {
-            leader_term: report.leader_term,
-        });
-        match cluster
-            .accept_recovery_plan(group, member.node_id, &follow)
-            .await
-        {
-            Ok(answer) => {
-                assert_eq!(answer.outcome, RecoveryPlanOutcome::Follows, "{context}");
-            }
-            // The members that took the plan already elected its leader,
-            // which reached this one: it rejoins through the leader.
-            Err(
-                error @ (ursula_raft::RecoveryGateError::FollowsLeader { .. }
-                | ursula_raft::RecoveryGateError::NotStalled { .. }),
-            ) if leader_by_state(cluster, group) == Some(leader) => {
-                tracing::info!(
-                    %error,
-                    "{context}: group {group}: node {} rejoins through the plan's leader",
-                    member.node_id
-                );
-            }
-            Err(error) => panic!(
-                "{context}: group {group}: node {} refused {follow:?}: {error}",
-                member.node_id
-            ),
-        }
-    }
-    lead
+        .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
+    assert!(
+        sent.refused.is_empty(),
+        "{context}: group {group}: {plan:?}: members refused: {:?}",
+        sent.refused
+    );
+    plan
 }
 
 /// Waits until every replica of `group` in `nodes` applied a history event

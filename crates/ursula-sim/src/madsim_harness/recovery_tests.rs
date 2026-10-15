@@ -60,6 +60,9 @@ use crate::madsim_harness::sim_wal::SimNodeWal;
 #[path = "recovery_regression_tests.rs"]
 mod regression;
 
+#[path = "foreign_entry_tests.rs"]
+mod foreign_entry;
+
 /// Every group of `node_id` is gated and durably recovering.
 fn assert_gated(cluster: &JournalCluster, node_id: u64, context: &str) {
     for group in JOURNAL_GROUPS {
