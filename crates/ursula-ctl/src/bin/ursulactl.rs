@@ -117,9 +117,11 @@ struct RecoverGroupArgs {
     /// restarts the group before the answer.
     #[arg(long, default_value_t = 120)]
     accept_timeout_secs: u64,
-    /// Print the plan and send nothing.
+    /// Send the plan, accepting the loss of every write acknowledged after
+    /// the last `fsync` of the replicas it keeps. Without it the command
+    /// explains the plan it would send and sends nothing.
     #[arg(long, default_value_t = false)]
-    dry_run: bool,
+    accept_loss: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1138,7 +1140,7 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
         settle_timeout: Duration::from_secs(args.settle_timeout_secs),
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         accept_timeout: Duration::from_secs(args.accept_timeout_secs),
-        dry_run: args.dry_run,
+        accept_loss: args.accept_loss,
     };
     match ursula_ctl::recovery::recover_group(&client, &nodes, args.group, &options).await? {
         ursula_ctl::recovery::RecoverOutcome::Healthy => {
@@ -1147,16 +1149,68 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
                 args.group
             );
         }
-        ursula_ctl::recovery::RecoverOutcome::DryRun(plan) => println!(
-            "group {}: would plan leader {} at point {} (cut: {})",
-            args.group, plan.leader, plan.point, plan.cut
-        ),
+        ursula_ctl::recovery::RecoverOutcome::DryRun(explained) => {
+            print_plan_explanation(args.group, &explained);
+        }
         ursula_ctl::recovery::RecoverOutcome::Satisfied { plan, plans_sent } => println!(
             "group {}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
             args.group, plan.leader, plan.point, plan.cut
         ),
     }
     Ok(())
+}
+
+/// What `recover-group` would send, before `--accept-loss`.
+fn print_plan_explanation(group: u64, explained: &ursula_ctl::recovery::PlanExplanation) {
+    let plan = explained.plan;
+    println!(
+        "group {group}: would plan leader {} at point {} (cut: {}); nothing was sent",
+        plan.leader, plan.point, plan.cut
+    );
+    let longest = explained
+        .longest_last_log_term
+        .map_or("an empty log".to_owned(), |term| {
+            format!("last log term {term}")
+        });
+    if plan.cut {
+        println!(
+            "  cut: the longest voter log ends at {longest}, below the floor {}, the highest vote \
+             term a restricted replica holds; every replica keeps only what it knew was committed",
+            plan.floor
+        );
+    } else {
+        println!(
+            "  no cut: the longest voter log ends at {longest}, not below the floor {}",
+            plan.floor
+        );
+    }
+    println!(
+        "  plan term at least {}, the highest vote term read",
+        plan.highest_term
+    );
+    for member in &explained.members {
+        println!(
+            "  node {}: gate {:?}, expected last log index {:?}, last log term {:?}, current term {}, committed {:?}",
+            member.node_id,
+            member.gate,
+            member.log.last_log_index,
+            member.log.last_log_term,
+            member.log.current_term,
+            member.committed
+        );
+    }
+    if explained.unreached_voters.is_empty() {
+        println!("  every voter answered");
+    } else {
+        println!(
+            "  voters that did not answer, which the plan goes ahead without: {:?}",
+            explained.unreached_voters
+        );
+    }
+    println!(
+        "  to accept the loss of writes acknowledged after the last fsync and send it, run again \
+         with --accept-loss"
+    );
 }
 
 async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {
@@ -1221,5 +1275,39 @@ mod cli_tests {
         ])
         .expect_err("a removed override must not authorize legacy identities");
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// Item 2 of the #612 review: `recover-group` sends nothing unless the
+    /// operator accepts the loss.
+    #[test]
+    fn recover_group_sends_only_with_accept_loss() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "ursulactl",
+                "recover-group",
+                "--config",
+                "cluster.toml",
+                "--group",
+                "4",
+            ];
+            args.extend_from_slice(extra);
+            match super::Cli::try_parse_from(args).expect("parses").command {
+                super::Command::RecoverGroup(args) => args,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(!parse(&[]).accept_loss);
+        assert!(parse(&["--accept-loss"]).accept_loss);
+        let removed = super::Cli::try_parse_from([
+            "ursulactl",
+            "recover-group",
+            "--config",
+            "cluster.toml",
+            "--group",
+            "4",
+            "--dry-run",
+        ])
+        .expect_err("--dry-run is gone: a run without --accept-loss is the dry run");
+        assert_eq!(removed.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }
