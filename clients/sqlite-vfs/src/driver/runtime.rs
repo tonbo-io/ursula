@@ -82,6 +82,10 @@ enum Command {
         binding: BindingId,
         position: Position,
     },
+    Snapshotted {
+        binding: BindingId,
+        log_bytes: u64,
+    },
     Retire {
         binding: BindingId,
     },
@@ -199,6 +203,7 @@ impl Shared {
 /// The process's driver.
 pub(crate) struct Driver {
     commands: mpsc::Sender<Command>,
+    transports: Transports,
     shared: Arc<Shared>,
     next_id: AtomicU64,
     thread: Option<JoinHandle<()>>,
@@ -239,6 +244,7 @@ impl Driver {
         });
         let published = Arc::clone(&shared);
         let completions = commands.clone();
+        let own = Arc::clone(&transports);
         let spawned = std::thread::Builder::new()
             .name("ursula-vfs-driver".to_owned())
             .spawn(move || {
@@ -261,6 +267,7 @@ impl Driver {
             .ok();
         Self {
             commands,
+            transports: own,
             shared,
             next_id: AtomicU64::new(1),
             thread,
@@ -435,13 +442,25 @@ impl Driver {
         self.command(Command::Reset { binding, kind })
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "snapshots call it from PR7"))]
+    /// A batch must end exactly at `position`, a snapshot's `k`: its receipt reaches the
+    /// binding's snapshot thread ([`crate::snapshotter::Snapper`]).
     pub(crate) fn boundary(
         &self,
         binding: BindingId,
         position: Position,
     ) -> Result<(), DriverGone> {
         self.command(Command::Boundary { binding, position })
+    }
+
+    /// A snapshot published (or found superseded) covers `log_bytes` of the frame bytes counted
+    /// toward the next one.
+    pub(crate) fn snapshotted(&self, binding: BindingId, log_bytes: u64) -> Result<(), DriverGone> {
+        self.command(Command::Snapshotted { binding, log_bytes })
+    }
+
+    /// The transport of the stream at `url`: the snapshot thread's publishes go out on it.
+    pub(crate) fn transport(&self, url: &str) -> Arc<dyn Transport> {
+        (self.transports)(url)
     }
 }
 
@@ -705,6 +724,7 @@ fn handle(core: &mut Core, command: Command, now_ms: u64) -> Vec<Io> {
             target,
         } => core.sync(ticket, binding, target, now_ms),
         Command::Boundary { binding, position } => core.boundary(binding, position, now_ms),
+        Command::Snapshotted { binding, log_bytes } => core.snapshotted(binding, log_bytes, now_ms),
         Command::Retire { binding } => core.retire(binding, now_ms),
         Command::Unconnected { binding } => {
             core.unconnected(binding, now_ms);

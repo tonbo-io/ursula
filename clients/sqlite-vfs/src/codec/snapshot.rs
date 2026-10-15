@@ -25,6 +25,7 @@ use std::io::Write;
 
 use ursula_headers::Epoch;
 use ursula_headers::Offset;
+use ursula_headers::SnapshotDigest;
 
 use super::PAGE;
 use super::Take;
@@ -99,6 +100,13 @@ pub enum SnapshotError {
     Write(#[source] io::Error),
     #[error("zstd: {0}")]
     Zstd(#[source] io::Error),
+    #[error("the body's digest is {found}, the stream names {expected}")]
+    Digest {
+        expected: SnapshotDigest,
+        found: SnapshotDigest,
+    },
+    #[error("the body is of offset {found}, the stream names {expected}")]
+    Offset { expected: Offset, found: Offset },
 }
 
 /// Copies at most `limit` bytes from `from` to `to`, returning their length and crc32c.
@@ -233,6 +241,35 @@ pub fn read_header(body: &[u8]) -> Result<(SnapshotHeader, usize), SnapshotError
         crc,
     };
     Ok((header, HEADER))
+}
+
+/// Checks a snapshot body read from the stream before anything uses it: its digest under
+/// `content_type` against the `digest` the stream names, its header's checksum, and the offset
+/// the header names against the stream's `offset`. Returns the header and where the compressed
+/// image starts; [`read_image`] checks the image's checksum as it decompresses it.
+pub fn check_body(
+    content_type: &str,
+    body: &[u8],
+    offset: Offset,
+    digest: &SnapshotDigest,
+) -> Result<(SnapshotHeader, usize), SnapshotError> {
+    let mut digester = super::digest::SnapshotDigester::new(content_type);
+    digester.update(body);
+    let found = digester.finalize();
+    if found != *digest {
+        return Err(SnapshotError::Digest {
+            expected: *digest,
+            found,
+        });
+    }
+    let (header, at) = read_header(body)?;
+    if header.fields.offset != offset {
+        return Err(SnapshotError::Offset {
+            expected: offset,
+            found: header.fields.offset,
+        });
+    }
+    Ok((header, at))
 }
 
 /// Decompresses the image of a body whose header is `header` from `compressed` into `out`. The

@@ -31,6 +31,7 @@ interface Status {
 	epoch: number | null;
 	commits: { logged: number; confirmed: number; acknowledged: number; pending: number; pending_bytes: number };
 	replication: { state: string; condition: string | null };
+	snapshot: { offset: number | null; age_ms: number | null; failures: number; error: string | null; log_bytes: number; due_bytes: number };
 	refused: { kind: string; action: string; message: string } | null;
 	reset: { kind: string; action: string } | null;
 }
@@ -161,6 +162,25 @@ const children = new Set<Child>();
 afterEach(async () => {
 	for (const c of [...children]) await c.stop("SIGKILL");
 });
+
+/** The stream's latest snapshot offset and retained offset, from a HEAD. */
+async function retention(path: string): Promise<{ snapshot: number | null; retained: number }> {
+	const r = await fetch(`${ursulaUrl()}${path}`, { method: "HEAD" });
+	const snapshot = r.headers.get("stream-snapshot-offset");
+	return { snapshot: snapshot === null ? null : Number(snapshot), retained: Number(r.headers.get("stream-retained-offset") ?? "0") };
+}
+
+/** Polls the child's status until `ready` holds, for at most 20 s. */
+async function waitStatus(c: Child, ready: (s: Status) => boolean): Promise<Status> {
+	const deadline = Date.now() + 20_000;
+	let last: Status | undefined;
+	while (Date.now() < deadline) {
+		last = (await c.send({ status: true })).status as Status;
+		if (ready(last)) return last;
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	throw new Error(`status never got there: ${JSON.stringify(last)}`);
+}
 
 /** The rows of `table` in a fresh build from the stream: a new process with a new cache root. */
 async function fromStream(url: string, sql: string): Promise<unknown[]> {
@@ -397,6 +417,43 @@ describe.skipIf(inject("ursulaServer") !== "model")("the 0.8 core on node:sqlite
 		db.close();
 		expect(await fromStream(s.url, "SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }]);
 		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+	});
+
+	it("publishes snapshots, keeps retention one behind, and a fresh directory builds from the latest", async () => {
+		const s = stream("snapshot");
+		// Due after any acknowledged byte: one snapshot per commit transaction.
+		const owner = new Child(s.url, freshDir(), { URSULA_VFS_SNAPSHOT_DUE_BYTES: "1" });
+		await owner.opened();
+		await owner.exec("BEGIN; CREATE TABLE t(x, pad); WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM n WHERE v < 20) INSERT INTO t SELECT v, randomblob(2000) FROM n; COMMIT");
+		expect((await owner.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
+		const first = await waitStatus(owner, (st) => st.snapshot.offset !== null && st.snapshot.log_bytes === 0);
+		expect(first.snapshot.error).toBeNull();
+		expect(await retention(s.path)).toEqual({ snapshot: first.snapshot.offset, retained: 0 });
+		await owner.exec("WITH RECURSIVE n(v) AS (SELECT 21 UNION ALL SELECT v + 1 FROM n WHERE v < 40) INSERT INTO t SELECT v, randomblob(2000) FROM n");
+		expect((await owner.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
+		const second = await waitStatus(owner, (st) => (st.snapshot.offset ?? 0) > (first.snapshot.offset ?? 0) && st.snapshot.log_bytes === 0);
+		// Retention trails one snapshot behind.
+		expect(await retention(s.path)).toEqual({ snapshot: second.snapshot.offset, retained: first.snapshot.offset });
+		const rows = await owner.rows("SELECT x, hex(pad) AS pad FROM t ORDER BY x");
+		await owner.stop();
+		// Below retention, only the snapshot and the tail after it can build a fresh directory.
+		expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
+		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+	});
+
+	it("does not publish a snapshot body above the request limit and reports it in snapshot.error", async () => {
+		const s = stream("oversized");
+		const owner = new Child(s.url, freshDir(), { URSULA_VFS_SNAPSHOT_DUE_BYTES: "100000", URSULA_VFS_MAX_REQUEST_BYTES: "32768" });
+		await owner.opened();
+		await owner.exec("CREATE TABLE t(x, pad)");
+		for (let i = 1; i <= 40; i++) await owner.exec(`INSERT INTO t VALUES (${i}, randomblob(3000))`);
+		expect((await owner.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
+		const st = await waitStatus(owner, (st) => st.snapshot.error !== null);
+		expect(st.snapshot.error).toMatch(/^request_too_large: /);
+		expect(st.snapshot.offset).toBeNull();
+		expect(st.reset).toBeNull();
+		expect(await retention(s.path)).toEqual({ snapshot: null, retained: 0 });
+		await owner.stop();
 	});
 
 	it("refuses a write in EXCLUSIVE locking mode alone, as unsupported", () => {

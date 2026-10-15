@@ -29,6 +29,7 @@ use crate::ids::Activation;
 use crate::ids::Position;
 use crate::replicator::Action;
 use crate::replicator::BlockedReason;
+use crate::replicator::BoundaryReceipt;
 use crate::replicator::ClaimKind;
 use crate::replicator::Condition;
 use crate::replicator::Event;
@@ -113,6 +114,41 @@ fn a_batch_ends_exactly_at_a_boundary_and_within_the_limit() {
     let body = h.last_request().body.clone();
     assert_eq!(body.len(), pending[0].frame.len() + pending[1].frame.len());
     let len = u64::try_from(body.len()).unwrap();
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        1,
+        1,
+        37,
+        37 + len,
+        None,
+    )));
+    // W is the end offset of the receipt of the batch ending exactly at the boundary.
+    let receipts: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Boundary(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    let frame_bytes = u64::try_from(body.len()).unwrap();
+    assert_eq!(receipts, vec![BoundaryReceipt {
+        position: Position(2),
+        offset: Some(off(37 + len)),
+        epoch: Some(epoch(1)),
+        log_bytes: frame_bytes,
+    }]);
+    // Past the boundary, the limit cuts: records 3 and 4 do not fit with the limit at 3 frames
+    // only when their sum exceeds it.
+    let body = h.last_request().body.clone();
+    assert_eq!(body.len(), pending[2].frame.len() + pending[3].frame.len());
+}
+
+// A boundary at the acknowledged position answers at once with the acknowledged offset; one
+// below it, which no receipt ends at any more, answers without an offset.
+#[test]
+fn a_boundary_already_acknowledged_answers_at_once() {
+    let mut h = streaming(2);
+    let len = u64::try_from(h.last_request().body.len()).unwrap();
     h.answer(&producer(&receipt(
         Delivery::Applied,
         1,
@@ -121,10 +157,28 @@ fn a_batch_ends_exactly_at_a_boundary_and_within_the_limit() {
         37 + len,
         None,
     )));
-    // Past the boundary, the limit cuts: records 3 and 4 do not fit with the limit at 3 frames
-    // only when their sum exceeds it.
-    let body = h.last_request().body.clone();
-    assert_eq!(body.len(), pending[2].frame.len() + pending[3].frame.len());
+    let actions = h.on(Event::Boundary(Position(2)));
+    assert_eq!(actions, vec![Action::Boundary(BoundaryReceipt {
+        position: Position(2),
+        offset: Some(off(37 + len)),
+        epoch: Some(epoch(1)),
+        log_bytes: len,
+    })]);
+    let actions = h.on(Event::Boundary(Position(1)));
+    assert!(matches!(actions.as_slice(), [Action::Boundary(
+        BoundaryReceipt {
+            position: Position(1),
+            offset: None,
+            ..
+        }
+    )]));
+    // A published snapshot's bytes stop counting toward the next.
+    let actions = h.on(Event::Snapshotted { log_bytes: len });
+    assert_eq!(actions, vec![Action::PersistAck {
+        acked: Position(2),
+        acked_offset: off(37 + len),
+        log_bytes: 0,
+    }]);
 }
 
 #[test]
@@ -663,7 +717,8 @@ fn a_410_on_a_fresh_probe_fences() {
 fn a_commit_logged_while_catching_up_resets_internal() {
     let (mut h, _) = Harness::activate(ClaimKind::Takeover { round: 1 }, local(Vec::new(), 0));
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 500, 537, None)));
-    let actions = h.answer(&RawAnswer::new(410));
+    h.answer(&RawAnswer::new(410));
+    let actions = h.answer(&super::head_naming(None, 537));
     assert!(matches!(actions.first(), Some(Action::Rebuild { .. })));
     let actions = h.on(Event::Logged(commit(LINEAGE, 1, 1)));
     assert_eq!(reset_of(&actions), Some(ResetKind::Internal));

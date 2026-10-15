@@ -76,10 +76,6 @@ impl Method {
 }
 
 /// What a request addresses, relative to the stream URL.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(dead_code, reason = "the model server's side of the protocol")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
     /// The stream: `HEAD`, create (`PUT`), append (`POST`).
@@ -217,10 +213,6 @@ impl Request {
     }
 
     /// A read of the snapshot at `offset`, whose body is up to `answer_bytes`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "PR7 installs snapshots with it")
-    )]
     pub(crate) fn snapshot_read(offset: Offset, answer_bytes: u64) -> Self {
         Self {
             answer_bytes,

@@ -30,7 +30,11 @@
 //! Settings: `URSULA_VFS_TOKEN_FILE`, `URSULA_VFS_CA_FILE`, `URSULA_VFS_IDLE_MS`,
 //! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`. Test hooks:
 //! `URSULA_VFS_ABORT_AT=<step>[:<n>]` (`config::Step`), `URSULA_VFS_PANIC_IN=<entry>`,
-//! `URSULA_VFS_FAIL_SYNC=<path suffix>`.
+//! `URSULA_VFS_FAIL_SYNC=<path suffix>`, `URSULA_VFS_SNAPSHOT_DUE_BYTES=<bytes>`.
+//!
+//! Each bound database has a snapshot thread: past `max(db size, 8 MiB)` of acknowledged frame
+//! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
+//! retention one snapshot behind. Builds install the latest snapshot, then read the tail.
 //!
 //! Module map:
 //!
@@ -66,7 +70,8 @@
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle.
 //! - `replicator`: the replicator state machine of one bound database.
 //! - `replog`: the commit log, `USL1` segments in a generation's `log/`.
-//! - `snapshotter`: the snapshot thread's wake-up and backoff, kept for PR7's snapshots.
+//! - `snapshotter`: the snapshot thread of a bound database: snapshots keyed by offset and digest,
+//!   retention one snapshot behind.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: the JSON the SQL functions return.
 //! - `transport`: one attempt of a request, over HTTP or to the model in process.
@@ -97,10 +102,6 @@ mod options;
 mod publication;
 mod replicator;
 mod replog;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "PR7's snapshots wake and back off with it")
-)]
 mod snapshotter;
 mod stats;
 mod status;

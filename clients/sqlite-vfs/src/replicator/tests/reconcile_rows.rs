@@ -10,6 +10,7 @@ use super::LINEAGE;
 use super::cluster;
 use super::commit;
 use super::epoch;
+use super::head_naming;
 use super::local;
 use super::off;
 use super::producer;
@@ -17,10 +18,13 @@ use super::read;
 use super::receipt;
 use super::reset_of;
 use super::sends;
+use super::snapshot_body;
+use super::snapshot_read;
 use super::token;
 use crate::codec::frame;
 use crate::codec::frame::Frame;
 use crate::ids::Activation;
+use crate::ids::CommitId;
 use crate::ids::Lineage;
 use crate::ids::Position;
 use crate::replicator::Action;
@@ -35,6 +39,7 @@ use crate::replicator::reconcile::FrameClass;
 use crate::replicator::reconcile::Mode;
 use crate::replicator::reconcile::RowDecision;
 use crate::replicator::reconcile::decide_frame;
+use crate::wire::Method;
 use crate::wire::RawAnswer;
 use crate::wire::Target;
 
@@ -196,6 +201,7 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
         let actions = h.on(Event::CaughtUp {
             last: Position(7),
             log_bytes: 900,
+            lineage: LINEAGE,
         });
         assert!(actions.contains(&Action::Bound { epoch: epoch(1) }));
         assert!(streaming(&h));
@@ -235,6 +241,7 @@ fn row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale() 
     let actions = h.on(Event::CaughtUp {
         last: Position(1),
         log_bytes: 77,
+        lineage: LINEAGE,
     });
     assert!(actions.contains(&Action::PersistAck {
         acked: Position(1),
@@ -281,7 +288,11 @@ fn row_6_a_410_at_the_start_rebuilds_a_takeover_and_resets_a_continuation_stale(
         decide_frame(Mode::Takeover, FrameClass::Gone),
         RowDecision::Diverge
     );
-    let (h, actions) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
+    let tail = u64::try_from(p1.frame.len()).unwrap() + 37;
+    let (mut h, actions) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
+    // The rule reads the latest snapshot's header: a HEAD names it first, and here none exists.
+    assert_eq!(sends(&actions)[0].method, Method::Head, "{actions:?}");
+    let actions = h.answer(&head_naming(None, tail));
     assert!(!streaming(&h));
     assert!(
         actions.contains(&rebuild(Some(Position(1)), p1.frame.len() + 37)),
@@ -291,19 +302,124 @@ fn row_6_a_410_at_the_start_rebuilds_a_takeover_and_resets_a_continuation_stale(
         decide_frame(Mode::Continuation, FrameClass::Gone),
         RowDecision::Reset(ResetKind::Stale)
     );
-    let (_, actions) = reconcile(KINDS[1], &p1.frame, Some(RawAnswer::new(410)));
+    let (mut h, _) = reconcile(KINDS[1], &p1.frame, Some(RawAnswer::new(410)));
+    let actions = h.answer(&head_naming(None, tail));
     assert_eq!(reset_of(&actions), Some(ResetKind::Stale));
+}
+
+/// Pending records 1 and 2 landed before the claim, retention passed them, and the latest
+/// snapshot (at the end of record 2) is `last`'s: the 410 rule's input.
+fn gone_with_snapshot(kind: ClaimKind, last: CommitId) -> (Harness, Vec<Action>, u64) {
+    let p1 = commit(LINEAGE, 1, 1);
+    let p2 = commit(LINEAGE, 2, 2);
+    let w = u64::try_from(p1.frame.len() + p2.frame.len()).unwrap();
+    let (mut h, actions) = reconcile(
+        kind,
+        &concat(&[&p1.frame, &p2.frame]),
+        Some(RawAnswer::new(410)),
+    );
+    assert_eq!(sends(&actions)[0].method, Method::Head);
+    let (body, snapshot) = snapshot_body(w, last);
+    let actions = h.answer(&head_naming(Some(snapshot), w + 37));
+    assert_eq!(
+        sends(&actions)[0].target,
+        Target::Snapshot { offset: off(w) },
+        "{actions:?}"
+    );
+    let actions = h.answer(&snapshot_read(snapshot, body));
+    (h, actions, w)
+}
+
+// Our own snapshot at or past the acknowledged position: its records are acknowledged and the
+// reconcile goes on from its offset, here the claim's start, so nothing is rebuilt.
+#[test]
+fn row_6_a_410_continues_from_our_own_snapshot() {
+    for kind in KINDS {
+        let last = CommitId {
+            lineage: LINEAGE,
+            position: Position(2),
+        };
+        let (h, actions, w) = gone_with_snapshot(kind, last);
+        assert!(streaming(&h), "{kind:?}: {actions:?}");
+        assert!(!actions.iter().any(|a| matches!(a, Action::Rebuild { .. })));
+        assert_eq!(acked(&actions), Some(Position(2)), "{kind:?}");
+        assert!(
+            actions.contains(&Action::Wake {
+                acked: Position(2),
+                offset: off(w + 37),
+            }),
+            "{actions:?}"
+        );
+    }
+}
+
+// Another lineage's snapshot, or ours past what we logged, or one whose body does not match
+// its digest: a takeover diverges, a continuation resets `stale`.
+#[test]
+fn row_6_a_410_with_a_snapshot_that_does_not_cover_us_diverges() {
+    let foreign = CommitId {
+        lineage: OTHER_LINEAGE,
+        position: Position(2),
+    };
+    let ahead = CommitId {
+        lineage: LINEAGE,
+        position: Position(3),
+    };
+    for last in [foreign, ahead] {
+        let (_, actions, w) = gone_with_snapshot(KINDS[0], last);
+        let w = usize::try_from(w).unwrap();
+        assert!(
+            actions.contains(&rebuild(Some(Position(1)), w + 37)),
+            "{actions:?}"
+        );
+        let (_, actions, _) = gone_with_snapshot(KINDS[1], last);
+        assert_eq!(reset_of(&actions), Some(ResetKind::Stale));
+    }
+    // A body that is not the one the digest names.
+    let p1 = commit(LINEAGE, 1, 1);
+    let w = u64::try_from(p1.frame.len()).unwrap();
+    let (mut h, _) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
+    let last = CommitId {
+        lineage: LINEAGE,
+        position: Position(1),
+    };
+    let (mut body, snapshot) = snapshot_body(w, last);
+    h.answer(&head_naming(Some(snapshot), w + 37));
+    body.push(0);
+    let actions = h.answer(&snapshot_read(snapshot, body));
+    assert!(
+        matches!(actions.first(), Some(Action::Rebuild { .. })),
+        "{actions:?}"
+    );
+}
+
+// A snapshot superseded between the HEAD and its read: the HEAD again.
+#[test]
+fn row_6_a_snapshot_gone_before_its_read_heads_again() {
+    let p1 = commit(LINEAGE, 1, 1);
+    let w = u64::try_from(p1.frame.len()).unwrap();
+    let (mut h, _) = reconcile(KINDS[0], &p1.frame, Some(RawAnswer::new(410)));
+    let last = CommitId {
+        lineage: LINEAGE,
+        position: Position(1),
+    };
+    let (_, snapshot) = snapshot_body(w, last);
+    h.answer(&head_naming(Some(snapshot), w + 37));
+    let actions = h.answer(&RawAnswer::new(404));
+    assert_eq!(sends(&actions)[0].method, Method::Head, "{actions:?}");
 }
 
 #[test]
 fn row_6_a_410_with_nothing_pending_still_rebuilds() {
     let (mut h, _) = Harness::activate(KINDS[0], local(Vec::new(), 0));
     h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 500, 537, None)));
-    let actions = h.answer(&RawAnswer::new(410));
+    h.answer(&RawAnswer::new(410));
+    let actions = h.answer(&head_naming(None, 537));
     assert_eq!(actions, vec![rebuild(None, 537)]);
     let actions = h.on(Event::CaughtUp {
         last: Position(4),
         log_bytes: 0,
+        lineage: LINEAGE,
     });
     assert!(streaming(&h));
     assert!(actions.contains(&Action::Wake {
@@ -348,6 +464,7 @@ fn a_catch_up_in_place_applies_each_read_before_the_next() {
     let actions = h.on(Event::CaughtUp {
         last: Position(1),
         log_bytes: 10,
+        lineage: LINEAGE,
     });
     let reads = sends(&actions);
     assert_eq!(reads.len(), 1);
@@ -361,6 +478,7 @@ fn a_catch_up_in_place_applies_each_read_before_the_next() {
     let actions = h.on(Event::CaughtUp {
         last: Position(2),
         log_bytes: 20,
+        lineage: LINEAGE,
     });
     assert!(actions.contains(&Action::Bound { epoch: epoch(1) }));
     assert_eq!(acked(&actions), Some(Position(2)));
@@ -385,6 +503,7 @@ fn a_catch_up_in_place_that_grows_past_the_database_rebuilds() {
     h2.on(Event::CaughtUp {
         last: Position(1),
         log_bytes: 10,
+        lineage: LINEAGE,
     });
     let actions = h2.answer(&read(&second.frame, 2 * len));
     let len_usize = usize::try_from(len).unwrap();
@@ -407,9 +526,11 @@ fn a_410_after_a_read_was_applied_rebuilds() {
     let actions = h.on(Event::CaughtUp {
         last: Position(1),
         log_bytes: 10,
+        lineage: LINEAGE,
     });
     assert_eq!(sends(&actions).len(), 1);
-    let actions = h.answer(&RawAnswer::new(410));
+    h.answer(&RawAnswer::new(410));
+    let actions = h.answer(&head_naming(None, 2 * len + 37));
     let len = usize::try_from(len).unwrap();
     assert_eq!(actions, vec![rebuild(None, 2 * len + 37)]);
 }

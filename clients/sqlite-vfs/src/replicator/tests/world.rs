@@ -451,6 +451,7 @@ impl World {
             catching_up: false,
         };
         let local = LocalState {
+            lineage: log.lineage,
             activation,
             cluster_id: cluster(),
             incarnation: log.incarnation,
@@ -498,6 +499,7 @@ impl World {
             .map(|(_, p)| p.clone())
             .collect();
         let local = LocalState {
+            lineage: log.lineage,
             activation,
             cluster_id: cluster(),
             incarnation: log.incarnation,
@@ -674,7 +676,7 @@ impl World {
                 Action::Timer { at_ms, jitter_ms } => {
                     self.owners[index].inst.timer = Some(at_ms.saturating_add(jitter_ms));
                 }
-                Action::Condition(_) => {}
+                Action::Condition(_) | Action::Boundary(_) => {}
                 // A catch-up logs every frame of one read as a COMMIT record at the next
                 // positions, then the ACK covering them, fsynced, before the next read.
                 Action::Apply(frames) => {
@@ -1077,7 +1079,11 @@ impl World {
             if let Some(discard_from) = self.owners[index].inst.unpublished.take() {
                 self.publish(index, discard_from);
             }
-            self.event(index, Event::CaughtUp { last, log_bytes: 0 });
+            self.event(index, Event::CaughtUp {
+                last,
+                log_bytes: 0,
+                lineage: self.owners[index].log.lineage,
+            });
         }
     }
 
@@ -1375,6 +1381,7 @@ fn ending(inst: &Instance) -> Result<&'static str, String> {
             Step::Reconcile { .. } => "reconciling",
             Step::Applying { .. } => "applying a read",
             Step::CatchingUp(_) => "catching up",
+            Step::Gone { .. } => "reading the latest snapshot after a 410",
         })),
         Replicator::Reset(_) | Replicator::Refused(_) | Replicator::Stopped => Ok("reset"),
     }

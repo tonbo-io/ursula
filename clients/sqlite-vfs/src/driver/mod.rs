@@ -43,6 +43,7 @@ use crate::open::OpenError;
 use crate::replicator::Condition;
 use crate::replicator::ResetKind;
 use crate::replog::Log;
+use crate::snapshotter::Snapshots;
 use crate::transport::Attempt;
 use crate::wire::Request;
 
@@ -146,6 +147,8 @@ pub(crate) struct BindingHandle {
     replication: Mutex<Replication>,
     /// Released when the binding retires with no connection left; otherwise with the last handle.
     root: Mutex<Option<Arc<Root>>>,
+    /// The snapshot thread's wake-up, the receipts of its boundaries and its status.
+    pub(crate) snapshots: Snapshots,
 }
 
 /// Where a binding stands between its connections and the driver.
@@ -176,6 +179,10 @@ pub(crate) struct Replication {
     pub(crate) condition: Option<Condition>,
     /// Logged commits not yet acknowledged.
     pub(crate) pending: usize,
+    /// Frame bytes acknowledged since the latest snapshot.
+    pub(crate) log_bytes: u64,
+    /// The request limit `L` (design §4.6).
+    pub(crate) request_limit: u64,
 }
 
 const RESETS: [ResetKind; 7] = [
@@ -222,6 +229,7 @@ impl BindingHandle {
             replication: Mutex::new(Replication::default()),
             last_commit: AtomicU64::new(0),
             root: Mutex::new(Some(root)),
+            snapshots: Snapshots::default(),
         }
     }
 
@@ -333,6 +341,17 @@ impl BindingHandle {
             return false;
         }
         l.life = Life::Live;
+        l.connections = l.connections.saturating_add(1);
+        true
+    }
+
+    /// The extension's private connection opens: counted only while the binding is live with a
+    /// connection open already. False otherwise.
+    pub(crate) fn connect_beside(&self) -> bool {
+        let mut l = self.life_lock();
+        if l.life != Life::Live || l.connections == 0 {
+            return false;
+        }
         l.connections = l.connections.saturating_add(1);
         true
     }

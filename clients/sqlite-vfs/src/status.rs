@@ -91,6 +91,32 @@ pub(crate) fn status_json(b: &Binding) -> String {
                 .map_or_else(null, |c| json_str(condition(c))),
         ),
     ]);
+    let snapshots = h.snapshots.status();
+    let snapshot = object(&[
+        (
+            "offset",
+            snapshots
+                .published
+                .map_or_else(null, |(offset, _)| offset.get().to_string()),
+        ),
+        (
+            "age_ms",
+            snapshots
+                .published
+                .map_or_else(null, |(_, at)| at.elapsed().as_millis().to_string()),
+        ),
+        (
+            "failures",
+            snapshots
+                .failing
+                .as_ref()
+                .map_or(0, |f| f.count)
+                .to_string(),
+        ),
+        ("error", snapshots.error().map_or_else(null, json_str)),
+        ("log_bytes", replication.log_bytes.to_string()),
+        ("due_bytes", h.snapshots.due_bytes().to_string()),
+    ]);
     let refused = refused.map_or_else(null, |r| {
         object(&[
             ("kind", json_str(r.kind().as_str())),
@@ -133,6 +159,7 @@ pub(crate) fn status_json(b: &Binding) -> String {
         ("lineage", json_str(&lineage)),
         ("commits", commits),
         ("replication", repl),
+        ("snapshot", snapshot),
         ("refused", refused),
         ("reset", reset_json),
     ])

@@ -84,7 +84,22 @@ pub(crate) struct Commit {
     pub(crate) based: Position,
     /// The latest write refused, until a commit is logged.
     pub(crate) refused: Option<WriteRefusal>,
+    /// The snapshot thread's window (design §4.11).
+    pub(crate) window: Window,
     pub(crate) stats: Stats,
+}
+
+/// The snapshot thread's window: while it is open no commit is logged, so the snapshot's
+/// checkpoint and the start of its read transaction see exactly its `k`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Window {
+    #[default]
+    Closed,
+    /// A snapshot waits for no undecided commit and no other checkpointer: a commit point waits
+    /// for it at most a second.
+    Wanted,
+    /// Commit points wait until it closes.
+    Open,
 }
 
 impl Commit {
@@ -147,6 +162,12 @@ impl Binding {
     /// A main db handle opened: a retiring binding is taken back. False once it retired.
     pub(crate) fn connect(&self) -> bool {
         self.handle.connect()
+    }
+
+    /// The extension's private connection opened: counted only beside a connection of the host,
+    /// so it never takes a retiring binding back. False otherwise.
+    pub(crate) fn connect_private(&self) -> bool {
+        self.handle.connect_beside()
     }
 
     /// A main db handle closed: after the last one, the binding drains and retires.
@@ -417,6 +438,7 @@ fn register(bound: Bound, url: String) -> Result<Arc<Binding>, Error> {
         ("file", &b.path),
         ("stream", &b.url),
     ]);
+    crate::snapshotter::spawn(&b);
     handed_out(&b);
     Ok(b)
 }
