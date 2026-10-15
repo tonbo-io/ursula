@@ -167,7 +167,8 @@ leader and refuses writes. The groups are listed under
 If the stalled replicas retain their voting history, an operator can accept
 the loss of writes acknowledged after the last `fsync` with a recovery plan,
 sent through `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` to
-every replica that answers, the leader last. The plan starts a new history of
+the plan's leader first and then to every other replica that answers, with the
+leader's plan term (`ursulactl recover-group` does both). The plan starts a new history of
 the group, so every stream of the group gets a new `Stream-Incarnation`. A
 voter of the group that was never gated does not report `recovery_stalled`. It
 answers `raft_replica_unready` with `leader_unknown` for the group. See
@@ -181,12 +182,14 @@ proof. Restore connectivity to intact voters.
 
 The call also refuses when the replica leads or follows a live leader, when
 its gate awaits or applies a leader's barrier (it may still open without losing
-anything), when the plan's leader is not a voter, when the replica no longer
-holds the log the plan's `expected` names, when it committed or applied an entry
-above the plan's `point`, or when it is the plan's leader and its log does not
-continue from the `point` or end at `leader_last_log_term`. Read
-`/__ursula/metrics` on every replica again and plan again with what it shows.
-A body of the 0.7 form answers `422`.
+anything) or runs a plan's cut, when the request's `step` is not the replica's
+(`lead` for the plan's leader, `follow` for every other replica), when the
+plan's leader is not a voter, when the replica no longer holds the log the
+plan's `expected` names, when it committed or applied an entry above the plan's
+`point`, when it is the plan's leader and its log does not continue from the
+`point`, or when the plan's cut cannot run because the log no longer holds the
+entry it keeps. Read `/__ursula/metrics` on every replica again and plan again
+with what it shows. A body of the 0.7 form answers `422`.
 
 ### Writes and reads answer `503` after a recovery plan
 

@@ -40,6 +40,7 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `backup-create` | Export every Raft group into a backup at a local directory or `s3://bucket/prefix` |
 | `backup-verify` | Check a backup's manifest, sizes, checksums and every group snapshot without contacting a cluster |
 | `restore` | Restore a verified backup into a fresh, empty cluster with the same group count, once the cluster confirms it holds every cold object the backup references |
+| `recover-group --group G` | Accept the unsynced loss of one stalled group: plan it from every reachable voter, send the plan to its leader first and then to the other voters with the leader's plan term, and wait until its history event applied. A plan that wedges or is refused is planned again, up to `--max-plans`. `--dry-run` prints the plan. See [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash) |
 
 Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe transfer target, catch-up stall). Anything else is a configuration or transport error with a single-line, machine-greppable message.
 

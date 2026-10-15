@@ -178,25 +178,30 @@ While at most a minority of a group's voters lost their tail, the other voters h
 
 **A majority of a group's voters lost their tail at once.** If the group's leader kept its log, it stays leader and its barrier opens the gated replicas as above. Otherwise the gated voters refuse every vote, so the group elects no leader and writes answer `503`. After `30s` without a leader barrier and without applying anything, each gated replica reports its group stalled: readiness reason `recovery_stalled`, the group under `recovery_stalled_groups` in `GET /__ursula/ready` and under `recovery_gates.stalled` in the metrics, the `ursula.raft.recovery_gates{status="stalled"}` gauge, and an error log naming the group. Writes acknowledged after the last `fsync` of the surviving replicas may be gone. Only an operator can accept that, with a recovery plan. The plan elects one replica as the group's leader, and that leader starts a new history of the group: every stream of the group gets a new `Stream-Incarnation`, and every producer epoch claimed before is closed (see [history rewrites](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation)). For each stalled group:
 
-1. On every voter, read `GET /__ursula/metrics`: the group's gate under `recovery_gates.gated` (a group missing there is open), and under `raft_groups` its `last_log_term`, `last_log_index`, `current_term`, `committed_index` and `recovery`. Go on only when a majority of the group's voters answer, and only while no replica's gate is `awaiting_barrier` or `catching_up`: such a replica may still open through a leader's barrier without losing anything.
+`ursulactl recover-group --config cluster.toml --group 42` runs the steps below for one group: it reads every voter, computes the plan, sends it to the plan's leader first and then to every other replica that answered, and waits until the plan is satisfied. It plans again when a plan wedges (see below) or a replica refuses it, up to `--max-plans` plans. `--dry-run` prints the plan and sends nothing ([ursulactl](/docs/cli)). By hand:
+
+1. On every voter, read `GET /__ursula/metrics`, and under `raft_groups` the group's `recovery_gate`, `last_log_term`, `last_log_index`, `current_term`, `committed_index` and `recovery`. Go on only when a majority of the group's voters answer, and only while no replica's gate is `awaiting_barrier`, `catching_up` or `cutting`: such a replica may still open through a leader's barrier without losing anything, or is running a plan's cut.
 2. Compute the plan from the replicas that answered:
    - `floor`: the highest `current_term` among the replicas whose gate is not open or whose `recovery` is not `null`.
    - The leader: the replica with the greatest last log id, highest `last_log_term` first, then highest `last_log_index`. An empty log (`null`) ranks last. Its `last_log_index` is the plan's `point`, and `cut` is `false`.
    - When the group has more than one voter and that replica's `last_log_term` is below `floor`, its log may hold an entry that a lost leader overwrote. Then `cut` is `true`, the leader is the replica with the greatest `committed_index`, and its `committed_index` is the `point`. Every replica then keeps only the entries it knew were committed.
-3. Send the plan to every replica that answered, the leader last: `{"leader", "point", "cut", "leader_last_log_term", "expected": {"last_log_index", "last_log_term", "current_term"}}`, where `leader_last_log_term` is the leader's `last_log_term` and `expected` is what you read on that replica.
-4. Each answers its `outcome`: `leads` or `follows`. When the plan cuts, the replica first stops voting and taking replication, restarts its group in the process with the log cut back to its committed entry, and answers once the restarted group holds the plan.
+3. Send the plan to the leader first: `{"leader", "point", "cut", "step": "lead", "expected": {"last_log_index", "last_log_term", "current_term"}}`, where `expected` is what you read on the leader. It answers `outcome` `leads` and `leader_term`, the plan term.
+4. Then send it to every other replica that answered, with `"step": {"follow": {"leader_term": T}}` where `T` is the leader's plan term, and `expected` as you read it on that replica. Each answers `follows`.
+5. When the plan cuts, each replica first stops voting and taking replication, restarts its group in the process with the log cut back to its committed entry, and answers once the restarted group holds the plan.
 
-A replica that holds a plan votes only for the plan's leader, and when the plan cuts, only once the leader's log ends at the point or carries a term above `leader_last_log_term`, so the leader's stale entries never win an election. Once elected, the leader proposes the group's history event before anything else and answers `503` with `Retry-After` to writes and reads until the event applies. On each replica the plan is satisfied once it applied the event: `history.event_index` above the plan's `point` and `recovery` back to `null` in its metrics. The plan is recorded in the node's metadata, so a restart keeps it until then, and the leader serves nothing until its record is gone. A replica that lost power again after taking the plan keeps its vote restricted to the plan's leader across restarts, and once the event applies its gate stays closed until a leader's barrier opens it. Leaders after that hold the event, so a later leader change starts no new history. If the plan's leader loses entries it had replicated, for example in a crash right after its election, the members' logs are longer than its own and they elect no one: the gates report `planned` and the group stalls. Plan again; the new plan elects the member with the longest log.
+The plan's leader takes the plan by voting for itself at the plan term, the term after its current one. From then on it campaigns but votes for no other candidate, and it serves nothing until the plan's history event applies. A replica that holds the plan votes only for the plan's leader, and only in an election at a term above the plan term: an election the leader started after it took the plan. So no replica elects a leader that has not taken the plan, even one that campaigns while the plan reaches the other replicas. Once elected, the leader proposes the group's history event before anything else and answers `503` with `Retry-After` to writes and reads until the event applies. On each replica the plan is satisfied once it applied the event: `history.event_index` above the plan's `point` and `recovery` back to `null` in its metrics. The plan is recorded in the node's metadata, so a restart keeps it until then, and the leader serves nothing until its record is gone. A replica that lost power again after taking the plan keeps its vote restricted to the plan's leader across restarts, and once the event applies its gate stays closed until a leader's barrier opens it. Leaders after that hold the event, so a later leader change starts no new history.
+
+If the plan's leader loses entries it had replicated, for example in a crash right after its election, the other replicas' logs are longer than its own and they elect no one. The plan wedges. After `30s` in which a replica holding the plan applied nothing, it reports its group stalled like a closed gate does: readiness reason `recovery_stalled`, and `stalled` as its `recovery_gate`. Plan again. The new plan replaces the first, and since the wedged leader's failed elections raised its vote term, it usually cuts every log back to its committed entry. `ursulactl recover-group` plans again by itself when a replica holding the plan has a longer log than the plan's leader, or reports the group stalled.
 
 ```bash
 # group 42: one admin URL per voter, through your forwards
 admins=(http://127.0.0.1:5441 http://127.0.0.1:5442 http://127.0.0.1:5443)
 for admin in "${admins[@]}"; do
   curl -sS --fail "${admin}/__ursula/metrics" | jq -c --arg admin "${admin}" '
-    .process_incarnation as $incarnation | (.recovery_gates.gated // {}) as $gated
+    .process_incarnation as $incarnation
     | .raft_groups[] | select(.raft_group_id == 42)
     | {admin: $admin, process_incarnation: $incarnation, node_id, voters: (.voter_ids | length),
-       gate: ($gated[.raft_group_id | tostring] // "open"), recovery, committed_index,
+       gate: .recovery_gate, recovery, committed_index,
        expected: {last_log_index, last_log_term, current_term}}'
 done > replicas.jsonl
 
@@ -206,29 +211,41 @@ jq -sc 'select(length * 2 > .[0].voters)
   | ((.[0].voters > 1) and (($longest.expected.last_log_term // 0) < $floor)) as $cut
   | (if $cut then max_by([.committed_index // -1, .node_id]) else $longest end) as $leader
   | {leader: $leader.node_id, cut: $cut,
-     point: (if $cut then $leader.committed_index else $leader.expected.last_log_index end // 0),
-     leader_last_log_term: $leader.expected.last_log_term} as $plan
-  | sort_by(.node_id == $leader.node_id)[] | . + {plan: ($plan + {expected})}' replicas.jsonl > plan.jsonl
+     point: (if $cut then $leader.committed_index else $leader.expected.last_log_index end // 0)} as $plan
+  | sort_by(.node_id != $leader.node_id)[] | . + {plan: ($plan + {expected})}' replicas.jsonl > plan.jsonl
 
-# Review plan.jsonl, then send it, the leader last. Stop at the first refusal and observe again.
+# Review plan.jsonl, then send it: the leader first, then every other replica with the
+# leader's plan term. Stop at the first refusal.
+leader_term=""
 while read -r replica; do
-  curl -sS --fail -w '\n' -H "x-ursula-process-incarnation: $(jq -r .process_incarnation <<<"${replica}")" \
-    -H "content-type: application/json" -d "$(jq -c .plan <<<"${replica}")" \
-    -X POST "$(jq -r .admin <<<"${replica}")/__ursula/raft/42/recovery/accept-unsynced-loss" || break
+  if [ -z "${leader_term}" ]; then
+    body=$(jq -c '.plan + {step: "lead"}' <<<"${replica}")
+  else
+    body=$(jq -c --argjson term "${leader_term}" '.plan + {step: {follow: {leader_term: $term}}}' <<<"${replica}")
+  fi
+  answer=$(curl -sS --fail -H "x-ursula-process-incarnation: $(jq -r .process_incarnation <<<"${replica}")" \
+    -H "content-type: application/json" -d "${body}" \
+    -X POST "$(jq -r .admin <<<"${replica}")/__ursula/raft/42/recovery/accept-unsynced-loss") || break
+  echo "${answer}"
+  leader_term=${leader_term:-$(jq -r .leader_term <<<"${answer}")}
 done < plan.jsonl
 ```
 
-The script plans one group. For many stalled groups, as after a rack power loss, run it for each, one group at a time.
+If the leader refuses the plan, nothing changed: read the metrics again and plan again. A replica that refuses after the leader took the plan does not undo it. The replicas that took it elect the leader, and a replica the elected leader reached refuses because it follows a live leader and rejoins through it. Wait until the plan is satisfied, or plan again when it wedges.
+
+The script plans one group. For many stalled groups, as after a rack power loss, run it or `ursulactl recover-group` for each, one group at a time.
 
 The call is refused with `409 Conflict`, and changes nothing, when:
 
 - the replica lost its vote and has not established a durable vote floor. Restore connectivity to an intact quorum so it can obtain a fresh barrier. Accepting unsynced data loss cannot authorize a replica to acknowledge an unknown leader.
-- the replica leads the group with a quorum that acknowledged it within the last 3 seconds, or follows a leader whose replication reached it within the last 3 seconds, or its gate awaits or applies a leader's barrier. The group has a live leader or may still recover without loss.
+- the replica leads the group with a quorum that acknowledged it within the last 3 seconds, or follows a leader whose replication reached it within the last 3 seconds, or its gate awaits or applies a leader's barrier or runs a plan's cut. The group has a live leader or may still recover without loss.
+- the request's `step` is not the replica's: `lead` goes to the plan's leader only, and `follow` to every other replica.
 - the plan's leader is not one of the group's voters.
-- the replica no longer holds the log `expected` names, because it moved since you read the metrics. Read the metrics again and plan again.
+- the replica no longer holds the log `expected` names, because it moved since you read the metrics. A replica that campaigns, one with an open gate or the plan's leader, raises its `current_term` with every election it starts, so only its last log id is compared. Read the metrics again and plan again.
 - the replica committed or applied an entry above the plan's `point`. The plan picked the wrong leader: read the metrics again and plan again.
-- the replica is the plan's leader and its log does not continue from the `point` (its last log index, or its committed index when the plan cuts), or `leader_last_log_term` is not its last log term.
+- the replica is the plan's leader and its log does not continue from the `point`: its last log index, or its committed index when the plan cuts.
 - the plan cuts and the replica knows no committed entry, or no longer holds the committed entry it recorded.
+- the plan cuts and its cut cannot run when the group restarts, because the log no longer holds the entry it keeps. The replica drops the plan, keeps its gate closed and answers `409`. Read the metrics again and plan again.
 
 A body of the 0.7 form answers `422`. A second plan replaces a first one that was never satisfied, as long as `floor` counts the replicas the first one holds.
 
