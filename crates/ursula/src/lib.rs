@@ -1522,7 +1522,7 @@ fn producer_answer_response(
     insert_producer_answer(&mut headers, &answer);
     let status = match (to, &answer) {
         (AnswerTo::CloseOnly, ProducerAnswer::Receipt { .. }) => StatusCode::NO_CONTENT,
-        _ => StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::NO_CONTENT),
+        _ => StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     };
     (status, headers).into_response()
 }
@@ -2834,7 +2834,7 @@ pub(crate) async fn append_stream(
     body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    if early_answer_may_help(&headers, version)
+    if early_answer_may_help(&headers)
         && let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await
     {
         return answer_before_body(answer, version, &headers, body).await;
@@ -2891,18 +2891,19 @@ async fn producer_early_answer(
 }
 
 /// The smallest declared body for which an early answer is worth its lookup
-/// on HTTP/1.1 without `Expect: 100-continue`: below it the drain costs about
-/// what the upload does, and the lookup would end the group's append batch
-/// for nothing.
+/// without `Expect: 100-continue`, on any HTTP version: below it the lookup
+/// ends the group's append batch for less than it saves. On HTTP/2 the
+/// answer saves the rest of the upload; on HTTP/1.1 the body is still read
+/// and dropped, so the answer saves the staging and the proposal.
 const EARLY_ANSWER_MIN_BODY_BYTES: u64 = 64 * 1024;
 
-/// Whether to look for an early answer: only when it can save the upload
-/// (HTTP/2, `Expect: 100-continue`, or a declared body of at least
-/// [`EARLY_ANSWER_MIN_BODY_BYTES`]), and only after the request-shape checks
+/// Whether to look for an early answer: only after `Expect: 100-continue`,
+/// which always saves the upload, or for a declared body of at least
+/// [`EARLY_ANSWER_MIN_BODY_BYTES`], and only after the request-shape checks
 /// of step 1 (#581 section 5.3) pass, as on the late path. The content
 /// checks of step 5 come after the producer rows on both paths, so a repeat
 /// or a key conflict is answered whatever the body is.
-fn early_answer_may_help(headers: &HeaderMap, version: Version) -> bool {
+fn early_answer_may_help(headers: &HeaderMap) -> bool {
     let expects_continue = headers
         .get(axum::http::header::EXPECT)
         .and_then(|value| value.to_str().ok())
@@ -2911,10 +2912,9 @@ fn early_answer_may_help(headers: &HeaderMap, version: Version) -> bool {
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let saves_upload = version >= Version::HTTP_2
-        || expects_continue
-        || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES);
-    saves_upload
+    let worth_it =
+        expects_continue || content_length.is_some_and(|len| len >= EARLY_ANSWER_MIN_BODY_BYTES);
+    worth_it
         && removed_surface::reject_removed_append_headers(headers).is_ok()
         && incarnation_precondition(headers).is_ok()
         && stream_seq(headers).is_ok()

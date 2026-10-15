@@ -96,6 +96,8 @@ struct Write<'a> {
     closes: bool,
     /// Declares the body's length in `Content-Length`.
     declared: bool,
+    /// Sends `Expect: 100-continue`.
+    expecting: bool,
     /// The text whose digest `Producer-Digest` names, when not the body's.
     digest_of: Option<&'a str>,
     /// Sends no `Content-Type`.
@@ -113,6 +115,7 @@ impl<'a> Write<'a> {
             version: Version::HTTP_11,
             closes: false,
             declared: false,
+            expecting: false,
             digest_of: None,
             untyped: false,
         }
@@ -142,6 +145,13 @@ impl<'a> Write<'a> {
     fn closing(self) -> Self {
         Self {
             closes: true,
+            ..self
+        }
+    }
+
+    fn expecting(self) -> Self {
+        Self {
+            expecting: true,
             ..self
         }
     }
@@ -195,6 +205,9 @@ async fn send(app: &Router, write: &Write<'_>) -> (Response, bool) {
     }
     if write.closes {
         request = request.header("stream-closed", "true");
+    }
+    if write.expecting {
+        request = request.header("expect", "100-continue");
     }
     if write.declared {
         request = request.header("content-length", write.body.len().to_string());
@@ -483,10 +496,15 @@ async fn a_tokened_repeat_or_key_conflict_is_answered_before_the_body() {
     let first = answer(&first);
     let after = tail(&app).await;
 
-    // On HTTP/2 the answer goes first: the body is never polled.
+    // After `Expect: 100-continue` the answer goes first: the body is never
+    // polled.
     let (repeat, polled) = send(
         &app,
-        &Write::new(0, 0, "abc").digest().tokened(&token).http2(),
+        &Write::new(0, 0, "abc")
+            .digest()
+            .tokened(&token)
+            .http2()
+            .expecting(),
     )
     .await;
     assert!(!polled, "an early answer polls no body");
@@ -509,7 +527,11 @@ async fn a_tokened_repeat_or_key_conflict_is_answered_before_the_body() {
     });
     let (conflict, polled) = send(
         &app,
-        &Write::new(0, 0, "xyz").digest().tokened(&token).http2(),
+        &Write::new(0, 0, "xyz")
+            .digest()
+            .tokened(&token)
+            .http2()
+            .expecting(),
     )
     .await;
     assert!(!polled, "a key conflict polls no body");
@@ -517,8 +539,15 @@ async fn a_tokened_repeat_or_key_conflict_is_answered_before_the_body() {
         epoch: Epoch::ZERO
     });
 
-    // On HTTP/1.1 without `Expect`, a small body is read and decided at
-    // apply: the lookup would save nothing.
+    // Without `Expect`, a small body is read and decided at apply, on
+    // either version: the lookup would save less than it costs.
+    let (repeat, polled) = send(
+        &app,
+        &Write::new(0, 0, "abc").digest().tokened(&token).http2(),
+    )
+    .await;
+    assert!(polled, "a small HTTP/2 body without Expect is read");
+    assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
     let (repeat, polled) = send(&app, &Write::new(0, 0, "abc").digest().tokened(&token)).await;
     assert!(polled, "a small HTTP/1.1 body is read");
     assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
@@ -526,12 +555,15 @@ async fn a_tokened_repeat_or_key_conflict_is_answered_before_the_body() {
 
     // Untokened, or under another token, the write is read and decided at
     // apply.
-    let (repeat, polled) = send(&app, &Write::new(0, 0, "abc").digest().http2()).await;
+    let (repeat, polled) = send(&app, &Write::new(0, 0, "abc").digest().http2().expecting()).await;
     assert!(polled, "an untokened write is read");
     assert_eq!(repeat.status(), StatusCode::NO_CONTENT);
     let (stale, polled) = send(
         &app,
-        &Write::new(0, 0, "abc").tokened("4503599627370497").http2(),
+        &Write::new(0, 0, "abc")
+            .tokened("4503599627370497")
+            .http2()
+            .expecting(),
     )
     .await;
     assert!(polled, "a write under another token is read");
@@ -556,8 +588,11 @@ async fn early_and_late_answers_agree() {
     // A repeat of the newest write, and of an older one, early (HTTP/2) and
     // late (a small HTTP/1.1 body): the same headers.
     for (seq, body) in [(1, "y"), (0, big.as_str())] {
-        let (early, early_polled) =
-            send(&app, &Write::new(0, seq, body).tokened(&token).http2()).await;
+        let (early, early_polled) = send(
+            &app,
+            &Write::new(0, seq, body).tokened(&token).http2().expecting(),
+        )
+        .await;
         let (late, late_polled) = send(&app, &Write::new(0, seq, "z").tokened(&token)).await;
         assert!(!early_polled && late_polled, "{seq}");
         assert_eq!(early.status(), late.status(), "{seq}");
@@ -573,7 +608,11 @@ async fn early_and_late_answers_agree() {
     // A close-only repeat of a key whose write was an append: the receipt,
     // and no `Stream-Closed` on the open stream, on both paths.
     for write in [
-        Write::new(0, 1, "").tokened(&token).closing().http2(),
+        Write::new(0, 1, "")
+            .tokened(&token)
+            .closing()
+            .http2()
+            .expecting(),
         Write::new(0, 1, "").tokened(&token).closing(),
     ] {
         let (repeat, _) = send(&app, &write).await;
@@ -587,14 +626,14 @@ async fn early_and_late_answers_agree() {
     // apply is `400 EmptyAppend` (#581 section 5.3, step 5).
     assert_same_answer(
         &app,
-        Write::new(0, 1, "").tokened(&token).http2(),
+        Write::new(0, 1, "").tokened(&token).http2().expecting(),
         Write::new(0, 1, "").tokened(&token),
         StatusCode::NO_CONTENT,
     )
     .await;
     assert_same_answer(
         &app,
-        Write::new(0, 2, "").tokened(&token).http2(),
+        Write::new(0, 2, "").tokened(&token).http2().expecting(),
         Write::new(0, 2, "").tokened(&token),
         StatusCode::BAD_REQUEST,
     )
@@ -645,7 +684,11 @@ async fn producer_rows_come_before_content_checks_on_both_paths() {
     // matches its digest or not, never a `400`.
     assert_same_answer(
         &app,
-        Write::new(0, 0, "other").digest().tokened(&token).http2(),
+        Write::new(0, 0, "other")
+            .digest()
+            .tokened(&token)
+            .http2()
+            .expecting(),
         Write::new(0, 0, "other").digest().tokened(&token),
         StatusCode::FORBIDDEN,
     )
@@ -655,7 +698,8 @@ async fn producer_rows_come_before_content_checks_on_both_paths() {
         Write::new(0, 0, "held")
             .digest_of("other")
             .tokened(&token)
-            .http2(),
+            .http2()
+            .expecting(),
         Write::new(0, 0, "held").digest_of("other").tokened(&token),
         StatusCode::FORBIDDEN,
     )
@@ -677,7 +721,8 @@ async fn producer_rows_come_before_content_checks_on_both_paths() {
             .digest()
             .untyped()
             .tokened(&token)
-            .http2(),
+            .http2()
+            .expecting(),
         Write::new(0, 0, "held").digest().untyped().tokened(&token),
         StatusCode::NO_CONTENT,
     )
