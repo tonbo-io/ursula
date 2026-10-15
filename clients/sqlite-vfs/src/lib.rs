@@ -188,11 +188,9 @@
 //! - `wal`: the local WAL's recovery scan and fold.
 //! - `wire`: the 0.8 requests and answers as values, shared by the transports and the model.
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 mod applier;
 mod attach;
 mod auth;
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 mod capture;
 mod claim;
 mod client;

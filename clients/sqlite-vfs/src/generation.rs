@@ -6,13 +6,15 @@
 //!   lock                      flock, held with the binding
 //!   gen-<lineage>/            the current generation: db, db-uwal, db-shm, log/
 //!   gen-<lineage>.tmp/        a generation being built
+//!   gen-<lineage>.trash/      a superseded generation being deleted
 //! ```
 //!
 //! The database is its canonical stream path ([`canonical_path`]): scheme, host, port and userinfo
 //! are transport, so every host alias of a deployment shares one root. A generation is built in
 //! `gen-<lineage>.tmp`, fsynced, and published by one rename, and its first log segment names the
 //! generation it supersedes, so a crash that leaves two is finished at the next open
-//! ([`Root::finish_leftovers`]).
+//! ([`Root::finish_leftovers`]). A superseded generation is renamed to `gen-<lineage>.trash`
+//! before it is deleted, so a crash midway never leaves a half-deleted `gen-` directory.
 
 use std::fs::File;
 use std::fs::{self};
@@ -31,6 +33,7 @@ use crate::replog::sync_dir;
 const LOCK: &str = "lock";
 const GEN: &str = "gen-";
 const TMP: &str = ".tmp";
+const TRASH: &str = ".trash";
 
 /// A stream URL's path spelled one way: every segment percent-decoded and encoded again one
 /// fixed way (a segment that does not decode to UTF-8 stays as it is), `.` and `..` resolved, no
@@ -329,33 +332,52 @@ impl Root {
         let mut removed = false;
         for entry in fs::read_dir(&self.dir).map_err(io("list", &self.dir))? {
             let entry = entry.map_err(io("list", &self.dir))?;
-            let temporary = entry
+            let leftover = entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(GEN) && n.ends_with(TMP));
-            if temporary {
+                .is_some_and(|n| n.starts_with(GEN) && (n.ends_with(TMP) || n.ends_with(TRASH)));
+            if leftover {
                 let path = entry.path();
                 fs::remove_dir_all(&path).map_err(io("remove", &path))?;
-                removed = true;
-            }
-        }
-        let gens = self.generations()?;
-        if gens.len() > 1 {
-            let mut superseded = Vec::new();
-            for g in &gens {
-                if let Some(old) = g.first_header()?.supersedes {
-                    superseded.push(old);
-                }
-            }
-            for g in gens.iter().filter(|g| superseded.contains(&g.lineage)) {
-                fs::remove_dir_all(&g.dir).map_err(io("remove", &g.dir))?;
                 removed = true;
             }
         }
         if removed {
             sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
         }
+        let gens = self.generations()?;
+        if gens.len() > 1 {
+            // A generation whose header cannot be read is finished when a readable one says it
+            // supersedes it; otherwise its error stands.
+            let mut superseded = Vec::new();
+            let mut unreadable = Vec::new();
+            for g in &gens {
+                match g.first_header() {
+                    Ok(h) => superseded.extend(h.supersedes),
+                    Err(e) => unreadable.push((g.lineage, e)),
+                }
+            }
+            if let Some((_, e)) = unreadable
+                .into_iter()
+                .find(|(lineage, _)| !superseded.contains(lineage))
+            {
+                return Err(e);
+            }
+            for g in gens.iter().filter(|g| superseded.contains(&g.lineage)) {
+                self.discard(g)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Deletes a superseded generation: renamed to `gen-<lineage>.trash` and the root fsynced
+    /// first, so a crash midway leaves only trash, then deleted and the root fsynced again.
+    fn discard(&self, g: &Generation) -> Result<(), GenerationError> {
+        let trash = self.dir.join(format!("{GEN}{}{TRASH}", hex(g.lineage)));
+        fs::rename(&g.dir, &trash).map_err(io("rename", &g.dir))?;
+        sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
+        fs::remove_dir_all(&trash).map_err(io("remove", &trash))?;
+        sync_dir(&self.dir).map_err(io("fsync", &self.dir))
     }
 
     /// The current generation, if any. Two left after [`Root::finish_leftovers`] are an error.
@@ -414,7 +436,8 @@ enum Step {
     FsyncDir,
     Rename,
     FsyncRoot,
-    RemoveSuperseded,
+    TrashSuperseded,
+    RemoveTrash,
 }
 
 /// A generation being built.
@@ -452,7 +475,12 @@ impl Building {
             Step::FsyncRoot,
         ];
         if self.supersedes.is_some() {
-            plan.extend([Step::RemoveSuperseded, Step::FsyncRoot]);
+            plan.extend([
+                Step::TrashSuperseded,
+                Step::FsyncRoot,
+                Step::RemoveTrash,
+                Step::FsyncRoot,
+            ]);
         }
         for (ran, step) in plan.iter().enumerate() {
             if ran == steps {
@@ -469,9 +497,16 @@ impl Building {
                     fs::rename(&self.tmp, &self.target).map_err(io("rename", &self.tmp))?;
                 }
                 Step::FsyncRoot => sync_dir(&self.root).map_err(io("fsync", &self.root))?,
-                Step::RemoveSuperseded => {
+                Step::TrashSuperseded => {
                     if let Some(old) = &self.supersedes {
-                        fs::remove_dir_all(&old.dir).map_err(io("remove", &old.dir))?;
+                        let trash = self.trash(old);
+                        fs::rename(&old.dir, &trash).map_err(io("rename", &old.dir))?;
+                    }
+                }
+                Step::RemoveTrash => {
+                    if let Some(old) = &self.supersedes {
+                        let trash = self.trash(old);
+                        fs::remove_dir_all(&trash).map_err(io("remove", &trash))?;
                     }
                 }
             }
@@ -483,6 +518,10 @@ impl Building {
     #[cfg(test)]
     pub(crate) fn crash_after(self, steps: usize) -> Result<usize, GenerationError> {
         self.publish_steps(steps).map(|(_, done)| done)
+    }
+
+    fn trash(&self, old: &Generation) -> PathBuf {
+        self.root.join(format!("{GEN}{}{TRASH}", hex(old.lineage)))
     }
 
     /// The db file being built.

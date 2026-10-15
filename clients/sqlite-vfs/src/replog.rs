@@ -2,13 +2,15 @@
 //! their first position (`<20 digits>.usl`) and rolled at 16 MiB.
 //!
 //! The valid log is the longest prefix whose chains verify and whose positions grow by one across
-//! segments. [`Log::open`] cuts the log after that prefix, deletes the segments after the cut, and
-//! reports the cut ([`Cut`]) with a warning. A record that does not verify is cut whether a record
-//! that verifies follows it or not: after a power loss the filesystem may keep later unsynced
-//! records and lose an earlier one, and a database user can plant bytes that look like a later
-//! record inside a commit. Neither touches L3, since pages reach the db only after F1 fsyncs the
+//! segments. [`Log::open`] cuts the log after that prefix and reports the cut ([`Cut`]) with a
+//! warning, whatever follows the first broken record: after a power loss the filesystem may keep
+//! later unsynced records and lose an earlier one, and a database user can store bytes that look
+//! like a record inside a commit. That keeps L3, since pages reach the db only after F1 fsyncs the
 //! log, so every record whose pages could be there is in the durable prefix. A gap or a malformed
-//! record under valid chains fails (`internal`: the extension wrote them). [`Log::append`]
+//! record under valid chains fails (`internal`: the extension wrote them), and so does a segment
+//! header of another format or version. Segments are removed from the front (trim, oldest first)
+//! and cut from the back (open deletes the later segments before it truncates), each step made
+//! durable before the next, so a crash between steps leaves a log open reads the same way. [`Log::append`]
 //! writes a record with one positioned write and no fsync, and cuts the segment back when the
 //! write fails. [`Log::sync`] fdatasyncs the current segment when it holds unsynced records. A roll
 //! fdatasyncs the segment it leaves and fsyncs the new one and the directory before the first
@@ -25,6 +27,9 @@ use std::sync::Arc;
 use ursula_headers::Epoch;
 use ursula_headers::Offset;
 
+use crate::codec::frame::Decoded;
+use crate::codec::frame::Frame;
+use crate::codec::frame::decode;
 use crate::codec::segment::RecordBody;
 use crate::codec::segment::SegmentError;
 use crate::codec::segment::SegmentHeader;
@@ -33,6 +38,7 @@ use crate::codec::segment::encode_header;
 use crate::codec::segment::encode_record;
 use crate::codec::segment::scan;
 use crate::ids::Activation;
+use crate::ids::Lineage;
 use crate::ids::Position;
 
 /// The size past which the next record starts a new segment.
@@ -56,13 +62,22 @@ pub(crate) enum LogError {
         #[source]
         source: SegmentError,
     },
+    #[error(
+        "log segment {}: the log starts at {first:?}, but records from {needed:?} on are needed",
+        .path.display()
+    )]
+    MissingPrefix {
+        path: PathBuf,
+        first: Position,
+        needed: Position,
+    },
     #[error("log {}: no segment", .dir.display())]
     Empty { dir: PathBuf },
     #[error("log {}: a segment of lineage {found:?} in a log of lineage {expected:?}", .path.display())]
     Lineage {
         path: PathBuf,
-        expected: crate::ids::Lineage,
-        found: crate::ids::Lineage,
+        expected: Lineage,
+        found: Lineage,
     },
     #[error(
         "log segment {} at byte {at}: position {found:?} where {expected:?} follows",
@@ -128,13 +143,16 @@ pub(crate) struct Recovered {
 }
 
 impl Recovered {
-    /// The COMMIT records after the latest ACK: logged, not acknowledged.
+    /// This generation's COMMIT records after the latest ACK: logged, not acknowledged. Stream
+    /// frames a catch-up logged carry another lineage and are never pending.
     pub(crate) fn pending(&self) -> Vec<(Position, Arc<[u8]>)> {
         self.records
             .iter()
             .filter(|r| r.position > self.acked)
             .filter_map(|r| match &r.body {
-                RecordBody::Commit { frame } => Some((r.position, Arc::from(frame.as_slice()))),
+                RecordBody::Commit { frame } if !foreign(frame, self.header.lineage) => {
+                    Some((r.position, Arc::from(frame.as_slice())))
+                }
                 _ => None,
             })
             .collect()
@@ -152,9 +170,6 @@ impl Recovered {
 pub(crate) struct Cut {
     pub(crate) segment: PathBuf,
     pub(crate) at: u64,
-    /// A record that verifies followed the one that did not: damage, or a look-alike planted
-    /// in a commit, rather than a write cut short.
-    pub(crate) damaged: bool,
 }
 
 /// A segment file.
@@ -225,6 +240,24 @@ fn list(dir: &Path) -> Result<Vec<Segment>, LogError> {
     }
     segments.sort_by_key(|s| s.first);
     Ok(segments)
+}
+
+/// Whether a COMMIT record's frame names a commit of another lineage than `ours`.
+fn foreign(frame: &[u8], ours: Lineage) -> bool {
+    let max_body = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+    matches!(
+        decode(frame, max_body),
+        Ok(Decoded::Frame { frame: Frame::Commit { id, .. }, .. }) if id.lineage != ours
+    )
+}
+
+/// A segment header error a crash during a roll leaves: cut short or not verifying. Any other is a
+/// header of another format or version.
+fn torn_header(e: &SegmentError) -> bool {
+    matches!(
+        e,
+        SegmentError::HeaderTruncated { .. } | SegmentError::HeaderChecksum { .. }
+    )
 }
 
 /// Brings the carried-over fields of `state` past `body`.
@@ -301,19 +334,19 @@ impl Log {
             let bytes = fs::read(&segment.path).map_err(io("read", &segment.path))?;
             let scanned = match scan(&bytes) {
                 Ok(s) => s,
-                // The first segment's header is the log's identity; a later one's was cut short
-                // by a crash during a roll.
-                Err(source) if kept.is_empty() => {
+                // The first segment's header is the log's identity, and any header of another
+                // format or version is a refusal, never a cut.
+                Err(source) if kept.is_empty() || !torn_header(&source) => {
                     return Err(LogError::Segment {
                         path: segment.path,
                         source,
                     });
                 }
+                // A later segment's header cut short or not verifying: a crash during a roll.
                 Err(_torn_header) => {
                     cut = Some(Cut {
                         segment: segment.path.clone(),
                         at: 0,
-                        damaged: false,
                     });
                     removed.push(segment);
                     continue;
@@ -360,14 +393,6 @@ impl Log {
                     cut = Some(Cut {
                         segment: segment.path.clone(),
                         at: to_u64(at),
-                        damaged: false,
-                    });
-                }
-                Tail::Damaged { at } => {
-                    cut = Some(Cut {
-                        segment: segment.path.clone(),
-                        at: to_u64(at),
-                        damaged: true,
                     });
                 }
                 Tail::Gap {
@@ -415,24 +440,35 @@ impl Log {
             crate::log::emit(crate::log::Level::Warn, "log_cut", &[
                 ("segment", &c.segment.display()),
                 ("at", &c.at),
-                ("damaged", &c.damaged),
                 ("removed_segments", &removed.len()),
             ]);
-            if file.metadata().map_err(io("stat", &last.path))?.len() > len {
-                file.set_len(len).map_err(io("cut", &last.path))?;
-                file.sync_data().map_err(io("fdatasync", &last.path))?;
-            }
-            for segment in &removed {
+            // From the back: the later segments go first, then the current one is truncated.
+            for segment in removed.iter().rev() {
                 fs::remove_file(&segment.path).map_err(io("remove", &segment.path))?;
             }
             if !removed.is_empty() {
                 sync_dir(dir).map_err(io("fsync", dir))?;
+            }
+            if file.metadata().map_err(io("stat", &last.path))?.len() > len {
+                file.set_len(len).map_err(io("cut", &last.path))?;
+                file.sync_data().map_err(io("fdatasync", &last.path))?;
             }
         }
         // The current segment's identity with the state at the end of the log.
         state.first_position = header.first_position;
         state.supersedes = header.supersedes;
         let min = state.base.min(state.acked);
+        // Trim deletes only segments whose records all lie at or below `min`: a log starting later
+        // lost records it still needs.
+        if let Some(first) = kept.first()
+            && first.first.0 > min.0.saturating_add(1)
+        {
+            return Err(LogError::MissingPrefix {
+                path: first.path.clone(),
+                first: first.first,
+                needed: Position(min.0.saturating_add(1)),
+            });
+        }
         records.retain(|r| r.position > min);
         let recovered = Recovered {
             base: state.base,
@@ -584,14 +620,13 @@ impl Log {
                 |w| matches!(w, [_, next] if next.first.0 <= durable_min.0.saturating_add(1)),
             )
             .count();
-        let removed: Vec<Segment> = self.segments.drain(..removable).collect();
-        for segment in &removed {
+        // From the front, oldest first, each unlink durable before the next.
+        for _ in 0..removable {
+            let segment = self.segments.remove(0);
             fs::remove_file(&segment.path).map_err(io("remove", &segment.path))?;
-        }
-        if !removed.is_empty() {
             sync_dir(&self.dir).map_err(io("fsync", &self.dir))?;
         }
-        Ok(removed.len())
+        Ok(removable)
     }
 
     /// The segment files, by first position.

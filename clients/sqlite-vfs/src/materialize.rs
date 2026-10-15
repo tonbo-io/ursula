@@ -33,8 +33,30 @@ use crate::replog::LogError;
 use crate::replog::Recovered;
 use crate::replog::sync_dir;
 
-/// The page images a batch holds before it is written: 8 MiB.
-const BATCH_PAGES: usize = 2048;
+/// The page images a batch holds before it is written: 8 MiB (8 pages in tests, so batches split).
+const BATCH_PAGES: usize = if cfg!(test) { 8 } else { 2048 };
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: page writes left before replay fails as a crash would stop it.
+    pub(crate) static CRASH_AFTER_PAGES: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Counts a page written by replay; under the test hook, fails once its budget is spent.
+fn page_written() -> Result<(), std::io::Error> {
+    #[cfg(test)]
+    {
+        let left = CRASH_AFTER_PAGES.get();
+        if let Some(n) = left {
+            if n == 0 {
+                return Err(std::io::Error::other("injected crash"));
+            }
+            CRASH_AFTER_PAGES.set(Some(n.saturating_sub(1)));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LocalError {
@@ -57,6 +79,11 @@ pub(crate) enum LocalError {
     NotACommit { position: Position },
     #[error("a PART frame ending at stream offset {end_offset} to catch up: runs are joined first")]
     Part { end_offset: Offset },
+    #[error(
+        "catching up with stream frames while this generation's commit at {first:?} is pending: \
+         a takeover with pending commits rebuilds instead"
+    )]
+    OwnPending { first: Position },
     #[error("encoding a frame to catch up: {0}")]
     Encode(#[source] FrameError),
 }
@@ -123,11 +150,21 @@ pub(crate) fn materialize(g: &Generation) -> Result<Materialized, LocalError> {
 }
 
 /// Logs the foreign `frames` (COMMITs, then one ACK at the last), fsyncs the log, applies them,
-/// fsyncs the db and appends a BASE, so a crash midway replays.
+/// fsyncs the db and appends a BASE, so a crash midway replays. Refused while this generation has
+/// pending commits.
 pub(crate) fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<(), LocalError> {
     let Some(last) = frames.last() else {
         return Ok(());
     };
+    // Foreign frames go after our pending commits only by discarding them, which rebuilds.
+    if let Some(&(first, _)) = m
+        .recovered
+        .pending()
+        .iter()
+        .find(|(p, _)| *p > m.log.acked())
+    {
+        return Err(LocalError::OwnPending { first });
+    }
     let mut log_bytes = m.log.log_bytes();
     let mut logged = Vec::new();
     for f in frames {
@@ -167,7 +204,9 @@ pub(crate) fn catch_up(m: &mut Materialized, frames: &[ForeignFrame]) -> Result<
     Ok(())
 }
 
-/// fsyncs the db, then appends a BASE naming the last record.
+/// fsyncs the db, then appends a BASE naming the last record. That is right only before binding,
+/// when the db holds every logged commit; F2 in the switch PR must name the last confirmed
+/// position instead, since a logged commit may be undecided then.
 fn base(m: &mut Materialized) -> Result<(), LocalError> {
     let db_path = m.generation.db();
     m.db.sync_all().map_err(io("fsync", &db_path))?;
@@ -247,7 +286,9 @@ fn flush(
     db: &File,
     db_path: &Path,
 ) -> Result<(), LocalError> {
-    batch.flush(db, || {}).map_err(io("replay into", db_path))
+    batch
+        .flush(db, page_written)
+        .map_err(io("replay into", db_path))
 }
 
 #[cfg(test)]

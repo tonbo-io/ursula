@@ -146,8 +146,15 @@ fn a_crash_after_each_publish_step_converges_to_one_generation() {
         let root = Root::lock(dir.path(), &p).unwrap();
         let old = root.build(header(1)).unwrap().publish().unwrap();
         let done = root.build(header(2)).unwrap().crash_after(steps).unwrap();
-        // The process dies: its lock goes with it.
+        // The process dies, its lock with it, possibly midway through deleting the trash.
         drop(root);
+        let trash = dir
+            .path()
+            .join(root_name(&p))
+            .join(format!("gen-{}.trash", "01".repeat(16)));
+        if trash.exists() {
+            fs::remove_dir_all(trash.join("log")).unwrap();
+        }
         let root = Root::lock(dir.path(), &p).unwrap();
         root.finish_leftovers().unwrap();
         let current = root.current().unwrap().unwrap();
@@ -169,5 +176,39 @@ fn a_crash_after_each_publish_step_converges_to_one_generation() {
         }
         steps += 1;
     }
-    assert_eq!(steps, 8);
+    assert_eq!(steps, 10);
+}
+
+#[test]
+fn an_unreadable_generation_another_supersedes_is_finished() {
+    let dir = TempDir::new("gen-unreadable");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let old = root.build(header(1)).unwrap().publish().unwrap();
+    // A crash right after the new generation's rename, then the old one lost its log.
+    root.build(header(2)).unwrap().crash_after(5).unwrap();
+    fs::remove_dir_all(old.log_dir()).unwrap();
+    drop(root);
+    let root = Root::lock(dir.path(), &p).unwrap();
+    root.finish_leftovers().unwrap();
+    assert_eq!(root.current().unwrap().unwrap().lineage, Lineage([2; 16]));
+}
+
+#[test]
+fn an_unreadable_generation_nothing_supersedes_is_an_error() {
+    let dir = TempDir::new("gen-orphan");
+    let p = canonical_path("https://h/v1/stream/db").unwrap();
+    let root = Root::lock(dir.path(), &p).unwrap();
+    let a = root.build(header(1)).unwrap().publish().unwrap();
+    let side = dir.path().join("side");
+    fs::rename(&a.dir, &side).unwrap();
+    let b = root.build(header(2)).unwrap().publish().unwrap();
+    fs::rename(&side, &a.dir).unwrap();
+    // `b` supersedes nothing (it was built with no current generation), and `a` is unreadable.
+    fs::remove_dir_all(a.log_dir()).unwrap();
+    assert_eq!(b.first_header().unwrap().supersedes, None);
+    assert!(matches!(
+        root.finish_leftovers(),
+        Err(GenerationError::NoSegment { .. } | GenerationError::Io { .. })
+    ));
 }

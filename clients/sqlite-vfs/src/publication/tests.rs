@@ -145,7 +145,7 @@ fn an_unpublished_commit_is_unconfirmed() {
 #[test]
 fn a_commit_whose_frame_write_failed_under_a_reader_is_unconfirmed() {
     // P2: the commit frame's page write fails while a SELECT of the same connection is mid-step.
-    all_confirmed_but(include_str!("vectors/pendingreader.trace"), &[(86, 89)]);
+    all_confirmed_but(include_str!("vectors/pendingreader.trace"), &[(86, 91)]);
 }
 
 #[test]
@@ -229,6 +229,7 @@ proptest! {
         let mut next = 1u64;
         let mut history: Vec<Call> = Vec::new();
         let mut decided = BTreeSet::new();
+        let mut logged = Vec::new();
         // The position logged since the last WRITE lock, if any.
         let mut logged_under_lock: Option<Position> = None;
         for c in calls {
@@ -236,6 +237,7 @@ proptest! {
                 Call::Logged(_) => {
                     let p = Position(next);
                     next += 1;
+                    logged.push(p);
                     Call::Logged(p)
                 }
                 other => other,
@@ -251,7 +253,9 @@ proptest! {
                 }
                 Verdict::Unconfirmed(p) => {
                     assert_ne!(c, Call::PhaseTwo);
-                    assert!(decided.insert(p), "{p:?} decided twice");
+                    assert!(!decided.contains(&p), "{p:?} decided twice");
+                    // It covers every position logged since.
+                    decided.extend(logged.iter().copied().filter(|&l| l >= p));
                 }
                 Verdict::Unsupported => {
                     assert_eq!(c, Call::WalWrite);
@@ -271,6 +275,10 @@ proptest! {
                 _ => {}
             }
             history.push(c);
+        }
+        // Every logged position is decided, or is the one still undecided.
+        for p in logged {
+            assert!(decided.contains(&p) || s.undecided() == Some(p), "{p:?} forgotten");
         }
     }
 }

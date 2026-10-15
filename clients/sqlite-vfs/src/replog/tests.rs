@@ -153,15 +153,14 @@ fn a_gap_under_valid_chains_is_an_error() {
 }
 
 /// Opens the log, checks the cut, and checks that it takes appends again.
-fn reopen_cut(log_dir: &std::path::Path, at: u64, damaged: bool, kept: &[RecordBody]) {
+fn reopen_cut(log_dir: &std::path::Path, at: u64, kept: &[RecordBody]) {
     let path = super::segment_path(log_dir, Position(1));
     let (mut log, r) = Log::open(log_dir).unwrap();
     assert_eq!(
         r.cut,
         Some(super::Cut {
             segment: path.clone(),
-            at,
-            damaged
+            at
         })
     );
     assert_eq!(records(&r), bodies(kept));
@@ -192,11 +191,11 @@ fn a_torn_tail_is_cut() {
     let path = super::segment_path(&log_dir, Position(1));
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
-    reopen_cut(&log_dir, second, false, &[commit(1, 40)]);
+    reopen_cut(&log_dir, second, &[commit(1, 40)]);
 }
 
 #[test]
-fn a_record_lost_before_a_kept_one_is_cut_as_damage() {
+fn a_record_lost_before_a_kept_one_is_cut_there() {
     // After a power loss the filesystem kept the second record's block and lost part of the
     // first's.
     let dir = TempDir::new("log-damaged");
@@ -207,7 +206,7 @@ fn a_record_lost_before_a_kept_one_is_cut_as_damage() {
     let header_len = crate::codec::segment::scan(&bytes).unwrap().header_len;
     bytes[header_len + 20] ^= 1;
     fs::write(&path, &bytes).unwrap();
-    reopen_cut(&log_dir, header_len as u64, true, &[]);
+    reopen_cut(&log_dir, header_len as u64, &[]);
 }
 
 #[test]
@@ -230,7 +229,54 @@ fn a_planted_look_alike_record_does_not_refuse_the_open() {
     drop(log);
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() - 20]).unwrap();
-    reopen_cut(&log_dir, header_len, true, &[]);
+    reopen_cut(&log_dir, header_len, &[]);
+}
+
+#[test]
+fn a_later_segment_of_another_version_is_refused_not_cut() {
+    let dir = TempDir::new("log-version");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.set_roll_bytes(100);
+    log.append(&commit(1, 200)).unwrap();
+    log.append(&commit(2, 200)).unwrap();
+    let segments = log.segment_paths();
+    assert_eq!(segments.len(), 2);
+    drop(log);
+    // Version 2 where version 1 is: a header of another format, not a torn one.
+    let mut bytes = fs::read(&segments[1]).unwrap();
+    bytes[4] = 2;
+    fs::write(&segments[1], &bytes).unwrap();
+    assert!(matches!(
+        Log::open(&log_dir).unwrap_err(),
+        LogError::Segment {
+            source: crate::codec::segment::SegmentError::Version { found: 2 },
+            ..
+        }
+    ));
+    assert!(segments[1].exists());
+}
+
+#[test]
+fn a_log_missing_records_it_still_needs_is_refused() {
+    let dir = TempDir::new("log-prefix");
+    let log_dir = dir.path().join("log");
+    let mut log = Log::create(&log_dir, header()).unwrap();
+    log.set_roll_bytes(100);
+    for n in 0..4 {
+        log.append(&commit(n, 200)).unwrap();
+    }
+    let segments = log.segment_paths();
+    drop(log);
+    // Base and acked are 0: every record is needed, but the oldest segment is gone.
+    fs::remove_file(&segments[0]).unwrap();
+    assert!(matches!(
+        Log::open(&log_dir).unwrap_err(),
+        LogError::MissingPrefix {
+            needed: Position(1),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -320,7 +366,7 @@ fn a_torn_roll_deletes_the_new_segment() {
     let bytes = fs::read(&segments[1]).unwrap();
     fs::write(&segments[1], &bytes[..30]).unwrap();
     let (log, r) = Log::open(&log_dir).unwrap();
-    assert!(matches!(&r.cut, Some(c) if c.at == 0 && !c.damaged && c.segment == segments[1]));
+    assert!(matches!(&r.cut, Some(c) if c.at == 0 && c.segment == segments[1]));
     assert_eq!(log.segment_paths(), segments[..1].to_vec());
     assert!(!segments[1].exists());
     assert_eq!(records(&r), bodies(&[commit(1, 300)]));

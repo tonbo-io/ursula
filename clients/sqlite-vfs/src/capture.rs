@@ -38,6 +38,7 @@ pub(crate) fn page_at(off: i64) -> bool {
 }
 
 /// Whether `off` is where a frame's header starts in the WAL file.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 fn frame_header_at(off: i64) -> bool {
     off >= WAL_HDR && off.saturating_sub(WAL_HDR).checked_rem(FRAME) == Some(0)
 }
@@ -66,6 +67,7 @@ pub(crate) fn be32(b: &[u8], at: usize) -> Option<u32> {
 
 /// A WAL write, by its offset and length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) enum WalWrite<'a> {
     /// The WAL header (a new WAL generation), with the page size it names.
     Header { page_size: Option<u32> },
@@ -83,6 +85,7 @@ pub(crate) enum WalWrite<'a> {
 }
 
 /// Names the WAL write of `data` at `off`.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) fn classify(off: i64, data: &[u8]) -> WalWrite<'_> {
     match data.len() {
         WAL_HDR_LEN if off == 0 => WalWrite::Header {
@@ -106,6 +109,7 @@ pub(crate) fn classify(off: i64, data: &[u8]) -> WalWrite<'_> {
 
 /// The commit point: the commit frame's page is being written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) struct CommitPoint {
     /// The database size after the commit, in pages.
     pub(crate) db_pages_after: u32,
@@ -115,13 +119,12 @@ pub(crate) struct CommitPoint {
 
 /// A write transaction's WAL write or commit that the extension does not capture.
 #[derive(Debug, thiserror::Error)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) enum CaptureError {
     #[error("a WAL write of {len} bytes at offset {off}: not a header, frame header or page")]
     Shape { off: i64, len: usize },
     #[error("a WAL header naming page size {page_size:?}: the extension requires 4096-byte pages")]
     PageSize { page_size: Option<u32> },
-    #[error("a WAL header written after frames of the same transaction")]
-    HeaderAfterFrames,
     #[error("a frame header at offset {off} while the header at {pending} has no page yet")]
     HeaderWithoutPage { off: i64, pending: i64 },
     #[error("a page at offset {off} that no frame header of the transaction precedes")]
@@ -149,6 +152,7 @@ pub(crate) enum CaptureError {
 
 /// A frame the transaction wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 struct Written {
     pgno: u32,
     /// The crc32c of the page as this process last wrote it.
@@ -157,6 +161,7 @@ struct Written {
 
 /// Where the transaction stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 enum Stage {
     /// Frames are being written. `pending` is a frame header whose page has not followed yet.
     Open { pending: Option<Pending> },
@@ -165,6 +170,7 @@ enum Stage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 struct Pending {
     off: i64,
     pgno: u32,
@@ -173,11 +179,12 @@ struct Pending {
 
 /// One write transaction's frames, from its WRITE lock to its commit point.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) struct WriteTxn {
-    /// Frame page offset → what was written there.
+    /// Frame page offset → what was written there. A frame header written at or below the highest
+    /// frame drops every frame from its offset on: `ROLLBACK TO` after a cache spill rewinds the
+    /// WAL and writes over the frames it undid.
     frames: BTreeMap<i64, Written>,
-    /// Page number → the page offset of its latest frame.
-    latest: BTreeMap<u32, i64>,
     stage: Stage,
 }
 
@@ -187,11 +194,11 @@ impl Default for WriteTxn {
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 impl WriteTxn {
     pub(crate) fn new() -> Self {
         WriteTxn {
             frames: BTreeMap::new(),
-            latest: BTreeMap::new(),
             stage: Stage::Open { pending: None },
         }
     }
@@ -210,9 +217,14 @@ impl WriteTxn {
                 if page_size != Some(PAGE as u32) {
                     return Err(CaptureError::PageSize { page_size });
                 }
-                if !self.frames.is_empty() || pending.is_some() {
-                    return Err(CaptureError::HeaderAfterFrames);
+                if let Some(p) = pending {
+                    return Err(CaptureError::HeaderWithoutPage {
+                        off: 0,
+                        pending: p.off,
+                    });
                 }
+                // A restart, or a rewind to frame 0 that writes the header again.
+                self.frames.clear();
                 Ok(None)
             }
             WalWrite::FrameHeader {
@@ -229,6 +241,8 @@ impl WriteTxn {
                 if pgno == 0 {
                     return Err(CaptureError::PageZero { off, pgno });
                 }
+                // A rewind: the frames from here on were undone.
+                drop(self.frames.split_off(&off.saturating_add(FRAME_HDR)));
                 self.stage = Stage::Open {
                     pending: Some(Pending {
                         off,
@@ -243,7 +257,6 @@ impl WriteTxn {
                 match pending {
                     Some(p) if p.off.checked_add(FRAME_HDR) == Some(off) => {
                         self.frames.insert(off, Written { pgno: p.pgno, crc });
-                        self.latest.insert(p.pgno, off);
                         if p.commit_size == 0 {
                             self.stage = Stage::Open { pending: None };
                             return Ok(None);
@@ -271,12 +284,17 @@ impl WriteTxn {
 
     /// The final image of every page up to `size`, but the commit frame's page `commit_pgno`
     /// (which is in the caller's buffer): page number, the page's WAL offset and the crc32c of
-    /// what this process wrote there, by ascending page number.
+    /// what this process wrote there, by ascending page number. The frames are walked in offset
+    /// order, a later frame of a page winning; the commit frame is the last of them.
     pub(crate) fn final_frames(&self, size: u32, commit_pgno: u32) -> Vec<(u32, i64, u32)> {
-        self.latest
+        let mut latest: BTreeMap<u32, (i64, u32)> = BTreeMap::new();
+        for (&off, w) in &self.frames {
+            latest.insert(w.pgno, (off, w.crc));
+        }
+        latest
             .range(1..=size)
             .filter(|&(&pgno, _)| pgno != commit_pgno)
-            .filter_map(|(&pgno, &off)| self.frames.get(&off).map(|w| (pgno, off, w.crc)))
+            .map(|(&pgno, &(off, crc))| (pgno, off, crc))
             .collect()
     }
 
@@ -325,6 +343,7 @@ impl WriteTxn {
 
 /// Page 1 keeps WAL mode (file format read and write versions 2, bytes 18 and 19) and 4096-byte
 /// pages (bytes 16 and 17, big-endian).
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
 pub(crate) fn check_page1(p: &[u8]) -> Result<(), CaptureError> {
     let byte = |at: usize| p.get(at).copied().unwrap_or(0);
     let (write, read) = (byte(18), byte(19));

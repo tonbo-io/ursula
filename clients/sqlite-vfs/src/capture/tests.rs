@@ -267,12 +267,43 @@ fn a_wal_header_must_name_4096_byte_pages_and_come_first() {
     assert!(matches!(err, CaptureError::PageSize {
         page_size: Some(1024)
     }));
+}
+
+#[test]
+fn a_rewind_to_frame_0_that_writes_the_header_again_restarts_the_capture() {
     let mut wal = Wal::new();
+    wal.header();
     wal.frame(0, 2, 0, &page(2));
-    let mut h = [0u8; 32];
-    h[8..12].copy_from_slice(&4096u32.to_be_bytes());
-    let err = wal.write(0, &h).unwrap_err();
-    assert!(matches!(err, CaptureError::HeaderAfterFrames));
+    wal.frame(1, 9, 0, &page(9));
+    wal.header();
+    let record = wal.frame(0, 3, 3, &page(3)).unwrap();
+    assert_eq!(images(&record), vec![(3, 3)]);
+}
+
+#[test]
+fn a_savepoint_rollback_that_rewrites_a_frame_drops_what_it_undid() {
+    // A cache spill wrote frames 0 (page 2) and 1 (page 7); ROLLBACK TO rewound the WAL to frame
+    // 1, which now holds page 5.
+    let mut wal = Wal::new();
+    wal.header();
+    wal.frame(0, 2, 0, &page(2));
+    wal.frame(1, 7, 0, &page(7));
+    wal.frame(1, 5, 0, &page(5));
+    let record = wal.frame(2, 4, 7, &page(4)).unwrap();
+    assert_eq!(images(&record), vec![(2, 2), (4, 4), (5, 5)]);
+}
+
+#[test]
+fn a_commit_frame_written_over_undone_frames_drops_the_later_ones() {
+    // Frames 0 to 2 (pages 2, 4, 8) were spilled, then rolled back to frame 1, where the commit
+    // frame of page 4 goes: page 8 is no longer part of the transaction.
+    let mut wal = Wal::new();
+    wal.header();
+    wal.frame(0, 2, 0, &page(2));
+    wal.frame(1, 4, 0, &page(4));
+    wal.frame(2, 8, 0, &page(8));
+    let record = wal.frame(1, 4, 8, &page(40)).unwrap();
+    assert_eq!(images(&record), vec![(2, 2), (4, 40)]);
 }
 
 #[test]

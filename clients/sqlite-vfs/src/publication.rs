@@ -60,7 +60,8 @@ pub(crate) enum Verdict {
     /// SQLite published the commit logged at this position.
     Confirmed(Position),
     /// The handle's transaction ended otherwise: the attachment resets (`local_damage`) and the
-    /// reopen replays the log, which commits it.
+    /// reopen replays the log, which commits it. It covers this position and every one logged
+    /// after it on the handle, which the reset replays as well.
     Unconfirmed(Position),
     /// A WAL write without the WRITE shm lock (EXCLUSIVE locking mode): it fails alone as
     /// `unsupported`.
@@ -89,10 +90,17 @@ impl HandleState {
                 Verdict::None
             }
             (HandleState::Idle, Call::WalWrite) => Verdict::Unsupported,
-            (HandleState::Writing, Call::Logged(p)) | (HandleState::Logged(_), Call::Logged(p)) => {
+            (HandleState::Writing, Call::Logged(p)) => {
                 *self = HandleState::Logged(p);
                 Verdict::None
             }
+            // A commit logged without the WRITE lock, or a second one under it: capture never
+            // does either, and neither position may be forgotten.
+            (HandleState::Logged(q), Call::Logged(_)) => {
+                *self = HandleState::Idle;
+                Verdict::Unconfirmed(q)
+            }
+            (HandleState::Idle, Call::Logged(p)) => Verdict::Unconfirmed(p),
             (HandleState::Writing, Call::UnlockWrite | Call::Close) => {
                 *self = HandleState::Idle;
                 Verdict::None

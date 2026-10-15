@@ -23,8 +23,9 @@
 //!
 //! Positions start at 1, so a `base` or `acked` of 0 means nothing yet. The valid log is the
 //! longest prefix whose chain verifies and whose positions grow by one from the header's
-//! `first_position`. [`scan`] returns that prefix and says how the rest ends: a torn write at the
-//! tail, or damage that a chain-valid record follows.
+//! `first_position`. [`scan`] returns that prefix and says how the rest ends. A record that is cut
+//! short or does not verify ends it as [`Tail::Torn`], whatever follows: bytes after a broken
+//! record that look like a record prove nothing, since a database user can store them in a commit.
 
 use ursula_headers::Epoch;
 use ursula_headers::Incarnation;
@@ -106,12 +107,9 @@ pub struct Record {
 pub enum Tail {
     /// The valid prefix is the whole segment.
     Clean,
-    /// An incomplete record or one whose chain does not verify, with no chain-valid record after
-    /// it: a torn write, cut at open.
+    /// An incomplete record or one whose chain does not verify: the log ends there, and open cuts
+    /// the rest.
     Torn { at: usize },
-    /// A record whose chain does not verify, followed by one whose chain does: damage inside the
-    /// log, which open never cuts silently, since its pages may already be in the db file.
-    Damaged { at: usize },
     /// A record whose chain verifies but whose position does not follow.
     Gap {
         at: usize,
@@ -401,29 +399,6 @@ fn record_at(bytes: &[u8]) -> Option<(u8, Position, &[u8], u32, usize)> {
     ))
 }
 
-/// Whether a record whose chain verifies against the 4 bytes before it, at a position from `from`
-/// on, starts anywhere after byte `at`.
-fn chained_after(bytes: &[u8], at: usize, from: Option<Position>) -> bool {
-    let start = at.saturating_add(1).max(RECORD_TAIL);
-    (start..bytes.len()).any(|p| {
-        let Some(before) = p.checked_sub(RECORD_TAIL) else {
-            return false;
-        };
-        let (Some(previous), Some(rest)) = (
-            bytes
-                .get(before..p)
-                .and_then(|b| <[u8; 4]>::try_from(b).ok()),
-            bytes.get(p..),
-        ) else {
-            return false;
-        };
-        record_at(rest).is_some_and(|(kind, position, payload, found, _)| {
-            from.is_none_or(|f| position >= f)
-                && chain(u32::from_le_bytes(previous), kind, position, payload) == found
-        })
-    })
-}
-
 /// The segment's header and its longest valid prefix of records. A header that is cut short,
 /// damaged or of another format is an error: the records cannot be trusted without it.
 pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
@@ -437,20 +412,13 @@ pub fn scan(bytes: &[u8]) -> Result<Scan, SegmentError> {
         if t.rest_len() == 0 {
             break Tail::Clean;
         }
-        let broken = || {
-            if chained_after(bytes, at, expected) {
-                Tail::Damaged { at }
-            } else {
-                Tail::Torn { at }
-            }
-        };
         let rest = t.rest_slice();
         let Some((kind, position, payload, found, size)) = record_at(rest) else {
-            break broken();
+            break Tail::Torn { at };
         };
         let chain = chain(previous, kind, position, payload);
         if chain != found {
-            break broken();
+            break Tail::Torn { at };
         }
         t = Take(rest.get(size..).unwrap_or_default());
         let Some(want) = expected else {

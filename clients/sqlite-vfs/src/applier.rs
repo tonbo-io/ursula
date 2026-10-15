@@ -99,11 +99,12 @@ impl<P: Image> PageBatch<P> {
     }
 
     /// Writes the batch to `f`: cut to its smallest size, write the final page images (calling
-    /// `written` after each), set the size. A batch without a commit writes nothing.
+    /// `written` after each, which may stop the flush), set the size. A batch without a commit
+    /// writes nothing.
     pub(crate) fn flush(
         &mut self,
         f: &File,
-        mut written: impl FnMut(),
+        mut written: impl FnMut() -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
         let (Some(min), Some(size)) = (self.min_size.take(), self.size) else {
             return Ok(());
@@ -114,7 +115,7 @@ impl<P: Image> PageBatch<P> {
         }
         for (pgno, data) in pages {
             f.write_all_at(data.bytes(), page_offset(pgno))?;
-            written();
+            written()?;
         }
         f.set_len(db_len(size))
     }
@@ -155,7 +156,12 @@ mod tests {
         batch.commit(3, Vec::new());
         assert_eq!(batch.len(), 2);
         let mut n = 0;
-        batch.flush(&f, || n += 1).unwrap();
+        batch
+            .flush(&f, || {
+                n += 1;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(n, 2);
         let bytes = read(&f);
         assert_eq!(bytes.len(), 3 * PAGE);
@@ -163,7 +169,12 @@ mod tests {
         assert!(bytes[PAGE..2 * PAGE].iter().all(|&b| b == 2));
         assert!(bytes[2 * PAGE..].iter().all(|&b| b == 0));
         // An empty batch writes nothing.
-        batch.flush(&f, || n += 1).unwrap();
+        batch
+            .flush(&f, || {
+                n += 1;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(read(&f).len(), 3 * PAGE);
     }
 }

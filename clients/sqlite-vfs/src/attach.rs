@@ -167,6 +167,7 @@ impl Applier {
                         ]);
                         std::process::abort();
                     }
+                    Ok(())
                 })
                 .map_err(|source| Error::Io {
                     op: "replay into",
