@@ -4,8 +4,11 @@
 //! Module map:
 //!
 //! - [`admin_fence`]: process-local executor ordering for administrative mutations.
-//! - [`admission`]: client-plane ingress admission, which refuses writes before
-//!   they reach a handler and marks those refusals with `x-ursula-not-applied`.
+//! - [`admission`]: client-plane ingress admission: a write's size before its
+//!   handler, and its pressure checks, which a write routed before its body
+//!   meets after routing.
+//! - [`front_door`]: what a write's head decides before its body is read:
+//!   routing, early answers and deferred admission.
 //! - [`identity`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on every HEAD
 //!   answer.
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
@@ -20,6 +23,7 @@ mod admin_fence;
 mod admission;
 mod bootstrap;
 mod cold_snapshot;
+mod front_door;
 mod identity;
 pub mod json_text;
 mod limits;
@@ -49,6 +53,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 pub use admission::IngressAdmission;
+use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -135,6 +140,7 @@ use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::CreateStreamResponse;
 use ursula_runtime::DeleteStreamRequest;
+use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::GroupEngineError;
@@ -143,7 +149,6 @@ use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::LiveReadOwner;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerEarlyAnswer;
-use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
@@ -157,7 +162,10 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use wal_disk::WalDiskMonitor;
 
+use crate::admission::DeferredAdmission;
 use crate::admission::ingress_admission_middleware;
+use crate::front_door::BodyState;
+use crate::front_door::HeadDecision;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
 use crate::render::http_read_content_type;
@@ -623,14 +631,30 @@ impl ClientWriteLeaderRouter {
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
         let leader_hint = err.leader_hint()?;
         let leader_id = leader_hint.node_id?;
+        self.peer_base(leader_id, leader_hint.address.as_deref())
+            .map(|base| (leader_id, base))
+    }
+
+    /// The base URL of `leader_id`: its configured peer URL, else
+    /// `address`. `None` for this node itself.
+    fn peer_base(&self, leader_id: u64, address: Option<&str>) -> Option<String> {
         if Some(leader_id) == self.node_id {
             return None;
         }
-        let leader_base = self
-            .peers
-            .get(&leader_id)
-            .or(leader_hint.address.as_ref())?;
-        Some((leader_id, leader_base.trim_end_matches('/').to_owned()))
+        let base = self.peers.get(&leader_id).map(String::as_str).or(address)?;
+        Some(base.trim_end_matches('/').to_owned())
+    }
+
+    /// The URL of `request_target` on `leader_id`, the target of a routing
+    /// redirect (#581 section 6.1).
+    pub(crate) fn leader_url(
+        &self,
+        leader_id: u64,
+        address: Option<&str>,
+        request_target: &str,
+    ) -> Option<String> {
+        self.peer_base(leader_id, address)
+            .map(|base| format!("{base}{request_target}"))
     }
 
     fn hosted_group_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -2747,17 +2771,70 @@ fn resolve_registered_raft_group(
 pub(crate) async fn create_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
+    version: Version,
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
-    body: Bytes,
+    admission: Option<Extension<DeferredAdmission>>,
+    body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    create_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
+    let request_target = request_target(&uri);
+    if let Err(response) = create_head_checks(&headers) {
+        return answer_before_body(*response, version, &headers, body).await;
+    }
+    let decision = front_door::route_before_body(
+        &state,
+        &stream_id,
+        &request_target,
+        None,
+        admission.map(|Extension(admission)| admission),
+    )
+    .await;
+    let _permit = match decision {
+        HeadDecision::Answer(answer) => {
+            return answer_before_body(answer, version, &headers, body).await;
+        }
+        HeadDecision::Read(permit) => permit,
+    };
+    let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return unreadable_body_response(&err),
+    };
+    create_stream_by_id(state, stream_id, headers, body).await
+}
+
+/// The checks of a create's head that answer `400`, which come before
+/// routing (#581 section 6.1). The late path runs them again.
+fn create_head_checks(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    stream_lifetime(headers)?;
+    incarnation_precondition(headers)?;
+    stream_seq(headers)
+        .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+    refuse_create_producer_headers(headers)
+}
+
+/// A create carries no producer headers (#581 section 3): keyed bytes
+/// enter a stream only through claims and appends.
+fn refuse_create_producer_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    match parse_producer_headers(headers) {
+        Ok(ProducerRequestHeaders { producer: None, .. }) => Ok(()),
+        Ok(ProducerRequestHeaders {
+            producer: Some(_), ..
+        }) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "a create carries no producer headers: create the stream, then claim an epoch",
+            )
+                .into_response(),
+        )),
+        Err(err) => Err(Box::new(
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        )),
+    }
 }
 
 pub(crate) async fn create_stream_by_id(
     state: HttpState,
-    request_target: String,
     stream_id: BucketStreamId,
     request_headers: HeaderMap,
     body: Bytes,
@@ -2788,23 +2865,11 @@ pub(crate) async fn create_stream_by_id(
     };
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
-    // A create carries no producer headers (#581 section 3): keyed bytes
-    // enter a stream only through claims and appends.
-    match parse_producer_headers(&request_headers) {
-        Ok(ProducerRequestHeaders { producer: None, .. }) => {}
-        Ok(ProducerRequestHeaders {
-            producer: Some(_), ..
-        }) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "a create carries no producer headers: create the stream, then claim an epoch",
-            )
-                .into_response();
-        }
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    if let Err(response) = refuse_create_producer_headers(&request_headers) {
+        return *response;
     }
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
-        return create_stream_external_by_id(state, request_target, request).await;
+        return create_stream_external_by_id(state, request).await;
     }
 
     match state.runtime.create_stream(request).await {
@@ -2815,13 +2880,12 @@ pub(crate) async fn create_stream_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
         }),
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => runtime_error_after_body(err),
     }
 }
 
 pub(crate) async fn create_stream_external_by_id(
     state: HttpState,
-    request_target: String,
     mut request: CreateStreamRequest,
 ) -> Response {
     let stream_id = request.stream_id.clone();
@@ -2855,7 +2919,7 @@ pub(crate) async fn create_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
+            runtime_error_after_body(err)
         }
     }
 }
@@ -2866,33 +2930,55 @@ pub(crate) async fn append_stream(
     version: Version,
     Path(path): Path<StreamPath>,
     headers: HeaderMap,
+    admission: Option<Extension<DeferredAdmission>>,
     body: Body,
 ) -> Response {
     let stream_id = path.into_stream_id();
-    if early_answer_may_help(&headers)
-        && let Some(answer) = producer_early_answer(&state, &stream_id, &headers).await
-    {
-        return answer_before_body(answer, version, &headers, body).await;
+    let request_target = request_target(&uri);
+    if let Err(response) = append_head_checks(&headers) {
+        return answer_before_body(*response, version, &headers, body).await;
     }
+    let early_answer = early_answer_may_help(&headers)
+        .then(|| early_answer_query(&state, &headers))
+        .flatten();
+    let decision = front_door::route_before_body(
+        &state,
+        &stream_id,
+        &request_target,
+        early_answer,
+        admission.map(|Extension(admission)| admission),
+    )
+    .await;
+    let _permit = match decision {
+        HeadDecision::Answer(answer) => {
+            return answer_before_body(answer, version, &headers, body).await;
+        }
+        HeadDecision::Read(permit) => permit,
+    };
     let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
         Ok(body) => body,
         Err(err) => return unreadable_body_response(&err),
     };
-    append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
+    append_stream_by_id(state, stream_id, headers, body).await
 }
 
-/// The answer to a tokened producer write that its head alone decides
-/// (#581 section 2.5, W7): a repeat of a write that applied under the
-/// request's `Stream-Incarnation` (`204` with its receipt, or
-/// `receipt-evicted`), or a key conflict (`403`). Only the group's leader
-/// answers, from its applied state. `None` for every other write, which is
-/// read, proposed and decided at apply, as is any write whose head is
-/// malformed or whose early answer failed.
-async fn producer_early_answer(
-    state: &HttpState,
-    stream_id: &BucketStreamId,
-    headers: &HeaderMap,
-) -> Option<Response> {
+/// The checks of an append's head that answer `400`, which come before
+/// routing (#581 section 6.1). The late path runs them again.
+fn append_head_checks(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    removed_surface::reject_removed_append_headers(headers)?;
+    incarnation_precondition(headers)?;
+    stream_seq(headers)
+        .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+    parse_producer_headers(headers)
+        .map_err(|err| Box::new((StatusCode::BAD_REQUEST, err.to_string()).into_response()))?;
+    Ok(())
+}
+
+/// The key of a tokened producer write, whose answer the group's leader
+/// may decide from the head alone (#581 section 2.5, W7). `None` for every
+/// other write, which is read, proposed and decided at apply, as is any
+/// write whose head is malformed.
+fn early_answer_query(state: &HttpState, headers: &HeaderMap) -> Option<EarlyAnswerQuery> {
     let ProducerRequestHeaders {
         producer: Some(write),
         precondition: Some(IncarnationPrecondition { incarnation }),
@@ -2900,20 +2986,17 @@ async fn producer_early_answer(
     else {
         return None;
     };
-    let incarnation = incarnation.get();
-    let request = ProducerEarlyAnswerRequest {
-        stream_id: stream_id.clone(),
+    Some(EarlyAnswerQuery {
         producer: producer_request(write),
-        incarnation,
+        incarnation: incarnation.get(),
         now_ms: state.unix_time_ms(),
-    };
-    let answer = match state.runtime.producer_early_answer(request).await {
-        Ok(answer) => answer?,
-        Err(err) => {
-            tracing::debug!(error = %err, "no early answer; the write is read and proposed");
-            return None;
-        }
-    };
+    })
+}
+
+/// The early answer to a tokened producer write: a repeat of a write that
+/// applied under the request's `Stream-Incarnation` (`204` with its
+/// receipt, or `receipt-evicted`), or a key conflict (`403`).
+pub(crate) fn early_answer_response(answer: ProducerEarlyAnswer, incarnation: u64) -> Response {
     let answer = match answer {
         ProducerEarlyAnswer::Repeat(ack) => producer_ack_answer(&ack, incarnation),
         ProducerEarlyAnswer::KeyConflict { epoch } => {
@@ -2922,7 +3005,7 @@ async fn producer_early_answer(
     };
     // A repeat is `204` whether the request is a close or an append, so the
     // renderer needs no more than this.
-    Some(producer_answer_response(answer, AnswerTo::Append))
+    producer_answer_response(answer, AnswerTo::Append)
 }
 
 /// The smallest declared body for which an early answer is worth its lookup
@@ -3005,7 +3088,6 @@ fn unreadable_body_response(err: &axum::Error) -> Response {
 )]
 pub(crate) async fn append_stream_by_id(
     state: HttpState,
-    request_target: String,
     stream_id: BucketStreamId,
     headers: HeaderMap,
     body: Bytes,
@@ -3055,7 +3137,7 @@ pub(crate) async fn append_stream_by_id(
             .await
         {
             Ok(response) => close_http_response(&response),
-            Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+            Err(err) => runtime_error_after_body(err),
         };
     }
     let mut request = AppendRequest::from_bytes(stream_id, payload);
@@ -3067,18 +3149,17 @@ pub(crate) async fn append_stream_by_id(
     request.producer = producer;
 
     if should_externalize_payload(&state, request.payload.len(), true) {
-        return append_stream_external_by_id(state, request_target, request).await;
+        return append_stream_external_by_id(state, request).await;
     }
 
     match state.runtime.append(request).await {
         Ok(response) => append_http_response(response),
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => runtime_error_after_body(err),
     }
 }
 
 pub(crate) async fn append_stream_external_by_id(
     state: HttpState,
-    request_target: String,
     mut request: AppendRequest,
 ) -> Response {
     let stream_id = request.stream_id.clone();
@@ -3102,7 +3183,7 @@ pub(crate) async fn append_stream_external_by_id(
         }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
-            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
+            runtime_error_after_body(err)
         }
     }
 }
@@ -3386,19 +3467,38 @@ pub(crate) async fn read_stream_by_id(
 pub(crate) async fn publish_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
+    version: Version,
     Path(path): Path<SnapshotPath>,
     headers: HeaderMap,
+    admission: Option<Extension<DeferredAdmission>>,
     body: Body,
 ) -> Response {
     if let Err(response) = removed_surface::reject_removed_snapshot_headers(&headers) {
-        return *response;
+        return answer_before_body(*response, version, &headers, body).await;
     }
     let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
-        Err(response) => return *response,
+        Err(response) => return answer_before_body(*response, version, &headers, body).await,
     };
+    if let Err(response) = incarnation_precondition(&headers) {
+        return answer_before_body(*response, version, &headers, body).await;
+    }
     let request_target = request_target(&uri);
+    let decision = front_door::route_before_body(
+        &state,
+        &stream_id,
+        &request_target,
+        None,
+        admission.map(|Extension(admission)| admission),
+    )
+    .await;
+    let _permit = match decision {
+        HeadDecision::Answer(answer) => {
+            return answer_before_body(answer, version, &headers, body).await;
+        }
+        HeadDecision::Read(permit) => permit,
+    };
     publish_snapshot_by_offset(
         state,
         request_target,
@@ -3452,6 +3552,7 @@ async fn verify_json_boundary(
     stream_id: &BucketStreamId,
     offset: u64,
     request_target: &str,
+    body: BodyState,
 ) -> Result<(), Response> {
     let read = state
         .runtime
@@ -3467,7 +3568,7 @@ async fn verify_json_boundary(
     let byte = match read {
         Ok(read) => read.payload.first().copied(),
         Err(err) if is_forward_to_leader(&err) => {
-            return Err(runtime_error_or_leader_redirect_async(state, err, request_target).await);
+            return Err(front_door::write_error_response(state, err, request_target, body).await);
         }
         Err(err) => {
             tracing::warn!(
@@ -3529,8 +3630,14 @@ async fn publish_snapshot_by_offset(
     };
     let mut result = state.runtime.publish_snapshot(request.clone()).await;
     if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
-        if let Err(response) =
-            verify_json_boundary(&state, &stream_id, snapshot_offset, &request_target).await
+        if let Err(response) = verify_json_boundary(
+            &state,
+            &stream_id,
+            snapshot_offset,
+            &request_target,
+            BodyState::Read,
+        )
+        .await
         {
             // Nothing references the staged body: apply refused it.
             if let Some(staged_path) = staged_path.as_deref() {
@@ -3556,7 +3663,7 @@ async fn publish_snapshot_by_offset(
             insert_incarnation(&mut headers, response.incarnation);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => runtime_error_after_body(err),
     }
 }
 
@@ -3585,8 +3692,14 @@ pub(crate) async fn advance_retention(
     };
     let mut result = state.runtime.advance_retention(request.clone()).await;
     if let Some(incarnation) = result.as_ref().err().and_then(json_boundary_unverified) {
-        if let Err(response) =
-            verify_json_boundary(&state, &stream_id, retained_offset, &request_target).await
+        if let Err(response) = verify_json_boundary(
+            &state,
+            &stream_id,
+            retained_offset,
+            &request_target,
+            BodyState::Unread,
+        )
+        .await
         {
             return response;
         }
@@ -4341,6 +4454,17 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     // Forward-to-leader error whose leader is currently unknown (election in
     // progress): tell the client to retry rather than failing hard.
     if is_forward_to_leader(&err) {
+        return leader_unknown_retry_response(err);
+    }
+    runtime_error_response(err)
+}
+
+/// The answer to a write that failed after its body was read: never a
+/// redirect (#581 section 6.1). A leadership refusal, of a node that lost
+/// the group's leadership while it read the body, answers `503` with
+/// `Retry-After`, and the write's key resolves the outcome.
+pub(crate) fn runtime_error_after_body(err: RuntimeError) -> Response {
+    if is_forward_to_leader(&err) || matches!(err, RuntimeError::GroupNotHosted { .. }) {
         return leader_unknown_retry_response(err);
     }
     runtime_error_response(err)

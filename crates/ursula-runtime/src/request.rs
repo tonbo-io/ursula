@@ -4,6 +4,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushPressure;
@@ -690,6 +691,65 @@ pub struct ProducerEarlyAnswerRequest {
     /// of the applied state is answered early.
     pub incarnation: u64,
     pub now_ms: u64,
+}
+
+/// A write's head, routed before its body is read (#581 section 6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteWriteRequest {
+    pub stream_id: BucketStreamId,
+    /// The key of a tokened producer write, whose answer the group's leader
+    /// may decide from the head alone (section 2.5, W7).
+    pub early_answer: Option<EarlyAnswerQuery>,
+}
+
+impl RouteWriteRequest {
+    /// The early-answer lookup this request asks for, if any.
+    pub fn early_answer_request(&self) -> Option<ProducerEarlyAnswerRequest> {
+        self.early_answer
+            .as_ref()
+            .map(|query| ProducerEarlyAnswerRequest {
+                stream_id: self.stream_id.clone(),
+                producer: query.producer.clone(),
+                incarnation: query.incarnation,
+                now_ms: query.now_ms,
+            })
+    }
+}
+
+/// The key and token of a producer write that asks for an early answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlyAnswerQuery {
+    pub producer: ProducerRequest,
+    /// The write's `Stream-Incarnation`.
+    pub incarnation: u64,
+    pub now_ms: u64,
+}
+
+/// Where a write goes, as this replica of its group sees it before the
+/// write's body is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteRoute {
+    /// This replica leads the group: the write is read and proposed here,
+    /// unless its head alone decides its answer.
+    Leader {
+        early_answer: Option<ursula_stream::ProducerEarlyAnswer>,
+    },
+    /// Another node leads the group in `term`.
+    Follower {
+        leader_id: u64,
+        /// The leader's address in the group's membership, if known.
+        leader_address: Option<String>,
+        term: u64,
+    },
+    /// No leader of the group is known.
+    NoLeader,
+}
+
+/// A [`WriteRoute`] and the group it is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedWrite {
+    pub raft_group_id: RaftGroupId,
+    pub route: WriteRoute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

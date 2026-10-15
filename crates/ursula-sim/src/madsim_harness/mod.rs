@@ -68,12 +68,12 @@ use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupOpenLiveReadFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
-use ursula_runtime::GroupProducerEarlyAnswerFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamPartsFuture;
+use ursula_runtime::GroupRouteWriteFuture;
 use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
@@ -86,11 +86,11 @@ use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
-use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::RuntimeThreading;
@@ -1176,13 +1176,13 @@ impl GroupEngine for MadsimScopedGroupEngine {
         }))
     }
 
-    fn producer_early_answer<'a>(
+    fn route_write<'a>(
         &'a mut self,
-        request: ProducerEarlyAnswerRequest,
+        request: RouteWriteRequest,
         placement: ShardPlacement,
-    ) -> GroupProducerEarlyAnswerFuture<'a> {
+    ) -> GroupRouteWriteFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.producer_early_answer(request, placement).await
+            self.inner.route_write(request, placement).await
         }))
     }
 

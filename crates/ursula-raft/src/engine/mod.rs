@@ -63,7 +63,6 @@ use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanColdOrphanSweepFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPlanSharedRefCompactionFuture;
-use ursula_runtime::GroupProducerEarlyAnswerFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadRoute;
@@ -74,6 +73,7 @@ use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRepairColdIndexFuture;
 use ursula_runtime::GroupRouteHeadStreamFuture;
 use ursula_runtime::GroupRouteReadStreamFuture;
+use ursula_runtime::GroupRouteWriteFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
@@ -86,17 +86,18 @@ use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
-use ursula_runtime::ProducerEarlyAnswerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RepairColdIndexRequest;
 use ursula_runtime::RepairColdIndexResponse;
+use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TidyStreamsRequest;
 use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
+use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::collect_retained_cold_objects;
 use ursula_runtime::default_snapshot_store;
@@ -910,24 +911,42 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn producer_early_answer<'a>(
+    fn route_write<'a>(
         &'a mut self,
-        request: ProducerEarlyAnswerRequest,
+        request: RouteWriteRequest,
         _placement: ShardPlacement,
-    ) -> GroupProducerEarlyAnswerFuture<'a> {
+    ) -> GroupRouteWriteFuture<'a> {
         Box::pin(async move {
-            // Only the leader answers early (#581 section 2.5). A follower
-            // answers nothing and the write takes its usual path, which
-            // forwards it. Applied entries are committed, so a leader that was
-            // deposed a moment ago still answers truly under the request's
-            // token.
             if !self.raft.is_leader() {
-                return Ok(None);
+                // One metrics snapshot, so the leader and the term agree.
+                let (self_id, leader_id, term) = {
+                    let metrics = self.raft.metrics();
+                    let metrics = metrics.borrow_watched();
+                    (metrics.id, metrics.current_leader, metrics.current_term)
+                };
+                return Ok(match leader_id {
+                    Some(leader_id) if leader_id != self_id => WriteRoute::Follower {
+                        leader_id,
+                        leader_address: self.current_leader_node().await.map(|node| node.addr),
+                        term,
+                    },
+                    // This node is leaving or about to take leadership: no
+                    // leader to send the write to yet.
+                    _ => WriteRoute::NoLeader,
+                });
             }
-            self.with_state_machine(move |state_machine| {
-                Box::pin(async move { state_machine.engine.producer_early_answer_now(&request) })
-            })
-            .await
+            // Only the leader answers early (#581 section 2.5). Applied
+            // entries are committed, so a leader that was deposed a moment
+            // ago still answers truly under the request's token.
+            let Some(early) = request.early_answer_request() else {
+                return Ok(WriteRoute::Leader { early_answer: None });
+            };
+            let early_answer = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move { state_machine.engine.producer_early_answer_now(&early) })
+                })
+                .await?;
+            Ok(WriteRoute::Leader { early_answer })
         })
     }
 

@@ -456,6 +456,8 @@ async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftW
 
 struct StaticGrpcTestNode {
     runtime: ShardRuntime,
+    /// The node's router, for requests sent in process.
+    app: Router,
     registry: RaftGroupHandleRegistry,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
@@ -576,8 +578,9 @@ async fn spawn_static_grpc_test_node(
         storage.per_group_voters,
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = app.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, served)
             .with_graceful_shutdown(async move {
                 // A dropped sender also means shut down.
                 if shutdown_rx.await.is_err() {
@@ -589,6 +592,7 @@ async fn spawn_static_grpc_test_node(
     });
     StaticGrpcTestNode {
         runtime,
+        app,
         registry,
         shutdown: Some(shutdown_tx),
         server,
@@ -1311,7 +1315,8 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"sse_data_events\":0"));
     assert!(body.contains("\"sse_control_events\":0"));
     assert!(body.contains("\"sse_error_events\":0"));
-    assert!(body.contains("\"routed_requests\":3"));
+    // Each write is routed before its body, then proposed: two requests.
+    assert!(body.contains("\"routed_requests\":6"));
     assert!(body.contains("\"per_core_routed_requests\":["));
     assert!(body.contains("\"mailbox_send_wait_ns\":"));
     assert!(body.contains("\"per_core_mailbox_send_wait_ns\":["));
@@ -1563,7 +1568,18 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
     assert!(body.contains("\"sse_streams_opened\":1"));
     assert!(body.contains("\"sse_read_iterations\":"));
     assert!(body.contains("\"sse_data_events\":1"));
-    assert!(body.contains("\"sse_control_events\":1"));
+    // One control event follows the data. The reader may also have sent
+    // one when it first caught up, before the append reached it.
+    let metrics: serde_json::Value = serde_json::from_str(body).expect("metrics JSON");
+    assert!(
+        (1..=2).contains(
+            &metrics["sse_control_events"]
+                .as_u64()
+                .expect("control events")
+        ),
+        "{}",
+        metrics["sse_control_events"]
+    );
     assert!(body.contains("\"sse_error_events\":0"));
 }
 
@@ -2474,6 +2490,153 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
 
     for node in nodes {
         node.shutdown().await;
+    }
+}
+
+/// A request body that fails the test if the server polls it.
+fn unpollable_body() -> Body {
+    Body::from_stream(futures_util::stream::poll_fn(
+        |_cx| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+            panic!("the server polled the body of a write it routes before reading it")
+        },
+    ))
+}
+
+/// A write to a follower is routed before its body (#581 section 6.1): a
+/// create, an append and a snapshot publish each answer `307` to the leader
+/// with the leader, the group and the term, and the follower never polls
+/// the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_follower_routes_writes_before_their_body() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                node_id == 1,
+                1,
+                StaticGrpcTestNodeStorage::default(),
+            )
+            .await,
+        );
+    }
+    for node in nodes.iter().skip(1) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("warm follower groups timed out")
+            .expect("warm follower groups");
+    }
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].runtime.warm_all_groups())
+        .await
+        .expect("warm initializing leader groups timed out")
+        .expect("warm initializing leader groups");
+    for node in &nodes {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "static gRPC Raft cluster should elect node 1")
+            .await
+            .expect("wait for shared leader");
+    }
+    let created = send(
+        &nodes[0].app,
+        "PUT",
+        "/benchcmp/routed",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let follower = &nodes[1].app;
+    for (write, method, target) in [
+        ("create", "PUT", "/benchcmp/routed-new"),
+        ("append", "POST", "/benchcmp/routed"),
+        ("snapshot", "PUT", "/benchcmp/routed/snapshot/0"),
+    ] {
+        let response = send(
+            follower,
+            method,
+            target,
+            // With `Expect: 100-continue` the client sends no body until
+            // the server asks for it, so the answer needs none of it. Over
+            // HTTP/1.1 without it, the node drains an unread body after its
+            // answer (addendum A3).
+            &[
+                (CONTENT_TYPE.as_str(), "text/plain"),
+                (CONTENT_LENGTH.as_str(), "3"),
+                (axum::http::header::EXPECT.as_str(), "100-continue"),
+            ],
+            unpollable_body(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{write}");
+        assert_eq!(
+            response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("{}{target}", peers[0].1).as_str()),
+            "{write}"
+        );
+        let answer = ursula_headers::RoutingAnswer::parse(
+            response.status().as_u16(),
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .expect("well-formed routing answer");
+        assert!(
+            matches!(answer, Some(ursula_headers::RoutingAnswer::NotLeader {
+                leader, group, term
+            }) if leader.get() == 1 && group.get() == 0 && term.get() > 0),
+            "{write}: {answer:?}"
+        );
+    }
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+/// After the body is read, a node never redirects: a leadership refusal
+/// answers `503` with `Retry-After` (#581 section 6.1).
+#[test]
+fn a_leadership_refusal_after_the_body_is_a_retryable_503() {
+    for err in [
+        RuntimeError::GroupEngine {
+            core_id: ursula_shard::CoreId(0),
+            raft_group_id: RaftGroupId(0),
+            error: GroupEngineError::forward_to_leader_before_proposal("not leader", Some(1), None),
+        },
+        RuntimeError::GroupNotHosted {
+            core_id: ursula_shard::CoreId(0),
+            raft_group_id: RaftGroupId(0),
+        },
+    ] {
+        let response = super::runtime_error_after_body(err);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("1"))
+        );
+        assert!(!response.headers().contains_key(LOCATION));
     }
 }
 
