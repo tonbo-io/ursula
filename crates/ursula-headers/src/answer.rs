@@ -19,7 +19,10 @@ use crate::value::Offset;
 use crate::value::Seq;
 
 /// Whether a receipt reports a write applied by this request or a repeat of
-/// the producer's newest write.
+/// the producer's newest write. The base protocol answers a close-only write
+/// (an empty body with `Stream-Closed: true`) `204` whether it applied now or
+/// before, so a `204` receipt for a close-only write does not tell new from
+/// repeat: it parses as [`Delivery::Repeat`] either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     /// `200`: this request applied the write.

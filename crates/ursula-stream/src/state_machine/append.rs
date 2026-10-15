@@ -4,7 +4,6 @@ use super::AppendExternalInput;
 use super::AppendStreamInput;
 use super::BucketStreamId;
 use super::ClosedEpoch;
-use super::IncarnationCheck;
 use super::ObjectPayloadRef;
 use super::ProducerAck;
 use super::ProducerDelivery;
@@ -43,7 +42,6 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-                check,
             } = input;
             if let Err(response) = self.validate_stream_scope(&stream_id) {
                 break 'append response;
@@ -64,7 +62,7 @@ impl StreamStateMachine {
             if let Some(producer) = producer.as_ref() {
                 self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
             }
-            let gate = match self.producer_gate(&stream_id, producer.as_ref(), check, now_ms) {
+            let gate = match self.producer_gate(&stream_id, producer.as_ref(), now_ms) {
                 Ok(gate) => gate,
                 Err(response) => break 'append response,
             };
@@ -218,7 +216,6 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
-            check,
         } = input;
         if let Err(response) = validate_external_payload_ref(&payload) {
             return response;
@@ -241,7 +238,7 @@ impl StreamStateMachine {
         if let Some(producer) = producer.as_ref() {
             self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
         }
-        let gate = match self.producer_gate(&stream_id, producer.as_ref(), check, now_ms) {
+        let gate = match self.producer_gate(&stream_id, producer.as_ref(), now_ms) {
             Ok(ProducerGate::Repeat(ack)) => return self.repeat_response(&stream_id, ack, false),
             Ok(ProducerGate::Unkeyed) => None,
             Ok(ProducerGate::Apply(key, advance)) => Some((key, advance)),
@@ -349,13 +346,12 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
-        check: IncarnationCheck,
         now_ms: u64,
     ) -> bool {
         self.stream_is_live(stream_id, now_ms)
             && self.validate_stream_scope(stream_id).is_ok()
             && matches!(
-                self.producer_gate(stream_id, producer, check, now_ms),
+                self.producer_gate(stream_id, producer, now_ms),
                 Ok(ProducerGate::Repeat(_))
             )
     }
@@ -379,13 +375,7 @@ impl StreamStateMachine {
             return None;
         }
         let key = producer_write_key(producer).ok()?;
-        match self.evaluate_write(
-            stream_id,
-            &producer.producer_id,
-            key,
-            IncarnationCheck::Matched,
-            now_ms,
-        )? {
+        match self.evaluate_write(stream_id, &producer.producer_id, key, now_ms)? {
             Evaluation::Repeat(ack) => Some(ProducerEarlyAnswer::Repeat(ack)),
             Evaluation::Refuse(Refusal::Producer(ProducerRefusal::KeyConflict { epoch })) => {
                 Some(ProducerEarlyAnswer::KeyConflict { epoch })
@@ -402,7 +392,6 @@ impl StreamStateMachine {
         stream_id: &BucketStreamId,
         producer_id: &str,
         key: WriteKey,
-        check: IncarnationCheck,
         now_ms: u64,
     ) -> Option<Evaluation> {
         let slot = self.stream_slot(stream_id)?;
@@ -417,7 +406,7 @@ impl StreamStateMachine {
             ),
             record => (record, slot.retired_epoch_watermark),
         };
-        Some(evaluate(record, floor, key, check))
+        Some(evaluate(record, floor, key))
     }
 
     /// Evaluates a write's producer key before it applies. A refusal is the
@@ -426,15 +415,13 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
-        check: IncarnationCheck,
         now_ms: u64,
     ) -> Result<ProducerGate, StreamResponse> {
         let Some(producer) = producer else {
             return Ok(ProducerGate::Unkeyed);
         };
         let key = producer_write_key(producer)?;
-        let Some(evaluation) =
-            self.evaluate_write(stream_id, &producer.producer_id, key, check, now_ms)
+        let Some(evaluation) = self.evaluate_write(stream_id, &producer.producer_id, key, now_ms)
         else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,

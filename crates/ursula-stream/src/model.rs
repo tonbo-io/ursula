@@ -28,17 +28,6 @@ pub struct StreamMetadata {
 
 pub type ProducerRequest = ProducerRequestV1;
 
-/// Whether a write's `Stream-Incarnation` precondition matched. A write that
-/// carries it is "tokened"; the epoch floor binds tokened writes only
-/// (#581 section 2.3.1, row 1). A mismatch is refused before evaluation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IncarnationCheck {
-    /// The request carried no `Stream-Incarnation`.
-    Absent,
-    /// The request carried `Stream-Incarnation`, and it matched.
-    Matched,
-}
-
 #[derive(Debug)]
 pub struct AppendStreamInput<'a> {
     pub stream_id: BucketStreamId,
@@ -48,7 +37,6 @@ pub struct AppendStreamInput<'a> {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
-    pub check: IncarnationCheck,
 }
 
 #[derive(Debug)]
@@ -61,7 +49,6 @@ pub(crate) struct AppendExternalInput<'a> {
     pub(crate) stream_seq: Option<String>,
     pub(crate) producer: Option<ProducerRequest>,
     pub(crate) now_ms: u64,
-    pub(crate) check: IncarnationCheck,
 }
 
 /// BLAKE3-256 of a producer write's body (`Producer-Digest`), part of the

@@ -4,7 +4,6 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
 use ursula_stream::ColdFlushPassRequest;
-use ursula_stream::IncarnationCheck;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerAck;
 use ursula_stream::ProducerEarlyAnswer;
@@ -133,7 +132,6 @@ pub(crate) struct AppendPayloadInput<'a> {
     stream_seq: Option<String>,
     producer: Option<ProducerRequest>,
     now_ms: u64,
-    check: IncarnationCheck,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,17 +204,6 @@ impl InMemoryGroupEngine {
         command: StreamCommand,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
-        self.apply_checked_stream_command(command, placement, IncarnationCheck::Absent)
-    }
-
-    /// [`Self::apply_stream_command`] for a command whose
-    /// `Stream-Incarnation` precondition `check` says whether it matched.
-    fn apply_checked_stream_command(
-        &mut self,
-        command: StreamCommand,
-        placement: ShardPlacement,
-        check: IncarnationCheck,
-    ) -> Result<GroupWriteResponse, GroupEngineError> {
         match command {
             // The `Stream-Incarnation` precondition (D12) is checked before
             // anything the wrapped command does here (a create's implicit
@@ -231,7 +218,7 @@ impl InMemoryGroupEngine {
                 {
                     return self.group_response_from_stream(refusal, None, placement);
                 }
-                self.apply_checked_stream_command(*command, placement, IncarnationCheck::Matched)
+                self.apply_stream_command(*command, placement)
             }
             // Appends skip `StreamStateMachine::apply` to keep the exact
             // borrowed fast path (no TTL sweep on the append hot path).
@@ -253,7 +240,6 @@ impl InMemoryGroupEngine {
                         stream_seq,
                         producer,
                         now_ms,
-                        check,
                     },
                     placement,
                 )
@@ -288,7 +274,7 @@ impl InMemoryGroupEngine {
                 {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
-                let response = self.state_machine.apply_checked(command, check);
+                let response = self.state_machine.apply(command);
                 let response = self.group_response_from_stream(response, stream_id, placement);
                 if response.is_ok()
                     && let (Some(cache), Some(stream_id)) =
@@ -637,15 +623,6 @@ impl InMemoryGroupEngine {
             && !self.state_machine.append_would_deduplicate(
                 &request.stream_id,
                 request.producer.as_ref(),
-                match request.if_incarnation {
-                    Some(incarnation)
-                        if self.state_machine.stream_incarnation(&request.stream_id)
-                            == Some(incarnation) =>
-                    {
-                        IncarnationCheck::Matched
-                    }
-                    _ => IncarnationCheck::Absent,
-                },
                 request.now_ms,
             )
         {
@@ -748,7 +725,6 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
-            check,
         } = input;
         let stream_count_key = stream_id.clone();
         let response = self.state_machine.append_borrowed(AppendStreamInput {
@@ -759,7 +735,6 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
-            check,
         });
         self.append_response_from_stream(stream_count_key, response, placement)
     }

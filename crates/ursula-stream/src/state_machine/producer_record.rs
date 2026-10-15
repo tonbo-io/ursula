@@ -9,10 +9,16 @@
 //! (rows 4 to 7 before rows 8 to 13), so a write of an older epoch is never
 //! answered as a repeat. Row 11, a record fenced by a history event, comes
 //! with history identity.
+//!
+//! The epoch floor (G2b) binds every write, with or without
+//! `Stream-Incarnation`: no record is ever created at, or moved to, an epoch
+//! at or below the stream's `retired_epoch_watermark`. Every record's epoch is
+//! therefore above the floor when it opens, so an epoch that was closed or
+//! forgotten never opens again. Such a write answers `producer-expired` with
+//! the floor, and the producer claims above it.
 
 use super::ClosedBy;
 use super::ClosedEpoch;
-use super::IncarnationCheck;
 use super::ProducerAck;
 use super::ProducerDelivery;
 use super::ProducerReceipt;
@@ -51,23 +57,26 @@ pub(crate) enum Refusal {
     SeqGap { expected: u64, received: u64 },
 }
 
+/// `producer-expired` with the floor when `epoch` is at or below it: an
+/// epoch the stream may have forgotten never opens.
+fn at_or_below_floor(floor: Option<u64>, epoch: u64) -> Option<Evaluation> {
+    let floor = floor.filter(|floor| epoch <= *floor)?;
+    Some(Evaluation::Refuse(Refusal::Producer(
+        ProducerRefusal::Expired { epoch: floor },
+    )))
+}
+
 /// Evaluates the write `key` against the producer's record `record` (after
 /// idle retirement) and the stream's epoch floor `floor`.
 pub(crate) fn evaluate(
     record: Option<&ProducerState>,
     floor: Option<u64>,
     key: WriteKey,
-    check: IncarnationCheck,
 ) -> Evaluation {
     let Some(record) = record else {
-        // Row 1, the epoch floor: binds writes that carry the token.
-        if check == IncarnationCheck::Matched
-            && let Some(floor) = floor
-            && key.epoch <= floor
-        {
-            return Evaluation::Refuse(Refusal::Producer(ProducerRefusal::Expired {
-                epoch: floor,
-            }));
+        // Row 1, the epoch floor.
+        if let Some(refused) = at_or_below_floor(floor, key.epoch) {
+            return refused;
         }
         // Rows 2 and 3.
         return if key.seq == 0 {
@@ -96,6 +105,10 @@ pub(crate) fn evaluate(
         return Evaluation::Refuse(Refusal::Producer(refusal));
     }
     if key.epoch > record.epoch {
+        // The floor first: a record never moves to an epoch at or below it.
+        if let Some(refused) = at_or_below_floor(floor, key.epoch) {
+            return refused;
+        }
         // Rows 6 and 7.
         return if key.seq == 0 {
             Evaluation::Claim {

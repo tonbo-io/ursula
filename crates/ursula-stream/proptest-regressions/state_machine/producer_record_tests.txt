@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 946ea4b50be98419890774037e46b4c0f39203fef12c8103386811c061b74cb2 # shrinks to ops = [Claim { producer: 1, bump: 1, digest: None, tokened: false }, Claim { producer: 1, bump: 2, digest: None, tokened: false }, Wait { idle: true }, Any { producer: 0, epoch: 0, seq: 0, digest: None, tokened: false }, Claim { producer: 1, bump: 1, digest: None, tokened: false }, Any { producer: 0, epoch: 1, seq: 0, digest: None, tokened: false }]

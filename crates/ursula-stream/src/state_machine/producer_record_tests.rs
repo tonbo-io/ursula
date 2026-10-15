@@ -209,7 +209,7 @@ fn three_epochs(machine: &mut StreamStateMachine) -> BucketStreamId {
 }
 
 #[test]
-fn row_1_a_tokened_write_at_or_below_the_floor_is_expired() {
+fn row_1_a_write_at_or_below_the_floor_is_expired_with_or_without_the_token() {
     let mut machine = fresh_machine();
     let stream_id = create(&mut machine, "floor", OCTET);
     applied(send(
@@ -256,30 +256,84 @@ fn row_1_a_tokened_write_at_or_below_the_floor_is_expired() {
     assert!(record(&machine, &stream_id, "p").is_none());
     assert_eq!(floor(&machine, &stream_id), Some(3));
 
-    // The floor binds tokened writes only: the base protocol's rule, a
-    // forgotten producer is new, holds without the token.
+    // The floor binds writes without the token too: no record ever opens
+    // at or below it, whoever claims.
+    for write in [
+        Write::new("p", 3, 0).at(idle),
+        Write::new("q", 0, 0).tokened().at(idle),
+        Write::new("q", 0, 0).at(idle),
+    ] {
+        assert_eq!(
+            producer_refusal(send(&mut machine, &stream_id, write)),
+            (StreamErrorCode::ProducerExpired, ProducerRefusal::Expired {
+                epoch: 3
+            }),
+            "{write:?}"
+        );
+    }
     applied(send(
         &mut machine,
         &stream_id,
-        Write::new("p", 3, 0).at(idle),
+        Write::new("p", 4, 0).at(idle),
     ));
-    // Another producer, tokened, also claims above the floor.
-    let response = send(
-        &mut machine,
-        &stream_id,
-        Write::new("q", 0, 0).tokened().at(idle),
-    );
-    assert_eq!(
-        producer_refusal(response),
-        (StreamErrorCode::ProducerExpired, ProducerRefusal::Expired {
-            epoch: 3
-        })
-    );
     applied(send(
         &mut machine,
         &stream_id,
         Write::new("q", 4, 0).tokened().at(idle),
     ));
+}
+
+#[test]
+fn a_claim_on_a_record_never_moves_it_to_or_below_the_floor() {
+    // `a` holds epoch 1 while `b`'s epoch 5 retires: the floor is 5, so `a`
+    // claims above it, never 2 to 5, which the stream may have forgotten.
+    let mut machine = fresh_machine();
+    let stream_id = create(&mut machine, "record-floor", OCTET);
+    applied(send(&mut machine, &stream_id, Write::new("b", 5, 0)));
+    let idle = 1 + PRODUCER_IDLE_EXPIRY_MS;
+    applied(send(
+        &mut machine,
+        &stream_id,
+        Write::new("a", 1, 0).at(idle),
+    ));
+    assert_eq!(
+        machine.apply(StreamCommand::TidyStream {
+            stream_id: stream_id.clone(),
+            now_ms: idle,
+        }),
+        StreamResponse::StreamTidied {
+            debt_remaining: false
+        }
+    );
+    assert_eq!(floor(&machine, &stream_id), Some(5));
+    for epoch in [2, 5] {
+        for seq in [0, 1] {
+            assert_eq!(
+                producer_refusal(send(
+                    &mut machine,
+                    &stream_id,
+                    Write::new("a", epoch, seq).at(idle)
+                )),
+                (StreamErrorCode::ProducerExpired, ProducerRefusal::Expired {
+                    epoch: 5
+                }),
+                "{epoch} {seq}"
+            );
+        }
+    }
+    // Its own epoch below the floor keeps working: it opened above the
+    // floor of its time.
+    applied(send(
+        &mut machine,
+        &stream_id,
+        Write::new("a", 1, 1).at(idle),
+    ));
+    let claim = applied(send(
+        &mut machine,
+        &stream_id,
+        Write::new("a", 6, 0).at(idle),
+    ));
+    assert_eq!(claim.closed_epoch, Some(ClosedEpoch { epoch: 1, seq: 1 }));
 }
 
 #[test]
@@ -594,8 +648,8 @@ fn idle_producer_expires_at_its_own_next_write_and_raises_the_floor() {
         ))
         .is_repeat()
     );
-    // At the idle period a later sequence is refused (expected 0) and
-    // cannot double-write.
+    // At the idle period the record retires and its epoch is at the floor:
+    // a later sequence is expired and cannot double-write.
     let idle_at = t0 + PRODUCER_IDLE_EXPIRY_MS;
     let before = tail(&machine, &stream_id);
     let (code, _) = refused(send(
@@ -603,15 +657,15 @@ fn idle_producer_expires_at_its_own_next_write_and_raises_the_floor() {
         &stream_id,
         Write::new("p", 1, 3).at(idle_at),
     ));
-    assert_eq!(code, StreamErrorCode::ProducerSeqConflict);
+    assert_eq!(code, StreamErrorCode::ProducerExpired);
     assert_eq!(tail(&machine, &stream_id), before);
     assert!(record(&machine, &stream_id, "p").is_none());
     assert_eq!(floor(&machine, &stream_id), Some(1));
-    // Without the token, sequence 0 is a new producer.
+    // The producer claims above the floor, as a new record.
     let claim = applied(send(
         &mut machine,
         &stream_id,
-        Write::new("p", 1, 0).at(idle_at),
+        Write::new("p", 2, 0).at(idle_at),
     ));
     assert_eq!(claim.closed_epoch, None);
     assert_eq!(
@@ -1018,10 +1072,11 @@ fn producer_cap_evicts_hour_idle_producers_and_rejects_otherwise() {
     assert!(slot.producers.contains_key("p0002"));
     assert!(slot.producers.contains_key("new-a"));
     assert_eq!(slot.retired_epoch_watermark, Some(1));
+    // `p0000`'s eviction raised the floor to its epoch 1.
     applied(send(
         &mut machine,
         &stream_id,
-        Write::new("new-b", 1, 0).at(later),
+        Write::new("new-b", 2, 0).at(later),
     ));
     let slot = machine.stream_slot(&stream_id).unwrap();
     assert_eq!(slot.producers.len(), MAX_PRODUCERS_PER_STREAM);
@@ -1110,12 +1165,18 @@ struct Ledger {
     /// The highest applied seq of each `(producer, epoch)`.
     last: HashMap<(String, u64), u64>,
     keys: Vec<(String, u64, u64)>,
+    /// Epochs a claim closed or a retirement forgot, per producer (G2b:
+    /// none of them may ever apply a write again).
+    dead: std::collections::HashSet<(String, u64)>,
+    /// The highest epoch any retirement forgot, by the ledger's own count:
+    /// the stream may have forgotten every epoch at or below it, so no
+    /// record of any producer may open there (G2b).
+    forgotten: Option<u64>,
 }
 
 fn check_answer(
     ledger: &mut Ledger,
     write: Write<'_>,
-    record_before: Option<&ProducerState>,
     floor_before: Option<u64>,
     tail_before: u64,
     tail_after: u64,
@@ -1130,24 +1191,31 @@ fn check_answer(
         } => match ack.delivery {
             ProducerDelivery::Applied(receipt) => {
                 prop_assert_eq!((ack.epoch, ack.seq), (write.epoch, write.seq));
+                // G2b: an epoch a claim closed or a retirement forgot never
+                // applies a write again, tokened or not.
+                prop_assert!(
+                    !ledger.dead.contains(&(id.clone(), write.epoch)),
+                    "epoch {} of {} reopened",
+                    write.epoch,
+                    id
+                );
                 if write.seq == 0 {
-                    if write.tokened && record_before.is_none() {
-                        // L4, rows 1 and 2: a tokened claim without a record
-                        // never opens a forgotten epoch.
-                        prop_assert!(floor_before.is_none_or(|floor| write.epoch > floor));
-                    }
-                    if ledger.last.contains_key(&(id.clone(), write.epoch)) {
-                        // A key applies at most once within its record's
-                        // life. A forgotten epoch can apply again only after
-                        // an untokened claim made the producer new (#581
-                        // section 2.10): directly, or by a claim on the
-                        // record that untokened claim opened (row 6 does not
-                        // consult the floor).
-                        prop_assert!(floor_before.is_some_and(|floor| write.epoch <= floor));
-                        prop_assert!(!write.tokened || record_before.is_some());
+                    // L4: every record opens above the floor, with or
+                    // without a record before it, tokened or not, and so
+                    // above every epoch the stream forgot.
+                    prop_assert!(floor_before.is_none_or(|floor| write.epoch > floor));
+                    prop_assert!(
                         ledger
-                            .applied
-                            .retain(|(p, e, _), _| !(p == &id && *e == write.epoch));
+                            .forgotten
+                            .is_none_or(|forgotten| write.epoch > forgotten),
+                        "a claim of {} reopened forgotten epoch {}",
+                        id,
+                        write.epoch
+                    );
+                    // L1: a key applies at most once, ever.
+                    prop_assert!(!ledger.last.contains_key(&(id.clone(), write.epoch)));
+                    if let Some(closed) = ack.closed_epoch {
+                        ledger.dead.insert((id.clone(), closed.epoch));
                     }
                 } else {
                     // L1: exact seqs, in order.
@@ -1260,8 +1328,6 @@ proptest! {
                     Write { id: PRODUCERS[producer], epoch, seq, digest, tokened, now_ms }
                 }
             };
-            let idle_record = record(&machine, &stream_id, write.id)
-                .filter(|state| !producers::producer_is_idle(state, write.now_ms));
             let floor_before = {
                 let retired = record(&machine, &stream_id, write.id)
                     .filter(|state| producers::producer_is_idle(state, write.now_ms))
@@ -1271,13 +1337,24 @@ proptest! {
                     (floor, retired) => floor.or(retired),
                 }
             };
+            // The write retires its producer's idle record first: that
+            // epoch is forgotten.
+            if let Some(retired) = record(&machine, &stream_id, write.id)
+                .filter(|state| producers::producer_is_idle(state, write.now_ms))
+            {
+                ledger.dead.insert((write.id.to_owned(), retired.epoch));
+                ledger.forgotten = Some(
+                    ledger
+                        .forgotten
+                        .map_or(retired.epoch, |forgotten| forgotten.max(retired.epoch)),
+                );
+            }
             let tail_before = tail(&machine, &stream_id);
             let response = send(&mut machine, &stream_id, write);
             let tail_after = tail(&machine, &stream_id);
             check_answer(
                 &mut ledger,
                 write,
-                idle_record.as_ref(),
                 floor_before,
                 tail_before,
                 tail_after,

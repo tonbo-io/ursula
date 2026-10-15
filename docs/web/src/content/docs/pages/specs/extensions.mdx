@@ -360,13 +360,13 @@ A server implementing this section answers producer writes with the base protoco
 | `epoch-closed;by=claim` | `403` | epoch `Producer-Closed-Epoch` is closed: every seq at or below `Producer-Closed-Seq` applied, and no seq above it ever will |
 | `stale-epoch` | `403` | the write's epoch is older than the one the current claim closed; the server cannot say which of its writes applied |
 | `key-conflict` | `403` | the key holds a write with another identity; this write did not apply and never will under this key |
-| `producer-expired` | `403` | the server forgot this producer and the epoch is at or below the stream's epoch floor (Section 5.4) |
+| `producer-expired` | `403` | the epoch is at or below the stream's epoch floor (Section 5.4): the server may have forgotten it |
 
 ### 5.4. Epoch Floor
 
-A server that discards the state of idle producers SHOULD keep, per stream, the highest epoch of any producer state it discarded: the stream's epoch floor. A producer write that carries `Stream-Incarnation`, from a producer the server holds no state for, whose epoch is at or below the floor, MUST be refused with `403 Forbidden`, `Producer-Epoch: <floor>` and `Producer-Outcome: producer-expired`. A write without `Stream-Incarnation` keeps the base protocol's rule: a producer whose state expired is treated as new.
+A server that discards the state of idle producers SHOULD keep, per stream, the highest epoch of any producer state it discarded: the stream's epoch floor. A server that keeps a floor MUST NOT open a producer epoch at or below it: a producer write whose epoch is at or below the floor, from a producer the server holds no state for, or a claim that would move a producer's state to such an epoch, MUST be refused with `403 Forbidden`, `Producer-Epoch: <floor>` and `Producer-Outcome: producer-expired`, with or without `Stream-Incarnation`. The producer then claims an epoch above the floor. This replaces the base protocol's rule that a producer whose state expired is treated as new at any epoch.
 
-A claim that carries `Stream-Incarnation` therefore never reopens an epoch the server forgot, and a stale writer that returns after its state expired cannot claim an old epoch again.
+A closed or forgotten epoch therefore never opens again, and a stale writer that returns after its state expired cannot claim an old epoch. The floor is per stream: a new producer on a stream that discarded others' state claims above it too.
 
 ### 5.5. Answers Before the Body
 

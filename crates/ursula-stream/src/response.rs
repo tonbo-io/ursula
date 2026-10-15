@@ -128,7 +128,7 @@ pub enum StreamErrorCode {
     /// A producer write of an epoch that a claim closed (`403
     /// epoch-closed`).
     ProducerEpochClosed,
-    /// A tokened producer write at or below the stream's epoch floor (`403
+    /// A producer write at or below the stream's epoch floor (`403
     /// producer-expired`): the stream keeps no memory of its epoch.
     ProducerExpired,
     /// A producer write of an epoch below the producer's current one, other

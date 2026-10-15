@@ -56,7 +56,6 @@ use crate::model::ColdGcPlanEntry;
 use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
-use crate::model::IncarnationCheck;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
@@ -374,20 +373,7 @@ impl StreamStateMachine {
         self.registry.refresh_ttl(stream_id);
     }
 
-    /// Applies one command of a request without a `Stream-Incarnation`
-    /// precondition, or a wrapped [`StreamCommand::IfIncarnation`].
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
-        self.apply_checked(command, IncarnationCheck::Absent)
-    }
-
-    /// Applies one command. `check` says whether the request's
-    /// `Stream-Incarnation` precondition matched; the producer rules bind
-    /// tokened writes more tightly (the epoch floor).
-    pub fn apply_checked(
-        &mut self,
-        command: StreamCommand,
-        check: IncarnationCheck,
-    ) -> StreamResponse {
         match command {
             StreamCommand::CreateBucket { bucket_id } => self.create_bucket(bucket_id),
             StreamCommand::CreateStream {
@@ -462,7 +448,6 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
-                    check,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -486,7 +471,6 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
-                    check,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -571,7 +555,7 @@ impl StreamStateMachine {
                 producer,
                 now_ms,
             } => {
-                let response = self.close(stream_id, stream_seq, producer, now_ms, check);
+                let response = self.close(stream_id, stream_seq, producer, now_ms);
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
@@ -591,7 +575,7 @@ impl StreamStateMachine {
                 command,
             } => match self.incarnation_precondition(&command, incarnation) {
                 Some(refusal) => refusal,
-                None => self.apply_checked(*command, IncarnationCheck::Matched),
+                None => self.apply(*command),
             },
         }
     }
