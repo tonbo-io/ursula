@@ -25,6 +25,8 @@ use ursula_headers::CurrentEpoch;
 use ursula_headers::Delivery;
 use ursula_headers::EpochClosure;
 use ursula_headers::HeaderError;
+use ursula_headers::IncarnationMismatch;
+use ursula_headers::Inherited;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
 use ursula_headers::SnapshotRef;
@@ -146,12 +148,15 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         // D12: 412, never 409, so it does not mix with `Stream-Seq` and
         // producer conflicts.
         StreamErrorCode::IncarnationMismatch => StatusCode::PRECONDITION_FAILED,
+        // The proposer's clock is about 140,000 years ahead: a server fault
+        // a retry does not fix.
+        StreamErrorCode::CreatedAtOutOfRange => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 /// `Stream-Incarnation` (D12): the opaque token of the stream incarnation
-/// that served a response. `0` means unknown and is omitted; every epoch-2
-/// leader sets it, and a stream's `created_at_ms` is never `0`.
+/// that served a response. `0` means unknown and is omitted; a token is
+/// never `0` (#581 section 4.2).
 pub(crate) fn insert_incarnation(headers: &mut HeaderMap, incarnation: u64) {
     if incarnation != 0 {
         insert_u64_header(headers, names::STREAM_INCARNATION, incarnation);
@@ -174,15 +179,32 @@ pub(crate) fn stream_head(
         }),
         _ => None,
     };
-    Ok(StreamHead::new(
-        Incarnation::try_from(response.created_at_ms)?,
+    let inherited = response
+        .inherited
+        .map(|inherited| -> Result<Inherited, HeaderError> {
+            Ok(Inherited {
+                previous_incarnation: Incarnation::try_from(inherited.previous_incarnation)?,
+                offset: Offset::from_u64(inherited.offset),
+            })
+        })
+        .transpose()?;
+    let head = StreamHead::new(
+        Incarnation::try_from(response.incarnation)?,
         Offset::from_u64(response.tail_offset),
         Offset::from_u64(response.retained_offset),
         limits::MAX_REQUEST_BYTES,
     )?
     .with_closed(response.closed)
     .with_snapshot(snapshot)?
-    .with_max_snapshot_bytes(max_snapshot_bytes))
+    .with_max_snapshot_bytes(max_snapshot_bytes);
+    // W5: what the stream's current history began from. Two histories give
+    // one stream the same token with probability 2^-52; HEAD then reports
+    // no predecessor rather than a previous token equal to the current one.
+    match head.with_inherited(inherited) {
+        Ok(head) => Ok(head),
+        Err(HeaderError::PreviousIncarnationIsCurrent) => Ok(head),
+        Err(err) => Err(err),
+    }
 }
 
 /// Renders a HEAD's stream metadata with the shared header crate.
@@ -339,6 +361,19 @@ pub(crate) fn producer_refusal_answer(
                 Epoch::try_from(epoch)?,
                 closed_epoch(closed)?,
             )?),
+            // Row 11 (G2): a history event closed the producer's current
+            // epoch, which the refusal names as both epochs.
+            ProducerRefusal::EpochClosed {
+                epoch,
+                by: ClosedBy::History,
+                closed,
+            } => {
+                debug_assert_eq!(
+                    epoch, closed.epoch,
+                    "a history event closes the current epoch"
+                );
+                ProducerAnswer::EpochClosed(EpochClosure::by_history(closed_epoch(closed)?))
+            }
             ProducerRefusal::Expired { epoch } => ProducerAnswer::ProducerExpired {
                 epoch: Epoch::try_from(epoch)?,
             },
@@ -408,12 +443,23 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
     // A failed `Stream-Incarnation` precondition names the current
     // incarnation when the stream exists (D12).
     if err.stream_error_code() == Some(StreamErrorCode::IncarnationMismatch) {
-        for context in err.stream_error_context() {
-            if let StreamErrorContext::StreamIncarnation { incarnation } = context {
-                insert_incarnation(headers, *incarnation);
-            }
-        }
+        let current = err
+            .stream_error_context()
+            .iter()
+            .find_map(|context| match context {
+                StreamErrorContext::StreamIncarnation { incarnation } => {
+                    Incarnation::try_from(*incarnation).ok()
+                }
+                _ => None,
+            });
+        insert_incarnation_mismatch(headers, IncarnationMismatch { current });
     }
+}
+
+/// Renders the `412` of the `Stream-Incarnation` precondition with the
+/// shared header crate: the stream's current token when it exists.
+pub(crate) fn insert_incarnation_mismatch(headers: &mut HeaderMap, mismatch: IncarnationMismatch) {
+    mismatch.render(|name, value| insert_header_str(headers, name, value));
 }
 
 pub(crate) fn insert_stream_error_offset(headers: &mut HeaderMap, err: &RuntimeError) {
@@ -624,8 +670,11 @@ pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {
     !(content_type.starts_with("text/") || content_type == "application/json")
 }
 
+/// The token is part of the tag (#581 section 4.7), so a `304` never
+/// matches across a recreate or a history event with equal bytes.
 pub(crate) fn read_etag(response: &ReadStreamResponse) -> String {
     let mut hasher = DefaultHasher::new();
+    response.incarnation.hash(&mut hasher);
     response.offset.hash(&mut hasher);
     response.next_offset.hash(&mut hasher);
     response.content_type.hash(&mut hasher);

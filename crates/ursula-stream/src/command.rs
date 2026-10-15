@@ -1,10 +1,12 @@
 use std::fmt;
+use std::num::NonZeroU64;
 
 use bytes::Bytes;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
+use crate::history::BackupDigest;
 use crate::model::ColdChunkRef;
 use crate::model::ExternalPayloadRef;
 use crate::model::ObjectPayloadRef;
@@ -144,15 +146,34 @@ pub enum StreamCommand {
         seq: u64,
         not_before_ms: u64,
     },
-    /// Replaces this group's entire state with a backup snapshot.
+    /// Replaces this group's entire state with a backup snapshot, and starts
+    /// a new history in the same entry (#581 section 4.4): every restored
+    /// stream gets a new token, and every restored producer record is
+    /// history-fenced.
     ///
-    /// Restore-only: the target group must be empty. Travelling as a normal
-    /// replicated command keeps every replica of the restored cluster
+    /// Restore-only: the target group must be empty, or already hold this
+    /// import (`backup_digest`), which answers `already`. Travelling as a
+    /// normal replicated command keeps every replica of the restored cluster
     /// deterministic while the cluster retains its own raft identity and
     /// membership -- nothing from the backed-up cluster's raft metadata is
     /// reused.
     ImportSnapshot {
         snapshot: Box<StreamSnapshot>,
+        /// The new history's id, drawn by the proposer.
+        history: NonZeroU64,
+        /// The BLAKE3-256 digest of the backup, the import's key.
+        backup_digest: BackupDigest,
+        now_ms: u64,
+    },
+    /// Group-scoped: a new history starts here (#581 section 4.3). Bytes
+    /// served under an earlier history may differ. It starts every group
+    /// (genesis) and follows an accepted loss of acknowledged writes. Apply
+    /// is O(1): every token of the group changes and every producer record
+    /// is history-fenced because both are derived from the history id.
+    NewHistory {
+        /// The new history's id, drawn by the proposer.
+        history: NonZeroU64,
+        now_ms: u64,
     },
     /// Bounded normalization of one stream's replicated state (bounded-state
     /// F0): expires idle producers and evicts producers over the cap (F3).
@@ -174,8 +195,8 @@ pub enum StreamCommand {
     },
     /// The `Stream-Incarnation` request precondition (D12): `command` (a
     /// create, append, close, delete, snapshot publish or retention move)
-    /// applies only if its stream is the incarnation `incarnation` (its
-    /// `created_at_ms`) when this entry applies; otherwise apply refuses it
+    /// applies only if its stream's token in the group's current history is
+    /// `incarnation` when this entry applies; otherwise apply refuses it
     /// with [`crate::StreamErrorCode::IncarnationMismatch`] and changes
     /// nothing (see [`crate::StreamStateMachine::incarnation_precondition`]).
     /// A request without the header is never wrapped, so its command and log
@@ -225,7 +246,7 @@ impl StreamCommand {
             // stream, such as its names and producer receipts, has only the
             // allowance, so many streams with small bodies weigh less than
             // they encode to.
-            Self::ImportSnapshot { snapshot } => snapshot
+            Self::ImportSnapshot { snapshot, .. } => snapshot
                 .streams
                 .iter()
                 .map(|stream| {
@@ -329,12 +350,15 @@ impl fmt::Display for StreamCommand {
             Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
             Self::DeferColdGc { seq, .. } => write!(f, "defer_cold_gc:seq={seq}"),
-            Self::ImportSnapshot { snapshot } => write!(
+            Self::ImportSnapshot {
+                snapshot, history, ..
+            } => write!(
                 f,
-                "import_snapshot:buckets={}:streams={}",
+                "import_snapshot:buckets={}:streams={}:history={history:#x}",
                 snapshot.buckets.len(),
                 snapshot.streams.len()
             ),
+            Self::NewHistory { history, .. } => write!(f, "new_history:{history:#x}"),
             Self::TidyStream { stream_id, .. } => write!(f, "tidy_stream:{stream_id}"),
             Self::OffloadColdRefs { stream_id, refs } => {
                 write!(f, "offload_cold_refs:{stream_id}:{} refs", refs.len())

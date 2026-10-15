@@ -230,6 +230,8 @@ pub enum GroupWriteResponse {
     AckColdGc(AckColdGcResponse),
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
+    /// A history event applied (#581 section 4.3).
+    NewHistory(crate::request::NewHistoryResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),

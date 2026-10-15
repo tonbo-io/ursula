@@ -185,6 +185,13 @@ pub enum SnapshotStoreError {
         field: &'static str,
         len: usize,
     },
+    /// The group's history event names history id 0, which no proposer
+    /// draws.
+    #[error("snapshot history event has history id 0")]
+    HistoryIdZero,
+    /// The digest of the backup a group was restored from is not 32 bytes.
+    #[error("snapshot history event's backup digest is {len} bytes, not 32")]
+    BackupDigestLength { len: usize },
     /// A group snapshot whose leading frame names another format epoch than
     /// [`ursula_stream::FORMAT_EPOCH`], or that has no such frame
     /// (`found: None`, Ursula 0.5.x and earlier).

@@ -98,6 +98,8 @@ use tower_http::compression::predicate::Predicate;
 use tower_http::compression::predicate::SizeAbove;
 use ursula_headers::ClusterId;
 use ursula_headers::HeaderError as ProducerHeaderError;
+use ursula_headers::IncarnationMismatch;
+use ursula_headers::IncarnationPrecondition;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
@@ -174,6 +176,7 @@ use crate::render::insert_cursor;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 use crate::render::insert_incarnation;
+use crate::render::insert_incarnation_mismatch;
 use crate::render::insert_lifetime_headers;
 use crate::render::insert_location;
 use crate::render::insert_offset;
@@ -2173,15 +2176,50 @@ fn decode_backup_group(
     Ok((raft_group_id, snapshot))
 }
 
+/// The backup's BLAKE3 digest from the required `x-ursula-backup-blake3`
+/// header, checked against the body: the import's key (#581 section 4.4).
+/// A refusal is the `400` to answer.
+fn backup_digest(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<ursula_runtime::BackupDigest, Box<Response>> {
+    let bad_request =
+        |message: String| Box::new((StatusCode::BAD_REQUEST, message).into_response());
+    let mut values = headers.get_all(HEADER_BACKUP_BLAKE3).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Err(bad_request(format!(
+            "an import needs exactly one {HEADER_BACKUP_BLAKE3} header"
+        )));
+    };
+    let claimed = blake3::Hash::from_hex(value.as_bytes())
+        .map_err(|err| bad_request(format!("malformed {HEADER_BACKUP_BLAKE3}: {err}")))?;
+    let actual = blake3::hash(body);
+    if claimed != actual {
+        return Err(bad_request(format!(
+            "{HEADER_BACKUP_BLAKE3} {} does not match the body's BLAKE3 {}",
+            claimed.to_hex(),
+            actual.to_hex()
+        )));
+    }
+    Ok(*actual.as_bytes())
+}
+
 /// Imports one group's backup snapshot into an empty group as a replicated
-/// write. Non-empty groups fail closed with `409`; invalid payloads with
-/// `400`. The restored cluster keeps its own raft identity and membership.
+/// write that starts a new history (#581 section 4.4), keyed by the
+/// backup's digest: a repeat answers `already: true`. Non-empty groups fail
+/// closed with `409`; invalid payloads with `400`. The restored cluster
+/// keeps its own raft identity and membership.
 pub(crate) async fn import_backup_group(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(raft_group_id): Path<u64>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let backup_digest = match backup_digest(&headers, &body) {
+        Ok(digest) => digest,
+        Err(response) => return *response,
+    };
     let (raft_group_id, snapshot) = match decode_backup_group(&state, raft_group_id, &body) {
         Ok(decoded) => decoded,
         Err(response) => return *response,
@@ -2190,18 +2228,23 @@ pub(crate) async fn import_backup_group(
         .runtime
         .import_group_state(raft_group_id, ImportGroupStateRequest {
             snapshot: Box::new(snapshot),
+            history: ursula_runtime::draw_history_id(),
+            backup_digest,
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
-        Ok(response) => json_response(
+        Ok(response) => (
             StatusCode::OK,
-            serde_json::json!({
-                "buckets": response.buckets,
-                "streams": response.streams,
-                "group_commit_index": response.group_commit_index,
-            })
-            .to_string(),
-        ),
+            axum::Json(ursula_proto::admin::BackupImportResponse {
+                buckets: response.buckets,
+                streams: response.streams,
+                group_commit_index: response.group_commit_index,
+                history: response.history,
+                already: response.already,
+            }),
+        )
+            .into_response(),
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
@@ -3275,8 +3318,7 @@ pub(crate) async fn head_stream_by_id(
         .await
     {
         Ok(response) => {
-            if let Some(refused) = read_precondition_failed(if_incarnation, response.created_at_ms)
-            {
+            if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
                 return refused;
             }
             let head = match stream_head(
@@ -3922,7 +3964,7 @@ pub(crate) async fn long_poll_stream(
         };
         return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
     }
-    let incarnation = if_incarnation.or((head.created_at_ms != 0).then_some(head.created_at_ms));
+    let incarnation = if_incarnation.or((head.incarnation != 0).then_some(head.incarnation));
     let timeout_ms = long_poll_timeout_ms(query);
     let read = state.runtime.wait_read_stream_pinned(
         ReadStreamRequest {
@@ -3956,14 +3998,14 @@ pub(crate) async fn long_poll_stream(
         // `Stream-Up-To-Date` and `Stream-Closed` hold as the owner read
         // them only when that offset is the owner's tail.
         Err(_) => {
-            if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms) {
+            if let Some(refused) = read_precondition_failed(if_incarnation, head.incarnation) {
                 return refused;
             }
             let at_tail = offset == head.tail_offset;
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_offset(&mut headers, offset);
-            insert_incarnation(&mut headers, head.created_at_ms);
+            insert_incarnation(&mut headers, head.incarnation);
             if at_tail {
                 insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
             }
@@ -4016,7 +4058,7 @@ pub(crate) fn sse_stream(
     if_incarnation: Option<u64>,
 ) -> Response {
     let head = owner.head;
-    if let Some(refused) = read_precondition_failed(if_incarnation, head.created_at_ms) {
+    if let Some(refused) = read_precondition_failed(if_incarnation, head.incarnation) {
         return refused;
     }
 
@@ -4041,7 +4083,10 @@ pub(crate) fn sse_stream(
         encode_base64,
         cursor: query.get("cursor").cloned(),
         initial_read: true,
-        incarnation: if_incarnation,
+        // Pinned to the announced token, as a long-poll is (#581 section
+        // 4.7): a session without a precondition ends at a recreate or a
+        // history event too.
+        incarnation: if_incarnation.or((head.incarnation != 0).then_some(head.incarnation)),
         owner_read_index: owner.read_index,
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
@@ -4086,7 +4131,10 @@ pub(crate) fn sse_stream(
                     .fetch_add(1, Ordering::Relaxed);
                 let event = format!(
                     "event: error\ndata:{}\n\n",
-                    sse_safe_line("the stream was deleted and recreated (Stream-Incarnation)")
+                    sse_safe_line(
+                        "the stream was deleted and recreated, or its history was rewritten \
+                         (Stream-Incarnation)"
+                    )
                 );
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
@@ -4128,7 +4176,7 @@ pub(crate) fn sse_stream(
         http_read_content_type(&head.content_type),
     );
     insert_cache_control(&mut headers, "no-cache");
-    insert_incarnation(&mut headers, head.created_at_ms);
+    insert_incarnation(&mut headers, head.incarnation);
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -4244,21 +4292,21 @@ pub(crate) fn parse_stream_expires_at(raw: &str) -> Result<u64, String> {
 /// token the server could have issued (one canonical decimal integer) is
 /// malformed and answers 400, as do repeated values.
 pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
-    let mut values = headers.get_all(names::STREAM_INCARNATION).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    let malformed =
-        || Box::new((StatusCode::BAD_REQUEST, "malformed Stream-Incarnation").into_response());
-    if values.next().is_some() {
-        return Err(malformed());
-    }
-    let Some(value) = value.to_str().ok().map(str::trim) else {
-        return Err(malformed());
-    };
-    Incarnation::parse(names::STREAM_INCARNATION, value)
-        .map(|incarnation| Some(incarnation.get()))
-        .map_err(|_malformed| malformed())
+    IncarnationPrecondition::parse(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .map(|precondition| precondition.map(|precondition| precondition.incarnation.get()))
+    .map_err(|err| {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("malformed Stream-Incarnation: {err}"),
+            )
+                .into_response(),
+        )
+    })
 }
 
 /// A read's `Stream-Incarnation` precondition (D12), checked against the
@@ -4269,7 +4317,9 @@ fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Respon
     (expected != served).then(|| {
         let mut headers = HeaderMap::new();
         insert_default_response_headers(&mut headers);
-        insert_incarnation(&mut headers, served);
+        insert_incarnation_mismatch(&mut headers, IncarnationMismatch {
+            current: Incarnation::try_from(served).ok(),
+        });
         (
             StatusCode::PRECONDITION_FAILED,
             headers,
@@ -4552,6 +4602,8 @@ mod tests;
 mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod server_metadata_tests;
 #[cfg(test)]

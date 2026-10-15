@@ -522,6 +522,9 @@ fn an_import_weighs_at_least_what_its_bodies_encode_to() {
     assert!(bodies > 4 * 64 * 1024, "each high byte encodes to two");
     let import = StreamCommand::ImportSnapshot {
         snapshot: Box::new(snapshot),
+        history: std::num::NonZeroU64::MIN,
+        backup_digest: [0; 32],
+        now_ms: 0,
     };
     assert!(import.log_bytes_estimate() >= u64::try_from(bodies).unwrap());
 }
@@ -590,7 +593,7 @@ fn json_snapshot_and_retention_offsets_follow_lf_boundaries() {
         })),
         appended(16, 24)
     );
-    let incarnation = machine.head(&stream_id).expect("head").created_at_ms;
+    let incarnation = machine.stream_incarnation(&stream_id).expect("token");
     let publish = |offset: u64, expected_incarnation: Option<u64>| StreamCommand::PublishSnapshot {
         stream_id: stream_id.clone(),
         snapshot_offset: offset,
@@ -2442,6 +2445,8 @@ fn snapshot_entry(
         visible_snapshot: None,
         producer_states,
         retired_epoch_watermark: None,
+        history: 0,
+        inherited: None,
     }
 }
 
@@ -2461,6 +2466,7 @@ fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
         },
         closed_epoch: None,
         opened: Opened::AboveFloor,
+        history: 0,
         last_seen_ms: 0,
     }
 }
@@ -2476,6 +2482,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: Vec::new(),
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
+            history: None,
             format_epoch: crate::FORMAT_EPOCH,
         })
         .expect_err("duplicate bucket"),
@@ -2491,6 +2498,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: vec![entry],
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
+            history: None,
             format_epoch: crate::FORMAT_EPOCH,
         })
     };
@@ -3964,6 +3972,9 @@ fn restore_refuses_another_format_epoch() {
     assert!(matches!(
         StreamStateMachine::new().apply(StreamCommand::ImportSnapshot {
             snapshot: Box::new(snapshot),
+            history: std::num::NonZeroU64::MIN,
+            backup_digest: [0; 32],
+            now_ms: 0,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::ImportInvalid,
@@ -3990,6 +4001,9 @@ fn import_snapshot_never_lowers_last_created_at_ms() {
     assert!(matches!(
         target.apply(StreamCommand::ImportSnapshot {
             snapshot: Box::new(backup.snapshot()),
+            history: std::num::NonZeroU64::MIN,
+            backup_digest: [0; 32],
+            now_ms: 0,
         }),
         StreamResponse::SnapshotImported { .. }
     ));

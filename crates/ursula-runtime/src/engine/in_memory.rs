@@ -191,25 +191,63 @@ impl InMemoryGroupEngine {
         self.cold_store = cold_store;
     }
 
+    /// Applies the committed command of the log entry at `index`. The Raft
+    /// state machine passes each entry's log index, which a history event
+    /// records (#581 section 4.3).
+    pub fn apply_committed_entry(
+        &mut self,
+        command: GroupWriteCommand,
+        index: u64,
+        placement: ShardPlacement,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        match command {
+            GroupWriteCommand::Stream(command) => self.apply_checked_stream_command(
+                command,
+                index,
+                placement,
+                IncarnationCheck::Absent,
+            ),
+        }
+    }
+
+    /// [`Self::apply_committed_entry`] for an engine without a log: the
+    /// entry's index is the next commit index.
     pub fn apply_committed_write(
         &mut self,
         command: GroupWriteCommand,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
-        match command {
-            GroupWriteCommand::Stream(command) => self.apply_stream_command(command, placement),
-        }
+        let index = self.commit_index.saturating_add(1);
+        self.apply_committed_entry(command, index, placement)
     }
 
-    /// Applies one canonical [`StreamCommand`] to the deterministic state
-    /// machine and lifts its [`StreamResponse`] into the group-level response,
-    /// maintaining the group commit index and per-stream append counts.
+    /// Applies one canonical [`StreamCommand`] of an engine without a log
+    /// to the deterministic state machine and lifts its [`StreamResponse`]
+    /// into the group-level response, maintaining the group commit index
+    /// and per-stream append counts. The entry's index is the next commit
+    /// index.
     pub fn apply_stream_command(
         &mut self,
         command: StreamCommand,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
-        self.apply_checked_stream_command(command, placement, IncarnationCheck::Absent)
+        let index = self.commit_index.saturating_add(1);
+        self.apply_checked_stream_command(command, index, placement, IncarnationCheck::Absent)
+    }
+
+    /// Starts a group of an engine without Raft: it draws its genesis
+    /// history id when it creates the group (#581 section 4.3, W2).
+    pub fn start_genesis(&mut self, placement: ShardPlacement, now_ms: u64) {
+        if self.state_machine.history().is_none() {
+            let started = self.apply_stream_command(
+                StreamCommand::NewHistory {
+                    history: ursula_stream::draw_history_id(),
+                    now_ms,
+                },
+                placement,
+            );
+            debug_assert!(started.is_ok(), "a genesis event always applies");
+        }
     }
 
     /// [`Self::apply_stream_command`] for a command whose
@@ -217,6 +255,7 @@ impl InMemoryGroupEngine {
     fn apply_checked_stream_command(
         &mut self,
         command: StreamCommand,
+        index: u64,
         placement: ShardPlacement,
         check: IncarnationCheck,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
@@ -234,7 +273,12 @@ impl InMemoryGroupEngine {
                 {
                     return self.group_response_from_stream(refusal, None, placement);
                 }
-                self.apply_checked_stream_command(*command, placement, IncarnationCheck::Matched)
+                self.apply_checked_stream_command(
+                    *command,
+                    index,
+                    placement,
+                    IncarnationCheck::Matched,
+                )
             }
             // Appends skip `StreamStateMachine::apply` to keep the exact
             // borrowed fast path (no TTL sweep on the append hot path).
@@ -291,7 +335,7 @@ impl InMemoryGroupEngine {
                 {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
-                let response = self.state_machine.apply_checked(command, check);
+                let response = self.state_machine.apply_checked(index, command, check);
                 let response = self.group_response_from_stream(response, stream_id, placement);
                 if response.is_ok()
                     && let (Some(cache), Some(stream_id)) =
@@ -440,13 +484,32 @@ impl InMemoryGroupEngine {
                     },
                 ))
             }
-            StreamResponse::SnapshotImported { buckets, streams } => {
-                self.advance_commit_index();
+            StreamResponse::SnapshotImported {
+                buckets,
+                streams,
+                history,
+                already,
+            } => {
+                if !already {
+                    self.advance_commit_index();
+                }
                 Ok(GroupWriteResponse::ImportGroupState(
                     ImportGroupStateResponse {
                         placement,
                         buckets,
                         streams,
+                        group_commit_index: self.commit_index,
+                        history,
+                        already,
+                    },
+                ))
+            }
+            StreamResponse::HistoryStarted { history } => {
+                self.advance_commit_index();
+                Ok(GroupWriteResponse::NewHistory(
+                    crate::request::NewHistoryResponse {
+                        placement,
+                        history,
                         group_commit_index: self.commit_index,
                     },
                 ))
@@ -878,8 +941,11 @@ impl InMemoryGroupEngine {
         let closed = metadata.status == ursula_stream::StreamStatus::Closed;
         let stream_ttl_seconds = metadata.stream_ttl_seconds;
         let stream_expires_at_ms = metadata.stream_expires_at_ms;
-        let created_at_ms = metadata.created_at_ms;
-        let _ = metadata;
+        let incarnation = self
+            .state_machine
+            .stream_incarnation(&request.stream_id)
+            .unwrap_or(0);
+        let inherited = self.state_machine.stream_inherited(&request.stream_id);
         let snapshot = self
             .state_machine
             .latest_snapshot(&request.stream_id)
@@ -895,7 +961,8 @@ impl InMemoryGroupEngine {
             snapshot_offset: snapshot.as_ref().map(|snapshot| snapshot.offset),
             snapshot_digest: snapshot.map(|snapshot| snapshot.digest),
             retained_offset: self.state_machine.retained_offset(&request.stream_id),
-            created_at_ms,
+            incarnation,
+            inherited,
         })
     }
 
@@ -1500,8 +1567,7 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> crate::GroupImportGroupStateFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(StreamCommand::from(request));
-            match self.apply_committed_write(command, placement)? {
+            match self.apply_stream_command(StreamCommand::from(request), placement)? {
                 GroupWriteResponse::ImportGroupState(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected group state import response: {other:?}"
@@ -2138,12 +2204,13 @@ impl InMemoryGroupEngineFactory {
 impl GroupEngineFactory for InMemoryGroupEngineFactory {
     fn create<'a>(
         &'a self,
-        _placement: ShardPlacement,
+        placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
             let mut engine = InMemoryGroupEngine::default();
             engine.set_cold_store(self.cold_store.clone());
+            engine.start_genesis(placement, 0);
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
@@ -2194,7 +2261,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::DeferColdGc { .. }
-        | StreamCommand::ImportSnapshot { .. } => None,
+        | StreamCommand::ImportSnapshot { .. }
+        | StreamCommand::NewHistory { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

@@ -1428,7 +1428,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let result = self.engine.apply_committed_write(command, self.placement);
+                        let result = self.engine.apply_committed_entry(
+                            command,
+                            entry.log_id.index(),
+                            self.placement,
+                        );
                         // Inject AFTER mutation to prove partial state cannot escape.
                         #[cfg(any(test, madsim, feature = "fault-injection"))]
                         match self.apply_fault {

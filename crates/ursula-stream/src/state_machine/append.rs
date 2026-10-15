@@ -160,6 +160,12 @@ impl StreamStateMachine {
                 break 'append response;
             }
 
+            // W5: the write applies; record what the stream's current
+            // history began from before its bytes or closure change.
+            self.inherit_history(&stream_id);
+            let Some(stream) = self.stream_metadata_mut(&stream_id) else {
+                unreachable!("stream existence checked before producer evaluation");
+            };
             let offset = stream.tail_offset;
             stream.tail_offset = stream.tail_offset.saturating_add(payload_len);
             if let Some(seq) = stream_seq {
@@ -315,6 +321,8 @@ impl StreamStateMachine {
         }
         let offset = stream.tail_offset;
         let next_offset = offset.saturating_add(payload.payload_len);
+        // W5, as for an inline append.
+        self.inherit_history(&stream_id);
         let stream = self
             .stream_metadata_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
@@ -447,7 +455,7 @@ impl StreamStateMachine {
             ),
             record => (record, slot.retired_epoch_watermark),
         };
-        Some(evaluate(record, floor, key, check))
+        Some(evaluate(record, floor, self.history_id(), key, check))
     }
 
     /// Evaluates a write's producer key before it applies. A refusal is the
@@ -546,12 +554,13 @@ impl StreamStateMachine {
         receipt: WriteReceipt,
         now_ms: u64,
     ) -> ProducerAck {
+        let history = self.history_id();
         let slot = self
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before producer evaluation");
         match advance {
             Advance::Claim { closes, opened } => {
-                let state = ProducerState::claimed(key, closes, opened, receipt, now_ms);
+                let state = ProducerState::claimed(key, closes, opened, history, receipt, now_ms);
                 let ack = state.applied_ack();
                 slot.producers.insert(producer_id, state);
                 ack

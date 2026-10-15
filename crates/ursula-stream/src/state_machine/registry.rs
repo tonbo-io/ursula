@@ -257,6 +257,8 @@ mod tests {
             visible_snapshot: None,
             producers: HashMap::new(),
             retired_epoch_watermark: None,
+            history: 0,
+            inherited: None,
             append_count: 0,
         }
     }

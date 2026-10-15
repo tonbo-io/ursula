@@ -9758,10 +9758,14 @@ async fn backup_import_refuses_groups_without_this_format_epoch() {
         (without_epoch, "has no format_epoch"),
         (other_epoch, "unsupported format_epoch"),
     ] {
+        let digest = blake3::hash(&body).to_hex().to_string();
         let response = http_post(
             &app,
             "/__ursula/backup/group/0/import",
-            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
             Body::from(body),
         )
         .await;
@@ -9956,14 +9960,21 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     let restored = test_router();
 
     for (group, body) in exports.iter().enumerate() {
+        let digest = blake3::hash(body).to_hex().to_string();
         let response = http_post(
             &restored,
             &format!("/__ursula/backup/group/{group}/import"),
-            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
             Body::from(body.clone()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK, "import group {group}");
+        let imported: ursula_proto::admin::BackupImportResponse =
+            serde_json::from_slice(&body_bytes(response).await).expect("typed import answer");
+        assert!(!imported.already, "group {group}");
     }
 
     // Retention floor survived: reads below offset 18 are GONE, the app
@@ -10028,7 +10039,9 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
             .contains("\"id\":4")
     );
 
-    // Re-importing into a group that now owns a bucket fails closed.
+    // The import is keyed by the backup's digest: repeating it answers
+    // `already`, and another backup into a group that now owns a bucket
+    // fails closed.
     let mut conflicted = false;
     for (group, body) in exports.iter().enumerate() {
         let snapshot: ursula_runtime::StreamSnapshot =
@@ -10036,11 +10049,34 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
         if snapshot.buckets.is_empty() {
             continue;
         }
+        let digest = blake3::hash(body).to_hex().to_string();
         let response = http_post(
             &restored,
             &format!("/__ursula/backup/group/{group}/import"),
-            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
             Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "group {group}");
+        let repeat: ursula_proto::admin::BackupImportResponse =
+            serde_json::from_slice(&body_bytes(response).await).expect("typed import answer");
+        assert!(repeat.already, "group {group}");
+
+        let mut other = snapshot.clone();
+        other.buckets.push("tenant-z".to_owned());
+        let other = rmp_serde::to_vec_named(&other).expect("encode another backup");
+        let digest = blake3::hash(&other).to_hex().to_string();
+        let response = http_post(
+            &restored,
+            &format!("/__ursula/backup/group/{group}/import"),
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
+            Body::from(other),
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT, "group {group}");

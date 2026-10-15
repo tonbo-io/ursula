@@ -7,8 +7,16 @@
 //! change the record, through [`ProducerState::claimed`] and
 //! [`ProducerState::advance`]. The epoch is checked before deduplication
 //! (rows 4 to 7 before rows 8 to 13), so a write of an older epoch is never
-//! answered as a repeat. Row 11, a record fenced by a history event, comes
-//! with history identity.
+//! answered as a repeat.
+//!
+//! Row 11 is G2 (#581 section 4.6): a record keeps the group's history id
+//! from when its epoch was claimed. Once a history event changed the
+//! group's id, the record is history-fenced: its epoch is closed at its
+//! surviving `last_seq`, a write above it answers `epoch-closed;by=history`,
+//! and the producer claims a later epoch. A repeat at or below `last_seq`
+//! still gets its receipt (rows 9 and 10): it applied in the history that
+//! survived. The comparison is derived at each write, so the event itself
+//! touches no record.
 //!
 //! The epoch floor (G2b) binds writes that carry `Stream-Incarnation`, the
 //! same opt-in as G1 and G2 (#581 section 2.3.1 row 1, section 13 item 10,
@@ -66,7 +74,7 @@ pub(crate) enum Evaluation {
 /// A refused producer write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// Rows 1, 4, 5, 7 and 8.
+    /// Rows 1, 4, 5, 7, 8 and 11.
     Producer(ProducerRefusal),
     /// Rows 3 and 13: `409` with `Producer-Expected-Seq`.
     SeqGap { expected: u64, received: u64 },
@@ -83,11 +91,13 @@ fn expired(floor: u64) -> Evaluation {
 }
 
 /// Evaluates the write `key` against the producer's record `record` (after
-/// idle retirement) and the stream's epoch floor `floor`. `check` says
-/// whether the write carried `Stream-Incarnation`.
+/// idle retirement), the stream's epoch floor `floor` and the group's
+/// history id `history`. `check` says whether the write carried
+/// `Stream-Incarnation`.
 pub(crate) fn evaluate(
     record: Option<&ProducerState>,
     floor: Option<u64>,
+    history: u64,
     key: WriteKey,
     check: IncarnationCheck,
 ) -> Evaluation {
@@ -199,6 +209,18 @@ pub(crate) fn evaluate(
     if key.seq < record.last_seq {
         return repeat(ProducerDelivery::Evicted);
     }
+    // Row 11: a history event closed the epoch at `last_seq`; no seq above
+    // it ever applies.
+    if record.history != history {
+        return Evaluation::Refuse(Refusal::Producer(ProducerRefusal::EpochClosed {
+            epoch: record.epoch,
+            by: ClosedBy::History,
+            closed: ClosedEpoch {
+                epoch: record.epoch,
+                seq: record.last_seq,
+            },
+        }));
+    }
     // Rows 12 and 13. `last_seq < key.seq`, so the increment cannot overflow.
     let expected = record.last_seq.saturating_add(1);
     if key.seq == expected {
@@ -212,11 +234,13 @@ pub(crate) fn evaluate(
 }
 
 impl ProducerState {
-    /// The record after a claim of `key.epoch` applied (rows 2 and 6).
+    /// The record after a claim of `key.epoch` applied (rows 2 and 6) in
+    /// the group's history `history`.
     pub(crate) fn claimed(
         key: WriteKey,
         closes: Option<ClosedEpoch>,
         opened: Opened,
+        history: u64,
         receipt: WriteReceipt,
         now_ms: u64,
     ) -> Self {
@@ -230,6 +254,7 @@ impl ProducerState {
             },
             closed_epoch: closes,
             opened,
+            history,
             last_seen_ms: now_ms,
         }
     }

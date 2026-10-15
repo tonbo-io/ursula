@@ -3,6 +3,9 @@
 //! Module map:
 //!
 //! - [`command`]: replicated command variants applied to the state machine.
+//! - [`history`]: history identity: the group's history, the
+//!   `Stream-Incarnation` token derived from it, and what a stream inherited
+//!   from the history before (#581 section 4).
 //! - [`format`]: the format epoch every persisted format and the Raft RPC
 //!   protocol share, and its policy.
 //! - [`response`]: result variants and error codes returned per command.
@@ -21,6 +24,7 @@
 
 mod command;
 mod format;
+mod history;
 mod json_records;
 mod model;
 mod response;
@@ -32,6 +36,15 @@ pub use command::COMMAND_LOG_OVERHEAD_BYTES;
 pub use command::StreamCommand;
 pub use format::FORMAT_EPOCH;
 pub use format::format_epoch_refusal;
+pub use history::BackupDigest;
+pub use history::HistoryEvent;
+pub use history::INCARNATION_TAG;
+pub use history::InheritedHistory;
+pub use history::InheritedReport;
+pub use history::MAX_CREATED_AT_MS;
+pub use history::draw_history_id;
+pub use history::history_key;
+pub use history::incarnation_token;
 pub use json_records::NonCanonicalJsonPayload;
 pub use json_records::canonical_json_record_ends;
 pub use model::AppendStreamInput;

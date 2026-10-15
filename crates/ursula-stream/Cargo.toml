@@ -13,6 +13,7 @@ autobenches = false
 [dependencies]
 blake3 = { workspace = true }
 memchr = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
 bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }

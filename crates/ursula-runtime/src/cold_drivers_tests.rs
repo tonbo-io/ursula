@@ -60,16 +60,7 @@ async fn create(runtime: &ShardRuntime, stream_id: &BucketStreamId) {
 /// C7/F14g: the incarnation generation the stream's chunks and pages live
 /// under (its `created_at_ms`).
 async fn generation(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> u64 {
-    runtime
-        .head_stream(crate::HeadStreamRequest {
-            stream_id: stream_id.clone(),
-            now_ms: 0,
-            linearizable: false,
-            read_index: None,
-        })
-        .await
-        .expect("head")
-        .created_at_ms
+    crate::tests::live_cold_generation(runtime, stream_id).await
 }
 
 async fn append(runtime: &ShardRuntime, stream_id: &BucketStreamId, payload: &[u8]) {

@@ -110,10 +110,9 @@ pub struct CreateStreamResponse {
     pub closed: bool,
     pub already_exists: bool,
     pub group_commit_index: u64,
-    /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
-    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
-    /// and renders no header.
+    /// The token of the stream incarnation the write applied to, rendered
+    /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
+    /// unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
@@ -154,10 +153,13 @@ pub struct HeadStreamResponse {
     pub snapshot_offset: Option<u64>,
     pub snapshot_digest: Option<String>,
     pub retained_offset: u64,
-    /// The stream incarnation's `created_at_ms`, unique per group (C7). HEAD renders it as the public
-    /// `Stream-Incarnation` header, an opaque token that changes when the
-    /// stream is deleted and recreated.
-    pub created_at_ms: u64,
+    /// The stream's public `Stream-Incarnation` token in the group's current
+    /// history: it changes when the stream is deleted and recreated, and at
+    /// every history event (#581 section 4.2).
+    pub incarnation: u64,
+    /// What the stream's current history began from, after a history event
+    /// (`Stream-Previous-Incarnation`, `Stream-Inherited-Offset`, W5).
+    pub inherited: Option<ursula_stream::InheritedReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,10 +217,8 @@ pub struct ReadStreamResponse {
     pub payload: Vec<u8>,
     pub up_to_date: bool,
     pub closed: bool,
-    /// The incarnation (`created_at_ms`) of the stream that served the
-    /// read (D12). Every epoch-2 leader sets it, and a stream's
-    /// `created_at_ms` is never `0`; `0` means unknown and renders no
-    /// header.
+    /// The token of the stream that served the read (D12). A token is
+    /// never `0`; `0` means unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
 }
@@ -380,10 +380,9 @@ pub struct PublishSnapshotResponse {
     pub snapshot_offset: u64,
     pub snapshot_digest: String,
     pub group_commit_index: u64,
-    /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
-    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
-    /// and renders no header.
+    /// The token of the stream incarnation the write applied to, rendered
+    /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
+    /// unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
@@ -408,10 +407,9 @@ pub struct AdvanceRetentionResponse {
     pub placement: ShardPlacement,
     pub retained_offset: u64,
     pub group_commit_index: u64,
-    /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
-    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
-    /// and renders no header.
+    /// The token of the stream incarnation the write applied to, rendered
+    /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
+    /// unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
@@ -445,9 +443,16 @@ pub struct TidyStreamResponse {
     pub group_commit_index: u64,
 }
 
+/// A restore of one group from a backup: the import is a history event
+/// (#581 section 4.4), keyed by the backup's digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportGroupStateRequest {
     pub snapshot: Box<ursula_stream::StreamSnapshot>,
+    /// The new history's id, drawn by the proposer.
+    pub history: std::num::NonZeroU64,
+    /// The BLAKE3-256 digest of the backup.
+    pub backup_digest: ursula_stream::BackupDigest,
+    pub now_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -455,6 +460,19 @@ pub struct ImportGroupStateResponse {
     pub placement: ShardPlacement,
     pub buckets: u64,
     pub streams: u64,
+    pub group_commit_index: u64,
+    /// The history the import started.
+    pub history: std::num::NonZeroU64,
+    /// The group already held this import; nothing changed.
+    pub already: bool,
+}
+
+/// The answer of a history event (`NewHistory`): the group's genesis or
+/// the event after an accepted loss.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NewHistoryResponse {
+    pub placement: ShardPlacement,
+    pub history: std::num::NonZeroU64,
     pub group_commit_index: u64,
 }
 
@@ -535,10 +553,9 @@ pub struct CloseStreamResponse {
     pub group_commit_index: u64,
     /// The producer write's answer when the close carried producer headers.
     pub producer: Option<ProducerAck>,
-    /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
-    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
-    /// and renders no header.
+    /// The token of the stream incarnation the write applied to, rendered
+    /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
+    /// unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
 }
@@ -856,10 +873,9 @@ pub struct AppendResponse {
     pub producer: Option<ProducerAck>,
     pub stream_hot_bytes: u64,
     pub group_hot_bytes: u64,
-    /// The stream incarnation (`created_at_ms`) the write applied to,
-    /// rendered as `Stream-Incarnation` (D12). Every epoch-2 leader sets
-    /// it, and a stream's `created_at_ms` is never `0`; `0` means unknown
-    /// and renders no header.
+    /// The token of the stream incarnation the write applied to, rendered
+    /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
+    /// unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
 }

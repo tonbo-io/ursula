@@ -112,5 +112,15 @@ mod tests {
         assert_eq!(meta.last_log_id, Some(log));
         assert_eq!(meta.last_membership, membership);
         assert_eq!(meta.snapshot_id, "group-7-T7-N2-19");
+        // A history event (#581 section 4.3), the entry every group starts
+        // with.
+        let history: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "new_history_entry");
+        assert_eq!(history.log_id, log);
+        assert!(matches!(
+            history.payload,
+            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::NewHistory { history, now_ms: 1_700_000_000_000 }
+            )) if history.get() == 0x0123_4567_89ab_cdef
+        ));
     }
 }

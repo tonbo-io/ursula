@@ -118,7 +118,10 @@ impl StreamStateMachine {
             );
         }
 
-        let created_at_ms = self.next_created_at_ms(input.now_ms);
+        let created_at_ms = match self.next_created_at_ms(input.now_ms) {
+            Ok(created_at_ms) => created_at_ms,
+            Err(response) => return response,
+        };
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),
             content_type: input.content_type,
@@ -140,6 +143,8 @@ impl StreamStateMachine {
             visible_snapshot: None,
             producers: HashMap::new(),
             retired_epoch_watermark: None,
+            history: self.history_id(),
+            inherited: None,
             append_count: 0,
         };
         if self.insert_stream_slot(slot).is_none() {
@@ -218,7 +223,10 @@ impl StreamStateMachine {
         }
 
         let initial_len = input.initial_payload.payload_len;
-        let created_at_ms = self.next_created_at_ms(input.now_ms);
+        let created_at_ms = match self.next_created_at_ms(input.now_ms) {
+            Ok(created_at_ms) => created_at_ms,
+            Err(response) => return response,
+        };
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),
             content_type: input.content_type,
@@ -250,6 +258,8 @@ impl StreamStateMachine {
             visible_snapshot: None,
             producers: HashMap::new(),
             retired_epoch_watermark: None,
+            history: self.history_id(),
+            inherited: None,
             append_count: 0,
         };
         if self.insert_stream_slot(slot).is_none() {
@@ -442,17 +452,11 @@ impl StreamStateMachine {
         true
     }
 
-    /// The incarnation (`created_at_ms`) of the stream held in state, or
-    /// `None` when there is none. A response that renders
-    /// `Stream-Incarnation` reads it from the state that served it.
-    pub fn stream_incarnation(&self, stream_id: &BucketStreamId) -> Option<u64> {
-        self.stream_metadata(stream_id)
-            .map(|stream| stream.created_at_ms)
-    }
-
     /// The `Stream-Incarnation` precondition (D12) of `command` at apply
     /// time: `None` when it may apply, else the refusal, with nothing
-    /// changed. It applies when its stream is the incarnation `expected`.
+    /// changed. It applies when the stream's token in the current history
+    /// is `expected`, so a write that names a token of an earlier history
+    /// (a recreate, a restore, an accepted loss) never applies.
     /// Evaluation follows RFC 9110 §13.2: a command on a missing (or
     /// expired) stream applies and answers its usual 404, except a create,
     /// which is refused so that it creates nothing; a stream of any other
@@ -496,7 +500,7 @@ impl StreamStateMachine {
         let current = self
             .stream_metadata(stream_id)
             .filter(|stream| now_ms.is_none_or(|now_ms| !stream_is_expired(stream, now_ms)))
-            .map(|stream| stream.created_at_ms);
+            .map(|stream| self.token_of(stream));
         match current {
             Some(current) if current == expected => None,
             Some(current) => Some(StreamResponse::error_with_context(

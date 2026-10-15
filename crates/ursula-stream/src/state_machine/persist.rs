@@ -1,9 +1,13 @@
-//! Snapshot / restore serialization for the Raft state machine.
+//! Snapshot / restore serialization for the Raft state machine, and the
+//! import that restores a backup as a history event (#581 section 4.4).
+
+use std::num::NonZeroU64;
 
 use super::BucketStreamId;
 use super::ColdChunkRef;
 use super::ColdGcQueue;
 use super::HashMap;
+use super::HistoryEvent;
 use super::HotBuffer;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
@@ -46,6 +50,8 @@ impl StreamStateMachine {
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
                     retired_epoch_watermark: slot.retired_epoch_watermark,
+                    history: slot.history,
+                    inherited: slot.inherited,
                 }
             })
             .collect::<Vec<_>>();
@@ -62,16 +68,45 @@ impl StreamStateMachine {
             next_cold_gc_seq: self.cold_gc.next_seq(),
             bucket_usage: self.bucket_usage_report(),
             last_created_at_ms: self.last_created_at_ms,
+            history: self.history,
         }
     }
 
-    /// Applies a whole-group state import (`StreamCommand::ImportSnapshot`).
+    /// Applies a whole-group state import (`StreamCommand::ImportSnapshot`)
+    /// of the entry at `index`, a history event (#581 section 4.4).
     ///
-    /// Restore-only by design: importing over live state would silently merge
-    /// two histories, so a non-empty group fails closed with
-    /// [`StreamErrorCode::ImportConflict`] and an invalid payload with
-    /// [`StreamErrorCode::ImportInvalid`].
-    pub(crate) fn import_snapshot(&mut self, snapshot: StreamSnapshot) -> StreamResponse {
+    /// 1. A group that already holds the import of `backup_digest` answers
+    ///    it again with `already`, so a repeat after an unknown outcome is
+    ///    safe.
+    /// 2. Restore-only by design: importing over live state would silently
+    ///    merge two histories, so a non-empty group fails closed with
+    ///    [`StreamErrorCode::ImportConflict`] and an invalid payload with
+    ///    [`StreamErrorCode::ImportInvalid`]. A group that applied only its
+    ///    genesis is empty.
+    /// 3. The restore replaces the whole state. Producer records keep the
+    ///    history they were claimed in, so each is history-fenced (G2).
+    ///    Each stream names the source's history as the one its current
+    ///    history began from, with its restored tail (W5).
+    /// 4. The new history starts in the same entry, so no restored stream
+    ///    is ever served under an earlier token.
+    pub(crate) fn import_snapshot(
+        &mut self,
+        index: u64,
+        snapshot: StreamSnapshot,
+        history: NonZeroU64,
+        backup_digest: crate::history::BackupDigest,
+        now_ms: u64,
+    ) -> StreamResponse {
+        if let Some(current) = self.history
+            && current.imported == Some(backup_digest)
+        {
+            return StreamResponse::SnapshotImported {
+                buckets: u64::try_from(self.buckets.len()).unwrap_or(u64::MAX),
+                streams: u64::try_from(self.registry.slots().count()).unwrap_or(u64::MAX),
+                history: current.id,
+                already: true,
+            };
+        }
         if !self.buckets.is_empty() || !self.erased_buckets.is_empty() || !self.registry.is_empty()
         {
             return StreamResponse::error(
@@ -95,15 +130,36 @@ impl StreamStateMachine {
         }
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
+        let mut snapshot = snapshot;
+        // A source stream not written since the source's own latest history
+        // event still names the history before it. The source served its
+        // bytes under its current token too, and that is the token a client
+        // of the source holds, so the import names it.
+        let source_history = snapshot.history.map_or(0, |source| source.id.get());
+        for entry in &mut snapshot.streams {
+            entry.history = source_history;
+        }
         match Self::restore(snapshot) {
             Ok(mut restored) => {
                 // C7: the counter never goes backwards, so a later create
                 // never reuses an incarnation this group already assigned.
-                restored.last_created_at_ms =
-                    restored.last_created_at_ms.max(self.last_created_at_ms);
+                restored.last_created_at_ms = restored
+                    .last_created_at_ms
+                    .max(self.last_created_at_ms)
+                    .max(now_ms);
                 restored.normalize_last_created_at_ms();
+                restored.history = Some(HistoryEvent {
+                    id: history,
+                    event_index: index,
+                    imported: Some(backup_digest),
+                });
                 *self = restored;
-                StreamResponse::SnapshotImported { buckets, streams }
+                StreamResponse::SnapshotImported {
+                    buckets,
+                    streams,
+                    history,
+                    already: false,
+                }
             }
             Err(error) => StreamResponse::error(
                 StreamErrorCode::ImportInvalid,
@@ -127,6 +183,7 @@ impl StreamStateMachine {
         }
         let mut machine = Self {
             last_created_at_ms: snapshot.last_created_at_ms,
+            history: snapshot.history,
             ..Self::default()
         };
         for bucket_id in &snapshot.buckets {
@@ -204,6 +261,8 @@ impl StreamStateMachine {
                 visible_snapshot: entry.visible_snapshot,
                 producers: producer_states,
                 retired_epoch_watermark: entry.retired_epoch_watermark,
+                history: entry.history,
+                inherited: entry.inherited,
                 append_count: 0,
             };
             if machine.insert_stream_slot(slot).is_none() {
@@ -266,6 +325,7 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
             newest: state.newest.clone(),
             closed_epoch: state.closed_epoch,
             opened: state.opened,
+            history: state.history,
             last_seen_ms: state.last_seen_ms,
         })
         .collect::<Vec<_>>();
@@ -287,6 +347,7 @@ fn restore_producer_states(
                 newest: snapshot.newest,
                 closed_epoch: snapshot.closed_epoch,
                 opened: snapshot.opened,
+                history: snapshot.history,
                 last_seen_ms: snapshot.last_seen_ms,
             })
             .is_some()

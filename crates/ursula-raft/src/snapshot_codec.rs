@@ -16,7 +16,9 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::ClosedEpoch;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
+use ursula_stream::HistoryEvent;
 use ursula_stream::HotPayloadSegment;
+use ursula_stream::InheritedHistory;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::Opened;
 use ursula_stream::ProducerReceipt;
@@ -159,6 +161,7 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
                 .map(bucket_usage_from_proto)
                 .collect(),
             last_created_at_ms: header.last_created_at_ms,
+            history: header.history.map(history_from_proto).transpose()?,
         },
         stream_append_counts,
     })
@@ -231,8 +234,35 @@ impl GroupSnapshotFrameIter {
                 .collect(),
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: stream_snapshot.last_created_at_ms,
+            history: stream_snapshot.history.map(history_to_proto),
         }
     }
+}
+
+fn history_to_proto(history: HistoryEvent) -> proto::HistoryEventV1 {
+    proto::HistoryEventV1 {
+        id: history.id.get(),
+        event_index: history.event_index,
+        imported: history
+            .imported
+            .map(|digest| Bytes::copy_from_slice(&digest)),
+    }
+}
+
+/// A history id is never 0, and a backup digest is 32 bytes.
+fn history_from_proto(history: proto::HistoryEventV1) -> Result<HistoryEvent, SnapshotStoreError> {
+    Ok(HistoryEvent {
+        id: std::num::NonZeroU64::new(history.id).ok_or(SnapshotStoreError::HistoryIdZero)?,
+        event_index: history.event_index,
+        imported: history
+            .imported
+            .map(|bytes| {
+                ursula_stream::BackupDigest::try_from(bytes.as_ref()).map_err(|_wrong_length| {
+                    SnapshotStoreError::BackupDigestLength { len: bytes.len() }
+                })
+            })
+            .transpose()?,
+    })
 }
 
 impl Iterator for GroupSnapshotFrameIter {
@@ -313,6 +343,11 @@ fn stream_to_proto(
             .collect(),
         retained_offset: Some(entry.retained_offset),
         retired_epoch_watermark: entry.retired_epoch_watermark,
+        history: entry.history,
+        inherited: entry.inherited.map(|inherited| proto::InheritedHistoryV1 {
+            history: inherited.history,
+            offset: inherited.offset,
+        }),
     })
 }
 
@@ -346,6 +381,11 @@ fn stream_from_proto(
             .map(producer_from_proto)
             .collect::<Result<Vec<_>, _>>()?,
         retired_epoch_watermark: entry.retired_epoch_watermark,
+        history: entry.history,
+        inherited: entry.inherited.map(|inherited| InheritedHistory {
+            history: inherited.history,
+            offset: inherited.offset,
+        }),
     })
 }
 
@@ -486,6 +526,7 @@ fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
             seq: closed.seq,
         }),
         opened_below_floor: producer.opened == Opened::BelowFloor,
+        history: producer.history,
     }
 }
 
@@ -538,6 +579,7 @@ fn producer_from_proto(
         } else {
             Opened::AboveFloor
         },
+        history: producer.history,
         last_seen_ms,
         producer_id: producer.producer_id,
     })
@@ -657,6 +699,7 @@ mod tests {
                     },
                 }],
                 last_created_at_ms: 1_234,
+                history: None,
             },
             stream_append_counts: vec![StreamAppendCount {
                 stream_id: BucketStreamId {
@@ -827,6 +870,142 @@ mod tests {
         assert_eq!(restored.state_gauges(), machine.state_gauges());
     }
 
+    /// History identity (#581 section 4.2) survives the group snapshot
+    /// codec: the group's history event with its import digest, each
+    /// stream's history and inheritance, and each producer record's
+    /// history, so an installed replica derives the same tokens, fences and
+    /// HEAD reports.
+    #[test]
+    fn history_state_round_trips() {
+        use std::num::NonZeroU64;
+
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        let mut index = 0;
+        let mut apply = |machine: &mut ursula_stream::StreamStateMachine, command| {
+            index += 1;
+            machine.apply_entry(index, command)
+        };
+        apply(&mut machine, ursula_stream::StreamCommand::NewHistory {
+            history: NonZeroU64::new(11).unwrap(),
+            now_ms: 0,
+        });
+        apply(&mut machine, ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "bucket".to_owned(),
+        });
+        let stream_id = BucketStreamId::new("bucket", "history");
+        apply(&mut machine, ursula_stream::StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: bytes::Bytes::from_static(b"ab"),
+            close_after: false,
+            stream_seq: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            now_ms: 1,
+        });
+        let append = |seq| ursula_stream::StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            payload: bytes::Bytes::from_static(b"cd"),
+            close_after: false,
+            stream_seq: None,
+            producer: Some(ursula_stream::ProducerRequest {
+                producer_id: "p".to_owned(),
+                producer_epoch: 0,
+                producer_seq: seq,
+                ..Default::default()
+            }),
+            now_ms: 1,
+        };
+        apply(&mut machine, append(0));
+        // A restore into a fresh group: a history event with an import key.
+        let mut restored = ursula_stream::StreamStateMachine::new();
+        restored.apply_entry(1, ursula_stream::StreamCommand::NewHistory {
+            history: NonZeroU64::new(12).unwrap(),
+            now_ms: 0,
+        });
+        restored.apply_entry(2, ursula_stream::StreamCommand::ImportSnapshot {
+            snapshot: Box::new(machine.snapshot()),
+            history: NonZeroU64::new(13).unwrap(),
+            backup_digest: [5; 32],
+            now_ms: 1,
+        });
+        // An accepted loss, then a write that records the inheritance. No
+        // write happened between the import and the loss, so the stream
+        // still names the source's history.
+        restored.apply_entry(3, ursula_stream::StreamCommand::NewHistory {
+            history: NonZeroU64::new(14).unwrap(),
+            now_ms: 0,
+        });
+        restored.apply_entry(4, ursula_stream::StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+            payload: bytes::Bytes::from_static(b"ef"),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 1,
+        });
+        let stream_snapshot = restored.snapshot();
+        let history = stream_snapshot.history.expect("a history");
+        assert_eq!(history.id.get(), 14);
+        assert_eq!(history.event_index, 3);
+        assert_eq!(history.imported, Some([5; 32]));
+        let entry = &stream_snapshot.streams[0];
+        assert_eq!(entry.history, 14);
+        assert_eq!(
+            entry.inherited,
+            Some(ursula_stream::InheritedHistory {
+                history: 11,
+                offset: 4,
+            })
+        );
+        assert_eq!(entry.producer_states[0].history, 11);
+
+        let snapshot = GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            },
+            group_commit_index: 4,
+            stream_snapshot,
+            stream_append_counts: Vec::new(),
+        };
+        let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode frames")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let decoded = decode_group_snapshot(&bytes).expect("decode frames");
+        assert_eq!(decoded, snapshot);
+        let installed = ursula_stream::StreamStateMachine::restore(decoded.stream_snapshot)
+            .expect("restore decoded snapshot");
+        assert_eq!(
+            installed.stream_incarnation(&stream_id),
+            restored.stream_incarnation(&stream_id)
+        );
+        assert_eq!(
+            installed.stream_inherited(&stream_id),
+            restored.stream_inherited(&stream_id)
+        );
+
+        // A history id is never 0, and an import digest is 32 bytes.
+        let mut header = GroupSnapshotFrameIter::header_frame(&snapshot);
+        header.history.as_mut().expect("a history").id = 0;
+        assert!(matches!(
+            history_from_proto(header.history.clone().expect("a history")),
+            Err(SnapshotStoreError::HistoryIdZero)
+        ));
+        let mut header = GroupSnapshotFrameIter::header_frame(&snapshot);
+        header.history.as_mut().expect("a history").imported = Some(Bytes::from_static(b"short"));
+        assert!(matches!(
+            history_from_proto(header.history.expect("a history")),
+            Err(SnapshotStoreError::BackupDigestLength { len: 5 })
+        ));
+    }
+
     fn epoch_frame(epoch: u32) -> Bytes {
         encode_frame(proto::SnapshotFrameV1 {
             frame: Some(proto::snapshot_frame_v1::Frame::FormatEpoch(
@@ -850,6 +1029,7 @@ mod tests {
             bucket_usage: Vec::new(),
             committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             last_created_at_ms: 0,
+            history: None,
         }
     }
 
@@ -928,6 +1108,7 @@ mod tests {
                     bucket_usage: Vec::new(),
                     committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
                     last_created_at_ms: 0,
+                    history: None,
                 },
             )),
         })
@@ -963,6 +1144,7 @@ mod tests {
             bucket_usage: Vec::new(),
             committed_write_unit_bytes,
             last_created_at_ms: 0,
+            history: None,
         };
         [
             epoch_frame(ursula_stream::FORMAT_EPOCH),

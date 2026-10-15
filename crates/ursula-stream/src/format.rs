@@ -7,8 +7,11 @@
 //! the journal segment that holds it (`docs/architecture/raft-wal.md`); it is
 //! the format of Ursula 0.7. Epoch 4 is the format of Ursula 0.8: write keys
 //! with a producer record of one receipt, closed-epoch reports, write digests
-//! and the per-stream epoch floor. A binary reads exactly one epoch: it refuses data, backups and peers from any
-//! other epoch loudly, before it writes anything, and it does not convert them.
+//! and the per-stream epoch floor, and history identity: the group's history
+//! event, the history a producer record was claimed in, and what a stream
+//! inherited from the history before. A binary reads exactly one epoch: it
+//! refuses data, backups and peers from any other epoch loudly, before it
+//! writes anything, and it does not convert them.
 //!
 //! Every version number that an earlier binary checks is set equal to
 //! [`FORMAT_EPOCH`]: the Raft WAL journal header and state files, the Raft

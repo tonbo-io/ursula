@@ -11,7 +11,6 @@ use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::FlushColdRequest;
-use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
@@ -27,16 +26,17 @@ fn spawn_raft_with_cold_store(config: RuntimeConfig, cold_store: Arc<ColdStore>)
 
 /// C7/F14g: the cold generation of the stream's live incarnation.
 async fn cold_generation(runtime: &ShardRuntime, stream: &BucketStreamId) -> u64 {
+    let group = runtime.locate(stream).raft_group_id;
     runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: stream.clone(),
-            now_ms: 0,
-            linearizable: false,
-            read_index: None,
-        })
+        .snapshot_group(group)
         .await
-        .expect("head stream")
-        .created_at_ms
+        .expect("snapshot group")
+        .stream_snapshot
+        .streams
+        .into_iter()
+        .find(|entry| entry.metadata.stream_id == *stream)
+        .map(|entry| entry.cold_index_generation)
+        .expect("stream in snapshot")
 }
 
 async fn create_and_append(runtime: &ShardRuntime, stream: &BucketStreamId, payload: &[u8]) {

@@ -48,6 +48,27 @@ message SnapshotHeaderV1 {
   // Largest stream created_at_ms the group assigned (C7). Restore raises it
   // to every live stream's created_at_ms.
   uint64 last_created_at_ms = 11;
+  // The group's latest history event (#581 section 4.2). Absent before the
+  // group's genesis applied.
+  HistoryEventV1 history = 12;
+}
+
+// A history event: the group's genesis, an import or an accepted loss.
+message HistoryEventV1 {
+  // The random, non-zero id the event's proposer drew. Zero is refused.
+  uint64 id = 1;
+  // The log index of the entry that applied the event.
+  uint64 event_index = 2;
+  // The 32-byte BLAKE3 digest of the backup the group was restored from.
+  optional bytes imported = 3;
+}
+
+// What a stream's current history began from (W5).
+message InheritedHistoryV1 {
+  // The stream's history id before the event.
+  uint64 history = 1;
+  // The stream's tail at the event: bytes below it are unchanged.
+  uint64 offset = 2;
 }
 
 message BucketUsageV1 {
@@ -101,6 +122,12 @@ message StreamSnapshotEntryV1 {
   // The highest epoch of any producer record the stream retired: its epoch
   // floor. Absent when the stream never retired one.
   optional uint64 retired_epoch_watermark = 21;
+  // The group's history id when the stream was created or last changed its
+  // bytes or closure.
+  uint64 history = 22;
+  // What the stream's current history began from, recorded by its first
+  // write after a history event.
+  InheritedHistoryV1 inherited = 23;
 }
 
 message StreamMetadataV1 {
@@ -177,6 +204,9 @@ message ProducerSnapshotV1 {
   // untokened claim of a forgotten producer). A tokened write on it is
   // producer-expired until it claims above the floor.
   bool opened_below_floor = 13;
+  // The group's history id when the claim of `epoch` applied. A record of
+  // another history than the group's is history-fenced.
+  uint64 history = 14;
 }
 
 message ClosedEpochV1 {

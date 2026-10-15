@@ -597,6 +597,22 @@ pub struct LeadershipShedStatus {
     pub recovery_barriers_ready: bool,
     pub should_shed_current_leaders: bool,
 }
+/// Answer of `POST /__ursula/backup/group/{group}/import`. The import is a
+/// history event keyed by the backup's BLAKE3 digest (#581 section 4.4): a
+/// repeat of an import the group already holds answers `already: true` and
+/// changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupImportResponse {
+    pub buckets: u64,
+    pub streams: u64,
+    pub group_commit_index: u64,
+    /// The id of the history the import started: every restored stream has
+    /// a new token, and every restored producer record is history-fenced.
+    pub history: std::num::NonZeroU64,
+    /// The group already held this import.
+    pub already: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupInfo {
     pub format_version: u32,

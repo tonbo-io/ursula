@@ -697,7 +697,7 @@ impl StreamStateMachine {
                 format!("offset {offset} is not a JSON message boundary for stream '{stream_id}'"),
                 stream.tail_offset,
             )),
-            None if expected_incarnation == Some(stream.created_at_ms) => Ok(()),
+            None if expected_incarnation == Some(self.token_of(stream)) => Ok(()),
             None => Err(StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::JsonBoundaryUnverified,
                 format!(
@@ -705,7 +705,7 @@ impl StreamStateMachine {
                 ),
                 stream.tail_offset,
                 vec![StreamErrorContext::StreamIncarnation {
-                    incarnation: stream.created_at_ms,
+                    incarnation: self.token_of(stream),
                 }],
             )),
         }

@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
@@ -84,6 +86,16 @@ pub enum StreamResponse {
     SnapshotImported {
         buckets: u64,
         streams: u64,
+        /// The history the import started.
+        history: NonZeroU64,
+        /// The group already held this import: nothing changed.
+        already: bool,
+    },
+    /// A history event applied by [`StreamCommand::NewHistory`].
+    ///
+    /// [`StreamCommand::NewHistory`]: crate::StreamCommand::NewHistory
+    HistoryStarted {
+        history: NonZeroU64,
     },
     /// Result of [`StreamCommand::TidyStream`]: whether the stream still has
     /// normalization debt after this bounded step.
@@ -162,6 +174,9 @@ pub enum StreamErrorCode {
     /// A new producer would exceed the stream's producer cap and no producer
     /// has been idle long enough to evict (F3).
     ProducerLimit,
+    /// A create at a `now_ms` at or above 2^52, which no token can carry
+    /// ([`crate::MAX_CREATED_AT_MS`]): the proposer's clock is far ahead.
+    CreatedAtOutOfRange,
     /// A `Stream-Incarnation` precondition (D12) failed: the stream is
     /// another incarnation (its current one is in
     /// [`StreamErrorContext::StreamIncarnation`]), or a create found no
@@ -179,7 +194,7 @@ pub enum StreamErrorContext {
         expected_seq: u64,
         received_seq: u64,
     },
-    /// The stream incarnation (`created_at_ms`) a
+    /// The stream's token (`Stream-Incarnation`) a
     /// [`StreamErrorCode::JsonBoundaryUnverified`] or
     /// [`StreamErrorCode::IncarnationMismatch`] refusal saw.
     StreamIncarnation {
@@ -192,6 +207,9 @@ pub enum StreamErrorContext {
 pub enum ClosedBy {
     /// A claim of a later epoch.
     Claim,
+    /// A history event: a restore or an accepted loss (G2). It closes the
+    /// producer's current epoch.
+    History,
 }
 
 /// A producer refusal with what its answer reports. Every variant but

@@ -389,7 +389,15 @@ impl BackupClient {
         best.ok_or_else(|| last_error.unwrap_or(BackupError::NoNodes))
     }
 
-    async fn import_group(&self, raft_group_id: u32, body: Vec<u8>) -> Result<(), BackupError> {
+    /// Imports one group. The import is keyed by the backup's BLAKE3
+    /// digest, which the request carries, so a repeat after an unknown
+    /// outcome answers `already` instead of a conflict.
+    async fn import_group(
+        &self,
+        raft_group_id: u32,
+        body: Vec<u8>,
+    ) -> Result<ursula_proto::admin::BackupImportResponse, BackupError> {
+        let digest = blake3::hash(&body).to_hex().to_string();
         let mut last_error = None;
         for node in &self.nodes {
             let url = node
@@ -405,11 +413,17 @@ impl BackupClient {
                 })?;
             match request
                 .header("content-type", "application/x-msgpack")
+                .header("x-ursula-backup-blake3", &digest)
                 .body(body.clone())
                 .send()
                 .await
             {
-                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().is_success() => {
+                    return response
+                        .json::<ursula_proto::admin::BackupImportResponse>()
+                        .await
+                        .map_err(|source| BackupError::Request { url, source });
+                }
                 Ok(response) => {
                     let status = response.status();
                     let detail = response.text().await.unwrap_or_default();

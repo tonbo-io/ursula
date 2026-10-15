@@ -148,6 +148,10 @@ pub struct ProducerSnapshot {
     pub closed_epoch: Option<ClosedEpoch>,
     /// Whether the record's lineage opened above the epoch floor.
     pub opened: Opened,
+    /// The group's history id when the claim of `epoch` applied. A record
+    /// of another history than the group's is history-fenced (G2): its
+    /// epoch is closed at `last_seq` (#581 section 4.6).
+    pub history: u64,
     /// `now_ms` of the producer's newest accepted write (F3 idle expiry).
     pub last_seen_ms: u64,
 }
@@ -162,6 +166,7 @@ pub(crate) struct ProducerState {
     pub(crate) newest: ProducerReceipt,
     pub(crate) closed_epoch: Option<ClosedEpoch>,
     pub(crate) opened: Opened,
+    pub(crate) history: u64,
     pub(crate) last_seen_ms: u64,
 }
 
@@ -304,9 +309,8 @@ pub enum StreamReadSegment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamReadPlan {
-    /// The incarnation (`created_at_ms`) of the stream that served the
-    /// plan, rendered as `Stream-Incarnation` and checked against a read's
-    /// precondition (D12).
+    /// The token of the stream that served the plan, rendered as
+    /// `Stream-Incarnation` and checked against a read's precondition (D12).
     pub incarnation: u64,
     pub offset: u64,
     pub next_offset: u64,
