@@ -3180,7 +3180,7 @@ async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
         .set_plan(Some(crate::log_store::RecoveryRecord {
             leader: 1,
             point: u64::MAX,
-            cut: false,
+            uncut_leader_term: None,
             cut_after: None,
         }));
     let before = engine.snapshot(placement()).await;
@@ -3231,7 +3231,7 @@ fn a_pending_history_fences_only_its_leader() {
     let plan = RecoveryRecord {
         leader: 1,
         point: 10,
-        cut: false,
+        uncut_leader_term: None,
         cut_after: None,
     };
     // Genesis: no history yet.

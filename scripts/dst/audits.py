@@ -519,6 +519,7 @@ EXPECTED_PR_FAMILIES = {
     "idle-expiry-cannot-reopen-an-epoch",
     "history-rewind-under-leader-churn",
     "stale-writers-after-restore",
+    "recovery-plan-cut-under-restarts",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
@@ -526,6 +527,7 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "leader-read-linearizability-extended",
     "producer-repeats-exactly-once-extended",
     "history-rewind-under-leader-churn-extended",
+    "recovery-plan-cut-under-restarts-extended",
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199"}
 

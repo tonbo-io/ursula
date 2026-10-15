@@ -229,6 +229,7 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                     leader: ex_leader,
                     point: seen.last_log_index.unwrap_or(0),
                     cut: false,
+                    leader_last_log_term: seen.last_log_term,
                     expected: seen,
                 };
                 assert!(
@@ -544,6 +545,7 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                             leader: wiped,
                             point: seen.last_log_index.unwrap_or(0),
                             cut: false,
+                            leader_last_log_term: seen.last_log_term,
                             expected: seen,
                         },
                         &mut NeverRestart,

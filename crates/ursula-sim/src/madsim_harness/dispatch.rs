@@ -13,6 +13,8 @@ use super::SimSchedule;
 use super::ThreeNodeRaftSim;
 use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
+use super::accepted_loss::Controls as RecoveryPlanControls;
+use super::accepted_loss::run_recovery_plan_cut_inner;
 use super::cold_read_delay_ms_from_fault_plan;
 use super::cold_read_truncate_len_from_fault_plan;
 use super::cold_write_delay_ms_from_fault_plan;
@@ -262,6 +264,12 @@ impl ThreeNodeRaftSim {
             SimScenario::HistoryRewindUnderLeaderChurn | SimScenario::StaleWritersAfterRestore => {
                 Self::run_history_report(config, scenario)
             }
+            SimScenario::RecoveryPlanCutUnderRestarts => {
+                Self::run_recovery_plan_with_controls_report(
+                    config,
+                    RecoveryPlanControls::default(),
+                )
+            }
         }
     }
 
@@ -271,6 +279,19 @@ impl ThreeNodeRaftSim {
         scenario: SimScenario,
     ) -> SimReport {
         Self::run_history_with_controls_report(config, scenario, HistoryControls::default())
+    }
+
+    /// Runs the recovery-plan scenario (#581 section 4.5) with `controls`.
+    pub(super) fn run_recovery_plan_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: RecoveryPlanControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::RecoveryPlanCutUnderRestarts,
+            seed,
+            run_recovery_plan_cut_inner(config, controls),
+        )
     }
 
     pub(super) fn run_history_with_controls_report(

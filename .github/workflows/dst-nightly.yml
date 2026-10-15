@@ -53,7 +53,9 @@ jobs:
             --seed-family idle-expiry-cannot-reopen-an-epoch \
             --seed-family history-rewind-under-leader-churn \
             --seed-family history-rewind-under-leader-churn-extended \
-            --seed-family stale-writers-after-restore
+            --seed-family stale-writers-after-restore \
+            --seed-family recovery-plan-cut-under-restarts \
+            --seed-family recovery-plan-cut-under-restarts-extended
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

@@ -13,8 +13,6 @@ use super::*;
 mod disk_tests;
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
-#[path = "recovery_wiring.rs"]
-mod recovery_wiring;
 #[path = "strict_replay_tests.rs"]
 mod strict_replay_tests;
 

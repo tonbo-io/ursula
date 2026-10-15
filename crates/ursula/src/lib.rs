@@ -2762,6 +2762,7 @@ pub(crate) async fn accept_unsynced_loss(
             | ursula_raft::RecoveryGateError::CommittedEntryMissing { .. }
             | ursula_raft::RecoveryGateError::LeaderNotVoter { .. }
             | ursula_raft::RecoveryGateError::PointMismatch { .. }
+            | ursula_raft::RecoveryGateError::LeaderLogMismatch { .. }
             | ursula_raft::RecoveryGateError::MissingVoteFloor { .. }
             | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
         ) => (StatusCode::CONFLICT, err.to_string()).into_response(),

@@ -159,6 +159,7 @@ pub enum SimScenario {
     IdleExpiryCannotReopenAnEpoch,
     HistoryRewindUnderLeaderChurn,
     StaleWritersAfterRestore,
+    RecoveryPlanCutUnderRestarts,
 }
 
 #[derive(Clone)]
@@ -204,6 +205,7 @@ impl SimScenario {
             Self::IdleExpiryCannotReopenAnEpoch => "idle-expiry-cannot-reopen-an-epoch",
             Self::HistoryRewindUnderLeaderChurn => "history-rewind-under-leader-churn",
             Self::StaleWritersAfterRestore => "stale-writers-after-restore",
+            Self::RecoveryPlanCutUnderRestarts => "recovery-plan-cut-under-restarts",
         }
     }
 }
@@ -538,9 +540,12 @@ use cold_path::run_cold_read_fault_inner;
 use cold_path::run_cold_read_truncate_inner;
 use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
+mod accepted_loss;
 mod history;
 mod http;
+mod journal_cluster;
 mod leader_reads;
+mod recovery_wiring;
 mod write_keys;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;

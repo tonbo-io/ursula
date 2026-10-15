@@ -827,6 +827,7 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_a_recovery_plan()
         leader: 1,
         point: expected.last_log_index.unwrap_or(0),
         cut: false,
+        leader_last_log_term: expected.last_log_term,
         expected,
     };
     let response = admin_test_post(&client, accept_url)

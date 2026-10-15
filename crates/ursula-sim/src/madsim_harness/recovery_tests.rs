@@ -14,21 +14,15 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use openraft::RaftMetrics;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
-use ursula_proto::admin::RecoveryPlanOutcome;
-use ursula_proto::admin::RecoveryPlanReport;
-use ursula_proto::admin::RecoveryPlanRequest;
-use ursula_proto::admin::ReplicaLogView;
 use ursula_raft::JournalTuning;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaAppendEntriesRequest;
 use ursula_raft::UrsulaAppendEntriesResponse;
-use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::wal::diagnostics::GroupLogState;
 use ursula_raft::wal::diagnostics::JournalDisk;
 use ursula_raft::wal::diagnostics::JournalReplayMode;
@@ -42,65 +36,29 @@ use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::RaftGroupId;
 
-use super::disk_tests::JOURNAL_GROUPS;
-use super::disk_tests::JOURNAL_POWER_LOSS_SEEDS;
-use super::disk_tests::JournalCluster;
-use super::disk_tests::group_placement;
-use super::disk_tests::group_stream;
-use super::recovery_wiring::RECOVERY_STALL_AFTER;
 use super::seeds_from_env;
 use super::sim_test_guard;
+use crate::madsim_harness::journal_cluster::JOURNAL_GROUPS;
+use crate::madsim_harness::journal_cluster::JOURNAL_POWER_LOSS_SEEDS;
+use crate::madsim_harness::journal_cluster::JournalCluster;
+use crate::madsim_harness::journal_cluster::NODES;
+use crate::madsim_harness::journal_cluster::gate;
+use crate::madsim_harness::journal_cluster::group_placement;
+use crate::madsim_harness::journal_cluster::group_stream;
+use crate::madsim_harness::journal_cluster::lead_every_group;
+use crate::madsim_harness::journal_cluster::leader_by_state;
+use crate::madsim_harness::journal_cluster::log_state;
+use crate::madsim_harness::journal_cluster::member_view;
+use crate::madsim_harness::journal_cluster::metrics;
+use crate::madsim_harness::journal_cluster::recover_group;
+use crate::madsim_harness::journal_cluster::wait_leader;
+use crate::madsim_harness::journal_cluster::wait_plan_satisfied;
+use crate::madsim_harness::recovery_wiring::RECOVERY_STALL_AFTER;
 use crate::madsim_harness::run_with_madsim;
 use crate::madsim_harness::sim_wal::SimNodeWal;
 
 #[path = "recovery_regression_tests.rs"]
 mod regression;
-
-const NODES: [u64; 3] = [1, 2, 3];
-
-fn metrics(
-    cluster: &JournalCluster,
-    group: u32,
-    node_id: u64,
-) -> RaftMetrics<UrsulaRaftTypeConfig> {
-    openraft::rt::WatchReceiver::borrow_watched(
-        &cluster.engines[&(group, node_id)].raft_handle().metrics(),
-    )
-    .clone()
-}
-
-/// The replica of `group` that currently is in the leader state, if any.
-fn leader_by_state(cluster: &JournalCluster, group: u32) -> Option<u64> {
-    NODES.into_iter().find(|node_id| {
-        cluster.engines.contains_key(&(group, *node_id))
-            && metrics(cluster, group, *node_id).state == openraft::ServerState::Leader
-    })
-}
-
-async fn wait_leader(cluster: &JournalCluster, group: u32, context: &str) -> u64 {
-    let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(leader) = leader_by_state(cluster, group) {
-            return leader;
-        }
-        assert!(
-            madsim::time::Instant::now() < deadline,
-            "{context}: group {group} elected no leader"
-        );
-        madsim::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-fn gate(cluster: &JournalCluster, group: u32, node_id: u64) -> RecoveryGateStatus {
-    cluster.rejoins[&(group, node_id)].status()
-}
-
-fn log_state(cluster: &JournalCluster, group: u32, node_id: u64) -> GroupLogState {
-    cluster.wals[&node_id]
-        .store(RaftGroupId(group))
-        .expect("a running replica holds its store")
-        .log_state()
-}
 
 /// Every group of `node_id` is gated and durably recovering.
 fn assert_gated(cluster: &JournalCluster, node_id: u64, context: &str) {
@@ -160,192 +118,6 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
                 .collect::<Vec<_>>()
         );
         madsim::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// `node_id`'s replica of `group` as the recovery tool reads it from the
-/// metrics: its log, its vote term, its committed index and whether its
-/// gate restricts its vote.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct MemberView {
-    pub(super) node_id: u64,
-    pub(super) log: ReplicaLogView,
-    pub(super) committed: Option<u64>,
-    pub(super) restricted: bool,
-}
-
-pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u64) -> MemberView {
-    let mut store = cluster.wals[&node_id]
-        .store(RaftGroupId(group))
-        .expect("a running replica holds its store");
-    let last = store.get_log_state().await.expect("log state").last_log_id;
-    let vote = store.read_vote().await.expect("vote");
-    MemberView {
-        node_id,
-        log: ReplicaLogView {
-            last_log_index: last.map(|last| last.index),
-            last_log_term: last.map(|last| last.leader_id.term),
-            current_term: vote.map_or(0, |vote| vote.leader_id().term()),
-        },
-        committed: metrics(cluster, group, node_id)
-            .local_committed
-            .map(|committed| committed.index),
-        // A closed gate or an unsatisfied plan: the replica kept its vote
-        // while it may have lost entries (#581 section 4.5, `floor`).
-        restricted: gate(cluster, group, node_id) != RecoveryGateStatus::Open
-            || cluster.engines[&(group, node_id)]
-                .history()
-                .plan()
-                .is_some(),
-    }
-}
-
-/// The recovery tool's plan (#581 section 4.5) from the members it reached:
-/// the leader is the member with the greatest last log id; when its last
-/// log term is below the highest vote term a restricted member (a closed
-/// gate or an unsatisfied plan) holds, a stale entry is possible, so every
-/// member cuts its log to what it knew was committed and the leader is the
-/// member with the greatest committed index.
-pub(super) fn recovery_plan(members: &[MemberView]) -> (u64, u64, bool) {
-    let floor = members
-        .iter()
-        .filter(|member| member.restricted)
-        .map(|member| member.log.current_term)
-        .max()
-        .unwrap_or(0);
-    let longest = members
-        .iter()
-        .max_by_key(|member| {
-            (
-                member.log.last_log_term,
-                member.log.last_log_index,
-                member.node_id,
-            )
-        })
-        .expect("a reachable member");
-    let cut = members.len() > 1 && longest.log.last_log_term.unwrap_or(0) < floor;
-    if cut {
-        let leader = members
-            .iter()
-            .max_by_key(|member| (member.committed, member.node_id))
-            .expect("a reachable member");
-        (leader.node_id, leader.committed.unwrap_or(0), true)
-    } else {
-        (
-            longest.node_id,
-            longest.log.last_log_index.unwrap_or(0),
-            false,
-        )
-    }
-}
-
-/// The recovery tool for `group` over the members in `reachable`: computes
-/// the plan, sends it to every member through its production admin entry
-/// point with the leader last, and restarts the members whose plan cuts
-/// their log, as the runbook says. Returns the plan.
-pub(super) async fn recover_group(
-    cluster: &mut JournalCluster,
-    group: u32,
-    reachable: &[u64],
-    context: &str,
-) -> RecoveryPlanRequest {
-    let mut members = Vec::new();
-    for node_id in reachable {
-        members.push(member_view(cluster, group, *node_id).await);
-    }
-    let (leader, point, cut) = recovery_plan(&members);
-    cluster.plan_leaders.insert(leader);
-    members.sort_by_key(|member| member.node_id == leader);
-    let mut plan = None;
-    for member in &members {
-        let request = RecoveryPlanRequest {
-            leader,
-            point,
-            cut,
-            expected: member.log,
-        };
-        let report: RecoveryPlanReport = cluster
-            .accept_recovery_plan(group, member.node_id, &request)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{context}: group {group}: node {} refused the plan {request:?}: {error}",
-                    member.node_id
-                )
-            });
-        let expected = if member.node_id == leader {
-            RecoveryPlanOutcome::Leads
-        } else {
-            RecoveryPlanOutcome::Follows
-        };
-        assert_eq!(report.outcome, expected, "{context}: group {group}");
-        if cut && member.node_id == leader {
-            // B1 (#581 review): the cut ran before the answer.
-            let last = member_view(cluster, group, leader).await.log.last_log_index;
-            assert!(
-                last.is_none_or(|last| last <= point),
-                "{context}: group {group}: the plan's leader answered with its log uncut at {last:?}"
-            );
-        }
-        plan = Some(request);
-    }
-    plan.expect("a reachable member")
-}
-
-/// Waits until every replica of `group` in `nodes` applied a history event
-/// above `point`: the plan is satisfied everywhere.
-pub(super) async fn wait_plan_satisfied(
-    cluster: &JournalCluster,
-    group: u32,
-    nodes: &[u64],
-    point: u64,
-    context: &str,
-) {
-    let deadline = madsim::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let satisfied = nodes.iter().all(|node_id| {
-            cluster
-                .engines
-                .get(&(group, *node_id))
-                .is_some_and(|engine| {
-                    engine
-                        .history()
-                        .applied()
-                        .is_some_and(|event| event.event_index > point)
-                        && engine.history().plan().is_none()
-                })
-        });
-        if satisfied {
-            return;
-        }
-        assert!(
-            madsim::time::Instant::now() < deadline,
-            "{context}: group {group}: the recovery plan's history event never applied everywhere"
-        );
-        madsim::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// Moves the leadership of every group to `leader`.
-async fn lead_every_group(cluster: &JournalCluster, leader: u64, context: &str) {
-    for group in JOURNAL_GROUPS {
-        let current = wait_leader(cluster, group, context).await;
-        if current != leader {
-            cluster.engines[&(group, current)]
-                .raft_handle()
-                .trigger()
-                .transfer_leader(leader)
-                .await
-                .expect("transfer the leadership");
-        }
-        let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
-        while leader_by_state(cluster, group) != Some(leader) {
-            assert!(
-                madsim::time::Instant::now() < deadline,
-                "{context}: group {group} never moved to node {leader}"
-            );
-            madsim::time::sleep(Duration::from_millis(25)).await;
-        }
     }
 }
 

@@ -6195,6 +6195,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 leader: 1,
                 point: expected.last_log_index.unwrap_or(0),
                 cut: false,
+                leader_last_log_term: expected.last_log_term,
                 expected,
             }
         };

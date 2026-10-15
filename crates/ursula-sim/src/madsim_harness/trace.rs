@@ -649,6 +649,17 @@ pub enum SimEvent {
         boundary_claims: u64,
         leader_kills: u64,
     },
+    /// `accepted_loss_never_applies_a_stale_entry` held: after a quorum
+    /// loss, a recovery plan elected `leader`, cutting every log when `cut`;
+    /// no replica applied the `stale_writes` writes the cut-off leader held
+    /// uncommitted, and every replica applied the plan's history event
+    /// across `restarts` member restarts.
+    RecoveryPlanVerified {
+        leader: u64,
+        cut: bool,
+        stale_writes: u64,
+        restarts: u64,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

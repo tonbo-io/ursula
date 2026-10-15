@@ -314,6 +314,10 @@ fn generate_stale_writers_after_restore(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::StaleWritersAfterRestore)
 }
 
+fn generate_recovery_plan_cut_under_restarts(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanCutUnderRestarts)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -341,6 +345,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 384,
         kind: "stale-writers-after-restore",
         generate: generate_stale_writers_after_restore,
+    },
+    SeedFamily {
+        name: "recovery-plan-cut-under-restarts",
+        start: 385,
+        end: 389,
+        kind: "recovery-plan-cut-under-restarts",
+        generate: generate_recovery_plan_cut_under_restarts,
+    },
+    SeedFamily {
+        name: "recovery-plan-cut-under-restarts-extended",
+        start: 880,
+        end: 899,
+        kind: "recovery-plan-cut-under-restarts",
+        generate: generate_recovery_plan_cut_under_restarts,
     },
     SeedFamily {
         name: "history-rewind-under-leader-churn-extended",

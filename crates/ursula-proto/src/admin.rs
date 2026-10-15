@@ -267,6 +267,11 @@ pub struct RecoveryPlanRequest {
     /// the leader's last log term is below the highest vote term a gated
     /// member holds, so its log may hold a stale entry.
     pub cut: bool,
+    /// The plan's leader's last log term as the tool read it, `null` for an
+    /// empty log. Members of a cutting plan grant the leader their vote only
+    /// once its log ends at the point or carries a later term, so its
+    /// stale entries never win an election.
+    pub leader_last_log_term: Option<u64>,
     /// This replica's log as the tool read it.
     pub expected: ReplicaLogView,
 }
@@ -393,14 +398,15 @@ mod tests {
         use super::ReplicaLogView;
         assert_eq!(
             serde_json::from_str::<RecoveryPlanRequest>(
-                r#"{"leader": 2, "point": 12, "cut": false, "expected":
-                    {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
+                r#"{"leader": 2, "point": 12, "cut": false, "leader_last_log_term": 3,
+                    "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
             )
             .unwrap(),
             RecoveryPlanRequest {
                 leader: 2,
                 point: 12,
                 cut: false,
+                leader_last_log_term: Some(3),
                 expected: ReplicaLogView {
                     last_log_index: Some(12),
                     last_log_term: Some(3),

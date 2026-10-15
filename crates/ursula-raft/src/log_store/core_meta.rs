@@ -67,9 +67,11 @@ pub struct RecoveryRecord {
     pub leader: u64,
     /// The plan's leader's last log index after the plan.
     pub point: u64,
-    /// Whether the plan cuts every member's log: a member grants the
-    /// leader its vote only once the leader shows it was cut.
-    pub cut: bool,
+    /// When the plan cuts every member's log: the plan's leader's last log
+    /// term before its cut. A member grants the leader its vote only once
+    /// the leader's log ends at the point or carries a later term, which
+    /// only entries appended after the cut do.
+    pub uncut_leader_term: Option<u64>,
     /// This replica's cut until it ran: the committed entry it keeps the
     /// log up to. It runs while the group restarts, before its new Raft
     /// core, and is then recorded as done (`None`).
