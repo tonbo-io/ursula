@@ -64,9 +64,22 @@ impl SizeLimit {
     }
 }
 
+/// The `Ursula-Max-Request-Bytes` an intermediary forwards on a response
+/// that carries it (Section 10): the smaller of the received value and
+/// `limit`, the intermediary's own limit for the request. `Ok(None)` when the
+/// response carries none, and then the intermediary adds none. `Err` when
+/// the received value is malformed or repeated.
+pub fn lowered_request_limit<'a, I>(headers: I, limit: u64) -> Result<Option<u64>, HeaderError>
+where I: IntoIterator<Item = (&'a str, &'a [u8])> {
+    let [received] = fields::collect(headers, [names::URSULA_MAX_REQUEST_BYTES])?;
+    Ok(fields::decimal(names::URSULA_MAX_REQUEST_BYTES, received)?
+        .map(|received| received.min(limit)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::SizeLimit;
+    use super::lowered_request_limit;
     use crate::error::HeaderError;
 
     fn parse(pairs: &[(&str, &str)]) -> Result<Option<SizeLimit>, HeaderError> {
@@ -160,5 +173,38 @@ mod tests {
         ] {
             assert_eq!(parse(pairs), Err(expected), "{pairs:?}");
         }
+    }
+
+    #[test]
+    fn an_intermediary_lowers_the_request_limit_it_receives() {
+        let lowered = |pairs: &[(&str, &str)], limit| {
+            lowered_request_limit(
+                pairs.iter().map(|(name, value)| (*name, value.as_bytes())),
+                limit,
+            )
+        };
+        let received = [("Ursula-Max-Request-Bytes", "33554432")];
+        assert_eq!(lowered(&received, 1_048_576), Ok(Some(1_048_576)));
+        assert_eq!(lowered(&received, 33_554_432), Ok(Some(33_554_432)));
+        assert_eq!(lowered(&received, u64::MAX), Ok(Some(33_554_432)));
+        assert_eq!(lowered(&[("content-type", "text/plain")], 1), Ok(None));
+        assert_eq!(
+            lowered(&[("ursula-max-request-bytes", "1x")], 1),
+            Err(HeaderError::InvalidInteger {
+                name: "ursula-max-request-bytes",
+            })
+        );
+        assert_eq!(
+            lowered(
+                &[
+                    ("ursula-max-request-bytes", "1"),
+                    ("ursula-max-request-bytes", "2"),
+                ],
+                1
+            ),
+            Err(HeaderError::Duplicate {
+                name: "ursula-max-request-bytes",
+            })
+        );
     }
 }
