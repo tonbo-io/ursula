@@ -136,6 +136,13 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CheckpointId(pub(crate) usize);
 
+/// Every stream as it stood, and the group's history id then: the history its tokens were in.
+#[derive(Debug, Clone)]
+struct Checkpoint {
+    history: u64,
+    streams: BTreeMap<String, Stream>,
+}
+
 /// A history event (#581 §4.3): every token of the group changes and every producer record is
 /// history-fenced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +193,7 @@ pub(crate) struct ModelServer {
     clock_ms: u64,
     limits: Limits,
     streams: BTreeMap<String, Stream>,
-    checkpoints: Vec<BTreeMap<String, Stream>>,
+    checkpoints: Vec<Checkpoint>,
     faults: Faults,
 }
 
@@ -257,19 +264,27 @@ impl ModelServer {
 
     /// Saves every stream's state, to restore later as a history event.
     pub(crate) fn checkpoint(&mut self) -> CheckpointId {
-        self.checkpoints.push(self.streams.clone());
+        self.checkpoints.push(Checkpoint {
+            history: self.history,
+            streams: self.streams.clone(),
+        });
         CheckpointId(self.checkpoints.len().saturating_sub(1))
     }
 
     /// Applies a history event (#581 §4.3): a fresh history id, `last_created_at_ms` kept at least
-    /// the clock, and nothing else. Tokens, fences and inheritance all derive from the id.
+    /// the clock, and nothing else. Tokens, fences and inheritance all derive from the id. A
+    /// restore puts every stream back in the history of its source, so HEAD reports the source's
+    /// token with the restored tail (§4.8).
     pub(crate) fn history_event(&mut self, event: HistoryEvent) -> Result<(), ModelError> {
         if let HistoryEvent::Restore(CheckpointId(id)) = event {
-            self.streams = self
+            let source = self
                 .checkpoints
                 .get(id)
-                .ok_or(ModelError::NoCheckpoint(id))?
-                .clone();
+                .ok_or(ModelError::NoCheckpoint(id))?;
+            self.streams = source.streams.clone();
+            for stream in self.streams.values_mut() {
+                stream.history = source.history;
+            }
         }
         self.history = self.draw_history();
         self.last_created_at_ms = self.last_created_at_ms.max(self.clock_ms);
@@ -430,17 +445,7 @@ impl ModelServer {
             .streams
             .get_mut(path)
             .ok_or_else(|| RawAnswer::new(404))?;
-        let current = stream.token_in(history);
-        if let Some(precondition) = request.keys.precondition
-            && precondition.incarnation != current
-        {
-            let mut answer = RawAnswer::new(IncarnationMismatch::STATUS);
-            IncarnationMismatch {
-                current: Some(current),
-            }
-            .render(answer.emit());
-            return Err(answer);
-        }
+        precondition(stream, request, history)?;
         Ok(stream)
     }
 
@@ -603,12 +608,12 @@ impl ModelServer {
         })
     }
 
-    /// `GET {stream}?offset=`: up to a chunk of bytes from `from`, `410` below retention.
+    /// `GET {stream}?offset=`: up to a chunk of bytes from `from`, its refusals in #581's order:
+    /// `404`, `410` below retention, `416` past the tail, then the precondition (`412`).
     fn read(&mut self, path: &str, request: &Request, from: Option<Offset>) -> RawAnswer {
         let chunk = self.limits.read_chunk;
-        let stream = match self.stream(path, request) {
-            Ok(stream) => stream,
-            Err(answer) => return answer,
+        let Some(stream) = self.streams.get(path) else {
+            return RawAnswer::new(404);
         };
         let from = from.unwrap_or(Offset::ZERO);
         let tail = stream.tail();
@@ -616,7 +621,10 @@ impl ModelServer {
             return RawAnswer::new(410);
         }
         if from > tail {
-            return RawAnswer::new(400);
+            return RawAnswer::new(416);
+        }
+        if let Err(mismatch) = precondition(stream, request, self.history) {
+            return mismatch;
         }
         let next = Offset::from_u64(from.get().saturating_add(chunk).min(tail.get()));
         let bytes = usize::try_from(from.get())
@@ -773,6 +781,23 @@ fn closed_append(tail: Offset) -> RawAnswer {
     answer.header(names::STREAM_NEXT_OFFSET, tail.to_string());
     answer.header(names::STREAM_CLOSED, "true");
     answer
+}
+
+/// The incarnation precondition: `412` naming the stream's current token when the request names
+/// another.
+fn precondition(stream: &Stream, request: &Request, history: u64) -> Result<(), RawAnswer> {
+    let current = stream.token_in(history);
+    match request.keys.precondition {
+        Some(precondition) if precondition.incarnation != current => {
+            let mut answer = RawAnswer::new(IncarnationMismatch::STATUS);
+            IncarnationMismatch {
+                current: Some(current),
+            }
+            .render(answer.emit());
+            Err(answer)
+        }
+        Some(_) | None => Ok(()),
+    }
 }
 
 /// A producer answer, rendered.

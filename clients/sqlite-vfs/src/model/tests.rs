@@ -1073,7 +1073,7 @@ fn w5_a_history_event_reports_the_previous_token_and_the_tail() {
 }
 
 #[test]
-fn w5_an_accepted_loss_inherits_the_surviving_prefix() {
+fn s4_8_an_accepted_loss_inherits_the_surviving_tail_at_the_event() {
     let world = World::new();
     let old = world.create();
     world.server().foreign_append(PATH, &[1; 30]).unwrap();
@@ -1101,27 +1101,28 @@ fn w5_an_accepted_loss_inherits_the_surviving_prefix() {
 }
 
 #[test]
-fn w5_two_events_name_one_predecessor() {
-    // Without a write between them: the token before both.
+fn s4_8_two_events_without_a_write_report_the_token_before_both_and_the_unchanged_tail() {
     let world = World::new();
     let old = world.create();
     world.server().foreign_append(PATH, &[1; 8]).unwrap();
-    world
-        .server()
-        .history_event(HistoryEvent::NewHistory)
-        .unwrap();
-    world
-        .server()
-        .history_event(HistoryEvent::NewHistory)
-        .unwrap();
-    assert_eq!(
+    for _ in 0..2 {
         world
-            .stream_head()
-            .inherited()
-            .map(|i| i.previous_incarnation),
-        Some(old)
+            .server()
+            .history_event(HistoryEvent::NewHistory)
+            .unwrap();
+    }
+    assert_eq!(
+        world.stream_head().inherited(),
+        Some(Inherited {
+            previous_incarnation: old,
+            offset: Offset::from_u64(8),
+        })
     );
-    // With a write between them: the token of the history between.
+}
+
+#[test]
+fn s4_8_two_events_with_a_write_between_report_the_history_between() {
+    // Only one predecessor is ever reported.
     let world = World::new();
     world.create();
     world
@@ -1144,7 +1145,7 @@ fn w5_two_events_name_one_predecessor() {
 }
 
 #[test]
-fn w5_a_history_event_fences_the_producer_by_history() {
+fn s4_8_row_11_closes_the_epoch_at_its_last_seq_after_the_412() {
     let world = World::new();
     let old = world.create();
     world.producer(&write(tokened(old), 1, 0, b"claim"));
@@ -1161,7 +1162,9 @@ fn w5_a_history_event_fences_the_producer_by_history() {
     else {
         panic!();
     };
+    // Producer-Epoch E, Producer-Closed-Epoch E, Producer-Closed-Seq r.last.
     assert_eq!(closure.by(), ClosedBy::History);
+    assert_eq!(closure.epoch(), epoch(1));
     assert_eq!(closure.closed_epoch(), ClosedEpoch {
         epoch: epoch(1),
         seq: seq(1),
@@ -1181,6 +1184,108 @@ fn w5_a_history_event_fences_the_producer_by_history() {
             ..
         }
     ));
+}
+
+#[test]
+fn s4_8_a_restore_reports_the_source_token_and_the_restored_tail() {
+    // The source was taken after an event with no write since: its token, not the one before.
+    let world = World::new();
+    world.create();
+    world.server().foreign_append(PATH, &[1; 10]).unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::NewHistory)
+        .unwrap();
+    let source = world.server().token(PATH).unwrap();
+    let point = world.server().checkpoint();
+    world.server().foreign_append(PATH, &[2; 20]).unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::Restore(point))
+        .unwrap();
+    let head = world.stream_head();
+    assert_ne!(head.incarnation(), source);
+    assert_eq!(
+        head.inherited(),
+        Some(Inherited {
+            previous_incarnation: source,
+            offset: Offset::from_u64(10),
+        })
+    );
+}
+
+#[test]
+fn s4_8_delete_and_recreate_starts_without_inheritance() {
+    let world = World::new();
+    let old = world.create();
+    world.server().foreign_append(PATH, &[1; 10]).unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::NewHistory)
+        .unwrap();
+    world.server().delete(PATH).unwrap();
+    let new = world.create();
+    assert_ne!(new, old);
+    let head = world.stream_head();
+    assert_eq!((head.next_offset(), head.inherited()), (Offset::ZERO, None));
+}
+
+#[test]
+fn s4_8_the_snapshot_offset_is_never_above_inherited_until_a_new_publish() {
+    let world = World::new();
+    let token = world.create();
+    world.server().foreign_append(PATH, &[1; 30]).unwrap();
+    assert_eq!(world.send(&publish(token, 20, b"early").0).status, 204);
+    let point = world.server().checkpoint();
+    world.server().foreign_append(PATH, &[2; 20]).unwrap();
+    assert_eq!(world.send(&publish(token, 50, b"late").0).status, 204);
+    world
+        .server()
+        .history_event(HistoryEvent::Restore(point))
+        .unwrap();
+    let head = world.stream_head();
+    let inherited = head.inherited().unwrap().offset;
+    assert_eq!(inherited, Offset::from_u64(30));
+    assert_eq!(
+        head.snapshot().map(|s| s.offset),
+        Some(Offset::from_u64(20))
+    );
+    // A new publish under the new token may pass it.
+    world.server().foreign_append(PATH, &[3; 10]).unwrap();
+    let token = world.server().token(PATH).unwrap();
+    assert_eq!(world.send(&publish(token, 40, b"new").0).status, 204);
+    let head = world.stream_head();
+    assert_eq!(head.inherited().unwrap().offset, inherited);
+    assert_eq!(
+        head.snapshot().map(|s| s.offset),
+        Some(Offset::from_u64(40))
+    );
+}
+
+#[test]
+fn s4_8_read_refusals_come_in_the_order_404_410_416_412() {
+    let world = World::new();
+    let other = |token: Incarnation| tokened(Incarnation::try_from(token.get() ^ 1).unwrap());
+    let missing = read(None, Some(0));
+    assert_eq!(world.send(&missing).status, 404);
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 100]).unwrap();
+    assert_eq!(world.send(&publish(token, 60, b"image").0).status, 204);
+    let retain = Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        ..Request::new(Method::Put, Target::Retention {
+            offset: Offset::from_u64(60),
+        })
+    };
+    assert_eq!(world.send(&retain).status, 204);
+    // A wrong token below retention, past the tail, then within range.
+    assert_eq!(world.send(&read(other(token), Some(10))).status, 410);
+    assert_eq!(world.send(&read(other(token), Some(101))).status, 416);
+    assert_eq!(world.send(&read(other(token), Some(60))).status, 412);
+    assert_eq!(world.send(&read(tokened(token), Some(101))).status, 416);
 }
 
 #[test]
