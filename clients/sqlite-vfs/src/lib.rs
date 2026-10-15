@@ -149,8 +149,12 @@
 //!   the digests the server checks, not yet used by the extension.
 //! - [`frame`]: the stream's frames (commits and claims).
 //! - [`snapshot`]: snapshot bodies.
+//! - `applier`: applies commits to a db file in batches of final page images, whatever their
+//!   frame format (0.7's attach and 0.8's materialization).
 //! - `attach`: `ursula_attach`, from the local files' trust decision to the bound attachment.
 //! - `auth`: the bearer token every request carries.
+//! - `capture`: the WAL's layout, the shape of a write transaction's WAL writes, and its final page
+//!   images at the commit point (0.8, not yet wired).
 //! - `claim`: claiming a stream (fencing earlier owners) and re-claiming an expired producer.
 //! - `client`: the stream over blocking HTTP, with the retries.
 //! - `config`: settings and test hooks from the environment.
@@ -161,24 +165,35 @@
 //!   local damage), and the kinds and actions callers outside the extension see (`ErrorKind`,
 //!   `Action`).
 //! - `extension`: the entry point and the SQL functions.
+//! - `generation`: the canonical stream path, a stream's locked root directory and the
+//!   generations in it (0.8, not yet wired).
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
 //! - [`ids`]: lineages, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and private connections.
 //! - `local`: the sidecar, the boot id, and the db file locks.
 //! - `log`: log lines (logfmt) on the host's stderr.
+//! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
+//!   frames from the stream (0.8, not yet wired).
 //! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
 //!   the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
+//! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle
+//!   (0.8, not yet wired).
+//! - `replog`: the commit log, `USL1` segments in a generation's `log/` (0.8, not yet wired).
 //! - `snapshotter`: the snapshot thread, snapshots and retention.
 //! - `stats`: the measurements `ursula_stats` drains, at most 8,192 of each kind between drains.
 //! - `status`: `ursula_status` and `ursula_stats`.
 //! - `transport`: one attempt of a 0.8 request, over HTTP or to the model in process.
 //! - `vfs`: the VFS file methods and the commit path.
-//! - `wal`: the local WAL's format, recovery scan and fold.
+//! - `wal`: the local WAL's recovery scan and fold.
 //! - `wire`: the 0.8 requests and answers as values, shared by the transports and the model.
 
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
+mod applier;
 mod attach;
 mod auth;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
+mod capture;
 mod claim;
 mod client;
 pub mod codec;
@@ -188,14 +203,22 @@ mod descriptors;
 mod error;
 mod extension;
 pub mod frame;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
+mod generation;
 mod guard;
 mod host;
 pub mod ids;
 mod local;
 mod log;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
+mod materialize;
 #[cfg(any(test, feature = "model"))]
 pub mod model;
 mod net;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
+mod publication;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by the 0.8 switch PR"))]
+mod replog;
 pub mod snapshot;
 mod snapshotter;
 mod stats;
@@ -204,5 +227,8 @@ mod transport;
 mod vfs;
 mod wal;
 mod wire;
+
+#[cfg(test)]
+mod testdir;
 
 pub use extension::sqlite3_extension_init;

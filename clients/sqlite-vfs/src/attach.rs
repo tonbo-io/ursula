@@ -13,6 +13,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::applier::PageBatch;
+use crate::capture::pages_in;
 use crate::claim::claim;
 use crate::client::START;
 use crate::client::advanced;
@@ -57,12 +59,10 @@ use crate::snapshotter::Snapper;
 use crate::snapshotter::snapshot_loop;
 use crate::stats::Stats;
 use crate::wal::WalClaim;
-use crate::wal::db_len;
 use crate::wal::fold_wal;
-use crate::wal::page_offset;
-use crate::wal::pages_in;
 
-/// Applies records to the db file, deduplicating page writes per batch.
+/// Applies records to the db file, deduplicating page writes per batch (`applier`), and holds what
+/// 0.7's trust decision needs around it.
 ///
 /// Runs only inside `ursula_attach`, which refuses while any connection of this process has the
 /// file open (or opens one), or any descriptor of the process outside the extension is open on the
@@ -90,11 +90,8 @@ pub(crate) struct Applier {
     /// Page images written (for the `URSULA_VFS_ABORT_IN_REPLAY` test hook).
     pub(crate) written: u64,
     pub(crate) file: Option<fs::File>,
-    /// Final image per page of the current batch (pages past a later shrink removed).
-    pub(crate) pages: BTreeMap<u32, Vec<u8>>,
-    /// Smallest db size within the batch, and the size after it.
-    pub(crate) min_size: Option<u32>,
-    pub(crate) size: Option<u32>,
+    /// The current batch of commits (`applier`).
+    pub(crate) batch: PageBatch<Vec<u8>>,
     /// Highest claimed epoch seen.
     pub(crate) epoch: u64,
 }
@@ -112,16 +109,7 @@ impl Applier {
     fn apply(&mut self, record: Record) {
         match record {
             Record::Claim { epoch, .. } => self.epoch = self.epoch.max(epoch),
-            Record::Commit { size, pages } => {
-                if size < self.size.unwrap_or(u32::MAX) {
-                    self.pages.retain(|&p, _| p <= size);
-                }
-                self.min_size = Some(self.min_size.map_or(size, |m| m.min(size)));
-                self.size = Some(size);
-                for (pgno, data) in pages {
-                    self.pages.insert(pgno, data);
-                }
-            }
+            Record::Commit { size, pages } => self.batch.commit(size, pages),
         }
     }
 
@@ -162,34 +150,32 @@ impl Applier {
 
     /// Writes the batch: truncate to its smallest size, write the final page images, set the size.
     fn flush(&mut self) -> Result<(), Error> {
-        let (Some(min), Some(size)) = (self.min_size.take(), self.size) else {
+        if !self.batch.has_commit() {
             return Ok(());
-        };
-        let pages = std::mem::take(&mut self.pages);
+        }
+        let mut batch = std::mem::take(&mut self.batch);
         let mut written = self.written;
         let path = self.path.clone();
-        let err = |source| Error::Io {
-            op: "replay into",
-            path: path.clone(),
-            source,
-        };
-        let f = self.file()?;
-        let len = f.metadata().map_err(err)?.len();
-        if len > db_len(min) {
-            f.set_len(db_len(min)).map_err(err)?;
-        }
-        for (pgno, data) in pages {
-            f.write_all_at(&data, page_offset(pgno)).map_err(err)?;
-            written = written.saturating_add(1);
-            if abort_in_replay() == Some(written) {
-                log::emit(Level::Error, "test_hook_abort", &[
-                    ("hook", &"URSULA_VFS_ABORT_IN_REPLAY"),
-                    ("file", &self.path),
-                ]);
-                std::process::abort();
-            }
-        }
-        f.set_len(db_len(size)).map_err(err)?;
+        let flushed = self.file().and_then(|f| {
+            batch
+                .flush(f, || {
+                    written = written.saturating_add(1);
+                    if abort_in_replay() == Some(written) {
+                        log::emit(Level::Error, "test_hook_abort", &[
+                            ("hook", &"URSULA_VFS_ABORT_IN_REPLAY"),
+                            ("file", &path),
+                        ]);
+                        std::process::abort();
+                    }
+                })
+                .map_err(|source| Error::Io {
+                    op: "replay into",
+                    path: path.clone(),
+                    source,
+                })
+        });
+        self.batch = batch;
+        flushed?;
         self.written = written;
         Ok(())
     }
@@ -226,9 +212,7 @@ impl Applier {
         f.write_all_at(&snap.image, 0).map_err(err)?;
         f.set_len(snap.image.len() as u64).map_err(err)?;
         self.file = Some(f);
-        self.pages.clear();
-        self.min_size = None;
-        self.size = Some((snap.image.len() / PAGE) as u32);
+        self.batch.restart((snap.image.len() / PAGE) as u32);
         self.epoch = self.epoch.max(snap.epoch);
         self.installed = snap.offset;
         self.log = 0;
@@ -787,9 +771,7 @@ fn attach_files(path: &str, url: &str, mode: Mode, progress: &Progress) -> Resul
         log,
         written: 0,
         file: emptied,
-        pages: BTreeMap::new(),
-        min_size: None,
-        size: None,
+        batch: PageBatch::default(),
         epoch,
     };
     let mut pos = from.clone();

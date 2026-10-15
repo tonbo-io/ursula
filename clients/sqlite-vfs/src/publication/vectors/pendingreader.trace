@@ -1,0 +1,42 @@
+# Transcribed from proto-phasetwo/runs/v24.14.0/pendingreader.log (SQLite 3.51.2).
+# One line per call on a main db handle, or per WAL write of its connection:
+# <trace line> <connection> <event>. A failed WRITE lock is `other`. Runs of `other`
+# and of `wal-write` on one connection are kept as their first line.
+3 c1 other
+19 c1 phasetwo
+20 c1 other
+25 c1 lock-write
+26 c1 other
+37 c1 unlock-write
+38 c1 other
+39 c1 lock-write
+40 c1 other
+44 c1 wal-write
+51 c1 commit
+53 c1 unlock-write
+54 c1 phasetwo
+55 c1 other
+59 c1 lock-write
+60 c1 wal-write
+63 c1 commit
+65 c1 unlock-write
+66 c1 phasetwo
+67 c1 other
+72 c1 lock-write
+73 c1 wal-write
+76 c1 commit
+78 c1 unlock-write
+79 c1 phasetwo
+80 c1 other
+82 c1 lock-write
+83 c1 wal-write
+86 c1 commit
+88 c1 unlock-write
+89 c1 other
+96 c1 lock-write
+97 c1 wal-write
+100 c1 commit
+102 c1 unlock-write
+103 c1 phasetwo
+104 c1 other
+124 c1 close
