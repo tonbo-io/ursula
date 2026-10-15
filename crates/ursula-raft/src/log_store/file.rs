@@ -38,6 +38,7 @@ use ursula_shard::ShardPlacement;
 use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::core_meta::GroupLogState;
+use super::core_meta::RecoveryRecord;
 use super::disk::Disk;
 use super::disk::JournalDisk;
 use super::group_log::DiskRead;
@@ -85,6 +86,8 @@ pub struct RaftGroupFileLogStore {
     write_order: Arc<crate::rt::sync::Mutex<()>>,
     pending: Arc<Mutex<PendingAppend>>,
     core_writer: Arc<CoreFileLogWriter>,
+    /// The recovery plan the replica holds, as the metadata file records it.
+    recovery: Mutex<Option<RecoveryRecord>>,
 }
 
 /// At most one submitted batch per group. Keeping its entries readable lets
@@ -177,6 +180,7 @@ impl RaftGroupFileLogStore {
             write_order: Arc::new(crate::rt::sync::Mutex::new(())),
             pending: Arc::new(Mutex::new(PendingAppend::Idle)),
             core_writer,
+            recovery: Mutex::new(opened.recovery),
         }))
     }
 
@@ -195,6 +199,11 @@ impl RaftGroupFileLogStore {
     /// The id of the last entry the store holds, or of the last purged one.
     pub(crate) fn last_log_id(&self) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
         lock(&self.log).last_log_id()
+    }
+
+    /// The committed entry the store recorded last.
+    pub(crate) fn committed(&self) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+        lock(&self.log).committed()
     }
 
     /// The vote the replica runs with.
@@ -321,6 +330,58 @@ impl RaftGroupFileLogStore {
                 Ok(())
             }
         }
+    }
+
+    /// The recovery plan this replica holds (#581 section 4.5), if any.
+    pub(crate) fn recovery_record(&self) -> Option<RecoveryRecord> {
+        *lock(&self.recovery)
+    }
+
+    /// Records `record` as the replica's recovery plan, or removes it. The
+    /// metadata file is synced, and the journal before it.
+    pub(crate) async fn record_recovery(
+        &self,
+        record: Option<RecoveryRecord>,
+    ) -> Result<(), CoreJournalError> {
+        let _order = self.write_order.lock().await;
+        let timing = self
+            .core_writer
+            .write(CoreWriteOp::Recovery {
+                group_id: self.placement.raft_group_id.0,
+                record,
+            })
+            .await?;
+        self.record_timing(1, timing);
+        *lock(&self.recovery) = record;
+        Ok(())
+    }
+
+    /// Runs the cut of the replica's recovery plan, before its Raft core
+    /// starts: the log keeps only entries the replica knew were committed.
+    /// It persists the committed entry, truncates the log after it, and
+    /// records the cut as done; the journal is synced before that record.
+    /// Returns whether a cut ran.
+    pub(crate) async fn run_recovery_cut(self: &Arc<Self>) -> Result<bool, io::Error> {
+        let Some(record) = self.recovery_record() else {
+            return Ok(false);
+        };
+        let Some(committed) = record.cut_after else {
+            return Ok(false);
+        };
+        let mut store = Arc::clone(self);
+        if self
+            .last_log_id()
+            .is_some_and(|last| last.index() > committed.index())
+        {
+            store.save_committed(Some(committed)).await?;
+            store.truncate_after(Some(committed)).await?;
+        }
+        self.record_recovery(Some(RecoveryRecord {
+            cut_after: None,
+            ..record
+        }))
+        .await?;
+        Ok(true)
     }
 
     /// How the core journal holding this group was read when it opened.

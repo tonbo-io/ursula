@@ -727,12 +727,13 @@ async fn cli_single_voter_passes_verify_cluster_and_wait_node() {
 
 /// A single voter whose run state is gone while its journal holds records
 /// cannot know whether it lost acknowledged writes: it comes back gated, its
-/// group has no leader and readiness says why. Once the gate reports the
-/// group stalled, an operator who accepts the loss of the unsynced tail for
-/// the log the metrics show opens the gate, and the node serves again with
-/// what its journal kept.
+/// group has no leader and readiness says why. A recovery plan for the log
+/// the metrics show elects it (#581 section 4.5): it starts a new history,
+/// so its streams answer under new tokens, HEAD names the token each had
+/// before and the offset below which its bytes survived, and a write that
+/// names the old token answers `412`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_loss() {
+async fn cli_single_voter_with_an_unknown_history_serves_after_a_recovery_plan() {
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI recovery gate test");
@@ -748,13 +749,21 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_l
     let admin_url = format!("http://127.0.0.1:{admin_port}");
     let client = reqwest::Client::new();
     let stream_url = format!("{base_url}/benchcmp/cli-unknown-history");
-    {
+    let old_token = {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
         wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
         put_until_created(&client, &stream_url).await;
         post_until_no_content(&client, &stream_url, "kept-by-the-page-cache").await;
+        let head = client.head(&stream_url).send().await.expect("HEAD");
+        let head = ursula_headers::StreamHead::parse(
+            head.headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .expect("a stream head");
         // Killed: the page cache keeps every write.
-    }
+        head.incarnation()
+    };
     std::fs::remove_file(log_dir.join("raft-log").join("run-state.bin"))
         .expect("remove the run state");
 
@@ -775,30 +784,8 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_l
     let ready: serde_json::Value = ready.json().await.expect("readiness JSON");
     assert_eq!(ready["reason"], "recovery_gate_closed", "{ready}");
 
-    let accept_url = format!("{admin_url}/__ursula/raft/0/recovery/accept-unsynced-loss");
-    let observe = || async {
-        let metrics: serde_json::Value = client
-            .get(format!("{admin_url}/__ursula/metrics"))
-            .send()
-            .await
-            .expect("metrics")
-            .json()
-            .await
-            .expect("metrics JSON");
-        let group = &metrics["raft_groups"][0];
-        ursula_proto::admin::AcceptUnsyncedLossRequest {
-            expected_last_log_index: group["last_log_index"].as_u64(),
-            expected_current_term: group["current_term"].as_u64().expect("current term"),
-        }
-    };
-    // Not stalled yet: the gate may still open through a barrier.
-    let early = admin_test_post(&client, accept_url.clone())
-        .await
-        .json(&observe().await)
-        .send()
-        .await
-        .expect("accept before the stall");
-    assert_eq!(early.status(), reqwest::StatusCode::CONFLICT);
+    // The plan waits for the stall: until then a leader's barrier may still
+    // open the gate without losing anything.
     let stall_deadline = std::time::Instant::now()
         .checked_add(ursula_raft::RECOVERY_STALL_AFTER.saturating_add(Duration::from_secs(30)))
         .unwrap();
@@ -820,24 +807,118 @@ async fn cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_l
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-
-    let response = admin_test_post(&client, accept_url)
-        .await
-        .json(&observe().await)
+    let accept_url = format!("{admin_url}/__ursula/raft/0/recovery/accept-unsynced-loss");
+    let metrics: serde_json::Value = client
+        .get(format!("{admin_url}/__ursula/metrics"))
         .send()
         .await
-        .expect("accept the unsynced loss");
+        .expect("metrics")
+        .json()
+        .await
+        .expect("metrics JSON");
+    let group = &metrics["raft_groups"][0];
+    let expected = ursula_proto::admin::ReplicaLogView {
+        last_log_index: group["last_log_index"].as_u64(),
+        last_log_term: group["last_log_term"].as_u64(),
+        current_term: group["current_term"].as_u64().expect("current term"),
+    };
+    // A single voter never cuts: its log is a prefix of the old one.
+    let plan = ursula_proto::admin::RecoveryPlanRequest {
+        leader: 1,
+        point: expected.last_log_index.unwrap_or(0),
+        cut: false,
+        expected,
+    };
+    let response = admin_test_post(&client, accept_url)
+        .await
+        .json(&plan)
+        .send()
+        .await
+        .expect("send the recovery plan");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let report: ursula_raft::AcceptUnsyncedLossReport =
+    let report: ursula_proto::admin::RecoveryPlanReport =
         response.json().await.expect("typed report");
     assert_eq!(
         report.outcome,
-        ursula_raft::AcceptUnsyncedLossOutcome::GateOpened
+        ursula_proto::admin::RecoveryPlanOutcome::Leads
     );
     let payload =
         read_until_replicated(&client, &format!("{stream_url}?offset=0&max_bytes=64")).await;
     assert_eq!(payload, b"kept-by-the-page-cache");
+    // Until the plan's leader is elected the replica serves its old-history
+    // state as a follower, and HEAD, which needs a leader, answers `503`.
+    // Wait until the plan is satisfied and retired.
+    let satisfied_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .unwrap();
+    loop {
+        let metrics: ursula_proto::admin::NodeMetrics = client
+            .get(format!("{admin_url}/__ursula/metrics"))
+            .send()
+            .await
+            .expect("metrics")
+            .json()
+            .await
+            .expect("metrics JSON");
+        let group = &metrics.groups[0];
+        if group.recovery.is_none()
+            && group
+                .history
+                .is_some_and(|history| history.event_index > plan.point)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < satisfied_deadline,
+            "the recovery plan was never satisfied: {:?} {:?}",
+            group.history,
+            group.recovery
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let head = client.head(&stream_url).send().await.expect("HEAD");
+    let head = ursula_headers::StreamHead::parse(
+        head.headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("a stream head");
+    assert_ne!(
+        head.incarnation(),
+        old_token,
+        "the history event changed the token"
+    );
+    assert_eq!(
+        head.inherited(),
+        Some(ursula_headers::Inherited {
+            previous_incarnation: old_token,
+            offset: ursula_headers::Offset::from_u64(22),
+        })
+    );
+    let stale = client
+        .post(&stream_url)
+        .header("content-type", "text/plain")
+        .header("stream-incarnation", old_token.to_string())
+        .body("stale")
+        .send()
+        .await
+        .expect("a write naming the old token");
+    assert_eq!(stale.status(), reqwest::StatusCode::PRECONDITION_FAILED);
     post_until_no_content(&client, &stream_url, "-after").await;
+    // The plan was satisfied and retired.
+    let metrics: ursula_proto::admin::NodeMetrics = client
+        .get(format!("{admin_url}/__ursula/metrics"))
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("metrics JSON");
+    assert!(
+        metrics.groups[0]
+            .history
+            .is_some_and(|history| history.event_index > plan.point)
+    );
     drop(child);
 }
 

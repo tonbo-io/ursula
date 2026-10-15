@@ -21,6 +21,9 @@ slotmap = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }
 
+[target.'cfg(madsim)'.dependencies]
+madsim = { workspace = true }
+
 [dev-dependencies]
 dhat = { workspace = true }
 serde_json = { workspace = true }

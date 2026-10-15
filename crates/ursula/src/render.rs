@@ -84,7 +84,9 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
         // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
         // fallback when no routing target is available.
         RuntimeError::GroupNotHosted { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        RuntimeError::GroupEngine { error, .. } if error.is_backpressure() => {
+        RuntimeError::GroupEngine { error, .. }
+            if error.is_backpressure() || error.is_history_pending() =>
+        {
             StatusCode::SERVICE_UNAVAILABLE
         }
         RuntimeError::GroupEngine {
@@ -651,6 +653,8 @@ pub(crate) fn raft_group_metrics(
         last_snapshot_bytes: value.log.last_snapshot_bytes,
         has_snapshot: value.log.has_snapshot,
         apply_failure: value.apply_failure.clone(),
+        history: value.history,
+        recovery: value.recovery,
     }
 }
 

@@ -615,6 +615,12 @@ impl JournalCluster {
     }
 
     /// A node that leads no group, chosen from the seed.
+    /// The in-process network of `group`, which also reaches each node's
+    /// production admin and barrier entry points.
+    pub(super) fn registry(&self, group: u32) -> &InProcessRaftRegistry {
+        &self.registries[&group]
+    }
+
     pub(super) async fn follower_of_every_group(&self, seed: u64) -> u64 {
         let mut leaders = Vec::new();
         for group in JOURNAL_GROUPS {

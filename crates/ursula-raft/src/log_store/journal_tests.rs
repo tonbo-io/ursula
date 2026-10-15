@@ -2000,6 +2000,16 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .current_leader(1, "leader elected")
         .await
         .unwrap();
+    // The group's genesis history event commits before the pause, so the
+    // paused append is the last entry.
+    let started = std::time::Instant::now();
+    while engines
+        .iter()
+        .any(|engine| engine.history().applied().is_none())
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "no genesis");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     leader.runtime_config().tick(false);
     let response = leader
         .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {

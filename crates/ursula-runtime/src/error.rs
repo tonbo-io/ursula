@@ -130,7 +130,11 @@ impl RuntimeError {
             Self::GroupEngine { error, .. } if error.leader_hint().is_some() => {
                 ErrorStatus::Temporary
             }
-            Self::GroupEngine { error, .. } if error.is_backpressure() => ErrorStatus::Temporary,
+            Self::GroupEngine { error, .. }
+                if error.is_backpressure() || error.is_history_pending() =>
+            {
+                ErrorStatus::Temporary
+            }
             Self::GroupEngine { error, .. } if error.code().is_some() => ErrorStatus::Permanent,
             Self::GroupEngine { .. } => ErrorStatus::Persistent,
             _ => ErrorStatus::Permanent,

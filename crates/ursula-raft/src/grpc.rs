@@ -813,14 +813,17 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .entry(placement.raft_group_id)
                 .map_err(group_rpc_status)?;
             let raft = entry.raft().clone();
+            let history = entry.history.clone();
             let commands = request
                 .command_payloads
                 .into_iter()
                 .map(|payload| decode_wire(&payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-            let results = raft
-                .call(move |raft| async move { write_commands_on_raft(raft, commands).await })
+            let results =
+                raft.call(move |raft| async move {
+                    write_commands_on_raft(raft, &history, commands).await
+                })
                 .await
                 .map_err(|err| tonic::Status::unavailable(err.to_string()))?
                 .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
@@ -933,10 +936,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 })
             });
             let apply_health = entry.apply_health.clone();
+            let history = entry.history.clone();
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
                         rejoin: Default::default(),
+                        history,
                         apply_health,
                         snapshot_installs: Arc::default(),
                         metadata_serial: Arc::default(),

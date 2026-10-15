@@ -19,11 +19,11 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use ursula_config::WalFsync;
-use ursula_proto::admin::AcceptUnsyncedLossRequest;
-use ursula_raft::AcceptUnsyncedLossOutcome;
-use ursula_raft::AcceptUnsyncedLossReport;
+use ursula_proto::admin::RecoveryPlanOutcome;
+use ursula_proto::admin::RecoveryPlanReport;
+use ursula_proto::admin::RecoveryPlanRequest;
+use ursula_proto::admin::ReplicaLogView;
 use ursula_raft::JournalTuning;
-use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::RecoveryState;
 use ursula_raft::UrsulaAppendEntriesRequest;
@@ -163,20 +163,155 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
     }
 }
 
-/// The operator's acceptance of the unsynced loss on `node_id`'s replica of
-/// `group`, naming the log the group's metrics show there.
-async fn accept_observed_loss(
+/// `node_id`'s replica of `group` as the recovery tool reads it from the
+/// metrics: its log, its vote term, its committed index and whether its
+/// gate restricts its vote.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MemberView {
+    pub(super) node_id: u64,
+    pub(super) log: ReplicaLogView,
+    pub(super) committed: Option<u64>,
+    pub(super) restricted: bool,
+}
+
+pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u64) -> MemberView {
+    let mut store = cluster.wals[&node_id]
+        .store(RaftGroupId(group))
+        .expect("a running replica holds its store");
+    let last = store.get_log_state().await.expect("log state").last_log_id;
+    let vote = store.read_vote().await.expect("vote");
+    MemberView {
+        node_id,
+        log: ReplicaLogView {
+            last_log_index: last.map(|last| last.index),
+            last_log_term: last.map(|last| last.leader_id.term),
+            current_term: vote.map_or(0, |vote| vote.leader_id().term()),
+        },
+        committed: metrics(cluster, group, node_id)
+            .local_committed
+            .map(|committed| committed.index),
+        restricted: gate(cluster, group, node_id) != RecoveryGateStatus::Open,
+    }
+}
+
+/// The recovery tool's plan (#581 section 4.5) from the members it reached:
+/// the leader is the member with the greatest last log id; when its last
+/// log term is below the highest vote term a restricted member holds (a
+/// stale entry is possible), every member cuts its log to what it knew was
+/// committed and the leader is the member with the greatest committed index.
+pub(super) fn recovery_plan(members: &[MemberView]) -> (u64, u64, bool) {
+    let floor = members
+        .iter()
+        .filter(|member| member.restricted)
+        .map(|member| member.log.current_term)
+        .max()
+        .unwrap_or(0);
+    let longest = members
+        .iter()
+        .max_by_key(|member| {
+            (
+                member.log.last_log_term,
+                member.log.last_log_index,
+                member.node_id,
+            )
+        })
+        .expect("a reachable member");
+    let cut = members.len() > 1 && longest.log.last_log_term.unwrap_or(0) < floor;
+    if cut {
+        let leader = members
+            .iter()
+            .max_by_key(|member| (member.committed, member.node_id))
+            .expect("a reachable member");
+        (leader.node_id, leader.committed.unwrap_or(0), true)
+    } else {
+        (
+            longest.node_id,
+            longest.log.last_log_index.unwrap_or(0),
+            false,
+        )
+    }
+}
+
+/// The recovery tool for `group` over the members in `reachable`: computes
+/// the plan, sends it to every member through its production admin entry
+/// point with the leader last, and restarts the members whose plan cuts
+/// their log, as the runbook says. Returns the plan.
+pub(super) async fn recover_group(
+    cluster: &mut JournalCluster,
+    group: u32,
+    reachable: &[u64],
+    context: &str,
+) -> RecoveryPlanRequest {
+    let mut members = Vec::new();
+    for node_id in reachable {
+        members.push(member_view(cluster, group, *node_id).await);
+    }
+    let (leader, point, cut) = recovery_plan(&members);
+    members.sort_by_key(|member| member.node_id == leader);
+    let mut restart = Vec::new();
+    let mut plan = None;
+    for member in &members {
+        let request = RecoveryPlanRequest {
+            leader,
+            point,
+            cut,
+            expected: member.log,
+        };
+        let report: RecoveryPlanReport = cluster
+            .registry(group)
+            .accept_recovery_plan(member.node_id, &request)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{context}: group {group}: node {} refused the plan {request:?}: {error}",
+                    member.node_id
+                )
+            });
+        if report.outcome == RecoveryPlanOutcome::RestartToCut {
+            restart.push(member.node_id);
+        }
+        plan = Some(request);
+    }
+    for node_id in restart {
+        let wal = cluster.wals[&node_id].clone();
+        wal.clean_shutdown(cluster.stop_node(node_id)).await;
+        cluster.start_node(node_id).await;
+    }
+    plan.expect("a reachable member")
+}
+
+/// Waits until every replica of `group` in `nodes` applied a history event
+/// above `point`: the plan is satisfied everywhere.
+pub(super) async fn wait_plan_satisfied(
     cluster: &JournalCluster,
     group: u32,
-    node_id: u64,
-) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
-    let replica = metrics(cluster, group, node_id);
-    cluster.rejoins[&(group, node_id)]
-        .accept_unsynced_loss(&AcceptUnsyncedLossRequest {
-            expected_last_log_index: replica.last_log_index,
-            expected_current_term: replica.current_term,
-        })
-        .await
+    nodes: &[u64],
+    point: u64,
+    context: &str,
+) {
+    let deadline = madsim::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let satisfied = nodes.iter().all(|node_id| {
+            cluster
+                .engines
+                .get(&(group, *node_id))
+                .is_some_and(|engine| {
+                    engine
+                        .history()
+                        .applied()
+                        .is_some_and(|event| event.event_index > point)
+                        && engine.history().plan().is_none()
+                })
+        });
+        if satisfied {
+            return;
+        }
+        assert!(
+            madsim::time::Instant::now() < deadline,
+            "{context}: group {group}: the recovery plan's history event never applied everywhere"
+        );
+        madsim::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Moves the leadership of every group to `leader`.
@@ -711,32 +846,16 @@ fn a_majority_power_loss_stops_until_the_operator_accepts_the_loss() {
             }
             assert_no_vote_while_gated(&cluster, &context);
 
-            // The operator accepts the loss, longest log first, until the
-            // open replicas form a quorum.
+            // The operator runs the recovery tool: one plan per group, sent
+            // to every reachable member, the leader last (#581 section 4.5).
+            let mut points = BTreeMap::new();
             for group in JOURNAL_GROUPS {
-                let mut gated = Vec::new();
-                for node_id in &lost {
-                    let mut store = cluster.wals[node_id]
-                        .store(RaftGroupId(group))
-                        .expect("running store");
-                    let last = store.get_log_state().await.expect("log state").last_log_id;
-                    gated.push((last, *node_id));
-                }
-                gated.sort_unstable_by(|a, b| b.cmp(a));
-                let needed = 2_usize.saturating_sub(survivors.len());
-                for (_, node_id) in gated.into_iter().take(needed) {
-                    assert_eq!(
-                        accept_observed_loss(&cluster, group, node_id)
-                            .await
-                            .expect("accept the unsynced loss")
-                            .outcome,
-                        AcceptUnsyncedLossOutcome::GateOpened,
-                        "{context}: node {node_id} group {group}"
-                    );
-                }
+                let plan = recover_group(&mut cluster, group, &NODES, &context).await;
+                points.insert(group, plan.point);
             }
             for group in JOURNAL_GROUPS {
                 wait_leader(&cluster, group, &context).await;
+                wait_plan_satisfied(&cluster, group, &NODES, points[&group], &context).await;
             }
             wait_healed(&cluster, &context, Duration::from_secs(10)).await;
 
@@ -996,32 +1115,12 @@ fn a_handoff_to_a_powered_off_follower_never_parks_the_survivor() {
                 madsim::time::sleep(Duration::from_millis(50)).await;
             }
             for group in JOURNAL_GROUPS {
-                let mut open = NODES
+                let open = NODES
                     .into_iter()
                     .filter(|node_id| cluster.rejoins[&(group, *node_id)].vote_gate_open())
                     .count();
-                let mut stalled = followers
-                    .iter()
-                    .copied()
-                    .filter(|node_id| {
-                        gate(&cluster, group, *node_id) == RecoveryGateStatus::Stalled
-                    })
-                    .map(|node_id| (metrics(&cluster, group, node_id).last_log_index, node_id))
-                    .collect::<Vec<_>>();
-                stalled.sort_unstable_by(|a, b| b.cmp(a));
-                for (_, node_id) in stalled {
-                    if open >= 2 {
-                        break;
-                    }
-                    assert_eq!(
-                        accept_observed_loss(&cluster, group, node_id)
-                            .await
-                            .expect("accept the unsynced loss")
-                            .outcome,
-                        AcceptUnsyncedLossOutcome::GateOpened,
-                        "{context}: node {node_id} group {group}"
-                    );
-                    open = open.saturating_add(1);
+                if open < 2 && leader_by_state(&cluster, group).is_none() {
+                    recover_group(&mut cluster, group, &NODES, &context).await;
                 }
             }
 

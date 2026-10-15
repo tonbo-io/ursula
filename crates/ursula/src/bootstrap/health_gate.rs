@@ -808,6 +808,8 @@ mod tests {
             learner_ids: Vec::new(),
             maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
             log: Default::default(),
+            history: None,
+            recovery: None,
         }
     }
 

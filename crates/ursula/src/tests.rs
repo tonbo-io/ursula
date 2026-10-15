@@ -6057,13 +6057,13 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     engine.shutdown().await.unwrap();
 }
 
-/// `accept-unsynced-loss` is an incarnation-bound admin mutation: it opens
-/// the recovery gate of this node's replica once the gate reports its group
-/// stalled, and only for the log the operator saw in the metrics. It
-/// reports the replica's log and clears the readiness reason the closed gate
-/// gave.
+/// `accept-unsynced-loss` is an incarnation-bound admin mutation that takes
+/// a recovery plan (#581 section 4.5), only for the log the tool saw in the
+/// metrics. A plan electing this replica opens its gate, records the plan
+/// durably, reports it in the metrics, and clears the readiness reason the
+/// closed gate gave.
 #[tokio::test]
-async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
+async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
     use openraft::storage::RaftLogReader;
     use openraft::storage::RaftLogStorage;
 
@@ -6158,12 +6158,21 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
             serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
                 .expect("metrics JSON");
         let group = &metrics["raft_groups"][0];
-        let seen = ursula_proto::admin::AcceptUnsyncedLossRequest {
-            expected_last_log_index: group["last_log_index"].as_u64(),
-            expected_current_term: group["current_term"].as_u64().expect("current term"),
+        let seen = ursula_proto::admin::ReplicaLogView {
+            last_log_index: group["last_log_index"].as_u64(),
+            last_log_term: group["last_log_term"].as_u64(),
+            current_term: group["current_term"].as_u64().expect("current term"),
         };
-        let accept = |expected: ursula_proto::admin::AcceptUnsyncedLossRequest| {
-            Body::from(serde_json::to_vec(&expected).expect("request JSON"))
+        let plan = |expected: ursula_proto::admin::ReplicaLogView| {
+            ursula_proto::admin::RecoveryPlanRequest {
+                leader: 1,
+                point: expected.last_log_index.unwrap_or(0),
+                cut: false,
+                expected,
+            }
+        };
+        let accept = |expected: ursula_proto::admin::ReplicaLogView| {
+            Body::from(serde_json::to_vec(&plan(expected)).expect("request JSON"))
         };
 
         let unbound = admin
@@ -6181,6 +6190,15 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         assert_eq!(unbound.status(), StatusCode::PRECONDITION_REQUIRED);
         let unnamed = http_post(&admin, path, json_body, Body::from("{}")).await;
         assert_eq!(unnamed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // A 0.7 body is no plan.
+        let old = http_post(
+            &admin,
+            path,
+            json_body,
+            Body::from(r#"{"expected_last_log_index": null, "expected_current_term": 0}"#),
+        )
+        .await;
+        assert_eq!(old.status(), StatusCode::UNPROCESSABLE_ENTITY);
         // The gate awaits a barrier: it may still open without losing anything.
         let awaiting = http_post(&admin, path, json_body, accept(seen)).await;
         assert_eq!(awaiting.status(), StatusCode::CONFLICT);
@@ -6208,7 +6226,6 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         if !retained_vote {
             let rejected = http_post(&admin, path, json_body, accept(seen)).await;
             assert_eq!(rejected.status(), StatusCode::CONFLICT);
-            assert_eq!(gate.status(), ursula_raft::RecoveryGateStatus::Stalled);
             assert!(!gate.vote_gate_open());
             assert_eq!(store.read_vote().await.expect("unchanged lost vote"), None);
             assert!(!registry.recovery_barriers_ready());
@@ -6222,9 +6239,9 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
             engine.shutdown().await.expect("stop unknown-history group");
             continue;
         }
-        let other_log = ursula_proto::admin::AcceptUnsyncedLossRequest {
-            expected_last_log_index: Some(
-                seen.expected_last_log_index
+        let other_log = ursula_proto::admin::ReplicaLogView {
+            last_log_index: Some(
+                seen.last_log_index
                     .map_or(0, |index| index.saturating_add(1)),
             ),
             ..seen
@@ -6233,10 +6250,8 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
         assert_eq!(changed.status(), StatusCode::CONFLICT);
         assert!(!gate.vote_gate_open(), "a refused request opened the gate");
 
-        for expected in [
-            ursula_raft::AcceptUnsyncedLossOutcome::GateOpened,
-            ursula_raft::AcceptUnsyncedLossOutcome::AlreadyOpen,
-        ] {
+        // The plan elects this replica; a repeat of it is answered alike.
+        for _ in 0..2 {
             let response = http_post(&admin, path, json_body, accept(seen)).await;
             let status = response.status();
             let response_body = body_bytes(response).await;
@@ -6246,19 +6261,32 @@ async fn accept_unsynced_loss_opens_a_stalled_gate_for_the_observed_log_only() {
                 "{}",
                 String::from_utf8_lossy(&response_body)
             );
-            let report: ursula_raft::AcceptUnsyncedLossReport =
+            let report: ursula_proto::admin::RecoveryPlanReport =
                 serde_json::from_slice(&response_body).expect("typed report");
             assert_eq!(report.raft_group_id, 0);
             assert_eq!(report.node_id, 1);
-            assert_eq!(report.outcome, expected);
-            assert_eq!(report.last_log_index, seen.expected_last_log_index);
-            assert_eq!(report.current_term, seen.expected_current_term);
+            assert_eq!(
+                report.outcome,
+                ursula_proto::admin::RecoveryPlanOutcome::Leads
+            );
+            assert_eq!(report.leader, 1);
         }
         assert!(gate.vote_gate_open());
         barrier
             .await
             .expect("the barrier driver ends once the gate opens");
         assert!(registry.recovery_barriers_ready());
+        let metrics: ursula_proto::admin::NodeMetrics =
+            serde_json::from_slice(&body_bytes(http_get(&admin, "/__ursula/metrics").await).await)
+                .expect("metrics JSON");
+        assert_eq!(
+            metrics.groups[0].recovery,
+            Some(ursula_proto::admin::RaftGroupRecovery {
+                leader: 1,
+                point: seen.last_log_index.unwrap_or(0),
+                cut_pending: false,
+            })
+        );
         let ready = http_get(&client, READINESS_PATH).await;
         let body: serde_json::Value = serde_json::from_slice(&body_bytes(ready).await).unwrap();
         assert_eq!(body["recovery_barriers_ready"], json!(true));
@@ -6521,6 +6549,8 @@ fn raft_metrics_snapshot(
         learner_ids: vec![],
         maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
         log: Default::default(),
+        history: None,
+        recovery: None,
     }
 }
 

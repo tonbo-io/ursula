@@ -230,20 +230,71 @@ impl MaintenanceFenceState {
     }
 }
 
-/// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
-/// the replica's log as the operator saw it in `GET /__ursula/metrics`
-/// (`last_log_index` and `current_term` of the group) when deciding to
-/// accept its loss. The node refuses the request when the replica no longer
-/// holds that log, so the acceptance applies to what the operator saw.
+/// A replica's log as the recovery tool read it in `GET /__ursula/metrics`:
+/// what a recovery plan expects each member to still hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AcceptUnsyncedLossRequest {
-    /// The group's `last_log_index` on the replica, `null` for an empty log.
+pub struct ReplicaLogView {
+    /// The group's `last_log.index` on the replica, `null` for an empty log.
     /// Required, also when `null`.
     #[serde(deserialize_with = "required_option")]
-    pub expected_last_log_index: Option<u64>,
+    pub last_log_index: Option<u64>,
+    /// The group's `last_log.term` on the replica, `null` for an empty log.
+    /// Required, also when `null`.
+    #[serde(deserialize_with = "required_option")]
+    pub last_log_term: Option<u64>,
     /// The group's `current_term` on the replica.
-    pub expected_current_term: u64,
+    pub current_term: u64,
+}
+
+/// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
+/// a recovery plan that accepts the loss of the group's unsynced tail
+/// (#581 section 4.5). The tool reads every reachable member, refuses
+/// unless a majority of the voters answer, and sends the plan to every
+/// reachable member, the leader last. A member that takes it votes only for
+/// `leader` until it applied a history event at a log index above `point`;
+/// the leader proposes that event first and serves nothing before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPlanRequest {
+    /// The member the plan elects: the greatest last log id, or with a cut
+    /// the greatest committed index.
+    pub leader: u64,
+    /// The leader's last log index after the plan (its committed index
+    /// with a cut).
+    pub point: u64,
+    /// Whether every member keeps only the entries it knew were committed:
+    /// the leader's last log term is below the highest vote term a gated
+    /// member holds, so its log may hold a stale entry.
+    pub cut: bool,
+    /// This replica's log as the tool read it.
+    pub expected: ReplicaLogView,
+}
+
+/// What a recovery plan did on one replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPlanOutcome {
+    /// The replica is the plan's leader: it campaigns and proposes the
+    /// history event once elected.
+    Leads,
+    /// The replica votes only for the plan's leader until the event applies.
+    Follows,
+    /// The plan cuts this replica's log, which runs when the node restarts:
+    /// restart it, then it leads or follows as the plan says.
+    RestartToCut,
+}
+
+/// The answer of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
+/// on one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPlanReport {
+    pub raft_group_id: u32,
+    pub node_id: u64,
+    pub outcome: RecoveryPlanOutcome,
+    /// The plan this replica holds.
+    pub leader: u64,
+    pub point: u64,
 }
 
 /// Deserializes an `Option` field that must be present, so that a missing
@@ -292,7 +343,6 @@ impl From<ProcessIncarnation> for String {
 
 #[cfg(test)]
 mod tests {
-    use super::AcceptUnsyncedLossRequest;
     use super::ApplyFailure;
     use super::ApplyFailureKind;
     use super::MaintenanceFence;
@@ -338,37 +388,51 @@ mod tests {
         );
     }
 
-    /// The expected log must be stated, also when it is empty.
+    /// A recovery plan states every member's expected log, also when it is
+    /// empty, and nothing else.
     #[test]
-    fn an_accept_request_names_the_observed_log_explicitly() {
+    fn a_recovery_plan_names_the_observed_log_explicitly() {
+        use super::RecoveryPlanRequest;
+        use super::ReplicaLogView;
         assert_eq!(
-            serde_json::from_str::<AcceptUnsyncedLossRequest>(
-                r#"{"expected_last_log_index": 12, "expected_current_term": 3}"#
+            serde_json::from_str::<RecoveryPlanRequest>(
+                r#"{"leader": 2, "point": 12, "cut": false, "expected":
+                    {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
             )
             .unwrap(),
-            AcceptUnsyncedLossRequest {
-                expected_last_log_index: Some(12),
-                expected_current_term: 3,
+            RecoveryPlanRequest {
+                leader: 2,
+                point: 12,
+                cut: false,
+                expected: ReplicaLogView {
+                    last_log_index: Some(12),
+                    last_log_term: Some(3),
+                    current_term: 4,
+                },
             }
         );
         assert_eq!(
-            serde_json::from_str::<AcceptUnsyncedLossRequest>(
-                r#"{"expected_last_log_index": null, "expected_current_term": 0}"#
+            serde_json::from_str::<ReplicaLogView>(
+                r#"{"last_log_index": null, "last_log_term": null, "current_term": 0}"#
             )
             .unwrap(),
-            AcceptUnsyncedLossRequest {
-                expected_last_log_index: None,
-                expected_current_term: 0,
+            ReplicaLogView {
+                last_log_index: None,
+                last_log_term: None,
+                current_term: 0,
             }
         );
         for invalid in [
-            r#"{"expected_current_term": 3}"#,
-            r#"{"expected_last_log_index": 12}"#,
-            r#"{"expected_last_log_index": 12, "expected_current_term": 3, "force": true}"#,
-            r#"{}"#,
+            r#"{"expected_last_log_index": 12, "expected_current_term": 3}"#,
+            r#"{"leader": 2, "point": 12, "expected":
+                {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
+            r#"{"leader": 2, "point": 12, "cut": false, "expected":
+                {"last_log_index": 12, "current_term": 4}}"#,
+            r#"{"leader": 2, "point": 12, "cut": false, "force": true, "expected":
+                {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
         ] {
-            serde_json::from_str::<AcceptUnsyncedLossRequest>(invalid)
-                .expect_err("an incomplete or unknown expectation must be rejected");
+            serde_json::from_str::<RecoveryPlanRequest>(invalid)
+                .expect_err("a 0.7 body, an incomplete plan or an unknown field is refused");
         }
     }
 
@@ -560,6 +624,9 @@ pub enum RecoveryGateStatus {
     Stalled,
     /// Gated; a leader confirmed a barrier and the replica catches up.
     CatchingUp,
+    /// A recovery plan holds the replica: it votes only for the plan's
+    /// leader until the plan's history event applies (#581 section 4.5).
+    Planned,
 }
 
 impl RecoveryGateStatus {
@@ -726,6 +793,33 @@ pub struct RaftGroupMetrics {
     /// Set once a committed command failed to apply: the replica stopped.
     #[serde(deserialize_with = "Option::deserialize")]
     pub apply_failure: Option<ApplyFailure>,
+    /// The history event this replica applied last (#581 section 4.3),
+    /// `null` before the group's genesis.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub history: Option<RaftGroupHistory>,
+    /// The recovery plan this replica holds until its history event
+    /// applies (#581 section 4.5).
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub recovery: Option<RaftGroupRecovery>,
+}
+
+/// The history event a replica applied last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftGroupHistory {
+    /// The log index of the entry that applied it. A recovery plan is
+    /// satisfied on a replica once this is above the plan's point.
+    pub event_index: u64,
+    /// The group was restored from a backup.
+    pub imported: bool,
+}
+
+/// A recovery plan a replica holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftGroupRecovery {
+    pub leader: u64,
+    pub point: u64,
+    /// The plan's cut waits for the node's restart.
+    pub cut_pending: bool,
 }
 impl RaftGroupMetrics {
     pub fn participation_ready(&self) -> bool {
@@ -789,6 +883,8 @@ mod metrics_contract_tests {
                 last_snapshot_bytes: 0,
                 has_snapshot: false,
                 apply_failure: None,
+                history: None,
+                recovery: None,
             }],
         }
     }

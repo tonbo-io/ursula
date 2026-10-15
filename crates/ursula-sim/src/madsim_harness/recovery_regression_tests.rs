@@ -1,11 +1,11 @@
 //! Regression DST of the recovery gate and the run state: schedules that
 //! once broke them, each asserting the property it broke.
 //!
-//! - An operator accepts the unsynced loss on the replica that led its
-//!   groups, and it restarts before it records a newer vote, after a process
-//!   crash and after a clean shutdown: it never leads again without an
-//!   election and the log never forks. On the way, an acceptance opens only
-//!   a stalled gate, and only for the log the operator saw.
+//! - An operator's recovery plan covers the replica that led its groups, and
+//!   it restarts before it records a newer vote, after a process crash and
+//!   after a clean shutdown: it never leads again without an election and
+//!   the log never forks. On the way, a plan applies only to the log the
+//!   tool saw.
 //! - A node switches from `never` to `always` across a process crash, and its
 //!   host loses power before the new run writes: every acknowledged write
 //!   survives, or the group is gated.
@@ -19,8 +19,7 @@ use openraft::alias::EntryOf;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorageExt;
 use ursula_config::WalFsync;
-use ursula_proto::admin::AcceptUnsyncedLossRequest;
-use ursula_raft::AcceptUnsyncedLossOutcome;
+use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_raft::JournalTuning;
 use ursula_raft::RecoveryGateError;
 use ursula_raft::RecoveryGateStatus;
@@ -37,20 +36,21 @@ use super::JournalCluster;
 use super::NODES;
 use super::RECOVERY_STALL_AFTER;
 use super::SimNodeWal;
-use super::accept_observed_loss;
 use super::assert_no_vote_while_gated;
 use super::attempt_append;
 use super::gate;
 use super::group_placement;
 use super::lead_every_group;
 use super::leader_by_state;
-use super::log_state;
+use super::member_view;
 use super::metrics;
 use super::read_local;
+use super::recover_group;
 use super::seeds_from_env;
 use super::sim_test_guard;
 use super::wait_healed;
 use super::wait_leader;
+use super::wait_plan_satisfied;
 use crate::madsim_harness::run_with_madsim;
 use crate::madsim_harness::sim_wal::standalone_wal_metrics;
 
@@ -150,19 +150,18 @@ async fn clean_restart(cluster: &mut JournalCluster, node_id: u64, context: &str
     wait_healed(cluster, context, Duration::from_secs(5)).await;
 }
 
-/// An operator accepts the unsynced loss on the replica that led both
-/// groups, and it restarts before it records a newer vote, once after a
-/// process crash and once after a clean shutdown. It restarts as a follower
-/// each time: its start behind the gate recorded its vote for itself
-/// uncommitted. Restored as the leader of its old term over the log it kept,
-/// it would append under the log ids of entries it lost, which the other
-/// replicas still hold with other payloads, and the group's log would fork.
+/// An operator's recovery plan covers the replica that led both groups, and
+/// it restarts before it records a newer vote, once after a process crash
+/// and once after a clean shutdown. It restarts as a follower each time: its
+/// start behind the gate recorded its vote for itself uncommitted. Restored
+/// as the leader of its old term over the log it kept, it would append under
+/// the log ids of entries it lost, which the other replicas still hold with
+/// other payloads, and the group's log would fork.
 ///
 /// The followers `fsync` every entry before the power loss and the leader
 /// keeps a random prefix of an unsynced tail of several pages, so its log is
-/// usually the shortest. On the way, the operator's acceptance is refused
-/// while the gate awaits a barrier and when it names a log the replica does
-/// not hold.
+/// usually the shortest. On the way, a plan that names a log the replica
+/// does not hold is refused and changes nothing.
 #[test]
 fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
     let _guard = sim_test_guard();
@@ -196,10 +195,6 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                 clean_restart(&mut cluster, node_id, &context).await;
             }
             lead_every_group(&cluster, ex_leader, &context).await;
-            let old_votes = JOURNAL_GROUPS
-                .into_iter()
-                .map(|group| (group, metrics(&cluster, group, ex_leader).vote))
-                .collect::<BTreeMap<_, _>>();
 
             // Every node loses power at once: every replica is gated.
             for node_id in NODES {
@@ -210,21 +205,6 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
             }
             for node_id in NODES {
                 cluster.start_node(node_id).await;
-            }
-            // Long enough for the metrics to show the log, well short of a
-            // stall.
-            madsim::time::sleep(Duration::from_millis(200)).await;
-            for group in JOURNAL_GROUPS {
-                assert!(
-                    matches!(
-                        accept_observed_loss(&cluster, group, ex_leader).await,
-                        Err(RecoveryGateError::NotStalled {
-                            status: RecoveryGateStatus::AwaitingBarrier,
-                            ..
-                        })
-                    ),
-                    "{context}: group {group}: a gate awaiting a barrier accepted the loss"
-                );
             }
             madsim::time::sleep(RECOVERY_STALL_AFTER * 2).await;
 
@@ -242,40 +222,37 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                 }
                 ex_leader_shorter |= lengths.values().any(|length| *length > lengths[&ex_leader]);
 
-                // An acceptance that names another log changes nothing.
-                let replica = metrics(&cluster, group, ex_leader);
-                let other_log = AcceptUnsyncedLossRequest {
-                    expected_last_log_index: Some(
-                        replica
-                            .last_log_index
-                            .map_or(0, |index| index.saturating_add(1)),
-                    ),
-                    expected_current_term: replica.current_term,
+                // A plan that names another log changes nothing.
+                let mut seen = member_view(&cluster, group, ex_leader).await.log;
+                seen.last_log_index = Some(seen.last_log_index.map_or(0, |index| index + 1));
+                let other_log = RecoveryPlanRequest {
+                    leader: ex_leader,
+                    point: seen.last_log_index.unwrap_or(0),
+                    cut: false,
+                    expected: seen,
                 };
                 assert!(
                     matches!(
-                        cluster.rejoins[&(group, ex_leader)]
-                            .accept_unsynced_loss(&other_log)
+                        cluster
+                            .registry(group)
+                            .accept_recovery_plan(ex_leader, &other_log)
                             .await,
                         Err(RecoveryGateError::ReplicaChanged { .. })
                     ),
-                    "{context}: group {group}: an acceptance of another log was not refused"
+                    "{context}: group {group}: a plan for another log was not refused"
                 );
                 assert_eq!(
                     gate(&cluster, group, ex_leader),
                     RecoveryGateStatus::Stalled,
                     "{context}: group {group}"
                 );
+            }
 
-                // The operator accepts the loss on the ex-leader.
-                assert_eq!(
-                    accept_observed_loss(&cluster, group, ex_leader)
-                        .await
-                        .expect("accept the unsynced loss")
-                        .outcome,
-                    AcceptUnsyncedLossOutcome::GateOpened,
-                    "{context}: group {group}"
-                );
+            // The operator runs the recovery tool.
+            let mut points = BTreeMap::new();
+            for group in JOURNAL_GROUPS {
+                let plan = recover_group(&mut cluster, group, &NODES, &context).await;
+                points.insert(group, plan.point);
             }
 
             // It restarts twice before it records a newer vote: its process
@@ -291,58 +268,12 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                 restart(&mut cluster, ex_leader, how).await;
                 madsim::time::sleep(Duration::from_millis(300)).await;
                 for group in JOURNAL_GROUPS {
-                    // One open voter of three elects no leader.
-                    assert_eq!(
-                        leader_by_state(&cluster, group),
-                        None,
-                        "{context}: group {group}: after a {how:?} restart node {ex_leader} leads \
-                         with vote {} (it led with {} before) while the other voters are gated",
-                        metrics(&cluster, group, ex_leader).vote,
-                        old_votes[&group]
-                    );
-                    assert_eq!(
-                        log_state(&cluster, group, ex_leader),
-                        GroupLogState::Initialized,
-                        "{context}: group {group}: the accepted loss is recorded"
-                    );
+                    assert_log_matching(&cluster, group, &context).await;
                 }
             }
-            // Only one voter is open: nothing commits, and no replica holds
-            // two entries under one log id.
             for group in JOURNAL_GROUPS {
-                for attempt in 0..4 {
-                    assert_ne!(
-                        attempt_append(
-                            &mut cluster,
-                            group,
-                            ex_leader,
-                            format!("lost-{attempt};").as_bytes()
-                        )
-                        .await,
-                        Attempt::Acknowledged,
-                        "{context}: group {group} committed with one open voter"
-                    );
-                }
-                assert_log_matching(&cluster, group, &context).await;
-            }
-
-            // The operator opens the longest of the other replicas. The
-            // group elects a leader among the open replicas and the last one
-            // rejoins through a barrier.
-            for group in JOURNAL_GROUPS {
-                let second = NODES
-                    .into_iter()
-                    .filter(|node_id| *node_id != ex_leader)
-                    .max_by_key(|node_id| metrics(&cluster, group, *node_id).last_log_index)
-                    .expect("another voter");
-                assert_eq!(
-                    accept_observed_loss(&cluster, group, second)
-                        .await
-                        .expect("accept the unsynced loss")
-                        .outcome,
-                    AcceptUnsyncedLossOutcome::GateOpened,
-                    "{context}: node {second} group {group}"
-                );
+                wait_leader(&cluster, group, &context).await;
+                wait_plan_satisfied(&cluster, group, &NODES, points[&group], &context).await;
             }
             wait_healed(&cluster, &context, Duration::from_secs(15)).await;
             for group in JOURNAL_GROUPS {
@@ -606,11 +537,13 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                 cluster.engines[&(group, wiped)]
                     .publish_recovery(cluster.rejoins[&(group, wiped)].clone(), &admin)
                     .unwrap();
-                let seen = metrics(&cluster, group, wiped);
+                let seen = member_view(&cluster, group, wiped).await.log;
                 let error = admin
-                    .accept_unsynced_loss(RaftGroupId(group), &AcceptUnsyncedLossRequest {
-                        expected_last_log_index: seen.last_log_index,
-                        expected_current_term: seen.current_term,
+                    .accept_recovery_plan(RaftGroupId(group), &RecoveryPlanRequest {
+                        leader: wiped,
+                        point: seen.last_log_index.unwrap_or(0),
+                        cut: false,
+                        expected: seen,
                     })
                     .await
                     .expect_err(
@@ -766,12 +699,8 @@ fn bootstrap_membership_survives_full_cluster_power_loss_under_never() {
             }
             madsim::time::sleep(RECOVERY_STALL_AFTER * 2).await;
             for group in JOURNAL_GROUPS {
-                for node in NODES {
-                    if gate(&cluster, group, node) == RecoveryGateStatus::Stalled {
-                        accept_observed_loss(&cluster, group, node)
-                            .await
-                            .expect("accept loss against retained membership and vote");
-                    }
+                if leader_by_state(&cluster, group).is_none() {
+                    recover_group(&mut cluster, group, &NODES, &context).await;
                 }
                 wait_leader(&cluster, group, &context).await;
             }

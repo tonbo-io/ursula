@@ -65,10 +65,16 @@ pub fn incarnation_token(created_at_ms: u64, history_id: u64) -> u64 {
 }
 
 /// A fresh, random, non-zero history id for a history event. The proposer
-/// draws it, never apply. Under madsim the draw is deterministic per seed.
+/// draws it, never apply. Under madsim it comes from the simulation's
+/// seeded generator, so a seed replays the same ids (the id's encoded
+/// length reaches the log's layout).
 pub fn draw_history_id() -> NonZeroU64 {
     loop {
-        if let Some(id) = NonZeroU64::new(rand::random()) {
+        #[cfg(madsim)]
+        let drawn: u64 = madsim::rand::random();
+        #[cfg(not(madsim))]
+        let drawn: u64 = rand::random();
+        if let Some(id) = NonZeroU64::new(drawn) {
             return id;
         }
     }

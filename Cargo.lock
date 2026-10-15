@@ -4766,6 +4766,7 @@ dependencies = [
  "bytes",
  "criterion",
  "dhat",
+ "madsim",
  "memchr",
  "proptest",
  "rand 0.10.1",

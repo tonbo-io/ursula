@@ -1838,7 +1838,7 @@ async fn list_cold_index_page_ids(
 }
 
 #[cfg(not(madsim))]
-pub(crate) fn unix_time_ms() -> u64 {
+pub fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -1846,7 +1846,7 @@ pub(crate) fn unix_time_ms() -> u64 {
 }
 
 #[cfg(madsim)]
-pub(crate) fn unix_time_ms() -> u64 {
+pub fn unix_time_ms() -> u64 {
     0
 }
 

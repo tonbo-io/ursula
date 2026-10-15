@@ -154,6 +154,9 @@ pub struct InMemoryGroupEngine {
     /// Leader-local grace clock of retention GC (F14f). Not replicated; a
     /// new leader starts it empty.
     pub(crate) retention_gc: RetentionGcTracker,
+    /// The applied history, published after every command and snapshot
+    /// install (#581 section 4.7).
+    pub(crate) history: super::HistoryPublisher,
 }
 
 impl InMemoryGroupEngine {
@@ -235,6 +238,12 @@ impl InMemoryGroupEngine {
         self.apply_checked_stream_command(command, index, placement, IncarnationCheck::Absent)
     }
 
+    /// The applied history of this engine's group, which changes at every
+    /// history event it applies (#581 section 4.7).
+    pub fn subscribe_history(&self) -> super::HistoryWatch {
+        self.history.subscribe()
+    }
+
     /// Starts a group of an engine without Raft: it draws its genesis
     /// history id when it creates the group (#581 section 4.3, W2).
     pub fn start_genesis(&mut self, placement: ShardPlacement, now_ms: u64) {
@@ -253,6 +262,24 @@ impl InMemoryGroupEngine {
     /// [`Self::apply_stream_command`] for a command whose
     /// `Stream-Incarnation` precondition `check` says whether it matched.
     fn apply_checked_stream_command(
+        &mut self,
+        command: StreamCommand,
+        index: u64,
+        placement: ShardPlacement,
+        check: IncarnationCheck,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        let history_event = matches!(
+            command,
+            StreamCommand::NewHistory { .. } | StreamCommand::ImportSnapshot { .. }
+        );
+        let response = self.apply_unpublished(command, index, placement, check);
+        if history_event {
+            self.history.publish(self.state_machine.history());
+        }
+        response
+    }
+
+    fn apply_unpublished(
         &mut self,
         command: StreamCommand,
         index: u64,
@@ -1451,6 +1478,7 @@ impl InMemoryGroupEngine {
         if let Some(cache) = self.cold_index_cache.as_ref() {
             cache.clear();
         }
+        self.history.publish(self.state_machine.history());
         Ok(())
     }
 }
@@ -2176,6 +2204,10 @@ impl GroupEngine for InMemoryGroupEngine {
 
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
         Box::pin(async move { Ok(self.build_snapshot(placement)) })
+    }
+
+    fn history_watch(&self) -> Option<super::HistoryWatch> {
+        Some(self.subscribe_history())
     }
 
     fn install_snapshot<'a>(

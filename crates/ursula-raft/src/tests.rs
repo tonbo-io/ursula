@@ -1742,12 +1742,13 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     assert!(!written.is_forward_before_proposal(), "{written:?}");
     assert!(names_the_leader(&written), "{written:?}");
 
-    let batch = crate::forward::write_commands_on_raft(follower.raft_handle(), vec![
-        append_command(stream_id.clone(), b"a"),
-        append_command(stream_id, b"b"),
-    ])
-    .await
-    .expect("OpenRaft takes the batch");
+    let batch =
+        crate::forward::write_commands_on_raft(follower.raft_handle(), &follower.history, vec![
+            append_command(stream_id.clone(), b"a"),
+            append_command(stream_id, b"b"),
+        ])
+        .await
+        .expect("OpenRaft takes the batch");
     assert_eq!(batch.len(), 2);
     for entry in batch {
         let error = entry.expect_err("OpenRaft refuses each batch entry on a follower");
@@ -2923,7 +2924,8 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     assert_eq!(read.payload, b"payload");
 
     let snapshot = engine.snapshot(placement()).await.expect("snapshot");
-    assert_eq!(snapshot.group_commit_index, 2);
+    // The genesis history event, the create and the append.
+    assert_eq!(snapshot.group_commit_index, 3);
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 
@@ -3033,6 +3035,198 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         .shutdown()
         .await
         .expect("shutdown recovered engine");
+}
+
+/// Waits until `engine`'s replica applied a history event.
+#[cfg(not(madsim))]
+async fn wait_history(engine: &RaftGroupEngine) -> ursula_runtime::HistoryEvent {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(event) = engine.history().applied() {
+            return event;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the group's genesis never applied"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// W2 (#581 section 4.3): a new group's first leader proposes one genesis
+/// history event, with a random id, before anything else applies; a
+/// restart replays it and proposes no second one.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_new_group_starts_with_one_genesis_history_event() {
+    let root = tempfile::tempdir().expect("journal root");
+    let single_node_config = || raft_config("ursula-group-0", 30, 60);
+    let stream_id = bsid("genesis");
+    let genesis = {
+        let mut engine = RaftGroupEngine::new_single_node_with_log_store(
+            placement(),
+            1,
+            BasicNode::new("local"),
+            single_node_config(),
+            open_core_journal_store(root.path()).expect("open durable log store"),
+        )
+        .await
+        .expect("create durable raft group engine");
+        // A create racing the genesis waits for it: its token is never
+        // derived from a group without a history.
+        engine
+            .create_stream(
+                CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("create after the genesis");
+        let genesis = wait_history(&engine).await;
+        assert_eq!(genesis.imported, None);
+        let snapshot = engine.snapshot(placement()).await.expect("snapshot");
+        assert_eq!(snapshot.stream_snapshot.history, Some(genesis));
+        let created_at_ms = snapshot.stream_snapshot.streams[0].metadata.created_at_ms;
+        let head = engine
+            .head_stream(
+                HeadStreamRequest {
+                    stream_id: stream_id.clone(),
+                    now_ms: 0,
+                    linearizable: true,
+                    read_index: None,
+                },
+                placement(),
+            )
+            .await
+            .expect("head");
+        assert_eq!(
+            head.incarnation,
+            ursula_stream::incarnation_token(created_at_ms, genesis.id.get())
+        );
+        assert_eq!(head.inherited, None);
+        engine.shutdown().await.expect("shutdown first engine");
+        genesis
+    };
+    let recovered = RaftGroupEngine::new_single_node_with_log_store(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        single_node_config(),
+        open_core_journal_store(root.path()).expect("reopen durable log store"),
+    )
+    .await
+    .expect("reopen durable raft group engine");
+    // The leader applied its blank: an earlier genesis is in its state, so
+    // it proposes none.
+    recovered
+        .raft_handle()
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .last_applied
+                    .is_some_and(|applied| applied.leader_id.term == metrics.current_term)
+            },
+            "the restarted leader applied its blank entry",
+        )
+        .await
+        .expect("blank applied");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(recovered.history().applied(), Some(genesis));
+    recovered
+        .shutdown()
+        .await
+        .expect("shutdown recovered engine");
+}
+
+/// A leader whose recovery plan is not satisfied serves nothing (#581
+/// section 4.5): a write and a read wait for the history event and are
+/// refused with `RecoveryPending` (503) when it does not come, and nothing
+/// was proposed.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
+    let (_root, log_store) = fresh_journal_store();
+    let mut engine = RaftGroupEngine::new_single_node_on_log_store(placement(), log_store, None)
+        .await
+        .expect("single-node engine");
+    wait_history(&engine).await;
+    let stream_id = bsid("fenced");
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create before the plan");
+    // A plan whose point this leader's history event cannot pass.
+    engine
+        .history()
+        .set_plan(Some(crate::log_store::RecoveryRecord {
+            leader: 1,
+            point: u64::MAX,
+            cut_after: None,
+        }));
+    let before = engine.snapshot(placement()).await;
+    assert!(
+        matches!(&before, Err(error) if error.is_history_pending()),
+        "{before:?}"
+    );
+    let write = engine
+        .append(
+            AppendRequest::from_bytes(stream_id.clone(), b"fenced".to_vec()),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect_err("a fenced leader admits no write");
+    assert!(write.is_history_pending(), "{write:?}");
+    assert!(write.is_refused_before_proposal());
+    let read = engine
+        .read_stream(read_req(stream_id.clone(), 16), placement())
+        .await
+        .expect_err("a fenced leader serves no read");
+    assert!(read.is_history_pending(), "{read:?}");
+    // The plan is satisfied: the fence lifts, and the refused write never
+    // applied.
+    engine.history().set_plan(None);
+    let read = engine
+        .read_stream(read_req(stream_id, 16), placement())
+        .await
+        .expect("read after the plan");
+    assert!(read.payload.is_empty());
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// The leader's fence (#581 section 4.5): while its group's history is
+/// pending it admits nothing but the history event and serves no read, and
+/// it refuses once the wait runs out; a follower is never fenced.
+#[test]
+fn a_pending_history_fences_only_its_leader() {
+    use crate::history::history_pending;
+    use crate::history::plan_satisfied;
+    use crate::log_store::RecoveryRecord;
+
+    let event = |event_index| ursula_runtime::HistoryEvent {
+        id: std::num::NonZeroU64::new(7).expect("non-zero"),
+        event_index,
+        imported: None,
+    };
+    let plan = RecoveryRecord {
+        leader: 1,
+        point: 10,
+        cut_after: None,
+    };
+    // Genesis: no history yet.
+    assert!(history_pending(None, None));
+    assert!(!history_pending(Some(event(1)), None));
+    // A plan is satisfied only by an event above its point: an old event at
+    // or below the point never satisfies it (#577 B2).
+    assert!(history_pending(Some(event(10)), Some(&plan)));
+    assert!(!plan_satisfied(&plan, Some(event(10))));
+    assert!(plan_satisfied(&plan, Some(event(11))));
+    assert!(!history_pending(Some(event(11)), Some(&plan)));
 }
 
 #[cfg(not(madsim))]

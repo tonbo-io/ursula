@@ -523,16 +523,23 @@ pub(crate) struct GroupActor {
     pub(crate) cold_write_admission: ColdWriteAdmission,
     pub(crate) live_read_max_waiters_per_core: Option<u64>,
     pub(crate) read_materialization: Arc<Semaphore>,
+    /// The engine's applied history: a history event wakes every live read
+    /// of the group (#581 section 4.7).
+    pub(crate) history: Option<crate::engine::HistoryWatch>,
 }
 
 impl GroupActor {
     pub(crate) async fn run(mut self) {
         let mut explicitly_shutdown = false;
         loop {
+            let Some(command) = self.next_event().await else {
+                self.wake_every_watcher().await;
+                continue;
+            };
             let Some(Traced {
                 value: command,
                 parent,
-            }) = self.next_command().await
+            }) = command
             else {
                 break;
             };
@@ -744,6 +751,45 @@ impl GroupActor {
             .map_err(|err| RuntimeError::group_engine(self.placement, err));
         reply(response_tx, response);
         ControlFlow::Break(())
+    }
+
+    /// The next command (`None` once the mailbox closed), or `None` when
+    /// the group's applied history changed first. A deferred command goes
+    /// first.
+    async fn next_event(&mut self) -> Option<Option<Traced<GroupCommand>>> {
+        if self.deferred.is_some() {
+            return Some(self.next_command().await);
+        }
+        let Some(history) = self.history.as_mut() else {
+            return Some(self.next_command().await);
+        };
+        let command = crate::rt::select! {
+            command = self.rx.recv() => command,
+            () = history.changed() => return None,
+        };
+        if command.is_some() {
+            self.metrics
+                .record_group_mailbox_dequeued(self.placement.raft_group_id);
+        }
+        Some(command)
+    }
+
+    /// A history event changed every token of the group: every live read
+    /// pinned to a token re-reads, and the ones whose token was retired end
+    /// (long-poll with `412`, SSE with an `error` event).
+    async fn wake_every_watcher(&mut self) {
+        let streams = self.read_watchers.keys().cloned().collect::<Vec<_>>();
+        for stream_id in streams {
+            CoreWorker::notify_pinned_read_watchers(
+                &mut self.engine,
+                self.metrics.clone(),
+                self.read_materialization.clone(),
+                &mut self.read_watchers,
+                &stream_id,
+                self.placement,
+            )
+            .await;
+        }
     }
 
     pub(crate) async fn next_command(&mut self) -> Option<Traced<GroupCommand>> {

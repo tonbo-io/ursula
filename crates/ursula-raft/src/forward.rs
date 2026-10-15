@@ -540,8 +540,12 @@ pub(crate) fn validate_proposal(command: &GroupWriteCommand) -> Result<(), Group
     Ok(())
 }
 
+/// Proposes `commands` as one batch. `history` is the group's history on
+/// this replica: a leader whose history is pending admits none of them
+/// (#581 section 4.5).
 pub(crate) async fn write_commands_on_raft(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    history: &crate::history::GroupHistory,
     commands: Vec<GroupWriteCommand>,
 ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
@@ -549,6 +553,7 @@ pub(crate) async fn write_commands_on_raft(
     }
     for command in &commands {
         validate_proposal(command)?;
+        history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
     let stream = raft.client_write_many(commands).await.map_err(|error| {

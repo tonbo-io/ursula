@@ -165,6 +165,8 @@ pub use engine::GroupTidyStreamFuture;
 pub use engine::GroupTidyStreamsFuture;
 pub use engine::GroupTouchStreamAccessFuture;
 pub use engine::GroupWriteResponse;
+pub use engine::HistoryPublisher;
+pub use engine::HistoryWatch;
 pub use engine::UnproposableCommand;
 pub use engine::WalOpenFailureKind;
 pub use engine::in_memory::InMemoryGroupEngine;
@@ -242,6 +244,7 @@ pub use runtime::PurgeBucketReport;
 pub use runtime::RuntimeConfig;
 pub use runtime::RuntimeThreading;
 pub use runtime::ShardRuntime;
+pub use runtime::unix_time_ms;
 pub use snapshot_store::InlineSnapshotStore;
 #[cfg(not(madsim))]
 pub use snapshot_store::S3SnapshotStore;

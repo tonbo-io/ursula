@@ -173,6 +173,8 @@ mod tests {
                 stopped_for_operator: false,
             },
             log: Default::default(),
+            history: None,
+            recovery: None,
         }
     }
 

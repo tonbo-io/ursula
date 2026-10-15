@@ -82,6 +82,7 @@ use super::RaftGroupLogRecord;
 use super::core_meta::CoreMetadata;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::RecoveryRecord;
 use super::core_meta::core_metadata_path;
 use super::disk::Disk;
 use super::disk::DiskFile;
@@ -415,6 +416,7 @@ pub(crate) struct OpenedGroup {
     pub(crate) log: Arc<Mutex<GroupLog>>,
     pub(crate) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
     pub(crate) state: GroupLogState,
+    pub(crate) recovery: Option<RecoveryRecord>,
 }
 
 /// Closes once a core writer's worker has stopped. The last handle's drop
@@ -495,6 +497,13 @@ pub(crate) enum CoreWriteOp {
     /// An initialized group entering or leaving recovery, kept in the
     /// metadata file.
     LogState { group_id: u32, state: GroupLogState },
+    /// A group's recovery plan, kept in the metadata file, or its removal.
+    /// The journal is synced before the metadata file is replaced, so a
+    /// truncation that preceded it is durable first.
+    Recovery {
+        group_id: u32,
+        record: Option<RecoveryRecord>,
+    },
 }
 
 /// What one request's write cost, as reported to its group's metrics.
@@ -796,6 +805,7 @@ impl CoreFileLogWriter {
             log,
             vote: recorded.vote,
             state: recorded.log,
+            recovery: recorded.recovery,
         })
     }
 
@@ -1835,6 +1845,12 @@ fn write_core_log_batch(
             CoreWriteOp::LogState { group_id, state } => {
                 metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= journal.metadata.set_log_state(*group_id, *state);
+                None
+            }
+            CoreWriteOp::Recovery { group_id, record } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.set_recovery(*group_id, *record);
+                requires_sync = true;
                 None
             }
             CoreWriteOp::Record { record, first, log } => {

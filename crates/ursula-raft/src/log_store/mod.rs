@@ -49,6 +49,7 @@ use std::io;
 
 pub use core_meta::GroupLogState;
 pub use core_meta::MarkRecoveringError;
+pub use core_meta::RecoveryRecord;
 #[cfg(madsim)]
 pub use disk::JournalDisk;
 #[cfg(madsim)]

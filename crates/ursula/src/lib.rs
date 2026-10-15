@@ -2718,17 +2718,19 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
 }
 
 /// Operator recovery when a majority of a group's voters are gated after a
-/// crash may have cost them their unsynced tail: open this node's stalled
-/// recovery gate for the group, accepting that its replica may be missing
-/// entries it acknowledged, so it votes and campaigns with the log it holds.
-/// The body names the replica's log as the operator saw it in the metrics;
-/// a gate that is not stalled, or a replica whose log changed since, is
-/// refused with `409 Conflict`. Run it on the gated replicas with the longest
-/// logs until a leader is elected.
+/// crash may have cost them their unsynced tail: this replica takes a
+/// recovery plan (#581 section 4.5). The plan names its leader, the point
+/// the leader's log reaches, whether every member cuts its log to what it
+/// knew was committed, and this replica's log as the tool read it. A
+/// replica that follows a live leader, holds another log, or committed above
+/// the point refuses with `409 Conflict` and changes nothing; a 0.7 body is
+/// refused with `422`. The operator computes the plan and sends it to every
+/// reachable member, the leader last (operations docs, "Recovering after a
+/// host crash").
 pub(crate) async fn accept_unsynced_loss(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
-    axum::Json(expected): axum::Json<ursula_proto::admin::AcceptUnsyncedLossRequest>,
+    axum::Json(plan): axum::Json<ursula_proto::admin::RecoveryPlanRequest>,
 ) -> Response {
     let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
@@ -2741,22 +2743,23 @@ pub(crate) async fn accept_unsynced_loss(
         )
             .into_response();
     };
-    match registry
-        .accept_unsynced_loss(raft_group_id, &expected)
-        .await
-    {
+    match registry.accept_recovery_plan(raft_group_id, &plan).await {
         Ok(report) => (StatusCode::OK, axum::Json(report)).into_response(),
         Err(err @ ursula_raft::RecoveryGateError::NotRegistered { .. }) => {
             (StatusCode::NOT_FOUND, err.to_string()).into_response()
         }
         Err(
             err @ (ursula_raft::RecoveryGateError::StoreClosed { .. }
+            | ursula_raft::RecoveryGateError::FollowsLeader { .. }
             | ursula_raft::RecoveryGateError::NotStalled { .. }
+            | ursula_raft::RecoveryGateError::RecoveryPointBehind { .. }
+            | ursula_raft::RecoveryGateError::NoCommittedEntry { .. }
             | ursula_raft::RecoveryGateError::MissingVoteFloor { .. }
             | ursula_raft::RecoveryGateError::ReplicaChanged { .. }),
         ) => (StatusCode::CONFLICT, err.to_string()).into_response(),
         Err(
             err @ (ursula_raft::RecoveryGateError::Record { .. }
+            | ursula_raft::RecoveryGateError::Cut { .. }
             | ursula_raft::RecoveryGateError::StartAsFollower { .. }),
         ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(err @ ursula_raft::RecoveryGateError::OwnerStopped { .. }) => {
@@ -3489,17 +3492,24 @@ pub(crate) async fn read_stream_by_id(
         (None, _) => {}
     }
 
-    let read = state
-        .runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream_id.clone(),
-            offset,
-            max_len,
-            now_ms: state.unix_time_ms(),
-            leader_only,
-            read_index: None,
-        })
-        .await;
+    let read_request = |leader_only| ReadStreamRequest {
+        stream_id: stream_id.clone(),
+        offset,
+        max_len,
+        now_ms: state.unix_time_ms(),
+        leader_only,
+        read_index: None,
+    };
+    let mut read = state.runtime.read_stream(read_request(leader_only)).await;
+    // A follower never answers `412` from a state that may lag (#581
+    // section 4.7): when its token differs from the request's, the read
+    // goes to the stream's leader, whose linearized state decides.
+    if !leader_only
+        && let (Some(expected), Ok(response)) = (if_incarnation, &read)
+        && response.incarnation != expected
+    {
+        read = state.runtime.read_stream(read_request(true)).await;
+    }
     match read {
         Ok(response) => {
             if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {

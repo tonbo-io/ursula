@@ -32,7 +32,8 @@ use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 use openraft::vote::RaftLeaderId;
 use tokio::sync::watch;
-use ursula_proto::admin::AcceptUnsyncedLossRequest;
+use ursula_proto::admin::RecoveryPlanReport;
+use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::GroupEngineError;
@@ -52,7 +53,6 @@ use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
 use crate::owner::OwnerRaftHandle;
 use crate::read_index::ReadIndexBarrier;
-use crate::rejoin::AcceptUnsyncedLossReport;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateError;
 use crate::rejoin::RecoveryGateStatus;
@@ -182,6 +182,9 @@ pub(crate) struct ActiveGroup {
     pub(crate) cache: Option<GroupColdIndexCache>,
     pub(crate) barrier: Arc<ReadIndexBarrier>,
     pub(crate) recovery: Option<Arc<GroupRejoin>>,
+    /// The group's history on this replica (#581 section 4.5): a leader
+    /// whose history is pending proposes, serves and confirms nothing.
+    pub(crate) history: Arc<crate::history::GroupHistory>,
 }
 impl ActiveGroup {
     pub(crate) fn raft(&self) -> &OwnerRaftHandle {
@@ -317,6 +320,8 @@ pub enum QuorumProofError {
     NotLeader { group: RaftGroupId },
     #[error("Raft group {group:?} changed leadership while confirming its quorum")]
     LeadershipChanged { group: RaftGroupId },
+    #[error("Raft group {group:?} waits for its history event; its leader confirms no barrier")]
+    HistoryPending { group: RaftGroupId },
     #[error("ReadIndex confirmation failed for {group:?}: {source}")]
     Read {
         group: RaftGroupId,
@@ -476,7 +481,7 @@ impl RaftGroupHandleRegistry {
         &self,
         group: RaftGroupId,
     ) -> Result<(crate::UrsulaVote, u64), QuorumProofError> {
-        let (raft, barrier) = {
+        let (raft, barrier, history) = {
             let groups = self.groups.load();
             let entry = groups
                 .get(&group.0)
@@ -486,8 +491,15 @@ impl RaftGroupHandleRegistry {
                 .ok_or(QuorumProofError::NotRegistered { group })?;
             let raft = entry.raft().clone();
             let barrier = entry.barrier.clone();
-            (raft, barrier)
+            (raft, barrier, entry.history.clone())
         };
+        // A leader whose history is pending confirms no barrier: a gate
+        // opened on its state would follow a history it has not settled
+        // (#581 section 4.5, #577 N1). It waits for the event a moment, as
+        // a fenced proposal does.
+        if history.admit_on(raft.metrics()).await.is_err() {
+            return Err(QuorumProofError::HistoryPending { group });
+        }
         confirm_recovery_barrier(group, &raft, barrier.as_ref()).await
     }
 
@@ -554,6 +566,7 @@ impl RaftGroupHandleRegistry {
             snapshot_installs: engine.snapshot_installs.clone(),
             cache: engine.cold_index_cache.clone(),
             barrier: engine.read_barrier.clone(),
+            history: engine.history.clone(),
             recovery: engine
                 .rejoin
                 .lock()
@@ -590,15 +603,16 @@ impl RaftGroupHandleRegistry {
             .and_then(|entry| entry.active()?.recovery.clone())
     }
 
-    /// Operator recovery when a majority of the group's voters are gated:
-    /// open this node's stalled recovery gate for the group, accepting that
-    /// its replica may be missing entries it acknowledged, and let the group
-    /// campaign again (see [`GroupRejoin::accept_unsynced_loss`]).
-    pub async fn accept_unsynced_loss(
+    /// Operator recovery when a majority of the group's voters are gated
+    /// and may have lost acknowledged writes: this replica takes the
+    /// recovery plan (#581 section 4.5; see
+    /// [`GroupRejoin::accept_recovery_plan`]) as one owner job, its group's
+    /// leader fence learns the plan, and the group's elections follow it.
+    pub async fn accept_recovery_plan(
         &self,
         raft_group_id: RaftGroupId,
-        expected: &AcceptUnsyncedLossRequest,
-    ) -> Result<AcceptUnsyncedLossReport, RecoveryGateError> {
+        plan: &RecoveryPlanRequest,
+    ) -> Result<RecoveryPlanReport, RecoveryGateError> {
         let entry = self
             .groups
             .load()
@@ -610,14 +624,16 @@ impl RaftGroupHandleRegistry {
             .clone()
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
         let owner = entry.raft().clone();
-        let expected = *expected;
+        let plan = *plan;
+        let job = rejoin.clone();
         let report = owner
-            .call(move |_| async move { rejoin.accept_unsynced_loss(&expected).await })
+            .call(move |_| async move { job.accept_recovery_plan(&plan).await })
             .await
             .map_err(|source| RecoveryGateError::OwnerStopped {
                 raft_group_id,
                 source,
             })??;
+        entry.history.set_plan(rejoin.recovery_record());
         self.refresh_group_elections(raft_group_id);
         Ok(report)
     }
@@ -853,6 +869,8 @@ impl RaftGroupHandleRegistry {
                         },
                         apply_failure: Some(stopped.failure.clone()),
                         log,
+                        history: None,
+                        recovery: None,
                     });
                     continue;
                 }
@@ -902,6 +920,21 @@ impl RaftGroupHandleRegistry {
                         .is_some_and(|rejoin| rejoin.status().is_stalled()),
                 },
                 log,
+                history: entry.history.applied().map(|event| {
+                    ursula_proto::admin::RaftGroupHistory {
+                        event_index: event.event_index,
+                        imported: event.imported.is_some(),
+                    }
+                }),
+                recovery: entry
+                    .recovery
+                    .as_ref()
+                    .and_then(|rejoin| rejoin.recovery_record())
+                    .map(|record| ursula_proto::admin::RaftGroupRecovery {
+                        leader: record.leader,
+                        point: record.point,
+                        cut_pending: record.cut_after.is_some(),
+                    }),
             });
         }
         snapshots
