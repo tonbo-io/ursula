@@ -32,62 +32,20 @@ use ursula_headers::StreamHead;
 use ursula_headers::names;
 
 /// `Producer-Id` of every keyed write: constant for the `USQ2` format (design §4.6).
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 pub(crate) const PRODUCER_ID: &str = "sqlite-ursula-vfs/2";
 
 /// `Content-Type` header name.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 pub(crate) const CONTENT_TYPE: &str = "content-type";
 
 /// `Retry-After` header name.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 pub(crate) const RETRY_AFTER: &str = "retry-after";
 
 /// `Location` header name.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 pub(crate) const LOCATION: &str = "location";
 
 /// The base protocol's read offset for the start of a stream.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 const START: &str = "-1";
 
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Method {
     Head,
@@ -98,10 +56,7 @@ pub(crate) enum Method {
 
 #[cfg_attr(
     not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
+    expect(dead_code, reason = "the model server's side of the protocol")
 )]
 impl Method {
     pub(crate) fn parse(text: &str) -> Option<Self> {
@@ -123,10 +78,7 @@ impl Method {
 /// What a request addresses, relative to the stream URL.
 #[cfg_attr(
     not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
+    expect(dead_code, reason = "the model server's side of the protocol")
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -143,13 +95,6 @@ pub(crate) enum Target {
 
 impl Target {
     /// The path and query that follow the stream URL.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-        )
-    )]
     pub(crate) fn suffix(&self) -> String {
         match self {
             Self::Stream => String::new(),
@@ -167,10 +112,7 @@ impl Target {
     /// inverse of [`Target::suffix`]. A `GET` of the stream's path is a read.
     #[cfg_attr(
         not(any(test, feature = "model")),
-        expect(
-            dead_code,
-            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-        )
+        expect(dead_code, reason = "the model server's side of the protocol")
     )]
     pub(crate) fn split(method: Method, target: &str) -> Result<(&str, Self), WireError> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -203,10 +145,7 @@ impl Target {
 
     #[cfg_attr(
         not(any(test, feature = "model")),
-        expect(
-            dead_code,
-            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-        )
+        expect(dead_code, reason = "the model server's side of the protocol")
     )]
     fn snapshot(offset: Offset) -> Self {
         Self::Snapshot { offset }
@@ -214,10 +153,7 @@ impl Target {
 
     #[cfg_attr(
         not(any(test, feature = "model")),
-        expect(
-            dead_code,
-            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-        )
+        expect(dead_code, reason = "the model server's side of the protocol")
     )]
     fn retention(offset: Offset) -> Self {
         Self::Retention { offset }
@@ -227,10 +163,7 @@ impl Target {
 /// A request that a transport cannot carry, or that the model server cannot read.
 #[cfg_attr(
     not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
+    expect(dead_code, reason = "the model server's side of the protocol")
 )]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WireError {
@@ -242,13 +175,6 @@ pub(crate) enum WireError {
 
 /// One request to a stream. The transport adds the stream URL, `Content-Length`, the bearer token
 /// and `User-Agent`.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Request {
     pub(crate) method: Method,
@@ -269,13 +195,6 @@ pub(crate) struct Request {
 impl Request {
     /// A request without headers or body, expecting no answer body. A `GET` goes through
     /// [`Request::read`] or [`Request::snapshot_read`], which size its answer.
-    #[cfg_attr(
-        not(any(test, feature = "model")),
-        expect(
-            dead_code,
-            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-        )
-    )]
     pub(crate) fn new(method: Method, target: Target) -> Self {
         Self {
             method,
@@ -290,13 +209,6 @@ impl Request {
     }
 
     /// A read from `from`, expecting up to `answer_bytes` (the read's chunk) in the answer.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-        )
-    )]
     pub(crate) fn read(from: Option<Offset>, leader: bool, answer_bytes: u64) -> Self {
         Self {
             answer_bytes,
@@ -307,10 +219,7 @@ impl Request {
     /// A read of the snapshot at `offset`, whose body is up to `answer_bytes`.
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-        )
+        expect(dead_code, reason = "PR7 installs snapshots with it")
     )]
     pub(crate) fn snapshot_read(offset: Offset, answer_bytes: u64) -> Self {
         Self {
@@ -320,13 +229,6 @@ impl Request {
     }
 
     /// Emits every header of the request this module owns, as `(lowercase name, value)`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-        )
-    )]
     pub(crate) fn render_headers(&self, mut emit: impl FnMut(&'static str, &str)) {
         if let Some(content_type) = &self.content_type {
             emit(CONTENT_TYPE, content_type);
@@ -344,10 +246,7 @@ impl Request {
     /// the body: the inverse of [`Request::render_headers`].
     #[cfg_attr(
         not(any(test, feature = "model")),
-        expect(
-            dead_code,
-            reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-        )
+        expect(dead_code, reason = "the model server's side of the protocol")
     )]
     pub(crate) fn parse<'a, I>(
         method: Method,
@@ -378,13 +277,6 @@ impl Request {
 }
 
 /// What an answer says in the headers `ursula_headers` types, read in the light of the request.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Typed {
     /// No typed header applies: the status alone speaks.
@@ -422,13 +314,6 @@ pub(crate) enum Typed {
 }
 
 /// An answer, parsed.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
@@ -442,13 +327,6 @@ pub(crate) struct Answer {
 }
 
 /// What came of one attempt of a request.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Exchange {
     Answered(Box<Answer>),
@@ -456,13 +334,6 @@ pub(crate) enum Exchange {
 }
 
 /// An attempt that got no answer.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NoAnswer {
     /// Nothing of the request went out: the host did not resolve, or no connection was made.
@@ -474,10 +345,7 @@ pub(crate) enum NoAnswer {
 /// An answer as it travels: what the model server renders and the transports parse.
 #[cfg_attr(
     not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
+    expect(dead_code, reason = "the model server's side of the protocol")
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawAnswer {
@@ -488,10 +356,7 @@ pub(crate) struct RawAnswer {
 
 #[cfg_attr(
     not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
+    expect(dead_code, reason = "the model server's side of the protocol")
 )]
 impl RawAnswer {
     pub(crate) fn new(status: u16) -> Self {
@@ -517,7 +382,7 @@ impl RawAnswer {
         not(test),
         expect(
             dead_code,
-            reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
+            reason = "tests read the model's answers as the client does"
         )
     )]
     pub(crate) fn parse(&self, request: &Request) -> Answer {
@@ -533,13 +398,6 @@ impl RawAnswer {
 }
 
 /// Reads an answer to `request` from its status, `(name, value)` header pairs and body.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 pub(crate) fn parse_answer<'a, I>(
     request: &Request,
     status: u16,
@@ -562,13 +420,6 @@ where
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 fn typed<'a, I>(request: &Request, status: u16, headers: I) -> Result<Typed, HeaderError>
 where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
     if let Some(routing) = RoutingAnswer::parse(status, headers.clone())? {
@@ -635,13 +486,6 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
 /// The value of header `name` as text, trimmed of field whitespace: `None` when absent, an error
 /// when repeated or not visible ASCII. The rules of `ursula_headers`' own field reader, which the
 /// crate does not export.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 fn text<'a, I>(headers: I, name: &'static str) -> Result<Option<&'a str>, HeaderError>
 where I: IntoIterator<Item = (&'a str, &'a [u8])> {
     let mut found = None;
@@ -667,13 +511,6 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> {
 }
 
 /// Header `name`, which the answer requires, parsed with the crate's value type.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 fn required<'a, I, T>(
     name: &'static str,
     headers: I,
@@ -687,13 +524,6 @@ where
 }
 
 /// A flag header: absent, or exactly `true`.
-#[cfg_attr(
-    not(any(test, feature = "model")),
-    expect(
-        dead_code,
-        reason = "shared with the model server; unwired in the extension until the 0.8 driver (PR5)"
-    )
-)]
 fn flag<'a, I>(headers: I, name: &'static str) -> Result<bool, HeaderError>
 where I: IntoIterator<Item = (&'a str, &'a [u8])> {
     match text(headers, name)? {

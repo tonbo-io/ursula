@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::ACK_INTERVAL_MS;
+use super::Bind;
 use super::BindingHandle;
 use super::BindingId;
 use super::Bound;
@@ -39,8 +40,10 @@ use super::EventLog;
 use super::HttpIo;
 use super::Io;
 use super::IoId;
+use super::Life;
 use super::LogPoisoned;
 use super::OpenId;
+use super::Replication;
 use super::Rng;
 use super::SyncError;
 use super::Ticket;
@@ -70,6 +73,7 @@ use crate::open::Unavailable;
 use crate::replicator::Action;
 use crate::replicator::ClaimKind;
 use crate::replicator::Event;
+use crate::replicator::MAX_BATCH_BYTES;
 use crate::replicator::Pending;
 use crate::replicator::Refusal;
 use crate::replicator::Replicator;
@@ -182,7 +186,6 @@ struct Binding {
     tickets: BTreeSet<Ticket>,
     /// `synced()` calls whose target is past `last_commit`, waiting for its `Logged`.
     held: Vec<(Ticket, Position)>,
-    retiring: bool,
     max_pending_bytes: u64,
     /// The open failed while a disk job held the generation: the binding stays, its root locked
     /// and its replicator ignored, until the job returns, and the open resolves then.
@@ -469,7 +472,6 @@ impl Core {
             acks: Acks::default(),
             tickets: BTreeSet::new(),
             held: Vec::new(),
-            retiring: false,
             max_pending_bytes: spec.max_pending_bytes,
             failing: None,
         });
@@ -564,7 +566,8 @@ impl Core {
                 }
                 Action::Wake { acked, .. } => {
                     b.acknowledged(acked);
-                    if b.handle().is_some() {
+                    if let Some(handle) = b.handle() {
+                        handle.set_acked(acked);
                         self.events.push(DriverEvent::Acked { binding, acked });
                     }
                 }
@@ -779,7 +782,9 @@ impl Core {
         }
         match b.stage {
             Stage::Opening { open, .. } => self.opened(open, Err(OpenError::Reset(kind))),
-            Stage::Bound { .. } => {
+            Stage::Bound { handle } => {
+                handle.mark_reset(kind);
+                handle.retired();
                 self.events.push(DriverEvent::Reset {
                     binding,
                     cause: kind,
@@ -814,15 +819,34 @@ impl Core {
         }
     }
 
-    /// After a step: a retiring binding with nothing pending retires.
+    /// After a step: what status reports of the replicator is published, and a retiring binding
+    /// with nothing pending retires.
     fn settle(&mut self, binding: BindingId, now_ms: u64) {
         let Some(b) = self.bindings.get(&binding) else {
             return;
         };
-        let drained = matches!(b.stage, Stage::Bound { .. })
-            && b.unacked.is_empty()
-            && matches!(b.replicator, Replicator::Streaming { .. });
-        if b.retiring && drained {
+        let Some(handle) = b.handle() else {
+            return;
+        };
+        let (state, epoch) = match &b.replicator {
+            Replicator::Activating { .. } => ("activating", None),
+            Replicator::Streaming { epoch, .. } => ("streaming", Some(epoch.get())),
+            Replicator::Reset(_) => ("reset", None),
+            Replicator::Refused(_) => ("refused", None),
+            Replicator::Stopped => ("stopped", None),
+        };
+        let ctx = b.replicator.ctx();
+        handle.set_replication(
+            Replication {
+                state,
+                epoch,
+                condition: ctx.and_then(|ctx| ctx.condition.clone()),
+                pending: b.unacked.len(),
+            },
+            ctx.map(|ctx| ctx.limits.batch()),
+        );
+        let drained = b.unacked.is_empty() && matches!(b.replicator, Replicator::Streaming { .. });
+        if drained && handle.life() == Life::Retiring && handle.try_retire() {
             self.retire_now(binding, now_ms);
         }
     }
@@ -850,14 +874,19 @@ impl Core {
             .unacked
             .iter()
             .fold(0u64, |sum, (_, len)| sum.saturating_add(*len));
-        let handle = Arc::new(BindingHandle::new(
+        let ctx = b.replicator.ctx();
+        let bind = Bind {
             generation,
-            b.name.clone(),
+            name: b.name.clone(),
+            cluster_id: ctx.map(|c| c.cluster_id.to_string()).unwrap_or_default(),
+            incarnation: ctx.map(|c| c.incarnation.to_string()).unwrap_or_default(),
             log,
-            root,
-            pending,
-            b.max_pending_bytes,
-        ));
+            pending_bytes: pending,
+            max_pending_bytes: b.max_pending_bytes,
+            max_frame_bytes: ctx.map_or(MAX_BATCH_BYTES, |c| c.limits.batch()),
+            acked: ctx.map_or(Position(0), |c| c.acked),
+        };
+        let handle = Arc::new(BindingHandle::new(bind, root));
         handle.record_commit(b.last_commit);
         b.stage = Stage::Bound {
             handle: Arc::clone(&handle),
@@ -871,11 +900,17 @@ impl Core {
             return;
         };
         drop(b.replicator.on(Event::Stop, now_ms));
+        if let Some(handle) = b.handle() {
+            handle.retired();
+        }
         if let Err(e) = b.write_ack(now_ms) {
             log::emit(Level::Warn, "ack_lost", &[
                 ("binding", &binding.0),
                 ("error", &e),
             ]);
+        }
+        if let Some(handle) = b.handle() {
+            handle.release_root();
         }
         for ticket in std::mem::take(&mut b.tickets) {
             self.resolve(binding, ticket, Err(SyncError::NotBound));
@@ -1152,7 +1187,7 @@ impl Core {
         let live = self
             .bindings
             .get_mut(&binding)
-            .filter(|b| b.handle().is_some() && !b.retiring);
+            .filter(|b| b.handle().is_some_and(|h| h.life() != Life::Retired));
         let Some(b) = live else {
             self.resolve(binding, ticket, Err(SyncError::NotBound));
             return ios;
@@ -1188,18 +1223,26 @@ impl Core {
         ios
     }
 
-    /// The binding's last connection closed: it drains, then retires. Its root unlocks once the
-    /// last handle drops.
+    /// The binding's last connection closed: it drains, then retires, unless a new open revives
+    /// it first ([`BindingHandle::revive`]). Its root unlocks once the last handle drops.
     pub(crate) fn retire(&mut self, binding: BindingId, now_ms: u64) -> Vec<Io> {
-        if let Some(b) = self.bindings.get_mut(&binding) {
-            if let Stage::Opening { .. } = b.stage {
-                self.fail_open(binding, OpenError::Cancelled);
-                return Vec::new();
+        if let Some(b) = self.bindings.get(&binding) {
+            match &b.stage {
+                Stage::Opening { .. } => {
+                    self.fail_open(binding, OpenError::Cancelled);
+                    return Vec::new();
+                }
+                Stage::Bound { handle } => handle.retiring(),
             }
-            b.retiring = true;
         }
         self.settle(binding, now_ms);
         Vec::new()
+    }
+
+    /// The binding's connections found it damaged (an unconfirmed commit, a failed fsync, a panic):
+    /// it resets.
+    pub(crate) fn reset_binding(&mut self, binding: BindingId, kind: ResetKind, now_ms: u64) {
+        self.reset(binding, kind, now_ms);
     }
 
     /// Gives up an open: one that has not resolved fails `cancelled` (once its disk job, if any,

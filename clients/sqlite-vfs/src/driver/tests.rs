@@ -996,7 +996,7 @@ fn a_stream_of_another_content_type_is_refused() {
         ),
         "{e}"
     );
-    assert_eq!(e.kind(), "stream_format");
+    assert_eq!(e.error_kind().as_str(), "stream_format");
 }
 
 #[test]
@@ -1117,7 +1117,7 @@ fn an_unreachable_stream_fails_the_open_at_its_deadline() {
         matches!(*e, OpenError::Unavailable(Unavailable::Unreachable)),
         "{e}"
     );
-    assert_eq!(e.kind(), "unreachable");
+    assert_eq!(e.error_kind().as_str(), "unreachable");
 }
 
 #[test]
@@ -1229,6 +1229,8 @@ fn a_sync_ahead_of_its_logged_waits_for_it() {
 
 #[test]
 fn a_reopen_while_old_handles_live_is_in_use() {
+    // A binding that retired drained with no connection left (the VFS retires it only then): its
+    // root unlocks at once, though the registry may still hold the handle.
     let dir = TempDir::new("driver-old-handles");
     let mut w = World::new();
     let c = w.core();
@@ -1241,12 +1243,21 @@ fn a_reopen_while_old_handles_live_is_in_use() {
             .iter()
             .any(|e| matches!(e, DriverEvent::Retired { binding } if *binding == bound.binding))
     );
-    // A connection still holds the handle: the root stays locked.
     let c2 = w.core();
-    let e = kind(w.open_result(c2, spec(dir.path(), 2)));
-    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    let reopened = w.open(c2, spec(dir.path(), 2));
+    assert_eq!(reopened.handle.pending_bytes(), 0);
     drop(bound);
-    let bound = w.open(c2, spec(dir.path(), 3));
+    // A reset binding's connections may still write its generation: its root stays locked while
+    // they hold the handle.
+    let now = w.now;
+    w.c(c2)
+        .reset_binding(reopened.binding, ResetKind::LocalDamage, now);
+    assert_eq!(reopened.handle.reset(), Some(ResetKind::LocalDamage));
+    let c3 = w.core();
+    let e = kind(w.open_result(c3, spec(dir.path(), 3)));
+    assert!(matches!(*e, OpenError::InUse { .. }), "{e}");
+    drop(reopened);
+    let bound = w.open(c3, spec(dir.path(), 4));
     assert_eq!(bound.handle.pending_bytes(), 0);
 }
 

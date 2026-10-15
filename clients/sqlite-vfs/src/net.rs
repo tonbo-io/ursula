@@ -1,11 +1,11 @@
-//! The transport under the client's HTTP agents: a cache of the hosts' addresses, and the failures
+//! The network under the HTTP transport's agents: a cache of the hosts' addresses, and the failures
 //! that prove a request never went out.
 //!
 //! ureq resolves a request's host before it looks for a pooled connection (ureq 3.4.2,
 //! `run::connect`), so without the cache every request, on a pooled connection too, asked the
 //! system's resolver. In Kubernetes (`ndots:5`, a short name) that is several DNS queries per
 //! request: 128 owners sent CoreDNS about 1,300 queries a second, and a lookup that stalled failed
-//! its request after `CONNECT_TIMEOUT` (`client::new_agent`) with a pooled connection ready. With
+//! its request after the connect timeout (`transport::http::new_agent`) with a pooled connection ready. With
 //! the cache, a host is looked up at most once every [`DNS_FRESH`] (every [`DNS_RETRY`] while
 //! lookups fail), by one request at a time: while it waits for the lookup, up to the resolve
 //! timeout (5 s), the host's other requests go on with its last addresses, or fail as its last
@@ -16,7 +16,7 @@
 //!
 //! The resolver and the connector here wrap each failure of theirs in [`NotSent`]: a host that did
 //! not resolve, and a connection that was not made. Nothing of such a request went out, so an
-//! append whose every attempt failed this way applied nothing (`client::append`). A failure on a
+//! request that failed this way applied nothing (`wire::NoAnswer::NotSent`). A failure on a
 //! connection that was made, a pooled one included, is never wrapped: part of the request, or all
 //! of it, may have gone out. The wrapping is by where the failure happened, not by its kind: the
 //! same I/O error kinds (a reset, `InvalidData` from rustls, an unreachable host) also come from
@@ -27,7 +27,7 @@
 //! CONNECT proxy's tunnel, and the TLS handshake, which ureq's rustls connector completes) before
 //! it writes any byte of the request, it sends a request once and never again on another
 //! connection, and it sends no TLS early data.
-//! `client::tests::a_failed_tls_handshake_sends_nothing` pins the handshake. These use ureq's
+//! These use ureq's
 //! `unversioned` resolver and transport types, which its semver promises do not cover: an update
 //! of ureq that changes them fails the build here.
 

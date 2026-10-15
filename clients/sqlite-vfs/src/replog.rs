@@ -674,6 +674,7 @@ impl Log {
     }
 
     /// The segment files, by first position.
+    #[cfg(test)]
     pub(crate) fn segment_paths(&self) -> Vec<PathBuf> {
         self.segments.iter().map(|s| s.path.clone()).collect()
     }

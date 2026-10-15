@@ -4,7 +4,7 @@
 //! ```text
 //! <dir>/<label>-<hash32>/     the root: BLAKE3 of the canonical stream path, first 32 hex digits
 //!   lock                      flock, held with the binding
-//!   gen-<lineage>/            the current generation: db, db-uwal, db-shm, log/
+//!   gen-<lineage>/            the current generation: db, db-wal, db-shm, log/
 //!   gen-<lineage>.tmp/        a generation being built
 //!   gen-<lineage>.trash/      a superseded generation being deleted
 //! ```
@@ -201,6 +201,17 @@ fn hex(lineage: Lineage) -> String {
     lineage.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether `path` is a file directly inside a generation directory (`gen-<lineage>`, built or
+/// being built): a main db there opens only while bound (the guard M2's page-1 marker replaces).
+pub(crate) fn in_generation(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(GEN))
+        .map(|rest| rest.strip_suffix(TMP).unwrap_or(rest))
+        .is_some_and(|hex| parse_hex(hex).is_some())
+}
+
 fn parse_hex(s: &str) -> Option<Lineage> {
     if s.len() != 32 {
         return None;
@@ -225,9 +236,10 @@ impl Generation {
         self.dir.join("db")
     }
 
-    /// The WAL, under a name SQLite never probes.
+    /// The WAL, under SQLite's own name in M1 (M2 renames it `db-uwal`, a name SQLite never
+    /// probes, with the page-1 marker).
     pub(crate) fn wal(&self) -> PathBuf {
-        self.dir.join("db-uwal")
+        self.dir.join("db-wal")
     }
 
     pub(crate) fn shm(&self) -> PathBuf {
@@ -301,10 +313,6 @@ impl Root {
         })
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.dir
-    }
-
     /// The generations, temporary ones apart.
     fn generations(&self) -> Result<Vec<Generation>, GenerationError> {
         let mut gens = Vec::new();
@@ -324,6 +332,11 @@ impl Root {
         }
         gens.sort_by_key(|g| g.lineage);
         Ok(gens)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.dir
     }
 
     /// Finishes what a crash left: deletes every `gen-*.tmp` and every generation another one's

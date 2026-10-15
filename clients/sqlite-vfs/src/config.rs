@@ -1,35 +1,16 @@
 //! Settings and test hooks read from the environment (`URSULA_VFS_*`), once per process.
 
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use crate::log;
 use crate::log::Level;
 
-pub(crate) fn abort_after_ack() -> Option<u64> {
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("URSULA_VFS_ABORT_AFTER_ACK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
-}
-
-pub(crate) fn retry_budget() -> Duration {
-    static V: OnceLock<Duration> = OnceLock::new();
-    *V.get_or_init(|| {
-        Duration::from_millis(
-            std::env::var("URSULA_VFS_RETRY_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30_000),
-        )
-    })
-}
-
 /// `URSULA_VFS_IDLE_MS`: how long a connection is kept after its last request, for the next one
-/// to reuse, in milliseconds (90 s by default, see `client::agent`). 0 never reuses one. A value
-/// that is not a number of milliseconds keeps the default, logged once (`setting_adjusted`).
+/// to reuse, in milliseconds (90 s by default). 0 never reuses one. A value that is not a number
+/// of milliseconds keeps the default, logged once (`setting_adjusted`).
 pub(crate) fn idle_age() -> Duration {
     const DEFAULT_MS: u64 = 90_000;
     static V: OnceLock<Duration> = OnceLock::new();
@@ -38,21 +19,25 @@ pub(crate) fn idle_age() -> Duration {
             return Duration::from_millis(DEFAULT_MS);
         };
         let ms = value.trim().parse().unwrap_or_else(|_not_a_number| {
-            log::emit(Level::Warn, "setting_adjusted", &[
-                ("setting", &"URSULA_VFS_IDLE_MS"),
-                ("value", &value),
-                ("used", &DEFAULT_MS),
-            ]);
+            adjusted("URSULA_VFS_IDLE_MS", &value, &DEFAULT_MS);
             DEFAULT_MS
         });
         Duration::from_millis(ms)
     })
 }
 
+fn adjusted(setting: &'static str, value: &str, used: &dyn std::fmt::Display) {
+    log::emit(Level::Warn, "setting_adjusted", &[
+        ("setting", &setting),
+        ("value", &value),
+        ("used", used),
+    ]);
+}
+
 /// `URSULA_VFS_PANIC_IN`: what panics on purpose at every call, for tests of `guard::contain`: a
-/// file method by its name (`x_write`, `x_close`, ...), a SQL function (`ursula_status`, ...),
-/// `sqlite3_extension_init`, or the attach step `attach_files`. Unset outside tests. Unit tests set
-/// it per thread instead (`set_panic_in_for_tests`).
+/// file method by its name (`x_write`, `x_close`, ...), a SQL function (`ursula_status`, ...) or
+/// `sqlite3_extension_init`. Unset outside tests. Unit tests set it per thread instead
+/// (`set_panic_in_for_tests`).
 pub(crate) fn panic_in() -> Option<&'static str> {
     #[cfg(test)]
     if let Some(entry) = PANIC_IN_FOR_TESTS.get() {
@@ -75,123 +60,106 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
     PANIC_IN_FOR_TESTS.set(entry);
 }
 
-/// The largest commit frame the extension sends by default: the server refuses a request body over
-/// 32 MiB, and so does a gateway by default (`--max-request-body-bytes`).
-pub(crate) const DEFAULT_MAX_FRAME_BYTES: usize = 32 << 20;
-
-/// The smallest frame limit `URSULA_VFS_MAX_FRAME_BYTES` may set: well above a claim frame (about
-/// 50 bytes), which every attach of an owner sends, and a commit of a few pages.
-pub(crate) const MIN_FRAME_BYTES: usize = 64 << 10;
-
-/// The largest commit frame the extension sends (`client::append`): `URSULA_VFS_MAX_FRAME_BYTES` in
-/// bytes, or [`DEFAULT_MAX_FRAME_BYTES`]. Lower it to a smaller limit in front of the server. A
-/// value outside [`MIN_FRAME_BYTES`] to [`DEFAULT_MAX_FRAME_BYTES`] is taken to the nearer bound,
-/// and one that is not a number of bytes (`16MiB`, say) is ignored, both logged once
-/// (`setting_adjusted`): 0 would refuse every claim, and a frame above the server's limit would be
-/// sent and refused in a way that can poison.
-pub(crate) fn max_frame_bytes() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        let Ok(value) = std::env::var("URSULA_VFS_MAX_FRAME_BYTES") else {
-            return DEFAULT_MAX_FRAME_BYTES;
-        };
-        match frame_limit_from(&value) {
-            Setting::Taken(limit) => limit,
-            Setting::Adjusted(used) => {
-                log::emit(Level::Warn, "setting_adjusted", &[
-                    ("setting", &"URSULA_VFS_MAX_FRAME_BYTES"),
-                    ("value", &value),
-                    ("used", &used),
-                ]);
-                used
-            }
-        }
-    })
+/// A step of the commit path or of a checkpoint that `URSULA_VFS_ABORT_AT` can stop the process at
+/// (design §4.1, §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// A write transaction's first WAL write, admitted.
+    Admission,
+    /// The commit point, before the capture reads the frames back.
+    Capture,
+    /// The commit frame encoded, before the log write.
+    Encode,
+    /// The COMMIT record written, before the driver hears of it.
+    Logged,
+    /// The commit frame's page forwarded to the WAL.
+    Forward,
+    /// The commit confirmed by `SQLITE_FCNTL_COMMIT_PHASETWO`.
+    PhaseTwo,
+    /// F1: a checkpoint starts, before the log fdatasync.
+    CheckpointStart,
+    /// F1: the log fdatasynced, before the first db page.
+    CheckpointSynced,
+    /// F1: the first db page of a checkpoint written.
+    CheckpointPage,
+    /// F2: before the db fsync.
+    BaseStart,
+    /// F2: the db fsynced, before the BASE record.
+    BaseSynced,
+    /// F2: the BASE record written.
+    Based,
 }
 
-/// What a setting's value sets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Setting<T> {
-    /// The value, as given.
-    Taken(T),
-    /// Something else, because the value is out of range or not a number: logged once as
-    /// `setting_adjusted`.
-    Adjusted(T),
-}
-
-/// The frame limit `URSULA_VFS_MAX_FRAME_BYTES=value` sets (see [`max_frame_bytes`]).
-fn frame_limit_from(value: &str) -> Setting<usize> {
-    match value.trim().parse::<usize>() {
-        Ok(bytes) if (MIN_FRAME_BYTES..=DEFAULT_MAX_FRAME_BYTES).contains(&bytes) => {
-            Setting::Taken(bytes)
+impl Step {
+    fn name(self) -> &'static str {
+        match self {
+            Step::Admission => "admission",
+            Step::Capture => "capture",
+            Step::Encode => "encode",
+            Step::Logged => "logged",
+            Step::Forward => "forward",
+            Step::PhaseTwo => "phasetwo",
+            Step::CheckpointStart => "checkpoint_start",
+            Step::CheckpointSynced => "checkpoint_synced",
+            Step::CheckpointPage => "checkpoint_page",
+            Step::BaseStart => "base_start",
+            Step::BaseSynced => "base_synced",
+            Step::Based => "based",
         }
-        Ok(bytes) => Setting::Adjusted(bytes.clamp(MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES)),
-        Err(_not_a_number) => Setting::Adjusted(DEFAULT_MAX_FRAME_BYTES),
     }
 }
 
-/// Test hook `URSULA_VFS_SNAPSHOT_RETRY_MS`: the wait after a first failed snapshot attempt (100 ms
-/// by default, at least 1 ms), which doubles with each further failure
-/// (`snapshotter::SnapshotFailing`). Tests set it high to see the next attempt held back.
-pub(crate) fn snapshot_retry() -> Duration {
-    static V: OnceLock<Duration> = OnceLock::new();
-    *V.get_or_init(|| {
-        Duration::from_millis(
-            std::env::var("URSULA_VFS_SNAPSHOT_RETRY_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
-        )
-    })
+/// Test hook `URSULA_VFS_ABORT_AT=<step>[:<n>]`: aborts the process the `n`-th time (1 by default)
+/// it reaches `step` ([`Step`], by its name), as a crash there would stop it.
+pub(crate) fn abort_at(step: Step) {
+    static V: OnceLock<Option<(String, u64)>> = OnceLock::new();
+    static SEEN: Mutex<u64> = Mutex::new(0);
+    let Some((name, n)) = V.get_or_init(|| {
+        let value = std::env::var("URSULA_VFS_ABORT_AT").ok()?;
+        let (name, n) = value.split_once(':').unwrap_or((value.as_str(), "1"));
+        Some((name.to_owned(), n.parse().unwrap_or(1)))
+    }) else {
+        return;
+    };
+    if name != step.name() {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+    *seen = seen.saturating_add(1);
+    if *seen == *n {
+        log::emit(Level::Error, "test_hook_abort", &[
+            ("hook", &"URSULA_VFS_ABORT_AT"),
+            ("step", &step.name()),
+            ("n", n),
+        ]);
+        std::process::abort();
+    }
 }
 
-pub(crate) fn snapshot_min_bytes() -> u64 {
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("URSULA_VFS_SNAPSHOT_MIN_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8 << 20)
-    })
-}
-
-pub(crate) fn fail_post_ack() -> Option<u64> {
+/// `URSULA_VFS_MAX_REQUEST_BYTES`: a request limit below the server's, for a layer in front of it
+/// that refuses larger bodies (design §4.6). Unset, or not a number of bytes (logged once as
+/// `setting_adjusted`): the server's alone.
+pub(crate) fn max_request_bytes() -> Option<u64> {
     static V: OnceLock<Option<u64>> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("URSULA_VFS_FAIL_POST_ACK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
-}
-
-pub(crate) fn abort_in_replay() -> Option<u64> {
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("URSULA_VFS_ABORT_IN_REPLAY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
-}
-
-pub(crate) fn first_claim_epoch() -> Option<u64> {
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("URSULA_VFS_FIRST_CLAIM_EPOCH")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let value = std::env::var("URSULA_VFS_MAX_REQUEST_BYTES").ok()?;
+        match value.trim().parse::<u64>() {
+            Ok(bytes) if bytes > 0 => Some(bytes),
+            _ => {
+                adjusted(
+                    "URSULA_VFS_MAX_REQUEST_BYTES",
+                    &value,
+                    &"the server's limit",
+                );
+                None
+            }
+        }
     })
 }
 
 /// `URSULA_VFS_MIN_UPLOAD_KBPS`: the slowest upload, in KiB/s, an attempt's body time limit allows
 /// for (256 by default, at least 1): a body of `n` bytes may take `5 s + n / rate` to send (design
 /// §4.12, #566).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 pub(crate) fn min_upload_kbps() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
@@ -217,35 +185,14 @@ pub(crate) fn token_file() -> Option<&'static str> {
         .as_deref()
 }
 
-fn non_empty(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
+/// `URSULA_VFS_FAIL_SYNC=<suffix>` test hook: `xSync` of a file outside the extension's databases
+/// whose path ends with `suffix` fails, as a disk refusing a write-back would.
+pub(crate) fn fail_sync() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| non_empty("URSULA_VFS_FAIL_SYNC"))
+        .as_deref()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::DEFAULT_MAX_FRAME_BYTES;
-    use super::MIN_FRAME_BYTES;
-    use super::Setting;
-    use super::frame_limit_from;
-
-    // The frame limit is a number of bytes from 64 KiB to 32 MiB, both included: below, an owner's
-    // claim could be refused, and above, a frame the server cannot take would be sent. A value
-    // outside is taken to the nearer bound, and one that is not a number keeps 32 MiB, both
-    // adjusted (logged as `setting_adjusted`).
-    #[test]
-    fn the_frame_limit_stays_between_64_kib_and_32_mib() {
-        assert_eq!(
-            (MIN_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES),
-            (65_536, 33_554_432)
-        );
-        assert_eq!(frame_limit_from("1048576"), Setting::Taken(1_048_576));
-        assert_eq!(frame_limit_from(" 524288 "), Setting::Taken(524_288));
-        assert_eq!(frame_limit_from("65536"), Setting::Taken(65_536));
-        assert_eq!(frame_limit_from("33554432"), Setting::Taken(33_554_432));
-        assert_eq!(frame_limit_from("65535"), Setting::Adjusted(65_536));
-        assert_eq!(frame_limit_from("33554433"), Setting::Adjusted(33_554_432));
-        assert_eq!(frame_limit_from("0"), Setting::Adjusted(65_536));
-        assert_eq!(frame_limit_from("16MiB"), Setting::Adjusted(33_554_432));
-        assert_eq!(frame_limit_from(""), Setting::Adjusted(33_554_432));
-    }
+fn non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }

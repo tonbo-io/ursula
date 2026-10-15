@@ -1,5 +1,5 @@
 //! The scan for descriptors of this process on a database's files outside the extension, which
-//! attach refuses up front ([`open_in_process`]).
+//! `ursula_open` refuses ([`open_in_process`]).
 
 use std::ffi::OsStr;
 use std::fs::{self};
@@ -34,13 +34,13 @@ impl std::fmt::Display for DbFile {
 }
 
 /// A descriptor of this process open on the db file `path`, its `-wal`, `-shm` or `-journal`, in
-/// any access mode, if any. Attach calls it while no connection of this VFS has the file open, and
-/// once the previous attachment's snapshot thread has closed its own connection, so such a
-/// descriptor shows a SQLite connection outside the extension (one opened before the extension was
+/// any access mode, if any. `ursula_open` calls it once a binding's generation is ready and before
+/// any connection of this VFS opens it, so such a descriptor shows a SQLite connection outside the extension (one opened before the extension was
 /// loaded, when "unix" was the default VFS, or through another VFS, a read-only one included) or
 /// another open of the file. A connection outside the extension shares the "unix" VFS's locks and
 /// wal-index node of the file with this VFS's connections in the process: its commits never reach
-/// the stream, and even a read-only one keeps the wal-index of a WAL that attach deletes. The "unix"
+/// the stream, and even a read-only one keeps the wal-index of a WAL that materialization deletes.
+/// The "unix"
 /// VFS also keeps the descriptors of connections closed meanwhile (this VFS's included) open while
 /// such a connection holds a lock on the file, so those show it too.
 ///

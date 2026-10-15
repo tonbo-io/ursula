@@ -18,7 +18,7 @@ pub struct Lineage(pub [u8; 16]);
 pub struct Activation(pub [u8; 16]);
 
 /// A record's place in its log: positions grow by one per record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position(pub u64);
 
 /// A commit's identity: the generation that logged it and its position in that generation's log.

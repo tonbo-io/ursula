@@ -1,5 +1,5 @@
 //! The HTTP transport: one attempt of a request over blocking HTTP/1.1 (ureq), and the agents,
-//! TLS, bearer token and failure classes the 0.7 client shares with it.
+//! TLS and bearer token.
 //!
 //! [`HttpTransport`] sends a [`Request`] once and hands back what came of it. It never retries and
 //! never follows a redirect: the retry policy belongs to the replicator. Every request with a body
@@ -14,7 +14,6 @@
 //! is only another lost attempt.
 
 use std::fs;
-use std::io::Read;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -45,36 +44,15 @@ use crate::wire::parse_answer;
 
 /// The largest answer body read: a read's chunk or a snapshot. An answer with a larger body is
 /// lost (the attempt is repeated), never cut short.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 const ANSWER_BODY_LIMIT: u64 = 2 << 30;
 
 /// One stream over blocking HTTP/1.1. Snapshot transfers go on the bulk agent, every other request
 /// on the agent of appends and reads.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone)]
 pub(crate) struct HttpTransport {
     url: String,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 impl HttpTransport {
     /// The transport of the stream at `url`.
     pub(crate) fn new(url: impl Into<String>) -> Self {
@@ -149,13 +127,6 @@ impl Transport for HttpTransport {
 /// What an attempt that failed with `e` before its answer means: nothing sent only when `net`
 /// proves it, whatever the error's kind (an `InvalidData` or a refused connection on a connection
 /// that carried the request is lost, not unsent).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 fn no_answer_from(e: ureq::Error) -> NoAnswer {
     let (e, sent_nothing) = net::sent_nothing(e);
     let reason = e.to_string();
@@ -167,23 +138,9 @@ fn no_answer_from(e: ureq::Error) -> NoAnswer {
 }
 
 /// The rate the answer's body time limit assumes, in KiB/s.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 const MIN_DOWNLOAD_KBPS: u64 = 256;
 
 /// One attempt's time limits (design §4.12).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Timeouts {
     connect: Duration,
@@ -193,13 +150,6 @@ struct Timeouts {
     recv_body: Duration,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 impl Timeouts {
     /// The limits of an attempt that sends `body` bytes and expects an answer body of up to
     /// `answer` bytes, uploading at `upload_kbps` KiB/s at least.
@@ -227,13 +177,6 @@ impl Timeouts {
 }
 
 /// `base` plus the time `bytes` take at `kbps` KiB/s.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 fn scaled(base: Duration, bytes: u64, kbps: u64) -> Duration {
     let per_second = kbps.max(1).saturating_mul(1024);
     let millis = bytes
@@ -244,13 +187,6 @@ fn scaled(base: Duration, bytes: u64, kbps: u64) -> Duration {
 }
 
 /// `req` with the request's own headers.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 fn with_headers<B>(mut req: ureq::RequestBuilder<B>, request: &Request) -> ureq::RequestBuilder<B> {
     let mut headers = Vec::new();
     request.render_headers(|name, value| headers.push((name, value.to_owned())));
@@ -403,84 +339,6 @@ pub(crate) fn prepared<B>(req: ureq::RequestBuilder<B>, resend: Resend) -> ureq:
     }
 }
 
-/// A request that got no answer for a reason another attempt on a new connection may not meet:
-/// the connection was reset, aborted or closed under it (a server closing it mid-answer included,
-/// an early EOF, and on macOS a reset reported as `EINVAL`: `reset_on_macos`), the request timed
-/// out (a pooled connection closed as the request went out, or dropped by a device without telling
-/// either end), or a signal interrupted it. Not a refused connection (nothing listens there, so a
-/// server still restarting fails the read), a failed TLS handshake (`InvalidData`), a protocol
-/// error (an answer that is not HTTP/1, such as from a gRPC port, is the same every time), nor
-/// anything about the request or the setup.
-pub(crate) fn no_answer(e: &ureq::Error) -> bool {
-    match net::unwrapped(e) {
-        ureq::Error::Io(e) => {
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::Interrupted
-            ) || reset_on_macos(e)
-        }
-        ureq::Error::Timeout(_) => true,
-        _ => false,
-    }
-}
-
-/// Whether `e` is a reset as macOS reports it when the reset came in between two calls on the
-/// socket (#542): `EINVAL` from the OS (`Invalid argument (os error 22)`), where Linux reports
-/// `EPIPE` or `ECONNRESET`.
-///
-/// A reset shuts a socket down both ways, and macOS then fails every `setsockopt` on it with
-/// `EINVAL` (XNU's `sosetoptlock`). ureq 3.4.2 sets the socket's write timeout before it writes
-/// each buffer of a request (128 KiB) and its read timeout before each read (`TcpTransport`, each
-/// to the time left, which differs every time), and `TCP_NODELAY` once connected (`TcpConnector`).
-/// So a reset that comes in as a request goes out or as its answer starts (a pooled connection the
-/// server closed just before, or a body a gateway stopped reading, #540) can fail the request this
-/// way. Under TLS too: rustls hands the socket's error back unchanged.
-///
-/// No error about the request or the setup reaches here. ureq and ureq-proto make no
-/// `InvalidInput` of their own, and neither does rustls on ureq's path (its one is for TLS early
-/// data, which ureq never sends). A bad header or URL fails as `Error::Http` or `Error::BadUri`.
-/// The `InvalidInput` that std makes up for an argument it refuses (a host and port that do not
-/// parse, a NUL in a host, a zero timeout, none of which ureq passes) carries no OS error code, and
-/// would stay final. A request that meets any other `EINVAL` from the OS on macOS is sent again
-/// until the retry budget runs out, and then fails as before. Other systems keep `EINVAL` final:
-/// Linux reports a reset as a reset, and its `connect` fails with `EINVAL` for a wrong URL (an
-/// IPv6 link-local address without a zone).
-fn reset_on_macos(e: &std::io::Error) -> bool {
-    cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EINVAL)
-}
-
-/// A transport failure before any connection carried the request: the host did not resolve, the
-/// connection was refused or failed, the TLS handshake failed, or resolving or connecting (TLS
-/// included) timed out. Nothing of the request was sent. A reset is none of these, whatever error
-/// reports it (`EINVAL` on macOS among them, `reset_on_macos`): it came on an open connection,
-/// which may have carried part of the request or the whole of it.
-pub(crate) fn before_connection(e: &ureq::Error) -> bool {
-    if net::is_not_sent(e) {
-        return true;
-    }
-    match e {
-        ureq::Error::HostNotFound
-        | ureq::Error::ConnectionFailed
-        | ureq::Error::Tls(_)
-        | ureq::Error::Rustls(_)
-        | ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
-        ureq::Error::Io(e) => matches!(
-            e.kind(),
-            std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::HostUnreachable
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::AddrNotAvailable
-                | std::io::ErrorKind::InvalidData
-        ),
-        _ => false,
-    }
-}
-
 /// A token went out in clear (`authorized`), and the log said so.
 static IN_CLEAR_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -514,26 +372,7 @@ pub(crate) fn in_clear(uri: &Uri) -> bool {
     uri.scheme_str() == Some("http") && !uri.host().is_some_and(loopback)
 }
 
-/// The most of a response body an error message or a log line shows.
-pub(crate) const BODY_SHOWN: usize = 256;
-
-/// The start of a response's body as text, for an error message or a log line: at most
-/// `BODY_SHOWN` bytes, followed by `...` when there is more (a gateway's error page, say), and
-/// what could be read when the body breaks off.
-pub(crate) fn body_text(r: &mut ureq::http::Response<ureq::Body>) -> String {
-    let mut bytes = Vec::new();
-    let limit = u64::try_from(BODY_SHOWN.saturating_add(1)).unwrap_or(u64::MAX);
-    if let Err(_broken) = r.body_mut().as_reader().take(limit).read_to_end(&mut bytes) {
-        // Keep what arrived before the break.
-    }
-    let more = bytes.len() > BODY_SHOWN;
-    bytes.truncate(BODY_SHOWN);
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if more {
-        text.push_str("...");
-    }
-    text
-}
-
+#[cfg(test)]
+pub(crate) mod mock;
 #[cfg(test)]
 mod tests;

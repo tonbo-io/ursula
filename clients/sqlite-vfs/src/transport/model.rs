@@ -16,10 +16,7 @@ use crate::wire::Request;
 /// One stream of a shared [`ModelServer`].
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
+    expect(dead_code, reason = "tests drive the model in process")
 )]
 #[derive(Debug, Clone)]
 pub(crate) struct ModelTransport {
@@ -29,10 +26,7 @@ pub(crate) struct ModelTransport {
 
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
+    expect(dead_code, reason = "tests drive the model in process")
 )]
 impl ModelTransport {
     /// The transport of the stream at `path` on `server`.

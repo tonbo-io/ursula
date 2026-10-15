@@ -12,24 +12,24 @@ use std::ffi::CString;
 use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ptr::null_mut;
-use std::sync::Arc;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use libsqlite3_sys as ffi;
 
-use crate::attach::attach;
 use crate::auth::set_token;
-use crate::db::Mode;
+use crate::db;
+use crate::driver::OpenId;
+use crate::driver::SyncError;
+use crate::driver::runtime::driver;
 use crate::error::Error;
-use crate::error::WriteRefusal;
 use crate::guard::contain;
 use crate::host::API;
 use crate::host::OK;
 use crate::host::UNIX;
 use crate::host::api;
-use crate::status::stats;
-use crate::status::status;
+use crate::status;
 use crate::vfs::File;
 use crate::vfs::c_open;
 
@@ -102,33 +102,70 @@ unsafe fn result(ctx: *mut ffi::sqlite3_context, name: &str, outcome: Result<Str
     }
 }
 
-/// Sets the code a failed SQL function reports (`result` set its message; the code is
-/// SQLITE_ERROR otherwise).
+/// Argument `i` as an integer: `None` for NULL or a missing argument.
 ///
 /// # Safety
 ///
-/// `ctx` is the context SQLite passed to the function, whose error `result` set.
-unsafe fn result_error_code(ctx: *mut ffi::sqlite3_context, code: c_int) {
-    if let Some(result_error_code) = api().and_then(|a| a.result_error_code) {
-        // SAFETY: `ctx` is the function's context (the caller's contract).
-        unsafe { result_error_code(ctx, code) };
+/// `argv` and `argc` are what SQLite passed to the function.
+unsafe fn arg_int(argc: c_int, argv: *mut *mut ffi::sqlite3_value, i: usize) -> Option<i64> {
+    let a = api()?;
+    let (value_type, value_int64) = (a.value_type?, a.value_int64?);
+    if argv.is_null() {
+        return None;
     }
+    let n = usize::try_from(argc).unwrap_or_default();
+    // SAFETY: SQLite passes `argc` argument values at `argv` (the caller's contract).
+    let args = unsafe { std::slice::from_raw_parts(argv, n) };
+    let &value = args.get(i)?;
+    // SAFETY: `value` is one of the function's arguments, valid for the call.
+    if unsafe { value_type(value) } == ffi::SQLITE_NULL {
+        return None;
+    }
+    // SAFETY: as above.
+    Some(unsafe { value_int64(value) })
 }
 
-/// The code `ursula_attach` fails with when `e` refused it before anything reached the stream
-/// (nothing was claimed or created), which callers tell from other failures (a read-only attach
-/// can read the database meanwhile): SQLITE_AUTH for a 402 (as since 0.7.1), SQLITE_IOERR_AUTH
-/// (the code of a refused commit) for every other refusal. `None` for any other error.
-fn refused_code(e: &Error) -> Option<c_int> {
-    e.refusal().map(|refusal| match refusal {
-        WriteRefusal::PaymentRequired { .. } => ffi::SQLITE_AUTH,
-        _ => ffi::SQLITE_IOERR_AUTH,
+/// Argument `i` as a non-negative integer (`name` for the error), 0 for NULL.
+///
+/// # Safety
+///
+/// As [`arg_int`].
+unsafe fn arg_count(
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+    i: usize,
+    name: &'static str,
+) -> Result<u64, Error> {
+    // SAFETY: the caller's contract.
+    let n = unsafe { arg_int(argc, argv, i) }.unwrap_or(0);
+    u64::try_from(n).map_err(|_negative| Error::InvalidArgument {
+        name,
+        why: format!("{n} is negative"),
     })
 }
 
-/// `ursula_attach(path, url[, mode])`: the mode is `'owner'` (the default) or `'read_only'` (see
-/// `Mode`). An attach refused before anything reached the stream fails with `refused_code`.
-unsafe fn fn_attach(
+/// `ursula_open(url, dir, options_json, timeout_ms)` (design §8.6): `{done, path, name, state}`,
+/// or `{done: false, request}` while the open goes on. `dir` NULL or `''` is the default cache
+/// root; `timeout_ms` 0 returns at once.
+unsafe fn fn_open(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut ffi::sqlite3_value) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let url = unsafe { arg(argc, argv, 0) };
+    // SAFETY: as above.
+    let dir = unsafe { arg(argc, argv, 1) };
+    // SAFETY: as above.
+    let options = unsafe { arg(argc, argv, 2) };
+    // SAFETY: as above.
+    let outcome = unsafe { arg_count(argc, argv, 3, "timeout_ms") }.and_then(|timeout| {
+        let dir = (!dir.is_empty()).then_some(dir.as_str());
+        db::open(&url, dir, &options, timeout).map(|opened| status::opened_json(&opened))
+    });
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_open", outcome.as_ref().map(Clone::clone)) };
+}
+
+/// `ursula_synced(path, timeout_ms)` (design §8.2): `{synced, ticket, target, acknowledged}`; with
+/// `synced` false the ticket resolves later (`ursula_events`). A reset fails it.
+unsafe fn fn_synced(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
     argv: *mut *mut ffi::sqlite3_value,
@@ -136,25 +173,71 @@ unsafe fn fn_attach(
     // SAFETY: SQLite calls the function with its arguments.
     let path = unsafe { arg(argc, argv, 0) };
     // SAFETY: as above.
-    let url = unsafe { arg(argc, argv, 1) };
-    // SAFETY: as above (empty without a third argument).
-    let mode = unsafe { arg(argc, argv, 2) };
-    let outcome = Mode::try_from(mode.as_str())
-        .map_err(Arc::new)
-        .and_then(|mode| attach(&path, &url, mode));
-    let refused = outcome.as_ref().err().and_then(|e| refused_code(e));
+    let outcome = unsafe { arg_count(argc, argv, 1, "timeout_ms") }.and_then(|timeout| {
+        let b = db::bound(&path)?;
+        if let Some(kind) = b.reset_kind() {
+            return Err(Error::Reset(kind));
+        }
+        // The last commit logged at the call (design §8.2): every commit a reader can see.
+        let target = Some(b.handle.last_commit());
+        let ticket = driver().sync(b.id, target)?;
+        match driver().wait(ticket, Duration::from_millis(timeout)) {
+            None => Ok(status::synced_json(
+                false,
+                ticket.0,
+                target,
+                b.handle.acked(),
+            )),
+            Some(Ok(())) => Ok(status::synced_json(
+                true,
+                ticket.0,
+                target,
+                b.handle.acked(),
+            )),
+            // The binding reset while the call went out: the reset, not its retirement.
+            Some(Err(SyncError::NotBound)) => Err(b.reset_kind().map_or_else(
+                || Error::NotBound {
+                    path: b.path.clone(),
+                },
+                Error::Reset,
+            )),
+            Some(Err(e)) => Err(e.into()),
+        }
+    });
     // SAFETY: SQLite calls the function with its context.
-    unsafe {
-        result(
-            ctx,
-            "ursula_attach",
-            outcome.as_ref().cloned().map_err(|e| &**e),
-        )
-    };
-    if let Some(code) = refused {
-        // SAFETY: as above; `result` set the error.
-        unsafe { result_error_code(ctx, code) };
-    }
+    unsafe { result(ctx, "ursula_synced", outcome.as_ref().map(Clone::clone)) };
+}
+
+/// `ursula_events(cursor, timeout_ms)` (design §8.6): `{cursor, events}`, the events from `cursor`
+/// on, waiting at most `timeout_ms` for one.
+unsafe fn fn_events(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let outcome = unsafe { arg_count(argc, argv, 0, "cursor") }.and_then(|cursor| {
+        // SAFETY: as above.
+        let timeout = unsafe { arg_count(argc, argv, 1, "timeout_ms") }?;
+        let (events, next) = driver().events(cursor, Duration::from_millis(timeout));
+        Ok(status::events_json(&events, next))
+    });
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_events", outcome.as_ref().map(Clone::clone)) };
+}
+
+/// `ursula_cancel(request)`: gives up an open in progress.
+unsafe fn fn_cancel(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let outcome = unsafe { arg_count(argc, argv, 0, "request") }
+        .and_then(|request| db::cancel(OpenId(request)))
+        .map(|()| String::new());
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_cancel", outcome.as_ref().map(Clone::clone)) };
 }
 
 unsafe fn fn_status(
@@ -164,8 +247,9 @@ unsafe fn fn_status(
 ) {
     // SAFETY: SQLite calls the function with its arguments.
     let path = unsafe { arg(argc, argv, 0) };
+    let outcome = db::bound(&path).map(|b| status::status_json(&b));
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_status", status(&path).as_ref().cloned()) };
+    unsafe { result(ctx, "ursula_status", outcome.as_ref().map(Clone::clone)) };
 }
 
 unsafe fn fn_stats(
@@ -175,22 +259,37 @@ unsafe fn fn_stats(
 ) {
     // SAFETY: SQLite calls the function with its arguments.
     let path = unsafe { arg(argc, argv, 0) };
+    let outcome = db::bound(&path).map(|b| {
+        let drained = b.lock().stats.drain();
+        status::stats_json(&drained)
+    });
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_stats", stats(&path).as_ref().cloned()) };
+    unsafe { result(ctx, "ursula_stats", outcome.as_ref().map(Clone::clone)) };
 }
 
-/// `ursula_set_token(token)`: the bearer token every request carries from now on; NULL or `''` goes
-/// back to `URSULA_VFS_TOKEN_FILE`.
+/// `ursula_set_token(path, token)`: the bearer token requests carry from now on; NULL or `''` goes
+/// back to `URSULA_VFS_TOKEN_FILE`. M1 has one token per process, so a path (which must name a
+/// bound database) sets it as NULL does; M3's token providers make it per database.
 unsafe fn fn_set_token(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
     argv: *mut *mut ffi::sqlite3_value,
 ) {
     // SAFETY: SQLite calls the function with its arguments.
-    let token = unsafe { arg(argc, argv, 0) };
-    set_token(Some(&token));
+    let path = unsafe { arg(argc, argv, 0) };
+    // SAFETY: as above.
+    let token = unsafe { arg(argc, argv, 1) };
+    let outcome = if path.is_empty() {
+        Ok(())
+    } else {
+        db::bound(&path).map(drop)
+    }
+    .map(|()| {
+        set_token(Some(&token));
+        String::new()
+    });
     // SAFETY: SQLite calls the function with its context.
-    unsafe { result(ctx, "ursula_set_token", Ok(String::new())) };
+    unsafe { result(ctx, "ursula_set_token", outcome.as_ref().map(Clone::clone)) };
 }
 
 /// A SQL function's C entry point: runs the function named without `c_` through [`contain`], so a
@@ -218,14 +317,18 @@ macro_rules! sql_entry {
     };
 }
 
-sql_entry!(c_attach => fn_attach, "ursula_attach");
+sql_entry!(c_ursula_open => fn_open, "ursula_open");
+sql_entry!(c_synced => fn_synced, "ursula_synced");
+sql_entry!(c_events => fn_events, "ursula_events");
+sql_entry!(c_cancel => fn_cancel, "ursula_cancel");
 sql_entry!(c_status => fn_status, "ursula_status");
 sql_entry!(c_stats => fn_stats, "ursula_stats");
 sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
 
-/// Registers the "ursula" VFS over "unix" as the default (once per process) and the SQL functions
-/// on `db`, direct-only: a schema object of an untrusted database (a trigger, a view) cannot call
-/// them to attach a file or replace the process's token.
+/// Refuses a host SQLite the extension does not support (`gate`), then registers the "ursula" VFS
+/// over "unix" as the default (once per process) and the SQL functions on `db`, direct-only: a
+/// schema object of an untrusted database (a trigger, a view) cannot call them to open a stream or
+/// replace the process's token.
 ///
 /// # Safety
 ///
@@ -280,9 +383,18 @@ unsafe fn set_init_error(err: *mut *mut c_char, p_api: *const ffi::sqlite3_api_r
 /// As [`sqlite3_extension_init`].
 unsafe fn init(
     db: *mut ffi::sqlite3,
-    _err: *mut *mut c_char,
+    err: *mut *mut c_char,
     p_api: *const ffi::sqlite3_api_routines,
 ) -> c_int {
+    // SAFETY: the caller's contract: `p_api` is null or the host's routines.
+    let Some(a) = (unsafe { p_api.as_ref() }) else {
+        return ffi::SQLITE_ERROR;
+    };
+    if let Err(refusal) = gate(a) {
+        // SAFETY: the caller's contract.
+        unsafe { set_error(err, a, &refusal.to_string()) };
+        return ffi::SQLITE_ERROR;
+    }
     API.store(p_api.cast_mut(), Ordering::Release);
     let Some(a) = api() else {
         return ffi::SQLITE_ERROR;
@@ -298,12 +410,14 @@ unsafe fn init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 5] = [
-        (c"ursula_attach", 2, c_attach),
-        (c"ursula_attach", 3, c_attach),
+    let fns: [(&CStr, c_int, SqlFn); 7] = [
+        (c"ursula_open", 4, c_ursula_open),
+        (c"ursula_synced", 2, c_synced),
+        (c"ursula_events", 2, c_events),
+        (c"ursula_cancel", 1, c_cancel),
         (c"ursula_status", 1, c_status),
         (c"ursula_stats", 1, c_stats),
-        (c"ursula_set_token", 1, c_set_token),
+        (c"ursula_set_token", 2, c_set_token),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the
@@ -326,6 +440,71 @@ unsafe fn init(
         }
     }
     ffi::SQLITE_OK_LOAD_PERMANENTLY
+}
+
+/// The oldest SQLite the extension loads into: 3.50.4, Node 22.19.0's (the oldest Node the
+/// package supports, on which CI runs the PHASETWO conformance), as `sqlite3_libversion_number`
+/// spells it. Publication relies on when SQLite sends `SQLITE_FCNTL_COMMIT_PHASETWO` (design §4.2).
+pub(crate) const MIN_SQLITE: c_int = 3_050_004;
+
+/// Why the extension refuses to load into the host's SQLite.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum GateRefusal {
+    #[error(
+        "sqlite-ursula-vfs needs SQLite {} or newer, the host runs {}",
+        version(MIN_SQLITE),
+        version(*.0)
+    )]
+    TooOld(c_int),
+    #[error("sqlite-ursula-vfs needs WAL mode, which the host's SQLite omits (SQLITE_OMIT_WAL)")]
+    NoWal,
+    #[error("the host's SQLite lacks {0}")]
+    MissingRoutine(&'static str),
+}
+
+/// `3050004` as `3.50.4`.
+fn version(n: c_int) -> String {
+    let (major, minor, patch) = (n / 1_000_000, n / 1_000 % 1_000, n % 1_000);
+    format!("{major}.{minor}.{patch}")
+}
+
+/// Whether the host's SQLite is one the extension supports: new enough, with WAL.
+fn gate(a: &ffi::sqlite3_api_routines) -> Result<(), GateRefusal> {
+    let libversion = a
+        .libversion_number
+        .ok_or(GateRefusal::MissingRoutine("sqlite3_libversion_number"))?;
+    let used = a
+        .compileoption_used
+        .ok_or(GateRefusal::MissingRoutine("sqlite3_compileoption_used"))?;
+    // SAFETY: the host's routine, which takes no argument.
+    let n = unsafe { libversion() };
+    if n < MIN_SQLITE {
+        return Err(GateRefusal::TooOld(n));
+    }
+    // SAFETY: the option name is NUL-terminated.
+    if unsafe { used(c"OMIT_WAL".as_ptr()) } != 0 {
+        return Err(GateRefusal::NoWal);
+    }
+    Ok(())
+}
+
+/// The load's error message, allocated with the host's `sqlite3_mprintf` (SQLite frees it).
+///
+/// # Safety
+///
+/// `err` is null or writable.
+unsafe fn set_error(err: *mut *mut c_char, a: &ffi::sqlite3_api_routines, message: &str) {
+    let Some(mprintf) = a.mprintf else {
+        return;
+    };
+    if err.is_null() {
+        return;
+    }
+    let message = c_text(message);
+    // SAFETY: "%s" reads one NUL-terminated string, the one passed.
+    let copy = unsafe { mprintf(c"%s".as_ptr(), message.as_ptr()) };
+    // SAFETY: the caller's contract: `err` is writable.
+    unsafe { *err = copy };
 }
 
 /// Registers the "ursula" VFS: a copy of "unix" whose files carry this VFS's state in front of the
@@ -365,54 +544,13 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use libsqlite3_sys as ffi;
+    use super::MIN_SQLITE;
+    use super::version;
 
-    use super::refused_code;
-    use crate::error::Error;
-    use crate::error::WriteRefusal;
-
-    // An attach refused before anything reached the stream fails with a code of its own:
-    // SQLITE_AUTH for a 402 (as since 0.7.1), SQLITE_IOERR_AUTH (a refused commit's) for any other
-    // refusal. Every other failure keeps SQLITE_ERROR, a denied read included.
+    // The floor is Node 22.19.0's SQLite.
     #[test]
-    fn refused_attaches_fail_with_codes_of_their_own() {
-        let url = || "http://h/b/s".to_owned();
-        let refused = |refusal| Error::Refused {
-            op: "claim",
-            url: url(),
-            refusal,
-        };
-        let payment = WriteRefusal::PaymentRequired {
-            body: String::new(),
-        };
-        assert_eq!(refused_code(&refused(payment)), Some(ffi::SQLITE_AUTH));
-        for refusal in [
-            WriteRefusal::Unauthorized {
-                body: String::new(),
-            },
-            WriteRefusal::Forbidden {
-                body: String::new(),
-            },
-            WriteRefusal::RateLimited {
-                body: String::new(),
-            },
-            WriteRefusal::NotApplied {
-                status: 503,
-                reason: "RaftLogPressure".into(),
-            },
-        ] {
-            assert_eq!(
-                refused_code(&refused(refusal)),
-                Some(ffi::SQLITE_IOERR_AUTH)
-            );
-        }
-        let denied_read = Error::Unauthorized {
-            op: "head",
-            url: url(),
-            status: 403,
-            body: String::new(),
-        };
-        assert_eq!(refused_code(&denied_read), None);
-        assert_eq!(refused_code(&Error::ClaimRaces { url: url() }), None);
+    fn the_floor_is_3_50_4() {
+        assert_eq!(version(MIN_SQLITE), "3.50.4");
+        assert_eq!(version(3_051_002), "3.51.2");
     }
 }

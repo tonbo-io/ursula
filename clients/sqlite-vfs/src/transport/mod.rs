@@ -18,13 +18,6 @@ use crate::wire::Exchange;
 use crate::wire::Request;
 
 /// How an attempt goes out, after the attempts before it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Attempt {
     /// The attempt before got no answer: take a new connection rather than a pooled one that may
@@ -35,13 +28,6 @@ pub(crate) struct Attempt {
 }
 
 /// Sends one attempt of a request to one stream.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client side is unwired until the 0.8 driver (PR5) sends through it"
-    )
-)]
 pub(crate) trait Transport: Send + Sync {
     fn send(&self, request: &Request, attempt: Attempt) -> Exchange;
 }

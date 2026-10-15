@@ -1,6 +1,5 @@
 //! Applies commits to a db file in batches: the final image per page and the size, whatever the
-//! frame format they came in. 0.7's attach feeds it `USQ1` records, materialization `USQ2` commit
-//! records.
+//! frame format they came in: materialization and builds feed it `USQ2` commit records.
 //!
 //! A batch keeps, per page, the latest image among its commits, drops pages past a later shrink,
 //! and remembers its smallest size and its last. [`PageBatch::flush`] cuts the file to the
@@ -57,6 +56,7 @@ impl<P> Default for PageBatch<P> {
 
 impl<P: Image> PageBatch<P> {
     /// Adds a commit: the db size after it, in pages, and the images it wrote.
+    #[cfg(test)]
     pub(crate) fn commit(&mut self, size: u32, pages: impl IntoIterator<Item = (u32, P)>) {
         self.begin(size);
         for (pgno, data) in pages {
@@ -78,19 +78,6 @@ impl<P: Image> PageBatch<P> {
     pub(crate) fn page(&mut self, pgno: u32, data: P) {
         self.min_size = self.min_size.or(self.size);
         self.pages.insert(pgno, data);
-    }
-
-    /// Starts over from a file of `size` pages written whole (a snapshot image): nothing to cut,
-    /// nothing to write yet.
-    pub(crate) fn restart(&mut self, size: u32) {
-        self.pages.clear();
-        self.min_size = None;
-        self.size = Some(size);
-    }
-
-    /// Whether the batch holds a commit, so that [`PageBatch::flush`] writes.
-    pub(crate) fn has_commit(&self) -> bool {
-        self.min_size.is_some()
     }
 
     /// The page images the batch holds.

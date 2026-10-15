@@ -59,9 +59,8 @@ pub(crate) fn token(refresh: bool) -> Option<String> {
 /// cache's lock. A read that finds no usable token (the file is missing, empty, or caught
 /// half-written by a writer that truncates it first) keeps the last token the file held: a
 /// request sent without one is refused as if the stream did not exist (an authorizer conceals it
-/// with a 404), which fails an attach, and fails a commit at once (alone when the 404 is marked
-/// `x-ursula-not-applied` with a gateway's vouch, with a poison otherwise: see `client::append`),
-/// whereas a stale token is refused with a 401, which is retried with the file read again.
+/// with a 404, which an open takes for a missing stream), whereas a stale token is refused with a
+/// 401, which is retried with the file read again.
 fn file_token(path: &str, refresh: bool, cache: &Mutex<Option<Cached>>) -> Option<String> {
     let meta = fs::metadata(path).ok();
     let modified = meta.as_ref().and_then(|m| m.modified().ok());
