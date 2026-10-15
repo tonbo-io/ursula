@@ -347,6 +347,12 @@ verifies them, and only then creates the Git tag and GitHub Release:
 - Docker image: `ghcr.io/tonbo-io/ursula`
 - Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula`
 
+A release is the exact HEAD of the branch the workflow is dispatched on, with
+a successful push CI run on that branch: `main` for its own version, or
+`release/<major>.<minor>` for a patch to that line. `main` carries the next
+minor, so patches to a released line ship from its release branch (0.7.x from
+`release/0.7`). The image attestations name that branch as the source ref.
+
 GHCR holds only what tagged stable releases publish: the images, the charts,
 and nothing else. Image indexes carry no attestation manifests. Commit
 candidates come from the Commit Candidate Build workflow, which saves the image
