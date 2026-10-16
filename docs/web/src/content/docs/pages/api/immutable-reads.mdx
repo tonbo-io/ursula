@@ -29,11 +29,11 @@ A chunk answer holds the stream's bytes from `offset` to the next multiple of 4 
 | `206` | The requested byte range of the snapshot, as in [read snapshot](/docs/api/read-snapshot). |
 | `304` | `If-None-Match` named the answer's `ETag`. The headers are those of the `200`, the marker included. |
 | `307` | In a cluster, this node cannot answer the read and is not the stream's group leader. `Location` is the same request on the leader. |
-| `400` | The request has a query (`QUERY_NOT_ACCEPTED`), or the token or the offset is not in the form the server issues (`INVALID_RESOURCE`). On the stream and snapshot routes, the `incarnation` and `aligned` parameters of the earlier query form answer `400` too (`UNSUPPORTED`), naming the path form. |
+| `400` | The request has a query (`QUERY_NOT_ACCEPTED`), or the token or the offset is not in the form the server issues (`INVALID_RESOURCE`). A path segment that is not valid UTF-8 once percent-decoded is refused by the router before the route: `INVALID_REQUEST`. On the stream and snapshot routes, the `incarnation` and `aligned` parameters of the earlier query form answer `400` too (`UNSUPPORTED`), naming the path form. |
 | `404` | The stream does not exist, or the snapshot is not the latest. In the second case `Stream-Incarnation` is the stream's current token. |
 | `410` | The chunk starts below the stream's retained offset. `Stream-Incarnation` is the stream's current token, which differs from the path's when the stream was replaced. |
 | `412` | `token` is not the stream's current token. The response's `Stream-Incarnation` is the current token. |
-| `416` | The chunk starts past the tail, or the range starts past the end of the snapshot. `Stream-Incarnation` is the stream's current token, which differs from the path's when the stream was replaced. |
+| `416` | The chunk starts past the tail (`OFFSET_OUT_OF_RANGE`), or the range starts past the end of the snapshot (`RANGE_NOT_SATISFIABLE`). `Stream-Incarnation` is the stream's current token, which differs from the path's when the stream was replaced. The snapshot `416` is a JSON error answer (`Content-Type: application/json`) that keeps the snapshot headers (`Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Next-Offset`, `ETag`, `Accept-Ranges`) and `Content-Range: bytes */total`, without the marker. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
 A `HEAD` of a chunk reads the chunk, at most 4 MiB, to compute its `ETag`. A `HEAD` of a snapshot answers from the snapshot's metadata and reads no body. A chunk's `ETag` is strong and covers its body, and `If-None-Match` is compared weakly.
