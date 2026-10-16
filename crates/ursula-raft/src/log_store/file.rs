@@ -471,7 +471,17 @@ impl RaftGroupFileLogStore {
             .find(|log_id| match purged {
                 // B1 of the fifth #613 review: a purged entry is still a
                 // committed one. Every entry below the last purged one has a
-                // leader id at most its own, so a greater one differs.
+                // leader id at most its own, so a greater one differs. That
+                // covers every overwrite a plan can send: a plan's leader
+                // writes at a term above every vote term the plan read, and
+                // votes are synced before they are answered, so a replica
+                // whose committed entries a plan never reached voted at most
+                // in terms the plan's quorum saw (R1: its voter sets
+                // intersect every quorum that committed them). A log whose
+                // last term is below that floor is cut, so every entry the
+                // plan's history adds carries a term above all of this
+                // replica's entries. An id at most the purged one here is
+                // one this replica's log held.
                 Some(purged) if log_id.index() <= purged.index() && skip_purged => false,
                 Some(purged) if log_id.index() < purged.index() => {
                     (log_id.leader_id.term, log_id.leader_id.node_id)

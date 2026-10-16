@@ -2535,3 +2535,75 @@ async fn the_history_at_the_marker_follows_the_events_apply_would_take() {
         None
     );
 }
+
+/// B1 of the fifth #613 review, the OpenRaft half of the marker: after a
+/// snapshot install, OpenRaft committed 100 while the store's marker still
+/// says 40. A probe from another history at 75, below the purge point, is
+/// refused, though the stored marker alone would let it through.
+#[tokio::test]
+async fn the_screen_reads_the_commit_openraft_holds_above_the_stored_marker() {
+    let core = Core::new(JournalTuning::new(WalFsync::Never));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, (1..=40).map(blank_entry)).await;
+    store
+        .save_committed(Some(log_id(40)))
+        .await
+        .expect("save the committed entry");
+    // A snapshot through 100 installed: the log is purged up to it.
+    store.purge(log_id(100)).await.expect("purge");
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("a gate");
+    let mut metrics = openraft::RaftMetrics::<UrsulaRaftTypeConfig>::new_initial(1);
+    metrics.local_committed = Some(log_id(100));
+    metrics.last_applied = Some(log_id(100));
+    let marker = gate.effective_marker(&metrics);
+    assert_eq!(marker, Some(100));
+    let probe = openraft::raft::AppendEntriesRequest::<UrsulaRaftTypeConfig> {
+        vote: openraft::Vote::new_committed(9, 2),
+        prev_log_id: Some(openraft::LogId {
+            leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(9, 2),
+            index: 75,
+        }),
+        entries: Vec::new(),
+        leader_commit: None,
+    };
+    assert!(matches!(
+        gate.committed_overwrite(crate::rejoin::Incoming::Append(&probe), marker),
+        Some(ursula_runtime::GroupInfraError::CommittedOverwrite {
+            committed: 100,
+            index: 75,
+            ..
+        })
+    ));
+    // With the stored marker alone, as before the review, it would pass.
+    assert_eq!(
+        gate.committed_overwrite(crate::rejoin::Incoming::Append(&probe), Some(40)),
+        None
+    );
+}
+
+/// N5 of the fifth #613 review: without its store, the replica is
+/// stopping, and the screen refuses everything.
+#[tokio::test]
+async fn the_screen_refuses_everything_once_the_store_is_gone() {
+    let core = Core::new(JournalTuning::new(WalFsync::Never));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [blank_entry(1), blank_entry(2)]).await;
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("a gate");
+    drop(store);
+    let append_two = openraft::raft::AppendEntriesRequest::<UrsulaRaftTypeConfig> {
+        vote: openraft::Vote::new_committed(5, 1),
+        prev_log_id: Some(log_id(1)),
+        entries: vec![blank_entry(2)],
+        leader_commit: None,
+    };
+    assert!(matches!(
+        gate.committed_overwrite(crate::rejoin::Incoming::Append(&append_two), Some(2)),
+        Some(ursula_runtime::GroupInfraError::OwnerStopped)
+    ));
+}

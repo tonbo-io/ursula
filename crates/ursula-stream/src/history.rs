@@ -84,7 +84,9 @@ pub fn draw_history_id() -> NonZeroU64 {
 /// entry that carries it (#613). A replica whose entry at its commit marker
 /// has this leader id holds that leader's log up to there, so the event's
 /// history kept its committed entries. An import, which no plan proposes,
-/// records term 0, which no entry carries.
+/// records term 0. The only entry of term 0 is OpenRaft's initial
+/// membership at index 0, which the commit screen never matches against
+/// term 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryLeader {
     pub term: u64,
