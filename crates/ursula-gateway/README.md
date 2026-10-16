@@ -17,7 +17,7 @@ identifies the Raft leader.
   stream, or else to a configured upstream Ursula node picked at random,
   skipping upstreams that recently failed at the transport. See
   [Upstream Selection](#upstream-selection).
-- Buffers request bodies up to `--max-request-body-bytes`; larger requests
+- Buffers request bodies up to `--max-request-body-bytes`. Larger requests
   receive `413 Payload Too Large` before reaching an upstream.
 - Bounds the bodies it buffers across requests with a node-wide budget and
   headroom for small bodies, bounds each bucket's large uploads under a quota
@@ -261,11 +261,11 @@ reserves `--small-body-max-bytes` at first, and its reservation grows as the
 body arrives. The gateway copies each piece of a body into one buffer as it
 arrives and drops the piece, however small the pieces: a declared body gets a
 buffer of its `Content-Length`, and one without a declared length grows its
-buffer within its reservation, briefly holding up to twice its share while
-the buffer reallocates. The reservation shrinks to the buffer's size once the
+buffer within its reservation, briefly holding up to twice its share while the
+buffer reallocates. The reservation shrinks to the buffer's size once the
 gateway has the body whole, and ends when the gateway is done forwarding it,
-when it refuses the request, or when the client goes away. A request without a body reserves
-nothing.
+when it refuses the request, or when the client goes away. A request without a
+body reserves nothing.
 
 - `--small-body-headroom-bytes` of the budget only bodies of at most
   `--small-body-max-bytes` may take, so that small writes, such as SQLite
@@ -342,19 +342,19 @@ however long it takes. Over HTTP/1.1 the connection closes after the `408`,
 so a client that is still sending may see the closed connection instead.
 
 A chunk counts toward the window it arrives in, so a pause of just under the
-stall timeout that spans the end of a window, on a link slower than the
-floor over a whole window, can leave that window short. The SQLite extension
-gives a commit 10 s and a snapshot transfer 120 s. With the defaults the
-gateway never cuts a body that keeps arriving. Keep `--body-stall-timeout` above 10 s. The gateway warns at startup
-otherwise.
+stall timeout that spans the end of a window, on a link slower than the floor
+over a whole window, can leave that window short. The SQLite extension gives a
+commit 10 s and a snapshot transfer 120 s. With the defaults the gateway never
+cuts a body that keeps arriving. Keep `--body-stall-timeout` above 10 s. The
+gateway warns at startup otherwise.
 
 ### Refusals and Metrics
 
 The gateway reads the body of each refusal here other than the `408` to its
 end before it answers, at the pace a forwarded body may keep, and drops each
-chunk. A client that
-sends its whole body first then gets the refusal on an intact connection, as
-in [Refusals Before the Body](#refusals-before-the-body). That holds for the
+chunk. A client that sends its whole body first then gets the refusal on an
+intact connection, as in
+[Refusals Before the Body](#refusals-before-the-body). That holds for the
 `413` of a body over its bucket's own limit too. Only a body past
 `--max-request-body-bytes` gets its `413` with the rest unread.
 
