@@ -24,6 +24,14 @@
 //!   merged single-router build used in tests it falls through to stream
 //!   routing, where `__ursula` is a reserved bucket ID, so it answers 400.)
 //!   Every group runs one behaviour, so there is no level to report or raise.
+//! - The query form of the unreleased #567 immutable-read design: the
+//!   `incarnation` and `aligned` read parameters answer 400 on every read
+//!   (catch-up, long-poll and SSE), and `incarnation` on
+//!   `GET {stream}/snapshot/{offset}`. Ignoring them would turn a read
+//!   conditional on a token into an unconditional one, and one a cache
+//!   could key as immutable into an ordinary read of the tail. The answer
+//!   names the path form, `{stream}/incarnation/{token}/chunk/{offset}` and
+//!   `{stream}/incarnation/{token}/snapshot/{offset}`.
 //!
 //! The removed names live only in this file, which the release's "nothing
 //! left" check allowlists.
@@ -46,21 +54,54 @@ const HEADER_STREAM_RECORD_MATCH: &str = "stream-record-match";
 /// The removed record-coordinate read parameters.
 const RECORD_READ_PARAMETERS: [&str; 4] = ["record", "tail_records", "max_records", "record_view"];
 
-/// Rejects a read that carries a removed record-coordinate parameter.
+/// The read parameters of #567's immutable reads, replaced by the path
+/// form.
+const IMMUTABLE_QUERY_PARAMETERS: [&str; 2] = ["incarnation", "aligned"];
+
+/// Rejects a read that carries a removed record-coordinate parameter or a
+/// parameter of #567's immutable reads.
 pub(crate) fn reject_removed_read_parameters(
     query: &HashMap<String, String>,
 ) -> Result<(), Box<Response>> {
-    match RECORD_READ_PARAMETERS
+    if let Some(name) = RECORD_READ_PARAMETERS
+        .iter()
+        .find(|name| query.contains_key(**name))
+    {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            format!("the {name} parameter is not supported; record coordinates were removed"),
+        )));
+    }
+    match IMMUTABLE_QUERY_PARAMETERS
         .iter()
         .find(|name| query.contains_key(**name))
     {
         Some(name) => Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::Unsupported,
-            format!("the {name} parameter is not supported; record coordinates were removed"),
+            format!(
+                "the {name} parameter is not supported; an immutable read is \
+                 GET {{stream}}/incarnation/{{token}}/chunk/{{offset}}"
+            ),
         ))),
         None => Ok(()),
     }
+}
+
+/// Rejects a snapshot read that carries #567's `incarnation` parameter.
+pub(crate) fn reject_removed_snapshot_read_parameters(
+    query: &HashMap<String, String>,
+) -> Result<(), Box<Response>> {
+    if query.contains_key("incarnation") {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            "the incarnation parameter is not supported; an immutable snapshot read is \
+             GET {stream}/incarnation/{token}/snapshot/{offset}",
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects an append that carries the removed `Stream-Record-Match`.
@@ -208,6 +249,62 @@ mod tests {
         }
         let response = send(&app, "GET", &format!("{uri}/snapshot"), &[], "").await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn the_query_form_of_immutable_reads_answers_400() {
+        let app = app();
+        let uri = "/removed/immutable";
+        let at = stream_with_bytes(&app, uri).await;
+        let response = send(
+            &app,
+            "PUT",
+            &format!("{uri}/snapshot/{at}"),
+            &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+            "state",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let token = send(&app, "HEAD", uri, &[], "")
+            .await
+            .headers()
+            .get(names::STREAM_INCARNATION)
+            .expect("token")
+            .to_str()
+            .expect("utf-8 header")
+            .to_owned();
+        for query in [
+            format!("incarnation={token}&offset=0"),
+            "aligned=true&offset=0".to_owned(),
+            format!("aligned=true&incarnation={token}&offset=0"),
+        ] {
+            for live in ["", "&live=long-poll", "&live=sse"] {
+                let target = format!("{uri}?{query}{live}");
+                let response = send(&app, "GET", &target, &[], "").await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target}");
+                let body = crate::render::error_body_of(response).await;
+                assert_eq!(body.code, ErrorCode::Unsupported, "{target}");
+                assert!(
+                    body.message
+                        .contains("{stream}/incarnation/{token}/chunk/{offset}"),
+                    "{target}"
+                );
+            }
+        }
+        let target = format!("{uri}/snapshot/{at}?incarnation={token}");
+        let response = send(&app, "GET", &target, &[], "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = crate::render::error_body_of(response).await;
+        assert_eq!(body.code, ErrorCode::Unsupported);
+        assert!(
+            body.message
+                .contains("{stream}/incarnation/{token}/snapshot/{offset}")
+        );
+        // Without them, the same reads answer.
+        let response = send(&app, "GET", &format!("{uri}?offset=0"), &[], "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(&app, "GET", &format!("{uri}/snapshot/{at}"), &[], "").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

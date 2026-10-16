@@ -131,6 +131,23 @@ async fn snapshot_above_the_staging_threshold_round_trips_through_the_cold_tier(
     );
     assert!(body_of(response).await == snapshot);
 
+    // A HEAD answers the GET's headers without reading the cold body: with
+    // every cold read failing, it still answers, where a GET cannot.
+    cold_store.set_fault_policy(|_| Some(ursula_runtime::ColdStoreFaultEffect::fail("no reads")));
+    let response = send(&app, "HEAD", "/cold-snapshots/s/snapshot/2", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[CONTENT_LENGTH],
+        snapshot.len().to_string().as_str()
+    );
+    assert_eq!(
+        response.headers()[names::STREAM_SNAPSHOT_DIGEST],
+        digest.as_str()
+    );
+    let response = send(&app, "GET", "/cold-snapshots/s/snapshot/2", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    cold_store.clear_fault_policy();
+
     let response = send(&app, "GET", "/cold-snapshots/s/bootstrap", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let length = response.headers()[CONTENT_LENGTH]

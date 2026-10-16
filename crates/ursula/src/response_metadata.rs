@@ -6,7 +6,7 @@
 //! (extensions Section 11) to an error answer that no handler rendered,
 //! outside the operator paths under `/__ursula/`.
 //!
-//! One tower layer does both. It calls the inner service directly, so it
+//! One tower layer does all three. It calls the inner service directly, so it
 //! adds no clone of the routes to a request, as a `from_fn` middleware
 //! would.
 

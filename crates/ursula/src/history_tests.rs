@@ -402,3 +402,155 @@ async fn a_read_etag_differs_across_a_recreate_with_equal_bytes() {
     }
     assert_ne!(tags[0], tags[1]);
 }
+
+/// `Stream-Incarnation` of `response`, if any.
+fn token_of(response: &Response) -> Option<Incarnation> {
+    response
+        .headers()
+        .get(names::STREAM_INCARNATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| Incarnation::parse(names::STREAM_INCARNATION, value).expect("a token"))
+}
+
+/// Sends `GET uri` with `headers` and asserts its status and the token it
+/// names.
+async fn assert_names_token(
+    app: &Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+    status: StatusCode,
+    token: Option<Incarnation>,
+) {
+    let response = send(app, "GET", uri, headers, Body::empty()).await;
+    assert_eq!(response.status(), status, "{uri}");
+    assert_eq!(token_of(&response), token, "{uri}");
+}
+
+/// A `410` or `416` of a read, and the `404` of a snapshot that is not the
+/// latest, come before the `Stream-Incarnation` precondition. Each names the
+/// token of the stream that decided it, so a client tells another
+/// incarnation from a real overshoot or a real gone offset without a HEAD,
+/// under the current token and under one a restore retired. A missing
+/// stream names none.
+#[tokio::test]
+async fn gone_and_beyond_tail_answers_name_the_serving_token() {
+    let source = app();
+    let response = send(
+        &source,
+        "PUT",
+        URI,
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("0123456789abcdefghij"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for (path, body) in [
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(10)),
+            "snapshot",
+        ),
+        (format!("{URI}/retention/{}", Offset::from_u64(10)), ""),
+    ] {
+        let response = send(&source, "PUT", &path, &[], Body::from(body)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path}");
+    }
+    let old = head(&source).await.incarnation();
+    let chunk = |token: Incarnation, offset: u64| {
+        format!(
+            "{URI}{}",
+            ursula_headers::ImmutableResource {
+                kind: ursula_headers::ResourceKind::Chunk,
+                incarnation: token,
+                offset: Offset::from_u64(offset),
+            }
+            .path()
+        )
+    };
+    let snapshot = |token: Incarnation, offset: u64| {
+        format!(
+            "{URI}{}",
+            ursula_headers::ImmutableResource {
+                kind: ursula_headers::ResourceKind::Snapshot,
+                incarnation: token,
+                offset: Offset::from_u64(offset),
+            }
+            .path()
+        )
+    };
+
+    // Under the current token.
+    for (uri, headers, status) in [
+        (format!("{URI}?offset=0"), vec![], StatusCode::GONE),
+        (
+            format!("{URI}?offset=99"),
+            vec![],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (
+            format!("{URI}?offset=99&live=long-poll"),
+            vec![],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (chunk(old, 0), vec![], StatusCode::GONE),
+        (chunk(old, 99), vec![], StatusCode::RANGE_NOT_SATISFIABLE),
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(5)),
+            vec![],
+            StatusCode::NOT_FOUND,
+        ),
+        (snapshot(old, 5), vec![], StatusCode::NOT_FOUND),
+        (
+            snapshot(old, 10),
+            vec![("range", "bytes=100-")],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+    ] {
+        assert_names_token(&source, &uri, &headers, status, Some(old)).await;
+    }
+
+    // Under a token a restore retired: the restored stream's token.
+    let backup = export(&source).await;
+    let digest = blake3::hash(&backup).to_hex().to_string();
+    let target = app();
+    imported(import(&target, &backup, Some(&digest)).await).await;
+    let restored = head(&target).await.incarnation();
+    assert_ne!(restored, old);
+    let stale = old.to_string();
+    for (uri, headers, status) in [
+        (chunk(old, 0), vec![], StatusCode::GONE),
+        (chunk(old, 99), vec![], StatusCode::RANGE_NOT_SATISFIABLE),
+        (snapshot(old, 5), vec![], StatusCode::NOT_FOUND),
+        (
+            format!("{URI}?offset=0"),
+            vec![(names::STREAM_INCARNATION, stale.as_str())],
+            StatusCode::GONE,
+        ),
+        (
+            format!("{URI}?offset=99"),
+            vec![(names::STREAM_INCARNATION, stale.as_str())],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+    ] {
+        assert_names_token(&target, &uri, &headers, status, Some(restored)).await;
+    }
+
+    // No stream: no token.
+    let response = send(&target, "DELETE", URI, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_names_token(
+        &target,
+        &chunk(restored, 0),
+        &[],
+        StatusCode::NOT_FOUND,
+        None,
+    )
+    .await;
+    assert_names_token(
+        &target,
+        &snapshot(restored, 10),
+        &[],
+        StatusCode::NOT_FOUND,
+        None,
+    )
+    .await;
+}

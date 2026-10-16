@@ -9,6 +9,8 @@
 //!   meets after routing.
 //! - [`front_door`]: what a write's head decides before its body is read:
 //!   routing, early answers and deferred admission.
+//! - [`immutable_reads`]: the chunk and snapshot resources of one
+//!   incarnation that a shared cache can serve (extensions Section 4).
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
 //! - [`limits`]: the request and snapshot limits HEAD advertises and every
@@ -28,6 +30,7 @@ mod admission;
 mod bootstrap;
 mod cold_snapshot;
 mod front_door;
+mod immutable_reads;
 pub mod json_text;
 mod limits;
 mod otel_metrics;
@@ -155,6 +158,7 @@ use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ImportGroupStateRequest;
@@ -163,8 +167,10 @@ use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerEarlyAnswer;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
+use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
@@ -178,14 +184,17 @@ use crate::admission::PendingAdmission;
 use crate::admission::ingress_admission_middleware;
 use crate::front_door::BodyState;
 use crate::front_door::HeadDecision;
+use crate::render::COMPRESS_MIN_BYTES;
 use crate::render::Uncompressed;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
+use crate::render::compressible_media;
 use crate::render::error_answer;
 use crate::render::error_response;
 use crate::render::fixed_error_answer;
 use crate::render::fixed_error_response;
 use crate::render::http_read_content_type;
+use crate::render::if_none_match;
 use crate::render::insert_cache_control;
 use crate::render::insert_content_type;
 use crate::render::insert_cursor;
@@ -214,11 +223,13 @@ use crate::render::render_sse_read;
 use crate::render::response_cursor;
 use crate::render::runtime_error_body;
 use crate::render::should_base64_encode_sse_data;
+use crate::render::snapshot_etag;
 use crate::render::snapshot_head;
 use crate::render::snapshot_published_response;
 use crate::render::sse_error_event;
 use crate::render::stream_head;
 use crate::render::stream_seq_conflict;
+use crate::render::uncompressed;
 use crate::response_metadata::IdentityHeaders;
 use crate::response_metadata::ResponseMetadataLayer;
 
@@ -1518,14 +1529,7 @@ pub(crate) fn finite_record_response(
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| {
-            let media_type = content_type
-                .split(';')
-                .next()
-                .unwrap_or(content_type)
-                .trim();
-            media_type == "application/json" || media_type == "application/x-ndjson"
-        })
+        .is_some_and(compressible_media)
         && !headers.contains_key(names::ACCEPT_RANGES)
         && extensions.get::<Uncompressed>().is_none()
 }
@@ -1534,7 +1538,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
     let response_compression = CompressionLayer::new()
         .gzip(true)
         .quality(CompressionLevel::Fastest)
-        .compress_when(SizeAbove::new(256).and(finite_record_response));
+        .compress_when(SizeAbove::new(COMPRESS_MIN_BYTES).and(finite_record_response));
 
     Router::new()
         .route("/__ursula/metrics", get(metrics))
@@ -1555,6 +1559,14 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route(
             front_door::SNAPSHOT_PARTS_ROUTE,
             post(snapshot_parts::stage_snapshot_part),
+        )
+        .route(
+            immutable_reads::CHUNK_ROUTE,
+            get(immutable_reads::read_chunk),
+        )
+        .route(
+            immutable_reads::SNAPSHOT_ROUTE,
+            get(immutable_reads::read_immutable_snapshot),
         )
         .route(
             "/{bucket}/{stream}/retention/{retained_offset}",
@@ -3742,24 +3754,20 @@ pub(crate) async fn read_stream_by_id(
         (None, _) => {}
     }
 
-    let read_request = |leader_only| ReadStreamRequest {
-        stream_id: stream_id.clone(),
-        offset,
-        max_len,
-        now_ms: state.unix_time_ms(),
-        leader_only,
-        read_index: None,
-    };
-    let mut read = state.runtime.read_stream(read_request(leader_only)).await;
-    // A follower never answers `412` from a state that may lag (#581
-    // section 4.7): when its token differs from the request's, the read
-    // goes to the stream's leader, whose linearized state decides.
-    if !leader_only
-        && let (Some(expected), Ok(response)) = (if_incarnation, &read)
-        && response.incarnation != expected
-    {
-        read = state.runtime.read_stream(read_request(true)).await;
-    }
+    let read = read_at_token(
+        &state,
+        ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset,
+            max_len,
+            now_ms: state.unix_time_ms(),
+            leader_only,
+            read_index: None,
+            follower: FollowerRead::Prefix,
+        },
+        if_incarnation,
+    )
+    .await;
     match read {
         Ok(response) => {
             if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
@@ -3772,6 +3780,31 @@ pub(crate) async fn read_stream_by_id(
             }
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+    }
+}
+
+/// A catch-up read checked against the token the request expects. A
+/// follower never answers `412` from a state that may lag (#581 section
+/// 4.7): when its token differs from `expected`, the read goes to the
+/// stream's leader, whose linearized state decides.
+pub(crate) async fn read_at_token(
+    state: &HttpState,
+    request: ReadStreamRequest,
+    expected: Option<u64>,
+) -> Result<ReadStreamResponse, RuntimeError> {
+    let leader_only = request.leader_only;
+    let read = state.runtime.read_stream(request.clone()).await;
+    match (expected, &read) {
+        (Some(expected), Ok(response)) if !leader_only && response.incarnation != expected => {
+            state
+                .runtime
+                .read_stream(ReadStreamRequest {
+                    leader_only: true,
+                    ..request
+                })
+                .await
+        }
+        _ => read,
     }
 }
 
@@ -3939,6 +3972,7 @@ async fn verify_json_boundary(
             now_ms: state.unix_time_ms(),
             leader_only: true,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await;
     let byte = match read {
@@ -4113,10 +4147,17 @@ pub(crate) async fn advance_retention(
 )]
 pub(crate) async fn read_snapshot(
     State(state): State<HttpState>,
+    method: Method,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<SnapshotPath>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
+    if let Err(response) = parse_query(raw_query.as_deref())
+        .and_then(|query| removed_surface::reject_removed_snapshot_read_parameters(&query))
+    {
+        return *response;
+    }
     let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
@@ -4126,19 +4167,84 @@ pub(crate) async fn read_snapshot(
         Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
+    snapshot_answer(
+        &state,
+        SnapshotAnswer {
+            stream_id,
+            snapshot_offset,
+            if_incarnation,
+            resource: SnapshotResource::Stream,
+            body: SnapshotBody::of(&method),
+        },
+        &headers,
+        &request_target(&uri),
+    )
+    .await
+}
+
+/// Which resource a snapshot read answers for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotResource {
+    /// `{stream}/snapshot/{offset}` (extensions Section 2.5): it says
+    /// whether the snapshot is up to date.
+    Stream,
+    /// `{stream}/incarnation/{token}/snapshot/{offset}` (extensions Section
+    /// 4.1): always marked immutable, never `Stream-Up-To-Date`.
+    Immutable,
+}
+
+/// What a snapshot read asks for.
+pub(crate) struct SnapshotAnswer {
+    pub(crate) stream_id: BucketStreamId,
+    pub(crate) snapshot_offset: u64,
+    pub(crate) if_incarnation: Option<u64>,
+    pub(crate) resource: SnapshotResource,
+    pub(crate) body: SnapshotBody,
+}
+
+/// Whether a snapshot answer carries its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotBody {
+    /// A `GET`: the body, or the bytes of its range.
+    Sent,
+    /// A `HEAD`: the headers of the `GET` and no body, so a cold snapshot
+    /// is not read.
+    Omitted,
+}
+
+impl SnapshotBody {
+    pub(crate) fn of(method: &Method) -> Self {
+        if *method == Method::HEAD {
+            Self::Omitted
+        } else {
+            Self::Sent
+        }
+    }
+}
+
+/// The answer of a snapshot read, for both snapshot resources: `404`,
+/// `410` and `412` first, then a revalidation (`304`), then the byte range
+/// (addendum 7).
+pub(crate) async fn snapshot_answer(
+    state: &HttpState,
+    read: SnapshotAnswer,
+    headers: &HeaderMap,
+    request_target: &str,
+) -> Response {
     match state
         .runtime
         .read_snapshot(ReadSnapshotRequest {
-            stream_id: stream_id.clone(),
-            snapshot_offset: Some(snapshot_offset),
+            stream_id: read.stream_id,
+            snapshot_offset: Some(read.snapshot_offset),
             now_ms: state.unix_time_ms(),
             read_index: None,
         })
         .await
     {
         Ok(mut response) => {
-            // `404`, `410` and `412` come before the range (addendum 7).
-            if let Some(refused) = read_precondition_failed(if_incarnation, response.incarnation) {
+            if let Some(refused) =
+                read_precondition_failed(read.if_incarnation, response.incarnation)
+            {
                 return refused;
             }
             let object = response.object.take();
@@ -4147,13 +4253,32 @@ pub(crate) async fn read_snapshot(
                 || u64::try_from(payload.len()).unwrap_or(u64::MAX),
                 |object| object.payload_len,
             );
-            let range = ByteRange::parse(
-                headers
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
-            )
-            .and_then(|range| range.resolve(total));
-            let (status, mut response_headers) = snapshot_head(&response, range);
+            let revalidated = if_none_match(headers, &snapshot_etag(&response.snapshot_digest));
+            let range = if revalidated {
+                None
+            } else {
+                ByteRange::parse(
+                    headers
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_bytes())),
+                )
+                .and_then(|range| range.resolve(total))
+            };
+            let (status, mut response_headers) = match snapshot_head(
+                &response,
+                range,
+                read.resource,
+            ) {
+                Ok(head) => head,
+                Err(err) => {
+                    tracing::error!(error = %err, "a snapshot answer outside the protocol's range");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorCode::Internal,
+                        "snapshot answer outside the protocol's range",
+                    );
+                }
+            };
             if let Some(ContentRange::Unsatisfied { .. }) = range {
                 return error_answer(
                     status,
@@ -4162,14 +4287,22 @@ pub(crate) async fn read_snapshot(
                     response_headers,
                 );
             }
+            // The headers of the `200` it stands for (extensions Section 4.3).
+            if revalidated {
+                return uncompressed((StatusCode::NOT_MODIFIED, response_headers).into_response());
+            }
             let (start, len) = match range {
                 None => (0, total),
                 Some(ContentRange::Partial(span)) => (span.first(), span.len()),
                 Some(ContentRange::Unsatisfied { .. }) => (0, 0),
             };
+            if read.body == SnapshotBody::Omitted {
+                response_headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+                return uncompressed((status, response_headers).into_response());
+            }
             let body = match object {
                 Some(object) if len > 0 => {
-                    match cold_snapshot::cold_snapshot_body(&state, object, start, len).await {
+                    match cold_snapshot::cold_snapshot_body(state, object, start, len).await {
                         Ok(body) => body,
                         Err(response) => return response,
                     }
@@ -4193,11 +4326,9 @@ pub(crate) async fn read_snapshot(
                 }
             };
             response_headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
-            (status, response_headers, body).into_response()
+            uncompressed((status, response_headers, body).into_response())
         }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(state, err, request_target).await,
     }
 }
 
@@ -4270,7 +4401,8 @@ fn parse_path_offset(raw: &str, message: &'static str) -> Result<u64, BoxRespons
 /// A catch-up read's start position. Its `offset=now` HEAD is linearizable
 /// for `consistency=leader`; for `consistency=local` it reads the leader's
 /// applied state, which a just-elected leader may not have brought up to
-/// the committed tail, so it can resolve to a lagging tail.
+/// the committed tail, so it can resolve to a lagging tail. A missing stream
+/// is confirmed by a linearizable HEAD before it answers `404`.
 pub(crate) async fn read_offset(
     state: &HttpState,
     stream_id: &BucketStreamId,
@@ -4278,17 +4410,25 @@ pub(crate) async fn read_offset(
     request_target: &str,
     linearizable: bool,
 ) -> Result<u64, BoxResponse> {
+    let head = |linearizable| HeadStreamRequest {
+        stream_id: stream_id.clone(),
+        now_ms: state.unix_time_ms(),
+        linearizable,
+        read_index: None,
+    };
     match raw {
-        Some("now") => match state
-            .runtime
-            .head_stream(HeadStreamRequest {
-                stream_id: stream_id.clone(),
-                now_ms: state.unix_time_ms(),
-                linearizable,
-                read_index: None,
-            })
-            .await
-        {
+        Some("now") => match match state.runtime.head_stream(head(linearizable)).await {
+            // The leader's applied state may not hold a stream that was just
+            // created: a `404` is answered from a linearized HEAD only, as
+            // every read's `404` is (#581 section 5.3).
+            Err(err)
+                if !linearizable
+                    && err.stream_error_code() == Some(StreamErrorCode::StreamNotFound) =>
+            {
+                state.runtime.head_stream(head(true)).await
+            }
+            head => head,
+        } {
             Ok(head) => Ok(head.tail_offset),
             Err(err) => {
                 let response =
@@ -4339,13 +4479,16 @@ pub(crate) async fn long_poll_stream(
         let err = RuntimeError::GroupEngine {
             core_id: head.placement.core_id,
             raft_group_id: head.placement.raft_group_id,
-            error: GroupEngineError::stream_with_next_offset(
+            error: GroupEngineError::stream_with_context(
                 StreamErrorCode::OffsetOutOfRange,
                 format!(
                     "offset {offset} is beyond stream '{stream_id}' tail {}",
                     head.tail_offset
                 ),
                 Some(head.tail_offset),
+                vec![StreamErrorContext::StreamIncarnation {
+                    incarnation: head.incarnation,
+                }],
             ),
         };
         return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
@@ -4360,6 +4503,7 @@ pub(crate) async fn long_poll_stream(
             now_ms: state.unix_time_ms(),
             leader_only: false,
             read_index: owner.read_index,
+            follower: FollowerRead::Prefix,
         },
         incarnation,
     );
@@ -4495,6 +4639,7 @@ pub(crate) fn sse_stream(
             } else {
                 None
             },
+            follower: FollowerRead::Prefix,
         };
         let read = if state.initial_read {
             state.initial_read = false;
@@ -4535,7 +4680,7 @@ pub(crate) fn sse_stream(
         clamp_sse_text_read(&mut read, state.encode_base64);
 
         state.offset = read.next_offset;
-        let done = read.closed && read.up_to_date;
+        let done = read.end() == ReadEnd::ClosedTail;
         if !read.payload.is_empty() {
             state
                 .http_metrics
@@ -4559,7 +4704,9 @@ pub(crate) fn sse_stream(
         HEADER_STREAM_DATA_CONTENT_TYPE,
         http_read_content_type(&head.content_type),
     );
-    insert_cache_control(&mut headers, "no-cache");
+    // The base protocol asks an SSE answer for `no-cache`, and no cache may
+    // store a node's answer, so both.
+    insert_cache_control(&mut headers, "no-cache, no-store");
     insert_incarnation(&mut headers, head.incarnation);
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
@@ -5031,6 +5178,8 @@ mod cold_snapshot_tests;
 mod error_body_tests;
 #[cfg(test)]
 mod history_tests;
+#[cfg(test)]
+mod immutable_reads_tests;
 #[cfg(test)]
 mod server_metadata_tests;
 #[cfg(test)]
