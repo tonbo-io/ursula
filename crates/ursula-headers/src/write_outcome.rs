@@ -144,7 +144,7 @@
 //! | `json-boundary-unverified` | node | `503` | `JSON_BOUNDARY_UNVERIFIED`: a deterministic refusal at apply | `Refused` |
 //! | `snapshot-commits-busy` | node | `503` | `SNAPSHOT_COMMITS_BUSY` | `Refused` |
 //! | `snapshot-commit-in-progress` | node | `503` | `SNAPSHOT_COMMIT_IN_PROGRESS`: an earlier attempt of the commit, another commit or a discard of the stream runs | `Unknown` |
-//! | `internal` | node | `500` | `INTERNAL`, `CREATED_AT_OUT_OF_RANGE` | `Unknown` |
+//! | `internal` | node | `500` | `INTERNAL`, `CREATED_AT_OUT_OF_RANGE`, `HISTORY_MISMATCH` | `Unknown` |
 //! | `cold-store-failed` | node | `502` | `COLD_STORE_FAILED` | `Unknown` |
 //! | `gateway-invalid-credential` | gateway | `401` | `INVALID_CREDENTIAL`, `CREDENTIAL_EXPIRED` | `Refused` |
 //! | `gateway-forbidden` | gateway | `403` | `FORBIDDEN`, no producer header | `Refused` |
@@ -412,6 +412,7 @@ pub fn proves_refusal(status: u16, code: &ErrorCode) -> bool {
         | ErrorCode::ColdStoreFailed
         | ErrorCode::Internal
         | ErrorCode::CreatedAtOutOfRange
+        | ErrorCode::HistoryMismatch
         | ErrorCode::UpstreamTimeout
         | ErrorCode::UpstreamFailed
         | ErrorCode::Unknown(_) => None,
