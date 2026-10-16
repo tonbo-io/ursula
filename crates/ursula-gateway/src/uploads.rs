@@ -396,7 +396,10 @@ async fn acquire(
     };
     let waiting = async {
         match asks {
+            // Biased: a fixed poll order keeps the wait deterministic, and
+            // the first part's budget is tried first when both are free.
             [first, second] => tokio::select! {
+                biased;
                 acquired = acquiring(first) => Some(acquired),
                 acquired = acquiring(second) => Some(acquired),
             },
