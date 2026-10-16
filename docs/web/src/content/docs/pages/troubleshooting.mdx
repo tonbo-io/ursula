@@ -418,45 +418,74 @@ If hot bytes grow unbounded, you'll eventually hit `storage.cold.max_hot_size_pe
 
 ## SQLite VFS
 
-These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`. See [SQLite on Ursula](/docs/examples/sqlite-vfs).
+These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula` 0.8. See [SQLite on Ursula](/docs/examples/sqlite-vfs).
 
-### A commit or attach is refused with error code 7178
+### `synced()` does not resolve
 
-`SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`, `UrsulaWriteRefusedError` from `open`, its database, `attach` and `openUrsulaPiStorage`) means that a write was refused before it reached the stream, so nothing of it was applied. A refused commit was rolled back, but the file is not poisoned. Reads go on, and the next commit succeeds once the refusals stop, with no new attach. A refused attach claimed nothing. Attach again later, or attach read-only to read the database meanwhile. An attach whose claim a `402` refuses fails with `SQLITE_AUTH` (`errcode` 23) instead, and `open` and `attach` throw `UrsulaPaymentRequiredError`. For a refused commit, `status(file)` (`ursula_status`) reports `writes_refused: true` and names the refusal:
+`synced()` waits until the stream holds every commit made before the call. Commits keep working meanwhile. `db.status().replication.condition` says why it waits:
 
-| `refused_kind` | Refusal | What to do |
-| -------------- | ------- | ---------- |
-| `payment_required` | A layer in front of the stream answered `402` | Settle what the layer asks for. `refused_reason` carries its explanation |
-| `unauthorized` | The token was refused (`401`) until `URSULA_VFS_RETRY_MS` ran out | Set a fresh token with `setToken`, or fix the file `URSULA_VFS_TOKEN_FILE` names |
-| `forbidden` | The gateway's authorizer denied the write with a `403` | Allow the write in the authorizer |
-| `rate_limited` | `429` until `URSULA_VFS_RETRY_MS` ran out | With the code `RATE_LIMITED` in `refused_reason`, lower the write rate or raise the bucket's `requests_per_sec` in the gateway's `--quota-policy`. With `UPLOADS_EXHAUSTED` or `UPLOAD_BYTES_EXHAUSTED`, the bucket's large bodies under way reached its `max_concurrent_uploads` or `max_upload_bytes` there: raise them, or keep commits at or below the gateway's `--small-body-max-bytes` (1 MiB by default), which never count |
-| `too_large` | The transaction's commit frame is over `URSULA_VFS_MAX_FRAME_BYTES` (32 MiB by default), so the extension never sent it. Or a lower limit in front of the stream, such as the gateway's `--max-request-body-bytes` or a bucket's body limit, refused it with a `413` | Split the transaction. Other commits succeed as usual, and the next one that does clears the refusal. See [Rules](/docs/examples/sqlite-vfs#rules) |
-| `unreachable` | From 0.7.4: until `URSULA_VFS_RETRY_MS` ran out, every attempt failed before any byte of it went out, or was refused as above, and the last one failed before it went out. The stream URL's host did not resolve, or no connection to it was made: refused, timed out, or a failed TLS handshake. Nothing of the commit was sent | Check that the stream URL's host resolves from the client and that the gateway or the server behind it is up and reachable, through the proxy in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` when one is set (`NO_PROXY` excludes hosts). A failed TLS handshake shows in `refused_reason` as rustls reports it. `io: invalid peer certificate: UnknownIssuer` means the client does not trust the endpoint's certificate authority: point `URSULA_VFS_CA_FILE` at it. `io: invalid peer certificate: certificate not valid for name ...` means the stream URL names a host the certificate does not cover: use one it covers. `io: received corrupt message of type InvalidContentType` means an `https://` URL points at a port that speaks plain HTTP. `io: received fatal alert: ...` means the endpoint refused the handshake, for example over its TLS versions or cipher suites. Commits succeed again once the endpoint is reachable |
+| `condition` | Cause | What to do |
+| ----------- | ----- | ---------- |
+| `retrying` | No definite answer yet: the stream is unreachable, answers `5xx`, `429` or `408`, or the connection dropped. The append is resent unchanged after backoff. A `429` marked `TenantUploads` or `TenantUploadBytes` means the bucket's large bodies under way reached its `max_concurrent_uploads` or `max_upload_bytes` in the gateway's `--quota-policy` | Check that the stream URL's host resolves and that the gateway or the server behind it is up. Nothing is lost while it retries. For the upload refusals, raise those keys or keep commits at or below the gateway's `--small-body-max-bytes` (1 MiB by default), which never count |
+| `unauthorized` | The same token was refused twice (`401`) | Fix the token passed to `open` or the file `URSULA_VFS_TOKEN_FILE` names. A changed file is read again at once |
+| `forbidden` | An authorizer in front of the stream answered `403` | Allow the write in the authorizer |
+| `payment_required` | A layer in front of the stream answered `402` | Settle what the layer asks for |
+| `request_too_large` | A layer in front of the stream allows request bodies below 4 KiB | Raise the layer's limit |
+| `redirected` | The stream URL answers with a redirect, which the extension never follows | Point the URL at a gateway or at a single node |
+| `wrong_cluster` | The stream URL now reaches another deployment (another `Ursula-Cluster-Id`) | Fix the routing. Replication resumes by itself within 30 s |
+| `rejected` | A status the extension does not expect, such as a layer that rewrites bodies | Look at the layers between the client and the gateway |
 
-`refused_reason` is the refusing layer's response body. For `too_large` it is the frame's size and the limit, such as `41943104-byte frame over the 33554432-byte frame limit`. For `unreachable` it is the last attempt's failure, such as `timeout: resolve` or `io: Connection refused (os error 111)`.
+A blocked condition is retried every 30 s, and commits continue until `commits.pending_bytes` reaches `maxPendingBytes`. A `synced()` with a `signal` rejects with the signal's reason and leaves the commits replicating.
 
-A commit fails with 7178 only when every attempt of it was refused this way, or failed before any byte of it went out. One attempt that went out and got no answer, a `307`, or a `5xx` poisons the file instead, because that attempt may have been applied.
+### A write fails with error code 7178
 
-### The file is poisoned at the commit after a refused one
+`SQLITE_IOERR_AUTH` (`errcode` 7178 in `node:sqlite`, `UrsulaWriteRefusedError` from the package) means the write was refused before anything of it was committed. The database stays usable.
 
-`status(file)` reports `poisoned: true` with a `reason` that starts with `a commit refused as never applied may have been applied after all`. A commit failed with 7178, refused with an answer that says nothing was applied (a `401`, `402` or `429`). The next commit went out with the same producer sequence, and the stream answered it as a duplicate. So the stream holds a commit at that sequence that the file lacks: either the refused commit, applied after all, or the next commit, sent again by a layer in front of the stream. The answer does not tell which, so the extension poisoned the file instead of acknowledging a commit that may never have reached the stream.
+- `backlog_full`: compressed commits waiting for the stream reached `maxPendingBytes` (64 MiB by default). Await `db.synced()` and run the transaction again. If it stays full, see [`synced()` does not resolve](#synced-does-not-resolve).
+- `unsupported`: the transaction ran in EXCLUSIVE locking mode, or its commit leaves WAL mode or 4096-byte pages. Change the transaction. Other transactions go on.
 
-Attach the file again. The attach replays whichever commit the stream holds. Check which of the two transactions the database then holds before you run either again. When it holds the refused one, although its commit failed, a layer broke the rule in [Writes refused before they reach the stream](/docs/examples/sqlite-vfs#writes-refused-before-they-reach-the-stream). Find it:
+### Statements fail with error code 266 or 778
 
-- A proxy or service mesh that retries writes. Istio before 1.24 retries a `503` twice by default, POSTs included, and Istio 1.24 to 1.26 does the same when istiod runs with `EXCLUDE_UNSAFE_503_FROM_DEFAULT_RETRY=false`, which `compatibilityVersion=1.23` sets. Any version retries on a route whose `retryOn` includes `503`, `5xx`, `gateway-error` or `reset`. Set `retries: attempts: 0` on the routes that carry stream writes, to the gateway and from the gateway to the servers.
-- A proxy that follows redirects for writes.
-- A layer between `ursula gateway` and the servers that answers `401`, `402` or `429`.
-- A layer that refuses a write after it passed the write on, such as metering that answers `402` after the stream answered.
+The database was reset. Every statement throws an `UrsulaResetError` (`errcode` 266 for a read, 778 for a write), and `db.status().reset` names the kind:
 
-When the database holds the next transaction instead, a gateway sent that commit again to a new leader, after the old leader proposed it and redirected the gateway. No layer broke the rule, and nothing is lost.
+- `fenced` (`stop`): another process opened the stream and owns it now. Find that owner before you open the stream again, since opening it takes the stream back.
+- `stale` (`reopen`): the stream moved on while this process could not see it, for example after it was idle past producer expiry or opened provisionally during an outage. Open the stream again.
+- `rewound` (`reopen`): a restore or an accepted loss removed commits the stream had acknowledged. Open the stream again: the open moves the cache aside into `salvage/` (see below) and builds from the stream.
+- `deleted` (`fix`): the stream was deleted. Open it with `recreate: true` to create it again from the cache's data, or open another stream.
+- `local_damage` (`reopen`): a local fsync failed, a WAL page read back other bytes, or SQLite ended a commit without publishing it. Open the stream again: the log replays every commit. Check the disk if it repeats.
+- `stream_state` (`fix`): another writer appended to the stream, the stream was closed, or the server lost acknowledged state. The stream no longer matches the cache. Look at who writes to the stream.
+- `internal` (`reopen`): a bug inside the extension. A `panic` line on stderr names it. Open the stream again, and report it.
 
-### Reads of a fenced file fail with error code 266
+### `open` fails
 
-From 0.7.5, once an owner knows that another owner claimed its stream (its commit failed, and `status(file)` reports `poisoned: true` and `fenced: true`, or `error.kind` `fenced`), every new read transaction on the file fails with `SQLITE_IOERR_READ` (`errcode` 266 in `node:sqlite`, `disk I/O error`). `open`'s database and `openUrsulaPiStorage` report these reads, those inside a transaction included, as `UrsulaFencedError` (an `UrsulaReplicationError` with `fenced: true`, whose `action` is `stop`) with a message that starts with `read refused`. The file no longer holds what the stream does, so it serves nothing. A read transaction already open when the fence landed keeps its snapshot until it ends. Find the other owner. Attaching the file again takes the stream back from it, so do that only for a deliberate takeover.
+`open` throws an `UrsulaSetupError` or, when its signal fires first, an `UrsulaUnavailableError`. Every refusal leaves the cache as it was and sends nothing to the stream.
 
-### A file opens with "unable to open database file" after a failed attach
+| `kind` | Cause | What to do |
+| ------ | ----- | ---------- |
+| `server_too_old` | The stream's `HEAD` lacks `Ursula-Protocol: 2` or `Ursula-Cluster-Id`: a 0.7 server, or a layer that answers `HEAD` itself, such as a gateway whose authorizer conceals the stream | Run a 0.8 server, check the token, and send `HEAD` through to the server |
+| `stream_format` | The stream holds 0.7 data, or another content type | Move the database with an import, see [Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07) |
+| `wrong_cluster` | The cache was built on another deployment than the one the URL reaches now | Fix the routing, or use another `dir` for the other deployment |
+| `not_found` | The stream is missing and the cache holds data | Open with `recreate: true`, or open another stream |
+| `in_use` | Another process holds the cache | Stop that process, or use another `dir` |
+| `bound_elsewhere` | The stream is open in this process under another `dir` | Close that database, or pass its `dir` |
+| `stream_state` | The stream is closed | Open it read-only, or use another stream |
+| `unreachable`, `unavailable` | The signal fired while the stream could not be reached or did not answer | Check the network and the cluster. With a cache that claimed the stream before, `open` resolves provisionally instead |
 
-From 0.7.5 a file whose attach failed in the process (`SQLITE_CANTOPEN`, `errcode` 14) opens only after an attach of it succeeds, whether or not it has a sidecar `<db>-ursula`, so that no commit bypasses the stream. `status(file)` throws an error that names the failure: `ursula_status: attach_failed: <kind>: <file> is not attached: its last attach failed (<reason>)`. The kind says what to do, as in `ursula_attach`'s own error: `invalid_name` or `invalid_url` (fix the stream URL), `unreachable` or `unavailable` (attach again later), `local_setup` (the directory refuses the file: fix its permissions, its mount or its free space), `outcome_unknown` (the attach failed after its claim, which may have fenced the earlier owner: attach again), `fenced` (another owner claimed the stream during the attach). A failed attach that wrote nothing into a new file removes the sidecar it created. An attach refused because of the file itself, before it changed anything, records no failed attach and changes nothing. It fails with `in_use` while the process has the file, its `-wal`, `-shm` or `-journal` open outside the extension (a connection opened before the extension was loaded, or through another VFS, read-only ones included), or another process has the file open: close those connections, or that process, and attach again. The process's own descriptors are checked on Linux with `/proc` mounted and on macOS only. It fails with `unreplicated_file` when the file holds data but no sidecar: the file still opens, so copy its rows into a newly attached file, or move it and its `-wal` aside to attach the path. An attach that meets another process holding the file only after it changed the local files is a failed attach (`attach_failed: in_use`).
+### A cache appears in `salvage/`
+
+`status().salvage` lists caches the extension moved aside, in `salvage/` in the stream's cache directory: after a history change that lost commits the cache had, after a history change while the cache held commits it had no acknowledgement for, when the db file was not the cache's own (`replaced`), and with `recreate` (`recreated`). Each holds a plain SQLite database `db`, its log and a `manifest.json` with the tokens and the count of unacknowledged commits. Open `db` with any SQLite, compare it with the stream's database, and write again what you need. The extension never deletes a salvage.
+
+### `snapshot.error` is set
+
+`status().snapshot.error` says why snapshots are not published, and `snapshot.failures` counts the attempts. A database whose compressed snapshot is above the request limit (32 MiB) needs a cold backend on the server, which takes it in parts, up to 1 GiB. Until a snapshot publishes, the log grows and every fresh host reads all of it. Failed attempts wait from 100 ms up to five minutes, or an hour when the body is too large.
+
+### `file is not a database`
+
+A cache's db file holds a marker in place of SQLite's header magic, and its WAL is `db-uwal`. SQLite outside the extension (the `sqlite3` shell, node:sqlite without it, a connection opened before it loaded, `?vfs=unix`) fails with `SQLITE_NOTADB` and changes nothing. Read the database through `open`, or export it with `VACUUM INTO` from a connection `open` returned.
+
+### Closing a Pi session hangs during an outage
+
+On Pi Durable 1.3, `Session.close` waits for the storage calls in flight, and through `openUrsulaPiStorage` each waits for `synced()`, which waits for the stream. So `closeTimeoutMs` applies only once the session reaches the storage's `close`. Bound the shutdown in your host when it must end during an outage. The log keeps every commit for the next open.
 
 ## Still stuck?
 

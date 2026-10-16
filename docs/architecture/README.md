@@ -13,7 +13,7 @@ in the [specifications](../web/src/content/docs/pages/specs/).
 | [cluster-membership.md](cluster-membership.md) | Static membership, replica rebuild, the admin surface, the maintenance fence and reservation protocol. |
 | [deterministic-simulation-testing.md](deterministic-simulation-testing.md) | The madsim harness, its scenarios, faults, invariants, corpus and audits. |
 | [immutable-reads.md](immutable-reads.md) | The chunk and snapshot resources a shared cache can serve: routes, the grid, marking, follower forwarding, validators. |
-| [sqlite-vfs.md](sqlite-vfs.md) | The replicating SQLite VFS: writes, attach and fencing, snapshots, guarantees, failure model, limits. |
+| [sqlite-vfs.md](sqlite-vfs.md) | The replicating SQLite VFS: the local commit log, ordered replication and the output gate, claims and reconcile, snapshots, local generations, history changes, the API, the tests behind each guarantee, limits. |
 
 A document here states what is true of the code. Plans, open questions and work in progress
 belong in GitHub issues and pull requests, and history belongs in git.
