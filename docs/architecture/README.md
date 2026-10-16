@@ -12,6 +12,7 @@ in the [specifications](../web/src/content/docs/pages/specs/).
 | [bounded-stream-state.md](bounded-stream-state.md) | Why per-stream state stays bounded on a long-lived stream, mechanism by mechanism, and the CI ratchet that holds it. |
 | [cluster-membership.md](cluster-membership.md) | Static membership, replica rebuild, the admin surface, the maintenance fence and reservation protocol. |
 | [deterministic-simulation-testing.md](deterministic-simulation-testing.md) | The madsim harness, its scenarios, faults, invariants, corpus and audits. |
+| [immutable-reads.md](immutable-reads.md) | The chunk and snapshot resources a shared cache can serve: routes, the grid, marking, follower forwarding, validators. |
 | [sqlite-vfs.md](sqlite-vfs.md) | The replicating SQLite VFS: writes, attach and fencing, snapshots, guarantees, failure model, limits. |
 
 A document here states what is true of the code. Plans, open questions and work in progress

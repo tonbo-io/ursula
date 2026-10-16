@@ -1,0 +1,60 @@
+---
+title: Immutable reads
+api: "GET /{bucket}/{stream}/incarnation/{token}/chunk/{offset}"
+---
+
+`GET /{bucket}/{stream}/incarnation/{token}/chunk/{offset}` and `GET /{bucket}/{stream}/incarnation/{token}/snapshot/{offset}` read the parts of a stream that can no longer change: the bytes below the tail, in chunks of 4 MiB, and the latest snapshot. The stream's token and the offset are in the path, so a cache such as a CDN can store an answer under its URL and serve it to every reader of the same stream. See [immutable reads](/docs/specs/extensions#4-immutable-reads).
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID.
+</ParamField>
+
+<ParamField path="token" type="string" required>
+ The stream's `Stream-Incarnation` token, as [`HEAD`](/docs/api/head-stream) returned it. It is the read's precondition: when the stream's current token is another, the read answers `412`. A `Stream-Incarnation` request header has no effect here.
+</ParamField>
+
+<ParamField path="offset" type="string" required>
+ A chunk's first offset, or a snapshot's offset: the 20-character zero-padded decimal token returned by `Stream-Next-Offset` or `Stream-Snapshot-Offset`. Any other form answers `400`.
+</ParamField>
+
+A chunk answer holds the stream's bytes from `offset` to the next multiple of 4 MiB (4,194,304), or to the tail when the tail comes first. A reader that starts anywhere and continues from `Stream-Next-Offset` requests the same URLs as every other reader after one answer.
+
+| Status | Meaning |
+| ------ | -------------------------------------- |
+| `200` | The chunk or the snapshot. |
+| `206` | The requested byte range of the snapshot, as in [read snapshot](/docs/api/read-snapshot). |
+| `304` | `If-None-Match` named the answer's `ETag`. The headers are those of the `200`, the marker included. |
+| `307` | In a cluster, this node cannot answer the read and is not the stream's group leader. `Location` is the same request on the leader. |
+| `400` | The request has a query (`QUERY_NOT_ACCEPTED`), or the token or the offset is not in the form the server issues (`INVALID_RESOURCE`). On the stream and snapshot routes, the `incarnation` and `aligned` parameters of the earlier query form answer `400` too (`UNSUPPORTED`), naming the path form. |
+| `404` | The stream does not exist, or the snapshot is not the latest. In the second case `Stream-Incarnation` is the stream's current token. |
+| `410` | The chunk starts below the stream's retained offset. `Stream-Incarnation` is the stream's current token, which differs from the path's when the stream was replaced. |
+| `412` | `token` is not the stream's current token. The response's `Stream-Incarnation` is the current token. |
+| `416` | The chunk starts past the tail, or the range starts past the end of the snapshot. `Stream-Incarnation` is the stream's current token, which differs from the path's when the stream was replaced. |
+| `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
+
+A `HEAD` of a chunk reads the chunk, at most 4 MiB, to compute its `ETag`. A `HEAD` of a snapshot answers from the snapshot's metadata and reads no body. A chunk's `ETag` is strong and covers its body, and `If-None-Match` is compared weakly.
+
+A chunk answer carries `Content-Type` (`application/x-ndjson` for a JSON stream), `Stream-Incarnation`, `Stream-Offset` (equal to `offset`), `Stream-Next-Offset` and `ETag`, and no `Stream-Up-To-Date` or `Stream-Cursor`. A snapshot answer carries the headers of [read snapshot](/docs/api/read-snapshot) without `Stream-Up-To-Date`. Accept a `206` only when its `Content-Range` names exactly the range you asked for and the body is that long: a cache that merges ranges could hand you another slice under the same digest.
+
+`Stream-Immutable: true` marks an answer that no later answer for the same URL contradicts: a chunk that reaches the end of its 4 MiB chunk below the tail, the chunk at the tail of a closed stream (with `Stream-Closed: true`), and every snapshot answer. A chunk that holds the tail of an open stream is not marked: read on from its `Stream-Next-Offset` with an ordinary [read](/docs/api/read). A follower answers a chunk itself only when it can mark it, and leaves the others to the leader. The leader answers a chunk it cannot mark, and any read that would answer `404`, `410` or `416`, only after it confirmed its leadership with a majority of voters, so a just-elected leader never answers from a state that lags. A leader that cannot reach a majority answers those with `307` or `503` instead, and still answers the chunks it can mark.
+
+Ursula sends `Cache-Control: no-store` on these answers, as on every other, and never compresses them. A layer in front that authorizes every request before its cache MAY replace `Cache-Control` on marked answers, and MAY name its own origin for these paths in a `Stream-Read-Origin` header on `HEAD`. Ursula itself never sends that header.
+
+<RequestExample>
+```bash Read the first chunk
+TOKEN=$(curl -sI http://127.0.0.1:4437/demo/hello | awk -F': ' 'tolower($1)=="stream-incarnation" {print $2}' | tr -d '\r')
+curl -i "http://127.0.0.1:4437/demo/hello/incarnation/$TOKEN/chunk/00000000000000000000"
+```
+
+```bash Read the latest snapshot
+curl -i "http://127.0.0.1:4437/demo/hello/incarnation/$TOKEN/snapshot/00000000000000000042"
+```
+</RequestExample>
+
+<Info>
+After a restore or another history rewrite the stream has a new token, so every URL of the old one answers `412` and a cache never needs purging. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+</Info>

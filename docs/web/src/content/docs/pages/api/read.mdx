@@ -67,13 +67,13 @@ api: "GET /{bucket}/{stream}"
 | ------ | ------------------------------------------------------------- |
 | `200` | Data returned. A catch-up read at the tail answers `200` with an empty body and `Stream-Up-To-Date: true`. |
 | `204` | Long-poll only: `timeout_ms` passed without new data, or the stream is closed and the read is at its tail (answered at once with `Stream-Closed: true`, which signals end of stream). |
-| `304` | `If-None-Match` matched the response's `ETag`. |
-| `307` | In a cluster, this node could not serve the read as the stream's group leader (a long-poll or SSE read on a follower, or a `consistency=leader` read on a node that lost leadership). `Location` is the same request on the leader. |
-| `400` | Invalid offset, live mode or `consistency`, `consistency=leader` with `live`, or a read parameter removed in 0.6.0 (see the [release notes](/docs/release-notes)). |
+| `304` | `If-None-Match` matched the response's `ETag`, compared weakly. A read the server may gzip (JSON or NDJSON, at least 256 bytes) has a weak tag (`W/"…"`). |
+| `307` | In a cluster, this node could not serve the read as the stream's group leader (a long-poll or SSE read on a follower, a `consistency=leader` read on a node that lost leadership, or a read that would answer `404`, `410` or `416` on a leader that cannot confirm its leadership). `Location` is the same request on the leader. |
+| `400` | Invalid offset, live mode or `consistency`, `consistency=leader` with `live`, a read parameter removed in 0.6.0 (see the [release notes](/docs/release-notes)), or `incarnation` or `aligned`, which [immutable reads](/docs/api/immutable-reads) carry in the path instead. |
 | `404` | Stream not found or expired. |
-| `410` | Requested offset has been trimmed. `Stream-Next-Offset` is the earliest offset still readable. |
+| `410` | Requested offset has been trimmed. `Stream-Next-Offset` is the earliest offset still readable, and `Stream-Incarnation` the token of the stream that answered. |
 | `412` | `Stream-Incarnation` did not match: the stream was deleted and recreated. The response's `Stream-Incarnation` is the current token. A read that would answer `404`, `410` or `416` without the header still does. |
-| `416` | Requested offset is beyond the stream's tail. `Stream-Next-Offset` is the tail. |
+| `416` | Requested offset is beyond the stream's tail, on a catch-up read or a long-poll. `Stream-Next-Offset` is the tail, and `Stream-Incarnation` the token of the stream that answered. A `410` or `416` comes before the `Stream-Incarnation` precondition, so compare its token with yours: another token means the stream was replaced, not that your offset is wrong. |
 | `503` | The group has no known leader, the leader could not confirm its leadership in time (`consistency=leader` and live reads), or this node holds too many live readers. Retry after `Retry-After`. |
 
 Response headers include `Stream-Next-Offset`, `Stream-Incarnation`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`; the SSE response and the long-poll `204` carry `Stream-Incarnation` too. Long-poll responses for an open stream also carry `Stream-Cursor`.

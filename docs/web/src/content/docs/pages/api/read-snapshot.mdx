@@ -29,14 +29,16 @@ api: "GET /{bucket}/{stream}/snapshot/{offset}"
 | ------ | -------------------------------------- |
 | `200` | Snapshot blob returned. |
 | `206` | The requested byte range returned. |
+| `304` | `If-None-Match` named the snapshot's `ETag`. The headers are those of the `200`. |
 | `307` | In a cluster, this node is not the stream's group leader. `Location` is the same request on the leader. |
-| `404` | Stream, snapshot, or offset not found. |
+| `400` | The request carries `incarnation`, which [immutable reads](/docs/api/immutable-reads) carry in the path instead. |
+| `404` | Stream, snapshot, or offset not found. When the stream exists and the snapshot is not its latest, `Stream-Incarnation` is the stream's token. |
 | `412` | `Stream-Incarnation` did not match. The response's `Stream-Incarnation` is the current token. |
-| `416` | The range starts at or past the end of the snapshot. `Content-Range: bytes */total` names its size. |
+| `416` | The range starts at or past the end of the snapshot. `Content-Range: bytes */total` names its size, and `Stream-Incarnation` the stream's token. |
 | `502` | The snapshot body is in the cold tier and could not be read. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
-Response headers include `Content-Type`, `Content-Length`, `Accept-Ranges: bytes`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. They describe the whole snapshot on a `206` too: the digest always covers the whole body. A `404` or `412` comes before the range is looked at. A body stored in the cold tier is streamed from it. Snapshot answers are never compressed.
+Response headers include `Content-Type`, `Content-Length`, `Accept-Ranges: bytes`, `ETag` (the snapshot digest in quotes), `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. They describe the whole snapshot on a `206` too: the digest always covers the whole body. A `404` or `412` comes before the range is looked at, and a revalidation with `If-None-Match` answers `304` before it too. To read a snapshot through a cache, use [immutable reads](/docs/api/immutable-reads). A body stored in the cold tier is streamed from it. Snapshot answers are never compressed.
 
 <RequestExample>
 ```bash Read specific offset
