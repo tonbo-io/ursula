@@ -144,6 +144,8 @@ struct World {
     sent: Vec<Sent>,
     /// HEADs are answered as a protocol 1 server would.
     legacy: bool,
+    /// HEADs are answered `404` without `Ursula-Protocol`, as a gateway that conceals a stream.
+    concealed: bool,
     /// Disk jobs it matches wait in `held` instead of running.
     hold: Option<fn(&DiskJob) -> bool>,
     held: Vec<(usize, DiskIo)>,
@@ -181,6 +183,7 @@ impl World {
             now: 0,
             sent: Vec::new(),
             legacy: false,
+            concealed: false,
             after_head: None,
             skip_heads: 0,
             every_head: None,
@@ -233,6 +236,9 @@ impl World {
         }
         if self.legacy && request.method == Method::Head {
             return Exchange::Answered(Box::new(RawAnswer::new(200).parse(request)));
+        }
+        if self.concealed && request.method == Method::Head {
+            return Exchange::Answered(Box::new(RawAnswer::new(404).parse(request)));
         }
         if self.misroute_after_heads == Some(0) {
             self.misroute_after_heads = None;
@@ -910,6 +916,24 @@ fn highest_claim(bytes: &[u8]) -> Epoch {
 /// last commit is `last`, and moves retention up to it.
 fn snapshot_as(server: &mut ModelServer, last: CommitId) {
     let bytes = server.frames(PATH).unwrap().to_vec();
+    let tail = publish_image(server, last, &image_of(&bytes));
+    let keys = ursula_headers::ProducerRequestHeaders {
+        producer: None,
+        precondition: Some(ursula_headers::IncarnationPrecondition {
+            incarnation: server.token(PATH).unwrap(),
+        }),
+    };
+    let retain = Request {
+        keys,
+        ..Request::new(Method::Put, Target::Retention { offset: tail })
+    };
+    assert_eq!(server.handle(PATH, &retain).status, 204);
+}
+
+/// Publishes a real `USS3` snapshot of `image` at the stream's tail, whose last commit is `last`:
+/// the tail.
+fn publish_image(server: &mut ModelServer, last: CommitId, image: &[u8]) -> ursula_headers::Offset {
+    let bytes = server.frames(PATH).unwrap().to_vec();
     let tail = ursula_headers::Offset::from_u64(bytes.len() as u64);
     let fields = crate::codec::snapshot::SnapshotFields {
         offset: tail,
@@ -917,12 +941,8 @@ fn snapshot_as(server: &mut ModelServer, last: CommitId) {
         last,
     };
     let mut body = Vec::new();
-    crate::codec::snapshot::write_body(
-        &fields,
-        &mut std::io::Cursor::new(image_of(&bytes)),
-        &mut body,
-    )
-    .unwrap();
+    crate::codec::snapshot::write_body(&fields, &mut std::io::Cursor::new(image), &mut body)
+        .unwrap();
     let mut digester = crate::codec::digest::SnapshotDigester::new(CONTENT_TYPE);
     digester.update(&body);
     let token = server.token(PATH).unwrap();
@@ -931,18 +951,14 @@ fn snapshot_as(server: &mut ModelServer, last: CommitId) {
         precondition: Some(ursula_headers::IncarnationPrecondition { incarnation: token }),
     };
     let publish = Request {
-        keys: keys.clone(),
+        keys,
         content_type: Some(CONTENT_TYPE.to_owned()),
         snapshot_digest: Some(digester.finalize()),
         body: Arc::from(body),
         ..Request::new(Method::Put, Target::Snapshot { offset: tail })
     };
     assert_eq!(server.handle(PATH, &publish).status, 204);
-    let retain = Request {
-        keys,
-        ..Request::new(Method::Put, Target::Retention { offset: tail })
-    };
-    assert_eq!(server.handle(PATH, &retain).status, 204);
+    tail
 }
 
 /// [`snapshot_as`] by an owner of another lineage.
@@ -1391,6 +1407,205 @@ fn a_commit_answered_400_stages_its_parts_again_once() {
         "{e}"
     );
     assert_eq!(*always.commits.lock().unwrap(), 2);
+}
+
+/// A transport to the model that rewrites the answers `rewrite` picks.
+struct Rewrite {
+    server: Arc<Mutex<ModelServer>>,
+    rewrite: fn(&Request, RawAnswer) -> RawAnswer,
+}
+
+impl Transport for Rewrite {
+    fn send(&self, request: &Request, _attempt: crate::transport::Attempt) -> Exchange {
+        let raw = self.server.lock().unwrap().handle(PATH, request);
+        Exchange::Answered(Box::new((self.rewrite)(request, raw).parse(request)))
+    }
+}
+
+/// `raw` when `request` is not a publish or commit, else `status` alone.
+fn publish_answered(request: &Request, raw: RawAnswer, status: u16) -> RawAnswer {
+    match (request.method, request.target) {
+        (Method::Put, Target::Snapshot { .. }) => RawAnswer::new(status),
+        _ => raw,
+    }
+}
+
+// A 409 that names our offset and digest as the latest is an earlier attempt's publish: ours,
+// checked before any other conflict, single or in parts.
+#[test]
+fn a_409_naming_our_snapshot_is_published() {
+    let (server, token) = cold_world();
+    let conflict = |request: &Request, raw: RawAnswer| {
+        let answer = raw.parse(request);
+        match (request.method, answer.typed) {
+            (
+                Method::Put,
+                Ok(crate::wire::Typed::Snapshot(
+                    ursula_headers::SnapshotPublishAnswer::Published { snapshot, .. },
+                )),
+            ) => {
+                let latest = ursula_headers::SnapshotPublishAnswer::Conflict { latest: snapshot };
+                let mut raw = RawAnswer::new(latest.status());
+                latest.render(raw.emit());
+                raw
+            }
+            _ => raw,
+        }
+    };
+    for limit in [32 << 20, 4096] {
+        grow(&server);
+        let transport = Rewrite {
+            server: Arc::clone(&server),
+            rewrite: conflict,
+        };
+        let body = body_file(tail_of(&server), 3);
+        assert_eq!(
+            publish_through(&transport, token, limit, &body).unwrap(),
+            crate::snapshotter::Outcome::Published {
+                offset: body.offset
+            },
+            "limit {limit}"
+        );
+    }
+}
+
+// A 501 to a single request at or under the limit is no size refusal: the stream answered 501.
+// To a commit it means the stream takes no parts.
+#[test]
+fn a_501_is_a_size_refusal_only_for_parts() {
+    let (server, token) = cold_world();
+    let transport = Rewrite {
+        server: Arc::clone(&server),
+        rewrite: |request, raw| publish_answered(request, raw, 501),
+    };
+    let e =
+        publish_through(&transport, token, 32 << 20, &body_file(tail_of(&server), 1)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::Status {
+            status: 501,
+            ..
+        }),
+        "{e}"
+    );
+    assert!(!e.to_string().contains("request limit"), "{e}");
+    let e = publish_through(&transport, token, 4096, &body_file(tail_of(&server), 3)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            bound: crate::snapshotter::SizeBound::NoParts { request: 4096 },
+            ..
+        }),
+        "{e}"
+    );
+}
+
+// A 413 to a part names the limit it met: not published, too large.
+#[test]
+fn a_413_to_a_part_is_too_large() {
+    let (server, token) = cold_world();
+    let transport = Rewrite {
+        server: Arc::clone(&server),
+        rewrite: |request, raw| match request.target {
+            Target::SnapshotParts { .. } => {
+                let mut raw = RawAnswer::new(ursula_headers::SizeLimit::STATUS);
+                ursula_headers::SizeLimit::Request(2048).render(raw.emit());
+                raw
+            }
+            _ => raw,
+        },
+    };
+    let e = publish_through(&transport, token, 4096, &body_file(tail_of(&server), 3)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            bound: crate::snapshotter::SizeBound::Request(2048),
+            ..
+        }),
+        "{e}"
+    );
+}
+
+// A part past the stream's limit of staged parts (429) ends the attempt at once: the staged parts
+// are discarded (DELETE), and a later attempt stages again and publishes.
+#[test]
+fn a_part_past_the_staged_limit_discards_the_parts_and_a_later_attempt_publishes() {
+    let (server, token) = cold_world();
+    let mut limits = server.lock().unwrap().limits();
+    limits.max_staged_parts = 2;
+    server.lock().unwrap().set_limits(limits);
+    let body = body_file(tail_of(&server), 4);
+    let e = publish_file(&server, token, 4096, &body).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::StagedPartsFull {
+            status: 429
+        }),
+        "{e}"
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0, "discarded");
+    assert_eq!(retention(&server).1, None);
+    limits.max_staged_parts = crate::model::MAX_STAGED_PARTS;
+    server.lock().unwrap().set_limits(limits);
+    assert_eq!(
+        publish_file(&server, token, 4096, &body).unwrap(),
+        crate::snapshotter::Outcome::Published {
+            offset: body.offset
+        }
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0);
+}
+
+// A 429 to a part that names no limit of staged parts (a gateway's rate limit) is sent again like
+// any transient answer: the publish goes on and nothing is discarded.
+#[test]
+fn a_rate_limited_part_is_sent_again() {
+    let (server, token) = cold_world();
+    server.lock().unwrap().inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::Status {
+            status: 429,
+            retry_after: None,
+        },
+        times: 2,
+    });
+    let body = body_file(tail_of(&server), 4);
+    assert_eq!(
+        publish_file(&server, token, 4096, &body).unwrap(),
+        crate::snapshotter::Outcome::Published {
+            offset: body.offset
+        }
+    );
+    assert_eq!(
+        snapshot_body(&server, token),
+        std::fs::read(&body.path).unwrap()
+    );
+}
+
+// A binding that stops while its parts go up sends no part more, and discards the ones staged.
+#[test]
+fn a_stopped_snapshot_thread_stages_no_more_parts() {
+    let (server, token) = cold_world();
+    let body = body_file(tail_of(&server), 4);
+    let transport = ModelTransport::new(Arc::clone(&server), PATH);
+    let snapper = crate::snapshotter::Snapper::default();
+    snapper.stop();
+    let e = crate::snapshotter::publish(&crate::snapshotter::Publish {
+        remote: crate::snapshotter::Remote {
+            transport: &transport,
+            snapper: &snapper,
+            cluster_id: "cluster-a",
+            incarnation: token,
+        },
+        request_limit: 4096,
+        offset: body.offset,
+        digest: body.digest,
+        body: &body.path,
+        len: body.len,
+    })
+    .unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::Reset),
+        "{e}"
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0);
+    assert_eq!(retention(&server).1, None);
 }
 
 // A publish behind a later snapshot is superseded, and moves nothing.
@@ -2345,6 +2560,203 @@ fn a_server_without_protocol_2_is_refused() {
         matches!(*e, OpenError::ServerTooOld { protocol: None }),
         "{e}"
     );
+}
+
+// A gateway's concealing 404 carries no `Ursula-Protocol`: it is no missing stream. An open over
+// no generation creates nothing, and one with `recreate` over a generation holding data salvages
+// nothing: both are refused server_too_old.
+#[test]
+fn a_head_404_without_the_protocol_is_no_missing_stream() {
+    let dir = TempDir::new("driver-concealed");
+    let mut w = World::new();
+    w.concealed = true;
+    let c = w.core();
+    let e = kind(w.open_result(c, spec(dir.path(), 1)));
+    assert!(
+        matches!(*e, OpenError::ServerTooOld { protocol: None }),
+        "{e}"
+    );
+    assert!(w.server.token(PATH).is_none(), "nothing created");
+
+    let dir = TempDir::new("driver-concealed-data");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.retire(c, &bound);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.concealed = true;
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, OpenSpec {
+        access: Access::Owner { recreate: true },
+        ..spec(dir.path(), 2)
+    }));
+    assert!(
+        matches!(*e, OpenError::ServerTooOld { protocol: None }),
+        "{e}"
+    );
+    assert!(generation.exists(), "the generation stays");
+    assert!(!stream_root(dir.path()).join("salvage").exists());
+}
+
+/// Whether the stream's root under `dir` holds a published generation.
+fn has_generation(dir: &Path) -> bool {
+    std::fs::read_dir(stream_root(dir)).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("gen-") && !name.ends_with(".tmp")
+        })
+    })
+}
+
+// The claim of an import with no snapshot past it (an import in progress, or one that failed): an
+// owner's build from offset 0 and a reader's both refuse stream_state and build nothing.
+#[test]
+fn a_build_from_offset_0_refuses_the_claim_of_an_import() {
+    let mut w = World::new();
+    create(&mut w.server);
+    let epoch = Epoch::try_from(1).unwrap();
+    let body = frame::encode_claim(epoch, crate::codec::frame::IMPORT_ACTIVATION);
+    assert_eq!(
+        w.server.foreign_claim(PATH, epoch, &body).unwrap().status,
+        200
+    );
+    let tail = w.server.frames(PATH).unwrap().len();
+    for reader in [false, true] {
+        let dir = TempDir::new("driver-import-claim");
+        let c = w.core();
+        let spec = if reader {
+            reader_spec(dir.path())
+        } else {
+            spec(dir.path(), 1)
+        };
+        let e = kind(w.open_result(c, spec));
+        assert!(
+            matches!(*e, OpenError::ImportIncomplete { end } if end.get() == tail as u64),
+            "{e}"
+        );
+        assert_eq!(e.error_kind().as_str(), "stream_state");
+        assert!(!has_generation(dir.path()), "nothing built");
+        assert_eq!(w.server.frames(PATH).unwrap().len(), tail, "nothing sent");
+    }
+}
+
+/// What an import does to the stream (`crate::import`): its claim, then a snapshot of one page
+/// filled with `salt` at the claim's end, retention left at 0.
+fn import_page(server: &mut ModelServer, salt: u8) {
+    let epoch = Epoch::try_from(1).unwrap();
+    let body = frame::encode_claim(epoch, crate::codec::frame::IMPORT_ACTIVATION);
+    assert_eq!(
+        server.foreign_claim(PATH, epoch, &body).unwrap().status,
+        200
+    );
+    let last = CommitId {
+        lineage: crate::ids::Lineage([0x1d; 16]),
+        position: Position(0),
+    };
+    publish_image(server, last, &sqlite(Box::new([salt; 4096]))[..]);
+}
+
+// A reader generation built on the stream before an import (empty, acknowledged at 0) reopens
+// after it: the HEAD names the import's snapshot past its ACK, so it builds from the snapshot
+// rather than catching up through the import's claim.
+#[test]
+fn a_reader_built_before_an_import_reopens_from_its_snapshot() {
+    let dir = TempDir::new("driver-reader-import");
+    let mut w = World::new();
+    create(&mut w.server);
+    let r = w.core();
+    let before = w.open(r, reader_spec(dir.path()));
+    let old = before.handle.generation.dir.clone();
+    w.retire(r, &before);
+    drop(before);
+    import_page(&mut w.server, 0x11);
+    let r2 = w.core();
+    let reader = w.open(r2, reader_spec(dir.path()));
+    let h = &reader.handle;
+    assert!(
+        matches!(h.attach, Attach::Built {
+            snapshot: Some(_),
+            ..
+        }),
+        "{:?}",
+        h.attach
+    );
+    assert_ne!(h.generation.dir, old, "built anew");
+    assert_eq!(db_bytes(&reader), page_on_disk(h.generation.lineage, 0x11));
+}
+
+// An owner that built on the empty stream and crashed before its claim went out, then an import:
+// its generation holds no data and is behind the import's snapshot, so the reopen builds from the
+// snapshot, its generation trashed, and claims once, after the build: no claim goes out before
+// the decision, and none resets.
+#[test]
+fn an_empty_owner_behind_an_import_builds_from_its_snapshot_and_claims_after() {
+    let dir = TempDir::new("driver-owner-import");
+    let mut w = World::new();
+    create(&mut w.server);
+    w.hold = Some(|job| matches!(job, DiskJob::Publish(_)));
+    let a = w.core();
+    let now = w.now;
+    let open = OpenId(w.id());
+    let ios = w.c(a).open(open, spec(dir.path(), 1), now);
+    w.queue_ios(a, ios);
+    w.run_for(5_000);
+    assert_eq!(w.held.len(), 1, "the build reached its publish");
+    // The publish completes, and the core dies before anything after it goes out.
+    w.hold = None;
+    let (core, DiskIo { id, job }) = w.held.pop().unwrap();
+    let done = job.run();
+    let now = w.now;
+    drop(w.c(core).disk_done(id, done, now));
+    w.crash(a);
+    assert!(w.claims(a).is_empty(), "its claim never went out");
+    assert!(has_generation(dir.path()), "its generation is published");
+    let old = std::fs::read_dir(stream_root(dir.path()))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("gen-"))
+        .unwrap();
+    import_page(&mut w.server, 0x22);
+
+    let b = w.core();
+    let first = w.sent.len();
+    let bound = w.open(b, spec(dir.path(), 2));
+    let h = &bound.handle;
+    assert!(
+        matches!(h.attach, Attach::Built {
+            snapshot: Some(_),
+            salvaged: None
+        }),
+        "{:?}",
+        h.attach
+    );
+    assert_ne!(h.generation.dir, old, "built anew");
+    assert!(!old.exists(), "the old generation is trashed");
+    assert_eq!(db_bytes(&bound), page_on_disk(h.generation.lineage, 0x22));
+    let sent: Vec<&Request> = w.sent[first..]
+        .iter()
+        .filter(|s| s.core == b)
+        .map(|s| &s.request)
+        .collect();
+    let snapshot_read = sent
+        .iter()
+        .position(|r| r.method == Method::Get && matches!(r.target, Target::Snapshot { .. }))
+        .expect("the build read the snapshot");
+    let first_post = sent
+        .iter()
+        .position(|r| r.method == Method::Post)
+        .expect("it claimed");
+    assert!(first_post > snapshot_read, "no claim before the build");
+    assert_eq!(w.claims(b).len(), 1, "one claim");
+    // The binding is live: a commit is acknowledged.
+    w.commit(b, &bound, 3).unwrap();
+    let ticket = w.sync(b, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(b, ticket), Some(Ok(())));
 }
 
 #[test]

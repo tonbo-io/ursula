@@ -21,7 +21,8 @@
 //!    with `Stream-Snapshot-Digest`; a larger one, when the HEAD's `Ursula-Max-Snapshot-Bytes`
 //!    holds it in at most 4096 parts of `L`, in parts ([`publish`]): each part read from the body
 //!    file and staged with `POST {stream}/snapshot/{W}/parts`, then one commit listing their ids.
-//!    Only a `204` naming `W` and the digest confirms it. A `409` with a later offset, or a `410`
+//!    Only a `204` naming `W` and the digest confirms it, or a `409` naming them as the latest
+//!    (an earlier attempt's publish). A `409` with a later offset, or a `410`
 //!    below a later snapshot's retention, means another snapshot superseded it; one at `W` with
 //!    another digest stops snapshots (`stream_state`); a body no request or commit can carry is
 //!    not published (`snapshot.error`);
@@ -33,9 +34,12 @@
 //! `502`, a `503` because the node copies it or other commits) is repeated unchanged, for up to
 //! 30 minutes. Part ids are minted by the server and never reused: a part whose `201` is lost is
 //! staged again under a new id, and a commit lists only the ids its own staging got, in order. A
-//! `400` stages every part again once. Nothing of a staging survives the attempt: the next one,
-//! after a failure or a restart, starts over, and the server sweeps the orphaned parts after a
-//! day.
+//! `400` stages every part again once. A `429` to a part naming the stream's limit of staged parts
+//! (`Ursula-Max-Staged-Parts` or `-Bytes`) is never repeated: it fails the attempt. Another `429`
+//! is a rate limit, repeated as any. Nothing of a staging survives the attempt: one that fails
+//! before its commit is decided discards the stream's staged parts (`DELETE
+//! {stream}/snapshot/parts`, once, best effort), the next attempt starts over, and the server
+//! sweeps what is left after a day.
 //!
 //! A failed attempt waits before the next ([`SnapshotFailing`]): from 100 ms, doubling, up to five
 //! minutes, or an hour when the body is too large. Requests carry the binding's token as it is
@@ -510,6 +514,10 @@ pub(crate) enum SnapshotFailure {
         cause: OutageCause,
         retry_after: Option<Duration>,
     },
+    /// A part met the stream's limit of staged parts (`429`): the parts were discarded, and the
+    /// next attempt stages again.
+    #[error("unavailable: the stream holds as many staged parts as it takes (status {status})")]
+    StagedPartsFull { status: u16 },
     #[error("the binding reset")]
     Reset,
     #[error(transparent)]
@@ -541,7 +549,7 @@ impl SnapshotFailure {
     fn kind(&self) -> FailureKind {
         match self {
             Self::TooLarge { .. } => FailureKind::Size,
-            Self::Outage { .. } => FailureKind::Outage,
+            Self::Outage { .. } | Self::StagedPartsFull { .. } => FailureKind::Outage,
             _ => FailureKind::Other,
         }
     }
@@ -904,12 +912,18 @@ const COMMIT_RESTAGES: u32 = 1;
 
 /// Whether an answer decides nothing, so the request goes out again: `408`, `429`, a 5xx but
 /// `501` (which no repeat changes), or a node without a leader.
-fn transient(answer: &Answer) -> bool {
+pub(crate) fn transient(answer: &Answer) -> bool {
     matches!(answer.status, 408 | 429 | 500 | 502..=599)
         || matches!(
             answer.typed,
             Ok(Typed::Routing(RoutingAnswer::NoLeader { .. }))
         )
+}
+
+/// [`transient`] for a part: a `429` naming the stream's limit of staged parts decides, since no
+/// repeat of the part lifts it. Any other `429` (a rate limit) is sent again.
+fn transient_part(answer: &Answer) -> bool {
+    !matches!(answer.typed, Ok(Typed::StagedPartsFull)) && transient(answer)
 }
 
 impl Remote<'_> {
@@ -951,22 +965,24 @@ impl Remote<'_> {
     /// Sends `request` until a definite answer: no answer and [`transient`] answers are sent
     /// again after backoff, at most [`PUBLISH_ATTEMPTS`] times.
     fn send(&self, what: &'static str, request: &Request) -> Result<Answer, SnapshotFailure> {
-        self.send_until(what, request, Until::Attempts(PUBLISH_ATTEMPTS))
+        self.send_until(what, request, Until::Attempts(PUBLISH_ATTEMPTS), transient)
     }
 
-    /// Sends `request` until a definite answer, or until `until` gives up: the same request
-    /// every time, after backoff (at least the `Retry-After` asked for, up to a minute).
-    fn send_until(
+    /// Sends `request` until an answer that `retry` does not send again, or until `until` gives
+    /// up: the same request every time, after backoff (at least the `Retry-After` asked for, up to
+    /// a minute).
+    pub(crate) fn send_until(
         &self,
         what: &'static str,
         request: &Request,
         until: Until,
+        retry: fn(&Answer) -> bool,
     ) -> Result<Answer, SnapshotFailure> {
         let mut attempt = Attempt::default();
         let mut failures: u32 = 0;
         loop {
             let (cause, retry_after) = match self.transport.send(request, attempt) {
-                Exchange::Answered(answer) if !transient(&answer) => return Ok(*answer),
+                Exchange::Answered(answer) if !retry(&answer) => return Ok(*answer),
                 Exchange::Answered(answer) => {
                     attempt = Attempt::default();
                     (OutageCause::Status(answer.status), answer.retry_after)
@@ -1008,7 +1024,7 @@ impl Remote<'_> {
 
 /// When a request that gets no definite answer gives up.
 #[derive(Debug, Clone, Copy)]
-enum Until {
+pub(crate) enum Until {
     /// After this many attempts.
     Attempts(u32),
     /// Before an attempt that would go out after this.
@@ -1081,7 +1097,7 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
             ("snapshot commit", publish_parts(p, part_bytes, count)?)
         }
     };
-    match decided(p, what, limit, &answer)? {
+    match decided(p, what, upload, limit, &answer)? {
         Outcome::Published { .. } => {}
         other => return Ok(other),
     }
@@ -1119,6 +1135,7 @@ pub(crate) fn publish(p: &Publish<'_>) -> Result<Outcome, SnapshotFailure> {
 fn decided(
     p: &Publish<'_>,
     what: &'static str,
+    upload: Upload,
     limit: u64,
     answer: &Answer,
 ) -> Result<Outcome, SnapshotFailure> {
@@ -1131,11 +1148,12 @@ fn decided(
         bound,
     };
     match &answer.typed {
-        Ok(Typed::Snapshot(SnapshotPublishAnswer::Published { snapshot, .. }))
-            if *snapshot == ours =>
-        {
-            Ok(Outcome::Published { offset: p.offset })
-        }
+        // A `409` naming our offset and digest as the latest is ours, published by an earlier
+        // attempt: checked before any other conflict.
+        Ok(Typed::Snapshot(
+            SnapshotPublishAnswer::Published { snapshot, .. }
+            | SnapshotPublishAnswer::Conflict { latest: snapshot },
+        )) if *snapshot == ours => Ok(Outcome::Published { offset: p.offset }),
         Ok(Typed::Snapshot(conflict @ SnapshotPublishAnswer::Conflict { latest }))
             if conflict.supersedes(p.offset) =>
         {
@@ -1156,12 +1174,10 @@ fn decided(
             }),
             Some(_) | None => Err(SnapshotFailure::Status { what, status: 410 }),
         },
-        Ok(Typed::TooLarge(bound)) => Err(too_large(match bound {
-            Some(SizeLimit::Request(bytes)) => SizeBound::Request(*bytes),
-            Some(SizeLimit::Snapshot(bytes)) => SizeBound::Snapshot(*bytes),
-            None => SizeBound::Unnamed,
-        })),
-        Ok(Typed::Untyped) if answer.status == 501 => {
+        Ok(Typed::TooLarge(bound)) => Err(too_large(size_bound(*bound))),
+        // A commit's `501`: the stream takes no parts. A single request at or under the limit
+        // was not refused for its size.
+        Ok(Typed::Untyped) if answer.status == 501 && upload != Upload::Single => {
             Err(too_large(SizeBound::NoParts { request: limit }))
         }
         Ok(Typed::IncarnationMismatch(_)) => Err(SnapshotFailure::TokenChanged),
@@ -1173,19 +1189,32 @@ fn decided(
     }
 }
 
+/// The bound a `413` named.
+fn size_bound(limit: Option<SizeLimit>) -> SizeBound {
+    match limit {
+        Some(SizeLimit::Request(bytes)) => SizeBound::Request(bytes),
+        Some(SizeLimit::Snapshot(bytes)) => SizeBound::Snapshot(bytes),
+        None => SizeBound::Unnamed,
+    }
+}
+
 /// Stages the body in `count` parts of `part_bytes` and commits them: the commit's definite
 /// answer. A `400` stages every part again, under new ids, [`COMMIT_RESTAGES`] times.
 fn publish_parts(p: &Publish<'_>, part_bytes: u64, count: u32) -> Result<Answer, SnapshotFailure> {
     let file = File::open(p.body).map_err(io("open", p.body))?;
     let mut restages: u32 = 0;
     loop {
-        let manifest = stage_parts(p, &file, part_bytes, count)?;
+        let manifest = stage_parts(p, &file, part_bytes, count).inspect_err(|_failed| {
+            discard_parts(p);
+        })?;
         log::emit(Level::Info, "snapshot_parts_staged", &[
             ("offset", &p.offset),
             ("parts", &count),
             ("bytes", &p.len),
         ]);
-        let answer = commit_parts(p, &manifest)?;
+        let answer = commit_parts(p, &manifest).inspect_err(|_undecided| {
+            discard_parts(p);
+        })?;
         if answer.status != 400 || restages >= COMMIT_RESTAGES {
             return Ok(answer);
         }
@@ -1209,6 +1238,10 @@ fn stage_parts(
     let what = "snapshot part";
     let mut ids = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
     for index in 0..count {
+        // The binding retired or reset, or an import ran out of time: no part more goes out.
+        if p.remote.snapper.stopped() {
+            return Err(SnapshotFailure::Reset);
+        }
         let at = u64::from(index).saturating_mul(part_bytes);
         let len = part_bytes.min(p.len.saturating_sub(at));
         let mut bytes = vec![0; usize::try_from(len).unwrap_or(usize::MAX)];
@@ -1219,10 +1252,28 @@ fn stage_parts(
             body: Arc::from(bytes),
             ..Request::new(Method::Post, Target::SnapshotParts { offset: p.offset })
         };
-        let answer = p.remote.send(what, &request)?;
+        let answer = p.remote.send_until(
+            what,
+            &request,
+            Until::Attempts(PUBLISH_ATTEMPTS),
+            transient_part,
+        )?;
         match answer.typed {
             Ok(Typed::PartStaged(staged)) => ids.push(staged.part),
             Ok(Typed::IncarnationMismatch(_)) => return Err(SnapshotFailure::TokenChanged),
+            Ok(Typed::TooLarge(bound)) => {
+                return Err(SnapshotFailure::TooLarge {
+                    bytes: p.len,
+                    bound: size_bound(bound),
+                });
+            }
+            // The stream's limit of staged parts: the caller discards them, and the next attempt
+            // stages again.
+            Ok(Typed::StagedPartsFull) => {
+                return Err(SnapshotFailure::StagedPartsFull {
+                    status: answer.status,
+                });
+            }
             Ok(Typed::Untyped) if answer.status == 501 => {
                 return Err(SnapshotFailure::TooLarge {
                     bytes: p.len,
@@ -1258,8 +1309,36 @@ fn commit_parts(p: &Publish<'_>, manifest: &PartsManifest) -> Result<Answer, Sna
     };
     let now = Instant::now();
     let deadline = now.checked_add(COMMIT_DEADLINE).unwrap_or(now);
-    p.remote
-        .send_until("snapshot commit", &request, Until::Deadline(deadline))
+    p.remote.send_until(
+        "snapshot commit",
+        &request,
+        Until::Deadline(deadline),
+        transient,
+    )
+}
+
+/// Discards the stream's staged parts (`DELETE {stream}/snapshot/parts`, under the token) after a
+/// staging or a commit that failed before its answer decided it: one attempt, best effort. The
+/// server sweeps what this leaves after a day, so nothing depends on it.
+fn discard_parts(p: &Publish<'_>) {
+    let request = Request {
+        keys: p.remote.keys(),
+        ..Request::new(Method::Delete, Target::StagedParts)
+    };
+    match p
+        .remote
+        .send_until("parts discard", &request, Until::Attempts(1), transient)
+    {
+        Ok(answer) if (200..300).contains(&answer.status) => {}
+        Ok(answer) => log::emit(Level::Info, "snapshot_parts_left", &[
+            ("offset", &p.offset),
+            ("status", &answer.status),
+        ]),
+        Err(e) => log::emit(Level::Info, "snapshot_parts_left", &[
+            ("offset", &p.offset),
+            ("reason", &e),
+        ]),
+    }
 }
 
 /// The wait after a first failed attempt.

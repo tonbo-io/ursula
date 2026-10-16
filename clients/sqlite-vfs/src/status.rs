@@ -264,6 +264,17 @@ pub(crate) fn opened_json(opened: &Opened) -> String {
     }
 }
 
+/// `ursula_import`'s result.
+pub(crate) fn imported_json(imported: &crate::import::Imported) -> String {
+    object(&[
+        ("done", "true".into()),
+        ("offset", imported.offset.get().to_string()),
+        ("digest", json_str(&imported.digest.to_string())),
+        ("pages", imported.pages.to_string()),
+        ("bytes", imported.bytes.to_string()),
+    ])
+}
+
 /// `ursula_synced`'s result.
 pub(crate) fn synced_json(
     synced: bool,

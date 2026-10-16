@@ -249,3 +249,48 @@ function connect(binding: Binding, settings: Omit<DatabaseSyncOptions, "open">):
 		throw new UrsulaSetupError(`invalid_argument: bound ${binding.name}, then node:sqlite refused to open ${binding.path} (${why})`, "invalid_argument", error);
 	}
 }
+
+/** {@link importSqlite}'s options. */
+export interface ImportOptions {
+	/** The bearer token requests carry. One per process in this release. */
+	readonly token?: string | undefined;
+	/** How long the import may take. By default 10 minutes. */
+	readonly timeoutMs?: number | undefined;
+}
+
+/** What {@link importSqlite} published: the stream's first snapshot. */
+export interface Imported {
+	/** The snapshot's stream offset, the end of the import's claim. */
+	readonly offset: number;
+	readonly digest: string;
+	readonly pages: number;
+	/** The compressed snapshot's size. */
+	readonly bytes: number;
+}
+
+/** How long an import may take without `timeoutMs`. */
+const DEFAULT_IMPORT_MS = 10 * 60 * 1000;
+
+/**
+ * Imports the plain SQLite database `file` into a new stream at `url`, as the stream's first
+ * snapshot, page for page. The file must have 4096-byte pages (`PRAGMA page_size = 4096; VACUUM
+ * INTO ...` makes such a copy), no `-wal` beside it and no hot journal. It is only read. The stream
+ * must be missing or empty: anything else fails with `stream_state` and nothing is published. Then
+ * {@link open} the stream as any other. While the import runs, and after an import that failed
+ * once it claimed the stream, opens and imports of the stream fail with `stream_state` until the
+ * stream is deleted or recreated.
+ *
+ * It blocks the calling thread until it is done, for at most `timeoutMs`. Errors are
+ * {@link UrsulaSetupError} (such as `invalid_argument` for the file) and
+ * {@link UrsulaUnavailableError}, whose action is `fix`: the stream may hold the import's claim.
+ */
+export function importSqlite(url: string | URL, file: string, options: ImportOptions = {}): Imported {
+	const { token, timeoutMs } = options;
+	const timeout = timeoutMs ?? DEFAULT_IMPORT_MS;
+	if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+		throw new UrsulaSetupError(`invalid_argument: timeoutMs must be a positive whole number of milliseconds, not ${timeout}`, "invalid_argument");
+	}
+	const settings: Record<string, unknown> = {};
+	if (token !== undefined) settings.token = token;
+	return call<Imported>("SELECT ursula_import(?, ?, ?, ?)", String(url), file, JSON.stringify(settings), timeout);
+}

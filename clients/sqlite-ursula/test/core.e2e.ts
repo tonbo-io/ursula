@@ -98,7 +98,7 @@ describe("the 0.8 core on node:sqlite", () => {
 			.prepare("SELECT DISTINCT name FROM pragma_function_list WHERE name LIKE 'ursula!_%' ESCAPE '!' ORDER BY name")
 			.all()
 			.map((row) => (row as { name: string }).name);
-		expect(names).toEqual(["ursula_cancel", "ursula_events", "ursula_open", "ursula_set_token", "ursula_stats", "ursula_status", "ursula_synced"]);
+		expect(names).toEqual(["ursula_cancel", "ursula_events", "ursula_import", "ursula_open", "ursula_set_token", "ursula_stats", "ursula_status", "ursula_synced"]);
 		expect(() => call("SELECT ursula_status('/nowhere/db')")).toThrow(/^ursula_status: not_bound: /);
 		// A database the extension did not bind passes through its VFS unchanged.
 		const plain = new DatabaseSync(join(freshDir(), "plain.db"));

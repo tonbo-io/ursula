@@ -46,6 +46,37 @@ pub(crate) fn set_token(token: Option<&str>) {
     *lock(&SET) = token.and_then(usable);
 }
 
+/// A token set for a while ([`lend_token`]), and the token it replaced.
+#[derive(Debug)]
+pub(crate) struct Lent {
+    ours: Option<String>,
+    previous: Option<String>,
+}
+
+/// [`set_token`] for a while: [`take_back`] puts the token it replaced back.
+pub(crate) fn lend_token(token: &str) -> Lent {
+    lend(&SET, token)
+}
+
+/// Puts the token `lent` replaced back, unless the application set one since: the token set is
+/// then no longer the lent one, and stays.
+pub(crate) fn take_back(lent: Lent) {
+    put_back(&SET, lent);
+}
+
+fn lend(set: &Mutex<Option<String>>, token: &str) -> Lent {
+    let ours = usable(token);
+    let previous = std::mem::replace(&mut *lock(set), ours.clone());
+    Lent { ours, previous }
+}
+
+fn put_back(set: &Mutex<Option<String>>, lent: Lent) {
+    let mut set = lock(set);
+    if *set == lent.ours {
+        *set = lent.previous;
+    }
+}
+
 /// The token for the next request. `refresh`: read the token file again even if it looks unchanged
 /// (after the endpoint refused the token).
 pub(crate) fn token(refresh: bool) -> Option<String> {
@@ -112,7 +143,29 @@ mod tests {
     use std::sync::Mutex;
 
     use super::file_token;
+    use super::lend;
+    use super::put_back;
     use super::usable;
+
+    // A lent token is taken back to the one it replaced, unless the application set another since.
+    #[test]
+    fn a_lent_token_goes_back_unless_another_was_set_since() {
+        let set = Mutex::new(Some("app".to_owned()));
+        let lent = lend(&set, "import");
+        assert_eq!(set.lock().unwrap().as_deref(), Some("import"));
+        put_back(&set, lent);
+        assert_eq!(set.lock().unwrap().as_deref(), Some("app"));
+
+        let lent = lend(&set, "import");
+        *set.lock().unwrap() = Some("newer".to_owned());
+        put_back(&set, lent);
+        assert_eq!(set.lock().unwrap().as_deref(), Some("newer"));
+
+        let lent = lend(&set, "import");
+        *set.lock().unwrap() = None;
+        put_back(&set, lent);
+        assert_eq!(*set.lock().unwrap(), None, "cleared since: stays cleared");
+    }
 
     #[test]
     fn tokens_are_trimmed_printable_ascii() {

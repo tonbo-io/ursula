@@ -94,7 +94,7 @@ unsafe fn result(ctx: *mut ffi::sqlite3_context, name: &str, outcome: Result<Str
             }
         }
         Err(e) => {
-            let c = c_text(&format!("{name}: {}: {e}", e.kind().as_str()));
+            let c = c_text(&function_error(name, e));
             if let Some(result_error) = a.result_error {
                 // SAFETY: `ctx` is the function's context, and SQLite copies the NUL-terminated
                 // message.
@@ -102,6 +102,19 @@ unsafe fn result(ctx: *mut ffi::sqlite3_context, name: &str, outcome: Result<Str
             }
         }
     }
+}
+
+/// A SQL function's error message: `<function>: <kind>: <message>`, the kind named once. Most
+/// messages open with their kind already (an open's do, for `ursula_status` and the logs, which
+/// show them alone), and that one is not repeated.
+fn function_error(name: &str, e: &Error) -> String {
+    let kind = e.kind().as_str();
+    let message = e.to_string();
+    let detail = message
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(&message);
+    format!("{name}: {kind}: {detail}")
 }
 
 /// Argument `i` as an integer: `None` for NULL or a missing argument.
@@ -163,6 +176,30 @@ unsafe fn fn_open(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut f
     });
     // SAFETY: SQLite calls the function with its context.
     unsafe { result(ctx, "ursula_open", outcome.as_ref().map(Clone::clone)) };
+}
+
+/// `ursula_import(url, file, options_json, timeout_ms)`: `{done, offset, digest, pages, bytes}`
+/// once `file` is the first snapshot of a new stream at `url` (`crate::import`). `timeout_ms` must
+/// be positive: the import blocks.
+unsafe fn fn_import(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let url = unsafe { arg(argc, argv, 0) };
+    // SAFETY: as above.
+    let file = unsafe { arg(argc, argv, 1) };
+    // SAFETY: as above.
+    let options = unsafe { arg(argc, argv, 2) };
+    // SAFETY: as above.
+    let outcome = unsafe { arg_count(argc, argv, 3, "timeout_ms") }.and_then(|timeout| {
+        crate::import::import(&url, &file, &options, timeout)
+            .map(|imported| status::imported_json(&imported))
+            .map_err(Error::from)
+    });
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_import", outcome.as_ref().map(Clone::clone)) };
 }
 
 /// `ursula_synced(path, timeout_ms)` (design §8.2): `{synced, ticket, target, acknowledged}`; with
@@ -338,6 +375,7 @@ sql_entry!(c_cancel => fn_cancel, "ursula_cancel");
 sql_entry!(c_status => fn_status, "ursula_status");
 sql_entry!(c_stats => fn_stats, "ursula_stats");
 sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
+sql_entry!(c_import => fn_import, "ursula_import");
 
 /// Refuses a host SQLite the extension does not support (`gate`), then registers the "ursula" VFS
 /// over "unix" as the default (once per process) and the SQL functions on `db`, direct-only: a
@@ -424,7 +462,7 @@ unsafe fn init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 7] = [
+    let fns: [(&CStr, c_int, SqlFn); 8] = [
         (c"ursula_open", 4, c_ursula_open),
         (c"ursula_synced", 2, c_synced),
         (c"ursula_events", 2, c_events),
@@ -432,6 +470,7 @@ unsafe fn init(
         (c"ursula_status", 1, c_status),
         (c"ursula_stats", 1, c_stats),
         (c"ursula_set_token", 2, c_set_token),
+        (c"ursula_import", 4, c_import),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the
@@ -561,8 +600,37 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::MIN_SQLITE;
+    use super::function_error;
     use super::version;
+    use crate::error::Error;
+    use crate::import::ImportError;
+    use crate::open::OpenError;
+
+    // The kind is named once, whether the message opens with it or not.
+    #[test]
+    fn a_function_error_names_its_kind_once() {
+        assert_eq!(
+            function_error("ursula_open", &Error::Open(Arc::new(OpenError::NotFound))),
+            "ursula_open: not_found: the stream is missing"
+        );
+        assert_eq!(
+            function_error(
+                "ursula_import",
+                &Error::Import(ImportError::TimedOut { timeout_ms: 5 })
+            ),
+            "ursula_import: unavailable: the import ran out of its 5 ms"
+        );
+        assert_eq!(
+            function_error("ursula_import", &Error::InvalidArgument {
+                name: "timeout_ms",
+                why: "give it a positive timeout".to_owned(),
+            }),
+            "ursula_import: invalid_argument: timeout_ms: give it a positive timeout"
+        );
+    }
 
     // The floor is Node 22.19.0's SQLite.
     #[test]

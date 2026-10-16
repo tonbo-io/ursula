@@ -37,6 +37,12 @@
 //! * `SELECT ursula_synced(path, timeout_ms)` resolves once every commit logged before the call is
 //!   acknowledged and a round trip that started after it found this owner still the owner.
 //! * `SELECT ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions, resets.
+//! * `SELECT ursula_import(url, file, options_json, timeout_ms)` imports a plain SQLite file of
+//!   4096-byte pages into a new stream at `url`, as its first snapshot, and returns
+//!   `{done, offset, digest, pages, bytes}`. The file is only read. A stream that exists and is
+//!   not empty is refused `stream_state`, and nothing is published on it. Until the import's
+//!   snapshot is published, opens of the stream refuse `stream_state`, and after an import that
+//!   failed once it claimed the stream they do until the stream is deleted or recreated.
 //! * `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
 //!   `ursula_set_token(path, token)`.
 //!
@@ -74,6 +80,8 @@
 //! - `generation`: the canonical stream path, a stream's locked root directory and its reader
 //!   directories, and the generations in them (`gen-<id32>` directories).
 //! - `guard`: panics stop at the C entry points instead of aborting the host process.
+//! - `import`: `ursula_import`, a plain SQLite file imported as the first snapshot of a new
+//!   stream.
 //! - [`ids`]: lineages, generation directory ids, activations, positions and commit ids.
 //! - `host`: the host's SQLite API, the "unix" VFS and a private connection.
 //! - `json`: the flat JSON objects the extension writes and reads (status, options, manifests).
@@ -113,6 +121,7 @@ mod generation;
 mod guard;
 mod host;
 pub mod ids;
+mod import;
 mod json;
 mod log;
 mod materialize;

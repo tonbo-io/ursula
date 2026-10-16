@@ -288,7 +288,8 @@ impl Reconcile {
             }
         }
         if error.is_some() {
-            // Undecodable bytes, a broken PART run, or a frame running into the claim.
+            // Undecodable bytes, a broken PART run, a frame running into the claim, or an
+            // import's claim with no snapshot past it.
             return self.row(FrameClass::Undecodable, None, ctx);
         }
         if !self.stream.done() {

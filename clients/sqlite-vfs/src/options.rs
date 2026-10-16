@@ -1,6 +1,7 @@
 //! `ursula_open`'s `options_json` (design §8.6): one flat JSON object, parsed at the boundary into
 //! [`OpenOptions`].
 
+use crate::codec::frame::IMPORT_ACTIVATION;
 use crate::ids::Activation;
 use crate::json::SyntaxError;
 use crate::json::Value;
@@ -66,6 +67,9 @@ pub(crate) enum OptionsError {
     },
     #[error("options_json: read_only opens claim nothing, so recreate cannot go with it")]
     ReadOnlyRecreate,
+    /// The activation every import's claim carries, which no open's claim may.
+    #[error("options_json: activation {0} is reserved for ursula_import")]
+    ReservedActivation(String),
 }
 
 impl TryFrom<&str> for OpenOptions {
@@ -89,10 +93,14 @@ impl TryFrom<&str> for OpenOptions {
                     })?;
                 }
                 ("activation", Value::Text(hex)) => {
-                    options.activation = Some(activation(&hex).ok_or(OptionsError::Type {
+                    let parsed = activation(&hex).ok_or(OptionsError::Type {
                         name: "activation",
                         expected: "32 hex digits",
-                    })?);
+                    })?;
+                    if parsed == IMPORT_ACTIVATION {
+                        return Err(OptionsError::ReservedActivation(hex));
+                    }
+                    options.activation = Some(parsed);
                 }
                 ("timeout_ms", Value::Number(n)) => {
                     options.timeout_ms =
@@ -255,6 +263,11 @@ mod tests {
                 ..
             }
         ));
+        // The import's activation is no open's.
+        assert_eq!(
+            err(r#"{"activation": "757273756c612d696d706f72742d7631"}"#),
+            OptionsError::ReservedActivation("757273756c612d696d706f72742d7631".to_owned())
+        );
         // A reader claims nothing, so it cannot create the stream again.
         assert_eq!(
             err(r#"{"read_only": true, "recreate": true}"#),

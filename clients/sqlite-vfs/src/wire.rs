@@ -49,6 +49,11 @@ pub(crate) const RETRY_AFTER: &str = "retry-after";
 /// `Location` header name.
 pub(crate) const LOCATION: &str = "location";
 
+/// The headers of a `429` to a part past the stream's limit of staged parts (#622), naming the
+/// limit it met: its unused parts, or their bytes.
+pub(crate) const MAX_STAGED_PARTS: &str = "ursula-max-staged-parts";
+pub(crate) const MAX_STAGED_BYTES: &str = "ursula-max-staged-bytes";
+
 /// A `USS3` header's length, which a header read asks for.
 const SNAPSHOT_HEADER: u64 = crate::codec::snapshot::HEADER as u64;
 
@@ -64,6 +69,9 @@ const START: &str = "-1";
 /// The path suffix, after the snapshot's, of a part staged for it.
 const PARTS: &str = "/parts";
 
+/// The path suffix of the stream's staged parts, discarded together.
+const STAGED_PARTS: &str = "/snapshot/parts";
+
 /// The rate a parts commit's answer is waited for at: a server copies the parts before it
 /// answers, in time with their total.
 const COMMIT_COPY_BYTES_PER_SECOND: u64 = 16 << 20;
@@ -74,6 +82,7 @@ pub(crate) enum Method {
     Get,
     Put,
     Post,
+    Delete,
 }
 
 #[cfg_attr(
@@ -87,6 +96,7 @@ impl Method {
             "GET" => Some(Self::Get),
             "PUT" => Some(Self::Put),
             "POST" => Some(Self::Post),
+            "DELETE" => Some(Self::Delete),
             _ => None,
         }
     }
@@ -109,6 +119,8 @@ pub(crate) enum Target {
     Snapshot { offset: Offset },
     /// A part of the snapshot at `offset`, staged (`POST`) for a parts commit.
     SnapshotParts { offset: Offset },
+    /// Every part staged under the stream's current token, discarded (`DELETE`).
+    StagedParts,
     /// The retention boundary (`PUT`), monotonic (#581 §3).
     Retention { offset: Offset },
 }
@@ -125,6 +137,7 @@ impl Target {
             }
             Self::Snapshot { offset } => format!("/snapshot/{offset}"),
             Self::SnapshotParts { offset } => format!("/snapshot/{offset}/parts"),
+            Self::StagedParts => STAGED_PARTS.to_owned(),
             Self::Retention { offset } => format!("/retention/{offset}"),
         }
     }
@@ -137,6 +150,9 @@ impl Target {
     )]
     pub(crate) fn split(method: Method, target: &str) -> Result<(&str, Self), WireError> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if let Some(stream) = path.strip_suffix(STAGED_PARTS) {
+            return Ok((stream, Self::StagedParts));
+        }
         if let Some((stream, offset)) = path
             .strip_suffix(PARTS)
             .and_then(|path| path.rsplit_once("/snapshot/"))
@@ -398,6 +414,10 @@ pub(crate) enum Typed {
     Snapshot(SnapshotPublishAnswer),
     /// `201` to a part staged: its id.
     PartStaged(PartStaged),
+    /// `429` to a part, naming a limit of staged parts (`Ursula-Max-Staged-Parts` or
+    /// `Ursula-Max-Staged-Bytes`): no repeat of the part lifts it. A `429` without either is a
+    /// rate limit like any other.
+    StagedPartsFull,
     /// `200` or `206` to a snapshot read: `range` is the `Content-Range` of a `206`, `None` for
     /// the whole body of a `200`.
     SnapshotRead {
@@ -582,6 +602,13 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
         (Method::Post, Target::SnapshotParts { .. }) if status == 201 => {
             Typed::PartStaged(PartStaged::parse(headers)?)
         }
+        (Method::Post, Target::SnapshotParts { .. })
+            if status == 429
+                && (text(headers.clone(), MAX_STAGED_PARTS)?.is_some()
+                    || text(headers.clone(), MAX_STAGED_BYTES)?.is_some()) =>
+        {
+            Typed::StagedPartsFull
+        }
         (Method::Get, Target::Snapshot { .. }) if matches!(status, 200 | 206) => {
             let range = match ContentRange::parse(status, headers.clone())? {
                 None => None,
@@ -711,6 +738,7 @@ mod tests {
             (Method::Put, Target::Snapshot { offset }),
             (Method::Get, Target::Snapshot { offset }),
             (Method::Post, Target::SnapshotParts { offset }),
+            (Method::Delete, Target::StagedParts),
             (Method::Put, Target::Retention { offset }),
         ] {
             let path = format!("/v1/stream/b/s{}", target.suffix());
@@ -840,6 +868,20 @@ mod tests {
                 name: "stream-next-offset"
             })
         );
+    }
+
+    // A 429 to a part is the staged-parts limit only when it names one; otherwise a rate limit.
+    #[test]
+    fn a_429_to_a_part_is_the_staged_limit_only_when_it_names_one() {
+        let part = Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(4096),
+        });
+        assert_eq!(RawAnswer::new(429).parse(&part).typed, Ok(Typed::Untyped));
+        for name in [super::MAX_STAGED_PARTS, super::MAX_STAGED_BYTES] {
+            let mut raw = RawAnswer::new(429);
+            raw.header(name, "8192");
+            assert_eq!(raw.parse(&part).typed, Ok(Typed::StagedPartsFull));
+        }
     }
 
     #[test]
