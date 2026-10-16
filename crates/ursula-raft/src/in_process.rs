@@ -736,8 +736,9 @@ async fn sleep_in_process_raft_network(delay: Duration) {
     std::thread::sleep(delay);
 }
 
-/// Whether a replica refused the request because it would replace entries
-/// it knows are committed (#613). The gRPC network answers it `Unavailable`,
+/// Whether the commit screen refused the request: it would replace entries
+/// the replica knows are committed, or the replica's log lags what OpenRaft
+/// committed (#613). The gRPC network answers it `Unavailable`,
 /// which the client reports as unreachable, so OpenRaft backs off instead of
 /// resending at once; this network classifies it the same.
 fn refuses_overwrite(error: &ursula_runtime::GroupEngineError) -> bool {
@@ -746,6 +747,7 @@ fn refuses_overwrite(error: &ursula_runtime::GroupEngineError) -> bool {
         Some(
             ursula_runtime::GroupInfraError::CommittedOverwrite { .. }
                 | ursula_runtime::GroupInfraError::UnrelatedHistory { .. }
+                | ursula_runtime::GroupInfraError::LogBehindCommit { .. }
         )
     )
 }

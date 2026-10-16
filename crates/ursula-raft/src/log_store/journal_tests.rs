@@ -2558,7 +2558,9 @@ async fn the_screen_reads_the_commit_openraft_holds_above_the_stored_marker() {
     let mut metrics = openraft::RaftMetrics::<UrsulaRaftTypeConfig>::new_initial(1);
     metrics.local_committed = Some(log_id(100));
     metrics.last_applied = Some(log_id(100));
-    let marker = gate.effective_marker(&metrics);
+    let marker = gate
+        .effective_marker(&metrics)
+        .expect("the store holds 100");
     assert_eq!(marker, Some(100));
     let probe = openraft::raft::AppendEntriesRequest::<UrsulaRaftTypeConfig> {
         vote: openraft::Vote::new_committed(9, 2),
@@ -2606,4 +2608,38 @@ async fn the_screen_refuses_everything_once_the_store_is_gone() {
         gate.committed_overwrite(crate::rejoin::Incoming::Append(&append_two), Some(2)),
         Some(ursula_runtime::GroupInfraError::OwnerStopped)
     ));
+}
+
+/// While the store lags an install OpenRaft admitted, OpenRaft's committed
+/// index is above the last entry the store holds. The screen cannot compare
+/// anything there, so it refuses rather than lowering the marker to what
+/// the store holds, which would let a probe in that window through.
+#[tokio::test]
+async fn the_screen_refuses_while_the_store_lags_an_admitted_install() {
+    let core = Core::new(JournalTuning::new(WalFsync::Never));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, (1..=40).map(blank_entry)).await;
+    store
+        .save_committed(Some(log_id(40)))
+        .await
+        .expect("save the committed entry");
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("a gate");
+    // OpenRaft installed a snapshot through 100; the store has not purged.
+    let mut metrics = openraft::RaftMetrics::<UrsulaRaftTypeConfig>::new_initial(1);
+    metrics.local_committed = Some(log_id(100));
+    metrics.last_applied = Some(log_id(100));
+    assert!(matches!(
+        gate.effective_marker(&metrics),
+        Err(ursula_runtime::GroupInfraError::LogBehindCommit {
+            committed: 100,
+            held: Some(40),
+            ..
+        })
+    ));
+    // Once the store records the install, the marker is OpenRaft's.
+    store.purge(log_id(100)).await.expect("purge");
+    assert_eq!(gate.effective_marker(&metrics), Ok(Some(100)));
 }

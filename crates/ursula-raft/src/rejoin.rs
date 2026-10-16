@@ -1054,6 +1054,9 @@ pub struct GroupRejoin {
     /// install queues for the group's lock, the node's permit or a download.
     /// A refusal for a snapshot only grows firmer as the marker rises.
     refused_snapshot: Mutex<Option<(String, ursula_runtime::GroupInfraError)>>,
+    /// [`Self::over_foreign_store`].
+    #[cfg(test)]
+    foreign_store: bool,
     /// The committed leader whose AppendEntries reached this replica last,
     /// and when.
     last_leader_append: Mutex<
@@ -1264,6 +1267,8 @@ impl GroupRejoin {
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
             last_leader_append: Mutex::new(None),
             refused_snapshot: Mutex::new(None),
+            #[cfg(test)]
+            foreign_store: false,
             cut_refused,
             stall_after: OnceLock::new(),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -1595,30 +1600,61 @@ impl GroupRejoin {
     /// it, and under `fsync = never` the stored marker falls behind after a
     /// power loss. Read once per request, in the owner job. `None` when
     /// nothing is committed.
+    ///
+    /// OpenRaft's indexes are above the last entry the store holds only
+    /// while the store has not yet recorded an install OpenRaft admitted.
+    /// The screen cannot compare anything in that window, so it refuses with
+    /// [`ursula_runtime::GroupInfraError::LogBehindCommit`] instead of
+    /// lowering the marker; the sender retries once the store caught up.
     pub(crate) fn effective_marker(
         &self,
         metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>,
-    ) -> Option<u64> {
-        let store = self.store.upgrade();
-        let stored = store.as_ref().and_then(|store| store.committed_index());
+    ) -> Result<Option<u64>, ursula_runtime::GroupInfraError> {
+        let store = self
+            .store
+            .upgrade()
+            .ok_or(ursula_runtime::GroupInfraError::OwnerStopped)?;
+        let stored = store.committed_index();
         if ursula_stream::sim_controls::off(
             ursula_stream::sim_controls::Defence::CommitScreenPurged,
         ) {
-            return stored;
+            return Ok(stored);
         }
-        // OpenRaft's indexes never pass the log it keeps in this store; a
-        // gate built over another store, as tests do, reads its own.
-        let held = store.as_ref().and_then(|store| store.last_held_index());
         let raft = [
             metrics.local_committed.map(|id| id.index),
             metrics.last_applied.map(|id| id.index),
         ]
         .into_iter()
         .flatten()
-        .max()
-        .zip(held)
-        .map(|(index, held)| index.min(held));
-        stored.max(raft)
+        .max();
+        let held = store.last_held_index();
+        let behind = raft.is_some_and(|index| held.is_none_or(|held| index > held));
+        #[cfg(test)]
+        let behind = behind && !self.foreign_store;
+        if behind {
+            return Err(ursula_runtime::GroupInfraError::LogBehindCommit {
+                raft_group_id: self.raft_group_id,
+                committed: raft.unwrap_or(0),
+                held,
+            });
+        }
+        #[cfg(test)]
+        let raft = if self.foreign_store {
+            raft.zip(held).map(|(index, held)| index.min(held))
+        } else {
+            raft
+        };
+        Ok(stored.max(raft))
+    }
+
+    /// A gate built over another store than the one its engine keeps its
+    /// log in, as unit tests that need a closed gate on a running cluster
+    /// do: OpenRaft's indexes say nothing about that store, so the marker
+    /// reads them only up to its last entry.
+    #[cfg(test)]
+    pub(crate) fn over_foreign_store(mut self) -> Self {
+        self.foreign_store = true;
+        self
     }
 
     /// The commit screen (#613): refuses an append, or a snapshot install,
