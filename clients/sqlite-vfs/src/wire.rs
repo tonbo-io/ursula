@@ -10,7 +10,8 @@
 //!
 //! [`parse_answer`] reads an answer in the light of the request it answers: a `409` to a keyed
 //! append is the producer's or a closed stream's, a `204` to a snapshot publish is a published
-//! snapshot.
+//! snapshot. An answer to a write also carries what `ursula_headers::classify` reads from it
+//! ([`Answer::outcome`]), the one classification of write answers the VFS has.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,9 @@ use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRead;
 use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
+use ursula_headers::WriteKind;
+use ursula_headers::WriteOutcome;
+use ursula_headers::classify;
 use ursula_headers::names;
 
 /// `Producer-Id` of every keyed write: constant for the `USQ2` format (design: Appends).
@@ -256,6 +260,28 @@ pub(crate) enum SnapshotPart {
 }
 
 impl Request {
+    /// The write this request makes, which `ursula_headers::classify` reads its answer as: `None`
+    /// for a read or a HEAD, which change nothing.
+    pub(crate) fn write_kind(&self) -> Option<WriteKind> {
+        match (self.method, self.target) {
+            (Method::Post, Target::Stream) if self.keys.producer.is_some() => {
+                Some(WriteKind::Producer)
+            }
+            // An append or a close without producer headers.
+            (Method::Post, Target::Stream) => Some(WriteKind::Append),
+            (Method::Put, Target::Stream) => Some(WriteKind::Create),
+            // A snapshot publish or a parts commit.
+            (Method::Put, Target::Snapshot { .. }) => Some(WriteKind::Publish),
+            (Method::Post, Target::SnapshotParts { .. }) => Some(WriteKind::PartStage),
+            (Method::Delete, Target::StagedParts) => Some(WriteKind::PartsDiscard),
+            (Method::Put, Target::Retention { .. }) => Some(WriteKind::Retention),
+            (Method::Delete, Target::Stream) => Some(WriteKind::DeleteStream),
+            (Method::Head | Method::Get, _) => None,
+            // No request the VFS sends: nothing a write's answer is read as.
+            (Method::Put | Method::Post | Method::Delete, _) => None,
+        }
+    }
+
     /// A request without headers or body, expecting no answer body. A `GET` goes through
     /// [`Request::read`] or [`Request::snapshot_read`], which size its answer.
     pub(crate) fn new(method: Method, target: Target) -> Self {
@@ -442,6 +468,10 @@ pub(crate) struct Answer {
     pub(crate) status: u16,
     /// `Err` when a header the answer requires is malformed or missing: a protocol violation.
     pub(crate) typed: Result<Typed, HeaderError>,
+    /// What `ursula_headers::classify` reads from an answer to a write ([`Request::write_kind`]):
+    /// applied, a repeat, refused, redirected, or unknown. `None` for an answer to a read or a
+    /// HEAD.
+    pub(crate) outcome: Option<WriteOutcome>,
     /// `Retry-After` in seconds; an HTTP date is not read.
     pub(crate) retry_after: Option<Duration>,
     pub(crate) location: Option<String>,
@@ -545,6 +575,9 @@ where
     Answer {
         status,
         typed: typed(request, status, headers.clone()),
+        outcome: request
+            .write_kind()
+            .map(|kind| classify(kind, status, headers.clone(), &body)),
         retry_after: plain(RETRY_AFTER)
             .and_then(|seconds| seconds.parse().ok())
             .map(Duration::from_secs),

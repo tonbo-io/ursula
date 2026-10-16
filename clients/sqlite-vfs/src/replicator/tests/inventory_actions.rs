@@ -1,27 +1,27 @@
-//! The VFS's answer tables against `ursula_headers::classify`, row by row of the write-outcome
-//! inventory (`ursula_headers::write_outcome::inventory`). Until the VFS reads its answers with
-//! `classify` (#652), several readers of the same answers exist: this test keeps them from
-//! drifting.
+//! The VFS's action for every row of the write-outcome inventory
+//! (`ursula_headers::write_outcome::inventory`). The VFS classifies a write's answer once, with
+//! `ursula_headers::classify` ([`crate::wire::Answer::outcome`]), and maps the outcome to its
+//! action in `replicator/answer.rs`. This test pins that mapping row by row.
 //!
-//! Each row's answer goes through every reader of write answers the VFS has:
+//! Each row's answer goes through every reader of write answers the VFS has, by its production
+//! entry points:
 //!
-//! - [`decide_append`], for the in-flight keyed append, which reads a producer answer and hands
-//!   every other answer to [`decide_status`];
+//! - [`decide_append`], for the in-flight keyed append, which decides a producer answer by its own
+//!   rows and hands every other answer to [`decide_status`];
 //! - [`decide_claim`], for the in-flight claim (`Producer-Seq: 0`), for the rows of a keyed write;
 //! - the snapshotter's [`transient`] for a publish, a parts commit, a discard or a retention
 //!   advance, and [`transient_part`] for a part, which tell an answer to send again from one the
 //!   snapshotter decides on.
 //!
-//! [`EXPECTED`] names what each reader does with each row. Where the append and claim readers do
-//! what `classify` says, the row's reason is empty. Where either differs by design, the reason
-//! says why that is safe. Every reader must send again whatever `classify` reads as `Unknown`. A
-//! new row, a changed VFS decision or a changed classification fails the test.
+//! [`EXPECTED`] names what each reader does with each row, and whether the replicator's action is
+//! the one the outcome asks of a client ([`Mapping::Follows`]) or a deliberate difference that
+//! `replicator/answer.rs` maps explicitly ([`Mapping::Deliberate`], with why it is safe). Every
+//! reader sends again whatever `classify` reads as `Unknown`. A new row, a changed VFS action or a
+//! changed classification fails the test.
 
 use std::sync::Arc;
 
-use ursula_headers::WriteKind;
 use ursula_headers::WriteOutcome;
-use ursula_headers::classify;
 use ursula_headers::write_outcome::inventory::INVENTORY;
 use ursula_headers::write_outcome::inventory::Row;
 use ursula_headers::write_outcome::inventory::Write;
@@ -81,52 +81,85 @@ enum Snap {
     Decides,
 }
 
-/// One row of what the VFS does: its append and claim decisions (`None` for a row that is no
-/// keyed write's answer), its snapshotter's, and why the replicator's differ from `classify`'s.
+/// Whether the replicator's action for a row is the one its outcome asks of a client.
+#[derive(Debug, Clone, Copy)]
+enum Mapping {
+    /// Acknowledge what holds, resend what may have applied, follow a redirect, and stop or
+    /// repair on a refusal.
+    Follows,
+    /// A difference `replicator/answer.rs` maps explicitly, and why it is safe.
+    Deliberate(&'static str),
+}
+
+impl Mapping {
+    /// Why the action differs from the outcome's, for a deliberate difference.
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Follows => None,
+            Self::Deliberate(reason) => Some(reason),
+        }
+    }
+}
+
+/// One row of what the VFS does: its append and claim actions (`None` for a row that is no keyed
+/// write's answer), its snapshotter's, and how the replicator's relate to the outcome.
 struct Expected {
     id: &'static str,
     append: Vfs,
     claim: Option<Vfs>,
     snapshot: Snap,
-    reason: &'static str,
+    mapping: Mapping,
 }
 
-const SAFE_RESEND: &str =
-    "refused, and a keyed write's repeat is safe: it applies once or gets its receipt";
-const ELSEWHERE: &str =
-    "the VFS reads this write's success in its own table, never through decide_status";
-const KEYED_ONLY: &str =
-    "the VFS writes keyed only: a success without a receipt is not one of its answers";
-const NOT_URSULA: &str = "a keyed success without its receipt is no answer of Ursula's: the VFS \
-                          blocks, which sends the identical request again every 30 s";
-
-const NO_BUCKETS: &str = "the VFS never creates a bucket: an answer to one is none of its answers";
-const UNTYPED: &str = "a success without the typed answer Ursula sends for the write is no \
-                       answer of Ursula's: the VFS rejects it and blocks, which sends the \
-                       identical request again every 30 s";
+const FOLLOWS: Mapping = Mapping::Follows;
+/// answer.rs: `Refused`, a `408`, `429` or `5xx`.
+const SAFE_RESEND: Mapping = Mapping::Deliberate(
+    "refused, and a refusal of load or routing passes: a keyed write's repeat applies once or \
+     gets its receipt",
+);
+/// answer.rs: `Applied` or `Repeat` without a producer answer.
+const ELSEWHERE: Mapping = Mapping::Deliberate(
+    "the VFS reads this write's success in its own table, never through decide_status",
+);
+const KEYED_ONLY: Mapping = Mapping::Deliberate(
+    "the VFS writes keyed only: a success without a receipt is not one of its answers",
+);
+const NO_BUCKETS: Mapping =
+    Mapping::Deliberate("the VFS never creates a bucket: an answer to one is none of its answers");
+/// answer.rs: `Unknown`, a `1xx` or `2xx` (the keyed one through its malformed receipt).
+const NOT_URSULA: Mapping = Mapping::Deliberate(
+    "a keyed success without its receipt is no answer of Ursula's: the VFS blocks, which sends \
+     the identical request again every 30 s",
+);
+const UNTYPED: Mapping = Mapping::Deliberate(
+    "a success without the typed answer Ursula sends for the write is no answer of Ursula's: the \
+     VFS rejects it and blocks, which sends the identical request again every 30 s",
+);
+/// answer.rs's producer rows: `receipt-evicted` reads `Repeat`.
+const EVICTED: Mapping = Mapping::Deliberate(
+    "the in-flight write is always the producer's newest, so an evicted receipt names another \
+     writer's write under our key: the VFS fences, and a claim gives up its epoch",
+);
 
 macro_rules! expected {
-    ($($id:literal => $append:ident, $claim:tt, $snapshot:ident, $reason:expr;)+) => {
+    ($($id:literal => $append:ident, $claim:tt, $snapshot:ident, $mapping:expr;)+) => {
         &[$(Expected {
             id: $id,
             append: Vfs::$append,
             claim: expected!(@claim $claim),
             snapshot: Snap::$snapshot,
-            reason: $reason,
+            mapping: $mapping,
         },)+]
     };
     (@claim -) => { None };
     (@claim $claim:ident) => { Some(Vfs::$claim) };
 }
 
-/// What the VFS does for each row, and, where the replicator does not do what `classify` reads,
-/// why that is safe.
+/// What the VFS does for each row, and how the replicator's action relates to the outcome.
 const EXPECTED: &[Expected] = expected! {
-    "append-applied" => Acknowledge, Acknowledge, Decides, "";
-    "append-repeat" => Acknowledge, Acknowledge, Decides, "";
-    "append-receipt-evicted" => Reset, Lost, Decides,
-        "the in-flight write is always the producer's newest, so an evicted receipt names \
-         another writer's write under our key: the VFS fences, and a claim gives up its epoch";
+    "append-applied" => Acknowledge, Acknowledge, Decides, FOLLOWS;
+    "append-repeat" => Acknowledge, Acknowledge, Decides, FOLLOWS;
+    "append-receipt-evicted" => Reset, Lost, Decides, EVICTED;
     "append-keyless" => Blocked, -, Decides, KEYED_ONLY;
     "close-keyless" => Blocked, -, Decides, KEYED_ONLY;
     "create-new" => Blocked, -, Decides, ELSEWHERE;
@@ -138,22 +171,22 @@ const EXPECTED: &[Expected] = expected! {
     "stream-deleted" => Blocked, -, Decides, ELSEWHERE;
     "bucket-created" => Blocked, -, Decides, NO_BUCKETS;
     "parts-commit-published" => Blocked, -, Decides, ELSEWHERE;
-    "redirect" => Redirect, Redirect, Decides, "";
-    "producer-epoch-closed" => Reset, Lost, Decides, "";
-    "producer-stale-epoch" => Reset, Lost, Decides, "";
-    "producer-key-conflict" => Reset, Lost, Decides, "";
-    "producer-expired" => ContinuationClaim, Lost, Decides, "";
-    "producer-seq-gap" => Reset, Reset, Decides, "";
-    "producer-epoch-not-claimed" => Reset, Reset, Decides, "";
-    "bad-request" => Blocked, -, Decides, "";
-    "not-found" => Head, Head, Decides, "";
-    "stream-closed" => Reset, Reset, Decides, "";
-    "stream-seq-conflict" => Blocked, -, Decides, "";
-    "snapshot-conflict" => Blocked, -, Decides, "";
-    "conflict" => Blocked, -, Decides, "";
-    "gone" => Blocked, -, Decides, "";
-    "incarnation-mismatch" => Head, Head, Decides, "";
-    "too-large" => LowerLimit, -, Decides, "";
+    "redirect" => Redirect, Redirect, Decides, FOLLOWS;
+    "producer-epoch-closed" => Reset, Lost, Decides, FOLLOWS;
+    "producer-stale-epoch" => Reset, Lost, Decides, FOLLOWS;
+    "producer-key-conflict" => Reset, Lost, Decides, FOLLOWS;
+    "producer-expired" => ContinuationClaim, Lost, Decides, FOLLOWS;
+    "producer-seq-gap" => Reset, Reset, Decides, FOLLOWS;
+    "producer-epoch-not-claimed" => Reset, Reset, Decides, FOLLOWS;
+    "bad-request" => Blocked, -, Decides, FOLLOWS;
+    "not-found" => Head, Head, Decides, FOLLOWS;
+    "stream-closed" => Reset, Reset, Decides, FOLLOWS;
+    "stream-seq-conflict" => Blocked, -, Decides, FOLLOWS;
+    "snapshot-conflict" => Blocked, -, Decides, FOLLOWS;
+    "conflict" => Blocked, -, Decides, FOLLOWS;
+    "gone" => Blocked, -, Decides, FOLLOWS;
+    "incarnation-mismatch" => Head, Head, Decides, FOLLOWS;
+    "too-large" => LowerLimit, -, Decides, FOLLOWS;
     "producer-limit" => Resend, Resend, Resend, SAFE_RESEND;
     // Unlike every other `429`, the snapshotter decides on this one
     // (`transient_part`): no repeat of the part lifts the stream's bound.
@@ -161,8 +194,8 @@ const EXPECTED: &[Expected] = expected! {
     "no-cold-store" => Resend, -, Decides, SAFE_RESEND;
     "no-leader-before-body" => Resend, Resend, Resend, SAFE_RESEND;
     "no-leader-before-proposal" => Resend, Resend, Resend, SAFE_RESEND;
-    "leadership-lost-after-proposal" => Resend, Resend, Resend, "";
-    "outcome-unknown" => Resend, Resend, Resend, "";
+    "leadership-lost-after-proposal" => Resend, Resend, Resend, FOLLOWS;
+    "outcome-unknown" => Resend, Resend, Resend, FOLLOWS;
     "wal-disk-pressure" => Resend, Resend, Resend, SAFE_RESEND;
     "raft-log-pressure" => Resend, Resend, Resend, SAFE_RESEND;
     "ingress-body-budget" => Resend, Resend, Resend, SAFE_RESEND;
@@ -172,13 +205,13 @@ const EXPECTED: &[Expected] = expected! {
     "apply-stopped" => Resend, Resend, Resend, SAFE_RESEND;
     "json-boundary-unverified" => Resend, -, Resend, SAFE_RESEND;
     "snapshot-commits-busy" => Resend, -, Resend, SAFE_RESEND;
-    "snapshot-commit-in-progress" => Resend, -, Resend, "";
-    "internal" => Resend, Resend, Resend, "";
-    "cold-store-failed" => Resend, Resend, Resend, "";
-    "gateway-invalid-credential" => Reauthorize, Reauthorize, Decides, "";
-    "gateway-forbidden" => Blocked, Blocked, Decides, "";
-    "gateway-concealed" => Head, Head, Decides, "";
-    "gateway-too-large" => LowerLimit, LowerLimit, Decides, "";
+    "snapshot-commit-in-progress" => Resend, -, Resend, FOLLOWS;
+    "internal" => Resend, Resend, Resend, FOLLOWS;
+    "cold-store-failed" => Resend, Resend, Resend, FOLLOWS;
+    "gateway-invalid-credential" => Reauthorize, Reauthorize, Decides, FOLLOWS;
+    "gateway-forbidden" => Blocked, Blocked, Decides, FOLLOWS;
+    "gateway-concealed" => Head, Head, Decides, FOLLOWS;
+    "gateway-too-large" => LowerLimit, LowerLimit, Decides, FOLLOWS;
     "gateway-rate-limited" => Resend, Resend, Resend, SAFE_RESEND;
     "gateway-uploads-exhausted" => Resend, Resend, Resend, SAFE_RESEND;
     "gateway-upload-bytes-exhausted" => Resend, Resend, Resend, SAFE_RESEND;
@@ -189,23 +222,23 @@ const EXPECTED: &[Expected] = expected! {
     "gateway-no-upstream" => Resend, Resend, Resend, SAFE_RESEND;
     "gateway-upstream-unreachable" => Resend, Resend, Resend, SAFE_RESEND;
     "gateway-no-leader" => Resend, Resend, Resend, SAFE_RESEND;
-    "gateway-upstream-failed" => Resend, Resend, Resend, "";
-    "gateway-upstream-timeout" => Resend, Resend, Resend, "";
-    "embedder-payment-required" => Blocked, Blocked, Decides, "";
-    "embedder-account-revoked" => Blocked, Blocked, Decides, "";
-    "embedder-forbidden" => Blocked, Blocked, Decides, "";
+    "gateway-upstream-failed" => Resend, Resend, Resend, FOLLOWS;
+    "gateway-upstream-timeout" => Resend, Resend, Resend, FOLLOWS;
+    "embedder-payment-required" => Blocked, Blocked, Decides, FOLLOWS;
+    "embedder-account-revoked" => Blocked, Blocked, Decides, FOLLOWS;
+    "embedder-forbidden" => Blocked, Blocked, Decides, FOLLOWS;
     "embedder-rate-limited" => Resend, Resend, Resend, SAFE_RESEND;
-    "foreign-4xx" => Blocked, Blocked, Decides, "";
-    "foreign-408" => Resend, Resend, Resend, "";
-    "foreign-5xx" => Resend, Resend, Resend, "";
+    "foreign-4xx" => Blocked, Blocked, Decides, FOLLOWS;
+    "foreign-408" => Resend, Resend, Resend, FOLLOWS;
+    "foreign-5xx" => Resend, Resend, Resend, FOLLOWS;
     "keyed-2xx-without-receipt" => Blocked, Blocked, Decides, NOT_URSULA;
     "keyless-2xx-untyped" => Blocked, -, Decides, UNTYPED;
-    "transport-failure" => Resend, Resend, Resend, "";
+    "transport-failure" => Resend, Resend, Resend, FOLLOWS;
 };
 
 /// Whether the replicator does what `outcome` asks of a client: acknowledge what holds, resend
 /// what may have applied, follow a redirect, and stop or repair on a refusal.
-fn agrees(outcome: &WriteOutcome, vfs: Vfs) -> bool {
+fn follows(outcome: &WriteOutcome, vfs: Vfs) -> bool {
     match outcome {
         WriteOutcome::Applied | WriteOutcome::Repeat => vfs == Vfs::Acknowledge,
         WriteOutcome::Unknown => vfs == Vfs::Resend,
@@ -336,8 +369,8 @@ fn claim_decision(row: &Row) -> Option<Vfs> {
 }
 
 /// What the snapshotter does with `row`'s answer to a part, for a part's row, else to a publish
-/// or a commit.
-fn snapshot_decision(row: &Row) -> Snap {
+/// or a commit, and the outcome that answer carries.
+fn snapshot_decision(row: &Row) -> (Snap, WriteOutcome) {
     let (request, reader): (Request, fn(&Answer) -> bool) = match row.write {
         Write::PartStage => (request_of(row.write, 0), transient_part),
         // The snapshotter's own writes, read with their own request.
@@ -345,14 +378,29 @@ fn snapshot_decision(row: &Row) -> Snap {
         _ => (request_of(Write::SnapshotPublish, 0), transient),
     };
     match exchange(row, &request) {
-        Exchange::NoAnswer(_) => Snap::Resend,
-        Exchange::Answered(answer) if reader(&answer) => Snap::Resend,
-        Exchange::Answered(_) => Snap::Decides,
+        Exchange::NoAnswer(_) => (Snap::Resend, WriteOutcome::NO_ANSWER),
+        Exchange::Answered(answer) => {
+            let snap = if reader(&answer) {
+                Snap::Resend
+            } else {
+                Snap::Decides
+            };
+            (snap, answer.outcome.expect("an answer to a write"))
+        }
+    }
+}
+
+/// The outcome the VFS's own answer to `row`'s write carries ([`Answer::outcome`]), the one
+/// classification of the answer it reads.
+fn vfs_outcome(row: &Row) -> WriteOutcome {
+    match exchange(row, &request_of(row.write, 4)) {
+        Exchange::NoAnswer(_) => WriteOutcome::NO_ANSWER,
+        Exchange::Answered(answer) => answer.outcome.expect("an answer to a write"),
     }
 }
 
 #[test]
-fn the_vfs_and_classify_agree_on_every_inventory_row() {
+fn the_vfs_maps_every_inventory_row_to_its_action() {
     let ids: Vec<&str> = INVENTORY.iter().map(|row| row.id).collect();
     let expected: Vec<&str> = EXPECTED.iter().map(|row| row.id).collect();
     assert_eq!(
@@ -366,8 +414,16 @@ fn the_vfs_and_classify_agree_on_every_inventory_row() {
             .expect("a sample")
             .map_or(WriteOutcome::NO_ANSWER, |sample| sample.classify());
         assert_eq!(outcome, row.outcome, "{id}");
+        // The VFS reads the answer with `classify` itself. It never creates a bucket, and the
+        // stream's create that stands in reads a success without `Stream-Incarnation` as unknown.
+        let read = vfs_outcome(row);
+        if row.write == Write::CreateBucket {
+            assert_eq!(read, WriteOutcome::Unknown, "{id}");
+        } else {
+            assert_eq!(read, outcome, "{id}: the VFS read the answer otherwise");
+        }
 
-        let (append, claim, snapshot) = (
+        let (append, claim, (snapshot, as_snapshot)) = (
             append_decision(row),
             claim_decision(row),
             snapshot_decision(row),
@@ -392,38 +448,30 @@ fn the_vfs_and_classify_agree_on_every_inventory_row() {
                 "{id}: {vfs:?} is unsafe for {outcome:?}"
             );
         }
-        // The snapshotter sends again every answer that may have applied. A
-        // success it decides on (`decided`) counts as published only with the
-        // typed snapshot, so an untyped one never passes for a publish.
-        let as_snapshot =
-            row.sample()
-                .expect("a sample")
-                .map_or(WriteOutcome::NO_ANSWER, |sample| {
-                    let kind = match row.write {
-                        Write::PartStage => WriteKind::PartStage,
-                        _ => WriteKind::Publish,
-                    };
-                    if (200..300).contains(&sample.status) {
-                        return WriteOutcome::Applied;
-                    }
-                    classify(kind, sample.status, sample.pairs(), &sample.body)
-                });
-        if as_snapshot == WriteOutcome::Unknown {
+        // The snapshotter sends again every answer that may have applied. A success it decides
+        // on counts as published only with the typed snapshot, so an untyped one never passes
+        // for a publish.
+        let success = row
+            .sample()
+            .expect("a sample")
+            .is_some_and(|sample| (200..300).contains(&sample.status));
+        if as_snapshot == WriteOutcome::Unknown && !success {
             assert_eq!(
                 snapshot,
                 Snap::Resend,
                 "{id}: an unknown outcome is sent again"
             );
         }
-        let all_agree = decisions
+        let all_follow = decisions
             .into_iter()
             .flatten()
-            .all(|vfs| agrees(&outcome, vfs));
+            .all(|vfs| follows(&outcome, vfs));
+        let reason = expected.mapping.reason();
         assert_eq!(
-            all_agree,
-            expected.reason.is_empty(),
-            "{id}: {decisions:?} for {outcome:?}: a difference needs its reason, and an \
-             agreement none"
+            all_follow,
+            reason.is_none(),
+            "{id}: {decisions:?} for {outcome:?} ({reason:?}): a difference is mapped \
+             deliberately, with its reason, and an action that follows the outcome is not"
         );
     }
 }

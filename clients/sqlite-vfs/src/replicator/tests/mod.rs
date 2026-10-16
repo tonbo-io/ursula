@@ -3,14 +3,14 @@
     reason = "tests compute offsets, positions and counters from small generated sizes"
 )]
 //! Tests of the replicator: one per row of both answer tables (design: Answers)
-//! ([`answer_rows`]), the same answers against `ursula_headers::classify`
-//! ([`classify_cross_check`]), one per row of the reconcile table (design: Reconcile)
+//! ([`answer_rows`]), the VFS's action for every row of the write-outcome inventory
+//! ([`inventory_actions`]), one per row of the reconcile table (design: Reconcile)
 //! ([`reconcile_rows`]), the machine's own rules ([`machine`]), re-keys across a history the
 //! stream inherits ([`rekey`]),
 //! and the proptest world against the model server ([`world`]).
 
 mod answer_rows;
-mod classify_cross_check;
+mod inventory_actions;
 mod machine;
 mod parts;
 mod reconcile_rows;
