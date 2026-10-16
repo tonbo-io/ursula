@@ -47,6 +47,34 @@ pub enum Defence {
     /// A leader linearizes an immutable-read chunk it cannot mark, and a
     /// `416`, before it answers (#581 section 5.3, m1 of the step 5 review).
     ImmutableLeaderBarrier,
+    /// The plan's leader is checked against the membership it keeps after a
+    /// cut, and drops a plan whose cut leaves it no vote (#613, R2). Off, it
+    /// is checked against its effective membership even when the plan cuts,
+    /// and keeps such a plan, as before #613.
+    PlanKeptMembership,
+    /// The plan's leader restarts with the plan term as its uncommitted vote
+    /// (#613), so its first election is above the plan term. OpenRaft then
+    /// also refuses appends from a leader whose vote is below that one.
+    PlanTermVote,
+    /// A replica refuses an append whose entries differ from its log at or
+    /// below its commit marker (#613). Off, a plan led from a replica that
+    /// knew less overwrites a replica's committed entries.
+    CommitScreen,
+    /// A member of a recovery plan takes it whatever its own membership says
+    /// of the plan's leader (#613, R3). Off, it refuses a leader outside its
+    /// own membership, as before #613.
+    PlanMemberCheck,
+    /// A replica refuses a snapshot install that would replace entries at or
+    /// below its commit marker (#613). Off for installs only, the append
+    /// screen still runs.
+    CommitScreenInstall,
+    /// The install screen admits a snapshot of any other history that kept
+    /// entries up to the marker, not only of one that directly replaced the
+    /// replica's own (#613, as at `b9de4186`).
+    CommitScreenChain,
+    /// The commit screen reads the store's marker alone and skips every
+    /// index at or below the last purged entry (#613, as at `20bb1b88`).
+    CommitScreenPurged,
 }
 
 #[cfg(madsim)]
@@ -56,8 +84,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 10]> = const { Cell::new([false; 10]) };
-        static FIRED: Cell<[u64; 10]> = const { Cell::new([0; 10]) };
+        static OFF: Cell<[bool; 17]> = const { Cell::new([false; 17]) };
+        static FIRED: Cell<[u64; 17]> = const { Cell::new([0; 17]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -72,6 +100,13 @@ mod switches {
             Defence::ImmutableOpenTail => 7,
             Defence::FollowerMarkCheck => 8,
             Defence::ImmutableLeaderBarrier => 9,
+            Defence::PlanKeptMembership => 10,
+            Defence::PlanTermVote => 11,
+            Defence::CommitScreen => 12,
+            Defence::PlanMemberCheck => 13,
+            Defence::CommitScreenInstall => 14,
+            Defence::CommitScreenChain => 15,
+            Defence::CommitScreenPurged => 16,
         }
     }
 
@@ -94,7 +129,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 10]));
+        FIRED.with(|fired| fired.set([0; 17]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -6496,6 +6496,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         };
         let plan = |expected: ursula_proto::admin::ReplicaLogView| {
             ursula_proto::admin::RecoveryPlanRequest {
+                point_entry: None,
                 leader: 1,
                 point: expected.last_log_index.unwrap_or(0),
                 cut: false,
@@ -6589,6 +6590,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         // the leader's fence back as they were.
         let before = gate.status();
         let cutting = ursula_proto::admin::RecoveryPlanRequest {
+            point_entry: None,
             point: 0,
             cut: true,
             ..plan(seen)
@@ -6675,6 +6677,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         // the vote term the tool read on the replica did not come from the
         // plan's leader, and is refused, typed.
         let low_term = ursula_proto::admin::RecoveryPlanRequest {
+            point_entry: None,
             leader: 2,
             step: ursula_proto::admin::PlanStep::Follow {
                 leader_term: seen.current_term.saturating_add(4),
@@ -7027,7 +7030,11 @@ fn raft_metrics_snapshot(
     snapshot: Option<u64>,
     voters: Vec<u64>,
 ) -> RaftGroupMetricsSnapshot {
-    let progress = |index: u64| RaftLogProgressSnapshot { term: 1, index };
+    let progress = |index: u64| RaftLogProgressSnapshot {
+        term: 1,
+        index,
+        node_id: 1,
+    };
     RaftGroupMetricsSnapshot {
         apply_failure: None,
         raft_group_id: group_id,
@@ -7040,6 +7047,7 @@ fn raft_metrics_snapshot(
         snapshot: snapshot.map(progress),
         purged: None,
         voter_configurations: vec![voters.iter().copied().collect()],
+        committed_voter_configurations: vec![voters.iter().copied().collect()],
         voter_ids: voters,
         learner_ids: vec![],
         maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
@@ -7448,6 +7456,7 @@ mod snapshot_driver {
         snapshot.last_log = Some(super::RaftLogProgressSnapshot {
             term: 4,
             index: 120,
+            node_id: 1,
         });
         let rendered = crate::render::render_raft_group_metrics_array(&[snapshot]);
         let group = &rendered[0];

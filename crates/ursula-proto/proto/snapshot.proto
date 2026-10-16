@@ -61,6 +61,16 @@ message HistoryEventV1 {
   uint64 event_index = 2;
   // The 32-byte BLAKE3 digest of the backup the group was restored from.
   optional bytes imported = 3;
+  // The last log index the history kept from the one it replaced (#613).
+  // Required: a frame without it is refused.
+  optional uint64 kept = 4;
+  // The id of the history this one replaced, 0 for none (#613). Required:
+  // a frame without it is refused.
+  optional uint64 previous = 5;
+  // The term and node of the leader that proposed the event, 0 for an
+  // import (#613). Required: a frame without them is refused.
+  optional uint64 leader_term = 6;
+  optional uint64 leader_node = 7;
 }
 
 // What a stream's current history began from (W5).

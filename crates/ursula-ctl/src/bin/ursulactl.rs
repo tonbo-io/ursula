@@ -1152,10 +1152,32 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
         ursula_ctl::recovery::RecoverOutcome::DryRun(explained) => {
             print_plan_explanation(args.group, &explained);
         }
-        ursula_ctl::recovery::RecoverOutcome::Satisfied { plan, plans_sent } => println!(
-            "group {}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
-            args.group, plan.leader, plan.point, plan.cut
-        ),
+        ursula_ctl::recovery::RecoverOutcome::Satisfied {
+            plan,
+            plans_sent,
+            outside,
+            stopped,
+        } => {
+            println!(
+                "group {}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
+                args.group, plan.leader, plan.point, plan.cut
+            );
+            if !outside.is_empty() {
+                println!(
+                    "group {}: nodes {outside:?} are outside the leader's membership: they answer reads \
+                     of the group with 503 while they hold the plan; a configured voter is added \
+                     back as a learner, and one whose log is ahead of the plan's point must rejoin \
+                     as a wiped node (operations guide, Rejoining a wiped node)",
+                    args.group
+                );
+            }
+            if !stopped.is_empty() {
+                println!(
+                    "group {}: nodes {stopped:?} report the group stopped and were not waited for",
+                    args.group
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1175,7 +1197,8 @@ fn print_plan_explanation(group: u64, explained: &ursula_ctl::recovery::PlanExpl
     if plan.cut {
         println!(
             "  cut: the longest voter log ends at {longest}, below the floor {}, the highest vote \
-             term a restricted replica holds; every replica keeps only what it knew was committed",
+             term a restricted replica holds, or its replica is no voter of its own membership; \
+             every replica keeps only what it knew was committed",
             plan.floor
         );
     } else {
@@ -1190,13 +1213,15 @@ fn print_plan_explanation(group: u64, explained: &ursula_ctl::recovery::PlanExpl
     );
     for member in &explained.members {
         println!(
-            "  node {}: gate {:?}, expected last log index {:?}, last log term {:?}, current term {}, committed {:?}",
+            "  node {}: gate {:?}, expected last log index {:?}, last log term {:?}, current term {}, committed {:?}, voters {:?}, voters after a cut {:?}",
             member.node_id,
             member.gate,
             member.log.last_log_index,
             member.log.last_log_term,
             member.log.current_term,
-            member.committed
+            member.committed,
+            member.voter_configs,
+            member.committed_voter_configs
         );
     }
     if explained.unreached_voters.is_empty() {

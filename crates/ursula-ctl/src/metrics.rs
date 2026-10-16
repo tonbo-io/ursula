@@ -726,6 +726,8 @@ pub(crate) fn test_group(
         current_leader,
         committed_index,
         last_applied_index,
+        voter_configs: vec![voter_ids.iter().copied().collect()],
+        committed_voter_configs: vec![voter_ids.iter().copied().collect()],
         voter_ids,
         learner_ids: vec![],
         maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
@@ -741,6 +743,7 @@ pub(crate) fn test_group(
             .max(last_applied_index)
             .map(|_| current_term),
         committed_term: committed_index.map(|_| current_term),
+        committed_node: committed_index.map(|_| node_id),
         last_applied_term: last_applied_index.map(|_| current_term),
         snapshot_term: None,
         snapshot_index: None,
@@ -1288,7 +1291,7 @@ mod tests {
                 1 => {
                     wire["raft_groups"] = serde_json::json!([{
                         "raft_group_id":0,"node_id":2,"current_term":1,"current_leader":1,
-                        "committed_index":1,"last_applied_index":1,"voter_ids":[1,2,3],"learner_ids":[],
+                        "committed_index":1,"committed_node":1,"last_applied_index":1,"voter_ids":[1,2,3],"voter_configs":[[1,2,3]],"committed_voter_configs":[[1,2,3]],"learner_ids":[],
                         "maintenance":{"running":true,"recovery_ready":true,"accepting_transfers":true,"membership_joint":false,"membership_log_index":0,"stopped_for_operator":false},
                         "last_log_index":1,"last_log_term":1,"committed_term":1,"last_applied_term":1,
                         "snapshot_term":null,"snapshot_index":null,"purged_term":null,"purged_index":null,

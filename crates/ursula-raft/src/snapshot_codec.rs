@@ -246,6 +246,10 @@ fn history_to_proto(history: HistoryEvent) -> proto::HistoryEventV1 {
         imported: history
             .imported
             .map(|digest| Bytes::copy_from_slice(&digest)),
+        kept: Some(history.kept),
+        previous: Some(history.previous),
+        leader_term: Some(history.leader.term),
+        leader_node: Some(history.leader.node_id),
     }
 }
 
@@ -254,6 +258,15 @@ fn history_from_proto(history: proto::HistoryEventV1) -> Result<HistoryEvent, Sn
     Ok(HistoryEvent {
         id: std::num::NonZeroU64::new(history.id).ok_or(SnapshotStoreError::HistoryIdZero)?,
         event_index: history.event_index,
+        kept: required(history.kept, "snapshot history event kept index")?,
+        previous: required(
+            history.previous,
+            "snapshot history event's replaced history",
+        )?,
+        leader: ursula_stream::HistoryLeader {
+            term: required(history.leader_term, "snapshot history event's leader term")?,
+            node_id: required(history.leader_node, "snapshot history event's leader node")?,
+        },
         imported: history
             .imported
             .map(|bytes| {
@@ -655,6 +668,58 @@ mod tests {
 
     use super::*;
 
+    /// The history event in a snapshot's header frame, as format epoch 4
+    /// writes it (#613): a recovery's event, with the history it replaced,
+    /// the index it kept and its leader. A frame without any of them is
+    /// refused.
+    #[test]
+    fn a_history_event_frame_is_stable() {
+        // Fields 1 id, 2 event_index, 4 kept, 5 previous, 6 leader_term,
+        // 7 leader_node.
+        const GOLDEN: &[u8] = &[
+            8, 161, 134, 149, 187, 152, 245, 242, 246, 15, 16, 14, 32, 12, 40, 239, 155, 175, 205,
+            248, 172, 209, 145, 1, 48, 7, 56, 2,
+        ];
+        let event = HistoryEvent {
+            id: std::num::NonZeroU64::new(0x0fed_cba9_8765_4321).expect("non-zero"),
+            event_index: 14,
+            previous: 0x0123_4567_89ab_cdef,
+            kept: 12,
+            leader: ursula_stream::HistoryLeader {
+                term: 7,
+                node_id: 2,
+            },
+            imported: None,
+        };
+        let encoded = history_to_proto(event).encode_to_vec();
+        assert_eq!(encoded, GOLDEN);
+        let decoded = proto::HistoryEventV1::decode(GOLDEN).expect("decodes");
+        assert_eq!(history_from_proto(decoded.clone()).expect("valid"), event);
+        for missing in [
+            proto::HistoryEventV1 {
+                kept: None,
+                ..decoded.clone()
+            },
+            proto::HistoryEventV1 {
+                previous: None,
+                ..decoded.clone()
+            },
+            proto::HistoryEventV1 {
+                leader_term: None,
+                ..decoded.clone()
+            },
+            proto::HistoryEventV1 {
+                leader_node: None,
+                ..decoded
+            },
+        ] {
+            assert!(matches!(
+                history_from_proto(missing),
+                Err(SnapshotStoreError::MissingField { .. })
+            ));
+        }
+    }
+
     #[test]
     fn empty_group_snapshot_round_trips() {
         let snapshot = GroupSnapshot {
@@ -888,6 +953,12 @@ mod tests {
         apply(&mut machine, ursula_stream::StreamCommand::NewHistory {
             history: NonZeroU64::new(11).unwrap(),
             now_ms: 0,
+            previous: 0,
+            kept: 0,
+            leader: ursula_stream::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
         });
         apply(&mut machine, ursula_stream::StreamCommand::CreateBucket {
             bucket_id: "bucket".to_owned(),
@@ -923,6 +994,12 @@ mod tests {
         restored.apply_entry(1, ursula_stream::StreamCommand::NewHistory {
             history: NonZeroU64::new(12).unwrap(),
             now_ms: 0,
+            previous: 0,
+            kept: 0,
+            leader: ursula_stream::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
         });
         restored.apply_entry(2, ursula_stream::StreamCommand::ImportSnapshot {
             snapshot: Box::new(machine.snapshot()),
@@ -936,6 +1013,12 @@ mod tests {
         restored.apply_entry(3, ursula_stream::StreamCommand::NewHistory {
             history: NonZeroU64::new(14).unwrap(),
             now_ms: 0,
+            previous: 13,
+            kept: 2,
+            leader: ursula_stream::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
         });
         restored.apply_entry(4, ursula_stream::StreamCommand::Append {
             stream_id: stream_id.clone(),

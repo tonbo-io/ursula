@@ -149,7 +149,11 @@ mod tests {
     }
 
     fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
-        let progress = RaftLogProgressSnapshot { term: 1, index: 20 };
+        let progress = RaftLogProgressSnapshot {
+            term: 1,
+            index: 20,
+            node_id: 1,
+        };
         RaftGroupMetricsSnapshot {
             apply_failure: None,
             raft_group_id: id,
@@ -163,6 +167,7 @@ mod tests {
             purged: None,
             voter_ids: vec![1, 2, 3],
             voter_configurations: vec![BTreeSet::from([1, 2, 3])],
+            committed_voter_configurations: vec![BTreeSet::from([1, 2, 3])],
             learner_ids: vec![],
             maintenance: RaftGroupMaintenanceState {
                 running: true,
@@ -259,7 +264,11 @@ mod tests {
             report(&[healthy(0), new.clone()]).group_issues[&1]
                 .contains(&RaftMaintenanceIssue::MembershipNotApplied)
         );
-        new.last_applied = Some(RaftLogProgressSnapshot { term: 1, index: 21 });
+        new.last_applied = Some(RaftLogProgressSnapshot {
+            term: 1,
+            index: 21,
+            node_id: 1,
+        });
         assert!(report(&[healthy(0), new]).ready());
     }
 
@@ -298,9 +307,17 @@ mod tests {
         group.current_leader = Some(4);
         assert!(!report(&[healthy(0), group.clone()]).ready());
         group.current_leader = Some(2);
-        group.committed = Some(RaftLogProgressSnapshot { term: 1, index: 37 });
+        group.committed = Some(RaftLogProgressSnapshot {
+            term: 1,
+            index: 37,
+            node_id: 1,
+        });
         assert!(!report(&[healthy(0), group.clone()]).ready());
-        group.committed = Some(RaftLogProgressSnapshot { term: 1, index: 36 });
+        group.committed = Some(RaftLogProgressSnapshot {
+            term: 1,
+            index: 36,
+            node_id: 1,
+        });
         assert!(report(&[healthy(0), group]).ready());
     }
 

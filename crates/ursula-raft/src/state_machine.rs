@@ -1217,6 +1217,7 @@ impl RaftGroupStateMachine {
             .map_err(group_engine_io_error)?;
         self.last_applied_log_id = persisted.meta.last_log_id;
         self.last_membership = persisted.meta.last_membership.clone();
+        self.log_gauge.record_membership(&self.last_membership);
         self.log_gauge
             .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
@@ -1488,6 +1489,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                         Some(entry.log_id),
                         membership,
                     );
+                    self.log_gauge.record_membership(&self.last_membership);
                     RaftGroupResponse::Membership
                 }
             };
@@ -1605,6 +1607,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .map_err(group_engine_io_error)?;
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+        self.log_gauge.record_membership(&self.last_membership);
         self.log_gauge
             .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
         let current_snapshot = self.current_snapshot.clone();

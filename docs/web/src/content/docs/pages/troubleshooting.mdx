@@ -211,7 +211,7 @@ anything) or runs a plan's cut, when the request's `step` is not the replica's
 plan's leader is not a voter, when the replica no longer holds the log the
 plan's `expected` names, when it committed or applied an entry above the plan's
 `point`, when it is the plan's leader and its log does not continue from the
-`point`, or when the plan's cut cannot run because the log no longer holds the
+`point` or, with a `point_entry`, does not hold exactly that entry there, or when the plan's cut cannot run because the log no longer holds the
 entry it keeps. The answer's body names the `refusal` by its `reason`. Read
 `/__ursula/metrics` on every replica again and plan again with what it shows,
 once the group has no leader and, after a `not_stalled` refusal, once the gate

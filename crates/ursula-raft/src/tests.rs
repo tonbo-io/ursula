@@ -415,6 +415,12 @@ pub(crate) fn genesis_command() -> GroupWriteCommand {
     GroupWriteCommand::Stream(ursula_stream::StreamCommand::NewHistory {
         history: std::num::NonZeroU64::new(1).expect("non-zero"),
         now_ms: 0,
+        previous: 0,
+        kept: 0,
+        leader: ursula_stream::HistoryLeader {
+            term: 0,
+            node_id: 0,
+        },
     })
 }
 
@@ -3238,6 +3244,12 @@ fn a_pending_history_fences_only_its_leader() {
     let event = |event_index| ursula_runtime::HistoryEvent {
         id: std::num::NonZeroU64::new(7).expect("non-zero"),
         event_index,
+        previous: 1,
+        kept: 10,
+        leader: ursula_stream::HistoryLeader {
+            term: 0,
+            node_id: 0,
+        },
         imported: None,
     };
     let plan = RecoveryRecord {

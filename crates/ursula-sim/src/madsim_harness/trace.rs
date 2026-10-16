@@ -698,6 +698,52 @@ pub enum SimEvent {
         loss_checked: u64,
         leader_kills: u64,
     },
+    /// The `recovery-plan-membership-rollback` invariants held: after a
+    /// membership change the accepted loss rolled back (`promoted`: the
+    /// learner's promotion, else a voter's removal), `plans` recovery plans
+    /// elected `leader`, cutting every log when `cut`, and every replica in
+    /// its membership holds it. `marker_lagged` when a completed promotion's
+    /// voter came back with its commit marker below the promotion, so a cut
+    /// keeps it a learner (M1 of the #613 review).
+    MembershipRollbackRecovered {
+        leader: u64,
+        cut: bool,
+        promoted: bool,
+        marker_lagged: bool,
+        /// The cut kept up to a later committed entry a learner reported
+        /// than any voter's marker (F3 of the third #613 review).
+        raised: bool,
+        /// Running replicas outside the leader's membership: a voter that
+        /// missed its own committed removal.
+        outside: u64,
+        /// Snapshots sent to a follower after recovery, through the commit
+        /// screen.
+        installed: u64,
+        /// Replicas probed for the client-read fence while they held an
+        /// unsatisfied plan.
+        fenced: u64,
+        plans: u64,
+    },
+    /// `recovery-plan-membership-rollback`, two recoveries: voter `node_id`,
+    /// which neither plan reached, refused `refused_installs` snapshots of
+    /// the second history, kept its committed entries, and rejoined as a
+    /// wiped node after `plans` plans (A of the fourth #613 review).
+    MembershipRollbackRejoinedWiped {
+        node_id: u64,
+        refused_installs: u64,
+        plans: u64,
+        /// It purged its log up to its marker before it stopped (B1 of the
+        /// fifth #613 review).
+        purged: bool,
+    },
+    /// `recovery-plan-membership-rollback`, learner ahead: the tool refused
+    /// the plan, typed, because node `node_id` knows entry `committed` is
+    /// committed and the plan would continue from `point`.
+    MembershipRollbackRefused {
+        node_id: u64,
+        committed: u64,
+        point: u64,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

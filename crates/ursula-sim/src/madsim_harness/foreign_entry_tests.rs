@@ -11,12 +11,13 @@
 //! with its leadership at a term below the plan term. Then the other members
 //! take the plan.
 //!
-//! Two defences keep X's write from being applied: P takes no replication
-//! from a leader at or below the plan term, and the members refuse P while
-//! its log holds an entry above the point at or below the plan term. Either
-//! suffices. With both off, X extends P's log, the members elect P, and its
-//! history event lands above X's write, which they apply under the old
-//! history.
+//! Three defences keep X's write from being applied: P takes no replication
+//! from a leader at or below the plan term, P restarts with the plan term as
+//! its vote (#613), so OpenRaft refuses X's lower vote too, and the members
+//! refuse P while its log holds an entry above the point at or below the
+//! plan term. Each suffices. With all three off, X extends P's log, the
+//! members elect P, and its history event lands above X's write, which they
+//! apply under the old history.
 
 use std::time::Duration;
 
@@ -79,6 +80,8 @@ struct XReachesTheLeader<'a> {
     leader: u64,
     /// X extended P's log above the point at or below the plan term.
     extended: bool,
+    /// When X and P were cut off again.
+    parted: Option<madsim::time::Instant>,
 }
 
 impl XReachesTheLeader<'_> {
@@ -94,6 +97,7 @@ impl XReachesTheLeader<'_> {
             self.inner.cluster.policy.heal_bidirectional(X, P);
             madsim::time::sleep(Duration::from_secs(3)).await;
             self.inner.cluster.policy.partition_bidirectional(X, P);
+            self.parted = Some(madsim::time::Instant::now());
             if let Ok(report) = &answer {
                 let held = member_view(self.inner.cluster, self.inner.group, P)
                     .await
@@ -211,7 +215,16 @@ fn run(seed: u64, controls: Controls) -> Outcome {
         madsim::time::sleep(RECOVERY_STALL_AFTER.saturating_mul(2)).await;
 
         let mut outcome = Outcome::default();
+        let mut parted: Option<madsim::time::Instant> = None;
         for group in JOURNAL_GROUPS {
+            // The previous group's plan healed X and P for every group, so P's
+            // replica of this one may have followed X meanwhile. It refuses a
+            // plan while that leader's AppendEntries reached it within the
+            // server's 3 s liveness window: let the window pass.
+            if let Some(parted) = parted {
+                let window = Duration::from_millis(3_100);
+                madsim::time::sleep(window.saturating_sub(parted.elapsed())).await;
+            }
             let mut members = Vec::new();
             for node_id in REACHED {
                 members.push(member_view(&cluster, group, node_id).await);
@@ -226,11 +239,13 @@ fn run(seed: u64, controls: Controls) -> Outcome {
                 },
                 leader: plan.leader,
                 extended: false,
+                parted: None,
             };
             let sent = send_plan(&mut transport, plan, &members)
                 .await
                 .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
             let extended = transport.extended;
+            parted = transport.parted.or(parted);
             for error in &sent.refused {
                 tracing::info!(%error, "{context}: group {group}: a member refused the plan");
             }
@@ -239,7 +254,9 @@ fn run(seed: u64, controls: Controls) -> Outcome {
                 outcome.shaped = outcome.shaped.saturating_add(1);
                 outcome.extended = outcome.extended.saturating_add(usize::from(extended));
             }
-            let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
+            // A plan the guard keeps from electing P waits out the whole
+            // deadline, once per group, within the simulation's 30 s.
+            let deadline = madsim::time::Instant::now() + Duration::from_secs(6);
             loop {
                 if foreign_applied(&cluster, group).await {
                     outcome.foreign_applied = true;
@@ -290,16 +307,28 @@ fn a_leader_before_the_plan_never_extends_the_plans_leader() {
     assert!(shaped > 0, "no seed elected P: the scenario never ran");
 }
 
-/// Either defence alone keeps X's write from being applied, and each run
-/// shows that the remaining one fired: without the log guard, the fence
-/// keeps X's entry out of P's log and the plan is satisfied; without the
-/// fence, X extends P's log and the guard keeps P from being elected.
+/// Each defence alone keeps X's write from being applied, and each run
+/// shows that it fired: with only the fence, or only the plan term vote
+/// (#613), X's entry stays out of P's log and the plan is satisfied; with
+/// only the guard, X extends P's log and the guard keeps P from being
+/// elected.
 #[test]
 fn either_defence_against_a_foreign_entry_alone_suffices() {
     let _guard = sim_test_guard();
-    let (mut fenced, mut guarded) = (0_usize, 0_usize);
+    let (mut fenced, mut guarded, mut voted) = (0_usize, 0_usize, 0_usize);
     for seed in JOURNAL_POWER_LOSS_SEEDS {
-        let outcome = run(seed, Controls::NO_LOG_GUARD);
+        let outcome = run(seed, Controls::TERM_VOTE_ONLY);
+        assert!(
+            !outcome.foreign_applied,
+            "seed {seed} term vote only: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.extended, 0,
+            "seed {seed} term vote only: {outcome:?}"
+        );
+        voted = voted.saturating_add(outcome.shaped);
+
+        let outcome = run(seed, Controls::FENCE_ONLY);
         assert!(
             !outcome.foreign_applied,
             "seed {seed} fence only: {outcome:?}"
@@ -311,7 +340,7 @@ fn either_defence_against_a_foreign_entry_alone_suffices() {
         );
         fenced = fenced.saturating_add(outcome.shaped);
 
-        let outcome = run(seed, Controls::NO_REPLICATION_FENCE);
+        let outcome = run(seed, Controls::GUARD_ONLY);
         assert!(
             !outcome.foreign_applied,
             "seed {seed} guard only: {outcome:?}"
@@ -327,12 +356,12 @@ fn either_defence_against_a_foreign_entry_alone_suffices() {
         guarded = guarded.saturating_add(outcome.shaped);
     }
     assert!(
-        fenced > 0 && guarded > 0,
-        "no seed elected P: {fenced} {guarded}"
+        fenced > 0 && guarded > 0 && voted > 0,
+        "no seed elected P: {fenced} {guarded} {voted}"
     );
 }
 
-/// M1 of the third #581 review, with both defences off: X extends P's log
+/// M1 of the third #581 review, with all three defences off: X extends P's log
 /// after the plan, the members elect P and apply X's write.
 #[test]
 fn negative_control_a_leader_before_the_plan_extends_its_leader_and_its_write_applies() {
@@ -343,6 +372,6 @@ fn negative_control_a_leader_before_the_plan_extends_its_leader_and_its_write_ap
         .count();
     assert!(
         applied > 0,
-        "no seed applied X's write with both defences off"
+        "no seed applied X's write with all three defences off"
     );
 }

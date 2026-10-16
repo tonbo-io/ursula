@@ -206,6 +206,10 @@ impl RollingRestartValidator {
                             committed_index: fixture_committed,
                             last_applied_index: fixture_applied,
                             voter_ids,
+                            voter_configs: membership.get_joint_config().clone(),
+                            committed_voter_configs: // This harness plans no recovery: the kept membership is the
+                            // effective one.
+                            membership.get_joint_config().clone(),
                             learner_ids,
                             maintenance: ursula_raft::RaftGroupMaintenanceState {
                                 running: metrics.running_state.is_ok()
@@ -229,6 +233,9 @@ impl RollingRestartValidator {
                             last_log_index: last_log.map(|id| id.index),
                             last_log_term: last_log.map(|id| id.leader_id.term),
                             committed_term: metrics.local_committed.map(|id| id.leader_id.term),
+                            committed_node: metrics
+                                .local_committed
+                                .map(|id| id.leader_id.node_id),
                             last_applied_term: metrics.last_applied.map(|id| id.leader_id.term),
                             snapshot_term: metrics.snapshot.map(|id| id.leader_id.term),
                             snapshot_index: metrics.snapshot.map(|id| id.index),

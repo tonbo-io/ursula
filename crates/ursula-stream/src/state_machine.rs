@@ -628,9 +628,13 @@ impl StreamStateMachine {
                 backup_digest,
                 now_ms,
             } => self.import_snapshot(index, *snapshot, history, backup_digest, now_ms),
-            StreamCommand::NewHistory { history, now_ms } => {
-                self.new_history(index, history, now_ms)
-            }
+            StreamCommand::NewHistory {
+                history,
+                now_ms,
+                previous,
+                kept,
+                leader,
+            } => self.new_history(index, history, previous, kept, leader, now_ms),
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)

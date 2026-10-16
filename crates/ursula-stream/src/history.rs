@@ -80,6 +80,19 @@ pub fn draw_history_id() -> NonZeroU64 {
     }
 }
 
+/// The leader that proposed a history event: the term and node of the log
+/// entry that carries it (#613). A replica whose entry at its commit marker
+/// has this leader id holds that leader's log up to there, so the event's
+/// history kept its committed entries. An import, which no plan proposes,
+/// records term 0. The only entry of term 0 is OpenRaft's initial
+/// membership at index 0, which the commit screen never matches against
+/// term 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryLeader {
+    pub term: u64,
+    pub node_id: u64,
+}
+
 /// The latest history event a group applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEvent {
@@ -88,6 +101,16 @@ pub struct HistoryEvent {
     /// The log index of the entry that applied the event. A recovery plan is
     /// satisfied once this is above the plan's point (#581 section 4.5).
     pub event_index: u64,
+    /// The id of the history this one replaced; 0 for the genesis, which
+    /// replaced none (#613).
+    pub previous: u64,
+    /// The last log index this history kept from the one it replaced: up
+    /// to it, every replica's log is the same under both (#613). A recovery
+    /// plan's point; at the genesis and an import, an index below the
+    /// event's.
+    pub kept: u64,
+    /// The leader that proposed the event.
+    pub leader: HistoryLeader,
     /// The digest of the backup this group was restored from, if any: a
     /// repeat of that import answers `already`.
     pub imported: Option<BackupDigest>,

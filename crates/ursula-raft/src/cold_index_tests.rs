@@ -195,6 +195,12 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
         StreamCommand::NewHistory {
             history: std::num::NonZeroU64::new(1).expect("non-zero"),
             now_ms: 0,
+            previous: 0,
+            kept: 0,
+            leader: ursula_stream::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
         },
         StreamCommand::CreateStream {
             stream_id: stream_id.clone(),

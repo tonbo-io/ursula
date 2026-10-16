@@ -65,7 +65,9 @@ jobs:
             --seed-family routing-before-body-under-leader-churn \
             --seed-family routing-before-body-under-leader-churn-extended \
             --seed-family marked-chunks-never-contradict \
-            --seed-family marked-chunks-never-contradict-extended
+            --seed-family marked-chunks-never-contradict-extended \
+            --seed-family recovery-plan-membership-rollback \
+            --seed-family recovery-plan-membership-rollback-extended
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

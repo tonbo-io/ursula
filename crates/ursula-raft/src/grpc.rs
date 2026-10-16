@@ -646,6 +646,8 @@ pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic
         Some(
             ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
             | ursula_runtime::GroupInfraError::RecoveryCutting { .. }
+            | ursula_runtime::GroupInfraError::CommittedOverwrite { .. }
+            | ursula_runtime::GroupInfraError::UnrelatedHistory { .. }
             | ursula_runtime::GroupInfraError::RecoveryPlanFenced { .. }
             | ursula_runtime::GroupInfraError::OwnerStopped
             | ursula_runtime::GroupInfraError::ApplyStopped { .. }
@@ -997,6 +999,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let apply_health = entry.apply_health.clone();
             let history = entry.history.clone();
             let peer_cluster = Some(self.registry.peer_cluster().clone());
+            let log_gauge = entry.log_gauge.clone();
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
@@ -1015,6 +1018,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         // when none was registered.
                         cold_index_cache,
                         peer_cluster,
+                        log_gauge,
                     };
                     let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
                     let result = match required(request.read, "group_read.read")

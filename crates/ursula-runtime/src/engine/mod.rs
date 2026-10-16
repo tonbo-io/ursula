@@ -991,6 +991,34 @@ pub enum GroupInfraError {
     /// 4.5): it takes no replication until it has. Retryable.
     #[error("raft group {raft_group_id:?} restarts to cut its log for a recovery plan")]
     RecoveryCutting { raft_group_id: RaftGroupId },
+    /// The sender's entries differ from this replica's at or below the entry
+    /// it knows is committed (#613): taking them would overwrite committed
+    /// entries. Raft never sends that; a recovery plan led from a replica
+    /// that knew less would. The replica takes nothing from the sender.
+    #[error(
+        "raft group {raft_group_id:?}: the sender's entries differ from this replica's at index \
+         {index}, at or below the committed index {committed}"
+    )]
+    CommittedOverwrite {
+        raft_group_id: RaftGroupId,
+        committed: u64,
+        index: u64,
+    },
+    /// A snapshot of history `history`, which replaced history `replaced`,
+    /// while this replica's commit marker lies in history `local` (`None`
+    /// when its log could not be read): nothing shows that the snapshot
+    /// kept this replica's committed entries (#613). The replica takes
+    /// nothing from the sender; it rejoins as a wiped node.
+    #[error(
+        "raft group {raft_group_id:?}: a snapshot of history {history:#x}, which replaced \
+         {replaced:#x}, does not continue this replica's committed history {local:?}"
+    )]
+    UnrelatedHistory {
+        raft_group_id: RaftGroupId,
+        history: u64,
+        replaced: u64,
+        local: Option<u64>,
+    },
     /// This replica holds a recovery plan and the sender leads at or below
     /// the plan's term: a leader elected before the plan, whose entries it
     /// takes no more (#581 section 4.5). Retryable for the sender, which a

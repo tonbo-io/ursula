@@ -152,6 +152,12 @@ impl StreamStateMachine {
                 restored.history = Some(HistoryEvent {
                     id: history,
                     event_index: index,
+                    previous: self.history_id(),
+                    kept: index.saturating_sub(1),
+                    leader: crate::HistoryLeader {
+                        term: 0,
+                        node_id: 0,
+                    },
                     imported: Some(backup_digest),
                 });
                 *self = restored;

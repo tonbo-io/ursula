@@ -139,6 +139,8 @@ error_codes! {
     ProducerLimit = "PRODUCER_LIMIT", "the stream holds as many producers as it may";
     /// The server's clock is out of range (`500`).
     CreatedAtOutOfRange = "CREATED_AT_OUT_OF_RANGE", "the server's clock is out of range";
+    /// Two history events of the stream's group raced (`500`).
+    HistoryMismatch = "HISTORY_MISMATCH", "two history events of the stream's group raced";
     /// `Stream-Incarnation` does not match the stream (`412`).
     IncarnationMismatch = "INCARNATION_MISMATCH", "Stream-Incarnation does not match the stream";
     /// The stream's group has not applied its history yet (`503`).
@@ -625,6 +627,7 @@ mod tests {
             (ErrorCode::ImportInvalid, "IMPORT_INVALID"),
             (ErrorCode::ProducerLimit, "PRODUCER_LIMIT"),
             (ErrorCode::CreatedAtOutOfRange, "CREATED_AT_OUT_OF_RANGE"),
+            (ErrorCode::HistoryMismatch, "HISTORY_MISMATCH"),
             (ErrorCode::IncarnationMismatch, "INCARNATION_MISMATCH"),
             (ErrorCode::HistoryPending, "HISTORY_PENDING"),
             (ErrorCode::InvalidRequest, "INVALID_REQUEST"),

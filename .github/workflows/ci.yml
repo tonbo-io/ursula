@@ -159,7 +159,8 @@ jobs:
             --seed-family recovery-plan-cut-under-restarts \
             --seed-family recovery-plan-survivor-campaigns \
             --seed-family routing-before-body-under-leader-churn \
-            --seed-family marked-chunks-never-contradict
+            --seed-family marked-chunks-never-contradict \
+            --seed-family recovery-plan-membership-rollback
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json
