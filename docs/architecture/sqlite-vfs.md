@@ -1170,8 +1170,8 @@ file the first snapshot of a new stream, page for page:
 2. A HEAD: the stream must be missing, or an empty stream of the VFS content type with no
    snapshot. Anything else refuses (`server_too_old`, `stream_format`, `stream_state`). A `404`
    without `Ursula-Protocol: 2` is `server_too_old`, never a missing stream.
-3. The create, then a claim of epoch 1 with a random activation, resent unchanged until a definite
-   answer. Its receipt must start at offset 0. Its end is `W`, above 0, since builds skip a
+3. The create, then a claim of epoch 1 with the reserved import activation (`ursula-import-v1`),
+   resent unchanged until a definite answer. Its receipt must start at offset 0. Its end is `W`, above 0, since builds skip a
    snapshot at offset 0, and the first open then claims above epoch 1.
 4. The `USS3` body at `W`, epoch 1, a fresh lineage, position 0.
 5. A HEAD naming the tail `W`, the publish of [Snapshots](#snapshots) (one `PUT`, or parts with a
@@ -1179,9 +1179,12 @@ file the first snapshot of a new stream, page for page:
    a `204` naming `(W, digest)` and a HEAD naming that snapshot with the tail still at `W`. Bytes
    after `W` fail with `stream_state`.
 
-The source file is only read. Nothing is published on a stream that is not new. A failure after
-the claim leaves the stream holding the claim alone: import into a new stream. An open of the
-stream while an import runs is not prevented.
+The source file is only read. Nothing is published on a stream that is not new. A snapshot at `W`
+need not equal a replay of the bytes before it, so a build or a reader catch-up that reads from
+offset 0 with no snapshot and meets the import's claim refuses with `stream_state` and never
+builds an empty database. While an import runs, opens of the stream fail that way. A failure
+after the claim leaves a stream that refuses opens and imports with `stream_state` until it is
+deleted or recreated.
 
 Tests: `import/tests.rs` `a_header_must_name_whole_4096_byte_pages`,
 `a_wal_or_a_hot_journal_beside_the_file_refuses_it`, `a_file_becomes_the_first_snapshot_of_a_new_stream`,
@@ -1189,7 +1192,10 @@ Tests: `import/tests.rs` `a_header_must_name_whole_4096_byte_pages`,
 `a_file_above_the_limit_without_parts_is_refused_naming_it`,
 `only_a_missing_or_empty_stream_is_imported_into`, `a_claim_that_is_not_first_publishes_nothing`,
 `a_claim_whose_answer_is_lost_is_resent_unchanged`, `bytes_after_the_claim_fail_the_import`,
-`a_head_404_without_the_protocol_creates_nothing`, and `test/import.e2e.ts` "imports a plain
+`a_head_404_without_the_protocol_creates_nothing`, `the_claim_carries_the_import_activation`,
+`codec/stream.rs` `the_claim_of_an_import_stops_the_read`, `driver/tests.rs`
+`an_empty_owner_behind_an_import_builds_from_its_snapshot_and_claims_after`,
+`a_reader_built_before_an_import_reopens_from_its_snapshot`, and `test/import.e2e.ts` "imports a plain
 database as the first snapshot of a new stream, in parts under a 64 KiB limit", "refuses a file
 with 8192-byte pages before anything is sent", "refuses a file with a -wal beside it before
 anything is sent".
@@ -1280,7 +1286,7 @@ behind the gateway.
 
 | | format |
 | --- | --- |
-| stream frames | `USQ2` ([Frames](#frames)) |
+| stream frames | `USQ2` ([Frames](#frames)), and the reserved import activation `ursula-import-v1` ([Import](#import)) |
 | snapshot bodies | `USS3` ([Snapshots](#snapshots)), digest BLAKE3 of the length-prefixed content type and the body |
 | local state | generation directories ([Layout](#layout)), `USL1` log segments ([Log](#log)), the page-1 marker ([Marker](#marker)), `db-uwal`, `manifest.json` |
 | producer | `Producer-Id: sqlite-ursula-vfs/2`, `Producer-Digest`, receipt contiguity |
@@ -1297,6 +1303,7 @@ caches, since the default directory and the names changed. 0.7 fails closed on 0
 Tests: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_frozen`,
 `the_part_frames_are_frozen`, `the_log_segment_is_frozen`, `a_fresh_builds_segment_header_is_frozen`,
 `the_snapshot_header_is_frozen`, `the_page_one_marker_is_frozen`, `the_salvage_manifest_is_frozen`,
+`the_import_activation_is_frozen`,
 `codec/digest.rs` `snapshot_digests_equal_the_servers`, `producer_digests_are_blake3`.
 
 ## Verification
@@ -1340,7 +1347,8 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   Network filesystems, filesystems that ignore fsync, and a fork after open are unsupported.
 - **Host alias on a fresh host.** With no local cluster id to compare, a misrouted alias opens the
   other deployment's stream.
-- **Import.** An open of the stream during `ursula_import` is reported, not prevented.
+- **Import.** A failed import leaves a stream that refuses opens until it is deleted or
+  recreated.
 - **Platforms.** Linux x64 and arm64 with glibc 2.28 or later, Linux x64 with musl, and macOS on
   Apple silicon. Node.js 22.19 or later.
 
