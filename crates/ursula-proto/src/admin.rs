@@ -829,8 +829,12 @@ impl RecoveryGatesReport {
     }
 }
 
+/// Answer of `GET /__ursula/leadership-shed`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeadershipShedStatus {
+    /// The answering node's `server.cluster_id`. A poller trusts only an
+    /// answer of its own cluster.
+    pub cluster_id: ursula_headers::ClusterId,
     pub bits: u8,
     pub state: String,
     pub should_accept_transfer: bool,

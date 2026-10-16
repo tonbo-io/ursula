@@ -673,12 +673,16 @@ async fn spawn_static_grpc_test_node(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, storage.cold_store)
             .expect("runtime");
-    let app = router_with_static_raft_cluster_topology(
-        runtime.clone(),
-        registry.clone(),
-        node_id,
-        router_peers,
-        storage.per_group_voters,
+    // Its answers name the cluster its WAL holds, as a server's do.
+    let app = router_with_http_state(
+        HttpState::with_static_raft_cluster_topology(
+            runtime.clone(),
+            registry.clone(),
+            Some(node_id),
+            router_peers,
+            storage.per_group_voters,
+        )
+        .with_configured_cluster_id(Some(static_test_cluster_id())),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let served = app.clone();
@@ -9433,6 +9437,7 @@ mod leadership_shed {
                         }
                         let should_campaign = answer.load(Ordering::SeqCst);
                         Json(LeadershipShedStatus {
+                            cluster_id: crate::tests::static_test_cluster_id(),
                             bits: 0,
                             state: String::new(),
                             should_accept_transfer: should_campaign,
@@ -9673,7 +9678,7 @@ mod leadership_shed {
             "{leaders:?}"
         );
         // A cold-health shed keeps the node in elections.
-        assert!(node_1.registry.participation_status().should_campaign);
+        assert!(node_1.registry.should_campaign());
         cluster.shutdown().await;
     }
 }

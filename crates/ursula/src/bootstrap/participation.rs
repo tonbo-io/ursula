@@ -5,9 +5,9 @@
 //! gates hand leaderships only to the nodes known to be allowed to campaign.
 //! The cluster-egress gate, whose questions travel the path it judges
 //! impaired, may also try a peer that did not answer, once per leadership
-//! ([`CampaignStances::shed_targets_over_impaired_path`]). A peer the Raft
-//! plane refuses for another cluster id has an unknown stance, whatever it
-//! answers. A node that may
+//! ([`CampaignStances::shed_targets_over_impaired_path`]). An answer from a
+//! node of another cluster (its `cluster_id` differs) is an unknown stance.
+//! A node that may
 //! not campaign (under drain, behind its recovery gate, or shedding for its
 //! snapshot store, cluster egress or WAL disk) refuses a transfer without
 //! telling the leader, which then forwards writes to it until Raft abandons
@@ -142,28 +142,16 @@ impl PeerParticipation {
         &self,
         registry: &RaftGroupHandleRegistry,
     ) -> CampaignStances {
+        // Only an answer of this node's cluster counts: a node of another
+        // cluster at a peer's address says nothing about this one.
+        let identity = registry.peer_cluster().identity();
+        let local = identity.as_ref().map(ursula_raft::PeerIdentity::cluster_id);
         let answers = join_all(self.peers.iter().map(|(peer_id, peer_url)| async move {
-            (*peer_id, self.peer_stance(*peer_id, peer_url).await)
+            (*peer_id, self.peer_stance(*peer_id, peer_url, local).await)
         }))
         .await;
         let mut by_node: BTreeMap<u64, CampaignStance> = answers.into_iter().collect();
-        // A peer refused on the Raft plane for another cluster id answers this
-        // poll too, if a node of another cluster sits at its address. Its
-        // answer says nothing about this cluster, so its stance is unknown.
-        let other_cluster = registry
-            .peer_cluster()
-            .mismatches(std::time::Instant::now());
-        for mismatch in &other_cluster {
-            if let Some(stance) = by_node.get_mut(&mismatch.node_id) {
-                tracing::debug!(
-                    peer_id = mismatch.node_id,
-                    peer_cluster_id = %mismatch.cluster_id,
-                    "ignoring the leadership-shed state of a peer of another cluster"
-                );
-                *stance = CampaignStance::Unknown;
-            }
-        }
-        let own = if registry.participation_status().should_campaign {
+        let own = if registry.should_campaign() {
             CampaignStance::MayCampaign
         } else {
             CampaignStance::MayNotCampaign
@@ -185,7 +173,12 @@ impl PeerParticipation {
         self.campaign_stances(registry).await.may_campaign()
     }
 
-    async fn peer_stance(&self, peer_id: u64, peer_url: &str) -> CampaignStance {
+    async fn peer_stance(
+        &self,
+        peer_id: u64,
+        peer_url: &str,
+        local: Option<&ursula_headers::ClusterId>,
+    ) -> CampaignStance {
         let url = format!("{peer_url}{}", crate::LEADERSHIP_SHED_PATH);
         let response = match self.client.get(url).send().await {
             Ok(response) if response.status().is_success() => response,
@@ -210,6 +203,14 @@ impl PeerParticipation {
             }
         };
         match serde_json::from_str::<LeadershipShedStatus>(&body) {
+            Ok(status) if local != Some(&status.cluster_id) => {
+                tracing::debug!(
+                    peer_id,
+                    peer_cluster_id = %status.cluster_id,
+                    "ignoring the leadership-shed state of a node of another cluster"
+                );
+                CampaignStance::Unknown
+            }
             Ok(status) if status.should_campaign => CampaignStance::MayCampaign,
             Ok(_) => CampaignStance::MayNotCampaign,
             Err(err) => {
@@ -237,13 +238,40 @@ mod tests {
     use super::PeerParticipation;
     use crate::bootstrap::health_gate::ShedTargets;
 
-    /// A peer that answers its leadership-shed state with `should_campaign`.
+    const THIS_CLUSTER: &str = "this-cluster";
+
+    fn cluster(id: &str) -> ursula_headers::ClusterId {
+        ursula_headers::ClusterId::new(id).unwrap()
+    }
+
+    /// Node 1's registry, of [`THIS_CLUSTER`].
+    fn this_registry() -> RaftGroupHandleRegistry {
+        let registry = RaftGroupHandleRegistry::default();
+        registry.peer_cluster().bind(
+            ursula_raft::PeerIdentity::new(1, cluster(THIS_CLUSTER)),
+            std::collections::BTreeMap::new(),
+        );
+        registry
+    }
+
+    /// A peer of [`THIS_CLUSTER`] that answers its leadership-shed state
+    /// with `should_campaign`.
     async fn answering_peer(should_campaign: bool) -> (String, tokio::task::JoinHandle<()>) {
+        answering_peer_in(THIS_CLUSTER, should_campaign).await
+    }
+
+    /// A node of `cluster_id` that answers its leadership-shed state with
+    /// `should_campaign`.
+    async fn answering_peer_in(
+        cluster_id: &str,
+        should_campaign: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind peer");
         let address = listener.local_addr().expect("peer address");
         let status = LeadershipShedStatus {
+            cluster_id: cluster(cluster_id),
             bits: 0,
             state: String::new(),
             should_accept_transfer: should_campaign,
@@ -274,44 +302,32 @@ mod tests {
         (format!("http://{address}"), listener)
     }
 
-    /// A node of another cluster at a peer's address answers the poll, but
-    /// the Raft plane refuses it, so its answer does not count.
+    /// A node of another cluster at a peer's address answers the poll with
+    /// its own cluster id, so its answer does not count, even before this
+    /// node ever contacted it over Raft. A node with no cluster id trusts no
+    /// answer.
     #[tokio::test]
-    async fn a_peer_of_another_cluster_has_an_unknown_stance() {
+    async fn a_shed_answer_of_another_cluster_is_an_unknown_stance() {
         let (willing, willing_task) = answering_peer(true).await;
+        let (foreign, foreign_task) = answering_peer_in("other-cluster", true).await;
         let participation = PeerParticipation::new(
             1,
-            &[(2, willing.clone())],
+            &[(2, willing), (3, foreign)],
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
                 .build()
                 .expect("client"),
         );
-        let registry = RaftGroupHandleRegistry::default();
-        let cluster = |id: &str| ursula_headers::ClusterId::new(id).unwrap();
-        registry.peer_cluster().bind(
-            ursula_raft::PeerIdentity::new(1, cluster("this-cluster")),
-            std::collections::BTreeMap::from([(2, willing.clone())]),
-        );
-        assert_eq!(
-            participation.campaign_stances(&registry).await.of(2),
-            Some(CampaignStance::MayCampaign)
-        );
-        let refusal = tonic::Status::from(ursula_raft::PeerClusterError::Mismatch {
-            peer_node_id: 1,
-            peer_cluster_id: cluster("this-cluster"),
-            local_cluster_id: cluster("other-cluster"),
-        });
-        assert!(registry.peer_cluster().observe_refusal(
-            2,
-            &willing,
-            &refusal,
-            std::time::Instant::now()
-        ));
-        let stances = participation.campaign_stances(&registry).await;
-        assert_eq!(stances.of(2), Some(CampaignStance::Unknown));
-        assert!(!stances.may_campaign().contains(&2));
+        let stances = participation.campaign_stances(&this_registry()).await;
+        assert_eq!(stances.of(2), Some(CampaignStance::MayCampaign));
+        assert_eq!(stances.of(3), Some(CampaignStance::Unknown));
+        assert_eq!(stances.may_campaign(), HashSet::from([1, 2]));
+        let unbound = participation
+            .campaign_stances(&RaftGroupHandleRegistry::default())
+            .await;
+        assert_eq!(unbound.of(2), Some(CampaignStance::Unknown));
         willing_task.abort();
+        foreign_task.abort();
     }
 
     #[tokio::test]
@@ -332,7 +348,7 @@ mod tests {
                 .build()
                 .expect("client"),
         );
-        let registry = RaftGroupHandleRegistry::default();
+        let registry = this_registry();
 
         let stances = participation.campaign_stances(&registry).await;
         assert_eq!(stances.of(1), Some(CampaignStance::MayCampaign));

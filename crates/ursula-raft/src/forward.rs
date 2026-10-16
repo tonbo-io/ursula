@@ -423,7 +423,7 @@ where
                         route.leader_id,
                         address,
                         &status,
-                        std::time::Instant::now(),
+                        crate::rt::time::Instant::now(),
                     ) && let Some(cluster_id) = refusing_cluster(&status)
                     {
                         ForwardError::OtherCluster {

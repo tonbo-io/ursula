@@ -36,7 +36,6 @@ use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
@@ -44,6 +43,7 @@ use tonic::service::Interceptor;
 use ursula_headers::ClusterId;
 
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
+use crate::rt::time::Instant;
 
 /// Request metadata naming the sender's cluster id; on a refusal, the
 /// refusing node's.
@@ -342,7 +342,7 @@ impl PeerCluster {
 
     /// Records `status` when peer `node_id` at `address` refused an outbound
     /// RPC because it is in another cluster. Returns whether it did.
-    pub fn observe_refusal(
+    pub(crate) fn observe_refusal(
         &self,
         node_id: u64,
         address: &str,
@@ -415,7 +415,12 @@ impl PeerCluster {
     /// [`PEER_CLUSTER_MISMATCH_TTL`], either way, by node id. An inbound
     /// refusal counts when its sender claims a configured node id and, where
     /// that peer's URL names an IP address, sent from that address.
-    pub fn mismatches(&self, now: Instant) -> Vec<PeerClusterMismatch> {
+    pub fn mismatches(&self) -> Vec<PeerClusterMismatch> {
+        self.mismatches_at(Instant::now())
+    }
+
+    /// [`Self::mismatches`] as of `now`.
+    pub(crate) fn mismatches_at(&self, now: Instant) -> Vec<PeerClusterMismatch> {
         let peers = self.0.peers.load();
         let mut mismatches = self
             .lock()
@@ -516,7 +521,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::time::Duration;
-    use std::time::Instant;
 
     use super::ClusterCheck;
     use super::ClusterId;
@@ -531,6 +535,7 @@ mod tests {
     use super::refusing_cluster;
     use super::url_ip;
     use crate::format_epoch::is_protocol_mismatch;
+    use crate::rt::time::Instant;
 
     fn cluster(id: &str) -> ClusterId {
         ClusterId::new(id).unwrap()
@@ -590,7 +595,7 @@ mod tests {
         let server = bound(1, "prod-eu-1");
         let request = stamped(&PeerIdentity::new(2, cluster("prod-eu-1")));
         assert!(refusal(&server, request).is_none());
-        assert!(server.mismatches(Instant::now()).is_empty());
+        assert!(server.mismatches_at(Instant::now()).is_empty());
         assert_eq!(server.refusals(), 0);
     }
 
@@ -614,7 +619,7 @@ mod tests {
                 .unwrap_err(),
         );
         assert_eq!(server.refusals(), 2);
-        assert_eq!(server.mismatches(t0), vec![PeerClusterMismatch {
+        assert_eq!(server.mismatches_at(t0), vec![PeerClusterMismatch {
             node_id: 3,
             cluster_id: cluster("prod-us-1"),
         }]);
@@ -628,7 +633,7 @@ mod tests {
         assert!(client.refuses(1, t0));
         assert!(!client.refuses(2, t0));
         assert!(!client.refuses(1, at(t0, PEER_CLUSTER_MISMATCH_TTL * 2)));
-        assert_eq!(client.mismatches(t0), vec![PeerClusterMismatch {
+        assert_eq!(client.mismatches_at(t0), vec![PeerClusterMismatch {
             node_id: 1,
             cluster_id: cluster("prod-eu-1"),
         }]);
@@ -649,13 +654,13 @@ mod tests {
         server
             .admit(stamped(&stranger).metadata(), from_node(7), t0)
             .unwrap_err();
-        assert!(server.mismatches(t0).is_empty());
+        assert!(server.mismatches_at(t0).is_empty());
         assert_eq!(server.refusals(), 2);
         // The same claim from node 2's address is reported.
         server
             .admit(stamped(&impostor).metadata(), from_node(2), t0)
             .unwrap_err();
-        assert_eq!(server.mismatches(t0), vec![PeerClusterMismatch {
+        assert_eq!(server.mismatches_at(t0), vec![PeerClusterMismatch {
             node_id: 2,
             cluster_id: cluster("b"),
         }]);
@@ -702,12 +707,14 @@ mod tests {
         request(t0);
         request(at(t0, half));
         assert_eq!(
-            server.mismatches(at(t0, PEER_CLUSTER_MISMATCH_TTL)).len(),
+            server
+                .mismatches_at(at(t0, PEER_CLUSTER_MISMATCH_TTL))
+                .len(),
             1,
             "refused within the window"
         );
         let later = at(t0, half.saturating_add(PEER_CLUSTER_MISMATCH_TTL * 2));
-        assert!(server.mismatches(later).is_empty());
+        assert!(server.mismatches_at(later).is_empty());
         assert_eq!(server.refusals(), 2);
         // Refused again after the window, the peer is fresh again.
         assert!(server.record(stray(2), later));
@@ -757,7 +764,7 @@ mod tests {
         assert!(is_protocol_mismatch(&status), "{status:?}");
         assert_eq!(server.refusals(), 0);
         assert_eq!(server.unidentified_refusals(), 1);
-        assert!(server.mismatches(Instant::now()).is_empty());
+        assert!(server.mismatches_at(Instant::now()).is_empty());
     }
 
     #[test]

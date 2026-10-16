@@ -280,7 +280,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
                 leader_id,
                 &network.endpoint,
                 &status,
-                std::time::Instant::now(),
+                crate::rt::time::Instant::now(),
             );
             return Err(status.into());
         }
@@ -1356,7 +1356,7 @@ impl GrpcRaftNetwork {
             self.target,
             &self.endpoint,
             &status,
-            std::time::Instant::now(),
+            crate::rt::time::Instant::now(),
         );
         let message = format!(
             "{route} to node {} at {} failed: {}",
@@ -1501,7 +1501,7 @@ impl GrpcRaftNetwork {
                 let other_cluster = self
                     .transport
                     .peer_cluster
-                    .refuses(self.target, std::time::Instant::now());
+                    .refuses(self.target, crate::rt::time::Instant::now());
                 if !backpressure && !other_cluster {
                     self.note_failure("AppendStream");
                 }
@@ -1743,7 +1743,7 @@ async fn run_append_session(
                 refusals.target,
                 &refusals.address,
                 &status,
-                std::time::Instant::now(),
+                crate::rt::time::Instant::now(),
             );
             return;
         }
@@ -2663,21 +2663,18 @@ mod reconnect_tests {
         assert_eq!(peer_cluster.refusals(), 2);
         let test_cluster =
             ursula_headers::ClusterId::new(crate::peer_cluster::TEST_CLUSTER_ID).unwrap();
-        assert_eq!(peer_cluster.mismatches(std::time::Instant::now()), vec![
+        assert_eq!(peer_cluster.mismatches(), vec![
             crate::peer_cluster::PeerClusterMismatch {
                 node_id: 1,
                 cluster_id: test_cluster,
             }
         ]);
-        assert_eq!(
-            registry
-                .peer_cluster()
-                .mismatches(std::time::Instant::now()),
-            vec![crate::peer_cluster::PeerClusterMismatch {
+        assert_eq!(registry.peer_cluster().mismatches(), vec![
+            crate::peer_cluster::PeerClusterMismatch {
                 node_id: 3,
                 cluster_id: other,
-            }]
-        );
+            }
+        ]);
         assert_eq!(registry.peer_cluster().refusals(), 2);
         server.abort();
     }

@@ -536,11 +536,7 @@ impl HttpState {
     /// shape readiness and metrics report them.
     fn peer_cluster_mismatches(&self) -> Vec<ursula_proto::admin::PeerClusterMismatch> {
         self.raft_registry()
-            .map(|registry| {
-                registry
-                    .peer_cluster()
-                    .mismatches(std::time::Instant::now())
-            })
+            .map(|registry| registry.peer_cluster().mismatches())
             .unwrap_or_default()
     }
 
@@ -1464,7 +1460,7 @@ async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
             .raft_registry()
             .cloned()
             .unwrap_or_default()
-            .participation_status(),
+            .participation_status(state.cluster_id().clone()),
     )
     .into_response()
 }

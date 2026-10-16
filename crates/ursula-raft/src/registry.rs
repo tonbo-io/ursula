@@ -918,12 +918,22 @@ impl RaftGroupHandleRegistry {
         self.leadership_shed_state().is_shed()
     }
 
-    /// A node cannot receive a planned leadership handoff until the recovery
-    /// gate of every registered group is open.
-    pub fn participation_status(&self) -> ursula_proto::admin::LeadershipShedStatus {
+    /// Whether this node's leadership-shed policy lets it campaign.
+    pub fn should_campaign(&self) -> bool {
+        self.election.may_campaign(None) && self.recovery_barriers_ready()
+    }
+
+    /// This node's leadership-shed state, as a node of `cluster_id` answers
+    /// it. A node cannot receive a planned leadership handoff until the
+    /// recovery gate of every registered group is open.
+    pub fn participation_status(
+        &self,
+        cluster_id: ursula_headers::ClusterId,
+    ) -> ursula_proto::admin::LeadershipShedStatus {
         let state = self.election.state();
         let ready = self.recovery_barriers_ready();
         ursula_proto::admin::LeadershipShedStatus {
+            cluster_id,
             bits: state.bits(),
             state: state.to_string(),
             should_accept_transfer: self.election.may_campaign(None) && ready,
