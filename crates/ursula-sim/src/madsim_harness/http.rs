@@ -947,10 +947,11 @@ pub(super) async fn run_http_live_limit_protocol_surface_inner(
     let second = send(&app, "GET", &first_uri, &[], Body::empty()).await;
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     let second_body = body_bytes(second).await;
-    assert!(
-        std::str::from_utf8(&second_body)
-            .expect("utf8 second backpressure response")
-            .contains("live read waiters")
+    assert_eq!(
+        ursula_headers::ErrorBody::parse(&second_body)
+            .expect("an error body")
+            .code,
+        ursula_headers::ErrorCode::LiveReadBackpressure
     );
 
     let release = send(

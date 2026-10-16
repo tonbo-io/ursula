@@ -1,7 +1,7 @@
-//! The one body of every error answer (extensions Section 11), the shape
-//! of the Durable Streams protocol's own error bodies: a JSON object whose
-//! `error` member is an object with two string members, `code`, a stable
-//! [`ErrorCode`], and `message`, a human-readable detail.
+//! The one body of every error answer (extensions Section 11): a JSON object
+//! whose `error` member is an object with two string members, `code`, a
+//! stable [`ErrorCode`], and `message`, a human-readable detail. It is the
+//! shape the Durable Streams protocol uses for its subscription API errors.
 //!
 //! ```text
 //! {"error":{"code":"INVALID_HEADER","message":"stream-ttl must not contain leading zeros"}}
@@ -289,7 +289,10 @@ impl ErrorBody {
     }
 
     /// Parses an error body: a JSON object whose `error` member is an object
-    /// with the string members `code` and `message`. Members either object
+    /// with the string member `code` and, optionally, `message` (empty when
+    /// absent, as in the subscription errors of the Durable Streams
+    /// protocol: `{"error":{"code":"FENCED"}}`). Ursula always sends a
+    /// message. Members either object
     /// does not know are skipped, in any order, and a code this version
     /// does not know parses as [`ErrorCode::Unknown`] with its message. JSON
     /// whitespace may surround each token. `Err` for any other body, such as
@@ -421,10 +424,11 @@ impl<'a> Cursor<'a> {
             }
             _ => cursor.skip_value(MAX_SKIPPED_DEPTH),
         })?;
-        match (code, message) {
-            (Some(code), Some(message)) => Ok(ErrorBody::new(ErrorCode::from_name(&code), message)),
-            _ => Err(HeaderError::InvalidErrorBody),
-        }
+        let code = code.ok_or(HeaderError::InvalidErrorBody)?;
+        Ok(ErrorBody::new(
+            ErrorCode::from_name(&code),
+            message.unwrap_or_default(),
+        ))
     }
 
     /// Skips one JSON value of at most `depth` levels of nesting.
@@ -726,6 +730,18 @@ mod tests {
     }
 
     #[test]
+    fn a_body_without_a_message_parses() {
+        assert_eq!(
+            ErrorBody::parse(br#"{"error":{"code":"FENCED"}}"#),
+            Ok(ErrorBody::new(ErrorCode::Unknown("FENCED".to_owned()), ""))
+        );
+        assert_eq!(
+            ErrorBody::parse(br#"{"error":{"code":"NO_LEADER"}}"#),
+            Ok(ErrorBody::new(ErrorCode::NoLeader, ""))
+        );
+    }
+
+    #[test]
     fn other_bodies_are_refused() {
         let deep = format!(
             r#"{{"x":{}1{},"error":{{"code":"NO_LEADER","message":"m"}}}}"#,
@@ -737,7 +753,6 @@ mod tests {
             b"request body is too large",
             b"{}",
             br#"{"error":"NO_LEADER"}"#,
-            br#"{"error":{"code":"NO_LEADER"}}"#,
             br#"{"error":{"message":"m"}}"#,
             br#"{"error":{"code":"NO_LEADER","message":"m"}"#,
             br#"{"error":{"code":"NO_LEADER","code":"NO_LEADER","message":"m"}}"#,

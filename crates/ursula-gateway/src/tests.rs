@@ -999,6 +999,30 @@ async fn access_control_conceals_private_resource_before_forwarding() {
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
+/// A concealing `404` to a `HEAD` carries no server identity, as no answer
+/// of the gateway's own does (extensions Section 10): a client reads it as
+/// a refusal, never as a stream the deployment deleted.
+#[tokio::test]
+async fn a_concealed_head_carries_no_server_identity() {
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(
+        AuthorizationDecision::ConcealAsNotFound,
+    ));
+    let gateway = gateway_with_access_control("http://127.0.0.1:1", resolver, authorizer);
+    for method in ["HEAD", "GET"] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/private/events")
+            .body(Body::empty())
+            .expect("request");
+        let response = gateway.handle(request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        for name in [names::URSULA_PROTOCOL, names::URSULA_CLUSTER_ID] {
+            assert!(response.headers().get(name).is_none(), "{method} {name}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn access_control_rejects_invalid_bearer_before_authorization() {
     let resolver = Arc::new(FixedPrincipalResolver::valid());

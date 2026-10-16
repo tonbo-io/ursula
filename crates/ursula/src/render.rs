@@ -213,24 +213,36 @@ pub(crate) fn stream_error_answer(code: StreamErrorCode) -> (StatusCode, ErrorCo
     }
 }
 
-/// The message of a runtime error's answer. A `4xx` stream refusal sends
-/// its own text, which names only what the request named. Every other
-/// answer sends its code's fixed message: a `5xx`, a `503` of pressure or
-/// routing, and the `404`s, whose fixed text a gateway's concealment
-/// repeats. The full error is the server's log's.
-pub(crate) fn runtime_error_message(
-    err: &RuntimeError,
-    status: StatusCode,
-    code: &ErrorCode,
-) -> String {
-    let own_text = status.is_client_error()
-        && status != StatusCode::NOT_FOUND
-        && !matches!(
-            code,
-            ErrorCode::InvalidColdFlush | ErrorCode::ImportConflict | ErrorCode::ImportInvalid
-        );
+/// The stream refusals whose own text a client reads: the allowlist. Each
+/// of their messages names only what the request named, which
+/// `error_body_tests` checks for every code here. Every other refusal, a
+/// new one included, sends its code's fixed message.
+pub(crate) const REFUSALS_WITH_TEXT: &[StreamErrorCode] = &[
+    StreamErrorCode::InvalidBucketId,
+    StreamErrorCode::InvalidStreamId,
+    StreamErrorCode::ContentTypeMismatch,
+    StreamErrorCode::StreamClosed,
+    StreamErrorCode::StreamSeqConflict,
+    StreamErrorCode::StreamAlreadyExistsConflict,
+    StreamErrorCode::InvalidProducer,
+    StreamErrorCode::ProducerSeqConflict,
+    StreamErrorCode::ProducerEpochStale,
+    StreamErrorCode::ProducerKeyConflict,
+    StreamErrorCode::OffsetOutOfRange,
+];
+
+/// The message of a runtime error's answer: an allowlisted stream
+/// refusal's own text ([`REFUSALS_WITH_TEXT`]), else its code's fixed
+/// message. The full error is the server's log's.
+pub(crate) fn runtime_error_message(err: &RuntimeError, code: &ErrorCode) -> String {
     let refusal = match err {
-        RuntimeError::GroupEngine { error, .. } if own_text => error.refusal_text(),
+        RuntimeError::GroupEngine { error, .. }
+            if error
+                .code()
+                .is_some_and(|code| REFUSALS_WITH_TEXT.contains(&code)) =>
+        {
+            error.refusal_text()
+        }
         _ => None,
     };
     refusal.map_or_else(|| code.default_message().to_owned(), str::to_owned)
@@ -241,7 +253,7 @@ pub(crate) fn runtime_error_message(
 /// `error` event alike.
 pub(crate) fn runtime_error_body(err: &RuntimeError) -> (StatusCode, ErrorBody) {
     let (status, code) = runtime_error_answer(err);
-    let message = runtime_error_message(err, status, &code);
+    let message = runtime_error_message(err, &code);
     if status.is_server_error() {
         tracing::warn!(%status, error = %err, "runtime request failed");
     } else {
@@ -658,6 +670,34 @@ pub(crate) fn insert_producer_error_headers(
     Ok(())
 }
 
+/// The typed answer of a refused `Stream-Seq` (extensions Section 5.8):
+/// `None` for every other error. `Err` for a `STREAM_SEQ_CONFLICT` without
+/// the last seq, or with one the header crate refuses, which the caller
+/// answers `500`, so no `409` of the code goes out without
+/// `Stream-Last-Seq`. Every stored seq passed the same check
+/// ([`StreamSeq::new`]) at the request boundary, so neither happens.
+pub(crate) fn stream_seq_conflict(
+    err: &RuntimeError,
+) -> Option<Result<StreamSeqConflict, HeaderError>> {
+    if err.stream_error_code() != Some(StreamErrorCode::StreamSeqConflict) {
+        return None;
+    }
+    let last = err
+        .stream_error_context()
+        .iter()
+        .find_map(|context| match context {
+            StreamErrorContext::LastStreamSeq { seq } => Some(seq.as_str()),
+            _ => None,
+        });
+    Some(
+        last.ok_or(HeaderError::Missing {
+            name: names::STREAM_LAST_SEQ,
+        })
+        .and_then(StreamSeq::new)
+        .map(|last| StreamSeqConflict { last }),
+    )
+}
+
 pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &RuntimeError) {
     if err
         .stream_error_context()
@@ -679,24 +719,6 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
                 _ => None,
             });
         insert_incarnation_mismatch(headers, IncarnationMismatch { current });
-    }
-    // A refused `Stream-Seq` names the stream's last one (extensions
-    // Section 5.8).
-    if let Some(last) = err
-        .stream_error_context()
-        .iter()
-        .find_map(|context| match context {
-            StreamErrorContext::LastStreamSeq { seq } => Some(seq),
-            _ => None,
-        })
-    {
-        match StreamSeq::new(last.as_str()) {
-            Ok(last) => StreamSeqConflict { last }
-                .render(|name, value| insert_header_str(headers, name, value)),
-            Err(err) => {
-                tracing::error!(error = %err, "a stream's last Stream-Seq is not a header value")
-            }
-        }
     }
     // A refused snapshot publish names the latest snapshot (#581 section 3).
     if let Some(latest) = err

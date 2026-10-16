@@ -541,3 +541,99 @@ async fn a_stream_seq_conflict_echoes_the_last_seq() {
         ErrorCode::ContentTypeMismatch
     );
 }
+
+/// Every allowlisted refusal sends its own text, and no such text names an
+/// internal of the server ([`crate::render::REFUSALS_WITH_TEXT`]).
+#[tokio::test]
+async fn every_allowlisted_refusal_names_no_internals() {
+    let app = app();
+    let producer = |epoch: &'static str, seq: &'static str| {
+        [
+            TEXT,
+            ("producer-id", "writer"),
+            ("producer-epoch", epoch),
+            ("producer-seq", seq),
+        ]
+    };
+    let digest = blake3::hash(b"other").to_hex().to_string();
+    assert_eq!(
+        send_body(&app, "PUT", "/allow/s", &[TEXT], "")
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let mut seen = Vec::new();
+    let check = |response: Response| async {
+        let status = response.status();
+        let body = error_body_of(response).await;
+        assert!(
+            !names_internals(&body.message),
+            "{}: {}",
+            body.code,
+            body.message
+        );
+        assert_ne!(
+            body.message,
+            body.code.default_message(),
+            "{status} {} sends its own text",
+            body.code
+        );
+        body.code
+    };
+    for (method, uri, headers, payload) in [
+        ("PUT", "/ab/s", vec![TEXT], ""),
+        ("PUT", "/allow/$s", vec![TEXT], ""),
+        (
+            "PUT",
+            "/allow/s",
+            vec![("content-type", "application/json")],
+            "",
+        ),
+        (
+            "POST",
+            "/allow/s",
+            vec![("content-type", "application/json")],
+            "{}",
+        ),
+        ("POST", "/allow/s", vec![TEXT, ("stream-seq", "0002")], "a"),
+        ("POST", "/allow/s", vec![TEXT, ("stream-seq", "0001")], "b"),
+        ("GET", "/allow/s?offset=99", vec![], ""),
+    ] {
+        let response = send_body(&app, method, uri, &headers, payload).await;
+        if response.status().is_client_error() {
+            seen.push(check(response).await);
+        }
+    }
+    for (headers, payload) in [
+        (producer("0", "0").to_vec(), "a"),
+        (producer("0", "5").to_vec(), "a"),
+        (producer("1", "1").to_vec(), "a"),
+        (producer("1", "0").to_vec(), "a"),
+        (producer("2", "0").to_vec(), "a"),
+        (producer("0", "1").to_vec(), "a"),
+        (
+            [producer("2", "0").as_slice(), &[(
+                "producer-digest",
+                digest.as_str(),
+            )]]
+            .concat(),
+            "other",
+        ),
+    ] {
+        let response = send_body(&app, "POST", "/allow/s", &headers, payload).await;
+        if response.status().is_client_error() {
+            seen.push(check(response).await);
+        }
+    }
+    let closed = send(&app, "POST", "/allow/s", &[
+        TEXT,
+        (names::STREAM_CLOSED, "true"),
+    ])
+    .await;
+    assert!(closed.status().is_success(), "{}", closed.status());
+    seen.push(check(send_body(&app, "POST", "/allow/s", &[TEXT], "x").await).await);
+    for code in crate::render::REFUSALS_WITH_TEXT {
+        let (_, wire) = crate::render::stream_error_answer(*code);
+        assert!(seen.contains(&wire), "no case sends {wire}; saw {seen:?}");
+    }
+}

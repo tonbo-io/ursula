@@ -104,7 +104,7 @@ pub enum HeaderError {
     /// total` on a `206`, or `bytes */total` on a `416`.
     InvalidContentRange,
     /// An error answer's body is not a JSON object whose `error` member
-    /// holds the strings `code` and `message`.
+    /// holds the string `code`, and `message` when present.
     InvalidErrorBody,
     /// `Stream-Last-Seq` is not 1 to 256 bytes of visible ASCII with inner
     /// spaces or tabs.

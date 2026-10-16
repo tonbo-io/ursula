@@ -114,6 +114,8 @@ use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
 use ursula_headers::RoutingAnswer;
+use ursula_headers::STREAM_SEQ_MAX_BYTES;
+use ursula_headers::StreamSeq;
 use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
@@ -216,6 +218,7 @@ use crate::render::snapshot_head;
 use crate::render::snapshot_published_response;
 use crate::render::sse_error_event;
 use crate::render::stream_head;
+use crate::render::stream_seq_conflict;
 use crate::response_metadata::IdentityHeaders;
 use crate::response_metadata::ResponseMetadataLayer;
 
@@ -4725,30 +4728,32 @@ pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
 }
 
 /// Maximum length in bytes of a `Producer-Id` or `Stream-Seq` value on every
-/// HTTP write path (bounded-stream-state F3).
-/// Both values are kept in replicated per-stream state, so their length must
-/// be bounded at the edge.
-pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = 256;
+/// HTTP write path (bounded-stream-state F3), both checked by the header
+/// crate. Both values are kept in replicated per-stream state, so their
+/// length is bounded at the edge.
+#[cfg(test)]
+pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = STREAM_SEQ_MAX_BYTES;
 
-fn check_write_identifier_len(name: &str, value: &str) -> Result<(), String> {
-    if value.len() > WRITE_IDENTIFIER_MAX_BYTES {
-        return Err(format!(
-            "{name} must be at most {WRITE_IDENTIFIER_MAX_BYTES} bytes"
-        ));
-    }
-    Ok(())
-}
-
+/// A request's `Stream-Seq`, checked by the header crate ([`StreamSeq`]),
+/// the one check of every seq the server stores and later echoes in
+/// `Stream-Last-Seq`. A value that is not visible ASCII text is ignored, as
+/// the base protocol's servers do; a blank one is absent.
 pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> {
     let Some(value) = headers
         .get(HEADER_STREAM_SEQ)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim_matches([' ', '\t']))
+        .filter(|value| !value.is_empty())
     else {
         return Ok(None);
     };
-    check_write_identifier_len(HEADER_STREAM_SEQ, value)?;
-    Ok(Some(value.to_owned()))
+    StreamSeq::new(value)
+        .map(|seq| Some(seq.as_str().to_owned()))
+        .map_err(|_invalid| {
+            format!(
+                "{HEADER_STREAM_SEQ} must be at most {STREAM_SEQ_MAX_BYTES} bytes of visible ASCII"
+            )
+        })
 }
 
 /// The write-key headers of a request (#581 section 2.2), parsed by the
@@ -4863,6 +4868,16 @@ fn runtime_error_response(err: RuntimeError) -> Response {
         tracing::error!(refusal = %err, "producer refusal outside the protocol's range");
         return producer_answer_failed(&render_err);
     }
+    match stream_seq_conflict(&err) {
+        Some(Ok(conflict)) => {
+            conflict.render(|name, value| insert_header_str(&mut headers, name, value));
+        }
+        Some(Err(render_err)) => {
+            tracing::error!(refusal = %err, error = %render_err, "a Stream-Seq conflict without its last seq");
+            return fixed_error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal);
+        }
+        None => {}
+    }
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
     error_answer(status, body.code, body.message, headers)
@@ -4973,8 +4988,9 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 /// 503 + `Retry-After: 1` for a request that must reach the group leader but
 /// cannot be redirected (purge) or has no known leader. Retryable.
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
-    // The error names the leader's address: it stays in the log.
-    tracing::warn!(error = %err, "no leader of the group is known");
+    // The error names the leader's address: it stays in the log, at debug,
+    // since every election answers so.
+    tracing::debug!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
     let group = match &err {
         RuntimeError::GroupEngine { raft_group_id, .. }

@@ -238,10 +238,6 @@ pub struct Gateway {
     ejections: Arc<Ejections>,
     metrics: Arc<GatewayMetrics>,
     cors: Option<crate::cors::CorsPolicy>,
-    /// The server identity headers of the latest upstream answer, which a
-    /// concealing `404` to a `HEAD` repeats as a node's own `404` carries
-    /// them.
-    identity: Arc<Mutex<Option<HeaderMap>>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -281,7 +277,6 @@ impl Gateway {
             ejections: Arc::new(Ejections::new(probe_deadline)),
             metrics: Arc::new(GatewayMetrics::default()),
             cors,
-            identity: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -353,14 +348,7 @@ impl Gateway {
 
         let context = match self.gate(&parts).await {
             Ok(context) => context,
-            Err(refusal) => {
-                let concealed = matches!(refusal, Refusal::Concealed);
-                let mut response = self.refuse_unread(refusal, body).await;
-                if concealed && parts.method == Method::HEAD {
-                    self.add_identity(response.headers_mut());
-                }
-                return response;
-            }
+            Err(refusal) => return self.refuse_unread(refusal, body).await,
         };
         if self.access_control.is_some() {
             // The credential terminates at the gateway. Internal Ursula nodes
@@ -434,41 +422,12 @@ impl Gateway {
         match self.forward(&upstream, &parts, body_bytes, tail).await {
             Ok(mut response) => {
                 lower_request_limit(response.headers_mut(), limit);
-                self.remember_identity(response.headers());
                 response
             }
             Err(e) => {
                 error!(error = ?e, "gateway request failed");
                 e.into_response()
             }
-        }
-    }
-
-    /// Keeps the server identity headers of an upstream answer.
-    fn remember_identity(&self, headers: &HeaderMap) {
-        let mut identity = HeaderMap::new();
-        for name in [names::URSULA_PROTOCOL, names::URSULA_CLUSTER_ID] {
-            if let Some(value) = headers.get(name) {
-                identity.insert(name, value.clone());
-            }
-        }
-        if identity.len() == 2 {
-            *self
-                .identity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
-        }
-    }
-
-    /// Adds the remembered server identity headers to `headers`.
-    fn add_identity(&self, headers: &mut HeaderMap) {
-        let identity = self
-            .identity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(identity) = identity {
-            headers.extend(identity);
         }
     }
 
@@ -1298,8 +1257,11 @@ fn principal_ref(principal: &VerifiedPrincipal) -> PrincipalRef {
 enum Refusal {
     /// Access control does not serve the route (`404`).
     NotFound,
-    /// The authorizer concealed the resource: the `404` a node answers for
-    /// a bucket nothing created, byte for byte, on every route.
+    /// The authorizer concealed the resource: the status, headers and body
+    /// a node answers for a bucket nothing created, on every route. Like
+    /// every answer of the gateway's own, it carries no server identity
+    /// (extensions Section 10), so a client never reads it as a deleted
+    /// stream of a known deployment.
     Concealed,
     /// The bearer credential failed verification (`401`), or the verifier is
     /// unavailable (`503`).

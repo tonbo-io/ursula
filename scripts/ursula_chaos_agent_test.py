@@ -340,13 +340,62 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertIs(agent.current_injection(), injection)
 
     def test_parse_producer_seq_conflict(self) -> None:
-        parsed = ChaosAgent.parse_producer_seq_conflict(
-            b"core 1 raft group 3 operation failed: "
-            b"ProducerSeqConflict: producer 'chaos-agent-021' expected sequence 2908, received 2938"
+        # A real 0.8 answer: the code in the error body, the seqs in the
+        # typed producer headers.
+        body = (
+            b'{"error":{"code":"PRODUCER_SEQ_CONFLICT",'
+            b'"message":"producer \'chaos-agent-021\' expected sequence 2908, received 2938"}}'
+        )
+        headers = {
+            "producer-epoch": "3",
+            "producer-expected-seq": "2908",
+            "producer-received-seq": "2938",
+        }
+        self.assertEqual(
+            ChaosAgent.parse_producer_seq_conflict(409, body, headers), (2908, 2938)
+        )
+        self.assertIsNone(
+            ChaosAgent.parse_producer_seq_conflict(
+                403,
+                b'{"error":{"code":"PRODUCER_EPOCH_STALE","message":"stale"}}',
+                {"producer-epoch": "4"},
+            )
+        )
+        # Another 409, such as a content-type mismatch, is no seq gap.
+        self.assertIsNone(
+            ChaosAgent.parse_producer_seq_conflict(
+                409,
+                b'{"error":{"code":"CONTENT_TYPE_MISMATCH","message":"m"}}',
+                {},
+            )
+        )
+        # 0.7's plain text is no longer read.
+        self.assertIsNone(
+            ChaosAgent.parse_producer_seq_conflict(
+                409,
+                b"ProducerSeqConflict: producer 'p' expected sequence 1, received 2",
+                headers,
+            )
         )
 
-        self.assertEqual(parsed, ("chaos-agent-021", 2908, 2938))
-        self.assertIsNone(ChaosAgent.parse_producer_seq_conflict(b"ProducerEpochStale"))
+    def test_transient_append_failures_are_read_from_codes(self) -> None:
+        no_leader = b'{"error":{"code":"NO_LEADER","message":"no leader of the stream\'s group is known; retry"}}'
+        self.assertTrue(ChaosAgent.is_transient_append_failure(503, no_leader, {}))
+        self.assertTrue(
+            ChaosAgent.is_transient_append_failure(503, b"{}", {"retry-after": "1"})
+        )
+        self.assertFalse(
+            ChaosAgent.is_transient_append_failure(
+                503, b'{"error":{"code":"INTERNAL","message":"the server failed"}}', {}
+            )
+        )
+        self.assertEqual(
+            ChaosAgent.error_code(
+                b'{"error":{"code":"COLD_BACKPRESSURE","message":"the stream\'s group waits for the cold tier; retry"}}'
+            ),
+            "COLD_BACKPRESSURE",
+        )
+        self.assertIsNone(ChaosAgent.error_code(b"ColdBackpressure: plain text"))
 
     def test_recover_producer_seq_conflict_resyncs_stream_and_bumps_epoch(self) -> None:
         agent = object.__new__(ChaosAgent)

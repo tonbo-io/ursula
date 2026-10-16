@@ -1417,7 +1417,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
         }
         Err(err) => {
             let message = format!("{err:?}");
-            if !message.contains("StreamClosed") {
+            if err.stream_error_code() != Some(ursula_runtime::StreamErrorCode::StreamClosed) {
                 let message = format!(
                     "append after close for stream {stream} returned unexpected error {message}"
                 );
