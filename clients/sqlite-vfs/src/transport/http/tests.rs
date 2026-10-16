@@ -147,6 +147,79 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
     Some(request)
 }
 
+/// A control request to the model behind `url`, over a connection of its own: the answer's body.
+fn control(url: &str, method: &str, route: &str) -> String {
+    use std::io::Read;
+    use std::io::Write;
+    let addr = url.trim_start_matches("http://").split('/').next().unwrap();
+    let mut connection = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        connection,
+        "{method} /__model/{route} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut answer = String::new();
+    connection.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 2"), "{answer}");
+    answer
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+// `/__model/hold` holds a snapshot PUT before the model sees it, for as long as the test needs,
+// other requests going on; `/__model/release` lets it through.
+#[test]
+fn a_held_snapshot_put_waits_for_the_release() {
+    let (server, url) = served();
+    let http = HttpTransport::new(url.clone());
+    let send = |request: &Request| match http.send(request, Attempt::default()) {
+        Exchange::Answered(answer) => *answer,
+        Exchange::NoAnswer(no) => panic!("{no:?}"),
+    };
+    assert_eq!(send(&create()).status, 201);
+    control(&url, "POST", "hold");
+    let token = server.lock().unwrap().token(PATH).unwrap();
+    let body = b"image".to_vec();
+    let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+    digester.update(&body);
+    let publish = Request {
+        keys: keys(Some(IncarnationPrecondition { incarnation: token })),
+        content_type: Some(CONTENT_TYPE.to_owned()),
+        snapshot_digest: Some(digester.finalize()),
+        body: Arc::from(body),
+        ..Request::new(Method::Put, Target::Snapshot {
+            offset: Offset::ZERO,
+        })
+    };
+    let held = {
+        let url = url.clone();
+        std::thread::spawn(move || HttpTransport::new(url).send(&publish, Attempt::default()))
+    };
+    let mut waited = 0;
+    while control(&url, "GET", "held") != "1" {
+        assert!(waited < 2_000, "the PUT was never held");
+        std::thread::sleep(Duration::from_millis(5));
+        waited += 5;
+    }
+    let snapshot = || match send(&Request::new(Method::Head, Target::Stream)).typed {
+        Ok(Typed::Head {
+            stream: Some(stream),
+            ..
+        }) => stream.snapshot(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(snapshot(), None, "other requests go on, nothing published");
+    control(&url, "POST", "release");
+    match held.join().unwrap() {
+        Exchange::Answered(answer) => assert_eq!(answer.status, 204),
+        Exchange::NoAnswer(no) => panic!("{no:?}"),
+    }
+    assert!(snapshot().is_some(), "published");
+    assert_eq!(control(&url, "GET", "held"), "0");
+}
+
 // A header read gets the body's first bytes alone whether the server honors `Range` (`206`) or
 // answers `200` with the whole body: the transport reads no more and drops the connection. A
 // chunk read reads its `206` whole, and the whole body of a `200`.

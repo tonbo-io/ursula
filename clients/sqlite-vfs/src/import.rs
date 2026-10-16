@@ -300,17 +300,15 @@ pub(crate) fn import(
         .checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or(now);
     let staged = Staged::copy(Path::new(file))?;
-    // The token stays the process's only once the import succeeded.
-    let previous = options
-        .token
-        .as_deref()
-        .map(|token| crate::auth::replace_token(Some(token)));
+    // The token stays the process's only once the import succeeded, and a failed import puts the
+    // previous one back unless the application set another meanwhile (`ursula_set_token`).
+    let lent = options.token.as_deref().map(crate::auth::lend_token);
     let transport = crate::transport::http::HttpTransport::new(url);
-    let imported = run(&transport, &staged, deadline, timeout_ms).inspect_err(|_failed| {
-        if let Some(previous) = &previous {
-            crate::auth::set_token(previous.as_deref());
-        }
-    })?;
+    let imported = run(&transport, &staged, deadline, timeout_ms);
+    if let (Err(_failed), Some(lent)) = (&imported, lent) {
+        crate::auth::take_back(lent);
+    }
+    let imported = imported?;
     log::emit(Level::Info, "imported", &[
         ("stream", &url),
         ("offset", &imported.offset),

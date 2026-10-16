@@ -43,13 +43,10 @@ pub enum StreamError {
     /// A frame runs past the end of the range.
     #[error("a frame runs past {end}")]
     PastEnd { end: Offset },
-    /// The claim of an import ([`frame::IMPORT_ACTIVATION`]) ending at `end`: the import's
-    /// snapshot, which every read of the stream starts from once it is published, is not, so the
-    /// import is in progress or failed. Nothing is built from it.
-    #[error(
-        "the claim of an import ends at {end}, and its snapshot is not published: the import is \
-         in progress or failed. Wait for it, or delete or recreate the stream"
-    )]
+    /// The claim of an import ([`frame::IMPORT_ACTIVATION`]) ending at `end`. A read starting at
+    /// the import's snapshot never meets it, so the import is in progress or failed, or the read
+    /// did not start from its snapshot. Nothing is built from it.
+    #[error("the stream up to {end} is the claim of an import")]
     ImportIncomplete { end: Offset },
 }
 
@@ -191,6 +188,5 @@ mod tests {
             matches!(error, Some(StreamError::ImportIncomplete { end: at }) if at == end),
             "{error:?}"
         );
-        assert!(error.unwrap().to_string().contains("delete or recreate"));
     }
 }

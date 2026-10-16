@@ -13,6 +13,7 @@
 //! | any | closed | refuse `stream_state` |
 //! | none | `200` | build |
 //! | replaced | `200` | build, the generation salvaged (`replaced`) |
+//! | trusted, same token, holding no data, a snapshot past its ACK | `200` | build, the generation trashed |
 //! | trusted, same token | `200` | resume |
 //! | trusted, other token, inheriting, nothing pending | `200` | re-key ([`inherits`]) |
 //! | trusted, other token, otherwise, holding data | `200` | build, the generation salvaged |
@@ -27,6 +28,15 @@
 //! stream's acknowledgements, so those commits may include acknowledged ones the history lost, and
 //! a re-keyed log names the new token, so a later open would resume it and discard them.
 //! Rows match in order, so a refusal sends nothing and moves no file.
+//!
+//! A generation of the stream's token holding no data whose latest ACK is below the stream's
+//! latest snapshot is built over rather than resumed ([`behind_snapshot`]): it has nothing to
+//! keep, and the stream below that snapshot may be the claim of an import, which no read takes
+//! (`codec::stream::StreamError::ImportIncomplete`), whereas a build starts at the snapshot. The
+//! row is decided before anything is sent, so a generation whose claim lost to an import's, or
+//! that never claimed, claims only after its build, once. One holding data resumes: an import
+//! refuses a stream holding anything, so such a generation cannot lie below an import's snapshot,
+//! and if it does, its reconcile meets the import's claim and resets `stream_state`.
 //!
 //! When the open's first HEAD got no answer with nothing sent (the stream is unreachable, design
 //! §5.5), [`decide_unreachable`] decides instead:
@@ -51,8 +61,12 @@
 //! | any | `404` | refuse `not_found` |
 //! | any | another content type | refuse `stream_format` |
 //! | none, replaced | `200`, closed or not | build, the replaced one trashed |
+//! | trusted, same token, a snapshot past its ACK | `200`, closed or not | build, the generation trashed |
 //! | trusted, same token | `200`, closed or not | catch up in place |
 //! | trusted, other token | `200`, closed or not | build, the generation trashed |
+//!
+//! A reader generation behind the stream's latest snapshot builds from it rather than reading the
+//! stream below it ([`behind_snapshot`]), which may be an import's claim.
 //!
 //! When the reader's first HEAD got no answer with nothing sent (the stream is unreachable),
 //! [`decide_reader_unreachable`] opens a trusted reader generation as it is, and otherwise waits:
@@ -254,6 +268,13 @@ pub(crate) fn rekeys(summary: &LocalSummary, head: &StreamHead) -> bool {
     inherits(head, summary.incarnation, summary.acked_offset) && takeover_may_rekey(summary.pending)
 }
 
+/// Whether the stream's latest snapshot, as `head` names it, lies past the trusted generation's
+/// latest ACK: a build starts at the snapshot, where catching up would read the stream below it.
+pub(crate) fn behind_snapshot(summary: &LocalSummary, head: &StreamHead) -> bool {
+    head.snapshot()
+        .is_some_and(|snapshot| snapshot.offset > summary.acked_offset)
+}
+
 /// The identity a HEAD named, checked (design §6.3): protocol 2, and the cluster id `ours` when a
 /// generation names one. The open table and a build's HEADs share it.
 pub(crate) fn check_identity<'a>(
@@ -337,7 +358,9 @@ pub(crate) fn decide_reader<L, R>(local: Local<L, R>, head: HeadSeen<'_>) -> Rea
         Err(refused) => return ReaderRow::Refuse(refused),
     };
     match local {
-        Local::Trusted(summary, local) if summary.incarnation == head.incarnation() => {
+        Local::Trusted(summary, local)
+            if summary.incarnation == head.incarnation() && !behind_snapshot(&summary, &head) =>
+        {
             ReaderRow::CatchUp {
                 local,
                 cluster_id,
@@ -404,6 +427,13 @@ pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>)
         Local::Trusted(summary, value) => (summary, value),
     };
     if summary.incarnation == head.incarnation() {
+        if !summary.holds_data && behind_snapshot(&summary, &head) {
+            return OpenRow::Build {
+                superseded: Superseded::Trash(value),
+                cluster_id,
+                head,
+            };
+        }
         return OpenRow::Resume {
             local: value,
             cluster_id,
@@ -443,6 +473,7 @@ mod tests {
     use ursula_headers::Inherited;
     use ursula_headers::Offset;
     use ursula_headers::ServerIdentity;
+    use ursula_headers::SnapshotRef;
     use ursula_headers::StreamHead;
 
     use super::Asked;
@@ -460,6 +491,7 @@ mod tests {
     use super::decide_reader;
     use super::decide_reader_unreachable;
     use super::decide_unreachable;
+    use crate::codec::digest::SnapshotDigester;
     use crate::codec::frame::CONTENT_TYPE;
     use crate::ids::Activation;
     use crate::replicator::answer::Unacked;
@@ -488,6 +520,17 @@ mod tests {
                 offset: Offset::from_u64(offset),
             }))
             .unwrap()
+    }
+
+    /// `head` naming a snapshot at `offset`.
+    fn with_snapshot(head: StreamHead, offset: u64) -> StreamHead {
+        let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+        digester.update(b"db");
+        head.with_snapshot(Some(SnapshotRef {
+            offset: Offset::from_u64(offset),
+            digest: digester.finalize(),
+        }))
+        .unwrap()
     }
 
     /// A trusted generation of token `t` holding data, nothing pending, acknowledged up to
@@ -682,6 +725,37 @@ mod tests {
             ),
             OpenRow::Resume { .. }
         ));
+    }
+
+    // A generation of the stream's token holding no data, acknowledged below the stream's latest
+    // snapshot (the claim of an import, say), is built over from the snapshot: it has nothing to
+    // keep, and the stream below the snapshot may not be readable. One holding data, or one at or
+    // past the snapshot, resumes.
+    #[test]
+    fn an_empty_generation_behind_the_snapshot_is_built_over_not_resumed() {
+        let id = identity("cluster-a");
+        let head = with_snapshot(stream(1, 80, None), 60);
+        for acked in [0, 59] {
+            assert_eq!(
+                decide(
+                    trusted(1, acked, Unacked::Nothing, false),
+                    ask(),
+                    seen(&id, Some(&head))
+                ),
+                build(Superseded::Trash("gen"), head)
+            );
+        }
+        for found in [
+            trusted(1, 60, Unacked::Nothing, false),
+            trusted(1, 70, Unacked::Nothing, false),
+            local(1, 0),
+            trusted(1, 0, Unacked::Commits, true),
+        ] {
+            assert!(matches!(
+                decide(found, ask(), seen(&id, Some(&head))),
+                OpenRow::Resume { .. }
+            ));
+        }
     }
 
     #[test]
@@ -890,6 +964,30 @@ mod tests {
             decide_reader(local(1, 40), seen(&id, Some(&lossy))),
             reader_build(lossy)
         );
+    }
+
+    // A reader generation acknowledged below the stream's latest snapshot builds from it rather
+    // than catching up in place through the stream below it (an import's claim, say).
+    #[test]
+    fn a_reader_behind_the_snapshot_builds_from_it() {
+        let id = identity("cluster-a");
+        let head = with_snapshot(stream(1, 80, None), 60);
+        for found in [local(1, 0), trusted(1, 59, Unacked::Nothing, false)] {
+            assert_eq!(
+                decide_reader(found, seen(&id, Some(&head))),
+                reader_build(head)
+            );
+        }
+        for acked in [60, 70] {
+            assert_eq!(
+                decide_reader(local(1, acked), seen(&id, Some(&head))),
+                ReaderRow::CatchUp {
+                    local: "gen",
+                    cluster_id: cluster("cluster-a"),
+                    head
+                }
+            );
+        }
     }
 
     // A reader reads a closed stream, which an owner refuses: it writes nothing to it.

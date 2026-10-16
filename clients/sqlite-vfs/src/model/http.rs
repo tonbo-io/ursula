@@ -25,6 +25,8 @@
 //! - `POST /__model/claim?path=<stream path>&epoch=<e>`, body: a claim by another claimant.
 //! - `POST /__model/close?path=<stream path>`, `POST /__model/delete?path=<stream path>`.
 //! - `GET /__model/frames?path=<stream path>`: every byte of the stream.
+//! - `POST /__model/hold`: holds every snapshot `PUT` (a publish or a parts commit) before the
+//!   model sees it, until `POST /__model/release`; `GET /__model/held` answers how many are held.
 
 use std::io;
 use std::io::BufRead;
@@ -34,6 +36,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
@@ -68,6 +71,10 @@ const MAX_CONTROL_BODY_BYTES: u64 = 64 << 20;
 /// The largest body of a request refused before its body that is read and dropped before the
 /// answer; a larger one is answered unread.
 const MAX_DRAIN_BYTES: u64 = 2 << 30;
+
+/// Signalled on every release of held requests (`/__model/release`), paired with the model's
+/// mutex. One for the process: a waiter whose model still holds waits again.
+static RELEASED: Condvar = Condvar::new();
 
 /// Why the model server stopped.
 #[derive(Debug, thiserror::Error)]
@@ -288,7 +295,14 @@ fn reply(incoming: &Incoming, server: &Mutex<ModelServer>) -> Reply {
         Ok(request) => request,
         Err(e) => return answer(text(400, &e.to_string())),
     };
-    let exchanged = lock(server).exchange(path, &request);
+    let mut model = lock(server);
+    if model.holds(&request) {
+        model = RELEASED
+            .wait_while(model, |model| model.holding())
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+    let exchanged = model.exchange(path, &request);
+    drop(model);
     delivered(exchanged, method)
 }
 
@@ -424,6 +438,16 @@ fn run_control(
                 .map_err(|e| ControlError::Wire(WireError::Header(e)))?;
             server.foreign_claim(path()?, epoch, body)?
         }
+        (Method::Post, "hold") => {
+            server.hold_snapshots();
+            RawAnswer::new(204)
+        }
+        (Method::Post, "release") => {
+            server.release();
+            RELEASED.notify_all();
+            RawAnswer::new(204)
+        }
+        (Method::Get, "held") => text(200, &server.held().to_string()),
         (Method::Post, "close") => {
             server.close(path()?)?;
             RawAnswer::new(204)

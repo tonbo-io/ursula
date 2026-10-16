@@ -298,10 +298,11 @@ pub(crate) enum OpenError {
     #[error("stream_state: the stream's latest snapshot: {0}")]
     Snapshot(#[source] SnapshotError),
     /// The read of the stream met the claim of an import (`codec::frame::IMPORT_ACTIVATION`),
-    /// ending at `end`, with no snapshot past it.
+    /// ending at `end`: the stream's latest snapshot, if any, did not start the read past it.
     #[error(
-        "stream_state: the claim of an import ends at {end} and its snapshot is not published: \
-         the import is in progress or failed. Wait for it, or delete or recreate the stream"
+        "stream_state: the stream up to {end} is the claim of an import, and the open did not \
+         start from the import's snapshot. While the import runs, wait for it. If it failed (no \
+         snapshot at {end} or later), delete or recreate the stream"
     )]
     ImportIncomplete { end: Offset },
     /// The stream is missing, and the open does not create it: an owner's over a local generation

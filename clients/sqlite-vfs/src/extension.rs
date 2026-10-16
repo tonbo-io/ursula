@@ -94,7 +94,7 @@ unsafe fn result(ctx: *mut ffi::sqlite3_context, name: &str, outcome: Result<Str
             }
         }
         Err(e) => {
-            let c = c_text(&format!("{name}: {}: {e}", e.kind().as_str()));
+            let c = c_text(&function_error(name, e));
             if let Some(result_error) = a.result_error {
                 // SAFETY: `ctx` is the function's context, and SQLite copies the NUL-terminated
                 // message.
@@ -102,6 +102,19 @@ unsafe fn result(ctx: *mut ffi::sqlite3_context, name: &str, outcome: Result<Str
             }
         }
     }
+}
+
+/// A SQL function's error message: `<function>: <kind>: <message>`, the kind named once. Most
+/// messages open with their kind already (an open's do, for `ursula_status` and the logs, which
+/// show them alone), and that one is not repeated.
+fn function_error(name: &str, e: &Error) -> String {
+    let kind = e.kind().as_str();
+    let message = e.to_string();
+    let detail = message
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(&message);
+    format!("{name}: {kind}: {detail}")
 }
 
 /// Argument `i` as an integer: `None` for NULL or a missing argument.
@@ -587,8 +600,37 @@ fn register_vfs(a: &ffi::sqlite3_api_routines) -> c_int {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::MIN_SQLITE;
+    use super::function_error;
     use super::version;
+    use crate::error::Error;
+    use crate::import::ImportError;
+    use crate::open::OpenError;
+
+    // The kind is named once, whether the message opens with it or not.
+    #[test]
+    fn a_function_error_names_its_kind_once() {
+        assert_eq!(
+            function_error("ursula_open", &Error::Open(Arc::new(OpenError::NotFound))),
+            "ursula_open: not_found: the stream is missing"
+        );
+        assert_eq!(
+            function_error(
+                "ursula_import",
+                &Error::Import(ImportError::TimedOut { timeout_ms: 5 })
+            ),
+            "ursula_import: unavailable: the import ran out of its 5 ms"
+        );
+        assert_eq!(
+            function_error("ursula_import", &Error::InvalidArgument {
+                name: "timeout_ms",
+                why: "give it a positive timeout".to_owned(),
+            }),
+            "ursula_import: invalid_argument: timeout_ms: give it a positive timeout"
+        );
+    }
 
     // The floor is Node 22.19.0's SQLite.
     #[test]

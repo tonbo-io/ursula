@@ -6,8 +6,9 @@
 //   integrity check that passes, the snapshot as where it was built from, and an epoch above the
 //   import's. A commit then reaches `synced()`. A server without a cold store (no
 //   `Ursula-Max-Snapshot-Bytes`) gets a small file that fits one request instead.
-// - Model only: an owner's and a reader's open between the import's claim and its publish refuse
-//   `stream_state` and build nothing. Once the import is done, a fresh open works.
+// - Model only: the model holds the import's publish (`/__model/hold`) until the test releases it,
+//   and an owner's and a reader's open in that window, after the claim, refuse `stream_state` and
+//   build nothing. Once the import is done, a fresh open works.
 // - A second import into that stream fails with `stream_state` and changes nothing.
 // - A file with 8192-byte pages, or with a `-wal` beside it, is refused before anything is sent:
 //   the stream is never created.
@@ -90,6 +91,13 @@ function built(dir: string): boolean {
 
 const READ_ONLY = JSON.stringify({ read_only: true });
 
+/** A model control route's answer body, which must be a success. */
+async function control(method: "GET" | "POST", route: string): Promise<string> {
+	const r = await fetch(`${directUrl()}/__model/${route}`, { method });
+	expect(r.ok, `${method} ${route}: ${r.status}`).toBe(true);
+	return r.text();
+}
+
 /** On the model, a cold store for the test's run (`fn`): snapshots in parts. */
 async function withColdStore<T>(fn: () => Promise<T>): Promise<T> {
 	if (!onModel()) return fn();
@@ -142,39 +150,44 @@ describe("ursula_import", () => {
 	});
 
 	it.runIf(onModel())("refuses an owner's and a reader's open between the claim and the publish", async () => {
-		await withColdStore(async () => {
-			const s = stream("import-window");
-			// About 25 MiB in 64 KiB parts: hundreds of requests between the claim and the publish.
-			const file = plainDb(freshDir(), "plain.db", 400);
-			const imp = new Child(s.url, file, { URSULA_VFS_MAX_REQUEST_BYTES: "65536" }, "import-child.mjs");
-			// The window: the claim landed, the snapshot is not published.
-			for (let i = 0; ; i++) {
-				const h = await head(s.path);
-				if (h.status === 200 && h.tail !== null && BigInt(h.tail) > 0n && h.snapshot === null) break;
-				if (i > 10_000) throw new Error("never saw the window");
-				await new Promise((r) => setTimeout(r, 2));
+		const s = stream("import-window");
+		const file = plainDb(freshDir(), "plain.db", 3);
+		// The window stays open until the release: the model holds the import's publish (a snapshot
+		// PUT) before it sees it, after the claim.
+		await control("POST", "hold");
+		let imp: Child | undefined;
+		try {
+			imp = new Child(s.url, file, {}, "import-child.mjs");
+			for (let i = 0; (await control("GET", "held")) !== "1"; i++) {
+				if (i > 6_000) throw new Error("the import's publish never came");
+				await new Promise((r) => setTimeout(r, 10));
 			}
+			const window = await head(s.path);
+			expect(window.status).toBe(200);
+			expect(BigInt(window.tail ?? "0"), "the claim landed").toBeGreaterThan(0n);
+			expect(window.snapshot, "nothing published").toBeNull();
 			for (const options of [READ_ONLY, "{}"]) {
 				const dir = freshDir();
 				const c = new Child(s.url, dir, {}, "core-child.mjs", [options]);
 				const reply = await c.first();
 				await c.stop();
 				expect(reply.ok, JSON.stringify(reply)).toBe(false);
-				expect(String(reply.error)).toMatch(/^Error: ursula_open: stream_state: .*the claim of an import/);
+				expect(String(reply.error)).toMatch(/^Error: ursula_open: stream_state: the stream up to \d+ is the claim of an import/);
 				expect(built(dir), "nothing built").toBe(false);
 			}
-			expect((await head(s.path)).snapshot, "the opens ran inside the window").toBeNull();
-			const reply = await imp.first();
-			await imp.stop();
-			expect(reply.ok, JSON.stringify(reply)).toBe(true);
+		} finally {
+			await control("POST", "release");
+		}
+		const reply = await imp.first();
+		await imp.stop();
+		expect(reply.ok, JSON.stringify(reply)).toBe(true);
 
-			const fresh = new Child(s.url, freshDir());
-			await fresh.opened();
-			expect(await fresh.rows("SELECT count(*) AS n FROM t")).toEqual([{ n: 400 }]);
-			expect(await fresh.rows("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
-			await fresh.stop();
-		});
-	}, 180_000);
+		const fresh = new Child(s.url, freshDir());
+		await fresh.opened();
+		expect(await fresh.rows("SELECT count(*) AS n FROM t")).toEqual([{ n: 3 }]);
+		expect(await fresh.rows("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+		await fresh.stop();
+	}, 120_000);
 
 	it("refuses a file with 8192-byte pages before anything is sent", async () => {
 		const s = stream("import-8k");

@@ -230,6 +230,19 @@ pub(crate) struct ModelServer {
     parts: BTreeMap<String, StagedPart>,
     /// The parts staged so far: every id is minted once.
     minted: u64,
+    /// Snapshot `PUT`s held by the HTTP front (`/__model/hold`).
+    hold: Hold,
+}
+
+/// Whether the HTTP front holds snapshot `PUT`s (a publish or a parts commit) before the server
+/// sees them, until a release: a test keeps a window open as long as it needs, whatever the
+/// speed of the machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Hold {
+    #[default]
+    Off,
+    /// Holding, `waiting` requests held so far.
+    On { waiting: u32 },
 }
 
 /// Whether a snapshot read honors `Range`: always, but under the scripted `ignore-range` fault,
@@ -256,6 +269,7 @@ impl ModelServer {
             faults: Faults::default(),
             parts: BTreeMap::new(),
             minted: 0,
+            hold: Hold::Off,
         };
         server.history = server.draw_history();
         server
@@ -294,6 +308,44 @@ impl ModelServer {
 
     pub(crate) fn inject(&mut self, scripted: Scripted) {
         self.faults.push(scripted);
+    }
+
+    /// Holds every snapshot `PUT` from now on until [`ModelServer::release`].
+    pub(crate) fn hold_snapshots(&mut self) {
+        if self.hold == Hold::Off {
+            self.hold = Hold::On { waiting: 0 };
+        }
+    }
+
+    /// Lets every held request go on, and holds no more.
+    pub(crate) fn release(&mut self) {
+        self.hold = Hold::Off;
+    }
+
+    /// Whether `request` waits for a release: a snapshot `PUT` while holding, counted.
+    pub(crate) fn holds(&mut self, request: &Request) -> bool {
+        let snapshot_put =
+            request.method == Method::Put && matches!(request.target, Target::Snapshot { .. });
+        match &mut self.hold {
+            Hold::On { waiting } if snapshot_put => {
+                *waiting = waiting.saturating_add(1);
+                true
+            }
+            Hold::On { .. } | Hold::Off => false,
+        }
+    }
+
+    /// Whether requests are held.
+    pub(crate) fn holding(&self) -> bool {
+        self.hold != Hold::Off
+    }
+
+    /// The requests held since the hold began.
+    pub(crate) fn held(&self) -> u32 {
+        match self.hold {
+            Hold::On { waiting } => waiting,
+            Hold::Off => 0,
+        }
     }
 
     /// The stream's current token.
