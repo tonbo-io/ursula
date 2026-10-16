@@ -28,7 +28,7 @@ type MdxModule = {
   };
 };
 
-const docsModules = import.meta.glob<MdxModule>("./pages/**/*.mdx", { eager: true });
+const docsModules = import.meta.glob<MdxModule>("@docs-pages/**/*.mdx", { eager: true });
 
 const pageOrder: Record<string, { group: string; order: number; title?: string }> = {
   // Getting Started - orient, decide, install, use.
@@ -98,7 +98,9 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
 
 function inferSlug(path: string) {
   return path
-    .replace(/^\.\/pages\//, "")
+    // Alias globs return paths relative to the project root, e.g.
+    // "/src/content/docs/pages/install.mdx" or "/archived-docs/0.7/pages/...".
+    .replace(/^.*?\/pages\//, "")
     .replace(/\.mdx$/, "")
     .replace(/\/index$/, "");
 }

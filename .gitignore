@@ -9,6 +9,7 @@
 docs/web/node_modules/
 docs/web/dist/
 docs/web/public/pagefind/
+docs/web/archived-docs/
 docs/web/public/docs/
 docs/web/public/llms*.txt
 docs/web/*.tsbuildinfo

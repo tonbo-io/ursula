@@ -1,0 +1,9 @@
+{
+  "archived": [
+    {
+      "id": "0.7",
+      "ref": "v0.7.6",
+      "upgrade": "/docs/operations/#upgrading-to-08"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { getDocsGroups } from "../../content/docs";
 import { buildAppHref, getDocsPagePath, isInternalAppPath, navigateTo } from "../../utils/navigation";
+import { VersionSwitcher } from "./DocsVersion";
 import SearchModal from "./SearchModal";
 
 type DocsSidebarProps = {
@@ -52,6 +53,7 @@ function DocsSidebar({ activeSlug }: DocsSidebarProps) {
         </span>
       </button>
       <div id="docs-sidebar-panel" className="docs-sidebar-panel">
+        <VersionSwitcher activeSlug={activeSlug} />
         <SearchModal />
         <nav>
           {groups.map((group) => (

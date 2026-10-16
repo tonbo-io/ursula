@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/build-llm-docs.mjs && pagefind --site dist --glob \"docs/**/*.html\" && rm -rf public/pagefind && cp -r dist/pagefind public/pagefind",
+    "build:all": "node scripts/docs-versions.mjs fetch && npm run build && node scripts/docs-versions.mjs build",
     "preview": "vite preview"
   },
   "dependencies": {

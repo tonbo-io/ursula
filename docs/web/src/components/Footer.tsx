@@ -1,4 +1,4 @@
-import { buildAppHref, isInternalAppPath } from "../utils/navigation";
+import { LLMS_ROOT, buildAppHref, isInternalAppPath } from "../utils/navigation";
 
 type FooterLink = {
   label: string;
@@ -26,8 +26,8 @@ const footerColumns = [
   {
     title: "For agents",
     links: [
-      { label: "llms.txt", href: "/llms.txt" },
-      { label: "llms-full.txt", href: "/llms-full.txt" },
+      { label: "llms.txt", href: `${LLMS_ROOT}/llms.txt` },
+      { label: "llms-full.txt", href: `${LLMS_ROOT}/llms-full.txt` },
     ] satisfies FooterLink[],
   },
 ] as const;

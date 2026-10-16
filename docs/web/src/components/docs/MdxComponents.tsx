@@ -363,7 +363,14 @@ export function Expandable({ title, children }: { title: string; children?: Reac
   );
 }
 
+// Plain markdown links. Root-relative links go through buildAppHref so an
+// archived version's "/docs/..." links stay inside that version.
+function MdxLink({ href, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
+  return <a href={href && isInternalAppPath(href) ? buildAppHref(href) : href} {...props} />;
+}
+
 export const mdxComponents = {
+  a: MdxLink,
   Card,
   CardGroup,
   Note,

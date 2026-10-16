@@ -3,6 +3,7 @@ import { useRef, type ReactNode } from "react";
 import CodeBlockCopyButtons from "./CodeBlockCopyButtons";
 import DocsSidebar from "./DocsSidebar";
 import DocsTableOfContents from "./DocsTableOfContents";
+import { VersionBanner } from "./DocsVersion";
 import { mdxComponents } from "./MdxComponents";
 
 type DocsLayoutProps = {
@@ -19,6 +20,7 @@ function DocsLayout({ activeSlug, title, description, children }: DocsLayoutProp
     <main className="docs-page">
       <DocsSidebar activeSlug={activeSlug} />
       <article className="docs-content" data-pagefind-body>
+        <VersionBanner activeSlug={activeSlug} />
         <header className="docs-content-header">
           <h1>{title}</h1>
           {description ? <p className="docs-content-description">{description}</p> : null}
