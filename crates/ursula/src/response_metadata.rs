@@ -2,7 +2,9 @@
 //! server's identity (`Ursula-Protocol` and `Ursula-Cluster-Id`) on every
 //! answer to a `HEAD`, so a client tells a host alias routed to another
 //! deployment from a deleted stream, and the request limit on any `413`
-//! that names no limit.
+//! that names no limit. On the client plane it also gives an error body
+//! (extensions Section 11) to an error answer that no handler rendered,
+//! outside the operator paths under `/__ursula/`.
 //!
 //! One tower layer does both. It calls the inner service directly, so it
 //! adds no clone of the routes to a request, as a `from_fn` middleware
@@ -25,6 +27,7 @@ use ursula_headers::ClusterId;
 use ursula_headers::ServerIdentity;
 
 use crate::limits;
+use crate::render;
 
 /// The identity headers, rendered once through `ursula-headers` when the
 /// router is built.
@@ -44,17 +47,35 @@ impl IdentityHeaders {
 }
 
 /// Adds the router's answer metadata. `identity` is sent on every answer to
-/// a `HEAD`, when the router serves streams.
+/// a `HEAD`, when the router serves streams. `error_bodies` gives an error
+/// body to every error answer no handler rendered, on the client plane.
 #[derive(Clone)]
 pub(crate) struct ResponseMetadataLayer {
     identity: Option<IdentityHeaders>,
+    error_bodies: bool,
 }
 
 impl ResponseMetadataLayer {
-    pub(crate) fn new(identity: Option<IdentityHeaders>) -> Self {
-        Self { identity }
+    /// The client plane's: identity on `HEAD` and an error body on every
+    /// error answer outside the operator paths.
+    pub(crate) fn client(identity: IdentityHeaders) -> Self {
+        Self {
+            identity: Some(identity),
+            error_bodies: true,
+        }
+    }
+
+    /// The admin plane's: neither, only the typed `413`.
+    pub(crate) fn admin() -> Self {
+        Self {
+            identity: None,
+            error_bodies: false,
+        }
     }
 }
+
+/// The prefix of the operator paths, which keep their own answers.
+const OPERATOR_PATH_PREFIX: &str = "/__ursula/";
 
 impl<S> Layer<S> for ResponseMetadataLayer {
     type Service = ResponseMetadata<S>;
@@ -63,6 +84,7 @@ impl<S> Layer<S> for ResponseMetadataLayer {
         ResponseMetadata {
             inner,
             identity: self.identity.clone(),
+            error_bodies: self.error_bodies,
         }
     }
 }
@@ -72,6 +94,7 @@ impl<S> Layer<S> for ResponseMetadataLayer {
 pub(crate) struct ResponseMetadata<S> {
     inner: S,
     identity: Option<IdentityHeaders>,
+    error_bodies: bool,
 }
 
 impl<S> Service<Request<Body>> for ResponseMetadata<S>
@@ -93,6 +116,8 @@ where
         } else {
             None
         };
+        let error_bodies =
+            self.error_bodies && !request.uri().path().starts_with(OPERATOR_PATH_PREFIX);
         let future = self.inner.call(request);
         Box::pin(async move {
             let mut response = future.await?;
@@ -103,6 +128,9 @@ where
                 }
             }
             limits::name_unnamed_size_refusal(&mut response);
+            if error_bodies {
+                render::render_unrendered_error(&mut response);
+            }
             Ok(response)
         })
     }

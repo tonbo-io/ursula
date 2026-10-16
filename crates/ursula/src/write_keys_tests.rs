@@ -245,6 +245,22 @@ fn answer(response: &Response) -> ProducerAnswer {
     parsed
 }
 
+/// The typed producer answer of `response`, and its body checked: a
+/// refusal's error body names the answer's code, a receipt has no body.
+async fn answer_and_body(response: Response) -> ProducerAnswer {
+    let parsed = answer(&response);
+    match parsed.error_code() {
+        Some(code) => assert_eq!(crate::render::error_code_of(response).await, code),
+        None => assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+                .is_empty()
+        ),
+    }
+    parsed
+}
+
 async fn create(app: &Router) -> String {
     let response = app
         .clone()
@@ -332,7 +348,7 @@ async fn every_answer_of_the_evaluation_table_is_typed_on_the_wire() {
     let incarnation = Incarnation::parse("stream-incarnation", &token).expect("token");
     let send = |write: Write<'static>| {
         let app = app.clone();
-        async move { answer(&send(&app, &write).await.0) }
+        async move { answer_and_body(send(&app, &write).await.0).await }
     };
     use Delivery::Applied;
     use Delivery::Repeat;
@@ -730,14 +746,28 @@ async fn assert_same_answer(app: &Router, early: Write<'_>, late: Write<'_>, sta
         "late: {:?}",
         late_answer.headers()
     );
-    // A late refusal carries the state machine's message as its body.
+    // Both paths answer the same headers and, on a refusal, the same code.
+    // The late message names the producer, the early one cannot, so the
+    // lengths differ.
     let headers = |response: &Response| {
         let mut headers = response.headers().clone();
-        headers.remove(CONTENT_TYPE);
         headers.remove(axum::http::header::CONTENT_LENGTH);
         headers
     };
     assert_eq!(headers(&early_answer), headers(&late_answer));
+    if status.is_success() {
+        let body = |response: Response| async {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body")
+        };
+        assert_eq!(body(early_answer).await, body(late_answer).await);
+    } else {
+        assert_eq!(
+            crate::render::error_code_of(early_answer).await,
+            crate::render::error_code_of(late_answer).await
+        );
+    }
 }
 
 /// D1 and D2 of the evaluation order (#581 section 5.3): the producer rows

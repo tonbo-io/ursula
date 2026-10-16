@@ -120,9 +120,11 @@ CLUSTER_IPS_BY_NAME = {
     "ursula-chaos-node-2": "172.31.31.150",
     "ursula-chaos-node-3": "172.31.47.237",
 }
-PRODUCER_SEQ_CONFLICT_RE = re.compile(
-    r"ProducerSeqConflict: producer '([^']+)' expected sequence (\d+), received (\d+)"
-)
+# Error codes of Ursula's error body, {"error":{"code":...,"message":...}}
+# (extensions Section 11). The agent matches codes, never message text.
+CODE_PRODUCER_SEQ_CONFLICT = "PRODUCER_SEQ_CONFLICT"
+CODE_COLD_BACKPRESSURE = "COLD_BACKPRESSURE"
+CODE_NO_LEADER = "NO_LEADER"
 # systemd unit running the ursula node process on each node, targeted by the
 # process kill/freeze faults (faultd runs `systemctl` against it).
 NODE_SERVICE_UNIT = "ursula-chaos.service"
@@ -725,12 +727,31 @@ class ChaosAgent:
             stream.old_payloads.append(sample)
 
     @staticmethod
-    def parse_producer_seq_conflict(body: bytes) -> tuple[str, int, int] | None:
-        body_preview = body[:240].decode("utf-8", errors="replace")
-        match = PRODUCER_SEQ_CONFLICT_RE.search(body_preview)
-        if match is None:
+    def error_code(body: bytes) -> str | None:
+        """The code of an Ursula error body, or None for any other body."""
+        try:
+            parsed = json.loads(body)
+        except ValueError:
             return None
-        return match.group(1), int(match.group(2)), int(match.group(3))
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        return code if isinstance(code, str) else None
+
+    @staticmethod
+    def parse_producer_seq_conflict(
+        status: int, body: bytes, headers: dict[str, str]
+    ) -> tuple[int, int] | None:
+        """The expected and received seq of the request's own producer seq gap
+        (409 PRODUCER_SEQ_CONFLICT), from its typed headers."""
+        if status != 409 or ChaosAgent.error_code(body) != CODE_PRODUCER_SEQ_CONFLICT:
+            return None
+        try:
+            return (
+                int(headers["producer-expected-seq"]),
+                int(headers["producer-received-seq"]),
+            )
+        except (KeyError, ValueError):
+            return None
 
     def resync_stream_from_server(self, stream: WorkloadStream) -> bool:
         next_offsets: list[int] = []
@@ -902,12 +923,7 @@ class ChaosAgent:
         if status == 503 and headers.get("retry-after"):
             return True
         if status == 503:
-            body_preview = body[:240].decode("utf-8", errors="replace")
-            return (
-                "forward request to leader" in body_preview
-                or "local leader runtime" in body_preview
-                or "leader" in body_preview.lower()
-            )
+            return ChaosAgent.error_code(body) == CODE_NO_LEADER
         return False
 
     def create_streams(self) -> None:
@@ -1182,14 +1198,10 @@ class ChaosAgent:
                 if status not in {200, 204}:
                     body_preview = body[:160].decode("utf-8", errors="replace").strip()
                     last_error = f"{node.name}: status={status} body={body_preview!r}"
-                    conflict = self.parse_producer_seq_conflict(body)
-                    if (
-                        status == 409
-                        and conflict is not None
-                        and conflict[0] == producer_id
-                    ):
-                        producer_seq_conflict = (conflict[1], conflict[2])
-                    if status == 503 and "ColdBackpressure" in body_preview:
+                    conflict = self.parse_producer_seq_conflict(status, body, headers)
+                    if conflict is not None:
+                        producer_seq_conflict = conflict
+                    if status == 503 and self.error_code(body) == CODE_COLD_BACKPRESSURE:
                         saw_cold_backpressure = True
                     elif self.is_transient_append_failure(status, body, headers):
                         saw_transient_failure = True

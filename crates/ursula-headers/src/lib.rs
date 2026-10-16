@@ -20,8 +20,12 @@
 //! - the typed `413`, which names the limit it applied (Section 10);
 //! - the routing answers a node sends before it reads the body (Section
 //!   5.7);
-//! - the `412` of the incarnation precondition and the `409` of a closed
-//!   stream.
+//! - the `412` of the incarnation precondition, the `409` of a closed
+//!   stream, and the `409` of a `Stream-Seq` conflict, which echoes the
+//!   stream's last one;
+//! - the JSON body of every error answer,
+//!   `{"error":{"code":"<code>","message":"<detail>"}}`, with its stable
+//!   code (Section 11).
 //!
 //! Not yet typed: the `400` of a `Producer-Digest` mismatch, the answer of a
 //! retention request (`Stream-Retained-Offset`), and the immutable-read
@@ -52,8 +56,8 @@
 //!
 //! - [`names`]: the lowercase header names.
 //! - [`value`]: field syntax and the value types: [`Offset`],
-//!   [`Incarnation`], [`Epoch`], [`Seq`], [`ProducerId`], [`BodyDigest`]
-//!   and [`SnapshotDigest`].
+//!   [`Incarnation`], [`Epoch`], [`Seq`], [`ProducerId`], [`StreamSeq`],
+//!   [`BodyDigest`] and [`SnapshotDigest`].
 //! - [`request`]: [`ProducerRequestHeaders`], the key, digest and
 //!   [`IncarnationPrecondition`] a write carries.
 //! - [`answer`]: [`ProducerAnswer`], every typed answer to a producer write.
@@ -68,11 +72,14 @@
 //! - [`routing`]: [`RoutingAnswer`], the `307` or `503` of a node that does
 //!   not lead the stream's group.
 //! - [`refusal`]: [`IncarnationMismatch`] (`412`) and
-//!   [`StreamClosedConflict`] (`409`).
+//!   [`StreamClosedConflict`] and [`StreamSeqConflict`] (`409`).
+//! - [`error_body`]: [`ErrorBody`], the body of every error answer, and its
+//!   [`ErrorCode`].
 //! - [`error`]: the one error, [`HeaderError`].
 
 pub mod answer;
 pub mod error;
+pub mod error_body;
 pub mod head;
 pub mod limit;
 pub mod names;
@@ -97,6 +104,8 @@ pub use answer::Outcome;
 pub use answer::ProducerAnswer;
 pub use answer::Receipt;
 pub use error::HeaderError;
+pub use error_body::ErrorBody;
+pub use error_body::ErrorCode;
 pub use head::CLUSTER_ID_MAX_BYTES;
 pub use head::ClusterId;
 pub use head::Inherited;
@@ -111,6 +120,7 @@ pub use range::ByteSpan;
 pub use range::ContentRange;
 pub use refusal::IncarnationMismatch;
 pub use refusal::StreamClosedConflict;
+pub use refusal::StreamSeqConflict;
 pub use request::IncarnationPrecondition;
 pub use request::ProducerRequestHeaders;
 pub use request::ProducerWrite;
@@ -138,5 +148,7 @@ pub use value::OFFSET_WIDTH;
 pub use value::Offset;
 pub use value::PRODUCER_ID_MAX_BYTES;
 pub use value::ProducerId;
+pub use value::STREAM_SEQ_MAX_BYTES;
 pub use value::Seq;
 pub use value::SnapshotDigest;
+pub use value::StreamSeq;

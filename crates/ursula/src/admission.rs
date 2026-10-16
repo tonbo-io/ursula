@@ -14,16 +14,16 @@ use axum::http::Method;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
-use axum::http::header::CONTENT_TYPE;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use ursula_headers::ErrorCode;
 use ursula_headers::SizeLimit;
 
 use crate::MAX_HTTP_BODY_BYTES;
 use crate::front_door;
 use crate::limits;
-use crate::render::insert_default_response_headers;
+use crate::render::fixed_error_answer;
 use crate::wal_disk::WalDiskMonitor;
 
 const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
@@ -102,24 +102,14 @@ pub(crate) enum AdmissionRefusal {
     IngressBodyBytesLimitReached,
 }
 
-impl AdmissionRefusal {
-    /// The refusal's token: the JSON `error` of a `503`.
-    fn code(self) -> &'static str {
-        match self {
-            Self::BodyTooLarge(_) => "RequestBodyTooLarge",
-            Self::WalDiskPressure => "WalDiskPressure",
-            Self::RaftLogPressure => "RaftLogPressure",
-            Self::IngressBodyBytesLimitReached => "IngressBodyBytesLimitReached",
-        }
-    }
-}
-
 impl IntoResponse for AdmissionRefusal {
     fn into_response(self) -> Response {
         match self {
             Self::BodyTooLarge(limit) => limits::size_refusal(limit),
-            Self::WalDiskPressure | Self::RaftLogPressure | Self::IngressBodyBytesLimitReached => {
-                retry_after_json(self.code())
+            Self::WalDiskPressure => retry_after_json(ErrorCode::WalDiskPressure),
+            Self::RaftLogPressure => retry_after_json(ErrorCode::RaftLogPressure),
+            Self::IngressBodyBytesLimitReached => {
+                retry_after_json(ErrorCode::IngressBodyBytesLimitReached)
             }
         }
     }
@@ -319,18 +309,13 @@ fn is_write_method(method: &Method) -> bool {
     )
 }
 
-pub(crate) fn retry_after_json(error: &'static str) -> Response {
+/// A `503` with `Retry-After: 1` whose error body names `code`, with its
+/// fixed message.
+pub(crate) fn retry_after_json(code: ErrorCode) -> Response {
     let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
     headers.insert(
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),
     );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        headers,
-        serde_json::json!({ "error": error }).to_string(),
-    )
-        .into_response()
+    fixed_error_answer(StatusCode::SERVICE_UNAVAILABLE, code, headers)
 }

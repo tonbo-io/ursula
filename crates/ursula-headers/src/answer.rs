@@ -10,6 +10,7 @@
 //! treats that as a protocol violation, not as a receipt.
 
 use crate::error::HeaderError;
+use crate::error_body::ErrorCode;
 use crate::fields;
 use crate::fields::Emit;
 use crate::names;
@@ -405,6 +406,20 @@ impl ProducerAnswer {
             | Self::StaleEpoch { .. } => 403,
             Self::SeqGap { .. } => 409,
             Self::EpochNotClaimed => 400,
+        }
+    }
+
+    /// The code of a refusal's error body, the code the server's late path
+    /// gives the same refusal. `None` for a receipt.
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Receipt { .. } | Self::ReceiptEvicted { .. } => None,
+            Self::EpochClosed(_) => Some(ErrorCode::ProducerEpochClosed),
+            Self::KeyConflict { .. } => Some(ErrorCode::ProducerKeyConflict),
+            Self::ProducerExpired { .. } => Some(ErrorCode::ProducerExpired),
+            Self::StaleEpoch { .. } => Some(ErrorCode::ProducerEpochStale),
+            Self::SeqGap { .. } => Some(ErrorCode::ProducerSeqConflict),
+            Self::EpochNotClaimed => Some(ErrorCode::InvalidProducer),
         }
     }
 

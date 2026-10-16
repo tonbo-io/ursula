@@ -365,10 +365,9 @@ async fn a_manifest_that_repeats_a_part_is_refused() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        String::from_utf8(body_of(response).await)
-            .unwrap()
-            .contains("repeats"),
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::InvalidPartsCommit
     );
 }
 
@@ -437,6 +436,10 @@ async fn a_part_needs_its_stream_and_fits_one_request() {
         SizeLimit::parse(413, pairs(&response)),
         Ok(Some(SizeLimit::Request(MAX_HTTP_BODY_BYTES as u64)))
     );
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::RequestTooLarge
+    );
 }
 
 /// Without a cold store, a part and a commit answer `501`, and HEAD sends
@@ -453,9 +456,17 @@ async fn a_node_without_a_cold_store_takes_no_parts() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::NoColdStore
+    );
     let part = PartId::new(format!("{:032x}-{:016x}.part", 1, 2)).unwrap();
     let response = send(&app, commit_request("/parts/s", &[part], digest_of(b"x"))).await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::NoColdStore
+    );
     let response = send(&app, Request::head("/parts/s").body(Body::empty()).unwrap()).await;
     assert_eq!(
         StreamHead::parse(pairs(&response))
@@ -896,8 +907,8 @@ async fn a_commit_finishes_after_its_client_goes_away() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(response.headers().contains_key(RETRY_AFTER));
     assert_eq!(
-        body_of(response).await,
-        br#"{"error":"SnapshotCommitInProgress"}"#
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitInProgress
     );
 
     gate.open();
@@ -940,8 +951,8 @@ async fn a_third_concurrent_commit_is_busy() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(response.headers().contains_key(RETRY_AFTER));
     assert_eq!(
-        body_of(response).await,
-        br#"{"error":"SnapshotCommitsBusy"}"#
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitsBusy
     );
     let metrics = send(
         &app,
@@ -1001,8 +1012,8 @@ async fn one_copy_and_one_full_request_fit_the_smallest_budget() {
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        body_of(response).await,
-        br#"{"error":"SnapshotCommitsBusy"}"#
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitsBusy
     );
 
     let response = send(

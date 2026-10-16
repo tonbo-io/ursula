@@ -1,5 +1,5 @@
-//! The one error of parsing Ursula's headers and the parts manifest, and of
-//! constructing a value that would not round-trip.
+//! The one error of parsing Ursula's headers, the parts manifest and error
+//! bodies, and of constructing a value that would not round-trip.
 
 use std::error::Error;
 use std::fmt;
@@ -103,6 +103,12 @@ pub enum HeaderError {
     /// `Content-Range` is not `bytes first-last/total` with `first <= last <
     /// total` on a `206`, or `bytes */total` on a `416`.
     InvalidContentRange,
+    /// An error answer's body is not a JSON object whose `error` member
+    /// holds the string `code`, and `message` when present.
+    InvalidErrorBody,
+    /// `Stream-Last-Seq` is not 1 to 256 bytes of visible ASCII with inner
+    /// spaces or tabs.
+    InvalidStreamSeq,
 }
 
 impl fmt::Display for HeaderError {
@@ -234,6 +240,15 @@ impl fmt::Display for HeaderError {
                 "{} must be `bytes first-last/total` within the body on a 206, or \
                  `bytes */total` on a 416",
                 names::CONTENT_RANGE
+            ),
+            Self::InvalidStreamSeq => write!(
+                f,
+                "{} must be 1 to 256 bytes of visible ASCII",
+                names::STREAM_LAST_SEQ
+            ),
+            Self::InvalidErrorBody => write!(
+                f,
+                r#"an error body must be {{"error":{{"code":"<code>","message":"<message>"}}}}"#
             ),
             Self::DuplicateManifestPart { line } => {
                 write!(

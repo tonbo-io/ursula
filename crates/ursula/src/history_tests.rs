@@ -348,6 +348,24 @@ async fn an_unpinned_sse_session_ends_at_a_recreate() {
     let body = std::str::from_utf8(&body).expect("utf8");
     assert!(body.contains("event: error"), "{body}");
     assert!(!body.contains("data:new"), "{body}");
+    // The event's data is the JSON error body of an HTTP answer.
+    let data = body
+        .split("event: error\ndata:")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .expect("an error event's data");
+    // The delete ends it (`STREAM_NOT_FOUND`) or the new incarnation does.
+    let code = ursula_headers::ErrorBody::parse(data.as_bytes())
+        .expect("an error body")
+        .code;
+    assert!(
+        matches!(
+            code,
+            ursula_headers::ErrorCode::StreamNotFound
+                | ursula_headers::ErrorCode::IncarnationMismatch
+        ),
+        "{code}"
+    );
 }
 
 /// A `304` never matches across a recreate with equal bytes: the token is

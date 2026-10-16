@@ -1,6 +1,9 @@
 //! The front door's size limits (extensions Section 10): what HEAD
 //! advertises, and the limit every `413` names.
 //!
+//! Every `413` names its limit in a header and in its error body's code
+//! (`RequestTooLarge` or `SnapshotTooLarge`).
+//!
 //! A node has one request limit, [`MAX_REQUEST_BYTES`], for every request.
 //! A node with a cold store also accepts snapshots of up to
 //! [`MAX_COLD_SNAPSHOT_BYTES`] uploaded in parts ([`crate::snapshot_parts`]),
@@ -9,13 +12,12 @@
 
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::response::Response;
 use ursula_headers::SizeLimit;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 
 use crate::MAX_HTTP_BODY_BYTES;
-use crate::render::insert_default_response_headers;
+use crate::render::error_answer;
 use crate::render::insert_header_str;
 
 /// The largest request body any request may carry
@@ -37,14 +39,21 @@ pub(crate) fn max_snapshot_bytes(cold_store: bool) -> Option<u64> {
 /// A `413` that names `limit`.
 pub(crate) fn size_refusal(limit: SizeLimit) -> Response {
     let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
     insert_size_limit(&mut headers, limit);
-    (
+    let message = match limit {
+        SizeLimit::Request(bytes) => {
+            format!("the request body is above the request limit of {bytes} bytes")
+        }
+        SizeLimit::Snapshot(bytes) => {
+            format!("the snapshot is above the snapshot limit of {bytes} bytes")
+        }
+    };
+    error_answer(
         StatusCode::PAYLOAD_TOO_LARGE,
+        limit.error_code(),
+        message,
         headers,
-        "request body is too large",
     )
-        .into_response()
 }
 
 fn insert_size_limit(headers: &mut HeaderMap, limit: SizeLimit) {

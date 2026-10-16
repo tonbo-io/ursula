@@ -1015,6 +1015,10 @@ pub enum GroupInfraError {
     OwnerStopped,
     #[error("write outcome is unknown; the proposal may have committed")]
     OutcomeUnknown,
+    /// A read or write of the cold tier failed. `detail` names the object
+    /// and the store's error, for the server's log only.
+    #[error("{detail}")]
+    ColdStore { detail: String },
     #[error("{message}")]
     Internal { message: String },
     #[error("ProtoDecode: protobuf raft payload missing {field}")]
@@ -1242,6 +1246,19 @@ impl GroupEngineError {
     pub fn code(&self) -> Option<StreamErrorCode> {
         match self {
             Self::Stream(err) => Some(err.code),
+            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
+        }
+    }
+
+    /// A stream refusal's own text, without the code the message starts
+    /// with: what the state machine said about the request, which names
+    /// nothing but what the request named. `None` for every other error.
+    pub fn refusal_text(&self) -> Option<&str> {
+        match self {
+            Self::Stream(err) => {
+                let prefix = format!("{:?}: ", err.code);
+                Some(err.message.strip_prefix(&prefix).unwrap_or(&err.message))
+            }
             Self::Infra(_) | Self::ForwardToLeader { .. } => None,
         }
     }

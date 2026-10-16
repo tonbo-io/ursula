@@ -21,6 +21,9 @@ pub const PRODUCER_CLOSED_SEQ: &str = "producer-closed-seq";
 pub const PRODUCER_EXPECTED_SEQ: &str = "producer-expected-seq";
 /// The sequence number a `409` refused.
 pub const PRODUCER_RECEIVED_SEQ: &str = "producer-received-seq";
+/// The stream's last accepted `Stream-Seq`, on the `409` of a `Stream-Seq`
+/// that is not above it.
+pub const STREAM_LAST_SEQ: &str = "stream-last-seq";
 
 /// The stream incarnation token: a request's precondition, and the token
 /// that served a response.

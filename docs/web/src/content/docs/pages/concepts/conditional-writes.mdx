@@ -10,13 +10,13 @@ Writers that share a stream sometimes need to say "append this only if the strea
 - Each stream stores the last accepted `Stream-Seq`. An append that carries `Stream-Seq` is accepted only when its value is strictly greater than the stored one, and the value is then stored.
 - The comparison is bytewise, not numeric: `"10"` sorts before `"9"`. Use fixed-width values, such as a counter zero-padded to 20 digits.
 - Values must be printable ASCII. A header with any other byte is ignored: the append is not checked and nothing is stored.
-- An equal or smaller value answers `409 Conflict`, and nothing from the request is committed. The `409` carries `Stream-Next-Offset` set to the stream's current tail.
+- An equal or smaller value answers `409 Conflict` with the error code `STREAM_SEQ_CONFLICT`, and nothing from the request is committed. The `409` carries `Stream-Next-Offset` set to the stream's current tail and `Stream-Last-Seq` set to the stream's last accepted `Stream-Seq`, so a writer can retry from it without reading first. Only a stream that accepted a `Stream-Seq` refuses one, so a `Stream-Seq` `409` always carries `Stream-Last-Seq`.
 - The scope is the stream. A value is checked only against earlier values on the same stream, whoever sent them.
 - An append without `Stream-Seq` is not checked and leaves the stored value unchanged.
 - A `PUT` that creates the stream stores its `Stream-Seq` as the starting value without checking it. A `PUT` that finds the stream already there ignores the header.
 - Producer deduplication runs first. A retry of an append that was already accepted from the same `Producer-Id`, `Producer-Epoch` and `Producer-Seq` is answered as a duplicate, not `409`, even though its `Stream-Seq` is no longer greater than the stored value. A repeat of the producer's newest write carries its original `Stream-Next-Offset`, and a repeat of an older write carries none (see [Exactly-once writes](/docs/concepts/exactly-once-writes#how-dedup-works)). An append rejected with `409` uses up no `Producer-Seq`.
 - A `Stream-Seq` `409` carries neither `Stream-Closed` nor `Producer-Expected-Seq`. A closed stream answers `409` with `Stream-Closed: true`, and an out-of-order `Producer-Seq` answers `409` with `Producer-Expected-Seq`.
-- A `Content-Type` that differs from the stream's also answers `409`, with the same headers as a `Stream-Seq` `409`; only the plain-text body differs. Types are compared after normalization, which keeps parameters, so `application/json; charset=utf-8` is not `application/json`. The recipes below send exactly the content type `HEAD` reports. Then a `409` without `Stream-Closed` or `Producer-Expected-Seq` can only come from the `Stream-Seq` check, and they treat every other `409` as an error.
+- A `Content-Type` that differs from the stream's also answers `409`, with the code `CONTENT_TYPE_MISMATCH` and without `Stream-Last-Seq`. Types are compared after normalization, which keeps parameters, so `application/json; charset=utf-8` is not `application/json`. A `409` with `Stream-Last-Seq` comes only from the `Stream-Seq` check, and the recipes below treat every other `409` as an error. Rust clients parse it with `ursula_headers::StreamSeqConflict`.
 - A value is at most 256 bytes.
 
 ## Prefix-count compare-and-set
@@ -27,7 +27,7 @@ This pattern lets several writers extend one log while each commit is validated 
 2. **Commits.** Each append is one commit of one or more events. On an `application/json` stream, `POST` the commit as a JSON array: the elements are committed together, one message per event. Never append an empty commit.
 3. **Read to the tail.** Read with `consistency=leader`, continuing from `Stream-Next-Offset`, until a response carries `Stream-Up-To-Date: true`. Count the events you read; call it `n`. `n` counts every event since the stream was created. Once retention has trimmed the start of the stream, those events can't be read (a read from `offset=-1` answers `410`), so keep the event count in every snapshot you publish and count on from it, or don't advance retention on a prefix-count stream.
 4. **Append.** Validate the commit against what you read, then append it with `Stream-Seq` set to `n`, zero-padded to a fixed width. On a new stream, the first commit sends `0`.
-5. **On a `Stream-Seq` `409`.** Another writer committed first. Read on from where you stopped until `Stream-Up-To-Date: true`, count the `k` new events, validate again, and retry with `n + k`.
+5. **On a `Stream-Seq` `409`.** Another writer committed first. `Stream-Last-Seq` is the count before that writer's commit. Read on from where you stopped until `Stream-Up-To-Date: true`, count the `k` new events, validate again, and retry with `n + k`.
 
 ```bash
 # The writer read 3 events, ending with Stream-Up-To-Date: true.
@@ -53,7 +53,7 @@ When the facts are decided somewhere else, such as a database transaction or a [
 
 1. **Number the commits** in the source of truth, and publish only facts that have committed, in commit order.
 2. **Send both guards** on each append: `Producer-Id`, `Producer-Epoch` and `Producer-Seq` for retries, and `Stream-Seq` set to the commit's number, zero-padded.
-3. **On takeover**, the new owner uses a higher `Producer-Epoch` and starts `Producer-Seq` again at `0`. If it republishes a fact the old owner already published, the `Stream-Seq` check answers `409`, which here means "already published": go on to the next fact with the same `Producer-Seq`. Only a `Stream-Seq` `409` means that. A `409` with `Stream-Closed` or `Producer-Expected-Seq`, or any `409` while your `Content-Type` differs from the one `HEAD` reports, is an error, and skipping on it would lose facts.
+3. **On takeover**, the new owner uses a higher `Producer-Epoch` and starts `Producer-Seq` again at `0`. If it republishes a fact the old owner already published, the `Stream-Seq` check answers `409` with `Stream-Last-Seq`, which here means "already published": go on to the next fact with the same `Producer-Seq`, or to the first fact after `Stream-Last-Seq`. Only a `409` with `Stream-Last-Seq` means that. Any other `409` is an error, and skipping on it would lose facts.
 4. **Old owners.** Once the new owner's first append is accepted, appends with the old epoch answer `403`. Before that, an old owner can still publish only facts that committed, and `Stream-Seq` accepts each of those at most once and in commit order.
 5. **Gaps.** If a fact can no longer be published, for example because the source pruned it, append a snapshot or reset marker that tells readers to resynchronize. A fact skipped once can never be appended later, because its number is no longer greater than the stored value.
 

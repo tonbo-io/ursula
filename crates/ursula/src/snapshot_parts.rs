@@ -48,6 +48,7 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::StreamExt;
 use futures_util::stream;
+use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
 use ursula_headers::MAX_MANIFEST_BYTES;
 use ursula_headers::PartId;
@@ -87,6 +88,9 @@ use crate::cold_snapshot::stream_into_object;
 use crate::front_door;
 use crate::front_door::HeadDecision;
 use crate::limits;
+use crate::render::error_answer;
+use crate::render::error_response;
+use crate::render::fixed_error_response;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 use crate::render::insert_offset;
@@ -265,29 +269,33 @@ pub(crate) enum PartsRefusal {
 
 impl IntoResponse for PartsRefusal {
     fn into_response(self) -> Response {
-        let mut headers = HeaderMap::new();
-        insert_default_response_headers(&mut headers);
-        let status = match &self {
-            Self::NoColdStore => StatusCode::NOT_IMPLEMENTED,
+        let (status, code) = match &self {
+            Self::NoColdStore => (StatusCode::NOT_IMPLEMENTED, ErrorCode::NoColdStore),
             Self::SnapshotTooLarge => return limits::size_refusal(limits::SNAPSHOT_LIMIT),
             Self::PartTooLarge => return limits::size_refusal(limits::REQUEST_LIMIT),
-            Self::Malformed(_)
-            | Self::ManifestTooLarge
-            | Self::UnknownPart { .. }
-            | Self::DigestMismatch { .. }
-            | Self::Body(_) => StatusCode::BAD_REQUEST,
-            Self::Busy => return retry_after_json("SnapshotCommitsBusy"),
-            Self::InProgress => return retry_after_json("SnapshotCommitInProgress"),
+            Self::Malformed(_) | Self::ManifestTooLarge => {
+                (StatusCode::BAD_REQUEST, ErrorCode::InvalidPartsCommit)
+            }
+            Self::UnknownPart { .. } => (StatusCode::BAD_REQUEST, ErrorCode::UnknownPart),
+            Self::DigestMismatch { .. } => {
+                (StatusCode::BAD_REQUEST, ErrorCode::SnapshotDigestMismatch)
+            }
+            Self::Body(_) => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
+            Self::Busy => return retry_after_json(ErrorCode::SnapshotCommitsBusy),
+            Self::InProgress => return retry_after_json(ErrorCode::SnapshotCommitInProgress),
             Self::ColdStore(err) => {
                 tracing::warn!(error = %err, "snapshot parts in the cold store failed");
-                StatusCode::BAD_GATEWAY
+                return fixed_error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed);
             }
             Self::Invariant(err) => {
                 tracing::error!(error = %err, "a snapshot part value is outside the protocol");
-                StatusCode::INTERNAL_SERVER_ERROR
+                return fixed_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                );
             }
         };
-        (status, headers, self.to_string()).into_response()
+        error_response(status, code, self.to_string())
     }
 }
 
@@ -393,15 +401,14 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
     KeyCheck::Answered(match snapshot_ref(latest_offset, &latest_digest) {
         Ok(latest) => {
             let mut headers = HeaderMap::new();
-            insert_default_response_headers(&mut headers);
             SnapshotPublishAnswer::Conflict { latest }
                 .render(|name, value| insert_header_str(&mut headers, name, value));
-            (
+            error_answer(
                 StatusCode::CONFLICT,
-                headers,
+                ErrorCode::SnapshotConflict,
                 "another snapshot is the latest at or after this offset",
+                headers,
             )
-                .into_response()
         }
         Err(err) => PartsRefusal::Invariant(err).into_response(),
     })
@@ -413,16 +420,20 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
 /// `Stream-Next-Offset` as the publish's refusal does. Otherwise the key is
 /// open.
 fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -> KeyCheck {
-    let (status, next_offset, message) = if target.snapshot_offset < head.retained_offset {
+    // The codes of the publish's own refusals (`StreamGone` and
+    // `SnapshotConflict`).
+    let (status, next_offset, code, message) = if target.snapshot_offset < head.retained_offset {
         (
             StatusCode::GONE,
             head.retained_offset,
+            ErrorCode::StreamGone,
             "snapshot offset is older than the stream's retained offset",
         )
     } else if target.snapshot_offset > head.tail_offset {
         (
             StatusCode::CONFLICT,
             head.tail_offset,
+            ErrorCode::SnapshotConflict,
             "snapshot offset is beyond the stream's tail",
         )
     } else {
@@ -431,9 +442,8 @@ fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -
         };
     };
     let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, next_offset);
-    KeyCheck::Answered((status, headers, message).into_response())
+    KeyCheck::Answered(error_answer(status, code, message, headers))
 }
 
 /// Commits a snapshot uploaded in parts, staged for the stream's
@@ -534,11 +544,11 @@ pub(crate) async fn commit(
             if let Err(err) = task.await {
                 tracing::error!(error = %err, "a snapshot commit task failed");
             }
-            (
+            error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
                 "the snapshot commit failed",
             )
-                .into_response()
         }
     }
 }
@@ -934,6 +944,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::response::IntoResponse;
+    use ursula_headers::ErrorCode;
     use ursula_headers::PartId;
     use ursula_headers::PartsManifest;
     use ursula_headers::SizeLimit;
@@ -1000,6 +1011,10 @@ mod tests {
                     .map(|(name, value)| (name.as_str(), value.as_bytes()))
             ),
             Ok(Some(SizeLimit::Snapshot(MAX_COLD_SNAPSHOT_BYTES)))
+        );
+        assert_eq!(
+            crate::render::error_code_of(response).await,
+            ErrorCode::SnapshotTooLarge
         );
         // Another incarnation of the stream finds none of them.
         let other = PartOwner {

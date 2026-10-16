@@ -105,6 +105,8 @@ use tower_http::compression::predicate::SizeAbove;
 use ursula_headers::ByteRange;
 use ursula_headers::ClusterId;
 use ursula_headers::ContentRange;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError as ProducerHeaderError;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::IncarnationPrecondition;
@@ -112,6 +114,8 @@ use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::ProducerWrite;
 use ursula_headers::RoutingAnswer;
+use ursula_headers::STREAM_SEQ_MAX_BYTES;
+use ursula_headers::StreamSeq;
 use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
@@ -174,8 +178,13 @@ use crate::admission::PendingAdmission;
 use crate::admission::ingress_admission_middleware;
 use crate::front_door::BodyState;
 use crate::front_door::HeadDecision;
+use crate::render::Uncompressed;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
+use crate::render::error_answer;
+use crate::render::error_response;
+use crate::render::fixed_error_answer;
+use crate::render::fixed_error_response;
 use crate::render::http_read_content_type;
 use crate::render::insert_cache_control;
 use crate::render::insert_content_type;
@@ -203,12 +212,13 @@ use crate::render::read_response;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
 use crate::render::response_cursor;
-use crate::render::runtime_error_status;
+use crate::render::runtime_error_body;
 use crate::render::should_base64_encode_sse_data;
 use crate::render::snapshot_head;
 use crate::render::snapshot_published_response;
-use crate::render::sse_safe_line;
+use crate::render::sse_error_event;
 use crate::render::stream_head;
+use crate::render::stream_seq_conflict;
 use crate::response_metadata::IdentityHeaders;
 use crate::response_metadata::ResponseMetadataLayer;
 
@@ -791,7 +801,14 @@ impl ClientWriteLeaderRouter {
         let location = HeaderValue::from_str(&format!("{base}{request_target}")).ok()?;
         headers.insert(LOCATION, location);
         answer.render(|name, value| insert_header_str(&mut headers, name, value));
-        Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
+        Some(
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                headers,
+                "this node does not lead the stream's group",
+            )
+                .into_response(),
+        )
     }
 }
 
@@ -1160,7 +1177,7 @@ fn admin_ops_router(state: HttpState) -> Router {
             require_admin_incarnation,
         ))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(ResponseMetadataLayer::new(None))
+        .layer(ResponseMetadataLayer::admin())
         .with_state(state)
 }
 
@@ -1489,27 +1506,31 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
     leadership_shed_status(State(state)).await
 }
 
+/// Whether the compression layer may compress an answer: a finite JSON or
+/// NDJSON body, never a snapshot answer, which offers byte ranges of its
+/// identity body, and never an error answer ([`Uncompressed`]).
+pub(crate) fn finite_record_response(
+    _status: StatusCode,
+    _version: Version,
+    headers: &HeaderMap,
+    extensions: &axum::http::Extensions,
+) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            let media_type = content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim();
+            media_type == "application/json" || media_type == "application/x-ndjson"
+        })
+        && !headers.contains_key(names::ACCEPT_RANGES)
+        && extensions.get::<Uncompressed>().is_none()
+}
+
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
-    let finite_record_response =
-        |_status: StatusCode,
-         _version: Version,
-         headers: &HeaderMap,
-         _extensions: &axum::http::Extensions| {
-            headers
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|content_type| {
-                    let media_type = content_type
-                        .split(';')
-                        .next()
-                        .unwrap_or(content_type)
-                        .trim();
-                    media_type == "application/json" || media_type == "application/x-ndjson"
-                })
-                // A snapshot answer offers byte ranges of its identity body,
-                // so it is never compressed.
-                && !headers.contains_key(names::ACCEPT_RANGES)
-        };
     let response_compression = CompressionLayer::new()
         .gzip(true)
         .quality(CompressionLevel::Fastest)
@@ -1553,9 +1574,13 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             admission,
             ingress_admission_middleware,
         ))
-        .layer(ResponseMetadataLayer::new(Some(IdentityHeaders::new(
+        // An unknown path gets its error body from this layer only because
+        // the client router's fallback is the one a merged router keeps: the
+        // node merges the client router last, after the cluster and admin
+        // routers (`error_body_tests` pins it on that composition).
+        .layer(ResponseMetadataLayer::client(IdentityHeaders::new(
             state.cluster_id(),
-        ))))
+        )))
         .layer(response_compression)
         .with_state(state)
 }
@@ -1577,22 +1602,22 @@ pub(crate) async fn stage_external_payload(
     payload: &[u8],
 ) -> Result<ExternalPayloadRef, Response> {
     let Some(cold_store) = state.runtime.cold_store() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cold backend must be configured before externalizing payloads",
-        )
-            .into_response());
+        return Err(fixed_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            ErrorCode::NoColdStore,
+        ));
     };
     let s3_path = new_external_payload_path(stream_id);
     let object_size = cold_store
         .write_chunk(&s3_path, payload)
         .await
         .map_err(|err| {
-            (
+            tracing::warn!(error = %err, "write external payload object");
+            error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("write external payload object: {err}"),
+                ErrorCode::ColdStoreFailed,
+                "writing the external payload object failed",
             )
-                .into_response()
         })?;
     Ok(ExternalPayloadRef {
         s3_path,
@@ -1740,7 +1765,34 @@ fn producer_answer_response(
         (AnswerTo::CloseOnly, ProducerAnswer::Receipt { .. }) => StatusCode::NO_CONTENT,
         _ => StatusCode::from_u16(answer.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
     };
-    (status, headers).into_response()
+    match answer.error_code() {
+        Some(code) => error_answer(status, code, producer_refusal_message(&answer), headers),
+        None => (status, headers).into_response(),
+    }
+}
+
+/// The message of a producer refusal answered before the body, from its
+/// typed answer: the late path's message names the producer too.
+fn producer_refusal_message(answer: &ProducerAnswer) -> String {
+    match answer {
+        ProducerAnswer::Receipt { .. } | ProducerAnswer::ReceiptEvicted { .. } => String::new(),
+        ProducerAnswer::EpochClosed(_) => "the producer's epoch is closed".to_owned(),
+        ProducerAnswer::KeyConflict { epoch } => {
+            format!("producer epoch {epoch} holds a write with another identity under this key")
+        }
+        ProducerAnswer::ProducerExpired { epoch } => {
+            format!("the producer's epoch is not remembered; claim an epoch above {epoch}")
+        }
+        ProducerAnswer::StaleEpoch { epoch } => {
+            format!("the producer's epoch is stale; current epoch is {epoch}")
+        }
+        ProducerAnswer::SeqGap { expected, received } => {
+            format!("producer sequence {received} is out of order; expected {expected}")
+        }
+        ProducerAnswer::EpochNotClaimed => {
+            "a new producer epoch must start at sequence 0".to_owned()
+        }
+    }
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
@@ -1832,7 +1884,9 @@ const COLD_GC_PURGE_BATCH_MAX_ENTRIES: usize = 4096;
 pub(crate) async fn create_bucket(Path(bucket): Path<String>) -> Response {
     match ursula_runtime::validate_bucket_id(&bucket) {
         Ok(()) => StatusCode::CREATED.into_response(),
-        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            error_response(StatusCode::BAD_REQUEST, ErrorCode::InvalidBucketId, message)
+        }
     }
 }
 
@@ -3062,8 +3116,7 @@ impl CreateHead {
     fn parse(headers: &HeaderMap) -> Result<Self, Box<Response>> {
         let (stream_ttl_seconds, stream_expires_at_ms) = stream_lifetime(headers)?;
         let if_incarnation = incarnation_precondition(headers)?;
-        let stream_seq = stream_seq(headers)
-            .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+        let stream_seq = stream_seq(headers).map_err(invalid_header)?;
         refuse_create_producer_headers(headers)?;
         Ok(Self {
             stream_ttl_seconds,
@@ -3081,16 +3134,12 @@ fn refuse_create_producer_headers(headers: &HeaderMap) -> Result<(), Box<Respons
         Ok(ProducerRequestHeaders { producer: None, .. }) => Ok(()),
         Ok(ProducerRequestHeaders {
             producer: Some(_), ..
-        }) => Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "a create carries no producer headers: create the stream, then claim an epoch",
-            )
-                .into_response(),
-        )),
-        Err(err) => Err(Box::new(
-            (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-        )),
+        }) => Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidProducer,
+            "a create carries no producer headers: create the stream, then claim an epoch",
+        ))),
+        Err(err) => Err(invalid_producer(&err)),
     }
 }
 
@@ -3116,7 +3165,13 @@ pub(crate) async fn create_stream_by_id(
     request.initial_payload = match normalize_http_write_payload(&content_type, body.clone(), true)
     {
         Ok(payload) => payload,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidRecordBoundaries,
+                message,
+            );
+        }
     };
     request.close_after = stream_closed(&request_headers);
     request.stream_seq = stream_seq;
@@ -3230,8 +3285,7 @@ impl AppendHead {
         removed_surface::reject_removed_append_headers(headers)?;
         let if_incarnation = incarnation_precondition(headers)?;
         let producer = producer_write(headers)?;
-        let stream_seq = stream_seq(headers)
-            .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+        let stream_seq = stream_seq(headers).map_err(invalid_header)?;
         Ok(Self {
             if_incarnation,
             stream_seq,
@@ -3327,11 +3381,11 @@ fn unreadable_body_response(err: &axum::Error) -> Response {
     if over_limit {
         return limits::size_refusal(limits::REQUEST_LIMIT);
     }
-    (
+    error_response(
         StatusCode::BAD_REQUEST,
+        ErrorCode::BodyUnreadable,
         format!("request body unreadable: {err}"),
     )
-        .into_response()
 }
 
 #[tracing::instrument(
@@ -3362,11 +3416,11 @@ pub(crate) async fn append_stream_by_id(
     // A write without a key has no producer rows, so its empty body is
     // refused here, with the other content faults, instead of in the log.
     if producer.is_none() && payload.is_empty() && !close_after {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
+            ErrorCode::EmptyAppend,
             "append payload must be non-empty unless closing the stream",
-        )
-            .into_response();
+        );
     }
     if close_only {
         return match state
@@ -3515,11 +3569,11 @@ pub(crate) async fn head_stream_by_id(
                 Ok(head) => head,
                 Err(err) => {
                     tracing::error!(error = %err, "a stream's HEAD is outside the protocol's range");
-                    return (
+                    return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
+                        ErrorCode::Internal,
                         "stream metadata outside the protocol's range",
-                    )
-                        .into_response();
+                    );
                 }
             };
             let mut headers = HeaderMap::new();
@@ -3582,22 +3636,28 @@ pub(crate) async fn read_stream_by_id(
     let leader_only = match query.get("consistency").map(String::as_str) {
         None | Some("local") => false,
         Some("leader") => true,
-        Some(_) => return (StatusCode::BAD_REQUEST, "invalid consistency").into_response(),
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidQuery,
+                "invalid consistency",
+            );
+        }
     };
     if leader_only && live_mode.is_some() {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
             "leader consistency is available only for catch-up reads",
-        )
-            .into_response();
+        );
     }
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
     if live_mode.is_some() && !query.contains_key("offset") {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
             "live reads require a start position",
-        )
-            .into_response();
+        );
     }
     // A live read takes every lookup from its owner check (D10): `offset=now`,
     // existence, content type and incarnation come from state this replica
@@ -3672,7 +3732,13 @@ pub(crate) async fn read_stream_by_id(
             )
             .await;
         }
-        (Some(_), _) => return (StatusCode::BAD_REQUEST, "invalid live mode").into_response(),
+        (Some(_), _) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidQuery,
+                "invalid live mode",
+            );
+        }
         (None, _) => {}
     }
 
@@ -3823,12 +3889,14 @@ pub(crate) async fn publish_snapshot(
 /// Loro's streams client reads a 404 as "no snapshot" (see
 /// `removed_surface`).
 pub(crate) async fn removed_latest_snapshot() -> Response {
-    (
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::ALLOW, HeaderValue::from_static(""));
+    error_answer(
         StatusCode::METHOD_NOT_ALLOWED,
-        [(axum::http::header::ALLOW, "")],
+        ErrorCode::Unsupported,
         "the latest-snapshot redirect was removed; read Stream-Snapshot-Offset from HEAD",
+        headers,
     )
-        .into_response()
 }
 
 /// The stream incarnation an apply refusal names when a JSON snapshot or
@@ -3891,16 +3959,24 @@ async fn verify_json_boundary(
     };
     match byte {
         Some(b'\n') => Ok(()),
-        Some(_) => Err((
+        Some(_) => Err(error_response(
             StatusCode::BAD_REQUEST,
+            ErrorCode::NotJsonBoundary,
             format!("offset {offset} is not a JSON message boundary"),
-        )
-            .into_response()),
-        None => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("could not verify that offset {offset} is a JSON message boundary"),
-        )
-            .into_response()),
+        )),
+        None => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+            Err(error_answer(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::JsonBoundaryUnverified,
+                format!("could not verify that offset {offset} is a JSON message boundary"),
+                headers,
+            ))
+        }
     }
 }
 
@@ -3981,7 +4057,7 @@ pub(crate) async fn advance_retention(
     headers: HeaderMap,
 ) -> Response {
     let (stream_id, retained_offset) = path.into_parts();
-    let retained_offset = match parse_snapshot_offset(&retained_offset) {
+    let retained_offset = match parse_path_offset(&retained_offset, "invalid retention offset") {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
@@ -4078,6 +4154,14 @@ pub(crate) async fn read_snapshot(
             )
             .and_then(|range| range.resolve(total));
             let (status, mut response_headers) = snapshot_head(&response, range);
+            if let Some(ContentRange::Unsatisfied { .. }) = range {
+                return error_answer(
+                    status,
+                    ErrorCode::RangeNotSatisfiable,
+                    "the range lies outside the snapshot",
+                    response_headers,
+                );
+            }
             let (start, len) = match range {
                 None => (0, total),
                 Some(ContentRange::Partial(span)) => (span.first(), span.len()),
@@ -4099,11 +4183,11 @@ pub(crate) async fn read_snapshot(
                         // A range resolved against this body lies inside it.
                         None => {
                             tracing::error!(start, len, total, "a snapshot range outside its body");
-                            return (
+                            return error_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
+                                ErrorCode::Internal,
                                 "snapshot range outside its body",
-                            )
-                                .into_response();
+                            );
                         }
                     }
                 }
@@ -4133,11 +4217,11 @@ pub(crate) async fn bootstrap_stream(
         Err(response) => return *response,
     };
     if query.contains_key("live") {
-        return (
+        return error_response(
             StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
             "bootstrap does not support live reads",
-        )
-            .into_response();
+        );
     }
     let stream_id = path.into_stream_id();
     match state
@@ -4165,14 +4249,22 @@ pub(crate) async fn bootstrap_stream(
 }
 
 fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
+    parse_path_offset(raw, "invalid snapshot offset")
+}
+
+/// An offset in a request path: a decimal, never `-1`. `message` names it.
+fn parse_path_offset(raw: &str, message: &'static str) -> Result<u64, BoxResponse> {
+    let invalid = || {
+        Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidOffset,
+            message,
+        ))
+    };
     if raw == "-1" {
-        return Err(Box::new(
-            (StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response(),
-        ));
+        return Err(invalid());
     }
-    raw.parse::<u64>().map_err(|_invalid| {
-        Box::new((StatusCode::BAD_REQUEST, "invalid snapshot offset").into_response())
-    })
+    raw.parse::<u64>().map_err(|_invalid| invalid())
 }
 
 /// A catch-up read's start position. Its `offset=now` HEAD is linearizable
@@ -4214,7 +4306,11 @@ pub(crate) fn parse_read_offset(raw: Option<&str>) -> Result<u64, BoxResponse> {
     match raw {
         Some("-1") | None => Ok(0),
         Some(raw) => raw.parse::<u64>().map_err(|_invalid| {
-            Box::new((StatusCode::BAD_REQUEST, "invalid offset").into_response())
+            Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidOffset,
+                "invalid offset",
+            ))
         }),
     }
 }
@@ -4419,13 +4515,11 @@ pub(crate) fn sse_stream(
                     .http_metrics
                     .sse_error_events
                     .fetch_add(1, Ordering::Relaxed);
-                let event = format!(
-                    "event: error\ndata:{}\n\n",
-                    sse_safe_line(
-                        "the stream was deleted and recreated, or its history was rewritten \
-                         (Stream-Incarnation)"
-                    )
-                );
+                let event = sse_error_event(&ErrorBody::new(
+                    ErrorCode::IncarnationMismatch,
+                    "the stream was deleted and recreated, or its history was rewritten \
+                     (Stream-Incarnation)",
+                ));
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
             Ok(read) => read,
@@ -4434,7 +4528,7 @@ pub(crate) fn sse_stream(
                     .http_metrics
                     .sse_error_events
                     .fetch_add(1, Ordering::Relaxed);
-                let event = format!("event: error\ndata:{}\n\n", sse_safe_line(&err.to_string()));
+                let event = sse_error_event(&runtime_error_body(&err).1);
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
         };
@@ -4504,9 +4598,11 @@ pub(crate) fn parse_query(raw: Option<&str>) -> Result<HashMap<String, String>, 
     };
     for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
         if key == "offset" && query.contains_key("offset") {
-            return Err(Box::new(
-                (StatusCode::BAD_REQUEST, "multiple offset parameters").into_response(),
-            ));
+            return Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidQuery,
+                "multiple offset parameters",
+            )));
         }
         query.insert(key.into_owned(), value.into_owned());
     }
@@ -4539,18 +4635,14 @@ pub(crate) fn stream_lifetime(
     let ttl = header_value(headers, HEADER_STREAM_TTL)
         .map(parse_stream_ttl)
         .transpose()
-        .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+        .map_err(invalid_header)?;
     let expires_at = header_value(headers, HEADER_STREAM_EXPIRES_AT)
         .map(parse_stream_expires_at)
         .transpose()
-        .map_err(|message| Box::new((StatusCode::BAD_REQUEST, message).into_response()))?;
+        .map_err(invalid_header)?;
     if ttl.is_some() && expires_at.is_some() {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "stream-ttl and stream-expires-at cannot be provided together",
-            )
-                .into_response(),
+        return Err(invalid_header(
+            "stream-ttl and stream-expires-at cannot be provided together".to_owned(),
         ));
     }
     Ok((ttl, expires_at))
@@ -4588,15 +4680,25 @@ pub(crate) fn incarnation_precondition(headers: &HeaderMap) -> Result<Option<u64
             .map(|(name, value)| (name.as_str(), value.as_bytes())),
     )
     .map(|precondition| precondition.map(|precondition| precondition.incarnation.get()))
-    .map_err(|err| {
-        Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                format!("malformed Stream-Incarnation: {err}"),
-            )
-                .into_response(),
-        )
-    })
+    .map_err(|err| invalid_header(format!("malformed Stream-Incarnation: {err}")))
+}
+
+/// `400 InvalidHeader`, for a header value that `message` describes.
+fn invalid_header(message: String) -> BoxResponse {
+    Box::new(error_response(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidHeader,
+        message,
+    ))
+}
+
+/// `400 InvalidProducer`, for malformed producer headers.
+fn invalid_producer(err: &ProducerHeaderError) -> BoxResponse {
+    Box::new(error_response(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidProducer,
+        err.to_string(),
+    ))
 }
 
 /// A read's `Stream-Incarnation` precondition (D12), checked against the
@@ -4606,16 +4708,15 @@ fn read_precondition_failed(expected: Option<u64>, served: u64) -> Option<Respon
     let expected = expected?;
     (expected != served).then(|| {
         let mut headers = HeaderMap::new();
-        insert_default_response_headers(&mut headers);
         insert_incarnation_mismatch(&mut headers, IncarnationMismatch {
             current: Incarnation::try_from(served).ok(),
         });
-        (
+        error_answer(
             StatusCode::PRECONDITION_FAILED,
-            headers,
+            ErrorCode::IncarnationMismatch,
             format!("Stream-Incarnation {expected} does not match the stream"),
+            headers,
         )
-            .into_response()
     })
 }
 
@@ -4627,30 +4728,32 @@ pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
 }
 
 /// Maximum length in bytes of a `Producer-Id` or `Stream-Seq` value on every
-/// HTTP write path (bounded-stream-state F3).
-/// Both values are kept in replicated per-stream state, so their length must
-/// be bounded at the edge.
-pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = 256;
+/// HTTP write path (bounded-stream-state F3), both checked by the header
+/// crate. Both values are kept in replicated per-stream state, so their
+/// length is bounded at the edge.
+#[cfg(test)]
+pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = STREAM_SEQ_MAX_BYTES;
 
-fn check_write_identifier_len(name: &str, value: &str) -> Result<(), String> {
-    if value.len() > WRITE_IDENTIFIER_MAX_BYTES {
-        return Err(format!(
-            "{name} must be at most {WRITE_IDENTIFIER_MAX_BYTES} bytes"
-        ));
-    }
-    Ok(())
-}
-
+/// A request's `Stream-Seq`, checked by the header crate ([`StreamSeq`]),
+/// the one check of every seq the server stores and later echoes in
+/// `Stream-Last-Seq`. A value that is not visible ASCII text is ignored, as
+/// the base protocol's servers do; a blank one is absent.
 pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> {
     let Some(value) = headers
         .get(HEADER_STREAM_SEQ)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim_matches([' ', '\t']))
+        .filter(|value| !value.is_empty())
     else {
         return Ok(None);
     };
-    check_write_identifier_len(HEADER_STREAM_SEQ, value)?;
-    Ok(Some(value.to_owned()))
+    StreamSeq::new(value)
+        .map(|seq| Some(seq.as_str().to_owned()))
+        .map_err(|_invalid| {
+            format!(
+                "{HEADER_STREAM_SEQ} must be at most {STREAM_SEQ_MAX_BYTES} bytes of visible ASCII"
+            )
+        })
 }
 
 /// The write-key headers of a request (#581 section 2.2), parsed by the
@@ -4683,8 +4786,7 @@ fn producer_request(write: ProducerWrite) -> ProducerRequest {
 pub(crate) fn producer_write(
     headers: &HeaderMap,
 ) -> Result<Option<ProducerRequest>, Box<Response>> {
-    let parsed = parse_producer_headers(headers)
-        .map_err(|err| Box::new((StatusCode::BAD_REQUEST, err.to_string()).into_response()))?;
+    let parsed = parse_producer_headers(headers).map_err(|err| invalid_producer(&err))?;
     Ok(parsed.producer.map(producer_request))
 }
 
@@ -4726,17 +4828,27 @@ fn content_checks(
             producer.content_fault = fault.into();
             Ok(Bytes::new())
         }
+        // The codes apply gives the same faults of a keyed write.
         (None, Some(fault)) => {
-            let message = match fault {
-                ContentFaultV1::ContentFaultMissingContentType => {
-                    "append with a body must include content type".to_owned()
-                }
-                ContentFaultV1::ContentFaultMalformedJson => malformed.unwrap_or_default(),
-                ContentFaultV1::ContentFaultDigestMismatch | ContentFaultV1::ContentFaultNone => {
-                    "producer-digest does not match the request body".to_owned()
-                }
+            let (code, message) = match fault {
+                ContentFaultV1::ContentFaultMissingContentType => (
+                    ErrorCode::MissingContentType,
+                    "append with a body must include content type".to_owned(),
+                ),
+                ContentFaultV1::ContentFaultMalformedJson => (
+                    ErrorCode::InvalidRecordBoundaries,
+                    malformed.unwrap_or_default(),
+                ),
+                ContentFaultV1::ContentFaultDigestMismatch | ContentFaultV1::ContentFaultNone => (
+                    ErrorCode::ProducerDigestMismatch,
+                    "producer-digest does not match the request body".to_owned(),
+                ),
             };
-            Err(Box::new((StatusCode::BAD_REQUEST, message).into_response()))
+            Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                code,
+                message,
+            )))
         }
     }
 }
@@ -4749,20 +4861,26 @@ pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a
 }
 
 fn runtime_error_response(err: RuntimeError) -> Response {
-    let status = runtime_error_status(&err);
-    if status.is_server_error() {
-        tracing::warn!(%status, error = %err, "runtime request failed");
-    }
+    let (status, body) = runtime_error_body(&err);
     let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
     insert_retry_after_for_temporary(&mut headers, &err);
     if let Err(render_err) = insert_producer_error_headers(&mut headers, &err) {
         tracing::error!(refusal = %err, "producer refusal outside the protocol's range");
         return producer_answer_failed(&render_err);
     }
+    match stream_seq_conflict(&err) {
+        Some(Ok(conflict)) => {
+            conflict.render(|name, value| insert_header_str(&mut headers, name, value));
+        }
+        Some(Err(render_err)) => {
+            tracing::error!(refusal = %err, error = %render_err, "a Stream-Seq conflict without its last seq");
+            return fixed_error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal);
+        }
+        None => {}
+    }
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
-    (status, headers, err.to_string()).into_response()
+    error_answer(status, body.code, body.message, headers)
 }
 
 fn insert_retry_after_for_temporary(headers: &mut HeaderMap, err: &RuntimeError) {
@@ -4870,8 +4988,10 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 /// 503 + `Retry-After: 1` for a request that must reach the group leader but
 /// cannot be redirected (purge) or has no known leader. Retryable.
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
+    // The error names the leader's address: it stays in the log, at debug,
+    // since every election answers so.
+    tracing::debug!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
     let group = match &err {
         RuntimeError::GroupEngine { raft_group_id, .. }
         | RuntimeError::GroupNotHosted { raft_group_id, .. } => Some(*raft_group_id),
@@ -4887,7 +5007,11 @@ fn leader_unknown_retry_response(err: RuntimeError) -> Response {
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),
     );
-    (StatusCode::SERVICE_UNAVAILABLE, headers, err.to_string()).into_response()
+    fixed_error_answer(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::NoLeader,
+        headers,
+    )
 }
 
 fn request_target(uri: &Uri) -> String {
@@ -4903,6 +5027,8 @@ mod tests;
 mod base_contract_tests;
 #[cfg(test)]
 mod cold_snapshot_tests;
+#[cfg(test)]
+mod error_body_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]

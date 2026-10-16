@@ -32,8 +32,10 @@ use std::collections::HashMap;
 
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::response::Response;
+use ursula_headers::ErrorCode;
+
+use crate::render::error_response;
 
 /// The removed compare-and-set precondition on snapshot publish.
 const HEADER_STREAM_SNAPSHOT_MATCH: &str = "stream-snapshot-match";
@@ -52,13 +54,11 @@ pub(crate) fn reject_removed_read_parameters(
         .iter()
         .find(|name| query.contains_key(**name))
     {
-        Some(name) => Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                format!("the {name} parameter is not supported; record coordinates were removed"),
-            )
-                .into_response(),
-        )),
+        Some(name) => Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            format!("the {name} parameter is not supported; record coordinates were removed"),
+        ))),
         None => Ok(()),
     }
 }
@@ -66,13 +66,11 @@ pub(crate) fn reject_removed_read_parameters(
 /// Rejects an append that carries the removed `Stream-Record-Match`.
 pub(crate) fn reject_removed_append_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
     if headers.contains_key(HEADER_STREAM_RECORD_MATCH) {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "Stream-Record-Match is not supported",
-            )
-                .into_response(),
-        ));
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            "Stream-Record-Match is not supported",
+        )));
     }
     Ok(())
 }
@@ -80,13 +78,11 @@ pub(crate) fn reject_removed_append_headers(headers: &HeaderMap) -> Result<(), B
 /// Rejects a snapshot publish that carries a removed precondition header.
 pub(crate) fn reject_removed_snapshot_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
     if headers.contains_key(HEADER_STREAM_SNAPSHOT_MATCH) {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "Stream-Snapshot-Match is not supported",
-            )
-                .into_response(),
-        ));
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            "Stream-Snapshot-Match is not supported",
+        )));
     }
     Ok(())
 }
@@ -95,7 +91,6 @@ pub(crate) fn reject_removed_snapshot_headers(headers: &HeaderMap) -> Result<(),
 mod tests {
     use axum::Router;
     use axum::body::Body;
-    use axum::body::to_bytes;
     use axum::http::Request;
     use axum::http::header::CONTENT_TYPE;
     use tower::ServiceExt;
@@ -104,6 +99,7 @@ mod tests {
     use ursula_runtime::ShardRuntime;
 
     use super::*;
+    use crate::render::error_code_of;
 
     fn app() -> Router {
         crate::router(ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"))
@@ -124,13 +120,6 @@ mod tests {
             .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
             .await
             .expect("response")
-    }
-
-    async fn body_text(response: Response) -> String {
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        String::from_utf8(body.to_vec()).expect("utf-8 body")
     }
 
     /// Creates an octet stream holding `abc` and returns its tail offset.
@@ -158,7 +147,7 @@ mod tests {
         let target = format!("{uri}/snapshot/{at}");
         let response = send(&app, "PUT", &target, &header, "state").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(response).await.contains("Stream-Snapshot-Match"));
+        assert_eq!(error_code_of(response).await, ErrorCode::Unsupported);
 
         let head = send(&app, "HEAD", uri, &[], "").await;
         assert_eq!(head.status(), StatusCode::OK);
@@ -193,7 +182,7 @@ mod tests {
         ];
         let response = send(&app, "POST", uri, &matched, "{\"b\":2}\n").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(response).await.contains("Stream-Record-Match"));
+        assert_eq!(error_code_of(response).await, ErrorCode::Unsupported);
         let head = send(&app, "HEAD", uri, &[], "").await;
         assert_eq!(
             head.headers()

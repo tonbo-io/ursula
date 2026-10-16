@@ -2,6 +2,7 @@
 //! limit it applied, by that limit's header set to its value.
 
 use crate::error::HeaderError;
+use crate::error_body::ErrorCode;
 use crate::fields;
 use crate::names;
 
@@ -23,6 +24,14 @@ impl SizeLimit {
     pub fn bytes(self) -> u64 {
         match self {
             Self::Request(bytes) | Self::Snapshot(bytes) => bytes,
+        }
+    }
+
+    /// The code of the refusal's error body.
+    pub fn error_code(self) -> ErrorCode {
+        match self {
+            Self::Request(_) => ErrorCode::RequestTooLarge,
+            Self::Snapshot(_) => ErrorCode::SnapshotTooLarge,
         }
     }
 

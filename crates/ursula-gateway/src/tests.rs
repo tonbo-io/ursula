@@ -999,6 +999,30 @@ async fn access_control_conceals_private_resource_before_forwarding() {
     assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
+/// A concealing `404` to a `HEAD` carries no server identity, as no answer
+/// of the gateway's own does (extensions Section 10): a client reads it as
+/// a refusal, never as a stream the deployment deleted.
+#[tokio::test]
+async fn a_concealed_head_carries_no_server_identity() {
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(
+        AuthorizationDecision::ConcealAsNotFound,
+    ));
+    let gateway = gateway_with_access_control("http://127.0.0.1:1", resolver, authorizer);
+    for method in ["HEAD", "GET"] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/private/events")
+            .body(Body::empty())
+            .expect("request");
+        let response = gateway.handle(request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        for name in [names::URSULA_PROTOCOL, names::URSULA_CLUSTER_ID] {
+            assert!(response.headers().get(name).is_none(), "{method} {name}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn access_control_rejects_invalid_bearer_before_authorization() {
     let resolver = Arc::new(FixedPrincipalResolver::valid());
@@ -2385,6 +2409,43 @@ async fn gateway_preserves_path_and_query_with_trailing_upstream_slash() {
         .await
         .unwrap();
     assert_eq!(body_bytes, "/bucket/stream?offset=now&live=sse");
+}
+
+/// A node's answers pass through with their own headers: the gateway adds
+/// `Cache-Control` only to answers it sends itself (#640).
+#[tokio::test]
+async fn a_forwarded_answer_keeps_its_own_cache_control() {
+    let app = Router::new()
+        .route(
+            "/bucket/stream",
+            get(|| async { (StatusCode::NOT_FOUND, "missing") }),
+        )
+        .route(
+            "/bucket/cached",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CACHE_CONTROL, "max-age=60")],
+                    "ok",
+                )
+            }),
+        );
+    let upstream = spawn_upstream(app).await;
+    let gateway = gateway_for_url(upstream.url.clone());
+    for (uri, expected) in [
+        ("/bucket/stream", None),
+        ("/bucket/cached", Some("max-age=60")),
+    ] {
+        let response = gateway.handle(get_path(uri)).await;
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            expected,
+            "{uri}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3882,4 +3943,175 @@ mod refused_bodies {
         let metrics = gateway.metrics_snapshot();
         assert_eq!((metrics.refusal_drains, metrics.refusal_drains_cut), (1, 0));
     }
+}
+
+/// Every answer the gateway sends itself carries the error body Ursula
+/// renders, `{"error":{"code":"<code>","message":"<message>"}}`, beside its
+/// typed headers.
+#[tokio::test]
+async fn the_gateways_own_answers_carry_an_error_body() {
+    let cases = [
+        (Refusal::NotFound.into_response(), 404, ErrorCode::NotFound),
+        (
+            Refusal::Concealed.into_response(),
+            404,
+            ErrorCode::BucketNotFound,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::InvalidCredential).into_response(),
+            401,
+            ErrorCode::InvalidCredential,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::WrongAudience).into_response(),
+            401,
+            ErrorCode::InvalidCredential,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::Expired).into_response(),
+            401,
+            ErrorCode::CredentialExpired,
+        ),
+        (
+            Refusal::Authentication(AuthenticationError::Unavailable).into_response(),
+            503,
+            ErrorCode::AuthenticationUnavailable,
+        ),
+        (
+            Refusal::Forbidden.into_response(),
+            403,
+            ErrorCode::Forbidden,
+        ),
+        (
+            Refusal::Authorization(AuthorizationError::Unavailable).into_response(),
+            503,
+            ErrorCode::AuthorizationUnavailable,
+        ),
+        (
+            Refusal::Admission(AdmissionRejection::RateLimited {
+                retry_after_secs: 2,
+            })
+            .into_response(),
+            429,
+            ErrorCode::RateLimited,
+        ),
+        (
+            Refusal::Admission(AdmissionRejection::LiveReadsExhausted).into_response(),
+            429,
+            ErrorCode::LiveReadsExhausted,
+        ),
+        (
+            Refusal::BodyTooLarge { limit: 7 }.into_response(),
+            413,
+            ErrorCode::RequestTooLarge,
+        ),
+        (
+            Refusal::BodyUnreadable.into_response(),
+            400,
+            ErrorCode::BodyUnreadable,
+        ),
+        (
+            Refusal::NoUpstream.into_response(),
+            503,
+            ErrorCode::NoUpstream,
+        ),
+        (
+            GatewayError::LeaderNotFound { followed: 3 }.into_response(),
+            503,
+            ErrorCode::NoLeader,
+        ),
+        (
+            GatewayError::UpstreamTimeout {
+                upstream: "http://node:4437".to_owned(),
+                timeout: Duration::from_secs(1),
+            }
+            .into_response(),
+            504,
+            ErrorCode::UpstreamTimeout,
+        ),
+        (unreachable_response(), 503, ErrorCode::UpstreamUnreachable),
+    ];
+    for (response, status, code) in cases {
+        assert_eq!(response.status().as_u16(), status, "{code}");
+        // #640: no cache in front of the gateway may keep its own answer,
+        // such as a concealing `404`.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "{code}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(ErrorBody::CONTENT_TYPE),
+            "{code}"
+        );
+        let typed_413 = SizeLimit::parse(
+            status,
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        );
+        if status == 413 {
+            assert_eq!(typed_413, Ok(Some(SizeLimit::Request(7))));
+        }
+        if code == ErrorCode::RateLimited {
+            assert_eq!(
+                response.headers().get(RETRY_AFTER),
+                Some(&HeaderValue::from_static("2"))
+            );
+        }
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let parsed = ErrorBody::parse(&body).expect("an error body");
+        assert_eq!(parsed.code, code);
+        assert!(!parsed.message.is_empty(), "{code}");
+        // No internal address leaks into a message.
+        assert!(!parsed.message.contains("node:4437"), "{code}");
+    }
+}
+
+/// A concealing `404` is the node's `404` for a bucket nothing created,
+/// byte for byte: the same status, headers and body (the node side is
+/// pinned by `ursula`'s `error_body_tests`).
+#[tokio::test]
+async fn a_concealing_404_is_the_nodes_missing_bucket_404() {
+    let response = Refusal::Concealed.into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().expect("text").to_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    assert_eq!(headers, vec![
+        ("cache-control".to_owned(), "no-store".to_owned()),
+        ("content-type".to_owned(), "application/json".to_owned()),
+        (
+            "cross-origin-resource-policy".to_owned(),
+            "cross-origin".to_owned()
+        ),
+        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+    ]);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(
+        body,
+        ErrorBody::fixed(ErrorCode::BucketNotFound)
+            .render()
+            .as_bytes()
+    );
 }

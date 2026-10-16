@@ -258,7 +258,10 @@ async fn a_snapshot_read_honors_one_byte_range_inline_and_in_the_cold_tier() {
                 Ok(Some(ContentRange::Unsatisfied { total })),
                 "{tier} {range}"
             );
-            assert!(body_of(response).await.is_empty());
+            assert_eq!(
+                crate::render::error_code_of(response).await,
+                ursula_headers::ErrorCode::RangeNotSatisfiable
+            );
         }
 
         for headers in [
@@ -413,6 +416,10 @@ async fn range_edge_cases_on_snapshot_reads() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::RangeNotSatisfiable
+    );
 
     // Retention past a superseded snapshot's offset.
     let response = send(&app, "PUT", "/edges/s/retention/6", Body::empty()).await;

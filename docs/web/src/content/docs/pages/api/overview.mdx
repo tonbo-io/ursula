@@ -62,6 +62,18 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 ```
 
+## Errors
+
+Every error answer from a node or from the gateway carries the same JSON body, the shape the Durable Streams protocol uses for its subscription API errors:
+
+```json
+{"error":{"code":"STREAM_NOT_FOUND","message":"the stream does not exist"}}
+```
+
+`error.code` is a stable code that names the refusal, so match it instead of parsing text. `error.message` says why for a person reading it. A `4xx` that only names what the request named says what was wrong with it, for example `{"error":{"code":"INVALID_HEADER","message":"stream-ttl must not contain leading zeros"}}`. Every other answer carries a fixed sentence per code, which names nothing of the cluster. The wording can change in any release, so never match it. It never echoes the request body or a credential. Ignore members you do not know, and treat a code you do not know by its status alone: a later 0.8 release may add both. The status and the typed headers keep their meaning beside it: a `413` names its limit in `Ursula-Max-Request-Bytes` or `Ursula-Max-Snapshot-Bytes`, a `503` carries `Retry-After`, a producer `403` carries `Producer-Outcome`. A `503` whose code is `NO_LEADER` means no leader of the stream's group is known yet. A layer in front of Ursula, such as a proxy, may answer with another body, so treat the code as optional and fall back on the status. A live SSE read that ends in error sends the same body as the data of an `event: error`. [Error bodies](/docs/specs/extensions#11-error-bodies) lists every code. Rust clients parse the body with `ursula_headers::ErrorBody`.
+
+The operator routes under `/__ursula/` keep their own answers.
+
 ## Write outcomes
 
 A write whose answer is lost, such as one that timed out or got a `5xx`, may have applied. No response says that a write applied nothing. Resolve an unknown outcome by repeating the write with its key: the same `Producer-Id`, `Producer-Epoch`, `Producer-Seq` and body, and the same `Producer-Digest` and `Stream-Incarnation` when the first attempt carried them. The answer to the repeat is definite. A `200` or `204` means the write applied. A producer `403` carries `Producer-Epoch` and a `Producer-Outcome` that says what became of the write's epoch. A `409`, or a `400` with `Producer-Expected-Seq`, names the seq the server expects next. See [write keys and typed answers](/docs/specs/extensions#5-write-keys-and-typed-answers) for every answer and [exactly-once writes](/docs/concepts/exactly-once-writes) for the producer model.

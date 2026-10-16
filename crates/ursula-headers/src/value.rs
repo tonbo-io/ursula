@@ -230,6 +230,41 @@ impl fmt::Display for ProducerId {
     }
 }
 
+/// The longest `Stream-Seq` a server accepts, in bytes.
+pub const STREAM_SEQ_MAX_BYTES: usize = 256;
+
+/// A `Stream-Seq` value: 1 to [`STREAM_SEQ_MAX_BYTES`] bytes of visible
+/// ASCII, with inner spaces or tabs, compared as bytes (base protocol).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamSeq(String);
+
+impl StreamSeq {
+    pub fn new(seq: impl Into<String>) -> Result<Self, HeaderError> {
+        let seq = seq.into();
+        let bytes = seq.as_bytes();
+        let visible = |byte: &u8| (0x21..=0x7e).contains(byte);
+        let valid = matches!((bytes.first(), bytes.last()), (Some(first), Some(last)) if visible(first) && visible(last))
+            && bytes.len() <= STREAM_SEQ_MAX_BYTES
+            && bytes
+                .iter()
+                .all(|byte| visible(byte) || matches!(byte, b' ' | b'\t'));
+        if !valid {
+            return Err(HeaderError::InvalidStreamSeq);
+        }
+        Ok(Self(seq))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StreamSeq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// 32 bytes rendered as 64 lowercase hex digits.
 fn parse_hex32(name: &'static str, text: &str) -> Result<[u8; 32], HeaderError> {
     fn nibble(byte: u8) -> Option<u8> {

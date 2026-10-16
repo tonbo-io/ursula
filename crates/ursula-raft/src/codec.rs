@@ -68,6 +68,24 @@ mod tests {
     use super::encode_wire;
     use crate::UrsulaRaftTypeConfig;
 
+    /// A forwarded write's refusal keeps its context, so a `Stream-Seq`
+    /// conflict answered on the leader names the last seq after a forward
+    /// as it does on the leader.
+    #[test]
+    fn a_forwarded_refusal_keeps_its_context() {
+        let refusal = ursula_runtime::GroupEngineError::stream_with_context(
+            ursula_runtime::StreamErrorCode::StreamSeqConflict,
+            "stream sequence 'a' is not greater than last sequence 'b'",
+            Some(3),
+            vec![ursula_runtime::StreamErrorContext::LastStreamSeq {
+                seq: "b".to_owned(),
+            }],
+        );
+        let decoded: ursula_runtime::GroupEngineError =
+            decode_wire(&encode_wire(&refusal), "group engine error").expect("decodes");
+        assert_eq!(decoded, refusal);
+    }
+
     #[test]
     fn epoch4_persisted_envelopes_are_stable() {
         // Named MessagePack (rmp_serde::to_vec_named) of the OpenRaft types
