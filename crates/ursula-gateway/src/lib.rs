@@ -17,8 +17,11 @@
 //! from `Location` so that redirect-following clients keep talking to the
 //! gateway.
 //!
-//! No response says that a write applied nothing. A client resolves an
-//! unknown outcome by repeating a keyed write (#581 section 2).
+//! A refusal says that its request applied nothing by its status and error
+//! code (extensions Section 11.1, `ursula_headers::classify`). Every refusal
+//! the gateway sends itself, and every one of an embedder
+//! ([`Gateway::refuse`]), is one. A client resolves any other outcome by
+//! repeating a keyed write (#581 section 2).
 //!
 //! A refusal the gateway decides from a request's head alone (access control,
 //! tenant admission) goes out once it has read the request's body, up to
@@ -46,6 +49,9 @@
 //! - [`admission`]: opt-in per-tenant rate, live-read, body-size and upload
 //!   limits.
 //! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
+//! - [`refusal`]: [`refusal::EmbedderRefusal`], a refusal of an embedder
+//!   before forwarding, answered by [`Gateway::refuse`] as the gateway
+//!   answers its own.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
 //! - [`uploads`]: the per-request limit and the node-wide budget for buffered
 //!   request bodies, and the pace a body must keep.
@@ -95,6 +101,7 @@ pub mod admission;
 pub mod auth;
 pub mod cors;
 mod ejection;
+pub mod refusal;
 pub mod service;
 pub mod uploads;
 pub mod usage;
@@ -117,6 +124,7 @@ use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
 use crate::ejection::Ejections;
 use crate::ejection::Failed;
+use crate::refusal::EmbedderRefusal;
 use crate::uploads::BodyPermit;
 use crate::uploads::BudgetExhausted;
 use crate::uploads::UploadLimits;
@@ -161,7 +169,9 @@ const REFUSED_PACE: Pace = Pace::Bounded {
     stall_timeout: REFUSED_BODY_STALL_TIMEOUT,
     read_timeout: REFUSED_BODY_DRAIN_TIMEOUT,
 };
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// The protocol's request limit ([`ursula_headers::MAX_REQUEST_BYTES`]),
+/// which is also the most the gateway may be configured to accept.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = ursula_headers::MAX_REQUEST_BYTES as usize;
 
 #[derive(Debug, Default)]
 struct GatewayMetrics {
@@ -183,6 +193,7 @@ struct GatewayMetrics {
     upload_refusals_tenant_uploads: AtomicU64,
     upload_refusals_budget: AtomicU64,
     upload_refusals_too_slow: AtomicU64,
+    embedder_refusals: AtomicU64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -243,6 +254,9 @@ struct GatewayMetricsSnapshot {
     /// [`UploadLimits::min_window_bytes`] of them arrived in one window of
     /// it.
     upload_refusals_too_slow: u64,
+    /// Requests an embedder refused ([`Gateway::refuse`]). They count in
+    /// `requests` too.
+    embedder_refusals: u64,
     /// The body budget in effect, the small-body headroom included: an
     /// unset `--body-budget-bytes` grows with `--max-request-body-bytes`.
     upload_budget_bytes: u64,
@@ -916,11 +930,10 @@ impl Gateway {
     ///   limits, the client gets a retryable `503`
     ///   ([`GatewayError::LeaderNotFound`]).
     ///
-    /// Each hop sends the request again. A node routes a write with a body
-    /// before it reads the body, so it never redirects one it proposed. Only
-    /// a bodiless write (a delete or a retention move) can be redirected after
-    /// OpenRaft took it, and both tolerate a repeat, as the README's Redirects
-    /// section explains.
+    /// Each hop sends the request again. A node redirects a write only when
+    /// it refused the write before proposing it, so no hop meets a write an
+    /// earlier hop applied, and a `503 NO_LEADER` after the hops is a
+    /// refusal too.
     async fn forward(
         &self,
         upstream: &str,
@@ -1356,6 +1369,7 @@ impl Gateway {
                 .metrics
                 .upload_refusals_too_slow
                 .load(Ordering::Relaxed),
+            embedder_refusals: self.metrics.embedder_refusals.load(Ordering::Relaxed),
             upload_budget_bytes: self.config.uploads.budget_bytes(),
             upload_reserved_bytes: self.uploads.reserved_bytes(),
             upload_tenants: self.admission.upload_buckets(),
@@ -1417,6 +1431,11 @@ fn upstream_client(config: &GatewayConfig) -> reqwest::Client {
         .tcp_keepalive(keepalive.idle)
         .tcp_keepalive_interval(keepalive.interval)
         .tcp_keepalive_retries(keepalive.retries)
+        // Straight to the nodes: a system proxy from `HTTP_PROXY` would sit
+        // between the gateway and the nodes, which must not be (README,
+        // Proxies Around the Gateway), and would make a connect failure
+        // describe the proxy rather than the node.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     #[cfg(target_os = "linux")]
     let builder = builder.tcp_user_timeout(Duration::from_secs(
@@ -1597,6 +1616,8 @@ enum Refusal {
     BodyUnreadable,
     /// No upstream is configured (`503`).
     NoUpstream,
+    /// A refusal of the gateway's embedder ([`Gateway::refuse`]).
+    Embedder(EmbedderRefusal),
 }
 
 impl IntoResponse for Refusal {
@@ -1673,6 +1694,7 @@ impl IntoResponse for Refusal {
             }
             Self::BodyUnreadable => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
             Self::NoUpstream => (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoUpstream),
+            Self::Embedder(refusal) => return refusal.into_response(),
         };
         error_answer(status, ErrorBody::fixed(code), headers)
     }

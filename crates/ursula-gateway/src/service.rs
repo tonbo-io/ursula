@@ -315,9 +315,11 @@ pub struct GatewayArgs {
     upstream_tcp_user_timeout: NonZeroU64,
 
     /// Maximum request body bytes buffered for leader-redirect replay. Also
-    /// the most the gateway reads of a body before it sends a refusal. Must
-    /// fit the part of `--body-budget-bytes` large bodies may take, the
-    /// budget less `--small-body-headroom-bytes`: raise the budget with it.
+    /// the most the gateway reads of a body before it sends a refusal. At
+    /// most the protocol's request limit of 32 MiB, which every node
+    /// applies: a larger value refuses to start. Must fit the part of
+    /// `--body-budget-bytes` large bodies may take, the budget less
+    /// `--small-body-headroom-bytes`.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
     max_request_body_bytes: usize,
 
@@ -550,7 +552,7 @@ mod tests {
     // The body budget's flags default to the library's limits, and limits
     // that leave a body at the limit no room are refused at startup.
     #[test]
-    fn upload_flags_default_to_the_library_limits_and_grow_an_unset_budget_for_a_raised_limit() {
+    fn upload_flags_default_to_the_library_limits_and_refuse_a_limit_above_the_protocols() {
         assert_eq!(config_from(&[]).uploads, UploadLimits::default());
         let parsed = |extra: &[&str]| {
             let argv = ["ursulagw", "--upstream", "http://node:4437"]
@@ -558,44 +560,35 @@ mod tests {
                 .chain(extra);
             gateway_config(&Cli::try_parse_from(argv).unwrap().args).map(|config| config.uploads)
         };
-        // Raising the limit alone grows the budget to hold it.
+        // A limit above the protocol's is refused at startup: the node
+        // refuses such a body before reading it, and the gateway would
+        // answer `502` instead of a typed `413`.
         assert_eq!(
-            parsed(&["--max-request-body-bytes", "1073741824"])
+            parsed(&["--max-request-body-bytes", "33554433"]),
+            Err(UploadLimitsError::LimitAboveProtocol {
+                max_request_body_bytes: (32 << 20) + 1,
+                protocol_limit: 32 << 20,
+            })
+        );
+        // Raising the headroom alone grows the budget to hold the limit
+        // beside it, in whole KiB, so a headroom that is not whole KiB
+        // still starts.
+        assert_eq!(
+            parsed(&["--small-body-headroom-bytes", "268435457"])
                 .unwrap()
                 .spec()
                 .budget_bytes,
-            (1 << 30) + (32 << 20)
-        );
-        // Grown in whole KiB, so a limit and a headroom that are not whole
-        // KiB still start.
-        assert_eq!(
-            parsed(&[
-                "--max-request-body-bytes",
-                "314572801",
-                "--small-body-headroom-bytes",
-                "33554433"
-            ])
-            .unwrap()
-            .spec()
-            .budget_bytes,
-            (307_201 + 32_769) * 1024
+            (32_768 + 262_145) * 1024
         );
         // A budget set too small for the limit is refused.
         assert_eq!(
-            parsed(&[
-                "--max-request-body-bytes",
-                "1073741824",
-                "--body-budget-bytes",
-                "268435456"
-            ]),
+            parsed(&["--body-budget-bytes", "50331648"]),
             Err(UploadLimitsError::LimitAboveSharedBudget {
-                max_request_body_bytes: 1 << 30,
-                shared_bytes: 224 << 20,
+                max_request_body_bytes: 32 << 20,
+                shared_bytes: 16 << 20,
             })
         );
         let raised = parsed(&[
-            "--max-request-body-bytes",
-            "1073741824",
             "--body-budget-bytes",
             "1207959552",
             "--body-stall-timeout",
@@ -605,7 +598,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(raised.spec(), &UploadLimitsSpec {
-            max_request_body_bytes: 1 << 30,
             budget_bytes: 1_207_959_552,
             stall_timeout: Duration::from_secs(10),
             min_bytes_per_sec: 0,

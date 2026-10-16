@@ -410,6 +410,7 @@ gateway:
   # Idle connections are probed three times within it. At least 1.
   upstreamTcpUserTimeoutSeconds: 5
   # Maximum request body bytes the gateway buffers for leader-redirect replay.
+  # At most 33554432, the protocol's request limit, which every node applies.
   # With bodyBudgetBytes unset, the gateway grows its body budget to hold a
   # body at this limit beside its 32 MiB small-body headroom. Give the pod at
   # least twice the budget in memory. A budget cannot go below this limit

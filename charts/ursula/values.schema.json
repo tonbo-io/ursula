@@ -946,7 +946,8 @@
         "maxRequestBodyBytes": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum request body bytes buffered for leader-redirect replay. Must fit the body budget less its 32 MiB small-body headroom."
+          "maximum": 33554432,
+          "description": "Maximum request body bytes buffered for leader-redirect replay. At most 32 MiB, the protocol's request limit. Must fit the body budget less its 32 MiB small-body headroom."
         },
         "bodyBudgetBytes": {
           "type": ["integer", "null"],
