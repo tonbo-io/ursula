@@ -2372,7 +2372,7 @@ mod frozen_gc_tests {
     #[test]
     fn garbage_remove_failure_does_not_block_healthy_rewrite() {
         let _guard = crate::tests::madsim_test_guard();
-        madsim::runtime::Runtime::with_seed_and_config(43691, Default::default()).block_on(async {
+        crate::sim_runtime::run_seeded(43691, None, || async {
             let dir = SimDisk::provision_dir("frozen-gc-progress").unwrap();
             let metrics = RuntimeMetrics::new(1, 3);
             let writer = CoreFileLogWriter::open(dir.clone(), CoreJournalOptions {

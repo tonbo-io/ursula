@@ -15,6 +15,8 @@ mod disk_tests;
 mod recovery_tests;
 #[path = "strict_replay_tests.rs"]
 mod strict_replay_tests;
+#[path = "thread_isolation_tests.rs"]
+mod thread_isolation_tests;
 
 static SIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 

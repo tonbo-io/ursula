@@ -84,6 +84,8 @@ mod rejoin;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
+#[cfg(madsim)]
+mod sim_watch;
 pub mod snapshot_cadence;
 mod snapshot_codec;
 mod snapshot_references;
@@ -202,6 +204,8 @@ pub use rejoin::run_rejoin_heal;
 pub use rejoin::run_rejoin_vote_barrier;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
+#[cfg(madsim)]
+pub use sim_runtime::run_isolated;
 pub use snapshot_codec::decode_group_snapshot;
 pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::Handoff;

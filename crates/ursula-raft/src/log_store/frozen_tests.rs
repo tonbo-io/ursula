@@ -42,10 +42,9 @@ use crate::types::UrsulaRaftTypeConfig;
 type Entry = EntryOf<UrsulaRaftTypeConfig>;
 type Id = LogIdOf<UrsulaRaftTypeConfig>;
 
-fn simulated(seed: u64, test: impl FnOnce() + 'static) {
+fn simulated(seed: u64, test: impl FnOnce() + Send) {
     let _guard = crate::tests::madsim_test_guard();
-    madsim::runtime::Runtime::with_seed_and_config(seed, Default::default())
-        .block_on(async move { test() });
+    crate::sim_runtime::run_seeded(seed, None, move || async move { test() });
 }
 
 fn archive_id() -> ArchiveId {

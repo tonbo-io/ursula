@@ -729,12 +729,33 @@ fn catch_up_read(stream: &BucketStreamId, offset: u64, max_len: usize) -> ReadSt
     }
 }
 
-fn run_with_madsim<T>(seed: u64, workload: impl Future<Output = T>) -> T {
-    SimTrace::clear_recorded();
-    let mut runtime =
-        madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
-    runtime.set_time_limit(Duration::from_secs(30));
-    runtime.block_on(MadsimOpenRaftRuntime::scope(seed, workload))
+/// Runs `workload` under a fresh madsim runtime for `seed`, on a fresh OS
+/// thread ([`ursula_raft::run_isolated`]), and returns its output on the
+/// calling thread. This is the only place the harness starts a runtime
+/// (the `nondeterminism` audit checks it).
+///
+/// A run leaves state in its thread's thread-locals that madsim does not
+/// reset. Lazily seeded ones draw from madsim's intercepted `getrandom` only
+/// on their first use on a thread: `rand`'s thread RNG, which
+/// `generate_cluster_id` draws when a journal-backed node starts without a
+/// cluster id, and std's `RandomState` keys. A second run on the same thread
+/// would not spend those draws, every later draw of madsim's RNG would shift,
+/// and a seed's run would depend on the runs before it (#638). A thread per
+/// run also starts the recorded trace and the `sim_controls` switches from
+/// their initial values.
+///
+/// The thread's recorded trace replaces the caller's, so
+/// [`SimTrace::last_recorded`] reads this run's events afterwards, and a
+/// panic of the run resumes on the caller.
+fn run_with_madsim<T: Send>(seed: u64, workload: impl Future<Output = T> + Send) -> T {
+    let (result, recorded) = ursula_raft::run_isolated(
+        seed,
+        Some(Duration::from_secs(30)),
+        move || MadsimOpenRaftRuntime::scope(seed, workload),
+        SimTrace::last_recorded,
+    );
+    SimTrace::replace_recorded(recorded);
+    result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 pub(super) fn sim_network_policy() -> InProcessRaftNetworkPolicy {

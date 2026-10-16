@@ -43,9 +43,11 @@ impl SimTrace {
         LAST_SIM_TRACE.with(|trace| trace.borrow().clone())
     }
 
-    pub(super) fn clear_recorded() {
+    /// Makes `recorded` this thread's last recorded trace: a run records on
+    /// a thread of its own and hands its trace to the caller's.
+    pub(super) fn replace_recorded(recorded: Self) {
         LAST_SIM_TRACE.with(|trace| {
-            *trace.borrow_mut() = Self::default();
+            *trace.borrow_mut() = recorded;
         });
     }
 }

@@ -80,7 +80,7 @@ use super::write_keys::run_producer_repeats_are_exactly_once_inner;
 /// Runs one scenario workload under a fresh madsim runtime for `seed` and
 /// wraps the outcome into a `SimReport`.
 fn report_of<Fut>(scenario: SimScenario, seed: u64, workload: Fut) -> SimReport
-where Fut: Future<Output = ThreeNodeRaftSimOutcome> {
+where Fut: Future<Output = ThreeNodeRaftSimOutcome> + Send {
     run_with_madsim(seed, async move {
         SimReport {
             scenario,

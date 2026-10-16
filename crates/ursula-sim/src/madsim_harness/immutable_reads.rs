@@ -1134,25 +1134,16 @@ mod tests {
     }
 
     /// Runs the scenario at `seed` with `controls` and asserts the
-    /// invariant failed.
-    /// Runs the scenario at `seed` with `controls` and asserts the
     /// invariant failed after `step`, the read the lost defence decided.
     fn assert_fails(seed: u64, controls: Controls, step: &str) {
         let _guard = sim_test_guard();
-        // On a thread of its own, as the seed sweep runs it first in its
-        // process (see `marked_chunks_never_contradict_replays`).
-        let (failed, recorded) = std::thread::spawn(move || {
-            SimTrace::clear_recorded();
-            let previous_hook = std::panic::take_hook();
-            std::panic::set_hook(Box::new(|_| {}));
-            let result = std::panic::catch_unwind(|| {
-                ThreeNodeRaftSim::run_immutable_reads_with_controls_report(config(seed), controls)
-            });
-            std::panic::set_hook(previous_hook);
-            (result.is_err(), SimTrace::last_recorded())
-        })
-        .join()
-        .expect("the run");
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            ThreeNodeRaftSim::run_immutable_reads_with_controls_report(config(seed), controls)
+        });
+        std::panic::set_hook(previous_hook);
+        let (failed, recorded) = (result.is_err(), SimTrace::last_recorded());
         assert!(failed, "{controls:?} left the scenario passing");
         assert!(
             invariant_failed(&recorded, INVARIANT),
@@ -1203,14 +1194,8 @@ mod tests {
         // 920 is the seed of the barrier's negative control: with every
         // defence on it passes.
         for seed in (395..=399).chain([920]) {
-            // Each run on a thread of its own: a thread's hash-map keys
-            // advance with every map it builds, so a second run on the same
-            // thread iterates maps in another order and schedules otherwise.
-            let run = || {
-                std::thread::spawn(move || ThreeNodeRaftSim::run_report(SCENARIO, config(seed)))
-                    .join()
-                    .expect("the run")
-            };
+            // Every run starts on a fresh thread (`run_with_madsim`, #638).
+            let run = || ThreeNodeRaftSim::run_report(SCENARIO, config(seed));
             let first = run();
             let second = run();
             assert_eq!(first, second, "seed {seed}");
