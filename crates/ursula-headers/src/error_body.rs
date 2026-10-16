@@ -154,6 +154,12 @@ error_codes! {
     InvalidQuery = "INVALID_QUERY", "a query parameter is malformed";
     /// An offset in the path or query is malformed (`400`).
     InvalidOffset = "INVALID_OFFSET", "the offset is malformed";
+    /// An immutable resource (extensions Section 4.1) carries a query
+    /// component (`400`).
+    QueryNotAccepted = "QUERY_NOT_ACCEPTED", "an immutable resource takes no query";
+    /// The token or the offset in an immutable resource's path is not in the
+    /// form the server issues (`400`).
+    InvalidResource = "INVALID_RESOURCE", "the token or offset in the path is malformed";
     /// The request uses a parameter, header or route that was removed
     /// (`400`, or `405` on the bare snapshot path).
     Unsupported = "UNSUPPORTED", "the request uses a removed feature";
@@ -609,6 +615,8 @@ mod tests {
             (ErrorCode::InvalidHeader, "INVALID_HEADER"),
             (ErrorCode::InvalidQuery, "INVALID_QUERY"),
             (ErrorCode::InvalidOffset, "INVALID_OFFSET"),
+            (ErrorCode::QueryNotAccepted, "QUERY_NOT_ACCEPTED"),
+            (ErrorCode::InvalidResource, "INVALID_RESOURCE"),
             (ErrorCode::Unsupported, "UNSUPPORTED"),
             (ErrorCode::BodyUnreadable, "BODY_UNREADABLE"),
             (ErrorCode::NotJsonBoundary, "NOT_JSON_BOUNDARY"),

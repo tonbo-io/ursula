@@ -25,12 +25,13 @@
 //!   stream's last one;
 //! - the JSON body of every error answer,
 //!   `{"error":{"code":"<code>","message":"<detail>"}}`, with its stable
-//!   code (Section 11).
+//!   code (Section 11);
+//! - immutable reads: the path of a chunk or a snapshot of one incarnation,
+//!   the headers of their answers with the `Stream-Immutable` marker, and the
+//!   deployment's `Stream-Read-Origin` hint (Section 4).
 //!
-//! Not yet typed: the `400` of a `Producer-Digest` mismatch, the answer of a
-//! retention request (`Stream-Retained-Offset`), and the immutable-read
-//! headers `Stream-Immutable` and `Stream-Read-Origin`. The immutable-reads
-//! PR (#567) adds the last two; the write-keys server PR adds the first two.
+//! Not yet typed: the `400` of a `Producer-Digest` mismatch and the answer
+//! of a retention request (`Stream-Retained-Offset`).
 //!
 //! Every value is valid by construction: the value types check their range
 //! when built, and the structs whose fields constrain each other keep them
@@ -65,6 +66,9 @@
 //!   stream's successful HEAD.
 //! - [`snapshot`]: [`SnapshotRead`], [`SnapshotPublishAnswer`], and the parts
 //!   upload: [`PartStaged`], [`PartsCommit`] and [`PartsManifest`].
+//! - [`immutable`]: [`ImmutableResource`], the path of a chunk or a snapshot
+//!   of one incarnation, [`ChunkRead`] and [`ImmutableSnapshotRead`], their
+//!   answers, and [`ReadOrigin`], the read-origin hint.
 //! - [`range`]: [`ByteRange`], the range a snapshot read honors, and
 //!   [`ContentRange`], its answer.
 //! - [`limit`]: [`SizeLimit`], the limit a `413` applied, and
@@ -81,6 +85,7 @@ pub mod answer;
 pub mod error;
 pub mod error_body;
 pub mod head;
+pub mod immutable;
 pub mod limit;
 pub mod names;
 pub mod range;
@@ -112,6 +117,13 @@ pub use head::Inherited;
 pub use head::PROTOCOL_VERSION;
 pub use head::ServerIdentity;
 pub use head::StreamHead;
+pub use immutable::ChunkMark;
+pub use immutable::ChunkRead;
+pub use immutable::ImmutableResource;
+pub use immutable::ImmutableSnapshotRead;
+pub use immutable::OriginScheme;
+pub use immutable::ReadOrigin;
+pub use immutable::ResourceKind;
 pub use limit::SizeLimit;
 pub use limit::lowered_request_limit;
 pub use range::ACCEPT_RANGES_BYTES;
