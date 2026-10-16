@@ -23,12 +23,17 @@
 //! - `every_redirect_is_a_typed_routing_answer`: every `307` parses as a
 //!   [`RoutingAnswer`] that names a leader, with a `Location`;
 //! - `routed_writes_apply_exactly_once`: no key applies twice, and the stream
-//!   holds each key's body once, where its receipt says.
+//!   holds each key's body once, where its receipt says;
+//! - `a_repeat_follows_an_attempt_that_may_have_applied`: by
+//!   `ursula_headers::classify`, a key's first `Repeat` receipt follows an
+//!   attempt answered `Applied` or `Unknown`, never one answered only
+//!   `Refused` or `Redirected`, which say that nothing applied.
 //!
 //! [`Controls`] break one defence, for the test that shows the invariants
 //! catch its loss.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::atomic::AtomicBool;
 
@@ -41,6 +46,9 @@ use axum::http::header::RETRY_AFTER;
 use ursula_headers::Delivery;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::RoutingAnswer;
+use ursula_headers::WriteKind;
+use ursula_headers::WriteOutcome;
+use ursula_headers::classify;
 
 use super::Arc;
 use super::Body;
@@ -62,6 +70,7 @@ use super::write_keys::Label;
 pub(super) const NO_REDIRECT_INVARIANT: &str = "no_redirect_after_the_body_is_polled";
 pub(super) const TYPED_INVARIANT: &str = "every_redirect_is_a_typed_routing_answer";
 pub(super) const ONCE_INVARIANT: &str = "routed_writes_apply_exactly_once";
+pub(super) const OUTCOME_INVARIANT: &str = "a_repeat_follows_an_attempt_that_may_have_applied";
 /// Attempts of one key before the client gives up.
 const MAX_ATTEMPTS: usize = 40;
 /// How long the client waits before it resends after an unknown outcome.
@@ -76,12 +85,20 @@ pub(super) struct Controls {
     /// A leadership refusal after the body redirects, as one before it does
     /// ([`ursula_stream::sim_controls::Defence::NoRedirectAfterBody`]).
     redirect_after_body: bool,
+    /// A write that applied is answered `NO_LEADER`
+    /// ([`ursula_stream::sim_controls::Defence::RefusalMeansUnapplied`]).
+    refusal_after_apply: bool,
 }
 
 #[cfg(test)]
 impl Controls {
     pub(super) const REDIRECT_AFTER_BODY: Self = Self {
         redirect_after_body: true,
+        refusal_after_apply: false,
+    };
+    pub(super) const REFUSAL_AFTER_APPLY: Self = Self {
+        redirect_after_body: false,
+        refusal_after_apply: true,
     };
 }
 
@@ -94,6 +111,10 @@ impl Switched {
             ursula_stream::sim_controls::Defence::NoRedirectAfterBody,
             controls.redirect_after_body,
         );
+        ursula_stream::sim_controls::set_off(
+            ursula_stream::sim_controls::Defence::RefusalMeansUnapplied,
+            controls.refusal_after_apply,
+        );
         Self
     }
 }
@@ -102,6 +123,10 @@ impl Drop for Switched {
     fn drop(&mut self) {
         ursula_stream::sim_controls::set_off(
             ursula_stream::sim_controls::Defence::NoRedirectAfterBody,
+            false,
+        );
+        ursula_stream::sim_controls::set_off(
+            ursula_stream::sim_controls::Defence::RefusalMeansUnapplied,
             false,
         );
     }
@@ -219,11 +244,11 @@ fn take_seq(next_seq: &mut BTreeMap<u8, u64>, producer: u8) -> u64 {
     seq
 }
 
-/// What one request saw: its answer's status and headers, and whether the
-/// server polled its body before answering.
+/// What one request saw: its answer's status, headers and body, and
+/// whether the server polled its body before answering.
 struct Exchange {
     write: Write,
-    response: Response<Body>,
+    response: Response<Bytes>,
     body_polled: bool,
 }
 
@@ -269,6 +294,11 @@ async fn send_once(app: Router, path: String, incarnation: String, write: Write)
     // The answer is decided: what the server polled until now is what it
     // read before answering.
     let body_polled = polled.load(Ordering::SeqCst);
+    let (parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .expect("the answer's body");
+    let response = Response::from_parts(parts, body);
     Exchange {
         write,
         response,
@@ -290,6 +320,10 @@ struct Ledger {
     receipts: BTreeMap<(u8, u64), Option<(u64, u64)>>,
     /// How often each key got an applied receipt.
     applied: BTreeMap<(u8, u64), u64>,
+    /// The keys an attempt of which was answered `Applied` or `Unknown`.
+    maybe_applied: BTreeSet<(u8, u64)>,
+    /// The keys that got a `Repeat` receipt.
+    repeated: BTreeSet<(u8, u64)>,
     redirects: u64,
     refused_after_body: u64,
 }
@@ -304,6 +338,7 @@ impl Ledger {
             body_polled,
         } = exchange;
         let status = response.status();
+        self.check_outcome(trace, *write, response);
         if status == StatusCode::TEMPORARY_REDIRECT {
             if *body_polled {
                 fail(
@@ -385,6 +420,37 @@ impl Ledger {
             ),
         }
         Some(answer)
+    }
+}
+
+impl Ledger {
+    /// Checks one answer against `a_repeat_follows_an_attempt_that_may_have_applied`.
+    fn check_outcome(&mut self, trace: &mut SimTrace, write: Write, response: &Response<Bytes>) {
+        let slot = (write.producer, write.seq);
+        match classify(
+            WriteKind::Producer,
+            response.status().as_u16(),
+            header_pairs(response),
+            response.body(),
+        ) {
+            WriteOutcome::Applied | WriteOutcome::Unknown => {
+                self.maybe_applied.insert(slot);
+            }
+            WriteOutcome::Repeat => {
+                if self.repeated.insert(slot) && !self.maybe_applied.contains(&slot) {
+                    fail(
+                        trace,
+                        OUTCOME_INVARIANT,
+                        "receipt",
+                        format!(
+                            "{write:?} got its first repeat receipt, but every earlier attempt \
+                             was answered that nothing applied"
+                        ),
+                    );
+                }
+            }
+            WriteOutcome::Refused(_) | WriteOutcome::Redirected => {}
+        }
     }
 }
 
@@ -602,6 +668,7 @@ pub(super) async fn run_routing_before_body_inner(
 mod tests {
     use super::Controls;
     use super::NO_REDIRECT_INVARIANT;
+    use super::OUTCOME_INVARIANT;
     use crate::madsim_harness::SimScenario;
     use crate::madsim_harness::SimTrace;
     use crate::madsim_harness::ThreeNodeRaftSim;
@@ -650,6 +717,28 @@ mod tests {
         assert!(
             invariant_failed(&SimTrace::last_recorded(), NO_REDIRECT_INVARIANT),
             "a redirect after the body did not fail `{NO_REDIRECT_INVARIANT}`"
+        );
+    }
+
+    #[test]
+    fn negative_control_a_refusal_of_an_applied_write_is_caught() {
+        let _guard = sim_test_guard();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            ThreeNodeRaftSim::run_routing_with_controls_report(
+                config(500),
+                Controls::REFUSAL_AFTER_APPLY,
+            )
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(
+            result.is_err(),
+            "a refusal of an applied write left the run passing"
+        );
+        assert!(
+            invariant_failed(&SimTrace::last_recorded(), OUTCOME_INVARIANT),
+            "a refusal of an applied write did not fail `{OUTCOME_INVARIANT}`"
         );
     }
 }

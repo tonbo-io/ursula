@@ -334,6 +334,32 @@ impl Outcome {
         }
     }
 
+    /// The code of the error body of the `403` that names this outcome, the
+    /// one list of the producer `403` codes. `None` for `receipt-evicted`,
+    /// which answers a `204`.
+    pub fn error_code(self) -> Option<ErrorCode> {
+        match self {
+            Self::ReceiptEvicted => None,
+            Self::EpochClosed(_) => Some(ErrorCode::ProducerEpochClosed),
+            Self::KeyConflict => Some(ErrorCode::ProducerKeyConflict),
+            Self::ProducerExpired => Some(ErrorCode::ProducerExpired),
+            Self::StaleEpoch => Some(ErrorCode::ProducerEpochStale),
+        }
+    }
+
+    /// Whether `code` is the code of a producer `403`, which a `403` carries
+    /// only with `Producer-Epoch` and `Producer-Outcome`.
+    pub fn is_refusal_code(code: &ErrorCode) -> bool {
+        [
+            Self::EpochClosed(ClosedBy::Claim),
+            Self::KeyConflict,
+            Self::ProducerExpired,
+            Self::StaleEpoch,
+        ]
+        .into_iter()
+        .any(|outcome| outcome.error_code().as_ref() == Some(code))
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReceiptEvicted => "receipt-evicted",
@@ -414,10 +440,10 @@ impl ProducerAnswer {
     pub fn error_code(&self) -> Option<ErrorCode> {
         match self {
             Self::Receipt { .. } | Self::ReceiptEvicted { .. } => None,
-            Self::EpochClosed(_) => Some(ErrorCode::ProducerEpochClosed),
-            Self::KeyConflict { .. } => Some(ErrorCode::ProducerKeyConflict),
-            Self::ProducerExpired { .. } => Some(ErrorCode::ProducerExpired),
-            Self::StaleEpoch { .. } => Some(ErrorCode::ProducerEpochStale),
+            Self::EpochClosed(closure) => Outcome::EpochClosed(closure.by()).error_code(),
+            Self::KeyConflict { .. } => Outcome::KeyConflict.error_code(),
+            Self::ProducerExpired { .. } => Outcome::ProducerExpired.error_code(),
+            Self::StaleEpoch { .. } => Outcome::StaleEpoch.error_code(),
             Self::SeqGap { .. } => Some(ErrorCode::ProducerSeqConflict),
             Self::EpochNotClaimed => Some(ErrorCode::InvalidProducer),
         }

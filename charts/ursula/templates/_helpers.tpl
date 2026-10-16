@@ -419,6 +419,11 @@ Validate gateway values before manifests are accepted.
 {{- if lt $maxRequestBodyBytes 1 -}}
 {{- fail (printf "gateway.maxRequestBodyBytes must be at least 1; got %v" .Values.gateway.maxRequestBodyBytes) -}}
 {{- end -}}
+{{- /* The protocol's request limit, which every node applies: a gateway
+above it exits at startup. */ -}}
+{{- if gt $maxRequestBodyBytes 33554432 -}}
+{{- fail (printf "gateway.maxRequestBodyBytes must be at most 33554432, the protocol's request limit; got %d" $maxRequestBodyBytes) -}}
+{{- end -}}
 {{- /* An unset budget grows to hold a body at the limit, so only a set one
 is checked: the gateway exits at startup unless a body at the limit fits the
 part of the budget large bodies may take, the budget less the small-body

@@ -154,6 +154,14 @@ impl TryFrom<UploadLimitsSpec> for UploadLimits {
         if spec.max_request_body_bytes == 0 {
             return Err(UploadLimitsError::ZeroRequestBodyLimit);
         }
+        if u64::try_from(spec.max_request_body_bytes).unwrap_or(u64::MAX)
+            > ursula_headers::MAX_REQUEST_BYTES
+        {
+            return Err(UploadLimitsError::LimitAboveProtocol {
+                max_request_body_bytes: spec.max_request_body_bytes,
+                protocol_limit: ursula_headers::MAX_REQUEST_BYTES,
+            });
+        }
         let shared_units =
             units(spec.budget_bytes).saturating_sub(units(spec.small_body_headroom_bytes));
         let limit_units = units(u64::try_from(spec.max_request_body_bytes).unwrap_or(u64::MAX));
@@ -224,6 +232,17 @@ impl UploadLimits {
 pub enum UploadLimitsError {
     #[error("the request body limit must be at least 1 byte")]
     ZeroRequestBodyLimit,
+    /// A limit above the protocol's: the node would refuse such a body
+    /// before reading it, and the gateway, still sending it, would answer
+    /// `502` instead of a typed `413`.
+    #[error(
+        "the request body limit of {max_request_body_bytes} bytes is over the protocol's request \
+         limit of {protocol_limit} bytes, which every Ursula node applies"
+    )]
+    LimitAboveProtocol {
+        max_request_body_bytes: usize,
+        protocol_limit: u64,
+    },
     #[error(
         "the request body limit of {max_request_body_bytes} bytes is over the {shared_bytes} \
          bytes of the body budget that large bodies may take (the budget less the small-body \
@@ -490,14 +509,26 @@ mod tests {
                 shared_bytes: 0,
             })
         );
+        // Above the protocol's request limit, whatever the budget.
         assert_eq!(
             limits(UploadLimitsSpec {
-                max_request_body_bytes: 1 << 30,
+                max_request_body_bytes: (32 << 20) + 1,
+                budget_bytes: 1 << 30,
+                ..spec()
+            }),
+            Err(UploadLimitsError::LimitAboveProtocol {
+                max_request_body_bytes: (32 << 20) + 1,
+                protocol_limit: 32 << 20,
+            })
+        );
+        assert_eq!(
+            limits(UploadLimitsSpec {
+                budget_bytes: 48 << 20,
                 ..spec()
             }),
             Err(UploadLimitsError::LimitAboveSharedBudget {
-                max_request_body_bytes: 1 << 30,
-                shared_bytes: 224 << 20,
+                max_request_body_bytes: 32 << 20,
+                shared_bytes: 16 << 20,
             })
         );
         assert_eq!(
@@ -517,9 +548,10 @@ mod tests {
             }),
             Err(UploadLimitsError::ZeroStallTimeout)
         );
-        // The limit may take the whole shared part.
+        // The limit may take the whole shared part, and may be the
+        // protocol's.
         limits(UploadLimitsSpec {
-            max_request_body_bytes: 224 << 20,
+            budget_bytes: 64 << 20,
             ..spec()
         })
         .expect("the limit may take the whole shared part");

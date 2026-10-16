@@ -922,7 +922,7 @@ pub(crate) fn transient(answer: &Answer) -> bool {
 
 /// [`transient`] for a part: a `429` naming the stream's limit of staged parts decides, since no
 /// repeat of the part lifts it. Any other `429` (a rate limit) is sent again.
-fn transient_part(answer: &Answer) -> bool {
+pub(crate) fn transient_part(answer: &Answer) -> bool {
     !matches!(answer.typed, Ok(Typed::StagedPartsFull)) && transient(answer)
 }
 

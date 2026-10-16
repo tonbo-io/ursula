@@ -1,7 +1,8 @@
 //! Client-plane ingress admission: refuses a write before it reaches a
-//! handler, so nothing of a refused request is ever proposed. A response
-//! never says so: a client resolves an unknown outcome by repeating a keyed
-//! write (#581 section 2).
+//! handler, so nothing of a refused request is ever proposed. Each refusal's
+//! code says so (`WAL_DISK_PRESSURE`, `RAFT_LOG_PRESSURE`,
+//! `INGRESS_BODY_BYTES_LIMIT_REACHED`, and the typed `413`), which
+//! `ursula_headers::classify` reads as `Refused` (extensions Section 11.1).
 
 use std::convert::Infallible;
 use std::sync::Arc;

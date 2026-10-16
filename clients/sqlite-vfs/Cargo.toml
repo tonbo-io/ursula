@@ -33,6 +33,8 @@ required-features = ["model"]
 
 [dev-dependencies]
 proptest = "1.11"
+# The write-outcome inventory, for the cross-check of the VFS's answer tables.
+ursula-headers = { path = "../../crates/ursula-headers", features = ["test-support"] }
 
 [lints]
 workspace = true

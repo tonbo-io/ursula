@@ -89,7 +89,7 @@ use crate::wire::Request;
 use crate::wire::Target;
 
 /// A node's one request limit (#581 §3.1).
-pub(crate) const MAX_REQUEST_BYTES: u64 = 32 << 20;
+pub(crate) const MAX_REQUEST_BYTES: u64 = ursula_headers::MAX_REQUEST_BYTES;
 
 /// The largest snapshot accepted in parts, with a cold store (#581 §6.3).
 pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;

@@ -237,6 +237,12 @@ error_codes! {
     Forbidden = "FORBIDDEN", "the request is not allowed";
     /// The authorizer could not decide (`503`).
     AuthorizationUnavailable = "AUTHORIZATION_UNAVAILABLE", "authorization is unavailable";
+    /// The account must pay before the gateway forwards its requests
+    /// (`402`). A refusal of a gateway's embedder.
+    PaymentRequired = "PAYMENT_REQUIRED", "payment is required";
+    /// The account's access is revoked (`403`). A refusal of a gateway's
+    /// embedder.
+    AccountRevoked = "ACCOUNT_REVOKED", "the account's access is revoked";
     /// The tenant's request rate limit is spent (`429`, with
     /// `Retry-After`).
     RateLimited = "RATE_LIMITED", "the request rate limit is spent";
@@ -684,6 +690,8 @@ mod tests {
                 ErrorCode::AuthorizationUnavailable,
                 "AUTHORIZATION_UNAVAILABLE",
             ),
+            (ErrorCode::PaymentRequired, "PAYMENT_REQUIRED"),
+            (ErrorCode::AccountRevoked, "ACCOUNT_REVOKED"),
             (ErrorCode::RateLimited, "RATE_LIMITED"),
             (ErrorCode::LiveReadsExhausted, "LIVE_READS_EXHAUSTED"),
             (ErrorCode::UploadsExhausted, "UPLOADS_EXHAUSTED"),

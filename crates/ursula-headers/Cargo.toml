@@ -17,6 +17,9 @@ serde = { workspace = true, optional = true }
 
 [features]
 serde = ["dep:serde"]
+# `write_outcome::inventory`: every write answer as data, with samples, for
+# the conformance tests of the server, the gateway and clients.
+test-support = []
 
 # Dev-dependencies of a path dependency do not reach its dependents.
 [dev-dependencies]

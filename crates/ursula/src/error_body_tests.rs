@@ -304,13 +304,23 @@ async fn no_message_names_the_servers_internals() {
     };
     let leader = "http://10.1.2.3:4438";
     let cases = [
-        // A leadership lost while a write's body was read.
+        // A leadership lost after the write was proposed: its outcome is
+        // unknown.
         (
             engine(GroupEngineError::forward_to_leader(
                 format!(
                     "OpenRaft client_write forwarded to leader: has to forward request to: \
                      Some(2), Some(BasicNode {{ addr: \"{leader}\" }})"
                 ),
+                Some(2),
+                Some(leader.to_owned()),
+            )),
+            ErrorCode::OutcomeUnknown,
+        ),
+        // A leadership check that failed before the proposal.
+        (
+            engine(GroupEngineError::forward_to_leader_before_proposal(
+                format!("not the leader; the leader is {leader}"),
                 Some(2),
                 Some(leader.to_owned()),
             )),
@@ -368,8 +378,8 @@ async fn no_message_names_the_servers_internals() {
     for (err, code) in cases {
         let event = crate::render::sse_error_event(&crate::render::runtime_error_body(&err).1);
         assert!(!names_internals(&event), "{event}");
-        let answer = if code == ErrorCode::NoLeader {
-            crate::leader_unknown_retry_response(err)
+        let answer = if err.leader_hint().is_some() {
+            crate::leader_unknown_retry_response(err, crate::Access::Write)
         } else {
             crate::runtime_error_response(err)
         };

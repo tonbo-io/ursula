@@ -92,6 +92,7 @@ use crate::cold_snapshot::piece_len;
 use crate::cold_snapshot::read_piece;
 use crate::cold_snapshot::stream_into_object;
 use crate::front_door;
+use crate::front_door::BodyState;
 use crate::front_door::HeadDecision;
 use crate::limits;
 use crate::render::error_answer;
@@ -397,8 +398,14 @@ pub(crate) enum KeyCheck {
 /// Checks a commit's key against the stream's latest snapshot, on the
 /// leader's linearizable `HEAD`, so a deposed leader never answers from a
 /// stale state (A2 of the #581 addendum on the VFS client asks). A
-/// superseded or conflicting commit copies nothing.
-pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> KeyCheck {
+/// superseded or conflicting commit copies nothing. `body` says whether
+/// the commit's body was read: after it, a leadership refusal answers `503`,
+/// never a redirect (extensions Section 5.7).
+pub(crate) async fn key_check(
+    target: &PublishTarget,
+    commit: &PartsCommit,
+    body: BodyState,
+) -> KeyCheck {
     let state = &target.state;
     let head = match state
         .runtime
@@ -413,8 +420,7 @@ pub(crate) async fn key_check(target: &PublishTarget, commit: &PartsCommit) -> K
         Ok(head) => head,
         Err(err) => {
             return KeyCheck::Answered(
-                crate::runtime_error_or_leader_redirect_async(state, err, &target.request_target)
-                    .await,
+                front_door::write_error_response(state, err, &target.request_target, body).await,
             );
         }
     };
@@ -690,7 +696,7 @@ async fn recheck_key(
     sent_token: bool,
     part: PartId,
 ) -> Response {
-    match key_check(target, commit).await {
+    match key_check(target, commit, BodyState::Read).await {
         KeyCheck::Answered(answer) => untokened(answer, sent_token, &part),
         KeyCheck::Open { .. } => PartsRefusal::UnknownPart { part }.into_response(),
     }
@@ -933,7 +939,7 @@ pub(crate) async fn stage_snapshot_part(
         },
         Err(err) => {
             let refused =
-                crate::runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
+                crate::write_error_or_leader_redirect_async(&state, err, &request_target).await;
             return crate::answer_before_body(refused, version, &headers, body).await;
         }
     };
@@ -1070,8 +1076,7 @@ pub(crate) async fn discard_snapshot_parts(
             None => head.incarnation,
         },
         Err(err) => {
-            return crate::runtime_error_or_leader_redirect_async(&state, err, &request_target)
-                .await;
+            return crate::write_error_or_leader_redirect_async(&state, err, &request_target).await;
         }
     };
     let raft_group_id = state.runtime.locate(&stream_id).raft_group_id;

@@ -146,18 +146,13 @@ Gateways before 0.7.3 followed one redirect, to a configured upstream only,
 and passed any other on to the client with a path-only `Location`.
 
 Each hop sends the request again. Only stream requests are redirected. A
-node routes a create, an append or close, and a snapshot publish before it
-reads the body, so it never redirects one of them after it proposed it: a
-node that loses the leadership while it reads the body answers `503` with
-`Retry-After`, which the gateway passes on. A bodiless write, a delete or a
-retention move, can still be redirected after OpenRaft took it, so the next
-hop's copy may meet a write that already applied:
-
-- A delete answers `404`: the stream is gone. An unconditional delete also
-  deletes a stream that another client recreated between the two hops. With
-  `Stream-Incarnation`, it answers `412` and deletes nothing instead, so send
-  it.
-- A retention move makes the same change again.
+node redirects a write only when it refused the write before proposing it,
+so no hop's copy meets a write that an earlier hop applied. A node routes a
+create, an append or close, and a snapshot publish before it reads the body.
+A node that loses the leadership while it reads the body answers `503` with
+`Retry-After`, which the gateway passes on: `NO_LEADER` when it refused the
+write before proposing it, and `OUTCOME_UNKNOWN` when it may have proposed
+it. The same holds for a bodiless write, a delete or a retention move.
 
 Other `307` responses remain visible to the client. Their `Location` header is
 reduced to the path and query so redirect-following clients such as `curl -L`
@@ -166,15 +161,51 @@ directly.
 
 ## Proxies Around the Gateway
 
-No response says that a write applied nothing. A client resolves an unknown
-outcome by repeating the write with its producer key. See
-[write outcomes](https://ursula.tonbo.io/docs/api/overview#write-outcomes).
+A refusal says that its request applied nothing by its status and error
+code, by one rule for every client, which `ursula_headers::classify`
+implements: every refusal the gateway sends itself is one, and so is a
+node's `NO_LEADER`. Any other outcome, such as `OUTCOME_UNKNOWN`, a `502` or
+a `504`, is unknown, and a client resolves it by repeating the write with
+its producer key. See
+[write outcomes](https://ursula.tonbo.io/docs/specs/extensions#111-write-outcomes).
 
 A proxy in front of the gateway must not resend writes, and a client must not
 let its HTTP library follow redirects or retry writes on its own: a resent
 write without producer headers applies twice. Point `--upstream` at the nodes
 themselves. A proxy, service-mesh sidecar or another gateway between the
 gateway and the nodes must not resend requests either.
+
+A client reads any `4xx` other than `408` as a refusal that applied nothing,
+whoever sent it. So a proxy in front of the gateway must never answer a write
+with such a `4xx` after it forwarded any of the request, for example from a
+firewall that inspects the response, as
+[write outcomes](https://ursula.tonbo.io/docs/specs/extensions#111-write-outcomes)
+requires. The gateway itself uses no system proxy (`HTTP_PROXY`) for its
+upstreams.
+
+## Refusals of an Embedder
+
+A program that embeds the gateway can refuse a request before the gateway
+forwards it, such as one of an unpaid account, with `Gateway::refuse` and an
+`EmbedderRefusal`:
+
+| Refusal | Status | Code |
+| --- | --- | --- |
+| `PaymentRequired` | `402` | `PAYMENT_REQUIRED` |
+| `AccountRevoked` | `403` | `ACCOUNT_REVOKED` |
+| `Forbidden` | `403` | `FORBIDDEN` |
+| `RateLimited` | `429`, with `Retry-After` | `RATE_LIMITED` |
+
+`Gateway::refuse` reads and drops the request's body first, as the gateway
+does for its own refusals from the head (see
+[Refusals Before the Body](#refusals-before-the-body)), then answers through
+the gateway's one error renderer: the JSON error body with the code,
+`Cache-Control: no-store`, and the gateway's CORS headers. The answer carries
+no producer header and no server identity. A client reads it as a refusal:
+nothing applied. A node's producer `403` always carries `Producer-Epoch` and
+`Producer-Outcome`, so a client tells the two apart. The codes are fixed, so
+every client knows them. An embedder that needs another refusal asks for a
+code to be added.
 
 ## Refusals Before the Body
 
@@ -250,10 +281,13 @@ can send it again after a leader redirect. `--max-request-body-bytes` bounds
 one body. The body budget bounds the bodies under way across requests, so
 that concurrent large or slow uploads cannot exhaust the gateway's memory.
 
-Raising `--max-request-body-bytes` above 32 MiB lets no larger request
-through. An Ursula node refuses a request body over 32 MiB with `413`
-whatever the gateway's limit, so a higher limit only grows the gateway's body
-budget and the memory it may buffer.
+`--max-request-body-bytes` is at most 32 MiB, the protocol's request limit
+(`ursula_headers::MAX_REQUEST_BYTES`), and a gateway configured above it
+refuses to start. An Ursula node refuses a body over that limit from its
+`Content-Length`, before reading it, and closes the connection. The gateway,
+still sending the body, would then see a reset and answer `502`, which a
+client reads as an unknown outcome. At or below the limit, the gateway's own
+`413` refuses every body the node would, typed and before forwarding.
 
 Before it reads any byte of a body, a request reserves the body's
 `Content-Length` from `--body-budget-bytes`. A body without a declared length
@@ -458,10 +492,9 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     Maximum request body bytes buffered for leader-redirect replay.
     Larger requests return 413 before upstream forwarding. Also the most the
     gateway reads of a body before it sends a refusal. Must fit
-    --body-budget-bytes less --small-body-headroom-bytes. Ursula nodes
-    refuse a body over 32 MiB with 413 whatever this limit, so raising it
-    above 33554432 lets no larger request through and only grows the body
-    budget. Defaults to 33554432.
+    --body-budget-bytes less --small-body-headroom-bytes. At most 33554432,
+    the protocol's request limit, which every node applies: a larger value
+    refuses to start (see Request Body Budget). Defaults to 33554432.
 
 --body-budget-bytes <BYTES>
     Bytes of request bodies the gateway buffers at once, across requests,
