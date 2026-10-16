@@ -2,10 +2,11 @@
     clippy::arithmetic_side_effects,
     reason = "tests compute offsets, positions and counters from small generated sizes"
 )]
-//! Tests of the replicator: one per row of both answer tables of design §4.7
+//! Tests of the replicator: one per row of both answer tables (design: Answers)
 //! ([`answer_rows`]), the same answers against `ursula_headers::classify`
-//! ([`classify_cross_check`]), one per row of the reconcile table of §4.9 ([`reconcile_rows`]), the
-//! machine's own rules ([`machine`]), re-keys across a history the stream inherits ([`rekey`]),
+//! ([`classify_cross_check`]), one per row of the reconcile table (design: Reconcile)
+//! ([`reconcile_rows`]), the machine's own rules ([`machine`]), re-keys across a history the
+//! stream inherits ([`rekey`]),
 //! and the proptest world against the model server ([`world`]).
 
 mod answer_rows;
@@ -230,7 +231,8 @@ impl Harness {
         (harness, actions)
     }
 
-    /// A provisional open's replicator (design §5.5, §7) whose log's latest claim is `claim`.
+    /// A provisional open's replicator (design: Open, Pre-check) whose log's latest claim is
+    /// `claim`.
     pub(crate) fn provisional(
         local: LocalState,
         claim: (Epoch, Activation),

@@ -1,7 +1,7 @@
-//! The reconcile of design §4.9: after a claim applies, read from the acknowledged offset to the
-//! claim's start with `consistency=leader` and the precondition, and sort every frame there by
-//! activation, and by commit id plus bytes, never by `(epoch, seq)`. [`decide_frame`] is the
-//! table, one row per [`FrameClass`] and one column per [`Mode`].
+//! The reconcile (design: Reconcile): after a claim applies, read from the acknowledged offset to
+//! the claim's start with `consistency=leader` and the precondition, and sort every frame there by
+//! activation, and by commit id plus bytes, never by `(epoch, seq)`. [`decide_frame`] is the table,
+//! one row per [`FrameClass`] and one column per [`Mode`].
 //!
 //! Once a claim at `E'` applies no older-epoch frame of the producer can apply, and the read sees
 //! every frame applied before the claim, so each pending record has landed or never will. The
@@ -12,7 +12,7 @@
 //! a continuation only when no CLAIM of our own follows it in the range: one that does applied
 //! after it, and supersedes it. Foreign commits still reset `stale` there, since this generation
 //! never caught them up. The same reads, up to the tail a HEAD named, are a provisional
-//! open's pre-check before it sends its claim (design §7, [`Reconcile::pre_check`]).
+//! open's pre-check before it sends its claim (design: Pre-check, [`Reconcile::pre_check`]).
 
 use ursula_headers::ClosedEpoch;
 use ursula_headers::Epoch;
@@ -53,8 +53,8 @@ pub(crate) enum FrameClass {
     ForeignCommit,
     /// Bytes that are not `USQ2` frames.
     Undecodable,
-    /// `410` and the latest snapshot does not cover this owner's acknowledged records (the rule
-    /// of design §4.9 did not continue from its offset): below retention.
+    /// `410` and the latest snapshot does not cover this owner's acknowledged records (the
+    /// `410` rule, design: Reconcile, did not continue from its offset): below retention.
     Gone,
 }
 
@@ -68,8 +68,8 @@ pub(crate) enum RowDecision {
     Reset(ResetKind),
 }
 
-/// The table of design §4.9. The `410` row's snapshot check runs first (the replicator's
-/// `Step::Gone`): [`FrameClass::Gone`] is its failure.
+/// The reconcile table (design: Reconcile). The `410` row's snapshot check runs first (the
+/// replicator's `Step::Gone`): [`FrameClass::Gone`] is its failure.
 pub(crate) fn decide_frame(mode: Mode, class: FrameClass) -> RowDecision {
     match (class, mode) {
         (FrameClass::OwnClaim, _) => RowDecision::Skip,
@@ -115,8 +115,8 @@ pub(crate) struct Done {
     pub(crate) catch_up: CatchUp,
 }
 
-/// How a takeover brings its generation up to the claim (design §5.6), once the reads are done.
-/// Foreign commits found with nothing pending are applied in place read by read
+/// How a takeover brings its generation up to the claim (design: Materialize), once the reads are
+/// done. Foreign commits found with nothing pending are applied in place read by read
 /// ([`Reconcile::take_chunk`]), never collected here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CatchUp {
@@ -181,9 +181,9 @@ impl Reconcile {
         }
     }
 
-    /// A provisional open's pre-check (design §7): the continuation's reads from `from`, its log's
-    /// acknowledged offset, up to `to`, the tail a HEAD named, before any claim goes out. `epoch`
-    /// is the claim it will send.
+    /// A provisional open's pre-check (design: Pre-check): the continuation's reads from `from`,
+    /// its log's acknowledged offset, up to `to`, the tail a HEAD named, before any claim goes out.
+    /// `epoch` is the claim it will send.
     pub(crate) fn pre_check(epoch: Epoch, from: Offset, to: Offset) -> Self {
         Self {
             mode: Mode::Continuation,
@@ -229,7 +229,7 @@ impl Reconcile {
     }
 
     /// The `410` rule found the latest snapshot covering this owner's acknowledged records: the
-    /// reads go on from its offset `from` (design §4.9).
+    /// reads go on from its offset `from` (design: Reconcile).
     pub(crate) fn restart(&mut self, from: Offset) {
         self.stream = FrameStream::new(from, self.stream.end(), MAX_BATCH_BYTES);
         self.chunk.clear();
@@ -245,8 +245,8 @@ impl Reconcile {
     }
 
     /// The current read's foreign commits to apply in place, if any. Once everything applied in
-    /// place would grow past the database, the takeover rebuilds instead (design §5.6): `None`,
-    /// and the reconcile is done with a rebuild.
+    /// place would grow past the database, the takeover rebuilds instead (design: Materialize):
+    /// `None`, and the reconcile is done with a rebuild.
     pub(crate) fn take_chunk(&mut self, ctx: &mut Ctx) -> Option<Vec<ForeignFrame>> {
         if self.chunk.is_empty() || matches!(self.catch_up, CatchUp::Rebuild { .. }) {
             self.chunk.clear();
@@ -400,7 +400,7 @@ impl Reconcile {
     }
 
     /// Whether `position` went out in a batch of the epoch the claim closed, above its last
-    /// applied seq: that batch must not be in the stream (design §4.8).
+    /// applied seq: that batch must not be in the stream (design: Claims).
     ///
     /// A takeover binds afresh (nothing sent), and a continuation after `producer-expired` claims
     /// over a retired record, so the claim closes no epoch. A re-key while bound claims over the
@@ -419,7 +419,7 @@ impl Reconcile {
 
 /// The reset for bytes a `synced()` probe found past the acknowledged tail: a valid frame (a
 /// claim, a copy's commit or claim under our activation) fences, undecodable bytes are a foreign
-/// append (design §7).
+/// append (design: Clones).
 pub(crate) fn past_tail(body: &[u8]) -> ResetKind {
     match frame::decode(body, MAX_BATCH_BYTES) {
         Ok(Decoded::Frame { .. }) => ResetKind::Fenced,

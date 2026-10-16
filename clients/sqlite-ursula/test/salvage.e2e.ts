@@ -1,4 +1,4 @@
-// Salvage (design §6.2, D3): a local cache the open cannot keep is moved whole into the cache
+// Salvage (design: History): a local cache the open cannot keep is moved whole into the cache
 // root's `salvage/`, a plain SQLite database with its log and a manifest.json, and the open builds
 // a new cache from the stream. A history change that may have lost what the cache holds salvages
 // it (`history_changed`), a db file that is not the cache's own is salvaged as found (`replaced`),
@@ -182,9 +182,9 @@ describe("salvage", () => {
 		expect(await child.send({ synced: 10_000 })).toMatchObject({ ok: true, synced: { synced: true } });
 		const saved = await checkpoint();
 		// Killed right after the acknowledgement: an ACK record names it only when the ACK interval
-		// since the last one had passed. Without one (#611 B2) the log holds an acknowledged commit
-		// after its latest ACK, and the restore inherits the log by that ACK. Either way the reopen
-		// never re-keys: it salvages the commit.
+		// since the last one had passed. Without one (the #611 history gate, design: History) the log
+		// holds an acknowledged commit after its latest ACK, and the restore inherits the log by that
+		// ACK. Either way the reopen never re-keys: it salvages the commit.
 		await child.exec("INSERT INTO t VALUES (1)");
 		expect(await child.send({ synced: 10_000 })).toMatchObject({ ok: true, synced: { synced: true } });
 		await child.stop("SIGKILL");

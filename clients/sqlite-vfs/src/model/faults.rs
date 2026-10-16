@@ -22,7 +22,8 @@ pub(crate) enum Fault {
     },
     /// A layer redirects with `307` to `location`, nothing applied.
     Redirect { location: String },
-    /// A layer outside #581 §6.4 refuses the size with a `413` that names no limit.
+    /// A layer that does not implement the size refusals (extensions: Server Metadata) refuses the
+    /// size with a `413` that names no limit.
     UntypedTooLarge,
     /// The server's answer comes after `ms` (over HTTP only; in process it comes at once).
     Delay { ms: u64 },

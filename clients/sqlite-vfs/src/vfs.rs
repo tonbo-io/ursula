@@ -1,4 +1,5 @@
-//! The "ursula" VFS: the file methods of a bound database (design §4.1 to §4.4).
+//! The "ursula" VFS: the file methods of a bound database (design: Capture, Publication, Fsyncs,
+//! Backpressure).
 //!
 //! WAL writes go straight to the WAL file. Each write transaction is admitted at its first WAL
 //! write (`backlog_full` fails it with `SQLITE_IOERR_AUTH`, nothing written), and every WAL write
@@ -8,7 +9,7 @@
 //! checks their crc32c, encodes one `USQ2` COMMIT frame, appends it to the log (one write, no
 //! fsync), hands it to the driver and only then forwards the commit page. A failure before the log
 //! write fails the transaction alone. Before all that, a commit point waits while the snapshot
-//! thread's window is open, and at most a second for a wanted one (design §4.11).
+//! thread's window is open, and at most a second for a wanted one (design: Snapshots).
 //!
 //! The snapshot thread's private connection opens through this VFS too (`opening_private`), so its
 //! checkpoints take F1; it counts as a connection of the binding only beside one of the host's.
@@ -24,7 +25,7 @@
 //! generation or a WAL truncate to nothing the db file is fsynced, then a BASE record names the
 //! last confirmed commit. A failed fsync resets `local_damage`.
 //!
-//! Page 1 (design §5.3): on disk bytes 0..16 of a bound db file hold the generation's marker
+//! Page 1 (design: Marker): on disk bytes 0..16 of a bound db file hold the generation's marker
 //! ([`marker`]). `xRead` gives SQLite its magic in their place, `xWrite` stores the marker in place
 //! of the magic, and `xFetch` maps nothing over them, so SQLite reads them through `xRead`. A read
 //! that finds anything but the marker resets `local_damage` (`SQLITE_IOERR_READ`). The WAL of a
@@ -38,9 +39,9 @@
 //! every write fails (`SQLITE_IOERR_WRITE`), db-file writes included, so no checkpoint moves pages
 //! of a commit that may be discarded. A panic in a file method resets `internal`.
 //!
-//! A reader binding's db file opens read-only whatever the connection asked (design D6), so SQLite
-//! refuses its writes with `SQLITE_READONLY`, and a write or truncate that reaches one of its files
-//! anyway is refused the same way: a reader logs no commit.
+//! A reader binding's db file opens read-only whatever the connection asked (design: Readers), so
+//! SQLite refuses its writes with `SQLITE_READONLY`, and a write or truncate that reaches one of
+//! its files anyway is refused the same way: a reader logs no commit.
 //!
 //! SQLite calls these methods with pointers it owns, under the VFS contract every unsafe block here
 //! relies on: each `file` is one this VFS opened and has not closed, laid out as [`File`] in the
@@ -120,7 +121,7 @@ const WAL_CKPT_LOCK: c_int = 1;
 const WAL_READ_LOCK_0: c_int = 3;
 
 /// The longest a commit waits at its commit point for another connection's logged commit to be
-/// decided (design §4.2).
+/// decided (design: Publication).
 const UNDECIDED_WAIT: Duration = Duration::from_secs(1);
 
 /// The longest a commit waits at its commit point for a wanted snapshot window to open.
@@ -262,7 +263,7 @@ unsafe fn ext<'a>(f: *mut ffi::sqlite3_file) -> Option<&'a Ext> {
 }
 
 /// fsyncs the "unix" file inside `file`, bypassing this VFS's `xSync`, which is a no-op for a
-/// bound database: the snapshot thread's db fsync before its BASE (design §4.11).
+/// bound database: the snapshot thread's db fsync before its BASE (design: Snapshots).
 ///
 /// # Safety
 ///
@@ -402,7 +403,7 @@ unsafe fn x_open(
             .map(|(e, connected)| (Arc::clone(&e.binding), connected)),
     );
     // A reader binding's db file opens read-only, so SQLite refuses every write on it with
-    // `SQLITE_READONLY` before one reaches the file (design D6).
+    // `SQLITE_READONLY` before one reaches the file (design: Readers).
     let flags = match &ext {
         Some(e) if e.is_main() && e.binding.handle.role == crate::driver::Role::Reader => {
             (flags & !(ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE))
@@ -740,8 +741,8 @@ unsafe fn wal_write(file: *mut ffi::sqlite3_file, b: &Binding, data: &[u8], off:
         settle(b, &mut c, writer, after, verdict);
     }
     if c.txn.is_none() {
-        // Admission (design §4.4): at the first WAL write, never at the write lock, so wal-index
-        // recovery is never refused.
+        // Admission (design: Backpressure): at the first WAL write, never at the write lock, so
+        // wal-index recovery is never refused.
         if let Err(full) = b.handle.admit(0) {
             return refuse(b, &mut c, WriteRefusal::BacklogFull {
                 pending: full.pending,
@@ -784,8 +785,8 @@ fn forward(file: *mut ffi::sqlite3_file, b: &Binding, data: &[u8], off: i64) -> 
     rc
 }
 
-/// F2 (design §4.3): fsyncs the db file through the main db handle holding the WAL write lock (or
-/// a closing connection's EXCLUSIVE lock), then appends a BASE record naming the last confirmed
+/// F2 (design: Fsyncs): fsyncs the db file through the main db handle holding the WAL write lock
+/// (or a closing connection's EXCLUSIVE lock), then appends a BASE record naming the last confirmed
 /// commit, before the WAL starts a new generation or is truncated to nothing. A failure resets
 /// `local_damage`.
 ///
@@ -839,7 +840,7 @@ fn commit_log(b: &Binding) -> Result<MutexGuard<'_, Log>, c_int> {
     })
 }
 
-/// The commit point (design §4.1): capture, encode, log, hand to the driver, forward.
+/// The commit point (design: Capture): capture, encode, log, hand to the driver, forward.
 ///
 /// # Safety
 ///
@@ -853,7 +854,7 @@ unsafe fn commit(
     off: i64,
 ) -> c_int {
     let started = Instant::now();
-    // A snapshot's window (design §4.11): the commit waits while it is open, so the snapshot's
+    // A snapshot's window (design: Snapshots): the commit waits while it is open, so the snapshot's
     // read sees exactly its `k`, and at most a second for a wanted one to open, so a writer
     // committing back to back cannot starve it.
     let deadline = started.checked_add(WINDOW_WAIT).unwrap_or(started);
@@ -1035,7 +1036,7 @@ unsafe fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3_int64) -> 
 }
 
 /// A no-op for the db file and WAL of a bound database, whatever `PRAGMA synchronous` says: the log
-/// holds every commit, and F1 and F2 are the only fsyncs the local files need (design §4.3).
+/// holds every commit, and F1 and F2 are the only fsyncs the local files need (design: Fsyncs).
 unsafe fn x_sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     // SAFETY: the module contract.
     if unsafe { ext(file) }.is_some() {
@@ -1128,7 +1129,7 @@ unsafe fn x_file_control(file: *mut ffi::sqlite3_file, op: c_int, arg: *mut c_vo
     }
 }
 
-/// F1 (design §4.3): the log is fdatasynced before a checkpoint copies its first page, so every
+/// F1 (design: Fsyncs): the log is fdatasynced before a checkpoint copies its first page, so every
 /// page reaching the db file comes from a durable record. SQLite ignores what CKPT_START returns:
 /// a failure resets `local_damage`, which refuses the checkpoint's db writes.
 fn checkpoint_start(b: &Binding) {

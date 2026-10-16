@@ -1,4 +1,4 @@
-//! Publication tracking (design §4.2): whether SQLite published a logged commit locally.
+//! Publication tracking (design: Publication): whether SQLite published a logged commit locally.
 //!
 //! A logged commit is final, shipped and replayed whatever happens next. What is left to learn is
 //! whether SQLite published it, since nothing built without it may be logged after it. SQLite

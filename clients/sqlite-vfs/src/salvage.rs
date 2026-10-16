@@ -1,4 +1,4 @@
-//! Salvage (design §6.2, D3): a generation that a history change, a replaced db file or a
+//! Salvage (design: History): a generation that a history change, a replaced db file or a
 //! recreate would otherwise discard is moved aside, whole, into the root's `salvage/`, and never
 //! read or deleted by the extension again.
 //!
@@ -54,7 +54,7 @@ const FORMAT: u64 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
     /// The stream's token changed and its history does not inherit the generation, or may have
-    /// lost commits its log holds after the latest ACK (design §6.2).
+    /// lost commits its log holds after the latest ACK (design: History).
     HistoryChanged,
     /// The db file is not the generation's (page 1 holds another marker, SQLite's magic, or
     /// nothing), or the log's first segment header is unreadable.

@@ -1,4 +1,4 @@
-//! Sealing (design §4.6): whole frames of consecutive pending records from the first
+//! Sealing (design: Appends): whole frames of consecutive pending records from the first
 //! unacknowledged one, at most the batch limit, ending exactly at a requested boundary. A seal
 //! fixes the seq, the body and its digest until a definite answer.
 //!

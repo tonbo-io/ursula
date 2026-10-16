@@ -1,5 +1,5 @@
-//! Local generations (design §5.1, §6.3): the directory a stream's files live in, its lock, and
-//! the generations inside it.
+//! Local generations (design: Layout, Identity): the directory a stream's files live in, its lock,
+//! and the generations inside it.
 //!
 //! ```text
 //! <dir>/<label>-<hash32>/     the root: BLAKE3 of the canonical stream path, first 32 hex digits
@@ -38,7 +38,7 @@
 //! hold it ([`Root::hold`]) until the last of them closes, and the root with it, so another process
 //! gets `in_use`. An open in this process shares the root and copies a held generation
 //! ([`Root::copy`]): db then log into a `.tmp`, published like a build, so the old connections keep
-//! their files and never share a WAL or wal-index with the copy (design §5.6).
+//! their files and never share a WAL or wal-index with the copy (design: Materialize).
 //!
 //! A read-only open with no binding of the stream in its process locks the first free
 //! `reader-<n>/` ([`Root::reader`]) and keeps its generations there, apart from the owner's, so a
@@ -748,15 +748,15 @@ impl Root {
 
 impl Root {
     /// Starts a copy of the current generation `from` in a fresh `gen-<id32>.tmp`, for an open
-    /// beside the connections of a reset binding that still hold it (design §5.6): its db file
-    /// first, then its log ([`replog::copy`]), so every page the copied db holds comes from a
+    /// beside the connections of a reset binding that still hold it (design: Materialize): its db
+    /// file first, then its log ([`replog::copy`]), so every page the copied db holds comes from a
     /// record the copied log holds (F1). The copy keeps the lineage, so its pending commits keep
     /// their ids and the page-1 marker stays valid, and every segment of its log names `from` as
-    /// the generation it supersedes. Its WAL and wal-index stay behind: the WAL's commits are in the
-    /// log, which materializing the copy re-applies. The copy is published like a build
-    /// ([`Building::publish`], `from` trashed), and a crash before the rename leaves only a
-    /// `.tmp` that the next open deletes. A failed copy deletes its `.tmp`. On a filesystem that
-    /// cannot clone files, the copy reads and writes the whole db file.
+    /// the generation it supersedes. Its WAL and wal-index stay behind: the WAL's commits are in
+    /// the log, which materializing the copy re-applies. The copy is published like a build
+    /// ([`Building::publish`], `from` trashed), and a crash before the rename leaves only a `.tmp`
+    /// that the next open deletes. A failed copy deletes its `.tmp`. On a filesystem that cannot
+    /// clone files, the copy reads and writes the whole db file.
     pub(crate) fn copy(&self, from: &Generation) -> Result<Building, GenerationError> {
         let id = GenId::random().map_err(|source| GenerationError::Random { source })?;
         let name = format!("{GEN}{}", id.hex());
@@ -818,7 +818,7 @@ impl Root {
 pub(crate) enum Fate {
     /// Renamed to `gen-<id32>.trash` and deleted.
     Trash,
-    /// Moved into `salvage/` with this manifest (design §6.2, D3).
+    /// Moved into `salvage/` with this manifest (design: History).
     Salvage(Manifest),
 }
 
@@ -855,7 +855,7 @@ pub(crate) struct Building {
 
 impl Building {
     /// Publishes the generation: writes the page 1 of an empty database into a db file nothing was
-    /// applied to (design D7), fsyncs the db, the log and the directory, writes the salvage
+    /// applied to (design: Layout), fsyncs the db, the log and the directory, writes the salvage
     /// manifest into the generation it supersedes when `fate` salvages it, renames the new one into
     /// place, fsyncs the root, then deletes the superseded one or moves it into `salvage/`.
     pub(crate) fn publish(self, fate: Fate) -> Result<Generation, GenerationError> {

@@ -1,4 +1,5 @@
-//! The producer record and the evaluation of a producer write, #581 §2.3 and §2.3.1, as the text
+//! The producer record and the evaluation of a producer write (extensions: Producer Write Answers,
+//! Epoch Floor), as the text
 //! states them. [`evaluate`] returns the row that decided, so tests cite rows by number.
 
 use ursula_headers::BodyDigest;
@@ -14,10 +15,10 @@ use ursula_headers::Receipt;
 use ursula_headers::Seq;
 
 /// A record whose producer wrote nothing for this long is retired at its producer's next write
-/// (#581 §2.7).
+/// (extensions: Client Rules).
 pub(crate) const IDLE_RETIREMENT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// Per stream and producer (#581 §2.3).
+/// Per stream and producer (extensions: Producer Write Answers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProducerRecord {
     /// The current epoch, with the epoch its claim closed and that epoch's last seq.
@@ -30,7 +31,8 @@ pub(crate) struct ProducerRecord {
     pub(crate) newest: Receipt,
     /// The digest the write at `last` carried.
     pub(crate) newest_digest: Option<BodyDigest>,
-    /// The group's history id when the claim of the current epoch applied (G2).
+    /// The group's history id when the claim of the current epoch applied (extensions: Producer
+    /// Write Answers, `epoch-closed;by=history`).
     pub(crate) history: u64,
     /// Whether the record was opened at or below the stream's floor, which only an untokened claim
     /// can do, and no claim above the floor has applied since: tokened writes on such a record are
@@ -40,7 +42,8 @@ pub(crate) struct ProducerRecord {
 }
 
 impl ProducerRecord {
-    /// Whether a history event happened since the claim of the current epoch (#581 §4.6).
+    /// Whether a history event happened since the claim of the current epoch
+    /// (extensions: Producer Write Answers, `epoch-closed;by=history`).
     fn history_fenced(&self, group_history: u64) -> bool {
         self.history != group_history
     }
@@ -104,7 +107,8 @@ pub(crate) enum Decision {
     Answer(ProducerAnswer),
 }
 
-/// The row of §2.3.1 that matched first, and its decision.
+/// The row of the producer rules (extensions: Producer Write Answers) that matched first, and its
+/// decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Evaluation {
     pub(crate) row: u8,

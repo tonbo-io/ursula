@@ -64,8 +64,8 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
 }
 
 /// A step of the commit path, of a checkpoint, of a re-key, of a trim or cut of the log, of a
-/// generation's copy or of its publish that `URSULA_VFS_ABORT_AT` can stop the process at (design §4.1, §4.3, §5.1, §5.6,
-/// §6.2).
+/// generation's copy or of its publish that `URSULA_VFS_ABORT_AT` can stop the process at (design:
+/// Capture, Fsyncs, Layout, Materialize, History).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     /// A write transaction's first WAL write, admitted.
@@ -148,9 +148,9 @@ impl Step {
 }
 
 /// Test hook `URSULA_VFS_ABORT_AT=<step>[:<n>]`: kills the process with SIGKILL the `n`-th time (1
-/// by default) it reaches `step` ([`Step`], by its name), as a crash there would stop it (design
-/// §12). SIGKILL rather than `abort()`: nothing of the process runs after it, and no crash report
-/// or core is written.
+/// by default) it reaches `step` ([`Step`], by its name), as a crash there would stop it (design:
+/// Verification). SIGKILL rather than `abort()`: nothing of the process runs after it, and no crash
+/// report or core is written.
 pub(crate) fn abort_at(step: Step) {
     static V: OnceLock<Option<(String, u64)>> = OnceLock::new();
     static SEEN: Mutex<u64> = Mutex::new(0);
@@ -185,7 +185,7 @@ fn kill_self() -> ! {
 }
 
 /// `URSULA_VFS_MAX_REQUEST_BYTES`: a request limit below the server's, for a layer in front of it
-/// that refuses larger bodies (design §4.6). Unset, or not a number of bytes (logged once as
+/// that refuses larger bodies (design: Appends). Unset, or not a number of bytes (logged once as
 /// `setting_adjusted`): the server's alone.
 pub(crate) fn max_request_bytes() -> Option<u64> {
     static V: OnceLock<Option<u64>> = OnceLock::new();
@@ -206,8 +206,8 @@ pub(crate) fn max_request_bytes() -> Option<u64> {
 }
 
 /// Test hook `URSULA_VFS_SNAPSHOT_DUE_BYTES`: a snapshot is due once more frame bytes than this
-/// are acknowledged since the latest one, instead of past the db file's size or 8 MiB (design
-/// §4.11). Unset, or not a number of bytes: the design's threshold.
+/// are acknowledged since the latest one, instead of past the db file's size or 8 MiB (design:
+/// Snapshots). Unset, or not a number of bytes: the design's threshold.
 pub(crate) fn snapshot_due_bytes() -> Option<u64> {
     static V: OnceLock<Option<u64>> = OnceLock::new();
     *V.get_or_init(|| {
@@ -218,8 +218,8 @@ pub(crate) fn snapshot_due_bytes() -> Option<u64> {
 }
 
 /// `URSULA_VFS_MIN_UPLOAD_KBPS`: the slowest upload, in KiB/s, an attempt's body time limit allows
-/// for (256 by default, at least 1): a body of `n` bytes may take `5 s + n / rate` to send (design
-/// §4.12, #566).
+/// for (256 by default, at least 1): a body of `n` bytes may take `5 s + n / rate` to send (design:
+/// Transport, #566).
 pub(crate) fn min_upload_kbps() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {

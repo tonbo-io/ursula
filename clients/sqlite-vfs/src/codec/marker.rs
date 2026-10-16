@@ -120,8 +120,8 @@ pub fn is_marked(head: &[u8], lineage: Lineage) -> bool {
 }
 
 /// Page 1 of an empty database in WAL mode, marked for a generation of `lineage`: what a
-/// generation's db file holds when it is published without a commit (design D7), so no published
-/// db file is ever empty or unmarked.
+/// generation's db file holds when it is published without a commit (design: Layout), so no
+/// published db file is ever empty or unmarked.
 ///
 /// The bytes are those SQLite writes for a new database (`sqlite3BtreeNewDb`), then WAL mode: a
 /// 4096-byte page, file format versions 2 and 2 (WAL), the default payload fractions, one page,

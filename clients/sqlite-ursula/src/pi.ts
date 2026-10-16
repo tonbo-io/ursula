@@ -1,4 +1,4 @@
-// `@tonbo/sqlite-ursula/pi` (design §8.5): Pi Durable's official node SqliteStorage on a replicated
+// `@tonbo/sqlite-ursula/pi` (design: Pi): Pi Durable's official node SqliteStorage on a replicated
 // database. The only module that imports `@earendil-works/pi-durable`, an optional peer dependency of
 // the package, so an application that uses the root entry alone never installs it.
 import * as durable from "@earendil-works/pi-durable";

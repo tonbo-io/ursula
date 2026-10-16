@@ -16,15 +16,15 @@
 //! ([`BindingHandle::give_up`]), waits for it to retire and binds anew, and is refused `in_use`
 //! otherwise.
 //!
-//! A read-only open (design D6) in a process that owns the stream under the same cache root gets
-//! the owner's binding, so its read-only connection sees the owner's latest commits. Nothing in the
-//! VFS makes that connection read-only: a write on the owner's binding is the owning process's own,
-//! so a host opens the returned path with `SQLITE_OPEN_READONLY`. Under another cache root it meets
-//! the owner's binding as an owner's open would: given up when nothing of the host holds it, and
-//! refused otherwise. Only a process with no binding of the stream opens a reader binding, in a
-//! reader directory of its own, which later read-only opens of the process share while it is
-//! bound: a reader sees the stream as of the open that bound it, and the first read-only open
-//! after it retired catches up again.
+//! A read-only open (design: Readers) in a process that owns the stream under the same cache root
+//! gets the owner's binding, so its read-only connection sees the owner's latest commits. Nothing
+//! in the VFS makes that connection read-only: a write on the owner's binding is the owning
+//! process's own, so a host opens the returned path with `SQLITE_OPEN_READONLY`. Under another
+//! cache root it meets the owner's binding as an owner's open would: given up when nothing of the
+//! host holds it, and refused otherwise. Only a process with no binding of the stream opens a
+//! reader binding, in a reader directory of its own, which later read-only opens of the process
+//! share while it is bound: a reader sees the stream as of the open that bound it, and the first
+//! read-only open after it retired catches up again.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -114,14 +114,14 @@ pub(crate) struct Commit {
     pub(crate) wal_open: usize,
     /// The checkpoint in progress (checkpoint lock held), and whether it wrote a db page yet.
     pub(crate) checkpoint: Option<(Instant, bool)>,
-    /// Main db handles whose logged commit is undecided (design §4.2), by address.
+    /// Main db handles whose logged commit is undecided (design: Publication), by address.
     pub(crate) undecided: BTreeMap<usize, Position>,
     /// The last commit SQLite published (PHASETWO), and the last BASE record written.
     pub(crate) confirmed: Position,
     pub(crate) based: Position,
     /// The latest write refused, until a commit is logged.
     pub(crate) refused: Option<WriteRefusal>,
-    /// The snapshot thread's window (design §4.11).
+    /// The snapshot thread's window (design: Snapshots).
     pub(crate) window: Window,
     pub(crate) stats: Stats,
 }
@@ -180,9 +180,9 @@ impl Binding {
     }
 
     /// The log, for a connection's append (a COMMIT, an ACK or a BASE record), unless the binding
-    /// reset. The reset is checked under the log's lock (G8), and the driver takes that lock once it
-    /// marks a reset, so no connection appends to the log after the reset: an open may copy it
-    /// (design §5.6).
+    /// reset. The reset is checked under the log's lock (design: Materialize), and the driver takes
+    /// that lock once it marks a reset, so no connection appends to the log after the reset: an
+    /// open may copy it (design: Materialize).
     pub(crate) fn log_unless_reset(&self) -> Result<MutexGuard<'_, Log>, LogRefused> {
         let log = self.handle.log()?;
         match self.reset_kind() {
@@ -439,11 +439,11 @@ enum Claim {
 /// holds is given up ([`BindingHandle::give_up`]) and leaves the registry, and the driver starts
 /// the new open once it retired. A reset or retired binding leaves the registry for a new open,
 /// which beside a reset binding's open connections shares their root and builds from a copy of
-/// their generation (design §5.6).
+/// their generation (design: Materialize).
 ///
-/// A reader's open first meets the owner's binding of the stream by the same rule (design D6):
-/// under the same root it shares it, under another one it gives it up or is refused. Only with no
-/// owner's binding left does it go to its own reader binding or open.
+/// A reader's open first meets the owner's binding of the stream by the same rule (design:
+/// Readers): under the same root it shares it, under another one it gives it up or is refused. Only
+/// with no owner's binding left does it go to its own reader binding or open.
 fn claim(
     reg: &mut Registry,
     key: &OpenKey,
@@ -664,7 +664,7 @@ fn forget(open: OpenId) -> Option<String> {
     reg.opens.remove(&name).map(|entry| entry.url)
 }
 
-/// The default cache root (design §5.1): `<user cache>/sqlite-ursula/0.8`.
+/// The default cache root (design: Layout): `<user cache>/sqlite-ursula/0.8`.
 fn default_dir() -> PathBuf {
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     let cache = std::env::var_os("XDG_CACHE_HOME")

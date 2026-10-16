@@ -150,7 +150,7 @@ pub(crate) enum Checkpoint {
 }
 
 /// A private connection of the extension's own, in the extension's process. [`Private::open`]
-/// goes through the "ursula" VFS, so its checkpoints take F1 (design §4.3) and it counts as a
+/// goes through the "ursula" VFS, so its checkpoints take F1 (design: Fsyncs) and it counts as a
 /// connection of the binding: the snapshot thread's checkpoint, read transaction, page copy and
 /// db fsync.
 pub(crate) struct Private {
@@ -293,7 +293,7 @@ impl Private {
     }
 
     /// fsyncs the db file through the connection's own handle, bypassing the "ursula" VFS's
-    /// `xSync`, which is a no-op for a bound database (design §4.3).
+    /// `xSync`, which is a no-op for a bound database (design: Fsyncs).
     pub(crate) fn sync_db(&self) -> Result<(), HostError> {
         let (f, _) = self.db_file()?;
         // SAFETY: `f` is the connection's open db file, a file of the "ursula" VFS.

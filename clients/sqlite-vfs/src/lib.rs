@@ -1,5 +1,5 @@
 //! SQLite loadable extension: a shim VFS ("ursula", registered as the default) over "unix" for
-//! databases bound to Ursula streams (design: SQLite VFS 0.8, #582). A commit is local: at
+//! databases bound to Ursula streams (docs/architecture/sqlite-vfs.md). A commit is local: at
 //! SQLite's commit point the VFS appends the transaction's final pages to a log the extension owns
 //! (one write, no fsync, no network), and a process-wide driver replicates the log to the stream in
 //! the background, one append in flight, resent unchanged until a definite answer. Durable means
@@ -62,6 +62,9 @@
 //! bytes it publishes a `USS3` snapshot keyed by its stream offset and digest, and moves
 //! retention one snapshot behind. Builds install the latest snapshot, then read the tail.
 //!
+//! Comments cite `design: <Heading>` for a heading of `docs/architecture/sqlite-vfs.md` and
+//! `extensions: <Heading>` for a heading of the extensions specification.
+//!
 //! Module map:
 //!
 //! - [`codec`]: the formats (`USQ2` frames, `USL1` log segments, `USS3` snapshot bodies, the
@@ -91,7 +94,7 @@
 //! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
 //!   the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
-//! - `open`: opening a stream (design §5.5) up to its takeover, or a reader's bind, run by the
+//! - `open`: opening a stream (design: Open) up to its takeover, or a reader's bind, run by the
 //!   driver.
 //! - `options`: `ursula_open`'s `options_json`.
 //! - `publication`: whether SQLite published a logged commit, from the calls on its main db handle.

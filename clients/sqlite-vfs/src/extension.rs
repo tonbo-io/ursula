@@ -159,9 +159,9 @@ unsafe fn arg_count(
     })
 }
 
-/// `ursula_open(url, dir, options_json, timeout_ms)` (design §8.6): `{done, path, name, state}`,
-/// or `{done: false, request}` while the open goes on. `dir` NULL or `''` is the default cache
-/// root; `timeout_ms` 0 returns at once.
+/// `ursula_open(url, dir, options_json, timeout_ms)` (design: SQL functions): `{done, path, name,
+/// state}`, or `{done: false, request}` while the open goes on. `dir` NULL or `''` is the default
+/// cache root; `timeout_ms` 0 returns at once.
 unsafe fn fn_open(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut ffi::sqlite3_value) {
     // SAFETY: SQLite calls the function with its arguments.
     let url = unsafe { arg(argc, argv, 0) };
@@ -202,9 +202,9 @@ unsafe fn fn_import(
     unsafe { result(ctx, "ursula_import", outcome.as_ref().map(Clone::clone)) };
 }
 
-/// `ursula_synced(path, timeout_ms)` (design §8.2): `{synced, ticket, target, acknowledged}`; with
-/// `synced` false the ticket resolves later, when a `synced` event of its path reaches `through` it
-/// (`ursula_events`). A reset fails it.
+/// `ursula_synced(path, timeout_ms)` (design: Synced): `{synced, ticket, target, acknowledged}`;
+/// with `synced` false the ticket resolves later, when a `synced` event of its path reaches
+/// `through` it (`ursula_events`). A reset fails it.
 unsafe fn fn_synced(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -218,7 +218,7 @@ unsafe fn fn_synced(
         if let Some(kind) = b.reset_kind() {
             return Err(Error::Reset(kind));
         }
-        // The last commit logged at the call (design §8.2): every commit a reader can see.
+        // The last commit logged at the call (design: Synced): every commit a reader can see.
         let target = Some(b.handle.last_commit());
         // With timeout 0 the outcome comes from `ursula_events` alone, and nothing is kept for it.
         let ticket = driver().sync(b.id, target, timeout > 0)?;
@@ -257,8 +257,8 @@ unsafe fn fn_synced(
     unsafe { result(ctx, "ursula_synced", outcome.as_ref().map(Clone::clone)) };
 }
 
-/// `ursula_events(cursor, timeout_ms)` (design §8.6): `{cursor, events}`, the events from `cursor`
-/// on, waiting at most `timeout_ms` for one.
+/// `ursula_events(cursor, timeout_ms)` (design: SQL functions): `{cursor, events}`, the events from
+/// `cursor` on, waiting at most `timeout_ms` for one.
 unsafe fn fn_events(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,
@@ -497,7 +497,8 @@ unsafe fn init(
 
 /// The oldest SQLite the extension loads into: 3.50.4, Node 22.19.0's (the oldest Node the
 /// package supports, on which CI runs the PHASETWO conformance), as `sqlite3_libversion_number`
-/// spells it. Publication relies on when SQLite sends `SQLITE_FCNTL_COMMIT_PHASETWO` (design §4.2).
+/// spells it. Publication relies on when SQLite sends `SQLITE_FCNTL_COMMIT_PHASETWO` (design:
+/// Publication).
 pub(crate) const MIN_SQLITE: c_int = 3_050_004;
 
 /// Why the extension refuses to load into the host's SQLite.
