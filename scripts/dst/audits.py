@@ -521,6 +521,7 @@ EXPECTED_PR_FAMILIES = {
     "stale-writers-after-restore",
     "recovery-plan-cut-under-restarts",
     "recovery-plan-survivor-campaigns",
+    "routing-before-body-under-leader-churn",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
@@ -530,8 +531,9 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "history-rewind-under-leader-churn-extended",
     "recovery-plan-cut-under-restarts-extended",
     "recovery-plan-survivor-campaigns-extended",
+    "routing-before-body-under-leader-churn-extended",
 }
-EXPECTED_NIGHTLY_RANGES = {"60..=199"}
+EXPECTED_NIGHTLY_RANGES = {"60..=199", "503..=504"}
 
 # PR ≤ 2 min, Nightly ≤ 30 min at ~70 seeds/min/core conservative
 # (bundled invocation amortises cargo startup). See the `CI` section of

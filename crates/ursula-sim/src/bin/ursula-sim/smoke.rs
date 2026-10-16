@@ -322,6 +322,10 @@ fn generate_recovery_plan_survivor_campaigns(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanSurvivorCampaigns)
 }
 
+fn generate_routing_before_body_under_leader_churn(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::RoutingBeforeBodyUnderLeaderChurn)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -336,6 +340,20 @@ struct SeedFamily {
 /// NOTE: `scripts/dst/audits.py` parses this table (the `name`, `start`, and
 /// `end` fields) for the seed-inventory audit; keep the field layout intact.
 const SEED_FAMILIES: &[SeedFamily] = &[
+    SeedFamily {
+        name: "routing-before-body-under-leader-churn",
+        start: 500,
+        end: 502,
+        kind: "routing-before-body-under-leader-churn",
+        generate: generate_routing_before_body_under_leader_churn,
+    },
+    SeedFamily {
+        name: "routing-before-body-under-leader-churn-extended",
+        start: 950,
+        end: 979,
+        kind: "routing-before-body-under-leader-churn",
+        generate: generate_routing_before_body_under_leader_churn,
+    },
     SeedFamily {
         name: "history-rewind-under-leader-churn",
         start: 375,

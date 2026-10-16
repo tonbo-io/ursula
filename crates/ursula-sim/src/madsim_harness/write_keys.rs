@@ -27,7 +27,6 @@ use axum::http::Response;
 use ursula_headers::Delivery;
 use ursula_headers::ProducerAnswer;
 use ursula_raft::InProcessRaftNetworkPolicy;
-use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::ShardPlacement;
 
 use super::Arc;
@@ -58,9 +57,9 @@ pub(super) const REPEATS_INVARIANT: &str = "producer_repeats_are_exactly_once";
 pub(super) const EXPIRY_INVARIANT: &str = "idle_expiry_cannot_reopen_an_epoch";
 /// The epoch the expiry scenario's producer holds when it retires.
 const EXPIRY_EPOCH: u64 = 3;
-const CONTENT_TYPE: &str = "application/octet-stream";
+pub(super) const CONTENT_TYPE: &str = "application/octet-stream";
 /// Every body is this long, so the stream splits back into bodies.
-const BODY_LEN: usize = 16;
+pub(super) const BODY_LEN: usize = 16;
 const IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// How long the network holds each Raft RPC back while a write is caught
 /// in flight.
@@ -107,15 +106,15 @@ impl Controls {
 /// A body: its producer, the seq it was written for, and whether a clone
 /// wrote it. Padded to [`BODY_LEN`] bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Label {
-    producer: u8,
-    epoch: u64,
-    seq: u64,
-    clone: bool,
+pub(super) struct Label {
+    pub(super) producer: u8,
+    pub(super) epoch: u64,
+    pub(super) seq: u64,
+    pub(super) clone: bool,
 }
 
 impl Label {
-    fn body(self) -> Vec<u8> {
+    pub(super) fn body(self) -> Vec<u8> {
         let mut body = format!(
             "{}e{}s{:02}{}",
             char::from(b'a'.saturating_add(self.producer)),
@@ -128,7 +127,7 @@ impl Label {
         body
     }
 
-    fn parse(bytes: &[u8]) -> Option<Self> {
+    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?.trim_end_matches('.');
         let producer = text.bytes().next()?.checked_sub(b'a')?;
         let rest = text.get(1..)?.strip_prefix('e')?;
@@ -146,7 +145,7 @@ impl Label {
         })
     }
 
-    fn producer_id(self) -> String {
+    pub(super) fn producer_id(self) -> String {
         format!("writer-{}", self.producer)
     }
 }
@@ -176,7 +175,10 @@ fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: Strin
     panic!("invariant `{invariant}` failed after `{after_event}`: {message}");
 }
 
-/// A runtime over a three-node group, its HTTP router and its clock.
+/// A runtime over a three-node group, its HTTP router and its clock. The
+/// router's `HttpState` reads leadership from the factory's front-door
+/// registry, so writes are routed before their body by the production
+/// leadership view.
 pub(super) struct Cluster {
     pub(super) app: Router,
     policy: InProcessRaftNetworkPolicy,
@@ -185,7 +187,7 @@ pub(super) struct Cluster {
     pub(super) placement: ShardPlacement,
     now_ms: Arc<AtomicU64>,
     pub(super) path: String,
-    incarnation: String,
+    pub(super) incarnation: String,
     pub(super) leader_kills: u64,
 }
 
@@ -224,14 +226,13 @@ impl Cluster {
             .expect("spawn hosted runtime over a three-node raft group");
         let peers = (1..=3).map(|node_id| (node_id, format!("http://runtime-raft-node-{node_id}")));
         let now_ms = Arc::new(AtomicU64::new(1_000));
-        let state = HttpState::with_static_raft_cluster(
-            runtime.clone(),
-            RaftGroupHandleRegistry::default(),
-            peers,
-        )
-        .with_wall_clock_handle(Arc::new(SimHttpWallClock {
-            now_ms: Arc::clone(&now_ms),
-        }));
+        // The front door routes writes through the leadership view of the
+        // replica the runtime hosts, as a node's own registry does.
+        let state =
+            HttpState::with_static_raft_cluster(runtime.clone(), factory.front_door(), peers)
+                .with_wall_clock_handle(Arc::new(SimHttpWallClock {
+                    now_ms: Arc::clone(&now_ms),
+                }));
         let app = router_with_http_state(state);
         trace.push(SimEvent::ClusterBuilt { seed: config.seed });
         let path = format!("/{}/{}", config.stream.bucket_id, config.stream.stream_id);

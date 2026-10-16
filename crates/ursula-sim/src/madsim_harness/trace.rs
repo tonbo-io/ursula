@@ -633,6 +633,17 @@ pub enum SimEvent {
         tidied: bool,
         leader_kills: u64,
     },
+    /// The routing invariants held across `leader_changes` leader changes:
+    /// `keys` keys applied once each, `redirects` writes were redirected
+    /// before their body, and `refused_after_body` writes whose body was
+    /// read were refused without a redirect.
+    RoutingBeforeBodyVerified {
+        stream: BucketStreamId,
+        keys: u64,
+        redirects: u64,
+        refused_after_body: u64,
+        leader_changes: u64,
+    },
     /// `rewind_applies_exactly_once` held: a restore started one history,
     /// which `answers` import answers named, across `leader_kills` kills.
     HistoryRewindVerified {
