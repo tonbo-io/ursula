@@ -48,6 +48,7 @@ fn sealed() -> Sealed {
         last: crate::ids::Position(6),
         body: Arc::from(b"batch".to_vec()),
         expected_start: off(100),
+        part: None,
     }
 }
 

@@ -2501,7 +2501,6 @@ fn ending(inst: &Instance) -> Result<&'static str, String> {
             match work {
                 Work::Idle => "idle",
                 Work::Append { .. } => "an append outstanding",
-                Work::Oversized { .. } => "an oversized frame",
             }
         )),
         Replicator::Activating { step, .. } => Err(format!("activating, {}", match step {

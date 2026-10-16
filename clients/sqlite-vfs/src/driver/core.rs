@@ -79,7 +79,10 @@ use super::disk::DiskDone;
 use super::disk::DiskJob;
 use super::disk::NewBuild;
 use super::disk::caught_up;
+use crate::codec::frame;
 use crate::codec::segment::RecordBody;
+use crate::config::Step;
+use crate::config::abort_at;
 use crate::generation::CanonicalPath;
 use crate::generation::Fate;
 use crate::generation::Root;
@@ -697,7 +700,6 @@ impl Core {
             log,
             pending_bytes: 0,
             max_pending_bytes: 0,
-            max_frame_bytes: MAX_BATCH_BYTES,
             acked: last,
             attach,
             role: Role::Reader,
@@ -708,14 +710,11 @@ impl Core {
         };
         let handle = Arc::new(BindingHandle::new(bind, root));
         handle.record_commit(last);
-        handle.set_replication(
-            Replication {
-                state: "none",
-                request_limit: MAX_BATCH_BYTES,
-                ..Replication::default()
-            },
-            None,
-        );
+        handle.set_replication(Replication {
+            state: "none",
+            request_limit: MAX_BATCH_BYTES,
+            ..Replication::default()
+        });
         let binding = BindingId(self.id());
         self.readers.insert(binding, Reader {
             handle: Arc::clone(&handle),
@@ -901,6 +900,9 @@ impl Core {
                     request,
                     attempt,
                 } => {
+                    if frame::part_index(&request.body).is_some_and(|index| index > 0) {
+                        abort_at(Step::PartSent);
+                    }
                     let url = Arc::clone(&b.url);
                     self.send(Owner::Replicator(binding, id), &url, request, attempt, ios);
                 }
@@ -1315,17 +1317,14 @@ impl Core {
             Replicator::Stopped => ("stopped", None),
         };
         let ctx = b.replicator.ctx();
-        handle.set_replication(
-            Replication {
-                state,
-                epoch,
-                condition: ctx.and_then(|ctx| ctx.condition.clone()),
-                pending: b.unacked.len(),
-                log_bytes: ctx.map_or(0, |ctx| ctx.log_bytes),
-                request_limit: ctx.map_or(MAX_BATCH_BYTES, |ctx| ctx.limits.request()),
-            },
-            ctx.map(|ctx| ctx.limits.batch()),
-        );
+        handle.set_replication(Replication {
+            state,
+            epoch,
+            condition: ctx.and_then(|ctx| ctx.condition.clone()),
+            pending: b.unacked.len(),
+            log_bytes: ctx.map_or(0, |ctx| ctx.log_bytes),
+            request_limit: ctx.map_or(MAX_BATCH_BYTES, |ctx| ctx.limits.request()),
+        });
         // Nothing pending, even while a claim or a provisional pre-check is out: a claim's CLAIM
         // record is logged before it goes out, so the next open knows the claim frame as its own.
         let drained = b.unacked.is_empty()
@@ -1384,7 +1383,6 @@ impl Core {
             log,
             pending_bytes: pending,
             max_pending_bytes: b.max_pending_bytes,
-            max_frame_bytes: ctx.map_or(MAX_BATCH_BYTES, |c| c.limits.batch()),
             acked: ctx.map_or(Position(0), |c| c.acked),
             attach: b.attach,
             provisional,

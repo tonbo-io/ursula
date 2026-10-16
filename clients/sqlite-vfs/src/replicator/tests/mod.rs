@@ -9,6 +9,7 @@
 
 mod answer_rows;
 mod machine;
+mod parts;
 mod reconcile_rows;
 mod rekey;
 mod world;

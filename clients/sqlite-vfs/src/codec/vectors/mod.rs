@@ -5,7 +5,8 @@
 //! extensions write to the stream or to disk, which every 0.8.x extension must keep reading. Fix
 //! the code, never the vector. A format change needs a new minor version with new magics.
 //!
-//! - [`CLAIM`] and [`COMMIT`]: `USQ2` frames.
+//! - [`CLAIM`], [`COMMIT`] and [`PARTS`]: `USQ2` frames, the last a run of two PART frames that
+//!   [`COMMIT`] cuts into.
 //! - [`SEGMENT`]: a `USL1` segment header and one record of each kind, and [`FRESH_HEADER`]: a
 //!   fresh build's header, with no `supersedes` and no claim.
 //! - [`SNAPSHOT_HEADER`]: a `USS3` snapshot body's 56-byte header.
@@ -53,6 +54,18 @@ const COMMIT: &str = "\
     555351320234000000de0e7652\
     11111111111111111111111111111111 0500000000000000\
     28b52ffd640c0f75000028010000005a0200fcc779f1eb888f1b3777";
+
+/// [`COMMIT`] cut into a run of two PART frames of 14 bytes of its compressed record each.
+const PARTS: [&str; 2] = [
+    "\
+    55535132032e0000009e4d1796\
+    11111111111111111111111111111111 0500000000000000 00000000 02000000\
+    28b52ffd640c0f75000028010000",
+    "\
+    55535132032e0000007946d9ea\
+    11111111111111111111111111111111 0500000000000000 01000000 02000000\
+    005a0200fcc779f1eb888f1b3777",
+];
 
 /// The `USL1` segment of [`header`], then a COMMIT record holding [`COMMIT`] at position 1, a
 /// CLAIM at 2, an ACK at 3 and a BASE at 4. Every carried field is distinct and non-zero, so a
@@ -227,6 +240,34 @@ fn the_commit_frame_is_frozen() {
     assert_eq!(*id, commit_id());
     assert_eq!(frame::decompress(compressed).unwrap(), record());
     assert_eq!(frame::encode(&frame).unwrap(), bytes);
+}
+
+#[test]
+fn the_part_frames_are_frozen() {
+    let commit = unhex(COMMIT);
+    let mut run = frame::PartRun::default();
+    let mut joined = None;
+    for (index, text) in (0u32..).zip(PARTS) {
+        let bytes = unhex(text);
+        let frame = decoded(&bytes);
+        let Frame::Part {
+            id,
+            index: at,
+            count,
+            chunk,
+        } = &frame
+        else {
+            panic!("not a part: {frame:?}");
+        };
+        assert_eq!((*id, *at, *count, chunk.len()), (commit_id(), index, 2, 14));
+        assert_eq!(frame::encode(&frame).unwrap(), bytes);
+        assert_eq!(frame::part_frame(&commit, index, 2, 14).unwrap(), bytes);
+        assert_eq!(frame::part_index(&bytes), Some(index));
+        joined = run.push(frame).unwrap();
+    }
+    assert_eq!(frame::part_count(&commit, 14).unwrap(), 2);
+    let joined = joined.expect("the run completes");
+    assert_eq!(frame::encode(&joined).unwrap(), commit);
 }
 
 #[test]

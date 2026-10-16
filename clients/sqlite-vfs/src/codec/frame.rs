@@ -49,6 +49,8 @@ const CLAIM_BODY: u32 = 24;
 const ID: usize = 24;
 /// A PART body before its chunk: the commit id, the index and the count.
 const PART_HEAD: usize = 32;
+/// The bytes of a PART frame beside its chunk: the frame header and the PART head.
+pub const PART_OVERHEAD: usize = HEADER + PART_HEAD;
 /// A commit record before its pages: the db size after the commit and the page count.
 const RECORD_HEAD: usize = 8;
 /// A commit record's page entry: the page number and the image.
@@ -110,6 +112,10 @@ pub enum FrameError {
     Checksum { expected: u32, found: u32 },
     #[error("part {index} of {count}: a run has at least two parts, each below the count")]
     PartIndex { index: u32, count: u32 },
+    #[error("a frame of kind {kind} cut into parts: only a COMMIT frame is")]
+    NotCommit { kind: u8 },
+    #[error("a compressed record of {len} bytes is not {count} parts of at most {chunk} bytes")]
+    PartChunk { len: u64, count: u32, chunk: u64 },
     #[error("a frame body or commit record of {len} bytes is too large")]
     TooLarge { len: u64 },
     #[error("a commit record of {pages} pages, above the 2^32 - 1 a record holds")]
@@ -223,6 +229,96 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FrameError> {
             wrap(PART, &body)
         }
     }
+}
+
+/// The commit id and the compressed record of the COMMIT frame `commit`, checked to be one
+/// whole COMMIT frame. Its checksum is not verified: the frame comes from our own log, which
+/// verified it on read.
+fn commit_slices(commit: &[u8]) -> Result<(&[u8], &[u8]), FrameError> {
+    let (head, body) = commit
+        .split_at_checked(HEADER)
+        .ok_or(FrameError::BodyLength {
+            kind: COMMIT,
+            len: commit.len() as u64,
+        })?;
+    let mut t = Take(head);
+    let magic = t.bytes(MAGIC.len()).unwrap_or_default();
+    if magic != MAGIC {
+        return Err(FrameError::Magic {
+            found: magic.to_vec(),
+        });
+    }
+    let kind = t.u8().unwrap_or_default();
+    if kind != COMMIT {
+        return Err(FrameError::NotCommit { kind });
+    }
+    let len = t.u32().unwrap_or_default();
+    if len as usize != body.len() || body.len() <= ID {
+        return Err(FrameError::BodyLength {
+            kind,
+            len: body.len() as u64,
+        });
+    }
+    Ok(body.split_at(ID))
+}
+
+/// How many parts of at most `chunk` bytes of its compressed record the COMMIT frame `commit`
+/// cuts into.
+pub fn part_count(commit: &[u8], chunk: usize) -> Result<u32, FrameError> {
+    let (_, compressed) = commit_slices(commit)?;
+    let refused = || FrameError::PartChunk {
+        len: compressed.len() as u64,
+        count: 0,
+        chunk: chunk as u64,
+    };
+    if chunk == 0 {
+        return Err(refused());
+    }
+    u32::try_from(compressed.len().div_ceil(chunk)).map_err(|_too_many| refused())
+}
+
+/// PART `index` of `count` of the COMMIT frame `commit`: the `index`-th slice of `chunk` bytes of
+/// its compressed record (the last one shorter), under the same commit id. `count` must be the
+/// [`part_count`] for `chunk`, so the run covers the record exactly. Pure: the same arguments give
+/// the same bytes, which is what keeps a part's body fixed across resends.
+pub fn part_frame(
+    commit: &[u8],
+    index: u32,
+    count: u32,
+    chunk: usize,
+) -> Result<Vec<u8>, FrameError> {
+    check_part(index, count)?;
+    let (id, compressed) = commit_slices(commit)?;
+    let wrong = || FrameError::PartChunk {
+        len: compressed.len() as u64,
+        count,
+        chunk: chunk as u64,
+    };
+    if part_count(commit, chunk)? != count {
+        return Err(wrong());
+    }
+    let start = (index as usize).checked_mul(chunk).ok_or_else(wrong)?;
+    let end = start.saturating_add(chunk).min(compressed.len());
+    let slice = compressed.get(start..end).ok_or_else(wrong)?;
+    let mut body = Vec::with_capacity(slice.len().saturating_add(PART_HEAD));
+    body.extend_from_slice(id);
+    body.extend_from_slice(&index.to_le_bytes());
+    body.extend_from_slice(&count.to_le_bytes());
+    body.extend_from_slice(slice);
+    wrap(PART, &body)
+}
+
+/// The index of the PART frame that `bytes` start with, or `None` when they do not start with
+/// one.
+pub fn part_index(bytes: &[u8]) -> Option<u32> {
+    let mut t = Take(bytes);
+    if t.bytes(MAGIC.len())? != MAGIC || t.u8()? != PART {
+        return None;
+    }
+    t.u32()?;
+    t.u32()?;
+    t.bytes(ID)?;
+    t.u32()
 }
 
 /// The record's length in bytes for `pages` pages: at most 8 + (2^32 - 1) x 4100, so it never

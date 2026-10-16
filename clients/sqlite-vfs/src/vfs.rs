@@ -929,19 +929,7 @@ unsafe fn commit(
             return ffi::SQLITE_IOERR_WRITE;
         }
     };
-    let max = b.handle.max_frame_bytes();
     let bytes = frame.len();
-    if u64::try_from(bytes).unwrap_or(u64::MAX) > max {
-        drop(log);
-        return refuse(
-            b,
-            &mut c,
-            WriteRefusal::Unsupported(format!(
-                "a commit frame of {bytes} bytes, above the batch limit of {max} bytes (M3 sends \
-                 parts)"
-            )),
-        );
-    }
     abort_at(Step::Encode);
     let logging = Instant::now();
     let body = RecordBody::Commit { frame };

@@ -512,3 +512,46 @@ fn a_claim_epoch_out_of_range_is_refused() {
     let frame = super::assemble(1, 24, &body);
     assert!(matches!(decode(&frame), Err(FrameError::Epoch(_))));
 }
+
+#[test]
+fn part_frames_cut_a_commit_and_join_back_to_it() {
+    let id = CommitId {
+        lineage: Lineage([7; 16]),
+        position: Position(9),
+    };
+    let compressed: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+    let commit = encode(&Frame::Commit { id, compressed }).unwrap();
+    let count = super::part_count(&commit, 300).unwrap();
+    assert_eq!(count, 4);
+    let mut run = PartRun::default();
+    let mut joined = None;
+    for index in 0..count {
+        let part = super::part_frame(&commit, index, count, 300).unwrap();
+        assert_eq!(super::part_index(&part), Some(index));
+        let last = if index + 1 == count { 100 } else { 300 };
+        assert_eq!(part.len(), super::PART_OVERHEAD + last);
+        joined = run.push(decoded(&part)).unwrap();
+    }
+    assert_eq!(encode(&joined.unwrap()).unwrap(), commit);
+    // A count that does not cover the record exactly, an empty chunk, an index past the run.
+    assert!(matches!(
+        super::part_frame(&commit, 0, 3, 300),
+        Err(FrameError::PartChunk { count: 3, .. })
+    ));
+    assert!(matches!(
+        super::part_count(&commit, 0),
+        Err(FrameError::PartChunk { chunk: 0, .. })
+    ));
+    assert!(matches!(
+        super::part_frame(&commit, 4, 4, 300),
+        Err(FrameError::PartIndex { index: 4, count: 4 })
+    ));
+    // Only a COMMIT frame cuts.
+    let claim = encode_claim(epoch(1), Activation([1; 16]));
+    assert!(matches!(
+        super::part_count(&claim, 300),
+        Err(FrameError::NotCommit { kind: 1 })
+    ));
+    assert_eq!(super::part_index(&commit), None);
+    assert_eq!(super::part_index(&claim), None);
+}
