@@ -18,6 +18,9 @@ use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Inherited;
 use ursula_headers::MAX_INCARNATION;
 use ursula_headers::Offset;
+use ursula_headers::PartId;
+use ursula_headers::PartsCommit;
+use ursula_headers::PartsManifest;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerId;
 use ursula_headers::ProducerRequestHeaders;
@@ -1391,4 +1394,234 @@ fn malformed_answers_are_protocol_violations() {
             name: "producer-outcome"
         })
     );
+}
+
+/// Stages `body` as a part of the snapshot at `offset`: its id, or the answer's status.
+fn stage(world: &World, token: Incarnation, offset: u64, body: &[u8]) -> Result<PartId, u16> {
+    let answer = world.send(&Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        body: Arc::from(body),
+        ..Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(offset),
+        })
+    });
+    match answer.typed {
+        Ok(Typed::PartStaged(staged)) if answer.status == 201 => Ok(staged.part),
+        _ => Err(answer.status),
+    }
+}
+
+/// The commit at `offset` of `parts`, whose whole body digests to `digest`.
+fn commit(token: Incarnation, offset: u64, parts: &[PartId], digest: SnapshotDigest) -> Request {
+    let manifest = PartsManifest::new(parts.to_vec()).unwrap();
+    Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        content_type: Some(CONTENT_TYPE.to_owned()),
+        parts: Some(Box::new(PartsCommit::for_manifest(&manifest, digest))),
+        body: Arc::from(manifest.render().into_bytes()),
+        ..Request::new(Method::Put, Target::Snapshot {
+            offset: Offset::from_u64(offset),
+        })
+    }
+}
+
+fn digest_of(body: &[u8]) -> SnapshotDigest {
+    let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+    digester.update(body);
+    digester.finalize()
+}
+
+fn with_cold_store(world: &World) {
+    let limits = world.server().limits();
+    world.server().set_limits(Limits {
+        max_snapshot_bytes: Some(super::MAX_SNAPSHOT_BYTES),
+        ..limits
+    });
+}
+
+// Staging mints a new id for every request, a repeat included; a commit assembles the parts in
+// manifest order, publishes, and deletes them; its repeat answers 204 from the key with the parts
+// gone.
+#[test]
+fn parts_stage_under_minted_ids_and_a_commit_publishes_them_in_order() {
+    let world = World::new();
+    with_cold_store(&world);
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 64]).unwrap();
+    let a = stage(&world, token, 64, b"first ").unwrap();
+    let again = stage(&world, token, 64, b"first ").unwrap();
+    assert_ne!(a, again, "staging is not idempotent");
+    let b = stage(&world, token, 64, b"second").unwrap();
+    assert_eq!(world.server().staged_parts(), 3);
+    let digest = digest_of(b"first second");
+    let published = Ok(Typed::Snapshot(SnapshotPublishAnswer::Published {
+        snapshot: SnapshotRef {
+            offset: Offset::from_u64(64),
+            digest,
+        },
+        incarnation: token,
+    }));
+    let answer = world.send(&commit(token, 64, &[a.clone(), b.clone()], digest));
+    assert_eq!((answer.status, answer.typed), (204, published.clone()));
+    // The commit's parts are gone; the repeat staged beside them stays for the sweep.
+    assert_eq!(world.server().staged_parts(), 1);
+    let repeat = world.send(&commit(token, 64, &[a, b], digest));
+    assert_eq!((repeat.status, repeat.typed), (204, published));
+    let read = world.send(&Request::snapshot_read(
+        Offset::from_u64(64),
+        token,
+        crate::wire::SnapshotPart::Chunk {
+            first: 0,
+            last: 1 << 20,
+        },
+    ));
+    assert_eq!(read.body, b"first second");
+}
+
+// The key comes first: a commit that a later snapshot supersedes, or whose offset holds another
+// one, is answered 409 naming the latest, before any part is looked at; below retention with no
+// later snapshot deciding, 410; beyond the tail, 409 naming none.
+#[test]
+fn a_commit_checks_its_key_before_its_parts() {
+    let world = World::new();
+    with_cold_store(&world);
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 100]).unwrap();
+    let (later, later_digest) = publish(token, 60, b"image at 60");
+    assert_eq!(world.send(&later).status, 204);
+    let latest = SnapshotRef {
+        offset: Offset::from_u64(60),
+        digest: later_digest,
+    };
+    let unknown = PartId::new("never-staged.part").unwrap();
+    for offset in [40, 60] {
+        let answer = world.send(&commit(
+            token,
+            offset,
+            std::slice::from_ref(&unknown),
+            digest_of(b"x"),
+        ));
+        assert_eq!(answer.status, 409);
+        assert_eq!(
+            answer.typed,
+            Ok(Typed::Snapshot(SnapshotPublishAnswer::Conflict { latest }))
+        );
+    }
+    let beyond = world.send(&commit(
+        token,
+        500,
+        std::slice::from_ref(&unknown),
+        digest_of(b"x"),
+    ));
+    assert_eq!((beyond.status, beyond.typed), (409, Ok(Typed::Untyped)));
+    // Retention past an offset that no snapshot decides: 410.
+    let other = World::new();
+    with_cold_store(&other);
+    let token = other.create();
+    other.server().foreign_append(PATH, &[0; 100]).unwrap();
+    other.server().streams.get_mut(PATH).unwrap().retained = Offset::from_u64(50);
+    let below = other.send(&commit(token, 40, &[unknown], digest_of(b"x")));
+    assert_eq!(below.status, 410);
+}
+
+// After the key: an unknown or listed-twice part, or a wrong count, is 400 and the parts stay
+// for a corrected commit; a snapshot above the limit is 413 naming it, the parts kept; another
+// token is 412; a digest that differs is 400 and consumes them.
+#[test]
+fn a_commit_refuses_its_parts_as_the_server_does() {
+    let world = World::new();
+    with_cold_store(&world);
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 64]).unwrap();
+    let a = stage(&world, token, 64, b"one").unwrap();
+    let b = stage(&world, token, 64, b"two").unwrap();
+    let digest = digest_of(b"onetwo");
+    let unknown = PartId::new("never-staged.part").unwrap();
+    assert_eq!(
+        world
+            .send(&commit(token, 64, &[a.clone(), unknown], digest))
+            .status,
+        400
+    );
+    // A count that does not match the manifest, and an id listed twice.
+    let mut miscounted = commit(token, 64, &[a.clone(), b.clone()], digest);
+    miscounted.parts = Some(Box::new(PartsCommit {
+        parts: ursula_headers::PartCount::try_from(3_u32).unwrap(),
+        digest,
+    }));
+    assert_eq!(world.send(&miscounted).status, 400);
+    let mut twice = commit(token, 64, &[a.clone(), b.clone()], digest);
+    twice.body = Arc::from(format!("{a}\n{a}\n").into_bytes());
+    assert_eq!(world.send(&twice).status, 400);
+    assert_eq!(world.server().staged_parts(), 2, "nothing copied, all kept");
+    // Another token: 412, before the parts.
+    let other = Incarnation::try_from(token.get() ^ 1).unwrap();
+    assert_eq!(
+        world
+            .send(&commit(other, 64, &[a.clone(), b.clone()], digest))
+            .status,
+        412
+    );
+    // Above the snapshot limit: 413 naming it, the parts kept.
+    let limits = world.server().limits();
+    world.server().set_limits(Limits {
+        max_snapshot_bytes: Some(5),
+        ..limits
+    });
+    let over = world.send(&commit(token, 64, &[a.clone(), b.clone()], digest));
+    assert_eq!(
+        (over.status, over.typed),
+        (413, Ok(Typed::TooLarge(Some(SizeLimit::Snapshot(5)))))
+    );
+    assert_eq!(world.server().staged_parts(), 2);
+    with_cold_store(&world);
+    // A digest that differs: the copy consumed the parts.
+    let wrong = world.send(&commit(token, 64, &[b.clone(), a.clone()], digest));
+    assert_eq!(wrong.status, 400);
+    assert_eq!(world.server().staged_parts(), 0);
+    assert_eq!(world.send(&commit(token, 64, &[a, b], digest)).status, 400);
+}
+
+// Without a cold store a part and a commit are 501; parts no commit used are swept after a day
+// on the model's clock; Busy and InProgress are scripted 503s with `Retry-After`.
+#[test]
+fn parts_need_a_cold_store_and_are_swept_after_a_day() {
+    let world = World::new();
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 64]).unwrap();
+    assert_eq!(stage(&world, token, 64, b"x"), Err(501));
+    let unknown = PartId::new("never-staged.part").unwrap();
+    let probe = commit(token, 64, std::slice::from_ref(&unknown), digest_of(b"x"));
+    assert_eq!(world.send(&probe).status, 501);
+    with_cold_store(&world);
+    let part = stage(&world, token, 64, b"x").unwrap();
+    world.server().advance(super::PART_GRACE_MS - 1);
+    assert_eq!(world.server().staged_parts(), 1);
+    world.server().advance(1);
+    let swept = world.send(&commit(token, 64, &[part], digest_of(b"x")));
+    assert_eq!(swept.status, 400, "swept");
+    assert_eq!(world.server().staged_parts(), 0);
+    for (refusal, code) in [
+        (super::faults::CommitRefusal::Busy, "SnapshotCommitsBusy"),
+        (
+            super::faults::CommitRefusal::InProgress,
+            "SnapshotCommitInProgress",
+        ),
+    ] {
+        world.server().inject(Scripted {
+            method: Some(Method::Put),
+            fault: Fault::CommitRefused(refusal),
+            times: 1,
+        });
+        let refused = world.send(&probe);
+        assert_eq!(refused.status, 503);
+        assert_eq!(refused.retry_after, Some(std::time::Duration::from_secs(1)));
+        assert!(String::from_utf8_lossy(&refused.body).contains(code));
+    }
 }

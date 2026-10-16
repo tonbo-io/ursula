@@ -527,12 +527,14 @@ impl Fetch {
 /// the generation it supersedes stays whole until then, and a failed build leaves it in place. A
 /// crash midway leaves only the `.tmp`, which the next open deletes (`finish_leftovers`).
 ///
-/// A HEAD names the latest snapshot. Its body is read in byte ranges of the request limit, at
-/// most [`MAX_SNAPSHOT_CHUNK`], each written into `snapshot.body` in the `.tmp` by a disk job of
-/// its own, so memory stays bounded by one chunk. Every `206` must continue where the file ends,
-/// name the same total length, and name the snapshot the HEAD named; anything else deletes the
-/// `.tmp` and starts over from the HEAD. A `200` is the whole body, from a server that ignored
-/// `Range`; a `404` or `416` sends the HEAD again. The whole file is then checked as it streams
+/// A HEAD names the latest snapshot. Its body is read in byte ranges of the HEAD's request limit,
+/// at most [`MAX_SNAPSHOT_CHUNK`], each written into `snapshot.body` in the `.tmp` by a disk job
+/// of its own, so memory stays bounded by one chunk. Every `206` must continue where the file
+/// ends, name the same total length, and name the snapshot the HEAD named; anything else deletes
+/// the `.tmp` and starts over from the HEAD. A `200` is the whole body, from a server that ignored
+/// `Range`, and a read after one that got no definite answer waits as long as the whole body
+/// takes. A `404` sends the HEAD again, and so does a `416`, after the open's backoff and counted
+/// as a recheck. The whole file is then checked as it streams
 /// (the digest the stream names, the `USS3` header's checksum and offset) and only then installed
 /// into the db file, whose image's checksum [`read_image`] checks; an ACK record then names the
 /// snapshot's offset as acknowledged at the position before the log's first (the base the header
@@ -569,8 +571,6 @@ pub(crate) struct Build {
     /// The latest HEAD the build read: a fresh build that started over after a history change
     /// takes over with its token.
     head: Option<StreamHead>,
-    /// `URSULA_VFS_MAX_REQUEST_BYTES`, which bounds a snapshot chunk with the HEAD's limit.
-    configured_max_request_bytes: Option<u64>,
 }
 
 /// A build published: the generation materialized, the highest epoch a CLAIM read named, where the
@@ -608,9 +608,24 @@ struct Download {
     total: Option<u64>,
     /// How much one read asks for.
     chunk: u64,
+    /// The largest body the stream may hold, which the HEAD named.
+    whole: u64,
+    /// The last read got no definite answer.
+    retried: bool,
 }
 
 impl Download {
+    /// The next ranged read of the snapshot, under `incarnation`. A read after one that got no
+    /// definite answer waits for an answer body as large as the whole snapshot may be: a
+    /// layer that strips `Range` (and so timed the read out) answers the whole body.
+    fn request(&self, incarnation: Incarnation) -> Request {
+        let mut request = Request::snapshot_read(self.snapshot.offset, incarnation, self.part());
+        if self.retried {
+            request.answer_bytes = request.answer_bytes.max(self.whole);
+        }
+        request
+    }
+
     /// The next ranged read: up to `chunk` bytes from `at`, within the body when its length is
     /// known.
     fn part(&self) -> SnapshotPart {
@@ -650,6 +665,7 @@ impl Download {
         let next = first.checked_add(len)?;
         self.at = next;
         self.total = Some(total);
+        self.retried = false;
         Some(Chunk {
             at: first,
             complete: next >= total,
@@ -714,7 +730,6 @@ impl Build {
         header: SegmentHeader,
         end: Offset,
         fate: Fate,
-        configured_max_request_bytes: Option<u64>,
     ) -> Self {
         Self {
             building,
@@ -731,7 +746,6 @@ impl Build {
             installed: None,
             fate,
             head: None,
-            configured_max_request_bytes,
         }
     }
 
@@ -739,11 +753,7 @@ impl Build {
     pub(crate) fn next(&self) -> BuildStep {
         let request = match self.stage {
             BuildStage::Head => head_request(),
-            BuildStage::Snapshot(download) => Request::snapshot_read(
-                download.snapshot.offset,
-                self.fetch.incarnation,
-                download.part(),
-            ),
+            BuildStage::Snapshot(download) => download.request(self.fetch.incarnation),
             BuildStage::Tail if self.fetch.done() => return BuildStep::Done,
             BuildStage::Tail => self.fetch.request(),
             BuildStage::Restarting => return BuildStep::Restart,
@@ -765,8 +775,8 @@ impl Build {
     }
 
     /// The answer to the last request.
-    pub(crate) fn answered(&mut self, exchange: &Exchange, now_ms: u64) -> BuildStep {
-        let answer = match exchange {
+    pub(crate) fn answered(&mut self, exchange: Exchange, now_ms: u64) -> BuildStep {
+        let answer = match &exchange {
             Exchange::Answered(answer) => Some(answer),
             Exchange::NoAnswer(_) => None,
         };
@@ -794,7 +804,7 @@ impl Build {
                             Some(_) => BuildStep::Fail(OpenError::Reset(ResetKind::Deleted)),
                         };
                     }
-                    _ => return self.failed(exchange, now_ms),
+                    _ => return self.failed(&exchange, now_ms),
                 };
                 self.succeeded();
                 if head.incarnation() != self.fetch.incarnation {
@@ -821,7 +831,13 @@ impl Build {
                             snapshot,
                             at: 0,
                             total: None,
-                            chunk: self.snapshot_chunk(&head),
+                            chunk: Self::snapshot_chunk(&head),
+                            // The largest body the stream holds: its snapshot limit with a cold
+                            // store, its request limit without.
+                            whole: head
+                                .max_snapshot_bytes()
+                                .unwrap_or(head.max_request_bytes()),
+                            retried: false,
                         })
                     }
                     _ => BuildStage::Tail,
@@ -830,32 +846,49 @@ impl Build {
             }
             (BuildStage::Snapshot(mut download), Some(answer)) => match &answer.typed {
                 Ok(Typed::SnapshotRead { read, range }) if matches!(answer.status, 200 | 206) => {
+                    let (read, range) = (*read, *range);
                     self.succeeded();
-                    let len = u64::try_from(answer.body.len()).unwrap_or(u64::MAX);
-                    match download.continued(read, *range, len) {
+                    let Exchange::Answered(answer) = exchange else {
+                        return BuildStep::Fail(OpenError::Panicked);
+                    };
+                    let bytes = answer.body;
+                    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    match download.continued(&read, range, len) {
                         Some(chunk) => {
                             self.stage = BuildStage::Snapshot(download);
-                            BuildStep::Download {
-                                chunk,
-                                bytes: answer.body.clone(),
-                            }
+                            BuildStep::Download { chunk, bytes }
                         }
                         // Another snapshot, or bytes that do not continue the file: what is
                         // downloaded is not trusted, and the build starts over from the HEAD.
                         None => self.download_broke(),
                     }
                 }
-                // Superseded since the HEAD (`404`), or shorter than the bytes downloaded (`416`):
-                // the HEAD again names the latest, whose download starts from its first byte.
-                Ok(Typed::Untyped) if matches!(answer.status, 404 | 416) => {
+                // Superseded since the HEAD: the HEAD again names the latest.
+                Ok(Typed::Untyped) if answer.status == 404 => {
                     self.succeeded();
                     self.stage = BuildStage::Head;
                     self.next()
                 }
-                _ => self.failed(exchange, now_ms),
+                // Shorter than the bytes downloaded: the HEAD again names the latest, whose
+                // download starts from its first byte. It counts as a recheck, so a server that
+                // keeps answering `416` to the reads its HEAD asks for cannot loop the build.
+                Ok(Typed::Untyped) if answer.status == 416 => {
+                    self.succeeded();
+                    self.recheck(now_ms)
+                }
+                _ => {
+                    download.retried = true;
+                    self.stage = BuildStage::Snapshot(download);
+                    self.failed(&exchange, now_ms)
+                }
             },
-            (BuildStage::Head | BuildStage::Snapshot { .. }, None) => self.failed(exchange, now_ms),
-            (BuildStage::Tail, _) => self.tail_answered(exchange, now_ms),
+            (BuildStage::Snapshot(mut download), None) => {
+                download.retried = true;
+                self.stage = BuildStage::Snapshot(download);
+                self.failed(&exchange, now_ms)
+            }
+            (BuildStage::Head, None) => self.failed(&exchange, now_ms),
+            (BuildStage::Tail, _) => self.tail_answered(&exchange, now_ms),
             // No request is out.
             (BuildStage::Restarting, _) => BuildStep::Fail(OpenError::Panicked),
         }
@@ -866,13 +899,11 @@ impl Build {
         self.attempt = Attempt::default();
     }
 
-    /// How much of a snapshot body one read asks for under `head`: its request limit (or the
-    /// configured one below it), between [`MIN_SNAPSHOT_CHUNK`] and [`MAX_SNAPSHOT_CHUNK`].
-    fn snapshot_chunk(&self, head: &StreamHead) -> u64 {
-        self.configured_max_request_bytes
-            .map_or(head.max_request_bytes(), |configured| {
-                configured.min(head.max_request_bytes())
-            })
+    /// How much of a snapshot body one read asks for under `head`: its request limit, between
+    /// [`MIN_SNAPSHOT_CHUNK`] and [`MAX_SNAPSHOT_CHUNK`]. The configured request limit bounds
+    /// what the client sends, not what it reads.
+    fn snapshot_chunk(head: &StreamHead) -> u64 {
+        head.max_request_bytes()
             .clamp(MIN_SNAPSHOT_CHUNK, MAX_SNAPSHOT_CHUNK)
     }
 
@@ -901,20 +932,23 @@ impl Build {
             // A `412` or a `404`: after the open's backoff, the HEAD tells whether the history
             // changed or the stream went. A changed history counts as a restart, and these checks
             // count apart, so reads and HEADs that disagree (two nodes) do not loop.
-            Failure::Restart => {
-                self.rechecks = self.rechecks.saturating_add(1);
-                if self.rechecks > MAX_BUILD_RECHECKS {
-                    return BuildStep::Fail(OpenError::GaveUp(GaveUp::Rechecks));
-                }
-                self.stage = BuildStage::Head;
-                match self.recheck.backoff(None, Attempt::default(), now_ms) {
-                    Next::Wait {
-                        at_ms, jitter_ms, ..
-                    } => BuildStep::Timer { at_ms, jitter_ms },
-                    Next::Resend(_) | Next::Head(_) | Next::Reset(_) => self.next(),
-                }
-            }
+            Failure::Restart => self.recheck(now_ms),
             Failure::Closed => BuildStep::Fail(OpenError::StreamState(StreamState::Closed)),
+        }
+    }
+
+    /// After the open's backoff, the HEAD again, at most [`MAX_BUILD_RECHECKS`] times.
+    fn recheck(&mut self, now_ms: u64) -> BuildStep {
+        self.rechecks = self.rechecks.saturating_add(1);
+        if self.rechecks > MAX_BUILD_RECHECKS {
+            return BuildStep::Fail(OpenError::GaveUp(GaveUp::Rechecks));
+        }
+        self.stage = BuildStage::Head;
+        match self.recheck.backoff(None, Attempt::default(), now_ms) {
+            Next::Wait {
+                at_ms, jitter_ms, ..
+            } => BuildStep::Timer { at_ms, jitter_ms },
+            Next::Resend(_) | Next::Head(_) | Next::Reset(_) => self.next(),
         }
     }
 
@@ -1047,17 +1081,10 @@ impl Build {
             restarts,
             rechecks,
             fate,
-            configured_max_request_bytes,
             ..
         } = self;
         building.discard().map_err(local)?;
-        let mut build = start_build(
-            root,
-            header,
-            fetch.stream.end(),
-            fate,
-            configured_max_request_bytes,
-        )?;
+        let mut build = start_build(root, header, fetch.stream.end(), fate)?;
         build.retry = retry;
         build.restarts = restarts;
         build.rechecks = rechecks;
@@ -1120,7 +1147,6 @@ pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
         claim,
         end,
         fate,
-        max_request_bytes,
     } = job;
     let before = Position(first.0.saturating_sub(1));
     let header = SegmentHeader {
@@ -1136,7 +1162,7 @@ pub(crate) fn new_build(job: NewBuild) -> Result<Build, OpenError> {
         log_bytes: 0,
         claim,
     };
-    start_build(root, header, end, fate, max_request_bytes)
+    start_build(root, header, end, fate)
 }
 
 /// Starts building the generation `header` names, its claim (a rebuild's) logged and fsynced.
@@ -1145,7 +1171,6 @@ fn start_build(
     header: SegmentHeader,
     end: Offset,
     fate: Fate,
-    configured_max_request_bytes: Option<u64>,
 ) -> Result<Build, OpenError> {
     let mut building = root.build(header.clone()).map_err(local)?;
     if let Some((epoch, activation)) = header.claim {
@@ -1155,14 +1180,7 @@ fn start_build(
             .and_then(|_position| building.log.sync())
             .map_err(local)?;
     }
-    Ok(Build::new(
-        building,
-        root,
-        header,
-        end,
-        fate,
-        configured_max_request_bytes,
-    ))
+    Ok(Build::new(building, root, header, end, fate))
 }
 
 /// A generation whose db file is not its own, or whose log's first segment header is unreadable:
@@ -1731,19 +1749,19 @@ impl Opening {
     /// The answer to the last request.
     pub(crate) fn answered(
         mut self: Box<Self>,
-        exchange: &Exchange,
+        exchange: Exchange,
         lineage: Lineage,
         now_ms: u64,
     ) -> OpenStep {
         let phase = std::mem::replace(&mut self.phase, Phase::Head);
         match phase {
             Phase::Head => match self.spec.access {
-                Access::Owner { .. } => self.head_answered(exchange, lineage, now_ms),
-                Access::Reader => self.reader_head_answered(exchange, lineage, now_ms),
+                Access::Owner { .. } => self.head_answered(&exchange, lineage, now_ms),
+                Access::Reader => self.reader_head_answered(&exchange, lineage, now_ms),
             },
-            Phase::Create => self.create_answered(exchange, now_ms),
+            Phase::Create => self.create_answered(&exchange, now_ms),
             Phase::CatchingUp { m, catch_up } => {
-                self.catch_up_answered(m, catch_up, exchange, lineage, now_ms)
+                self.catch_up_answered(m, catch_up, &exchange, lineage, now_ms)
             }
             Phase::Reading {
                 mut build,
@@ -1978,7 +1996,6 @@ impl Opening {
             claim: None,
             end: head.next_offset(),
             fate,
-            max_request_bytes: self.spec.max_request_bytes,
         });
         self.phase = Phase::Building { cluster_id, head };
         OpenStep::Disk { opening: self, job }

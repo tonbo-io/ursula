@@ -1027,7 +1027,16 @@ struct BodyFile {
 fn body_file(offset: u64, pages: usize) -> BodyFile {
     let dir = TempDir::new("driver-publish-body");
     let image_path = dir.path().join("image");
-    let image: Vec<u8> = (0..pages * 4096).map(|i| (i * 31 % 251) as u8).collect();
+    // Bytes that do not compress, so the body spans about as many bytes as the image.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ offset;
+    let image: Vec<u8> = (0..pages * 4096)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
     std::fs::write(&image_path, &image).unwrap();
     let mut image = std::fs::File::open(&image_path).unwrap();
     let fields = crate::codec::snapshot::SnapshotFields {
@@ -1057,10 +1066,20 @@ fn publish_file(
     body: &BodyFile,
 ) -> Result<crate::snapshotter::Outcome, crate::snapshotter::SnapshotFailure> {
     let transport = ModelTransport::new(Arc::clone(server), PATH);
+    publish_through(&transport, token, request_limit, body)
+}
+
+/// Publishes `body` under `request_limit` through `transport`.
+fn publish_through(
+    transport: &dyn Transport,
+    token: ursula_headers::Incarnation,
+    request_limit: u64,
+    body: &BodyFile,
+) -> Result<crate::snapshotter::Outcome, crate::snapshotter::SnapshotFailure> {
     let snapper = crate::snapshotter::Snapper::default();
     crate::snapshotter::publish(&crate::snapshotter::Publish {
         remote: crate::snapshotter::Remote {
-            transport: &transport,
+            transport,
             snapper: &snapper,
             cluster_id: "cluster-a",
             incarnation: token,
@@ -1159,18 +1178,219 @@ fn publishes_keep_retention_one_snapshot_behind_and_refuse_bodies_above_the_limi
         "{e}"
     );
     assert!(e.to_string().starts_with("stream_state: "));
-    // Above the request limit: not published, reported as request_too_large.
+    // Above the request limit, on a stream without a cold store: not published, reported as
+    // request_too_large.
     grow(&server);
     let e = publish_at_tail(&server, token, 100, 2).unwrap_err();
     assert!(
         matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
-            limit: Some(100),
+            bound: crate::snapshotter::SizeBound::NoParts { request: 100 },
             ..
         }),
         "{e}"
     );
     assert!(e.to_string().starts_with("request_too_large: "));
+    assert!(e.to_string().contains("not published"), "{e}");
     assert_eq!(retention(&server), (second, Some(third)));
+}
+
+/// A change to the server before a parts commit reaches it.
+type CommitHook = Box<dyn FnMut(&mut ModelServer) + Send>;
+
+/// A transport to the model that runs a hook on the server before each parts commit it sends.
+struct BeforeCommit {
+    server: Arc<Mutex<ModelServer>>,
+    inner: ModelTransport,
+    hook: Mutex<CommitHook>,
+    commits: Mutex<u32>,
+}
+
+impl BeforeCommit {
+    fn new(
+        server: &Arc<Mutex<ModelServer>>,
+        hook: impl FnMut(&mut ModelServer) + Send + 'static,
+    ) -> Self {
+        Self {
+            server: Arc::clone(server),
+            inner: ModelTransport::new(Arc::clone(server), PATH),
+            hook: Mutex::new(Box::new(hook)),
+            commits: Mutex::new(0),
+        }
+    }
+}
+
+impl Transport for BeforeCommit {
+    fn send(&self, request: &Request, attempt: crate::transport::Attempt) -> Exchange {
+        if request.parts.is_some() {
+            *self.commits.lock().unwrap() += 1;
+            (self.hook.lock().unwrap())(&mut self.server.lock().unwrap());
+        }
+        self.inner.send(request, attempt)
+    }
+}
+
+/// A published world whose stream takes snapshots in parts (a cold store's limit).
+fn cold_world() -> (Arc<Mutex<ModelServer>>, ursula_headers::Incarnation) {
+    let (server, token) = published_world();
+    let mut limits = server.lock().unwrap().limits();
+    limits.max_snapshot_bytes = Some(1 << 30);
+    server.lock().unwrap().set_limits(limits);
+    (server, token)
+}
+
+/// The latest snapshot's body on the model.
+fn snapshot_body(server: &Arc<Mutex<ModelServer>>, token: ursula_headers::Incarnation) -> Vec<u8> {
+    let (_, Some(offset)) = retention(server) else {
+        panic!("no snapshot");
+    };
+    let request = Request::snapshot_read(
+        ursula_headers::Offset::from_u64(offset),
+        token,
+        crate::wire::SnapshotPart::Chunk {
+            first: 0,
+            last: u64::MAX - 1,
+        },
+    );
+    let answer = server
+        .lock()
+        .unwrap()
+        .handle(PATH, &request)
+        .parse(&request);
+    assert_eq!(answer.status, 206);
+    answer.body
+}
+
+// A body above the request limit, on a stream with a cold store, is staged in parts of the limit
+// read from the file and committed: published once the 204 names it, the parts consumed, the
+// assembled body the file, and retention one behind as for a single request.
+#[test]
+fn a_body_above_the_request_limit_publishes_in_parts() {
+    let (server, token) = cold_world();
+    let first = tail_of(&server);
+    let body = body_file(first, 4);
+    assert!(body.len > 4 * 4096);
+    let outcome = publish_file(&server, token, 4096, &body).unwrap();
+    assert_eq!(outcome, crate::snapshotter::Outcome::Published {
+        offset: ursula_headers::Offset::from_u64(first),
+    });
+    assert_eq!(
+        snapshot_body(&server, token),
+        std::fs::read(&body.path).unwrap()
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0);
+    assert_eq!(retention(&server), (0, Some(first)));
+    grow(&server);
+    let second = tail_of(&server);
+    publish_at_tail(&server, token, 4096, 3).unwrap();
+    assert_eq!(retention(&server), (first, Some(second)));
+    // More parts than a commit lists, or above the snapshot limit: not published.
+    let e = publish_at_tail(&server, token, 1, 2).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            bound: crate::snapshotter::SizeBound::Parts { part_bytes: 1 },
+            ..
+        }),
+        "{e}"
+    );
+    let mut limits = server.lock().unwrap().limits();
+    limits.max_snapshot_bytes = Some(4096);
+    server.lock().unwrap().set_limits(limits);
+    let e = publish_at_tail(&server, token, 4096, 2).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            bound: crate::snapshotter::SizeBound::Snapshot(4096),
+            ..
+        }),
+        "{e}"
+    );
+}
+
+// A part whose 201 is lost is staged again under a new id (S6); the commit lists only the ids
+// its staging got, and the lost one is left to the sweep.
+#[test]
+fn a_part_whose_answer_is_lost_is_staged_again_under_a_new_id() {
+    let (server, token) = cold_world();
+    server.lock().unwrap().inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::DropAnswer,
+        times: 1,
+    });
+    let body = body_file(tail_of(&server), 3);
+    assert!(matches!(
+        publish_file(&server, token, 4096, &body),
+        Ok(crate::snapshotter::Outcome::Published { .. })
+    ));
+    assert_eq!(
+        snapshot_body(&server, token),
+        std::fs::read(&body.path).unwrap()
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 1, "the orphan");
+}
+
+// A commit that meets answers deciding nothing is repeated unchanged (S4): a 503 because the
+// node runs it or other commits, a 502, and a lost answer, after which the repeat is answered
+// 204 from the key with the parts gone.
+#[test]
+fn a_commit_is_repeated_until_a_definite_answer() {
+    let (server, token) = cold_world();
+    for fault in [
+        Fault::CommitRefused(crate::model::faults::CommitRefusal::Busy),
+        Fault::Status {
+            status: 502,
+            retry_after: None,
+        },
+        Fault::DropRequest,
+        Fault::DropAnswer,
+    ] {
+        server.lock().unwrap().inject(Scripted {
+            method: Some(Method::Put),
+            fault,
+            times: 1,
+        });
+    }
+    let body = body_file(tail_of(&server), 3);
+    let transport = BeforeCommit::new(&server, |_| {});
+    assert!(matches!(
+        publish_through(&transport, token, 4096, &body),
+        Ok(crate::snapshotter::Outcome::Published { .. })
+    ));
+    assert_eq!(*transport.commits.lock().unwrap(), 5);
+    assert_eq!(
+        snapshot_body(&server, token),
+        std::fs::read(&body.path).unwrap()
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0);
+}
+
+// A commit answered 400 (its parts were swept) stages every part again, once: published; a second
+// 400 fails the attempt.
+#[test]
+fn a_commit_answered_400_stages_its_parts_again_once() {
+    let (server, token) = cold_world();
+    let sweep = |server: &mut ModelServer| server.advance(24 * 60 * 60 * 1000);
+    let mut swept = false;
+    let transport = BeforeCommit::new(&server, move |server| {
+        if !std::mem::replace(&mut swept, true) {
+            sweep(server);
+        }
+    });
+    let body = body_file(tail_of(&server), 3);
+    assert!(matches!(
+        publish_through(&transport, token, 4096, &body),
+        Ok(crate::snapshotter::Outcome::Published { .. })
+    ));
+    assert_eq!(*transport.commits.lock().unwrap(), 2);
+    grow(&server);
+    let always = BeforeCommit::new(&server, sweep);
+    let e = publish_through(&always, token, 4096, &body_file(tail_of(&server), 3)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::Status {
+            status: 400,
+            ..
+        }),
+        "{e}"
+    );
+    assert_eq!(*always.commits.lock().unwrap(), 2);
 }
 
 // A publish behind a later snapshot is superseded, and moves nothing.
@@ -1440,9 +1660,16 @@ fn snapshot_ranges(w: &World, core: usize) -> Vec<Option<ursula_headers::ByteRan
         .collect()
 }
 
-fn chunked_spec(dir: &Path) -> OpenSpec {
+/// An open whose build reads in chunks of 4 KiB: the HEAD's request limit, which alone sizes
+/// them.
+fn chunked_spec(w: &mut World, dir: &Path) -> OpenSpec {
+    w.server.set_limits(crate::model::Limits {
+        max_request_bytes: 4096,
+        ..w.server.limits()
+    });
+    // The configured limit bounds what the client sends, never the chunks it reads.
     OpenSpec {
-        max_request_bytes: Some(4096),
+        max_request_bytes: Some(1 << 20),
         ..spec(dir, 3)
     }
 }
@@ -1456,7 +1683,8 @@ fn a_build_reads_the_snapshot_in_chunks_of_the_request_limit() {
     let mut w = World::new();
     let expected = chunked_snapshot(&mut w, owner.path());
     let c = w.core();
-    let bound = w.open(c, chunked_spec(dir.path()));
+    let spec = chunked_spec(&mut w, dir.path());
+    let bound = w.open(c, spec);
     assert_eq!(
         std::fs::read(bound.handle.generation.db()).unwrap(),
         on_disk(bound.handle.generation.lineage, expected)
@@ -1505,7 +1733,8 @@ fn a_chunk_that_does_not_continue_the_download_restarts_the_build() {
         answer.header("content-range", format!("bytes 0-{}/{total}", last - 8192));
     }));
     let c = w.core();
-    let bound = w.open(c, chunked_spec(dir.path()));
+    let spec = chunked_spec(&mut w, dir.path());
+    let bound = w.open(c, spec);
     assert_eq!(
         std::fs::read(bound.handle.generation.db()).unwrap(),
         on_disk(bound.handle.generation.lineage, expected)
@@ -1549,12 +1778,14 @@ fn a_whole_body_answer_to_a_ranged_read_installs_it() {
                 times: 1,
             });
             let now = w.now;
-            let ios = w.c(c).open(open, chunked_spec(dir.path()), now);
+            let spec = chunked_spec(&mut w, dir.path());
+            let ios = w.c(c).open(open, spec, now);
             w.queue_ios(c, ios);
         } else {
             w.hold = Some(|job| matches!(job, DiskJob::Download { .. }));
             let now = w.now;
-            let ios = w.c(c).open(open, chunked_spec(dir.path()), now);
+            let spec = chunked_spec(&mut w, dir.path());
+            let ios = w.c(c).open(open, spec, now);
             w.queue_ios(c, ios);
             // Each chunk's disk job runs alone, so the fault meets the read after the last.
             for _ in 0..after_chunks {
@@ -1581,6 +1812,70 @@ fn a_whole_body_answer_to_a_ranged_read_installs_it() {
         );
         assert_eq!(snapshot_ranges(&w, c).len(), after_chunks + 1);
     }
+}
+
+// A chunk read that got no answer is sent again waiting for an answer body as large as the
+// whole snapshot may be (the HEAD's snapshot limit): a layer that strips `Range` answers the
+// whole body, in the time it takes. The read after it is back to one chunk.
+#[test]
+fn a_retried_chunk_read_waits_for_the_whole_body() {
+    let dir = TempDir::new("driver-chunk-retried");
+    let owner = TempDir::new("driver-chunk-retried-owner");
+    let mut w = World::new();
+    let expected = chunked_snapshot(&mut w, owner.path());
+    let spec = chunked_spec(&mut w, dir.path());
+    let mut limits = w.server.limits();
+    limits.max_snapshot_bytes = Some(1 << 30);
+    w.server.set_limits(limits);
+    w.server.inject(Scripted {
+        method: Some(Method::Get),
+        fault: Fault::DropRequest,
+        times: 1,
+    });
+    let c = w.core();
+    let bound = w.open(c, spec);
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        on_disk(bound.handle.generation.lineage, expected)
+    );
+    let waits: Vec<u64> = w
+        .sent
+        .iter()
+        .filter(|s| s.core == c && matches!(s.request.target, Target::Snapshot { .. }))
+        .map(|s| s.request.answer_bytes)
+        .collect();
+    assert_eq!(&waits[..3], &[4096, 1 << 30, 4096], "{waits:?}");
+}
+
+// A server that answers `416` to every read its HEAD asks for: each `416` sends the HEAD again
+// after the open's backoff and counts as a recheck, so the build gives up instead of looping.
+#[test]
+fn a_416_on_every_chunk_ends_the_build_after_its_rechecks() {
+    let dir = TempDir::new("driver-chunk-416");
+    let owner = TempDir::new("driver-chunk-416-owner");
+    let mut w = World::new();
+    chunked_snapshot(&mut w, owner.path());
+    let spec = chunked_spec(&mut w, dir.path());
+    w.rewrite = Some(Box::new(|request, answer| {
+        if request.method == Method::Get && matches!(request.target, Target::Snapshot { .. }) {
+            *answer = RawAnswer::new(416);
+            answer.header("content-range", "bytes */1");
+        }
+    }));
+    let c = w.core();
+    let start = w.now;
+    let e = kind(w.open_result(c, spec));
+    assert!(
+        matches!(&*e, OpenError::GaveUp(crate::open::GaveUp::Rechecks)),
+        "{e}"
+    );
+    let reads = w
+        .sent
+        .iter()
+        .filter(|s| s.core == c && matches!(s.request.target, Target::Snapshot { .. }))
+        .count();
+    assert!((3..=20).contains(&reads), "{reads} reads");
+    assert!(w.now - start >= 1_000, "{} ms", w.now - start);
 }
 
 // A takeover's rebuild whose HEAD names a snapshot past its claim: another owner wrote after the

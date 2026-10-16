@@ -4,8 +4,11 @@
 //! through `ursula_headers`) and answered by [`ModelServer::exchange`]. A `PUT` or `POST` must
 //! carry `Content-Length` (`411` otherwise, chunked bodies are refused with `501`), as the
 //! client's transport always sends it. A stream request whose `Content-Length` exceeds the
-//! model's request limit (`/__model/limits`) gets the typed `413` before its body is read, and the
-//! connection closes. `Expect: 100-continue` gets `100 Continue`, then the body is read: the model
+//! model's request limit (`/__model/limits`) gets the typed `413` (or a scripted fault) decided
+//! before its body is read, which is then read and dropped, as the server does on HTTP/1.1 (A3),
+//! before the answer goes out and the connection closes; a client that sent
+//! `Expect: 100-continue` sends no body. Otherwise `Expect: 100-continue` gets `100 Continue`,
+//! then the body is read: the model
 //! answers every write after its body, in the order of #581 addendum 4, which an early answer
 //! follows too, so the answer is the same.
 //!
@@ -61,6 +64,10 @@ const MAX_HEAD_BYTES: usize = 64 << 10;
 /// The largest body of a control request read; a larger one closes the connection after its
 /// answer.
 const MAX_CONTROL_BODY_BYTES: u64 = 64 << 20;
+
+/// The largest body of a request refused before its body that is read and dropped before the
+/// answer; a larger one is answered unread.
+const MAX_DRAIN_BYTES: u64 = 2 << 30;
 
 /// Why the model server stopped.
 #[derive(Debug, thiserror::Error)]
@@ -210,7 +217,16 @@ fn read_request(
         Some(Ok(length)) if length <= limit => length,
         // Decided from `Content-Length`, before the body (#581 §6.4), through the same faults
         // as in process.
-        Some(Ok(_)) => {
+        Some(Ok(length)) => {
+            // As the server's early answers on HTTP/1.1 (A3): the body is read and dropped first,
+            // within the drain bound, so a client still writing it never meets a closed socket
+            // (which macOS reports as `EINVAL` rather than the answer). A client that sent
+            // `Expect: 100-continue` gets no `100 Continue` and sends no body.
+            let expects_continue =
+                header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+            if !expects_continue && length <= MAX_DRAIN_BYTES {
+                io::copy(&mut reader.by_ref().take(length), &mut io::sink())?;
+            }
             let refusal = match Method::parse(method) {
                 Some(method) if !control => {
                     delivered(lock(server).exchange_too_large(method), method)

@@ -9,9 +9,10 @@
 //! what a stream inherited after one (W5, §4.8), HEAD metadata on every answer (A1), the typed and
 //! untyped `413`, create keyed by configuration, reads with the incarnation precondition (`412`,
 //! `410`), snapshots keyed by offset and digest, snapshot reads in one byte range (`206`, `416`),
-//! monotonic retention, and scripted faults. Out of
-//! scope: immutable reads, snapshot parts, the timing of answers before the body, the producer
-//! cap, SSE and JSON streams.
+//! snapshots uploaded in parts (#618: minted part ids, the commit's key checked first, the parts
+//! a final answer consumes, the one-day sweep on the model's clock), monotonic retention, and
+//! scripted faults. Out of scope: immutable reads, the timing of answers before the body, the
+//! producer cap, SSE and JSON streams.
 //!
 //! Requests come in through [`ModelServer::exchange`] (with faults) or [`ModelServer::handle`]
 //! (without), in process ([`crate::transport::model::ModelTransport`]) or over HTTP/1.1
@@ -48,6 +49,10 @@ use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
+use ursula_headers::PartId;
+use ursula_headers::PartStaged;
+use ursula_headers::PartsCommit;
+use ursula_headers::PartsManifest;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerId;
 use ursula_headers::ProducerRequestHeaders;
@@ -63,6 +68,7 @@ use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
 use ursula_headers::names;
 
+use self::faults::CommitRefusal;
 use self::faults::Fault;
 use self::faults::Faults;
 use self::faults::Scripted;
@@ -87,6 +93,9 @@ pub(crate) const MAX_REQUEST_BYTES: u64 = 32 << 20;
 
 /// The largest snapshot accepted in parts, with a cold store (#581 §6.3).
 pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
+
+/// How long a staged part waits for a commit before the sweep reclaims it (extensions §2.2).
+const PART_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The base protocol's content type of a stream created without one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -183,6 +192,16 @@ pub(crate) enum Delivered {
     DroppedAfterApply,
 }
 
+/// A part staged for a parts commit: the stream and token it belongs to, its bytes, and when the
+/// model's clock staged it.
+#[derive(Debug, Clone)]
+struct StagedPart {
+    path: String,
+    token: Incarnation,
+    body: Arc<[u8]>,
+    staged_ms: u64,
+}
+
 /// The model of one server group.
 #[derive(Debug)]
 pub(crate) struct ModelServer {
@@ -198,6 +217,10 @@ pub(crate) struct ModelServer {
     streams: BTreeMap<String, Stream>,
     checkpoints: Vec<Checkpoint>,
     faults: Faults,
+    /// Staged snapshot parts, by id.
+    parts: BTreeMap<String, StagedPart>,
+    /// The parts staged so far: every id is minted once.
+    minted: u64,
 }
 
 /// Whether a snapshot read honors `Range`: always, but under the scripted `ignore-range` fault,
@@ -222,6 +245,8 @@ impl ModelServer {
             streams: BTreeMap::new(),
             checkpoints: Vec::new(),
             faults: Faults::default(),
+            parts: BTreeMap::new(),
+            minted: 0,
         };
         server.history = server.draw_history();
         server
@@ -266,6 +291,12 @@ impl ModelServer {
     #[cfg(test)]
     pub(crate) fn token(&self, path: &str) -> Option<Incarnation> {
         Some(self.streams.get(path)?.token_in(self.history))
+    }
+
+    /// How many parts are staged, swept or not.
+    #[cfg(test)]
+    pub(crate) fn staged_parts(&self) -> usize {
+        self.parts.len()
     }
 
     /// Every byte of the stream, from offset 0.
@@ -426,6 +457,7 @@ impl ModelServer {
                 delay_ms: ms,
             },
             Some(Fault::IgnoreRange) => answered(handle(self, Ranges::Ignored)),
+            Some(Fault::CommitRefused(refusal)) => answered(commit_refused(refusal)),
         }
     }
 
@@ -446,7 +478,11 @@ impl ModelServer {
             (Method::Put, Target::Stream) => self.create(path, request),
             (Method::Post, Target::Stream) => self.append(path, request),
             (Method::Get, Target::Read { from, .. }) => self.read(path, request, from),
-            (Method::Put, Target::Snapshot { offset }) => self.publish(path, request, offset),
+            (Method::Put, Target::Snapshot { offset }) => match request.parts.as_deref() {
+                Some(commit) => self.commit_parts(path, request, offset, *commit),
+                None => self.publish(path, request, offset),
+            },
+            (Method::Post, Target::SnapshotParts { .. }) => self.stage_part(path, request),
             (Method::Get, Target::Snapshot { offset }) => {
                 self.snapshot_read(path, request, offset, ranges)
             }
@@ -709,6 +745,140 @@ impl ModelServer {
         raw
     }
 
+    /// `POST {stream}/snapshot/{offset}/parts` (extensions §2.2): `201` naming a part id minted
+    /// for this request alone, bound to the stream and its token, never to the offset. Not
+    /// idempotent: a repeat stages another part. `501` without a cold store.
+    fn stage_part(&mut self, path: &str, request: &Request) -> RawAnswer {
+        if self.limits.max_snapshot_bytes.is_none() {
+            return RawAnswer::new(501);
+        }
+        self.sweep_parts();
+        let (history, now_ms) = (self.history, self.clock_ms);
+        let token = match self.stream(path, request) {
+            Ok(stream) => stream.token_in(history),
+            Err(answer) => return answer,
+        };
+        self.minted = self.minted.saturating_add(1);
+        let part = PartId::new(format!("{now_ms:016x}-{:016x}.part", self.minted))
+            .expect("a minted id is visible ASCII within the length");
+        self.parts.insert(part.as_str().to_owned(), StagedPart {
+            path: path.to_owned(),
+            token,
+            body: Arc::clone(&request.body),
+            staged_ms: now_ms,
+        });
+        let mut answer = RawAnswer::new(201);
+        PartStaged { part }.render(answer.emit());
+        answer
+    }
+
+    /// Reclaims every part older than its grace, used or not.
+    fn sweep_parts(&mut self) {
+        let now_ms = self.clock_ms;
+        self.parts
+            .retain(|_, part| now_ms.saturating_sub(part.staged_ms) < PART_GRACE_MS);
+    }
+
+    /// `PUT {stream}/snapshot/{offset}` with `Stream-Snapshot-Parts` (extensions §2.2), in the
+    /// server's order: `501` without a cold store; the stream (`404`, `412`); the key, before the
+    /// body, so a repeat is answered even after its parts are gone: `204` for the latest
+    /// snapshot, `409` naming the latest when another one is at or after the offset, `410` below
+    /// retention, `409` beyond the tail. Then the manifest and its parts: `400` for a malformed
+    /// manifest or a part not staged for this incarnation of this stream (the parts stay), `413`
+    /// naming the snapshot limit (they stay), and `400` for a digest that differs (the copy used
+    /// them up). A publish deletes them.
+    fn commit_parts(
+        &mut self,
+        path: &str,
+        request: &Request,
+        offset: Offset,
+        commit: PartsCommit,
+    ) -> RawAnswer {
+        let Some(max_snapshot) = self.limits.max_snapshot_bytes else {
+            return RawAnswer::new(501);
+        };
+        self.sweep_parts();
+        let history = self.history;
+        let ours = SnapshotRef {
+            offset,
+            digest: commit.digest,
+        };
+        let (token, latest, retained, tail) = match self.stream(path, request) {
+            Ok(stream) => (
+                stream.token_in(history),
+                stream.snapshot.as_ref().map(|s| s.snapshot),
+                stream.retained,
+                stream.tail(),
+            ),
+            Err(answer) => return answer,
+        };
+        match latest {
+            Some(latest) if latest == ours => {
+                return publish_answer(&SnapshotPublishAnswer::Published {
+                    snapshot: ours,
+                    incarnation: token,
+                });
+            }
+            Some(latest) if latest.offset >= offset => {
+                return publish_answer(&SnapshotPublishAnswer::Conflict { latest });
+            }
+            Some(_) | None => {}
+        }
+        if offset < retained {
+            return RawAnswer::new(410);
+        }
+        if offset > tail {
+            let mut answer = RawAnswer::new(409);
+            answer.header(names::STREAM_NEXT_OFFSET, tail.to_string());
+            return answer;
+        }
+        let Some(content_type) = request.content_type.clone() else {
+            return RawAnswer::new(400);
+        };
+        let Ok(manifest) = PartsManifest::parse(commit.parts, &request.body) else {
+            return RawAnswer::new(400);
+        };
+        let mut bodies = Vec::with_capacity(manifest.parts().len());
+        for id in manifest.parts() {
+            match self.parts.get(id.as_str()) {
+                Some(part) if part.path == path && part.token == token => {
+                    bodies.push(Arc::clone(&part.body));
+                }
+                Some(_) | None => return RawAnswer::new(400),
+            }
+        }
+        let total = bodies.iter().try_fold(0_u64, |total, body| {
+            total.checked_add(u64::try_from(body.len()).ok()?)
+        });
+        if total.is_none_or(|total| total > max_snapshot) {
+            let mut answer = RawAnswer::new(SizeLimit::STATUS);
+            SizeLimit::Snapshot(max_snapshot).render(answer.emit());
+            return answer;
+        }
+        let assembled: Arc<[u8]> = Arc::from(bodies.concat());
+        // The copy consumes the parts, whatever its digest.
+        for id in manifest.parts() {
+            self.parts.remove(id.as_str());
+        }
+        let mut digester = SnapshotDigester::new(&content_type);
+        digester.update(&assembled);
+        if digester.finalize() != commit.digest {
+            return RawAnswer::new(400);
+        }
+        let Some(stream) = self.streams.get_mut(path) else {
+            return RawAnswer::new(404);
+        };
+        stream.snapshot = Some(Snapshot {
+            snapshot: ours,
+            content_type,
+            body: assembled,
+        });
+        publish_answer(&SnapshotPublishAnswer::Published {
+            snapshot: ours,
+            incarnation: token,
+        })
+    }
+
     /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`. A single
     /// `Range` is answered `206` with its bytes, or `416` when it selects none (extensions §2.5).
     fn snapshot_read(
@@ -846,6 +1016,23 @@ fn precondition(stream: &Stream, request: &Request, history: u64) -> Result<(), 
         }
         Some(_) | None => Ok(()),
     }
+}
+
+/// A snapshot publish's answer, rendered.
+fn publish_answer(answer: &SnapshotPublishAnswer) -> RawAnswer {
+    let mut raw = RawAnswer::new(answer.status());
+    answer.render(raw.emit());
+    raw
+}
+
+/// The `503` of a node that refuses a parts commit for now, as the server sends it:
+/// `Retry-After: 1` and the JSON `error` code.
+fn commit_refused(refusal: CommitRefusal) -> RawAnswer {
+    let mut answer = RawAnswer::new(503);
+    answer.header(RETRY_AFTER, "1");
+    answer.header(CONTENT_TYPE, "application/json");
+    answer.body = format!("{{\"error\":\"{}\"}}", refusal.code()).into_bytes();
+    answer
 }
 
 /// A producer answer, rendered.
