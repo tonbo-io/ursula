@@ -130,6 +130,7 @@ impl SimFaultPlan {
             SimScenario::RecoveryPlanCutUnderRestarts => Vec::new(),
             SimScenario::RecoveryPlanSurvivorCampaigns => Vec::new(),
             SimScenario::RoutingBeforeBodyUnderLeaderChurn => Vec::new(),
+            SimScenario::MarkedChunksNeverContradict => Vec::new(),
             SimScenario::HttpProtocolSurfaceRandomized => vec![SimFaultStep {
                 phase: "http_protocol_surface_workload".to_owned(),
                 action: SimFaultAction::RunHttpProtocolSurfaceWorkload {

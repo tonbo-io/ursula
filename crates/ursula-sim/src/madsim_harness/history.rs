@@ -213,7 +213,7 @@ async fn head(app: &Router, path: &str) -> StreamHead {
 }
 
 /// Exports the group of `cluster`'s stream.
-async fn export(cluster: &Cluster) -> Bytes {
+pub(super) async fn export(cluster: &Cluster) -> Bytes {
     let path = format!(
         "/__ursula/backup/group/{}",
         cluster.placement.raft_group_id.0
@@ -224,7 +224,7 @@ async fn export(cluster: &Cluster) -> Bytes {
 }
 
 /// What one import attempt came back with.
-enum ImportAnswer {
+pub(super) enum ImportAnswer {
     Answered(BackupImportResponse),
     /// The group refused the import as a conflict: it holds state, and not
     /// state restored from this backup.
@@ -269,7 +269,7 @@ async fn import_once(
 }
 
 /// Repeats the import until it gets an answer, a refusal included.
-async fn import(cluster: &Cluster, backup: &Bytes) -> ImportAnswer {
+pub(super) async fn import(cluster: &Cluster, backup: &Bytes) -> ImportAnswer {
     for _ in 0..MAX_ATTEMPTS {
         match import_once(&cluster.runtime, cluster.placement.raft_group_id, backup).await {
             ImportAnswer::Unknown => madsim::time::sleep(Duration::from_millis(20)).await,
@@ -358,7 +358,7 @@ async fn source(
 /// Waits until every follower of `cluster`'s group joined it: it holds the
 /// group's membership, so the others can elect a new leader once the
 /// leader dies.
-async fn wait_followers_joined(cluster: &Cluster) {
+pub(super) async fn wait_followers_joined(cluster: &Cluster) {
     let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
     loop {
         let joined = cluster

@@ -41,6 +41,8 @@ use super::history::Controls as HistoryControls;
 use super::history::run_rewind_applies_exactly_once_inner;
 use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
+use super::immutable_reads::Controls as ImmutableReadControls;
+use super::immutable_reads::run_marked_chunks_never_contradict_inner;
 use super::leader_reads::run_leader_read_linearizability_inner;
 use super::routing::Controls as RoutingControls;
 use super::routing::run_routing_before_body_inner;
@@ -278,6 +280,12 @@ impl ThreeNodeRaftSim {
             SimScenario::RoutingBeforeBodyUnderLeaderChurn => {
                 Self::run_routing_with_controls_report(config, RoutingControls::default())
             }
+            SimScenario::MarkedChunksNeverContradict => {
+                Self::run_immutable_reads_with_controls_report(
+                    config,
+                    ImmutableReadControls::default(),
+                )
+            }
         }
     }
 
@@ -291,6 +299,19 @@ impl ThreeNodeRaftSim {
             SimScenario::RoutingBeforeBodyUnderLeaderChurn,
             seed,
             run_routing_before_body_inner(config, controls),
+        )
+    }
+
+    /// Runs the immutable-read scenario (#581 section 10) with `controls`.
+    pub(super) fn run_immutable_reads_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: ImmutableReadControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::MarkedChunksNeverContradict,
+            seed,
+            run_marked_chunks_never_contradict_inner(config, controls),
         )
     }
 

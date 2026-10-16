@@ -49,6 +49,7 @@ use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 
@@ -495,6 +496,7 @@ pub(super) async fn read_local(cluster: &JournalCluster, group: u32, node_id: u6
                 now_ms: 0,
                 leader_only: false,
                 read_index: None,
+                follower: FollowerRead::Prefix,
             },
             group_placement(group),
         )

@@ -44,7 +44,7 @@ pub(super) struct MadsimRuntimeRaftNetworkFactory {
     policy: InProcessRaftNetworkPolicy,
     cold_store: Option<ColdStoreHandle>,
     aggressive_snapshot_purge: bool,
-    followers: Arc<Mutex<Vec<(u64, RaftGroupEngine)>>>,
+    pub(super) followers: Arc<Mutex<Vec<(u64, RaftGroupEngine)>>>,
     leaders: Arc<Mutex<BTreeMap<u32, u64>>>,
     groups: Arc<Mutex<BTreeMap<u32, RuntimeRaftNetworkGroupControl>>>,
     node_wals: Arc<Mutex<BTreeMap<u64, SimNodeWal>>>,
