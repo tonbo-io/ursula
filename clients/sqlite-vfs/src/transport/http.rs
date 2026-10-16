@@ -10,8 +10,9 @@
 //!
 //! Each attempt's time limits scale with its size (design §4.12, #566): connecting 5 s, sending
 //! the request head 5 s, sending the body `5 s + n / rate` (`URSULA_VFS_MIN_UPLOAD_KBPS`, 256 KiB/s by default), the answer's
-//! head 15 s, and its body `10 s + m / 256 KiB/s` for the `m` bytes the caller expects. A timeout
-//! is only another lost attempt.
+//! head 15 s (plus `t / 16 MiB/s` for a parts commit of `t` bytes, which the server copies before
+//! it answers), and its body `10 s + m / 256 KiB/s` for the `m` bytes the caller expects. A
+//! timeout is only another lost attempt.
 
 use std::fs;
 use std::net::IpAddr;
@@ -64,7 +65,7 @@ impl Transport for HttpTransport {
     fn send(&self, request: &Request, attempt: Attempt) -> Exchange {
         let url = format!("{}{}", self.url, request.target.suffix());
         let agent = match request.target {
-            Target::Snapshot { .. } => bulk_agent(),
+            Target::Snapshot { .. } | Target::SnapshotParts { .. } => bulk_agent(),
             Target::Stream | Target::Read { .. } | Target::Retention { .. } => agent(),
         };
         let resend = Resend {
@@ -75,7 +76,8 @@ impl Transport for HttpTransport {
             u64::try_from(request.body.len()).unwrap_or(u64::MAX),
             request.answer_bytes,
             min_upload_kbps(),
-        );
+        )
+        .waiting(request.answer_wait());
         // A body always goes out from a slice, so ureq sets `Content-Length`, an empty body's
         // included, and never chunks it.
         let sent = match request.method {
@@ -176,6 +178,13 @@ impl Timeouts {
             recv_response: Duration::from_secs(15),
             recv_body: scaled(Duration::from_secs(10), answer, MIN_DOWNLOAD_KBPS),
         }
+    }
+
+    /// The limits of a request whose server works for `wait` before it answers (a parts commit's
+    /// copy): the answer's head may take that much longer.
+    fn waiting(mut self, wait: Duration) -> Self {
+        self.recv_response = self.recv_response.saturating_add(wait);
+        self
     }
 
     /// `req` under these limits in place of the agent's overall timeout.

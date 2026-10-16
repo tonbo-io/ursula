@@ -67,9 +67,21 @@ async function snapshotLength(path: string): Promise<number> {
 	return Number((r.headers.get("content-range") ?? "").split("/")[1]);
 }
 
-/** Polls the child's status until `ready` holds, for at most 20 s. */
-async function waitStatus(c: Child, ready: (s: Status) => boolean): Promise<Status> {
-	const deadline = Date.now() + 20_000;
+/** Whether the stream's node takes snapshots in parts: its HEAD advertises `Ursula-Max-Snapshot-Bytes` (a cold store). */
+async function takesParts(path: string): Promise<boolean> {
+	const r = await fetch(`${directUrl()}${path}`, { method: "HEAD" });
+	return r.headers.get("ursula-max-snapshot-bytes") !== null;
+}
+
+/** Sets the model's limits: its request limit, and its snapshot limit (`cold` for a cold store's 1 GiB, `none` for no cold store). */
+async function modelLimits(maxRequestBytes: number, maxSnapshotBytes: "cold" | "none"): Promise<void> {
+	const r = await fetch(`${directUrl()}/__model/limits?max_request_bytes=${maxRequestBytes}&max_snapshot_bytes=${maxSnapshotBytes}`, { method: "PUT" });
+	expect(r.status).toBe(204);
+}
+
+/** Polls the child's status until `ready` holds, for at most `ms` (20 s). */
+async function waitStatus(c: Child, ready: (s: Status) => boolean, ms = 20_000): Promise<Status> {
+	const deadline = Date.now() + ms;
 	let last: Status | undefined;
 	while (Date.now() < deadline) {
 		last = (await c.send({ status: true })).status as Status;
@@ -327,33 +339,121 @@ describe("the 0.8 core on node:sqlite", () => {
 		// Below retention, only the snapshot and the tail after it can build a fresh directory.
 		expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
 		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
-		// A reader under a 64 KiB request limit reads the snapshot in ranged chunks: at least two.
-		expect(await snapshotLength(s.path)).toBeGreaterThan(65_536);
-		const ranged = { URSULA_VFS_MAX_REQUEST_BYTES: "65536" };
-		expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x", ranged)).toEqual(rows);
-		expect(await fromStream(s.url, "PRAGMA integrity_check", ranged)).toEqual([{ integrity_check: "ok" }]);
 		if (onModel()) {
-			// A layer that strips `Range`: the build's first GET, its first snapshot read, gets the whole body as `200`.
-			await fault("ignore-range", 1, "GET");
-			expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x", ranged)).toEqual(rows);
-			await fault("ignore-range", 1, "GET");
-			expect(await fromStream(s.url, "PRAGMA integrity_check", ranged)).toEqual([{ integrity_check: "ok" }]);
+			// Under a node's 64 KiB request limit, which alone sizes the chunks, a build reads the snapshot in ranged chunks: at
+			// least two. (On the real node, the 40 MiB snapshot below reads in two chunks of its 32 MiB limit.)
+			expect(await snapshotLength(s.path)).toBeGreaterThan(65_536);
+			await modelLimits(65_536, "none");
+			try {
+				expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
+				expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+				// A layer that strips `Range`: the build's first GET, its first snapshot read, gets the whole body as `200`.
+				await fault("ignore-range", 1, "GET");
+				expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
+				await fault("ignore-range", 1, "GET");
+				expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+			} finally {
+				await modelLimits(32 << 20, "none");
+			}
 		}
 	});
 
-	it("does not publish a snapshot body above the request limit and reports it in snapshot.error", async () => {
-		const s = stream("oversized");
+	/**
+	 * An owner under a 32 KiB request limit whose snapshot body is above it, after `before` ran on the opened owner: the
+	 * owner, the stream and the snapshot status once it published (`published`) or failed.
+	 */
+	async function oversized(label: string, published: boolean, before = async (): Promise<void> => {}): Promise<{ owner: Child; s: { url: string; path: string }; st: Status }> {
+		const s = stream(label);
 		const owner = new Child(s.url, freshDir(), { URSULA_VFS_SNAPSHOT_DUE_BYTES: "100000", URSULA_VFS_MAX_REQUEST_BYTES: "32768" });
 		await owner.opened();
+		await before();
 		await owner.exec("CREATE TABLE t(x, pad)");
 		for (let i = 1; i <= 40; i++) await owner.exec(`INSERT INTO t VALUES (${i}, randomblob(3000))`);
 		expect((await owner.send({ synced: 10_000 })).synced).toMatchObject({ synced: true });
-		const st = await waitStatus(owner, (st) => st.snapshot.error !== null);
-		expect(st.snapshot.error).toMatch(/^request_too_large: /);
-		expect(st.snapshot.offset).toBeNull();
+		// Published, with no other snapshot due after it.
+		const st = await waitStatus(owner, (st) => (published ? st.snapshot.offset !== null && st.snapshot.log_bytes <= st.snapshot.due_bytes : st.snapshot.error !== null));
 		expect(st.reset).toBeNull();
+		return { owner, s, st };
+	}
+
+	/** Without a cold store, a body above the request limit is not published, and snapshot.error says so. */
+	async function notPublished(label: string): Promise<void> {
+		const { owner, s, st } = await oversized(label, false);
+		expect(st.snapshot.error).toMatch(/^request_too_large: .*not published/);
+		expect(st.snapshot.offset).toBeNull();
 		expect(await retention(s.path)).toEqual({ snapshot: null, retained: 0 });
 		await owner.stop();
+	}
+
+	/** With a cold store, it publishes in parts of the request limit: HEAD names it, and a fresh directory builds from it. */
+	async function publishedInParts(label: string, before?: () => Promise<void>): Promise<void> {
+		const { owner, s, st } = await oversized(label, true, before);
+		expect(st.snapshot.error).toBeNull();
+		// An earlier snapshot may have published during the writes, retention one behind.
+		expect((await retention(s.path)).snapshot).toBe(st.snapshot.offset);
+		// Above the 32 KiB limit, so it went up in parts.
+		expect(await snapshotLength(s.path)).toBeGreaterThan(32_768);
+		const rows = await owner.rows("SELECT x, hex(pad) AS pad FROM t ORDER BY x");
+		await owner.stop();
+		expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
+		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+	}
+
+	it("publishes a snapshot body above the request limit in parts with a cold store, and reports it in snapshot.error without one", async () => {
+		if (!onModel()) {
+			const probe = stream("oversized-probe");
+			const owner = new Child(probe.url, freshDir());
+			await owner.opened();
+			const parts = await takesParts(probe.path);
+			await owner.stop();
+			await (parts ? publishedInParts("oversized-parts") : notPublished("oversized"));
+			return;
+		}
+		// The model without a cold store, then with one.
+		await notPublished("oversized");
+		await modelLimits(32 << 20, "cold");
+		try {
+			await publishedInParts("oversized-parts");
+			// A commit that a node answers `503` (it runs that commit already) and `502` is repeated as is, and still publishes.
+			// The owner's create is behind it, so the next PUTs are the commit's.
+			await publishedInParts("oversized-parts-503", async () => {
+				await fault("commit-in-progress", 1, "PUT");
+				await fault("status 502", 1, "PUT");
+			});
+			// Both were the commit's: the next PUT meets no scripted answer.
+			const next = await fetch(`${directUrl()}${stream("oversized-after").path}`, { method: "PUT", headers: { "content-type": "application/octet-stream" } });
+			expect(next.status).toBe(201);
+		} finally {
+			await modelLimits(32 << 20, "none");
+		}
+	});
+
+	it.runIf(!onModel())("publishes a snapshot above the node's 32 MiB request limit in parts, and a fresh directory builds from it", async () => {
+		const s = stream("large-snapshot");
+		// Due past 36 MiB of acknowledged frames: one snapshot, of a database above 32 MiB.
+		const owner = new Child(s.url, freshDir(), { URSULA_VFS_SNAPSHOT_DUE_BYTES: String(36 << 20) });
+		await owner.opened();
+		if (!(await takesParts(s.path))) {
+			await owner.stop();
+			return;
+		}
+		await owner.exec("CREATE TABLE t(x INTEGER PRIMARY KEY, b BLOB)");
+		// 1 MiB transactions, each a frame below the batch limit.
+		for (let i = 1; i <= 40; i++) await owner.exec(`INSERT INTO t VALUES (${i}, randomblob(1048576))`);
+		expect((await owner.send({ synced: 60_000 })).synced).toMatchObject({ synced: true });
+		const st = await waitStatus(owner, (st) => st.snapshot.offset !== null || st.snapshot.error !== null, 120_000);
+		expect(st.snapshot.error).toBeNull();
+		expect(st.reset).toBeNull();
+		expect((await retention(s.path)).snapshot).toBe(st.snapshot.offset);
+		// Above the node's 32 MiB request limit: at least two parts.
+		expect(await snapshotLength(s.path)).toBeGreaterThan(32 << 20);
+		const sql = "SELECT x, length(b) AS n, hex(substr(b, 1, 16)) AS head, hex(substr(b, -16)) AS tail FROM t ORDER BY x";
+		const rows = await owner.rows(sql);
+		expect(rows).toHaveLength(40);
+		await owner.stop();
+		// The fresh build reads the snapshot in two chunks of the node's limit.
+		expect(await fromStream(s.url, sql)).toEqual(rows);
+		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
 	});
 
 	it("refuses a write in EXCLUSIVE locking mode alone, as unsupported", () => {

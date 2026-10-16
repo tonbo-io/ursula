@@ -994,8 +994,6 @@ impl Core {
                     incarnation,
                     cluster_id,
                 } => {
-                    let max_request_bytes =
-                        b.replicator.ctx().and_then(|ctx| ctx.limits.configured);
                     let lineage = self.lineage();
                     let salvage = salvage.then_some(incarnation);
                     self.rebuild(
@@ -1014,7 +1012,6 @@ impl Core {
                             claim: Some((epoch, activation)),
                             end: to,
                             fate,
-                            max_request_bytes,
                         },
                     );
                 }
@@ -1446,7 +1443,7 @@ impl Core {
                     let step = guard::contain(
                         "driver_open",
                         || OpenStep::Fail(OpenError::Panicked),
-                        || slot.opening.answered(&exchange, lineage, now_ms),
+                        || slot.opening.answered(exchange, lineage, now_ms),
                     );
                     self.open_step(open, step, now_ms, &mut ios);
                 }
@@ -1466,7 +1463,7 @@ impl Core {
                     else {
                         return;
                     };
-                    let step = build.answered(&exchange, now_ms);
+                    let step = build.answered(exchange, now_ms);
                     core.build_step(binding, build, step, &mut ios);
                 });
             }

@@ -28,6 +28,28 @@ pub(crate) enum Fault {
     Delay { ms: u64 },
     /// A layer strips `Range`: a snapshot read gets the whole body, `200`.
     IgnoreRange,
+    /// The node answers a parts commit `503` with `Retry-After: 1` and this JSON `error` code,
+    /// nothing applied.
+    CommitRefused(CommitRefusal),
+}
+
+/// Why a node refuses a parts commit for now (extensions §2.2): the client repeats it as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitRefusal {
+    /// Every copy slot is taken: `SnapshotCommitsBusy`.
+    Busy,
+    /// The node runs this commit now: `SnapshotCommitInProgress`.
+    InProgress,
+}
+
+impl CommitRefusal {
+    /// The JSON `error` code of the `503`.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Busy => "SnapshotCommitsBusy",
+            Self::InProgress => "SnapshotCommitInProgress",
+        }
+    }
 }
 
 /// A fault script line that does not parse.
@@ -38,7 +60,7 @@ pub(crate) struct FaultSyntax(pub(crate) String);
 impl Fault {
     /// Parses one fault, as the control route takes it: `unreachable`, `drop-request`,
     /// `drop-answer`, `status <code> [<retry-after seconds>]`, `redirect <location>`,
-    /// `untyped-413`, `delay <ms>` or `ignore-range`.
+    /// `untyped-413`, `delay <ms>`, `ignore-range`, `commits-busy` or `commit-in-progress`.
     pub(crate) fn parse(text: &str) -> Result<Self, FaultSyntax> {
         let syntax = || FaultSyntax(text.to_owned());
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -49,6 +71,8 @@ impl Fault {
             ["drop-answer"] => Ok(Self::DropAnswer),
             ["untyped-413"] => Ok(Self::UntypedTooLarge),
             ["ignore-range"] => Ok(Self::IgnoreRange),
+            ["commits-busy"] => Ok(Self::CommitRefused(CommitRefusal::Busy)),
+            ["commit-in-progress"] => Ok(Self::CommitRefused(CommitRefusal::InProgress)),
             ["status", code, rest @ ..] if rest.len() <= 1 => Ok(Self::Status {
                 status: code.parse().map_err(|_not_a_status| syntax())?,
                 retry_after: match rest.first() {
@@ -103,6 +127,7 @@ impl Faults {
 
 #[cfg(test)]
 mod tests {
+    use super::CommitRefusal;
     use super::Fault;
     use super::FaultSyntax;
     use super::Faults;
@@ -133,6 +158,14 @@ mod tests {
         );
         assert_eq!(Fault::parse("delay 20"), Ok(Fault::Delay { ms: 20 }));
         assert_eq!(Fault::parse("ignore-range"), Ok(Fault::IgnoreRange));
+        assert_eq!(
+            Fault::parse("commits-busy"),
+            Ok(Fault::CommitRefused(CommitRefusal::Busy))
+        );
+        assert_eq!(
+            Fault::parse("commit-in-progress"),
+            Ok(Fault::CommitRefused(CommitRefusal::InProgress))
+        );
         for bad in ["status x", "status 503 2 3", "explode"] {
             assert_eq!(Fault::parse(bad), Err(FaultSyntax(bad.to_owned())));
         }

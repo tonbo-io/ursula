@@ -47,8 +47,6 @@ pub(crate) struct NewBuild {
     pub(crate) end: Offset,
     /// What becomes of the generation the build replaces when it publishes.
     pub(crate) fate: Fate,
-    /// `URSULA_VFS_MAX_REQUEST_BYTES`, which bounds the build's snapshot chunks.
-    pub(crate) max_request_bytes: Option<u64>,
 }
 
 #[derive(Debug)]

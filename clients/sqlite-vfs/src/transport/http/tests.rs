@@ -347,6 +347,16 @@ fn time_limits_scale_with_the_body_and_the_answer() {
         Duration::from_secs(9)
     );
     assert_eq!(Timeouts::new(1024, 0, 0).send_body, Duration::from_secs(6));
+    // A commit of 1 GiB in parts: its answer may come 64 s after the 15 s.
+    let commit = Request {
+        wait_bytes: 1 << 30,
+        ..Request::new(Method::Put, Target::Snapshot {
+            offset: Offset::from_u64(1),
+        })
+    };
+    let waiting = Timeouts::new(0, 0, 256).waiting(commit.answer_wait());
+    assert_eq!(waiting.recv_response, Duration::from_secs(79));
+    assert_eq!(waiting.send_body, Duration::from_secs(5));
 }
 
 #[test]

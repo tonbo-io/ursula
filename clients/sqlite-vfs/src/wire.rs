@@ -23,6 +23,8 @@ use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::Offset;
+use ursula_headers::PartStaged;
+use ursula_headers::PartsCommit;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::RoutingAnswer;
@@ -58,6 +60,13 @@ const HEADER_RANGE: ByteRange = ByteRange::Bounded {
 
 /// The base protocol's read offset for the start of a stream.
 const START: &str = "-1";
+
+/// The path suffix, after the snapshot's, of a part staged for it.
+const PARTS: &str = "/parts";
+
+/// The rate a parts commit's answer is waited for at: a server copies the parts before it
+/// answers, in time with their total.
+const COMMIT_COPY_BYTES_PER_SECOND: u64 = 16 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Method {
@@ -96,8 +105,10 @@ pub(crate) enum Target {
     /// A read from `from` (`None`: the start of the stream), of the leader's applied state when
     /// `leader`.
     Read { from: Option<Offset>, leader: bool },
-    /// The snapshot at `offset`: a publish (`PUT`) or a read (`GET`).
+    /// The snapshot at `offset`: a publish or a parts commit (`PUT`), or a read (`GET`).
     Snapshot { offset: Offset },
+    /// A part of the snapshot at `offset`, staged (`POST`) for a parts commit.
+    SnapshotParts { offset: Offset },
     /// The retention boundary (`PUT`), monotonic (#581 §3).
     Retention { offset: Offset },
 }
@@ -113,6 +124,7 @@ impl Target {
                 format!("?offset={from}{consistency}")
             }
             Self::Snapshot { offset } => format!("/snapshot/{offset}"),
+            Self::SnapshotParts { offset } => format!("/snapshot/{offset}/parts"),
             Self::Retention { offset } => format!("/retention/{offset}"),
         }
     }
@@ -125,6 +137,13 @@ impl Target {
     )]
     pub(crate) fn split(method: Method, target: &str) -> Result<(&str, Self), WireError> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if let Some((stream, offset)) = path
+            .strip_suffix(PARTS)
+            .and_then(|path| path.rsplit_once("/snapshot/"))
+        {
+            let offset = Offset::parse(names::STREAM_OFFSET, offset)?;
+            return Ok((stream, Self::SnapshotParts { offset }));
+        }
         for (marker, build) in [
             ("/snapshot/", Self::snapshot as fn(Offset) -> Self),
             ("/retention/", Self::retention),
@@ -193,6 +212,9 @@ pub(crate) struct Request {
     pub(crate) content_type: Option<String>,
     /// `Stream-Snapshot-Digest` of a snapshot publish.
     pub(crate) snapshot_digest: Option<SnapshotDigest>,
+    /// `Stream-Snapshot-Parts` and `Stream-Snapshot-Digest` of a parts commit, whose body is the
+    /// `PartsManifest`.
+    pub(crate) parts: Option<Box<PartsCommit>>,
     /// `Stream-Closed: true`: a create of a closed stream, or a closing append.
     pub(crate) closes: bool,
     pub(crate) body: Arc<[u8]>,
@@ -202,6 +224,9 @@ pub(crate) struct Request {
     /// `Range` of a snapshot read: a server answers these bytes (`206`), or the whole body
     /// (`200`) when it ignores `Range`.
     pub(crate) range: Option<ByteRange>,
+    /// The bytes a server works through before it answers (a parts commit copies its parts): it
+    /// scales the time the answer's head may take. Not sent.
+    pub(crate) wait_bytes: u64,
 }
 
 /// Which part of a snapshot a read asks for.
@@ -224,11 +249,24 @@ impl Request {
             keys: ProducerRequestHeaders::default(),
             content_type: None,
             snapshot_digest: None,
+            parts: None,
             closes: false,
             body: Arc::from(Vec::new()),
             answer_bytes: 0,
             range: None,
+            wait_bytes: 0,
         }
+    }
+
+    /// How long the answer's head may take beyond the base wait: the [`Request::wait_bytes`] a
+    /// server copies, at 16 MiB/s.
+    pub(crate) fn answer_wait(&self) -> Duration {
+        let millis = self
+            .wait_bytes
+            .saturating_mul(1000)
+            .checked_div(COMMIT_COPY_BYTES_PER_SECOND)
+            .unwrap_or(0);
+        Duration::from_millis(millis)
     }
 
     /// A read from `from`, expecting up to `answer_bytes` (the read's chunk) in the answer.
@@ -279,6 +317,9 @@ impl Request {
         if let Some(digest) = &self.snapshot_digest {
             emit(names::STREAM_SNAPSHOT_DIGEST, &digest.to_string());
         }
+        if let Some(parts) = &self.parts {
+            parts.render(&mut emit);
+        }
         if self.closes {
             emit(names::STREAM_CLOSED, "true");
         }
@@ -306,19 +347,26 @@ impl Request {
         let content_type = text(headers.clone(), CONTENT_TYPE)?.map(str::to_owned);
         let closes = flag(headers.clone(), names::STREAM_CLOSED)?;
         let range = ByteRange::parse(headers.clone());
-        let snapshot_digest = text(headers, names::STREAM_SNAPSHOT_DIGEST)?
-            .map(|digest| SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest))
-            .transpose()?;
+        // A commit's digest travels in its `PartsCommit`.
+        let parts = PartsCommit::parse(headers.clone())?.map(Box::new);
+        let snapshot_digest = match parts {
+            Some(_) => None,
+            None => text(headers, names::STREAM_SNAPSHOT_DIGEST)?
+                .map(|digest| SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest))
+                .transpose()?,
+        };
         Ok(Self {
             method,
             target,
             keys,
             content_type,
             snapshot_digest,
+            parts,
             closes,
             body: Arc::from(body),
             answer_bytes: 0,
             range,
+            wait_bytes: 0,
         })
     }
 }
@@ -346,8 +394,10 @@ pub(crate) enum Typed {
     },
     /// `201` or `200` to a create: the stream exists with this token.
     Created { incarnation: Incarnation },
-    /// `204` or `409` to a snapshot publish.
+    /// `204` or `409` to a snapshot publish or a parts commit.
     Snapshot(SnapshotPublishAnswer),
+    /// `201` to a part staged: its id.
+    PartStaged(PartStaged),
     /// `200` or `206` to a snapshot read: `range` is the `Content-Range` of a `206`, `None` for
     /// the whole body of a `200`.
     SnapshotRead {
@@ -529,6 +579,9 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
         (Method::Put, Target::Snapshot { .. }) => {
             SnapshotPublishAnswer::parse(status, headers)?.map_or(Typed::Untyped, Typed::Snapshot)
         }
+        (Method::Post, Target::SnapshotParts { .. }) if status == 201 => {
+            Typed::PartStaged(PartStaged::parse(headers)?)
+        }
         (Method::Get, Target::Snapshot { .. }) if matches!(status, 200 | 206) => {
             let range = match ContentRange::parse(status, headers.clone())? {
                 None => None,
@@ -617,6 +670,10 @@ mod tests {
     use ursula_headers::Incarnation;
     use ursula_headers::IncarnationPrecondition;
     use ursula_headers::Offset;
+    use ursula_headers::PartId;
+    use ursula_headers::PartStaged;
+    use ursula_headers::PartsCommit;
+    use ursula_headers::PartsManifest;
     use ursula_headers::ProducerId;
     use ursula_headers::ProducerRequestHeaders;
     use ursula_headers::ProducerWrite;
@@ -653,6 +710,7 @@ mod tests {
             }),
             (Method::Put, Target::Snapshot { offset }),
             (Method::Get, Target::Snapshot { offset }),
+            (Method::Post, Target::SnapshotParts { offset }),
             (Method::Put, Target::Retention { offset }),
         ] {
             let path = format!("/v1/stream/b/s{}", target.suffix());
@@ -706,6 +764,68 @@ mod tests {
             request.body.to_vec(),
         );
         assert_eq!(parsed, Ok(request));
+    }
+
+    // A parts commit renders its count and digest through `PartsCommit`, and its manifest is
+    // the body; a staged part's `201` names its id.
+    #[test]
+    fn a_parts_commit_and_a_staged_part_travel_typed() {
+        let manifest = PartsManifest::new(vec![
+            PartId::new("a.part").unwrap(),
+            PartId::new("b.part").unwrap(),
+        ])
+        .unwrap();
+        let digest = SnapshotDigest::from_bytes([9; 32]);
+        let commit = Request {
+            parts: Some(Box::new(PartsCommit::for_manifest(&manifest, digest))),
+            content_type: Some("application/vnd.ursula.sqlite-vfs.v2".to_owned()),
+            body: Arc::from(manifest.render().into_bytes()),
+            ..Request::new(Method::Put, Target::Snapshot {
+                offset: Offset::from_u64(64),
+            })
+        };
+        let headers = rendered(&commit);
+        assert!(headers.contains(&("stream-snapshot-parts", "2".to_owned())));
+        assert_eq!(commit.body.as_ref(), b"a.part\nb.part\n");
+        let parsed = Request::parse(
+            commit.method,
+            commit.target,
+            headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_bytes())),
+            commit.body.to_vec(),
+        );
+        assert_eq!(parsed, Ok(commit));
+        let stage = Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(64),
+        });
+        let mut raw = RawAnswer::new(201);
+        raw.header("stream-snapshot-part", "a.part");
+        assert_eq!(
+            raw.parse(&stage).typed,
+            Ok(Typed::PartStaged(PartStaged {
+                part: PartId::new("a.part").unwrap()
+            }))
+        );
+        assert_eq!(
+            RawAnswer::new(201).parse(&stage).typed,
+            Err(HeaderError::Missing {
+                name: "stream-snapshot-part"
+            })
+        );
+    }
+
+    // A commit's answer may wait for the copy of its parts: 16 MiB/s beyond the base wait.
+    #[test]
+    fn a_commit_waits_for_its_copy() {
+        let commit = Request {
+            wait_bytes: 64 << 20,
+            ..Request::new(Method::Put, Target::Snapshot {
+                offset: Offset::from_u64(64),
+            })
+        };
+        assert_eq!(commit.answer_wait(), std::time::Duration::from_secs(4));
+        assert!(rendered(&commit).is_empty());
     }
 
     #[test]

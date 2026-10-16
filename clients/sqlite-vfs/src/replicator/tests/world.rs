@@ -433,7 +433,7 @@ enum Msg {
     Request {
         to: u64,
         id: RequestId,
-        request: Request,
+        request: Box<Request>,
         late: bool,
     },
     Answer {
@@ -1469,7 +1469,7 @@ impl World {
         self.msgs.push(Msg::Request {
             to,
             id,
-            request,
+            request: Box::new(request),
             late: false,
         });
     }
@@ -1999,7 +1999,7 @@ impl World {
                 id,
                 request,
                 late,
-            } => self.deliver_request(to, id, request, late, true),
+            } => self.deliver_request(to, id, *request, late, true),
             Msg::Answer {
                 to,
                 id,
@@ -2181,7 +2181,7 @@ impl World {
                         to, id, request, ..
                     } = self.msgs.remove(at)
                 {
-                    self.deliver_request(to, id, request, false, false);
+                    self.deliver_request(to, id, *request, false, false);
                 }
             }
             Op::DropAnswer(pick) => {
