@@ -258,7 +258,8 @@ const MALLOC_CONF_ENV_VAR: &str = if cfg!(target_vendor = "apple") {
 } else {
     "MALLOC_CONF"
 };
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// The protocol's request limit ([`ursula_headers::MAX_REQUEST_BYTES`]).
+const MAX_HTTP_BODY_BYTES: usize = ursula_headers::MAX_REQUEST_BYTES as usize;
 /// Server-side cap on one read response (bounded-stream-state F11), the same
 /// 8 MiB that caps bootstrap updates. A request's `max_bytes` is clamped to
 /// it; a capped response is partial (`Stream-Up-To-Date` absent), may end
@@ -1978,6 +1979,25 @@ fn producer_answer_response(
     };
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
+    // Only a DST negative control answers an applied write with a refusal,
+    // to show the simulation catches a refusal that is not true; every
+    // other build has no switch.
+    if matches!(answer, ProducerAnswer::Receipt {
+        delivery: ursula_headers::Delivery::Applied,
+        ..
+    }) && ursula_stream::sim_controls::off(
+        ursula_stream::sim_controls::Defence::RefusalMeansUnapplied,
+    ) {
+        headers.insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("1"),
+        );
+        return fixed_error_answer(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::NoLeader,
+            headers,
+        );
+    }
     insert_producer_answer(&mut headers, &answer);
     let status = match (to, &answer) {
         (AnswerTo::CloseOnly, ProducerAnswer::Receipt { .. }) => StatusCode::NO_CONTENT,
@@ -2091,7 +2111,7 @@ pub(crate) async fn purge_bucket(
 /// `Retry-After`; purge is idempotent, so the caller retries the whole request.
 fn purge_error_response(err: RuntimeError) -> Response {
     if is_forward_to_leader(&err) {
-        return leader_unknown_retry_response(err);
+        return leader_unknown_retry_response(err, Access::Write);
     }
     runtime_error_response(err)
 }
@@ -2457,9 +2477,7 @@ pub(crate) async fn flush_cold_stream(
             .to_string(),
         ),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
+        Err(err) => write_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await,
     }
 }
 
@@ -2660,9 +2678,7 @@ pub(crate) async fn import_backup_group(
             }),
         )
             .into_response(),
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
+        Err(err) => write_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await,
     }
 }
 
@@ -3760,7 +3776,7 @@ pub(crate) async fn delete_stream_by_id(
             insert_default_response_headers(&mut headers);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => write_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -4121,7 +4137,7 @@ pub(crate) async fn publish_snapshot(
     if let HeadDecision::Answer(answer) = decision {
         return answer_before_body(answer, version, &headers, body).await;
     }
-    let incarnation = match snapshot_parts::key_check(&snapshot, &commit).await {
+    let incarnation = match snapshot_parts::key_check(&snapshot, &commit, BodyState::Unread).await {
         snapshot_parts::KeyCheck::Answered(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
@@ -4365,7 +4381,7 @@ pub(crate) async fn advance_retention(
             insert_incarnation(&mut headers, response.incarnation);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => write_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -5278,10 +5294,44 @@ fn count_refusal(state: &HttpState, err: &RuntimeError) {
     }
 }
 
+/// Whether a request reads or writes, which decides what a leadership
+/// refusal of it answers ([`leader_unknown_retry_response`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// A read, which proposes nothing: a forward with a leader redirects,
+    /// and one without answers `NO_LEADER`.
+    Read,
+    /// A write: only one refused before its proposal redirects or answers
+    /// `NO_LEADER`, and any other answers `OUTCOME_UNKNOWN`.
+    Write,
+}
+
+/// The answer to a failed read: a redirect to the leader its error names,
+/// else the runtime's answer.
 pub(crate) async fn runtime_error_or_leader_redirect_async(
     state: &HttpState,
     err: RuntimeError,
     request_target: &str,
+) -> Response {
+    leadership_or_runtime_answer(state, err, request_target, Access::Read)
+}
+
+/// The answer to a failed write before its body was read: a redirect only
+/// for a write refused before its proposal (extensions Section 5.7), else
+/// the runtime's answer.
+pub(crate) async fn write_error_or_leader_redirect_async(
+    state: &HttpState,
+    err: RuntimeError,
+    request_target: &str,
+) -> Response {
+    leadership_or_runtime_answer(state, err, request_target, Access::Write)
+}
+
+fn leadership_or_runtime_answer(
+    state: &HttpState,
+    err: RuntimeError,
+    request_target: &str,
+    access: Access,
 ) -> Response {
     count_refusal(state, &err);
     let Some(router) = state.client_write_router() else {
@@ -5293,14 +5343,20 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.
-    if let Some(redirect) = router.redirect_response(&err, request_target) {
+    // Only a write refused before its proposal redirects: a redirect tells
+    // the client that this node applied nothing (extensions Section 5.7).
+    let redirects = match access {
+        Access::Read => true,
+        Access::Write => refused_before_proposal(&err),
+    };
+    if redirects && let Some(redirect) = router.redirect_response(&err, request_target) {
         return redirect;
     }
     // Forward-to-leader error whose leader or term is currently unknown
     // (election in progress), or a group no known node hosts: tell the
     // client to retry rather than failing hard.
-    if is_forward_to_leader(&err) || matches!(err, RuntimeError::GroupNotHosted { .. }) {
-        return leader_unknown_retry_response(err);
+    if is_leadership_refusal(&err) {
+        return leader_unknown_retry_response(err, access);
     }
     runtime_error_response(err)
 }
@@ -5308,7 +5364,9 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
 /// The answer to a write that failed after its body was read: never a
 /// redirect (#581 section 6.1). A leadership refusal, of a node that lost
 /// the group's leadership while it read the body, answers `503` with
-/// `Retry-After`, and the write's key resolves the outcome.
+/// `Retry-After` ([`leader_unknown_retry_response`]): `NO_LEADER` when the
+/// node refused the write before proposing it, else `OUTCOME_UNKNOWN`, and
+/// the write's key resolves the outcome.
 pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> Response {
     count_refusal(state, &err);
     // Only a DST negative control turns the rule off, to show the
@@ -5321,10 +5379,16 @@ pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> 
     {
         return redirect;
     }
-    if is_forward_to_leader(&err) || matches!(err, RuntimeError::GroupNotHosted { .. }) {
-        return leader_unknown_retry_response(err);
+    if is_leadership_refusal(&err) {
+        return leader_unknown_retry_response(err, Access::Write);
     }
     runtime_error_response(err)
+}
+
+/// Whether `err` refuses a request for this node's leadership: a forward to
+/// the leader, known or not, or a group this node hosts no replica of.
+fn is_leadership_refusal(err: &RuntimeError) -> bool {
+    is_forward_to_leader(err) || matches!(err, RuntimeError::GroupNotHosted { .. })
 }
 
 /// Whether the runtime refused `err`'s write before it proposed the write's
@@ -5333,7 +5397,9 @@ pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> 
 /// ([`GroupEngineError::is_refused_before_proposal`]). Every other failure can
 /// follow a proposal (a forward or a lost response after `client_write`, a
 /// group that stopped applying, a storage error) or is no refusal to retry.
-/// Only the F5 staged-payload cleanup asks; no response says it.
+/// The F5 staged-payload cleanup asks, and the answer to a leadership
+/// refusal says it: a redirect or `NO_LEADER` only when this holds
+/// ([`leader_unknown_retry_response`]).
 ///
 /// [`GroupEngineError::is_refused_before_proposal`]: ursula_runtime::GroupEngineError::is_refused_before_proposal
 fn refused_before_proposal(err: &RuntimeError) -> bool {
@@ -5361,13 +5427,33 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
     err.leader_hint().is_some()
 }
 
-/// 503 + `Retry-After: 1` for a request that must reach the group leader but
-/// cannot be redirected (purge) or has no known leader. Retryable.
-fn leader_unknown_retry_response(err: RuntimeError) -> Response {
+/// The `503` with `Retry-After: 1` of a leadership refusal that does not
+/// redirect: a purge, which cannot, or a leader that is unknown, or a body
+/// already read. The one place that tells the two leadership `503`s apart
+/// (extensions Section 5.7):
+///
+/// - `NO_LEADER` with `x-ursula-raft-group`, for a read, and for a write
+///   this node refused before proposing it ([`refused_before_proposal`]):
+///   nothing applied.
+/// - `OUTCOME_UNKNOWN`, for a write's forward reported after it was handed
+///   to Raft, which may follow a committed entry: the write may have
+///   applied, and its key resolves it. A read never gets it.
+fn leader_unknown_retry_response(err: RuntimeError, access: Access) -> Response {
     // The error names the leader's address: it stays in the log, at debug,
     // since every election answers so.
     tracing::debug!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    if access == Access::Write && !refused_before_proposal(&err) {
+        return fixed_error_answer(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::OutcomeUnknown,
+            headers,
+        );
+    }
     let group = match &err {
         RuntimeError::GroupEngine { raft_group_id, .. }
         | RuntimeError::GroupNotHosted { raft_group_id, .. } => Some(*raft_group_id),
@@ -5379,10 +5465,6 @@ fn leader_unknown_retry_response(err: RuntimeError) -> Response {
         }
         .render(|name, value| insert_header_str(&mut headers, name, value));
     }
-    headers.insert(
-        axum::http::header::RETRY_AFTER,
-        HeaderValue::from_static("1"),
-    );
     fixed_error_answer(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::NoLeader,
@@ -5417,3 +5499,5 @@ mod snapshot_parts_tests;
 mod staging_cleanup_tests;
 #[cfg(test)]
 mod write_keys_tests;
+#[cfg(test)]
+mod write_outcome_tests;

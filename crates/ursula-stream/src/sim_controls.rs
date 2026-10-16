@@ -75,6 +75,13 @@ pub enum Defence {
     /// The commit screen reads the store's marker alone and skips every
     /// index at or below the last purged entry (#613, as at `20bb1b88`).
     CommitScreenPurged,
+    /// A node answers a write with a refusal, such as `NO_LEADER`, only when
+    /// nothing of it applied (extensions Section 11.1). Off, the HTTP front
+    /// door answers each producer write that applied now with `503
+    /// NO_LEADER`, as a node that took OpenRaft's forward after a commit for
+    /// a refusal before the proposal would: the write's repeat then gets its
+    /// receipt.
+    RefusalMeansUnapplied,
 }
 
 #[cfg(madsim)]
@@ -84,8 +91,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 17]> = const { Cell::new([false; 17]) };
-        static FIRED: Cell<[u64; 17]> = const { Cell::new([0; 17]) };
+        static OFF: Cell<[bool; 18]> = const { Cell::new([false; 18]) };
+        static FIRED: Cell<[u64; 18]> = const { Cell::new([0; 18]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -107,6 +114,7 @@ mod switches {
             Defence::CommitScreenInstall => 14,
             Defence::CommitScreenChain => 15,
             Defence::CommitScreenPurged => 16,
+            Defence::RefusalMeansUnapplied => 17,
         }
     }
 
@@ -129,7 +137,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 17]));
+        FIRED.with(|fired| fired.set([0; 18]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

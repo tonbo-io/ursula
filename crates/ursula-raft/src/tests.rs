@@ -1729,14 +1729,15 @@ fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
     }
 }
 
-/// Only the engine's own leadership check, which runs before anything is
-/// proposed, reports its forward as raised before proposal. A forward that
-/// OpenRaft reports for a write handed to `client_write` or
-/// `client_write_many` stays ambiguous. OpenRaft reports one when it refuses
-/// the write up front, as on this follower, and also when it drops an entry
-/// it appended before it lost leadership, which may still commit. The HTTP
-/// layer marks the first kind as applying nothing, so the second must never
-/// look like it.
+/// The engine's one leadership check, which runs right before commands go to
+/// OpenRaft, reports its forward as raised before proposal: on its own,
+/// inside `write`, and inside a batch, for every entry. A forward that
+/// OpenRaft reports for a write handed to it stays ambiguous, since OpenRaft
+/// also reports one when it drops an entry it appended before it lost
+/// leadership, which may still commit
+/// (`a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_down`).
+/// The HTTP layer answers the first kind `NO_LEADER` and the second
+/// `OUTCOME_UNKNOWN`.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn only_the_engines_own_leadership_check_is_before_proposal() {
@@ -1768,8 +1769,8 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     let written = follower
         .write(append_command(stream_id.clone(), b"a"))
         .await
-        .expect_err("OpenRaft refuses client_write on a follower");
-    assert!(!written.is_forward_before_proposal(), "{written:?}");
+        .expect_err("the engine's check refuses a write on a follower");
+    assert!(written.is_forward_before_proposal(), "{written:?}");
     assert!(names_the_leader(&written), "{written:?}");
 
     let batch =
@@ -1778,26 +1779,25 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
             append_command(stream_id, b"b"),
         ])
         .await
-        .expect("OpenRaft takes the batch");
+        .expect("the batch is answered entry by entry");
     assert_eq!(batch.len(), 2);
     for entry in batch {
-        let error = entry.expect_err("OpenRaft refuses each batch entry on a follower");
-        assert!(!error.is_forward_before_proposal(), "{error:?}");
+        let error = entry.expect_err("the engine's check refuses each batch entry on a follower");
+        assert!(error.is_forward_before_proposal(), "{error:?}");
         assert!(names_the_leader(&error), "{error:?}");
     }
 
     shutdown_all(&engines).await;
 }
 
-/// A write that the engine hands to OpenRaft on a leader: after its own
-/// leadership check, but for an external create, which it hands straight to
-/// `client_write`.
+/// A write that the engine hands to OpenRaft on a leader, after its own
+/// leadership check.
 #[cfg(not(madsim))]
 #[derive(Debug, Clone, Copy)]
 enum WriteToOpenRaft {
     /// An inline create, with cold admission on.
     Create,
-    /// An external create, which the engine does not check first.
+    /// An external create.
     CreateExternal,
     Append,
     /// Two appends, which a leader hands to `client_write_many` together.
@@ -1926,8 +1926,8 @@ impl WriteToOpenRaft {
 
 /// A write the engine handed to OpenRaft is never refused before proposal,
 /// even by a node that lost leadership since. Each write below reaches
-/// OpenRaft on a leader cut off from its followers, all but the external
-/// create after the engine's own leadership check. The leader appends the
+/// OpenRaft on a leader cut off from its followers, after the engine's own
+/// leadership check. The leader appends the
 /// write's entries but cannot commit them. The followers
 /// elect a new leader, and once the partition heals, the new leader's log
 /// replaces the entries and OpenRaft answers the write with a forward to it.

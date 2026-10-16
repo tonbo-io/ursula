@@ -79,6 +79,11 @@ impl GroupLeadership {
         }
     }
 
+    /// This replica leads the group.
+    pub fn leads(&self) -> bool {
+        matches!(self.role, LeaderRole::Leads)
+    }
+
     /// The term in which this view knows `leader` leads, if it names it.
     pub fn term_of(&self, leader: u64) -> Option<u64> {
         match self.role {

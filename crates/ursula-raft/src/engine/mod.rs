@@ -678,6 +678,7 @@ impl RaftGroupEngine {
         self.apply_health.check(self.placement.raft_group_id)?;
         crate::forward::validate_proposal(&command)?;
         self.history.admit_proposal(&self.raft, &command).await?;
+        crate::forward::refuse_unless_leader(&self.raft)?;
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             // Once submitted, a group that stops may already have committed
@@ -694,19 +695,8 @@ impl RaftGroupEngine {
         &self,
         _command: GroupWriteCommand,
     ) -> Result<Option<GroupWriteResponse>, GroupEngineError> {
-        if self.raft.is_leader() {
-            return Ok(None);
-        }
-        let leader_id = self.raft.current_leader().await;
-        let leader_node = self.current_leader_node().await;
-        let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
-        Err(group_engine_forward_to_leader_error(
-            "OpenRaft group write has to run on the local leader runtime",
-            leader_id,
-            leader_node.as_ref(),
-            &leadership,
-            true,
-        ))
+        crate::forward::refuse_unless_leader(&self.raft)?;
+        Ok(None)
     }
 
     pub(crate) async fn with_state_machine<V>(
@@ -932,17 +922,6 @@ impl RaftGroupEngine {
             leader_id,
             leader,
         })
-    }
-
-    pub(crate) async fn current_leader_node(&self) -> Option<BasicNode> {
-        let leader_id = self.raft.current_leader().await?;
-        self.raft
-            .metrics()
-            .borrow_watched()
-            .membership_config
-            .membership()
-            .get_node(&leader_id)
-            .cloned()
     }
 }
 

@@ -123,7 +123,7 @@ pub(crate) async fn route_before_body(
             // that does.
             Err(err) => {
                 return HeadDecision::Answer(
-                    crate::runtime_error_or_leader_redirect_async(state, err, request_target).await,
+                    crate::write_error_or_leader_redirect_async(state, err, request_target).await,
                 );
             }
         },
@@ -276,7 +276,7 @@ pub(crate) async fn write_error_response(
 ) -> Response {
     match body {
         BodyState::Unread => {
-            crate::runtime_error_or_leader_redirect_async(state, err, request_target).await
+            crate::write_error_or_leader_redirect_async(state, err, request_target).await
         }
         BodyState::Read => crate::runtime_error_after_body(state, err),
     }

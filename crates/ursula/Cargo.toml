@@ -70,6 +70,7 @@ madsim = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+ursula-headers = { workspace = true, features = ["test-support"] }
 criterion = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }

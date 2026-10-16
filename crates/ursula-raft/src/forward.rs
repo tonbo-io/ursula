@@ -626,6 +626,11 @@ pub(crate) async fn write_commands_on_raft(
         history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
+    // A replica that lost the leadership during the admits refuses every
+    // command here, before proposing any, as `write` does.
+    if let Err(refused) = refuse_unless_leader(&raft) {
+        return Ok(vec![Err(refused); expected_responses]);
+    }
     let stream = raft.client_write_many(commands).await.map_err(|error| {
         tracing::warn!(%error, "Raft batch submission stopped");
         GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
@@ -641,6 +646,41 @@ pub(crate) async fn write_commands_on_raft(
         )),
     });
     Ok(collect_batch_responses(responses, expected_responses).await)
+}
+
+/// The one check, right before commands go to OpenRaft, that this replica
+/// leads the group, for a single write ([`RaftGroupEngine::write`]) and a
+/// batch ([`write_commands_on_raft`]) alike. A replica that does not lead
+/// refuses here, before proposing, so its refusal says that nothing applied
+/// (a redirect or `NO_LEADER`). OpenRaft's own forward after it took a
+/// command may follow a committed entry (RT1), so it stays ambiguous. One
+/// view of the metrics decides and names the leader.
+///
+/// [`RaftGroupEngine::write`]: crate::engine::RaftGroupEngine::write
+pub(crate) fn refuse_unless_leader(
+    raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+) -> Result<(), GroupEngineError> {
+    let receiver = raft.metrics();
+    let metrics = receiver.borrow_watched();
+    let leadership = GroupLeadership::of(&metrics);
+    if leadership.leads() {
+        return Ok(());
+    }
+    let leader_id = metrics.current_leader;
+    let leader_node = leader_id.and_then(|leader| {
+        metrics
+            .membership_config
+            .membership()
+            .get_node(&leader)
+            .cloned()
+    });
+    Err(group_engine_forward_to_leader_error(
+        "OpenRaft group write has to run on the local leader runtime",
+        leader_id,
+        leader_node.as_ref(),
+        &leadership,
+        true,
+    ))
 }
 
 /// Preserve every delivered outcome even when a later responder is lost.

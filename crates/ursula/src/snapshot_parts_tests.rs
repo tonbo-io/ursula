@@ -134,13 +134,13 @@ async fn stage(app: &Router, uri: &str, body: Vec<u8>) -> PartId {
     PartStaged::parse(pairs(&response)).expect("a part id").part
 }
 
-fn digest_of(body: &[u8]) -> DigestHeader {
+pub(crate) fn digest_of(body: &[u8]) -> DigestHeader {
     let mut digest = SnapshotDigest::new(OCTET);
     digest.update(body);
     DigestHeader::parse("digest", &digest.finalize()).expect("hex digest")
 }
 
-fn commit_request(uri: &str, parts: &[PartId], digest: DigestHeader) -> Request<Body> {
+pub(crate) fn commit_request(uri: &str, parts: &[PartId], digest: DigestHeader) -> Request<Body> {
     commit_request_at(uri, 3, parts, digest)
 }
 
@@ -843,13 +843,13 @@ async fn a_superseded_or_conflicting_commit_answers_409_from_its_key() {
 
 /// Holds every read of a staged part until [`Gate::open`], counting the
 /// reads that wait, so a test acts while a commit copies.
-struct Gate {
+pub(crate) struct Gate {
     permits: Arc<tokio::sync::Semaphore>,
     waiting: Arc<AtomicUsize>,
 }
 
 impl Gate {
-    fn on_part_reads(cold_store: &ColdStore) -> Self {
+    pub(crate) fn on_part_reads(cold_store: &ColdStore) -> Self {
         let permits = Arc::new(tokio::sync::Semaphore::new(0));
         let waiting = Arc::new(AtomicUsize::new(0));
         cold_store.set_fault_policy(|context| {
@@ -871,13 +871,13 @@ impl Gate {
     }
 
     /// Waits until `reads` part reads wait at the gate.
-    async fn reached(&self, reads: usize) {
+    pub(crate) async fn reached(&self, reads: usize) {
         while self.waiting.load(Ordering::SeqCst) < reads {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 
-    fn open(&self) {
+    pub(crate) fn open(&self) {
         self.permits.add_permits(1 << 20);
     }
 }

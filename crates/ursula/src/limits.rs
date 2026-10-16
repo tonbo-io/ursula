@@ -16,13 +16,12 @@ use axum::response::Response;
 use ursula_headers::SizeLimit;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
 
-use crate::MAX_HTTP_BODY_BYTES;
 use crate::render::error_answer;
 use crate::render::insert_header_str;
 
 /// The largest request body any request may carry
 /// (`Ursula-Max-Request-Bytes`).
-pub(crate) const MAX_REQUEST_BYTES: u64 = MAX_HTTP_BODY_BYTES as u64;
+pub(crate) const MAX_REQUEST_BYTES: u64 = ursula_headers::MAX_REQUEST_BYTES;
 
 /// The request limit, as a `413` names it.
 pub(crate) const REQUEST_LIMIT: SizeLimit = SizeLimit::Request(MAX_REQUEST_BYTES);

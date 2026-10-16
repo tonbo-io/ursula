@@ -32,7 +32,7 @@ use crate::render::error_code_of;
 use crate::router;
 
 const OCTET: &str = "application/octet-stream";
-const REQUEST_LIMIT: u64 = 32 * 1024 * 1024;
+const REQUEST_LIMIT: u64 = ursula_headers::MAX_REQUEST_BYTES;
 
 fn app() -> Router {
     let runtime = ShardRuntime::spawn_with_engine_factory(
