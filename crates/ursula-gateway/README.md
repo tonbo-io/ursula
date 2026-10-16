@@ -124,7 +124,7 @@ alone in `x-ursula-raft-group`:
 - It sends the request to the upstream that the redirect's `Location` names,
   unless the request already went to that upstream.
 - Otherwise, and when the `Location` names no upstream because `--upstream`
-  names the nodes otherwise than their peer URLs, it searches: it sends the
+  names the nodes otherwise than their client URLs, it searches: it sends the
   request to the next upstream it has not tried yet, starting after the one
   that redirected, in the configured order and around. It skips ejected
   upstreams, and one whose ejection window has expired becomes the request's
@@ -281,10 +281,12 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 
 --upstream <URL>
     Base URL for an Ursula HTTP or HTTPS node. Repeat once per node. Required.
-    Point it at the node itself, by the node's peer URL where you can. A
-    leader redirect names the leader by its peer URL, and the gateway follows
-    one that names another address only by trying the upstreams it has not
-    tried yet. A proxy, service-mesh sidecar or another gateway in between
+    Point it at the node itself, by the node's client URL where you can:
+    its [[raft.peers]] client_url, or its peer url when the node serves
+    both planes on one port. Never use a cluster port (server.cluster_listen),
+    which serves no client route. A leader redirect names the leader by its
+    client URL, and the gateway follows one that names another address only
+    by trying the upstreams it has not tried yet. A proxy, service-mesh sidecar or another gateway in between
     must not resend requests: a resent write without producer headers
     applies twice.
 

@@ -34,6 +34,7 @@ fn request(operation: u128, executor: u128, target: u64) -> OwnershipRequest {
                 .unwrap(),
             http_url: Some(format!("http://voter-{id}:4437").parse().unwrap()),
             metrics_url: None,
+            client_url: None,
             expected_process_incarnation: Some(ProcessIncarnation::from_bits(u128::from(id))),
             expected_maintenance_fence: None,
         })

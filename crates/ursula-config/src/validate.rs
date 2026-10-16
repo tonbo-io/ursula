@@ -18,6 +18,17 @@ pub enum ValidationError {
     ClusterIdRequired,
     #[error("storage.cold.s3.bucket is required when cold backend is 's3'")]
     ColdS3BucketRequired,
+    /// A node that splits its cluster plane off serves no client route on
+    /// a peer `url`, so a leader redirect needs the peer's client URL.
+    #[error("raft peer {node_id} needs client_url when server.cluster_listen is set")]
+    PeerClientUrlRequired { node_id: u64 },
+    /// A `client_url` equal to the peer's `url` names its cluster listener,
+    /// which serves no client route.
+    #[error(
+        "raft peer {node_id} client_url equals its url, which names its cluster listener when \
+         server.cluster_listen is set"
+    )]
+    PeerClientUrlIsRaftUrl { node_id: u64 },
     #[error("raft.node_id {0} must be present in raft.peers")]
     NodeIdNotInPeers(u64),
     #[error("raft group {0} has no voters")]
@@ -224,6 +235,20 @@ impl UrsulaConfig {
         }
         if !self.raft.peers.is_empty() && !seen_ids.contains(&self.raft.node_id) {
             return Err(ValidationError::NodeIdNotInPeers(self.raft.node_id));
+        }
+        if self.server.cluster_listen.is_some() {
+            for peer in &self.raft.peers {
+                let Some(client_url) = &peer.client_url else {
+                    return Err(ValidationError::PeerClientUrlRequired {
+                        node_id: peer.node_id,
+                    });
+                };
+                if client_url.trim_end_matches('/') == peer.url.trim_end_matches('/') {
+                    return Err(ValidationError::PeerClientUrlIsRaftUrl {
+                        node_id: peer.node_id,
+                    });
+                }
+            }
         }
         Ok(())
     }

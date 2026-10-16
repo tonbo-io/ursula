@@ -16,6 +16,8 @@ helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.5
 
 The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's `appVersion`. The default install runs three voters and 64 Raft groups, with durable per-pod Raft logs on PVCs, a headless peer Service, a client Service, and a quorum-protecting PodDisruptionBudget.
 
+Each voter listens on two ports. The client port (`server.ports.client`, `4437`) serves the stream API, and the client Service exposes only that port. The cluster port (`server.ports.cluster`, `4439`) carries Raft between voters, and only the headless peer Service names it. The chart renders each peer's `url` on the cluster port and its `client_url` on the client port, so leader redirects send clients to a client port. `server.clusterListen=false` serves both planes on the client port instead. The admin plane stays on pod loopback (`127.0.0.1:4438`).
+
 For production, add shared S3 cold storage and workload identity:
 
 ```yaml
@@ -75,6 +77,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
 - Add an `AbortIncompleteMultipartUpload` lifecycle rule to every cold bucket, for example after 1 day. Ursula never aborts the multipart upload of a cold write that a crash or shutdown interrupted, and S3 bills its parts until they are aborted. See [Incomplete multipart uploads](/docs/operations#incomplete-multipart-uploads).
 - Set `server.clusterId`, which the chart renders as `server.cluster_id`, the id every `HEAD` answer carries as `Ursula-Cluster-Id`. The chart refuses to render without it, for any replica count. Name the environment and the region, such as `prod-us-east-1`, and give every deployment one client can reach its own id, since two Kubernetes clusters can run the same namespace and release name. Keep the id when a restore replaces a deployment. Each node's WAL records the id, and a node whose configured id differs refuses to start.
 - Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private. Ursula itself has no TLS or auth (see [Security](/docs/security)).
+- Set `server.networkPolicy.enabled=true` on a CNI that enforces NetworkPolicy. The policy admits only the release's voters to the cluster port, and the sources in `server.networkPolicy.clientIngressFrom` to the client port (every source when the list is empty) plus the release's gateway, indexer and Helm test pods. See [Kubernetes NetworkPolicy](/docs/security#kubernetes-networkpolicy).
 - Kubernetes rolling updates do not transfer Raft leaders on their own. For an operationally safe restart, wrap the platform's restart in [ursulactl's maintenance verbs](/docs/cli): `ursulactl drain` the node, let Kubernetes restart the pod, then `ursulactl wait --node N` and `undrain` before moving to the next one. See [Operations](/docs/operations) for day-2 work.
 - The StatefulSet readiness probe calls `GET /__ursula/ready` and removes a pod
   from service during WAL disk pressure. Cluster-wide Raft readiness still
@@ -108,6 +111,7 @@ The same static-membership model works by hand. Every node runs the same config 
 ```toml
 [server]
 listen = "0.0.0.0:4437"
+cluster_listen = "0.0.0.0:4439"
 cluster_id = "prod-us-east-1"
 
 [raft]
@@ -127,15 +131,18 @@ region = "us-east-1"
 
 [[raft.peers]]
 node_id = 1
-url = "http://10.0.0.1:4437"
+url = "http://10.0.0.1:4439"
+client_url = "http://10.0.0.1:4437"
 
 [[raft.peers]]
 node_id = 2
-url = "http://10.0.0.2:4437"
+url = "http://10.0.0.2:4439"
+client_url = "http://10.0.0.2:4437"
 
 [[raft.peers]]
 node_id = 3
-url = "http://10.0.0.3:4437"
+url = "http://10.0.0.3:4439"
+client_url = "http://10.0.0.3:4437"
 ```
 
 Start each node with its own ID:
@@ -144,15 +151,17 @@ Start each node with its own ID:
 ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 ```
 
+Peers dial each other's `url` on the cluster port (`4439`), and a follower redirects clients to the leader's `client_url` on the client port (`4437`). Let only the voters reach port `4439`, with a security group or a firewall. Without `server.cluster_listen`, both planes share `server.listen` and each peer's `url` names that port (see [Network planes](/docs/security#network-planes)).
+
 `server.cluster_id` is required with `raft.peers`. Use the same value on every node and a different one for every deployment a client can reach, such as the environment and the region. `init_membership_per_group = true` bootstraps each group on the first start of a fresh cluster. Keep it on every node across restarts: a replica that ever held its group never initializes it again, and an empty replica initializes a group only when every configured voter reports it empty and no leader (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Verify the cluster with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'
 {
   "nodes": [
-    {"id": 1, "http_url": "http://10.0.0.1:4437", "host": "10.0.0.1"},
-    {"id": 2, "http_url": "http://10.0.0.2:4437", "host": "10.0.0.2"},
-    {"id": 3, "http_url": "http://10.0.0.3:4437", "host": "10.0.0.3"}
+    {"id": 1, "http_url": "http://10.0.0.1:4439", "client_url": "http://10.0.0.1:4437", "host": "10.0.0.1"},
+    {"id": 2, "http_url": "http://10.0.0.2:4439", "client_url": "http://10.0.0.2:4437", "host": "10.0.0.2"},
+    {"id": 3, "http_url": "http://10.0.0.3:4439", "client_url": "http://10.0.0.3:4437", "host": "10.0.0.3"}
   ]
 }
 JSON
@@ -160,5 +169,7 @@ JSON
 ursulactl wait-ready --config cluster-manifest.json --expected-groups 256
 ursulactl status      --config cluster-manifest.json
 ```
+
+`http_url` is the node's Raft address, so it names the cluster port. `client_url` is where `ursulactl` reads metrics and readiness on the client plane.
 
 Every config key (peers, listeners, WAL, cold-tier tuning) is documented in [Configuration](/docs/configuration).

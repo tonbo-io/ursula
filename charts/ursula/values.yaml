@@ -115,6 +115,16 @@ server:
   ports:
     # Ursula public client-plane HTTP port (stream reads/writes).
     client: 4437
+    # Cluster-plane port (Raft gRPC between voters), used when clusterListen
+    # is true. Only the headless peer Service exposes it.
+    cluster: 4439
+  # Serve the cluster plane on its own port (server.cluster_listen). Peers
+  # dial ports.cluster, leader redirects name ports.client, and the client
+  # Service never exposes the cluster plane. false serves both planes on
+  # ports.client, so anyone who reaches the client Service reaches Raft.
+  # Fixed at install: groups record each peer's url when they initialize, and
+  # a voter whose url changed afterwards refuses to start.
+  clusterListen: true
   # The mutating admin plane stays on pod loopback by default. A trusted
   # in-cluster operator or chaos controller may opt in to a pod-reachable bind
   # such as 0.0.0.0:4438; the chart never adds it to a Service.
@@ -139,6 +149,16 @@ server:
   headlessService:
     # Headless peer Service annotations.
     annotations: {}
+  networkPolicy:
+    # Render a NetworkPolicy for the server pods. It needs a CNI that
+    # enforces NetworkPolicy. The cluster port admits only this release's
+    # server pods. The admin plane stays on loopback and needs no rule: the
+    # chart refuses to render the policy when adminListen is off loopback.
+    enabled: false
+    # NetworkPolicy peers (podSelector, namespaceSelector, ipBlock) allowed to
+    # reach the client port. Empty admits every source. This release's
+    # gateway, indexer and Helm test pods are always admitted.
+    clientIngressFrom: []
   # Extra annotations applied to Ursula server pods.
   podAnnotations: {}
   # Extra labels applied to Ursula server pods.

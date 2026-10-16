@@ -4,6 +4,7 @@
 {{- $namespace := .Release.Namespace -}}
 {{- $clusterDomain := .Values.global.clusterDomain | toString -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
+{{- $clusterPort := include "ursula.clusterPort" . | int -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 {{- /* The chart always renders [[raft.peers]], and a node with peers requires server.cluster_id. */ -}}
 {{- $clusterId := required "server.clusterId is required: name the deployment, for example after its environment and region (prod-us-east-1), the same for every install of it and different for every deployment one client can reach" .Values.server.clusterId | toString -}}
@@ -13,9 +14,16 @@
 {{- $podName := printf "%s-%d" $fullname $i -}}
 {{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $namespace $clusterDomain -}}
 {{- $clientUrl := printf "http://%s:%d" $host $clientPort -}}
+{{- $clusterUrl := printf "http://%s:%d" $host $clusterPort -}}
 {{- $nodeId := add1 $i -}}
-{{- $peers = append $peers (dict "node_id" $nodeId "url" $clientUrl) -}}
-{{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clientUrl "host" $host "name" $podName) -}}
+{{- /* Peers dial the cluster plane. Leader redirects name the client plane. */ -}}
+{{- if $.Values.server.clusterListen -}}
+{{- $peers = append $peers (dict "node_id" $nodeId "url" $clusterUrl "client_url" $clientUrl) -}}
+{{- else -}}
+{{- $peers = append $peers (dict "node_id" $nodeId "url" $clusterUrl) -}}
+{{- end -}}
+{{- /* http_url is the Raft address. ursulactl reads metrics and readiness at client_url. */ -}}
+{{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clusterUrl "client_url" $clientUrl "host" $host "name" $podName) -}}
 {{- end -}}
 {{- $s3Bucket := .Values.s3.bucket | toString -}}
 {{- $s3Region := .Values.s3.region | toString -}}
@@ -103,6 +111,9 @@ data:
     cat > "${config_path}" <<EOF
     [server]
     listen = "0.0.0.0:{{ $clientPort }}"
+{{- if .Values.server.clusterListen }}
+    cluster_listen = "0.0.0.0:{{ $clusterPort }}"
+{{- end }}
     admin_listen = {{ .Values.server.adminListen | quote }}
     cluster_id = {{ $clusterId | quote }}
 
@@ -126,6 +137,9 @@ data:
     [[raft.peers]]
     node_id = {{ .node_id }}
     url = {{ .url | quote }}
+{{- if .client_url }}
+    client_url = {{ .client_url | quote }}
+{{- end }}
 {{- end }}
 
     [raft.wal]

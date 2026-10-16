@@ -20,16 +20,17 @@
 # ------------------------------------------------------------------------------
 [server]
 # Public HTTP client API bind address. Client-plane routes (append, read,
-# admin) are served here. When cluster_listen is unset, Raft/cluster routes
-# are also served on this socket.
+# metrics, readiness, usage) are served here. When cluster_listen is unset,
+# Raft/cluster routes are also served on this socket.
 listen = "127.0.0.1:4437"
 
 # Optional separate bind for the cluster / Raft gRPC plane. When set,
 # server.listen serves client/API routes and this address serves Raft/cluster
 # routes. Peer URLs must point to server.listen when cluster_listen is unset,
-# or to server.cluster_listen when it is set. The same peer URL is also used
-# for HTTP leader redirects, so clients and gateways must be able to reach it.
-# cluster_listen = "10.0.0.1:4438"
+# or to server.cluster_listen when it is set. Leader redirects name a peer's
+# client_url, which every [[raft.peers]] entry needs when cluster_listen is
+# set, and its url otherwise.
+# cluster_listen = "10.0.0.1:4439"
 
 # The deployment's id, sent as Ursula-Cluster-Id on every HEAD: 1 to 64
 # characters from A-Z, a-z, 0-9, ".", "_" and "-". Required when raft.peers
@@ -146,7 +147,12 @@ init_membership_per_group = false
 # ------------------------------------------------------------------------------
 # [raft.peers]  — Static gRPC Raft peers (repeatable table)
 # ------------------------------------------------------------------------------
-# Uncomment and repeat for every node in the cluster.
+# Uncomment and repeat for every node in the cluster. `url` is the address
+# peers dial: server.listen, or server.cluster_listen when that is set. With
+# cluster_listen set, add `client_url` (the peer's server.listen address),
+# which leader redirects name, for example:
+#   url = "http://10.0.0.1:4439"
+#   client_url = "http://10.0.0.1:4437"
 # [[raft.peers]]
 # node_id = 1
 # url = "http://10.0.0.1:4437"

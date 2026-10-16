@@ -385,7 +385,7 @@ mod tests {
                 if mode == 7 {
                     node.metrics_url = Some(url);
                 } else {
-                    node.http_url = Some(url);
+                    node.client_url = Some(url);
                 }
             }
             let timeout = if mode >= 7 {
@@ -554,6 +554,7 @@ mod tests {
             host: format!("10.0.0.{id}"),
             http_url: Some(Url::parse(&format!("http://10.0.0.{id}/")).unwrap()),
             metrics_url: None,
+            client_url: None,
         }
     }
 

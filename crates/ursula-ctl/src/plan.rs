@@ -280,6 +280,7 @@ mod tests {
             host: format!("10.0.0.{id}"),
             http_url: Some(Url::parse(&format!("http://10.0.0.{id}:8080")).unwrap()),
             metrics_url: None,
+            client_url: None,
         }
     }
 

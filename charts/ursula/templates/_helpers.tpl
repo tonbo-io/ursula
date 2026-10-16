@@ -307,6 +307,28 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- if or (lt $clientPort 1) (gt $clientPort 65535) -}}
 {{- fail (printf "server.ports.client must be between 1 and 65535; got %v" .Values.server.ports.client) -}}
 {{- end -}}
+{{- $adminPort := regexFind "[0-9]+$" (.Values.server.adminListen | toString) | int -}}
+{{- if eq $clientPort $adminPort -}}
+{{- fail (printf "server.ports.client must differ from the server.adminListen port; both are %d" $clientPort) -}}
+{{- end -}}
+{{- if .Values.server.networkPolicy.enabled -}}
+{{- $adminHost := regexReplaceAll ":[0-9]+$" (.Values.server.adminListen | toString) "" -}}
+{{- if not (or (hasPrefix "127." $adminHost) (eq $adminHost "localhost")) -}}
+{{- fail (printf "server.networkPolicy.enabled admits nothing to the admin plane, but server.adminListen (%s) is not on loopback: keep it on loopback, or leave the policy off and restrict the admin port another way" .Values.server.adminListen) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.server.clusterListen -}}
+{{- $clusterPort := .Values.server.ports.cluster | int -}}
+{{- if or (lt $clusterPort 1) (gt $clusterPort 65535) -}}
+{{- fail (printf "server.ports.cluster must be between 1 and 65535; got %v" .Values.server.ports.cluster) -}}
+{{- end -}}
+{{- if eq $clusterPort $clientPort -}}
+{{- fail (printf "server.ports.cluster must differ from server.ports.client; both are %d" $clientPort) -}}
+{{- end -}}
+{{- if eq $clusterPort $adminPort -}}
+{{- fail (printf "server.ports.cluster must differ from the server.adminListen port; both are %d" $adminPort) -}}
+{{- end -}}
+{{- end -}}
 {{- if $logDir | eq "" -}}
 {{- fail "raft.logDir must be non-empty" -}}
 {{- end -}}
@@ -408,5 +430,27 @@ Validate gateway values before manifests are accepted.
 {{- if and .Values.gateway.autoscaling.enabled (not .Values.gateway.autoscaling.targetCPUUtilizationPercentage) (not .Values.gateway.autoscaling.targetMemoryUtilizationPercentage) -}}
 {{- fail "gateway.autoscaling requires at least one target utilization metric when gateway.autoscaling.enabled=true" -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The port peers dial for the cluster plane: server.ports.cluster when the
+cluster plane listens apart (server.clusterListen), else server.ports.client.
+*/}}
+{{/*
+Selector labels of the Helm test pod. Its name label differs from the server
+pods', so the release label does not put it behind the server Services.
+*/}}
+{{- define "ursula.testSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "ursula.name" . | trunc 58 | trimSuffix "-" }}-test
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: helm-test
+{{- end -}}
+
+{{- define "ursula.clusterPort" -}}
+{{- if .Values.server.clusterListen -}}
+{{- .Values.server.ports.cluster | int -}}
+{{- else -}}
+{{- .Values.server.ports.client | int -}}
 {{- end -}}
 {{- end -}}

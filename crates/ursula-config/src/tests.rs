@@ -525,6 +525,69 @@ url = "http://127.0.0.1:4438"
     }
 
     #[test]
+    fn a_split_cluster_plane_needs_every_peers_client_url() {
+        let config = |client_url_2: &str| {
+            format!(
+                r#"[server]
+listen = "0.0.0.0:4437"
+cluster_listen = "0.0.0.0:4439"
+cluster_id = "prod-eu-1"
+
+[raft.wal]
+path = "/tmp/ursula-wal"
+
+[[raft.peers]]
+node_id = 1
+url = "http://node-1:4439"
+client_url = "http://node-1:4437"
+
+[[raft.peers]]
+node_id = 2
+url = "http://node-2:4439"
+{client_url_2}
+"#
+            )
+        };
+        let tmp = temp_config(".toml", &config(""));
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(
+                    crate::validate::ValidationError::PeerClientUrlRequired { node_id: 2 }
+                )
+            ),
+            "{err}"
+        );
+
+        let tmp = temp_config(".toml", &config(r#"client_url = "http://node-2:4439/""#));
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(
+                    crate::validate::ValidationError::PeerClientUrlIsRaftUrl { node_id: 2 }
+                )
+            ),
+            "{err}"
+        );
+
+        let tmp = temp_config(".toml", &config(r#"client_url = "http://node-2:4437""#));
+        let config = load_config(Some(tmp.path()), None, Some(1))
+            .expect("a split cluster plane with every peer's client URL");
+        let bases: Vec<_> = config
+            .raft
+            .peers
+            .iter()
+            .map(|peer| (peer.url.as_str(), peer.client_base_url()))
+            .collect();
+        assert_eq!(bases, [
+            ("http://node-1:4439", "http://node-1:4437"),
+            ("http://node-2:4439", "http://node-2:4437"),
+        ]);
+    }
+
+    #[test]
     fn a_cluster_id_outside_the_grammar_fails_the_load() {
         for id in ["", "a/b", "a b", &"x".repeat(65)] {
             let tmp = temp_config(".toml", &format!("[server]\ncluster_id = \"{id}\"\n"));

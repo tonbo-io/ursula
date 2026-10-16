@@ -9,7 +9,9 @@ set -eu
 
 # Ports the chart binds. Defaulted so the script stays runnable by hand against
 # a cluster installed with chart defaults.
-CLIENT_PORT=${CLIENT_PORT:-4437}
+# The port peers dial for Raft: server.ports.cluster, or server.ports.client
+# when the chart serves both planes on one port.
+CLUSTER_PORT=${CLUSTER_PORT:-4439}
 ADMIN_PORT=${ADMIN_PORT:-4438}
 # Local end of each port-forward. Node ids are one-based and pod ordinals are
 # zero-based, so node N listens on BASE + N - 1.
@@ -36,11 +38,12 @@ write_manifest() {
       printf '      "id": %s,\n' "$((ordinal + 1))"
       printf '      "admin_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
       # Metrics use the same Pod-bound tunnel. Keep http_url as the real peer
-      # address: learner attachment persists it in Raft membership.
+      # (cluster-plane) address: learner attachment persists it in Raft
+      # membership, and peers dial it.
       printf '      "metrics_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
       printf '      "host": "%s-%s",\n' "${STATEFULSET}" "${ordinal}"
       printf '      "http_url": "http://%s-%s.%s-headless.%s.svc.cluster.local:%s"\n' \
-        "${STATEFULSET}" "${ordinal}" "${STATEFULSET}" "${NAMESPACE}" "${CLIENT_PORT}"
+        "${STATEFULSET}" "${ordinal}" "${STATEFULSET}" "${NAMESPACE}" "${CLUSTER_PORT}"
       printf '    }'
       ordinal=$((ordinal + 1))
     done

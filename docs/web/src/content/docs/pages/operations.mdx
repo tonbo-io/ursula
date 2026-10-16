@@ -53,8 +53,10 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST ht
 # Purge log entries below the last snapshot index for one group
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/purge
 
-# Add a learner (non-voting replica) to one group without blocking on catch-up
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/learners/4?addr=http://node-4:4437&blocking=false"
+# Add a learner (non-voting replica) to one group without blocking on catch-up.
+# addr is the address peers dial: the learner's cluster listener (its
+# [[raft.peers]] url), here on the chart's cluster port 4439.
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/learners/4?addr=http://node-4:4439&blocking=false"
 
 # Hand leadership of one group to another voter (used by `ursulactl drain`)
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
@@ -265,7 +267,7 @@ With `fsync = "always"`, acknowledged appends survive a host crash, but the newe
 
 A single-voter group has no other replica to recover from, so it needs a plan after every host crash under `never`, once its gate reports the group stalled, and every such plan gives every stream of the group a new `Stream-Incarnation`. `Stream-Previous-Incarnation` and `Stream-Inherited-Offset` on `HEAD` then tell clients how much of each stream survived. Use `fsync = "always"` for single-voter groups whose clients keep state. Under `always` it needs the call only after a host crash that leaves a complete invalid frame in the newest segment. So does a group whose voters lose power together, for example in a rack power loss, when that gates a majority of them. No acknowledged write is lost in these cases, but only an operator can open the gates.
 
-`POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
+`POST /__ursula/cluster-probe` is served on the cluster plane, but it is machinery rather than an operator surface. Nodes send each other probe bodies through it at their peer `url` to verify cluster-plane egress. The cluster plane runs no ingress admission, so a node under write pressure still answers it.
 
 ## Memory without retention
 

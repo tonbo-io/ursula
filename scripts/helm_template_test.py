@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import re
 import subprocess
 import tomllib
@@ -20,12 +21,36 @@ def render_config(*values: str) -> str:
 
 
 def assert_server_accepts(config: str) -> None:
-    """The server's rule (`ursula-config` validation): a config with
-    `[[raft.peers]]` must set `server.cluster_id`."""
+    """The server's rules (`ursula-config` validation): a config with
+    `[[raft.peers]]` must set `server.cluster_id`, and with
+    `server.cluster_listen` every peer needs a `client_url`."""
     parsed = tomllib.loads(config)
-    if parsed.get("raft", {}).get("peers"):
+    peers = parsed.get("raft", {}).get("peers", [])
+    if peers:
         if not parsed.get("server", {}).get("cluster_id"):
             raise AssertionError("a config with [[raft.peers]] renders no server.cluster_id")
+    if parsed.get("server", {}).get("cluster_listen"):
+        for peer in peers:
+            if not peer.get("client_url"):
+                raise AssertionError(f"peer {peer['node_id']} renders no client_url with server.cluster_listen")
+
+
+def documents(rendered: str, kind: str) -> dict[str, str]:
+    """Map each rendered resource of ``kind`` to its manifest text by name."""
+    found: dict[str, str] = {}
+    for document in re.split(r"^---$", rendered, flags=re.M):
+        if not re.search(rf"^kind: {kind}$", document, re.M):
+            continue
+        name = re.search(r"^metadata:\n(?:[ \t].*\n)*? {2}name: (?P<name>\S+)$", document, re.M)
+        found[name.group("name") if name else ""] = document
+    return found
+
+
+def service_ports(document: str) -> list[tuple[str, int]]:
+    return [
+        (name, int(port))
+        for name, port in re.findall(r"^ {4}- name: (\S+)\n {6}port: (\d+)$", document, re.M)
+    ]
 
 
 def render_chart(*values: str) -> str:
@@ -422,6 +447,199 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "0.0.0.0:4438")
+
+    def test_cluster_plane_listens_on_its_own_port_by_default(self) -> None:
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
+        config = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))
+        host = "test-ursula-{}.test-ursula-headless.default.svc.cluster.local"
+
+        self.assertEqual(config["server"]["listen"], "0.0.0.0:4437")
+        self.assertEqual(config["server"]["cluster_listen"], "0.0.0.0:4439")
+        self.assertEqual(
+            [(peer["url"], peer["client_url"]) for peer in config["raft"]["peers"]],
+            [(f"http://{host.format(i)}:4439", f"http://{host.format(i)}:4437") for i in range(3)],
+        )
+        services = documents(rendered, "Service")
+        self.assertEqual(service_ports(services["test-ursula"]), [("client", 4437)])
+        self.assertEqual(
+            service_ports(services["test-ursula-headless"]), [("client", 4437), ("cluster", 4439)]
+        )
+        self.assertIn(
+            "- name: cluster\n              containerPort: 4439\n",
+            documents(rendered, "StatefulSet")["test-ursula"],
+        )
+        # http_url is the Raft address, and ursulactl reads readiness on
+        # the client plane.
+        manifest = re.search(r"cluster-manifest\.json: \|\n(?P<json>(?: {4}.*\n)+)", rendered)
+        nodes = json.loads(manifest.group("json"))["nodes"]
+        self.assertEqual(
+            [(node["http_url"], node["client_url"]) for node in nodes],
+            [(f"http://{host.format(i)}:4439", f"http://{host.format(i)}:4437") for i in range(3)],
+        )
+        # The gateway is a client: its upstreams stay on the client port, so
+        # a leader redirect names one of them.
+        for i in range(3):
+            self.assertIn(f"- \"http://{host.format(i)}:4437\"", rendered)
+
+    def test_cluster_plane_can_share_the_client_port(self) -> None:
+        values = (*NAMED, "--set", "s3.bucket=bkt", "--set", "server.clusterListen=false")
+        rendered = render_chart(*values)
+        config = tomllib.loads(render_config(*values))
+
+        self.assertNotIn("cluster_listen", config["server"])
+        for peer in config["raft"]["peers"]:
+            self.assertTrue(peer["url"].endswith(":4437"), peer)
+            self.assertNotIn("client_url", peer)
+        services = documents(rendered, "Service")
+        self.assertEqual(service_ports(services["test-ursula-headless"]), [("client", 4437)])
+        self.assertNotIn("name: cluster", documents(rendered, "StatefulSet")["test-ursula"])
+
+    def test_cluster_port_must_differ_from_the_client_and_admin_ports(self) -> None:
+        for port, message in (
+            ("4437", "must differ from server.ports.client"),
+            ("4438", "must differ from the server.adminListen port"),
+        ):
+            with self.subTest(port=port):
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+                     "--set", f"server.ports.cluster={port}"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+        # A shared port has no cluster port to collide.
+        render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.clusterListen=false",
+                     "--set", "server.ports.cluster=4437")
+
+    def test_graceful_rollout_attaches_learners_at_the_cluster_port(self) -> None:
+        for cluster_listen, port in (("true", "4439"), ("false", "4437")):
+            with self.subTest(cluster_listen=cluster_listen):
+                rendered = render_chart(
+                    *NAMED, "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
+                    "--set", "server.gracefulRollout.enabled=true",
+                    "--set", f"server.clusterListen={cluster_listen}",
+                )
+                self.assertIn(f"- name: CLUSTER_PORT\n              value: \"{port}\"", rendered)
+
+    def test_network_policy_is_off_by_default(self) -> None:
+        self.assertNotIn("test-ursula", documents(render_chart(*NAMED, "--set", "s3.bucket=bkt"), "NetworkPolicy"))
+
+    def test_network_policy_admits_every_client_and_only_peers_on_the_cluster_port(self) -> None:
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.networkPolicy.enabled=true")
+        policy = documents(rendered, "NetworkPolicy")["test-ursula"]
+
+        self.assertIn(
+            "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: ursula\n"
+            "      app.kubernetes.io/instance: test\n  policyTypes:\n    - Ingress\n",
+            policy,
+        )
+        # The client rule names no source, so it admits every one.
+        self.assertIn(
+            "    - ports:\n        - protocol: TCP\n          port: 4437\n"
+            "    # Cluster plane: only this release's server pods.\n",
+            policy,
+        )
+        self.assertIn(
+            "    - ports:\n        - protocol: TCP\n          port: 4439\n      from:\n"
+            "        - podSelector:\n            matchLabels:\n"
+            "              app.kubernetes.io/name: ursula\n              app.kubernetes.io/instance: test\n",
+            policy,
+        )
+        self.assertNotIn("4438", policy)
+
+    def test_network_policy_limits_client_ingress_to_the_configured_sources(self) -> None:
+        rendered = render_chart(
+            *NAMED, "--set", "s3.bucket=bkt", "--set", "server.networkPolicy.enabled=true",
+            "--set", "server.networkPolicy.clientIngressFrom[0].namespaceSelector.matchLabels.team=streams",
+        )
+        policy = documents(rendered, "NetworkPolicy")["test-ursula"]
+
+        self.assertIn(
+            "          port: 4437\n      from:\n"
+            "        - namespaceSelector:\n            matchLabels:\n              team: streams\n"
+            "        - podSelector:\n            matchLabels:\n"
+            "              app.kubernetes.io/name: ursula-gateway\n              app.kubernetes.io/instance: test\n"
+            "        - podSelector:\n            matchLabels:\n"
+            "              app.kubernetes.io/name: ursula-test\n              app.kubernetes.io/instance: test\n"
+            "              app.kubernetes.io/component: helm-test\n",
+            policy,
+        )
+        self.assertNotIn("ursula-indexer", policy)
+        # The test pod's own labels match that selector, and not the
+        # server Services' selector.
+        test_pod = documents(rendered, "Pod")["test-ursula-wait-ready"]
+        self.assertIn(
+            "    app.kubernetes.io/name: ursula-test\n    app.kubernetes.io/instance: test\n"
+            "    app.kubernetes.io/component: helm-test\n",
+            test_pod,
+        )
+
+        bare = documents(render_chart(
+            *NAMED, "--set", "s3.bucket=bkt", "--set", "server.networkPolicy.enabled=true",
+            "--set", "server.networkPolicy.clientIngressFrom[0].podSelector.matchLabels.role=client",
+            "--set", "gateway.enabled=false", "--set", "tests.enabled=false",
+        ), "NetworkPolicy")["test-ursula"]
+        self.assertNotIn("ursula-gateway", bare)
+        self.assertNotIn("helm-test", bare)
+
+    def test_network_policy_admits_the_release_indexer_to_the_client_port(self) -> None:
+        rendered = render_chart(
+            *NAMED, *indexer_values(), "--set", "server.networkPolicy.enabled=true",
+            "--set", "server.networkPolicy.clientIngressFrom[0].namespaceSelector.matchLabels.team=streams",
+        )
+        policy = documents(rendered, "NetworkPolicy")["test-ursula"]
+
+        self.assertIn(
+            "        - podSelector:\n            matchLabels:\n"
+            "              app.kubernetes.io/name: ursula-indexer\n              app.kubernetes.io/instance: test\n"
+            "              app.kubernetes.io/component: indexer\n",
+            policy,
+        )
+        # The indexer pods carry the labels the rule selects.
+        self.assertIn(
+            "app.kubernetes.io/name: ursula-indexer\n        app.kubernetes.io/instance: test\n"
+            "        app.kubernetes.io/component: indexer\n",
+            documents(rendered, "Deployment")["test-ursula-indexer"],
+        )
+
+    def test_network_policy_refuses_an_admin_plane_off_loopback(self) -> None:
+        result = subprocess.run(
+            ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+             "--set", "server.networkPolicy.enabled=true", "--set", "server.adminListen=0.0.0.0:4438"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server.adminListen (0.0.0.0:4438) is not on loopback", result.stderr)
+        # Off loopback without the policy, or on loopback with it, renders.
+        render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.adminListen=0.0.0.0:4438")
+        render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.networkPolicy.enabled=true",
+                     "--set", "server.adminListen=localhost:4438")
+
+    def test_client_port_must_differ_from_the_admin_port(self) -> None:
+        result = subprocess.run(
+            ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+             "--set", "server.adminListen=127.0.0.1:4437"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server.ports.client must differ from the server.adminListen port", result.stderr)
+
+    def test_network_policy_with_a_shared_port_admits_peers_on_the_client_port(self) -> None:
+        rendered = render_chart(
+            *NAMED, "--set", "s3.bucket=bkt", "--set", "server.networkPolicy.enabled=true",
+            "--set", "server.clusterListen=false",
+        )
+        policy = documents(rendered, "NetworkPolicy")["test-ursula"]
+
+        self.assertNotIn("4439", policy)
+        self.assertIn(
+            "    - ports:\n        - protocol: TCP\n          port: 4437\n      from:\n"
+            "        - podSelector:\n",
+            policy,
+        )
 
     def test_cluster_id_is_required_for_every_replica_count(self) -> None:
         # The chart renders [[raft.peers]] for every replica count, and a

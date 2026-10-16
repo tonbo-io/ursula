@@ -550,12 +550,14 @@ impl MetricsClient {
     }
 }
 
-/// Base URL of the read-only observations, metrics and serving readiness. Both
-/// planes serve them, so the rollout's Pod-bound admin tunnel suffices.
+/// Base URL of the read-only observations, metrics and serving readiness:
+/// `metrics_url`, else `client_url`, else `admin_url`. The client and admin
+/// planes serve them, so the rollout's Pod-bound admin tunnel suffices. The
+/// Raft `http_url` is never used: a node's cluster listener serves neither.
 fn metrics_base_url(node: &NodeInfo) -> &url::Url {
     node.metrics_url
         .as_ref()
-        .or(node.http_url.as_ref())
+        .or(node.client_url.as_ref())
         .unwrap_or(&node.admin_url)
 }
 
@@ -841,6 +843,7 @@ mod tests {
                 admin_url: Url::parse(&format!("http://{address}")).unwrap(),
                 http_url: None,
                 metrics_url: None,
+                client_url: None,
                 expected_process_incarnation: None,
                 expected_maintenance_fence: None,
             },
@@ -885,6 +888,7 @@ mod tests {
                 admin_url: format!("http://{address}").parse().unwrap(),
                 http_url: None,
                 metrics_url: None,
+                client_url: None,
                 expected_process_incarnation: None,
                 expected_maintenance_fence: None,
             };
@@ -1084,6 +1088,7 @@ mod tests {
             admin_url: format!("http://{address}").parse().unwrap(),
             http_url: None,
             metrics_url: None,
+            client_url: None,
             expected_process_incarnation: None,
             expected_maintenance_fence: None,
         };
@@ -1141,6 +1146,7 @@ mod tests {
             admin_url: format!("http://{address}").parse().unwrap(),
             http_url: None,
             metrics_url: None,
+            client_url: None,
             expected_process_incarnation: None,
             expected_maintenance_fence: None,
         };
@@ -1200,6 +1206,7 @@ mod tests {
                 admin_url: format!("http://{address}").parse().unwrap(),
                 http_url: None,
                 metrics_url: None,
+                client_url: None,
                 expected_process_incarnation: None,
                 expected_maintenance_fence: None,
             };
@@ -1255,6 +1262,7 @@ mod tests {
             host: "replacement".to_owned(),
             http_url: Some(advertised.clone()),
             metrics_url: Some(tunnel),
+            client_url: None,
         };
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         let view = client.fetch_node(&node).await.unwrap();
@@ -1315,6 +1323,7 @@ mod tests {
                 host: address.to_string(),
                 http_url: None,
                 metrics_url: None,
+                client_url: None,
             };
             let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
             let error = client.fetch_node(&node).await.unwrap_err();
@@ -1353,11 +1362,18 @@ mod tests {
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),
-            http_url: Some(Url::parse("http://127.0.0.1:4437").expect("client url")),
+            http_url: Some(Url::parse("http://127.0.0.1:4439").expect("raft url")),
             metrics_url: None,
+            client_url: Some(Url::parse("http://127.0.0.1:4437").expect("client url")),
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4437));
+        // Without a client URL, metrics never go to the Raft URL.
+        let raft_only = NodeInfo {
+            client_url: None,
+            ..node
+        };
+        assert_eq!(metrics_base_url(&raft_only).port(), Some(4438));
     }
 
     #[test]
@@ -1370,6 +1386,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             http_url: None,
             metrics_url: None,
+            client_url: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));

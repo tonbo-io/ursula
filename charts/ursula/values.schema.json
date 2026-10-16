@@ -296,11 +296,22 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 65535
+            },
+            "cluster": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "Cluster-plane (Raft gRPC) port, used when server.clusterListen is true. Only the headless peer Service exposes it."
             }
           },
           "required": [
-            "client"
+            "client",
+            "cluster"
           ]
+        },
+        "clusterListen": {
+          "type": "boolean",
+          "description": "Serve the cluster plane on server.ports.cluster (server.cluster_listen). Peers dial that port and the client Service never exposes it. false serves both planes on server.ports.client."
         },
         "adminListen": {
           "type": "string",
@@ -359,6 +370,27 @@
           },
           "required": [
             "annotations"
+          ]
+        },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render a NetworkPolicy for the server pods."
+            },
+            "clientIngressFrom": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "description": "NetworkPolicy peers allowed to reach the client port. Empty admits every source."
+            }
+          },
+          "required": [
+            "enabled",
+            "clientIngressFrom"
           ]
         },
         "podAnnotations": {
@@ -648,7 +680,9 @@
         "securityContext",
         "probes",
         "podDisruptionBudget",
-        "scheduling"
+        "scheduling",
+        "clusterListen",
+        "networkPolicy"
       ]
     },
     "gateway": {

@@ -23,11 +23,17 @@ pub struct NodeInfo {
     pub admin_url: Url,
     /// Address shown in reports. Defaults to the admin URL's host.
     pub host: String,
-    /// Advertised public client/Raft address for learner attachment and
-    /// survivor handoff. Metrics and readiness use it when `metrics_url` is
-    /// absent, then fall back to `admin_url`.
+    /// Advertised Raft address for learner attachment and survivor handoff:
+    /// the node's peer `url`, on its cluster listener when it sets
+    /// `server.cluster_listen`. Never read for metrics or readiness, since a
+    /// cluster listener serves neither.
     #[serde(default)]
     pub http_url: Option<Url>,
+    /// The node's client-plane URL (its `server.listen`, `client_url` in
+    /// `[[raft.peers]]`). Metrics and readiness use it when `metrics_url` is
+    /// absent, then fall back to `admin_url`.
+    #[serde(default)]
+    pub client_url: Option<Url>,
     /// Optional read-only metrics and readiness endpoint, independent of the
     /// advertised Raft/client address. Rollouts use their admin tunnel so a
     /// replacement can be inspected before its cluster DNS record resolves.
@@ -167,6 +173,8 @@ struct RawNode {
     #[serde(default)]
     http_url: Option<String>,
     #[serde(default)]
+    client_url: Option<String>,
+    #[serde(default)]
     metrics_url: Option<String>,
     #[serde(default)]
     expected_process_incarnation: Option<ProcessIncarnation>,
@@ -211,6 +219,13 @@ impl RawNode {
             Url::parse(&format!("http://{host}:{admin_port}"))
                 .with_context(|| format!("synthesize admin_url for node {}", self.id))?
         };
+        let client_url = self
+            .client_url
+            .as_deref()
+            .and_then(non_empty)
+            .map(Url::parse)
+            .transpose()
+            .with_context(|| format!("invalid client_url for node {}", self.id))?;
         let metrics_url = self
             .metrics_url
             .as_deref()
@@ -223,6 +238,7 @@ impl RawNode {
             admin_url,
             host,
             http_url,
+            client_url,
             metrics_url,
             expected_process_incarnation: self.expected_process_incarnation,
             expected_maintenance_fence: self.expected_maintenance_fence,

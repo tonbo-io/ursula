@@ -376,6 +376,7 @@ mod tests {
                         admin_url: format!("http://node-{id}:4438").parse().unwrap(),
                         http_url: Some(format!("http://node-{id}:4437").parse().unwrap()),
                         metrics_url: None,
+                        client_url: None,
                         host: format!("node-{id}"),
                     };
                     let groups = (0..2)

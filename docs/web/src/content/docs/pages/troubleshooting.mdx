@@ -114,7 +114,7 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 
 ### Port already in use
 
-`server.listen` is taken. Public HTTP and inter-node gRPC share the same port unless `server.cluster_listen` is configured separately.
+`server.listen`, `server.cluster_listen` or `server.admin_listen` is taken. The client plane and inter-node gRPC share `server.listen` unless `server.cluster_listen` is set.
 
 ### `raft WAL directory … holds data without a format marker`
 
