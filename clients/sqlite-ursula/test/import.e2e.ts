@@ -4,11 +4,14 @@
 // - A plain database of a few MiB, written by `VACUUM INTO`, imported under a 64 KiB request limit
 //   (so its snapshot goes up in parts), opens in a fresh cache root with the same rows, an
 //   integrity check that passes, the snapshot as where it was built from, and an epoch above the
-//   import's. A commit then reaches `synced()`.
+//   import's. A commit then reaches `synced()`. A server without a cold store (no
+//   `Ursula-Max-Snapshot-Bytes`) gets a small file that fits one request instead.
+// - Model only: an owner's and a reader's open between the import's claim and its publish refuse
+//   `stream_state` and build nothing. Once the import is done, a fresh open works.
 // - A second import into that stream fails with `stream_state` and changes nothing.
 // - A file with 8192-byte pages, or with a `-wal` beside it, is refused before anything is sent:
 //   the stream is never created.
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -69,6 +72,24 @@ async function head(path: string): Promise<{ status: number; tail: string | null
 	return { status: r.status, tail: r.headers.get("stream-next-offset"), snapshot: r.headers.get("stream-snapshot-offset") };
 }
 
+/** Whether the server takes snapshots in parts: a stream's HEAD advertises `Ursula-Max-Snapshot-Bytes` (a cold store). */
+async function takesParts(): Promise<boolean> {
+	const probe = stream("import-probe");
+	const created = await fetch(`${directUrl()}${probe.path}`, { method: "PUT", headers: { "content-type": "application/octet-stream" } });
+	expect(created.status).toBeLessThan(300);
+	const r = await fetch(`${directUrl()}${probe.path}`, { method: "HEAD" });
+	return r.headers.get("ursula-max-snapshot-bytes") !== null;
+}
+
+/** Whether the cache root `dir` holds a published generation of any stream. */
+function built(dir: string): boolean {
+	return readdirSync(dir, { withFileTypes: true })
+		.filter((e) => e.isDirectory())
+		.some((root) => readdirSync(join(dir, root.name)).some((name) => name.startsWith("gen-") && !name.endsWith(".tmp")));
+}
+
+const READ_ONLY = JSON.stringify({ read_only: true });
+
 /** On the model, a cold store for the test's run (`fn`): snapshots in parts. */
 async function withColdStore<T>(fn: () => Promise<T>): Promise<T> {
 	if (!onModel()) return fn();
@@ -87,16 +108,17 @@ async function withColdStore<T>(fn: () => Promise<T>): Promise<T> {
 describe("ursula_import", () => {
 	it("imports a plain database as the first snapshot of a new stream, in parts under a 64 KiB limit", async () => {
 		await withColdStore(async () => {
+			const parts = await takesParts();
 			const s = stream("import");
-			const file = plainDb(freshDir(), "plain.db", 48);
+			const file = plainDb(freshDir(), "plain.db", parts ? 48 : 3);
 			const expected = rowsOf(file);
 			expect((await head(s.path)).status).toBe(404);
-			const reply = await runImport(s.url, file, { URSULA_VFS_MAX_REQUEST_BYTES: "65536" });
+			const reply = await runImport(s.url, file, parts ? { URSULA_VFS_MAX_REQUEST_BYTES: "65536" } : {});
 			expect(reply.ok, JSON.stringify(reply)).toBe(true);
 			const imported = reply.imported as Imported;
 			expect(imported.offset).toBeGreaterThan(0);
 			// Above the request limit: only parts could carry it.
-			expect(imported.bytes).toBeGreaterThan(65536);
+			if (parts) expect(imported.bytes).toBeGreaterThan(65536);
 			expect(await head(s.path)).toEqual({ status: 200, tail: expect.any(String), snapshot: expect.any(String) });
 			expect(rowsOf(file), "the source is unchanged").toEqual(expected);
 
@@ -118,6 +140,41 @@ describe("ursula_import", () => {
 			expect(await head(s.path)).toEqual(settled);
 		});
 	});
+
+	it.runIf(onModel())("refuses an owner's and a reader's open between the claim and the publish", async () => {
+		await withColdStore(async () => {
+			const s = stream("import-window");
+			// About 25 MiB in 64 KiB parts: hundreds of requests between the claim and the publish.
+			const file = plainDb(freshDir(), "plain.db", 400);
+			const imp = new Child(s.url, file, { URSULA_VFS_MAX_REQUEST_BYTES: "65536" }, "import-child.mjs");
+			// The window: the claim landed, the snapshot is not published.
+			for (let i = 0; ; i++) {
+				const h = await head(s.path);
+				if (h.status === 200 && h.tail !== null && BigInt(h.tail) > 0n && h.snapshot === null) break;
+				if (i > 10_000) throw new Error("never saw the window");
+				await new Promise((r) => setTimeout(r, 2));
+			}
+			for (const options of [READ_ONLY, "{}"]) {
+				const dir = freshDir();
+				const c = new Child(s.url, dir, {}, "core-child.mjs", [options]);
+				const reply = await c.first();
+				await c.stop();
+				expect(reply.ok, JSON.stringify(reply)).toBe(false);
+				expect(String(reply.error)).toMatch(/^Error: ursula_open: stream_state: .*the claim of an import/);
+				expect(built(dir), "nothing built").toBe(false);
+			}
+			expect((await head(s.path)).snapshot, "the opens ran inside the window").toBeNull();
+			const reply = await imp.first();
+			await imp.stop();
+			expect(reply.ok, JSON.stringify(reply)).toBe(true);
+
+			const fresh = new Child(s.url, freshDir());
+			await fresh.opened();
+			expect(await fresh.rows("SELECT count(*) AS n FROM t")).toEqual([{ n: 400 }]);
+			expect(await fresh.rows("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+			await fresh.stop();
+		});
+	}, 180_000);
 
 	it("refuses a file with 8192-byte pages before anything is sent", async () => {
 		const s = stream("import-8k");

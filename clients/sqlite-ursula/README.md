@@ -44,9 +44,10 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 `importSqlite(url, file, { token, timeoutMs })` imports a plain SQLite database file into a new stream, as the stream's first snapshot, and returns `{ offset, digest, pages, bytes }`. Then `open(url)` it as any other stream.
 
 - The file must have 4096-byte pages, with no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
-- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published. A failure after the import claimed the stream leaves it holding the claim alone: import into a new stream.
+- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published.
+- While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until it is deleted or recreated. `UrsulaUnavailableError` from an import says `fix` for that reason.
 - A snapshot above the request limit goes up in parts, which needs a cold store on the server. Without one, a file whose compressed snapshot is above the limit fails with `invalid_argument`, naming the limit.
-- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default). An open of the stream while it runs is not prevented.
+- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default).
 
 ## Errors
 

@@ -297,6 +297,13 @@ pub(crate) enum OpenError {
     /// The snapshot the stream names is not one this extension can install.
     #[error("stream_state: the stream's latest snapshot: {0}")]
     Snapshot(#[source] SnapshotError),
+    /// The read of the stream met the claim of an import (`codec::frame::IMPORT_ACTIVATION`),
+    /// ending at `end`, with no snapshot past it.
+    #[error(
+        "stream_state: the claim of an import ends at {end} and its snapshot is not published: \
+         the import is in progress or failed. Wait for it, or delete or recreate the stream"
+    )]
+    ImportIncomplete { end: Offset },
     /// The stream is missing, and the open does not create it: an owner's over a local generation
     /// holding data without `recreate`, or a reader's.
     #[error("not_found: the stream is missing")]
@@ -505,6 +512,9 @@ impl Fetch {
             }
             Some(StreamError::Undecodable(_) | StreamError::PastEnd { .. }) => {
                 return Err(OpenError::StreamState(StreamState::Undecodable));
+            }
+            Some(StreamError::ImportIncomplete { end }) => {
+                return Err(OpenError::ImportIncomplete { end });
             }
         }
         Ok(frames

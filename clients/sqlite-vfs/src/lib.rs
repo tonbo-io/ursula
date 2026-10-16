@@ -40,7 +40,9 @@
 //! * `SELECT ursula_import(url, file, options_json, timeout_ms)` imports a plain SQLite file of
 //!   4096-byte pages into a new stream at `url`, as its first snapshot, and returns
 //!   `{done, offset, digest, pages, bytes}`. The file is only read. A stream that exists and is
-//!   not empty is refused `stream_state`, and nothing is published on it.
+//!   not empty is refused `stream_state`, and nothing is published on it. Until the import's
+//!   snapshot is published, opens of the stream refuse `stream_state`, and after an import that
+//!   failed once it claimed the stream they do until the stream is deleted or recreated.
 //! * `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
 //!   `ursula_set_token(path, token)`.
 //!

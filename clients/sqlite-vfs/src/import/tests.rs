@@ -223,6 +223,39 @@ fn a_wal_or_a_hot_journal_beside_the_file_refuses_it() {
     );
 }
 
+// A symbolic link to the file is resolved first: the WAL beside its target refuses it.
+#[test]
+fn a_wal_beside_the_target_of_a_link_refuses_it() {
+    let dir = TempDir::new("import-link");
+    let path = write_db(dir.path(), &image(2));
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    std::fs::write(dir.path().join("plain.db-wal"), b"").unwrap();
+    assert!(matches!(
+        Staged::copy(&link),
+        Err(ImportError::Source(SourceProblem::Wal(_)))
+    ));
+}
+
+// The import's claim carries the reserved activation, so no read of the stream builds from it.
+#[test]
+fn the_claim_carries_the_import_activation() {
+    let dir = TempDir::new("import-activation");
+    let path = write_db(dir.path(), &image(2));
+    let server = server();
+    let transport = ModelTransport::new(Arc::clone(&server), PATH);
+    let imported = import(&transport, &path).unwrap();
+    let frames = server.lock().unwrap().frames(PATH).unwrap().to_vec();
+    assert_eq!(imported.offset.get(), frames.len() as u64);
+    assert_eq!(
+        frames,
+        frame::encode_claim(
+            ursula_headers::Epoch::try_from(1).unwrap(),
+            frame::IMPORT_ACTIVATION
+        )
+    );
+}
+
 // The import of a plain file into a missing stream: created, claimed at epoch 1 from offset 0,
 // and its snapshot published at W, the claim's end, above 0, with the tail still at W. The
 // snapshot's image is the file, page 1 marked WAL. A second import into the stream is refused

@@ -1542,6 +1542,32 @@ fn a_part_past_the_staged_limit_discards_the_parts_and_a_later_attempt_publishes
     assert_eq!(server.lock().unwrap().staged_parts(), 0);
 }
 
+// A 429 to a part that names no limit of staged parts (a gateway's rate limit) is sent again like
+// any transient answer: the publish goes on and nothing is discarded.
+#[test]
+fn a_rate_limited_part_is_sent_again() {
+    let (server, token) = cold_world();
+    server.lock().unwrap().inject(Scripted {
+        method: Some(Method::Post),
+        fault: Fault::Status {
+            status: 429,
+            retry_after: None,
+        },
+        times: 2,
+    });
+    let body = body_file(tail_of(&server), 4);
+    assert_eq!(
+        publish_file(&server, token, 4096, &body).unwrap(),
+        crate::snapshotter::Outcome::Published {
+            offset: body.offset
+        }
+    );
+    assert_eq!(
+        snapshot_body(&server, token),
+        std::fs::read(&body.path).unwrap()
+    );
+}
+
 // A binding that stops while its parts go up sends no part more, and discards the ones staged.
 #[test]
 fn a_stopped_snapshot_thread_stages_no_more_parts() {
@@ -2563,6 +2589,48 @@ fn a_head_404_without_the_protocol_is_no_missing_stream() {
     );
     assert!(generation.exists(), "the generation stays");
     assert!(!stream_root(dir.path()).join("salvage").exists());
+}
+
+/// Whether the stream's root under `dir` holds a published generation.
+fn has_generation(dir: &Path) -> bool {
+    std::fs::read_dir(stream_root(dir)).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("gen-") && !name.ends_with(".tmp")
+        })
+    })
+}
+
+// The claim of an import with no snapshot past it (an import in progress, or one that failed): an
+// owner's build from offset 0 and a reader's both refuse stream_state and build nothing.
+#[test]
+fn a_build_from_offset_0_refuses_the_claim_of_an_import() {
+    let mut w = World::new();
+    create(&mut w.server);
+    let epoch = Epoch::try_from(1).unwrap();
+    let body = frame::encode_claim(epoch, crate::codec::frame::IMPORT_ACTIVATION);
+    assert_eq!(
+        w.server.foreign_claim(PATH, epoch, &body).unwrap().status,
+        200
+    );
+    let tail = w.server.frames(PATH).unwrap().len();
+    for reader in [false, true] {
+        let dir = TempDir::new("driver-import-claim");
+        let c = w.core();
+        let spec = if reader {
+            reader_spec(dir.path())
+        } else {
+            spec(dir.path(), 1)
+        };
+        let e = kind(w.open_result(c, spec));
+        assert!(
+            matches!(*e, OpenError::ImportIncomplete { end } if end.get() == tail as u64),
+            "{e}"
+        );
+        assert_eq!(e.error_kind().as_str(), "stream_state");
+        assert!(!has_generation(dir.path()), "nothing built");
+        assert_eq!(w.server.frames(PATH).unwrap().len(), tail, "nothing sent");
+    }
 }
 
 #[test]

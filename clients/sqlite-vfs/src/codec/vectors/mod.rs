@@ -5,6 +5,7 @@
 //! extensions write to the stream or to disk, which every 0.8.x extension must keep reading. Fix
 //! the code, never the vector. A format change needs a new minor version with new magics.
 //!
+//! - [`IMPORT_ACTIVATION`]: the activation of every import's claim.
 //! - [`CLAIM`], [`COMMIT`] and [`PARTS`]: `USQ2` frames, the last a run of two PART frames that
 //!   [`COMMIT`] cuts into.
 //! - [`SEGMENT`]: a `USL1` segment header and one record of each kind, and [`FRESH_HEADER`]: a
@@ -42,6 +43,10 @@ use crate::salvage::Acknowledged;
 use crate::salvage::Manifest;
 use crate::salvage::Reason;
 use crate::salvage::State;
+
+/// The activation of every import's claim (`frame::IMPORT_ACTIVATION`), which reads of the stream
+/// refuse to build from: `ursula-import-v1`.
+const IMPORT_ACTIVATION: &str = "757273756c612d696d706f72742d7631";
 
 /// A CLAIM at epoch 3 of activation `22..22`.
 const CLAIM: &str = "\
@@ -228,6 +233,17 @@ fn the_claim_frame_is_frozen() {
     });
     assert_eq!(frame::encode(&frame).unwrap(), bytes);
     assert_eq!(frame::encode_claim(epoch(), activation()), bytes);
+}
+
+#[test]
+fn the_import_activation_is_frozen() {
+    assert_eq!(
+        frame::IMPORT_ACTIVATION.0.to_vec(),
+        unhex(IMPORT_ACTIVATION)
+    );
+    let claim = frame::encode_claim(epoch(), frame::IMPORT_ACTIVATION);
+    assert!(frame::is_import_claim(&decoded(&claim)));
+    assert!(!frame::is_import_claim(&decoded(&unhex(CLAIM))));
 }
 
 #[test]

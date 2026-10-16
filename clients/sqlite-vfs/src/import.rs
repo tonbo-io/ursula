@@ -12,19 +12,27 @@
 //!    snapshot. Anything else refuses (`server_too_old`, `stream_format`, `stream_state`). An
 //!    answer without `Ursula-Protocol: 2` is `server_too_old`, never a missing stream: a gateway's
 //!    concealing `404` creates nothing;
-//! 3. the create, and the claim of epoch 1 under the create's token with a random activation. The
-//!    claim is resent unchanged, keyed by the producer, until a definite answer (I5). Its receipt
-//!    must start at offset 0: no byte came before it. Its end is `W`, above 0 (I3), since builds
-//!    skip a snapshot at offset 0, and the first open then claims above epoch 1;
+//! 3. the create, and the claim of epoch 1 under the create's token with the reserved activation
+//!    `IMPORT_ACTIVATION`. The claim is resent unchanged, keyed by the producer, until a definite
+//!    answer (I5). Its receipt must start at offset 0: no byte came before it. Its end is `W`,
+//!    above 0 (I3), since builds skip a snapshot at offset 0, and the first open then claims above
+//!    epoch 1;
 //! 4. the `USS3` body of the copy at `W`, epoch 1, a fresh lineage and position 0;
 //! 5. a HEAD naming the tail `W` and no snapshot, then the snapshotter's publish (one `PUT`, or
 //!    parts with a cold store, otherwise refused naming the limit), then a HEAD again. The import
 //!    is done only on a `204` naming `(W, digest)` and a HEAD naming that snapshot with the tail
 //!    still at `W` (I4). Bytes after `W` fail with `stream_state`.
 //!
-//! The import blocks for at most `timeout_ms`. A failure after the claim leaves the stream with
-//! the claim (an empty database to an open) and refuses a second import into it: import into a
-//! new stream. An open of the stream while an import runs is not prevented.
+//! A snapshot at `W` must equal a replay of the stream up to `W`, and the import's does not: the
+//! stream up to `W` is the claim alone. So no read of the stream builds from the claim. Any read
+//! that meets a claim of `IMPORT_ACTIVATION` (a build or catch-up from offset 0, a reconcile)
+//! refuses `stream_state` (`codec::stream::FrameStream`), and an open's `activation` cannot be
+//! the reserved one. Once the snapshot is published, every read starts at `W` and never meets the
+//! claim. An open while the import runs is refused, and so is every open of a stream whose import
+//! failed after its claim, until the stream is deleted or recreated. A second import into it is
+//! refused too.
+//!
+//! The import blocks for at most `timeout_ms`.
 
 use std::fs::File;
 use std::io::Read;
@@ -55,11 +63,11 @@ use crate::codec::PAGE;
 use crate::codec::digest::producer_digest;
 use crate::codec::frame;
 use crate::codec::frame::CONTENT_TYPE;
+use crate::codec::frame::IMPORT_ACTIVATION;
 use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::snapshot::SnapshotFields;
 use crate::generation::PathError;
 use crate::generation::canonical_path;
-use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::GenId;
 use crate::ids::Lineage;
@@ -292,11 +300,17 @@ pub(crate) fn import(
         .checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or(now);
     let staged = Staged::copy(Path::new(file))?;
-    if let Some(token) = &options.token {
-        crate::auth::set_token(Some(token));
-    }
+    // The token stays the process's only once the import succeeded.
+    let previous = options
+        .token
+        .as_deref()
+        .map(|token| crate::auth::replace_token(Some(token)));
     let transport = crate::transport::http::HttpTransport::new(url);
-    let imported = run(&transport, &staged, deadline, timeout_ms)?;
+    let imported = run(&transport, &staged, deadline, timeout_ms).inspect_err(|_failed| {
+        if let Some(previous) = &previous {
+            crate::auth::set_token(previous.as_deref());
+        }
+    })?;
     log::emit(Level::Info, "imported", &[
         ("stream", &url),
         ("offset", &imported.offset),
@@ -418,6 +432,9 @@ pub(crate) fn check_header(path: &Path, header: &[u8], len: u64) -> Result<u32, 
 impl Staged {
     /// Checks `file` and copies it (read-only) into a temp directory, page 1 marked WAL.
     pub(crate) fn copy(file: &Path) -> Result<Self, ImportError> {
+        // The WAL and journal SQLite uses lie beside the file a symbolic link names.
+        let resolved = std::fs::canonicalize(file).map_err(io("resolve", file))?;
+        let file = resolved.as_path();
         check_beside(file)?;
         let dir = TempDir::new()?;
         let image = dir.0.join("image");
@@ -607,11 +624,10 @@ fn create(remote: &Remote<'_>, deadline: Instant) -> Result<Incarnation, ImportE
 fn claim(
     remote: &Remote<'_>,
     incarnation: Incarnation,
-    activation: Activation,
     deadline: Instant,
 ) -> Result<Offset, ImportError> {
     let epoch = import_epoch();
-    let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, activation));
+    let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, IMPORT_ACTIVATION));
     let id = producer_id();
     let request = Request {
         keys: ProducerRequestHeaders {
@@ -689,8 +705,7 @@ fn steps(
     )?;
     let (cluster_id, _) = check_new(&head, None)?;
     let incarnation = create(&probe, deadline)?;
-    let activation = Activation(random16().map_err(io("read", Path::new(crate::ids::URANDOM)))?);
-    let w = claim(&probe, incarnation, activation, deadline)?;
+    let w = claim(&probe, incarnation, deadline)?;
     let lineage = Lineage(random16().map_err(io("read", Path::new(crate::ids::URANDOM)))?);
     let fields = SnapshotFields {
         offset: w,

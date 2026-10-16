@@ -275,13 +275,14 @@ const DEFAULT_IMPORT_MS = 10 * 60 * 1000;
  * Imports the plain SQLite database `file` into a new stream at `url`, as the stream's first
  * snapshot, page for page. The file must have 4096-byte pages (`PRAGMA page_size = 4096; VACUUM
  * INTO ...` makes such a copy), no `-wal` beside it and no hot journal. It is only read. The stream
- * must be missing or empty: anything else fails with `stream_state` and nothing is published. A
- * failure after the import claimed the stream leaves it unusable for another import: import into a
- * new stream. Then {@link open} the stream as any other.
+ * must be missing or empty: anything else fails with `stream_state` and nothing is published. Then
+ * {@link open} the stream as any other. While the import runs, and after an import that failed
+ * once it claimed the stream, opens and imports of the stream fail with `stream_state` until the
+ * stream is deleted or recreated.
  *
  * It blocks the calling thread until it is done, for at most `timeoutMs`. Errors are
- * {@link UrsulaSetupError} (`fix`, such as `invalid_argument` for the file, or `retry`) and
- * {@link UrsulaUnavailableError}.
+ * {@link UrsulaSetupError} (such as `invalid_argument` for the file) and
+ * {@link UrsulaUnavailableError}, whose action is `fix`: the stream may hold the import's claim.
  */
 export function importSqlite(url: string | URL, file: string, options: ImportOptions = {}): Imported {
 	const { token, timeoutMs } = options;

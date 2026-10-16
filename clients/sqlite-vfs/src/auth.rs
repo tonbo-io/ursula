@@ -46,6 +46,12 @@ pub(crate) fn set_token(token: Option<&str>) {
     *lock(&SET) = token.and_then(usable);
 }
 
+/// [`set_token`], returning the token the application had set before, for a caller that puts it
+/// back.
+pub(crate) fn replace_token(token: Option<&str>) -> Option<String> {
+    std::mem::replace(&mut *lock(&SET), token.and_then(usable))
+}
+
 /// The token for the next request. `refresh`: read the token file again even if it looks unchanged
 /// (after the endpoint refused the token).
 pub(crate) fn token(refresh: bool) -> Option<String> {

@@ -161,7 +161,9 @@ impl OpenError {
             OpenError::StreamFormat(_) => ErrorKind::StreamFormat,
             OpenError::ServerTooOld { .. } => ErrorKind::ServerTooOld,
             OpenError::WrongCluster { .. } => ErrorKind::WrongCluster,
-            OpenError::StreamState(_) | OpenError::Snapshot(_) => ErrorKind::StreamState,
+            OpenError::StreamState(_)
+            | OpenError::Snapshot(_)
+            | OpenError::ImportIncomplete { .. } => ErrorKind::StreamState,
             OpenError::NotFound => ErrorKind::NotFound,
             OpenError::ClaimRaces => ErrorKind::ClaimRaces,
             OpenError::Unavailable(condition) => match condition {

@@ -31,6 +31,19 @@ use crate::ids::Position;
 /// The stream's content type.
 pub const CONTENT_TYPE: &str = "application/vnd.ursula.sqlite-vfs.v2";
 
+/// The activation of every claim `ursula_import` makes, and of no other claim: an open refuses an
+/// `activation` option equal to it, and a random activation equals it with probability 2^-128.
+/// The stream holds the import's snapshot only once its publish completes, so a read of the
+/// stream that meets this claim (a build or catch-up from offset 0, a reconcile) has met an import
+/// in progress, or one that failed: it refuses `stream_state` and never builds from it
+/// ([`crate::codec::stream::FrameStream`]). Frozen for 0.8.x (`codec/vectors`).
+pub const IMPORT_ACTIVATION: Activation = Activation(*b"ursula-import-v1");
+
+/// Whether `frame` is the claim of an import.
+pub fn is_import_claim(frame: &Frame) -> bool {
+    matches!(frame, Frame::Claim { activation, .. } if *activation == IMPORT_ACTIVATION)
+}
+
 const MAGIC: &[u8; 4] = b"USQ2";
 /// Magic, kind, body length and checksum.
 const HEADER: usize = 13;

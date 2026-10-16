@@ -43,6 +43,14 @@ pub enum StreamError {
     /// A frame runs past the end of the range.
     #[error("a frame runs past {end}")]
     PastEnd { end: Offset },
+    /// The claim of an import ([`frame::IMPORT_ACTIVATION`]) ending at `end`: the import's
+    /// snapshot, which every read of the stream starts from once it is published, is not, so the
+    /// import is in progress or failed. Nothing is built from it.
+    #[error(
+        "the claim of an import ends at {end}, and its snapshot is not published: the import is \
+         in progress or failed. Wait for it, or delete or recreate the stream"
+    )]
+    ImportIncomplete { end: Offset },
 }
 
 /// The reader of one range.
@@ -121,6 +129,15 @@ impl FrameStream {
                     .get()
                     .saturating_add(u64::try_from(len).unwrap_or(u64::MAX)),
             );
+            // One check for every read of the stream's frames: builds, catch-ups, reconciles.
+            if frame::is_import_claim(&frame) {
+                return (
+                    frames,
+                    Some(StreamError::ImportIncomplete {
+                        end: self.buf_start,
+                    }),
+                );
+            }
             let direct = !matches!(frame, Frame::Part { .. });
             let frame = match self.parts.push(frame) {
                 Ok(Some(frame)) => frame,
@@ -145,5 +162,35 @@ impl FrameStream {
             return (frames, Some(StreamError::PastEnd { end: self.end }));
         }
         (frames, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ursula_headers::Epoch;
+    use ursula_headers::Offset;
+
+    use super::FrameStream;
+    use super::StreamError;
+    use crate::codec::frame;
+    use crate::ids::Activation;
+
+    // An import's claim stops every read of the stream at it, whatever came before; another
+    // claim reads as a frame.
+    #[test]
+    fn the_claim_of_an_import_stops_the_read() {
+        let epoch = Epoch::try_from(1).unwrap();
+        let other = frame::encode_claim(epoch, Activation([7; 16]));
+        let import = frame::encode_claim(epoch, frame::IMPORT_ACTIVATION);
+        let bytes = [other, import].concat();
+        let end = Offset::from_u64(bytes.len() as u64);
+        let mut stream = FrameStream::new(Offset::ZERO, end, 1 << 20);
+        let (frames, error) = stream.feed(&bytes, end);
+        assert_eq!(frames.len(), 1);
+        assert!(
+            matches!(error, Some(StreamError::ImportIncomplete { end: at }) if at == end),
+            "{error:?}"
+        );
+        assert!(error.unwrap().to_string().contains("delete or recreate"));
     }
 }

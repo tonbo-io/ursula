@@ -101,10 +101,6 @@ const PART_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 pub(crate) const MAX_STAGED_PARTS: u64 = 8192;
 pub(crate) const MAX_STAGED_BYTES: u64 = 2 << 30;
 
-/// The headers of the `429` a part past those limits gets: the limit it met.
-const MAX_STAGED_PARTS_HEADER: &str = "ursula-max-staged-parts";
-const MAX_STAGED_BYTES_HEADER: &str = "ursula-max-staged-bytes";
-
 /// The base protocol's content type of a stream created without one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -782,9 +778,9 @@ impl ModelServer {
             });
         let len = u64::try_from(request.body.len()).unwrap_or(u64::MAX);
         let over = if count >= self.limits.max_staged_parts {
-            Some((MAX_STAGED_PARTS_HEADER, self.limits.max_staged_parts))
+            Some((crate::wire::MAX_STAGED_PARTS, self.limits.max_staged_parts))
         } else if bytes.saturating_add(len) > self.limits.max_staged_bytes {
-            Some((MAX_STAGED_BYTES_HEADER, self.limits.max_staged_bytes))
+            Some((crate::wire::MAX_STAGED_BYTES, self.limits.max_staged_bytes))
         } else {
             None
         };

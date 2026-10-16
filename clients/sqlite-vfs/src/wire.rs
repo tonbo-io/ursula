@@ -49,6 +49,11 @@ pub(crate) const RETRY_AFTER: &str = "retry-after";
 /// `Location` header name.
 pub(crate) const LOCATION: &str = "location";
 
+/// The headers of a `429` to a part past the stream's limit of staged parts (#622), naming the
+/// limit it met: its unused parts, or their bytes.
+pub(crate) const MAX_STAGED_PARTS: &str = "ursula-max-staged-parts";
+pub(crate) const MAX_STAGED_BYTES: &str = "ursula-max-staged-bytes";
+
 /// A `USS3` header's length, which a header read asks for.
 const SNAPSHOT_HEADER: u64 = crate::codec::snapshot::HEADER as u64;
 
@@ -409,6 +414,10 @@ pub(crate) enum Typed {
     Snapshot(SnapshotPublishAnswer),
     /// `201` to a part staged: its id.
     PartStaged(PartStaged),
+    /// `429` to a part, naming a limit of staged parts (`Ursula-Max-Staged-Parts` or
+    /// `Ursula-Max-Staged-Bytes`): no repeat of the part lifts it. A `429` without either is a
+    /// rate limit like any other.
+    StagedPartsFull,
     /// `200` or `206` to a snapshot read: `range` is the `Content-Range` of a `206`, `None` for
     /// the whole body of a `200`.
     SnapshotRead {
@@ -592,6 +601,13 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
         }
         (Method::Post, Target::SnapshotParts { .. }) if status == 201 => {
             Typed::PartStaged(PartStaged::parse(headers)?)
+        }
+        (Method::Post, Target::SnapshotParts { .. })
+            if status == 429
+                && (text(headers.clone(), MAX_STAGED_PARTS)?.is_some()
+                    || text(headers.clone(), MAX_STAGED_BYTES)?.is_some()) =>
+        {
+            Typed::StagedPartsFull
         }
         (Method::Get, Target::Snapshot { .. }) if matches!(status, 200 | 206) => {
             let range = match ContentRange::parse(status, headers.clone())? {
@@ -852,6 +868,20 @@ mod tests {
                 name: "stream-next-offset"
             })
         );
+    }
+
+    // A 429 to a part is the staged-parts limit only when it names one; otherwise a rate limit.
+    #[test]
+    fn a_429_to_a_part_is_the_staged_limit_only_when_it_names_one() {
+        let part = Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(4096),
+        });
+        assert_eq!(RawAnswer::new(429).parse(&part).typed, Ok(Typed::Untyped));
+        for name in [super::MAX_STAGED_PARTS, super::MAX_STAGED_BYTES] {
+            let mut raw = RawAnswer::new(429);
+            raw.header(name, "8192");
+            assert_eq!(raw.parse(&part).typed, Ok(Typed::StagedPartsFull));
+        }
     }
 
     #[test]

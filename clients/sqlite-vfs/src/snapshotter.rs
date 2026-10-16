@@ -34,8 +34,9 @@
 //! `502`, a `503` because the node copies it or other commits) is repeated unchanged, for up to
 //! 30 minutes. Part ids are minted by the server and never reused: a part whose `201` is lost is
 //! staged again under a new id, and a commit lists only the ids its own staging got, in order. A
-//! `400` stages every part again once. A `429` to a part is the stream's limit of staged parts:
-//! never repeated, it fails the attempt. Nothing of a staging survives the attempt: one that fails
+//! `400` stages every part again once. A `429` to a part naming the stream's limit of staged parts
+//! (`Ursula-Max-Staged-Parts` or `-Bytes`) is never repeated: it fails the attempt. Another `429`
+//! is a rate limit, repeated as any. Nothing of a staging survives the attempt: one that fails
 //! before its commit is decided discards the stream's staged parts (`DELETE
 //! {stream}/snapshot/parts`, once, best effort), the next attempt starts over, and the server
 //! sweeps what is left after a day.
@@ -919,10 +920,10 @@ pub(crate) fn transient(answer: &Answer) -> bool {
         )
 }
 
-/// [`transient`] for a part: a `429` there is the stream's limit of staged parts, which no repeat
-/// of the part lifts, so it decides.
+/// [`transient`] for a part: a `429` naming the stream's limit of staged parts decides, since no
+/// repeat of the part lifts it. Any other `429` (a rate limit) is sent again.
 fn transient_part(answer: &Answer) -> bool {
-    answer.status != 429 && transient(answer)
+    !matches!(answer.typed, Ok(Typed::StagedPartsFull)) && transient(answer)
 }
 
 impl Remote<'_> {
@@ -1268,7 +1269,7 @@ fn stage_parts(
             }
             // The stream's limit of staged parts: the caller discards them, and the next attempt
             // stages again.
-            Ok(_) if answer.status == 429 => {
+            Ok(Typed::StagedPartsFull) => {
                 return Err(SnapshotFailure::StagedPartsFull {
                     status: answer.status,
                 });

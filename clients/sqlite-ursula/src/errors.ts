@@ -159,8 +159,8 @@ export class UrsulaResetError extends UrsulaError {
  */
 export class UrsulaUnavailableError extends UrsulaError {
 	declare readonly kind: UnavailableKind;
-	constructor(message: string, kind: UnavailableKind, cause?: unknown) {
-		super(message, kind, actionOf(kind), cause);
+	constructor(message: string, kind: UnavailableKind, cause?: unknown, action: UrsulaErrorAction = actionOf(kind)) {
+		super(message, kind, action, cause);
 		this.name = "UrsulaUnavailableError";
 	}
 }
@@ -194,6 +194,9 @@ function functionError(error: unknown): UrsulaError | undefined {
 	const named = FUNCTION_ERROR.exec(error.message);
 	if (named === null) return undefined;
 	const [, fn, kind] = named as unknown as [string, string, string];
+	// An import that got no definite answer may have claimed the stream, which then refuses opens
+	// and imports: a retry into it fails, so fix (check the stream, delete or recreate it).
+	if (fn === "ursula_import" && UNAVAILABLE_KINDS.has(kind)) return new UrsulaUnavailableError(error.message, kind as UnavailableKind, error, "fix");
 	return errorOf(kind, error.message, error, fn !== "ursula_open" && fn !== "ursula_cancel" && fn !== "ursula_import");
 }
 
