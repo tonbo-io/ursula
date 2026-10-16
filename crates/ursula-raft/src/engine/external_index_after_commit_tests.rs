@@ -14,6 +14,7 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::OffloadColdRefsRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
@@ -90,6 +91,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read stream")

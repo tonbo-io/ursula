@@ -36,6 +36,17 @@ pub enum Defence {
     /// Off, the HTTP front door answers it as it would before the body, with
     /// a `307` to the leader its hint names.
     NoRedirectAfterBody,
+    /// An immutable-read chunk that ends at the tail of an open stream is
+    /// never marked, even when it fills its chunk (#581 section 5.3).
+    ImmutableOpenTail,
+    /// A follower answers an immutable-read chunk only when it can mark it,
+    /// and forwards the others to the leader. Off, it answers every chunk
+    /// from its own state, as a base-protocol read, which hides its own open
+    /// tail (#567 review finding 4).
+    FollowerMarkCheck,
+    /// A leader linearizes an immutable-read chunk it cannot mark, and a
+    /// `416`, before it answers (#581 section 5.3, m1 of the step 5 review).
+    ImmutableLeaderBarrier,
 }
 
 #[cfg(madsim)]
@@ -45,8 +56,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 7]> = const { Cell::new([false; 7]) };
-        static FIRED: Cell<[u64; 7]> = const { Cell::new([0; 7]) };
+        static OFF: Cell<[bool; 10]> = const { Cell::new([false; 10]) };
+        static FIRED: Cell<[u64; 10]> = const { Cell::new([0; 10]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -58,6 +69,9 @@ mod switches {
             Defence::PlanLogGuard => 4,
             Defence::PlanReplicationFence => 5,
             Defence::NoRedirectAfterBody => 6,
+            Defence::ImmutableOpenTail => 7,
+            Defence::FollowerMarkCheck => 8,
+            Defence::ImmutableLeaderBarrier => 9,
         }
     }
 
@@ -80,7 +94,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 7]));
+        FIRED.with(|fired| fired.set([0; 10]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -11,6 +11,7 @@ use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
@@ -109,6 +110,11 @@ pub(crate) fn read_stream_read_v1(
         offset: request.offset,
         max_len,
         leader_only: request.leader_only,
+        follower: match request.follower {
+            FollowerRead::Prefix => raft_internal_proto::FollowerReadV1::Prefix,
+            FollowerRead::Immutable => raft_internal_proto::FollowerReadV1::Immutable,
+        }
+        .into(),
     })
 }
 

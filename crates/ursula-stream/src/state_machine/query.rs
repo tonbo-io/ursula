@@ -8,6 +8,7 @@ use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
+use super::StreamErrorContext;
 use super::StreamMessageRecord;
 use super::StreamMetadata;
 use super::StreamRead;
@@ -235,25 +236,36 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         }
+        // A `416` and a `410` come before the `Stream-Incarnation`
+        // precondition, so they name the token of the stream that decided
+        // them: a client tells another incarnation from a real overshoot or
+        // a real gone offset without another HEAD.
+        let token = || {
+            vec![StreamErrorContext::StreamIncarnation {
+                incarnation: self.token_of(stream),
+            }]
+        };
         if offset > stream.tail_offset {
-            return Err(StreamResponse::error_with_next_offset(
+            return Err(StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::OffsetOutOfRange,
                 format!(
                     "offset {offset} is beyond stream '{}' tail {}",
                     stream_id, stream.tail_offset
                 ),
                 stream.tail_offset,
+                token(),
             ));
         }
         let retained_offset = self.earliest_retained_offset(stream_id);
         if offset < retained_offset {
-            return Err(StreamResponse::error_with_next_offset(
+            return Err(StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::StreamGone,
                 format!(
                     "offset {offset} is older than stream '{}' retained offset {retained_offset}",
                     stream_id
                 ),
                 retained_offset,
+                token(),
             ));
         }
 
@@ -377,9 +389,17 @@ impl StreamStateMachine {
         let snapshot = self.latest_snapshot(stream_id)?;
         match snapshot {
             Some(snapshot) if snapshot.offset == snapshot_offset => Ok(snapshot),
-            _ => Err(StreamResponse::error(
+            // The stream exists: its token comes with the `404`, as with a
+            // `410` or `416` of a read.
+            _ => Err(StreamResponse::error_with_context(
                 StreamErrorCode::SnapshotNotFound,
                 format!("snapshot {snapshot_offset} for stream '{stream_id}' does not exist"),
+                self.stream_slot(stream_id)
+                    .map(|slot| StreamErrorContext::StreamIncarnation {
+                        incarnation: self.token_of(&slot.metadata),
+                    })
+                    .into_iter()
+                    .collect(),
             )),
         }
     }

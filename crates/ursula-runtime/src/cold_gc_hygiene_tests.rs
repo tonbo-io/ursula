@@ -22,6 +22,7 @@ use crate::ColdStoreFaultEffect;
 use crate::ColdStoreOperation;
 use crate::CreateStreamRequest;
 use crate::DeleteStreamRequest;
+use crate::FollowerRead;
 use crate::GroupWriteCommand;
 use crate::InMemoryGroupEngine;
 use crate::InMemoryGroupEngineFactory;
@@ -102,6 +103,7 @@ async fn read(runtime: &ShardRuntime, stream: &BucketStreamId, len: usize) -> Ve
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read stream")

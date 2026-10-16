@@ -11,6 +11,7 @@ use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
@@ -138,6 +139,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read compacted stream");

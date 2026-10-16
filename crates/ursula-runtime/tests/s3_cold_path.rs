@@ -6,6 +6,7 @@ use ursula_config::ColdBackend;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdStore;
 use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -100,6 +101,7 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read cold and hot bytes");

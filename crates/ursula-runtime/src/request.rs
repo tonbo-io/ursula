@@ -181,6 +181,79 @@ pub struct ReadStreamRequest {
     /// it, and otherwise answers the leader redirect or 503. `None` for
     /// every other read.
     pub read_index: Option<u64>,
+    /// What a follower may answer this read with from its own applied
+    /// state. Ignored with `leader_only`, which a follower always forwards.
+    pub follower: FollowerRead,
+}
+
+/// What a follower may serve of a read that is not `leader_only` from its
+/// own applied state, without asking the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowerRead {
+    /// Any prefix of what it applied, as a base-protocol catch-up read
+    /// allows: offsets are immutable, so the bytes are correct, and a
+    /// follower that lags may only return fewer of them.
+    Prefix,
+    /// Only an answer that the server marks immutable ([`immutable_read`]),
+    /// for a chunk of the immutable-read resources (extensions Section 4,
+    /// #581 section 5.3). The follower forwards any other answer to the
+    /// leader, so an unmarked answer always means that the tail of an open
+    /// stream lies within the chunk, never that a follower lags.
+    Immutable,
+}
+
+/// Where a read ended, as seen by the stream state that served it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// Below the tail: more bytes follow. Closure is visible only at the
+    /// tail, so a closed stream's read ends here too.
+    BelowTail,
+    /// At the tail of an open stream: a later append may extend it.
+    OpenTail,
+    /// At the tail of a closed stream: nothing ever follows.
+    ClosedTail,
+}
+
+impl ReadEnd {
+    /// The one reading of a read's `up_to_date` and `closed`.
+    pub fn of(up_to_date: bool, closed: bool) -> Self {
+        match (up_to_date, closed) {
+            (false, _) => Self::BelowTail,
+            (true, false) => Self::OpenTail,
+            (true, true) => Self::ClosedTail,
+        }
+    }
+}
+
+/// Whether a read of `[offset, next_offset)` that asked for `requested_len`
+/// bytes and ended at `end` is one that no later read of the same request
+/// can contradict, under the same incarnation token (extensions Section
+/// 4.3). It either reached what it asked for strictly below the tail, which
+/// for a chunk means the end of the chunk, or it ended at the tail of a
+/// closed stream. A read that ends at the tail of an open stream never is,
+/// even when it filled its request: the stream can still be closed there.
+pub fn immutable_read(offset: u64, next_offset: u64, requested_len: usize, end: ReadEnd) -> bool {
+    match end {
+        ReadEnd::ClosedTail => true,
+        ReadEnd::OpenTail
+            if ursula_stream::sim_controls::off(
+                ursula_stream::sim_controls::Defence::ImmutableOpenTail,
+            ) =>
+        {
+            filled(offset, next_offset, requested_len)
+        }
+        ReadEnd::OpenTail => false,
+        ReadEnd::BelowTail => filled(offset, next_offset, requested_len),
+    }
+}
+
+/// Whether a read of `[offset, next_offset)` returned all of the
+/// `requested_len` bytes it asked for.
+fn filled(offset: u64, next_offset: u64, requested_len: usize) -> bool {
+    requested_len > 0
+        && next_offset
+            .checked_sub(offset)
+            .is_some_and(|returned| u64::try_from(requested_len) == Ok(returned))
 }
 
 /// What a live read (SSE, long-poll) learned from its owner check (D10):
@@ -204,6 +277,7 @@ impl ReadStreamRequest {
             && self.max_len == other.max_len
             && self.leader_only == other.leader_only
             && self.read_index.is_some() == other.read_index.is_some()
+            && self.follower == other.follower
     }
 }
 
@@ -221,6 +295,19 @@ pub struct ReadStreamResponse {
     /// never `0`; `0` means unknown and renders no header.
     #[serde(default)]
     pub incarnation: u64,
+}
+
+impl ReadStreamResponse {
+    /// Where the read ended, as seen by the state that served it.
+    pub fn end(&self) -> ReadEnd {
+        ReadEnd::of(self.up_to_date, self.closed)
+    }
+
+    /// Whether the read is immutable for a request of `requested_len`
+    /// bytes ([`immutable_read`]).
+    pub fn is_immutable(&self, requested_len: usize) -> bool {
+        immutable_read(self.offset, self.next_offset, requested_len, self.end())
+    }
 }
 
 pub enum GroupReadStreamBody {
@@ -330,6 +417,17 @@ impl GroupReadStreamParts {
             closed: self.closed,
             incarnation: self.incarnation,
         })
+    }
+
+    /// Where the read ended, as seen by the state that served it.
+    pub fn end(&self) -> ReadEnd {
+        ReadEnd::of(self.up_to_date, self.closed)
+    }
+
+    /// Whether the read is immutable for a request of `requested_len`
+    /// bytes ([`immutable_read`]).
+    pub fn is_immutable(&self, requested_len: usize) -> bool {
+        immutable_read(self.offset, self.next_offset, requested_len, self.end())
     }
 
     pub fn payload_is_empty(&self) -> bool {
@@ -892,4 +990,36 @@ impl AppendResponse {
 pub struct StreamAppendCount {
     pub stream_id: BucketStreamId,
     pub append_count: u64,
+}
+
+#[cfg(test)]
+mod immutable_read_tests {
+    use super::ReadEnd;
+    use super::immutable_read;
+
+    #[test]
+    fn where_a_read_ends_decides_whether_it_is_immutable() {
+        assert_eq!(ReadEnd::of(false, false), ReadEnd::BelowTail);
+        assert_eq!(ReadEnd::of(false, true), ReadEnd::BelowTail);
+        assert_eq!(ReadEnd::of(true, false), ReadEnd::OpenTail);
+        assert_eq!(ReadEnd::of(true, true), ReadEnd::ClosedTail);
+
+        // Filled its request below the tail.
+        assert!(immutable_read(0, 10, 10, ReadEnd::BelowTail));
+        assert!(immutable_read(5, 10, 5, ReadEnd::BelowTail));
+        // Short of its request below the tail: a lagging replica's answer.
+        assert!(!immutable_read(0, 4, 10, ReadEnd::BelowTail));
+        // Nothing asked for, nothing proven.
+        assert!(!immutable_read(10, 10, 0, ReadEnd::BelowTail));
+        // Filled its request and ended at an open tail: the stream can still
+        // be closed there.
+        assert!(!immutable_read(0, 10, 10, ReadEnd::OpenTail));
+        assert!(!immutable_read(0, 4, 10, ReadEnd::OpenTail));
+        // The tail of a closed stream, full, short or empty.
+        assert!(immutable_read(0, 10, 10, ReadEnd::ClosedTail));
+        assert!(immutable_read(0, 4, 10, ReadEnd::ClosedTail));
+        assert!(immutable_read(10, 10, 10, ReadEnd::ClosedTail));
+        // A range that does not start at its offset is never filled.
+        assert!(!immutable_read(10, 4, 10, ReadEnd::BelowTail));
+    }
 }

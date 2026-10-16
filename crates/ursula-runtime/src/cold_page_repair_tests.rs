@@ -26,6 +26,7 @@ use crate::ColdWriteAdmission;
 use crate::CreateStreamRequest;
 use crate::DeleteStreamRequest;
 use crate::FlushColdRequest;
+use crate::FollowerRead;
 use crate::GroupEngine;
 use crate::InMemoryGroupEngine;
 use crate::InMemoryGroupEngineFactory;
@@ -58,6 +59,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         now_ms: 0,
         leader_only: false,
         read_index: None,
+        follower: FollowerRead::Prefix,
     }
 }
 
