@@ -309,7 +309,8 @@ write bytes that are proposed but not yet applied would exceed
 nothing on. Bodies of at most `--small-body-max-bytes` have headroom of their
 own, so this hits large bodies under heavy upload load. Writes resume once the
 uploads under way end. The gateway's `upload_refusals_budget` counter shows
-these refusals. See the gateway's Request Body Budget.
+these refusals. See the gateway's
+[request body budget](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-gateway/README.md#request-body-budget).
 
 A `503` also answers a write while the group has no known leader, for example
 during an election, and on a node that does not host the stream's group and

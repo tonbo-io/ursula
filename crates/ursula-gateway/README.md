@@ -250,6 +250,11 @@ can send it again after a leader redirect. `--max-request-body-bytes` bounds
 one body. The body budget bounds the bodies under way across requests, so
 that concurrent large or slow uploads cannot exhaust the gateway's memory.
 
+Raising `--max-request-body-bytes` above 32 MiB lets no larger request
+through. An Ursula node refuses a request body over 32 MiB with `413`
+whatever the gateway's limit, so a higher limit only grows the gateway's body
+budget and the memory it may buffer.
+
 Before it reads any byte of a body, a request reserves the body's
 `Content-Length` from `--body-budget-bytes`. A body without a declared length
 reserves `--small-body-max-bytes` at first, and its reservation grows as the
@@ -363,14 +368,15 @@ Each refusal here carries the JSON error body with its own code:
 | `503` | `UPLOAD_BUDGET_EXHAUSTED` | The body budget stayed spent for `--body-budget-wait-ms`. With `Retry-After: 1` |
 | `408` | `BODY_TOO_SLOW` | No byte of the body arrived for `--body-stall-timeout`, or less than `--body-min-bytes-per-sec` over one such window |
 
-`/__ursula/gateway/metrics` reports `upload_refusals_tenant_bytes`, `upload_refusals_tenant_uploads`,
-`upload_refusals_budget` and `upload_refusals_too_slow`, the refusals by
-reason, `upload_budget_bytes`, the budget in effect, `upload_reserved_bytes`,
-the bytes reserved now with each body's share rounded up to whole KiB,
-`upload_tenants`, the buckets with a large body under way under an upload
-limit now, and `body_bytes_buffered`, the bytes of bodies the gateway read to
-forward them, a body cut or refused part way included. The rest of a body
-refused part way counts in `refusal_drain_bytes`.
+`/__ursula/gateway/metrics` reports `upload_refusals_tenant_bytes`,
+`upload_refusals_tenant_uploads`, `upload_refusals_budget` and
+`upload_refusals_too_slow`, the refusals by reason, `upload_budget_bytes`, the
+budget in effect, `upload_reserved_bytes`, the bytes reserved now with each
+body's share rounded up to whole KiB, `upload_tenants`, the buckets with a
+large body under way under an upload limit now, and `body_bytes_buffered`, the
+bytes of bodies the gateway read to forward them, a body cut or refused part
+way included. The rest of a body refused part way counts in
+`refusal_drain_bytes`.
 
 The defaults suit a 512 MiB pod with the default 32 MiB per-request limit.
 The 256 MiB budget is half of the pod, leaving the rest to response streams,
@@ -452,8 +458,10 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     Maximum request body bytes buffered for leader-redirect replay.
     Larger requests return 413 before upstream forwarding. Also the most the
     gateway reads of a body before it sends a refusal. Must fit
-    --body-budget-bytes less --small-body-headroom-bytes. Defaults to
-    33554432.
+    --body-budget-bytes less --small-body-headroom-bytes. Ursula nodes
+    refuse a body over 32 MiB with 413 whatever this limit, so raising it
+    above 33554432 lets no larger request through and only grows the body
+    budget. Defaults to 33554432.
 
 --body-budget-bytes <BYTES>
     Bytes of request bodies the gateway buffers at once, across requests,

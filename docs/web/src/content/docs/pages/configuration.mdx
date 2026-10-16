@@ -52,6 +52,8 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
 | `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature |
 
+A node refuses a request body over 32 MiB with `413` and names that limit in `Ursula-Max-Request-Bytes`. The limit is fixed. Raising the gateway's `--max-request-body-bytes` (the chart's `gateway.maxRequestBodyBytes`) above 32 MiB lets no larger request through, since the node still answers `413`. It only grows the gateway's request body budget and the memory the gateway may buffer. With a cold backend, a larger snapshot goes up [in parts](/docs/api/publish-snapshot#upload-in-parts) instead.
+
 Without `server.cluster_listen`, `server.listen` serves both the client and the cluster plane, and each `[[raft.peers]].url` points at that address. Leader redirects then name the same URL, so clients must be able to reach it too.
 
 With `server.cluster_listen` set, `server.listen` serves only the client plane. Each `[[raft.peers]].url` points at the peer's cluster listener, and each `[[raft.peers]].client_url` at its client listener. A follower redirects a client to the leader's `client_url`, so only peers need to reach the cluster listener. A node refuses to start when a peer lacks `client_url`. `ursula gateway` follows a redirect to an upstream directly when its `--upstream` equals the leader's `client_url`, and searches its upstreams for the leader otherwise. See [Security](/docs/security#network-planes) for what each plane serves.
