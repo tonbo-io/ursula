@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_writers_never_apply_after_a_restore_and_replay() {
+    fn stale_writers_never_apply_after_a_restore_and_replays() {
         let _guard = sim_test_guard();
         let scenario = SimScenario::StaleWritersAfterRestore;
         for seed in 380..=384 {
