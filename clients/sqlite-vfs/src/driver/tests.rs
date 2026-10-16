@@ -28,6 +28,7 @@ use super::Io;
 use super::Kept;
 use super::Life;
 use super::OpenId;
+use super::Role;
 use super::SyncError;
 use super::Ticket;
 use super::UNCONNECTED_MS;
@@ -48,6 +49,7 @@ use crate::codec::segment::RecordBody;
 use crate::codec::segment::scan;
 use crate::generation::Root;
 use crate::generation::canonical_path;
+use crate::generation::root_name;
 use crate::ids::Activation;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
@@ -63,6 +65,7 @@ use crate::open::OpenSpec;
 use crate::open::StreamFormat;
 use crate::open::StreamState;
 use crate::open::Unavailable;
+use crate::options::Access;
 use crate::replicator::Pending;
 use crate::replicator::ResetKind;
 use crate::salvage::Reason;
@@ -89,7 +92,7 @@ fn spec(dir: &Path, activation: u8) -> OpenSpec {
         max_pending_bytes: 1 << 20,
         max_request_bytes: None,
         timeout_ms: 30_000,
-        recreate: false,
+        access: Access::Owner { recreate: false },
     }
 }
 
@@ -2129,7 +2132,7 @@ fn recreate_salvages_the_generation_and_creates_the_stream() {
     w.server.delete(PATH).unwrap();
     let c2 = w.core();
     let bound = w.open(c2, OpenSpec {
-        recreate: true,
+        access: Access::Owner { recreate: true },
         ..spec(dir.path(), 2)
     });
     assert_eq!(bound.handle.attach, salvaged_attach(Reason::Recreated));
@@ -3690,7 +3693,7 @@ fn a_create_answered_200_salvages_as_a_history_change() {
     }));
     let c2 = w.core();
     let bound = w.open(c2, OpenSpec {
-        recreate: true,
+        access: Access::Owner { recreate: true },
         ..spec(dir.path(), 2)
     });
     assert_eq!(bound.handle.attach, salvaged_attach(Reason::HistoryChanged));
@@ -4435,4 +4438,469 @@ fn a_hand_out_given_back_by_a_failed_open_waits_again() {
     w.run_for(UNCONNECTED_MS / 2 + 1_000);
     assert_eq!(bound.handle.life(), Life::Retired);
     assert!(!bound.handle.holds_root());
+}
+
+/// A read-only open's spec: the reader of design D6.
+fn reader_spec(dir: &Path) -> OpenSpec {
+    OpenSpec {
+        access: Access::Reader,
+        ..spec(dir, 9)
+    }
+}
+
+/// The stream's root directory under the cache root `dir`.
+fn stream_root(dir: &Path) -> PathBuf {
+    dir.join(root_name(&canonical_path(URL).unwrap()))
+}
+
+/// The db file of the binding, as it is on disk.
+fn db_bytes(bound: &Bound) -> Vec<u8> {
+    std::fs::read(bound.handle.generation.db()).unwrap()
+}
+
+/// An owner bound on core `c` that committed a page of `salt` and saw it acknowledged.
+fn owner_with_a_commit(w: &mut World, dir: &Path, c: usize, salt: u8) -> Bound {
+    let bound = w.open(c, spec(dir, 1));
+    w.commit(c, &bound, salt).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    bound
+}
+
+/// A reader in another process (design D6) builds its generation in `reader-0/`, beside the
+/// owner's lock, from HEADs and reads alone: it claims nothing, so the owner goes on committing
+/// unfenced. Its `synced()` resolves at once, and it shows the stream as of its open. A second
+/// reader takes `reader-1/`.
+#[test]
+fn a_reader_builds_in_a_reader_directory_and_claims_nothing() {
+    let dir = TempDir::new("driver-reader");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let reader = w.open(r, reader_spec(dir.path()));
+    let h = &reader.handle;
+    assert_eq!(h.role, Role::Reader);
+    assert_eq!(h.attach, Attach::Built {
+        snapshot: None,
+        salvaged: None
+    });
+    assert!(
+        h.generation
+            .dir
+            .starts_with(stream_root(dir.path()).join("reader-0"))
+    );
+    assert_eq!(db_bytes(&reader), page_on_disk(h.generation.lineage, 1));
+    assert_eq!(h.incarnation(), w.server.token(PATH).unwrap());
+    let methods: Vec<Method> = w
+        .sent
+        .iter()
+        .filter(|s| s.core == r)
+        .map(|s| s.request.method)
+        .collect();
+    assert!(
+        methods
+            .iter()
+            .all(|m| matches!(m, Method::Head | Method::Get)),
+        "{methods:?}"
+    );
+    let ticket = w.sync(r, reader.binding);
+    assert_eq!(w.outcome(r, ticket), Some(Ok(())));
+    // The owner is not fenced, and the reader keeps the state as of its open.
+    w.commit(o, &owner, 2).unwrap();
+    let ticket = w.sync(o, owner.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(o, ticket), Some(Ok(())));
+    assert!(w.resets(o).is_empty());
+    assert_eq!(db_bytes(&reader), page_on_disk(h.generation.lineage, 1));
+    let r2 = w.core();
+    let second = w.open(r2, reader_spec(dir.path()));
+    assert!(
+        second
+            .handle
+            .generation
+            .dir
+            .starts_with(stream_root(dir.path()).join("reader-1"))
+    );
+    assert_eq!(
+        db_bytes(&second),
+        page_on_disk(second.handle.generation.lineage, 2)
+    );
+}
+
+/// A reader retires as soon as its last connection closes, unlocking its directory. Its next open
+/// takes the same directory and catches its generation up in place to the tail.
+#[test]
+fn a_reader_reopened_catches_its_generation_up_in_place() {
+    let dir = TempDir::new("driver-reader-catch-up");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let first = w.open(r, reader_spec(dir.path()));
+    let generation = first.handle.generation.clone();
+    w.retire(r, &first);
+    assert!(!first.handle.holds_root());
+    assert!(
+        w.events(r)
+            .iter()
+            .any(|e| matches!(e, DriverEvent::Retired { binding } if *binding == first.binding))
+    );
+    w.commit(o, &owner, 2).unwrap();
+    let ticket = w.sync(o, owner.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(o, ticket), Some(Ok(())));
+    let again = w.open(r, reader_spec(dir.path()));
+    assert_eq!(again.handle.attach, Attach::CaughtUp);
+    assert_eq!(again.handle.generation, generation);
+    assert_eq!(db_bytes(&again), page_on_disk(generation.lineage, 2));
+    assert!(w.resets(o).is_empty());
+}
+
+/// A history change of the stream rebuilds a reader generation, the old one trashed: it holds no
+/// commit of its own to keep, so it is neither re-keyed nor salvaged.
+#[test]
+fn a_reader_of_another_token_builds_anew() {
+    let dir = TempDir::new("driver-reader-history");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let first = w.open(r, reader_spec(dir.path()));
+    let old = first.handle.generation.clone();
+    w.retire(r, &first);
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let again = w.open(r, reader_spec(dir.path()));
+    assert!(matches!(again.handle.attach, Attach::Built { .. }));
+    assert_ne!(again.handle.generation.dir, old.dir);
+    assert!(!old.dir.exists());
+    assert_eq!(again.handle.incarnation(), w.server.token(PATH).unwrap());
+    assert_eq!(
+        db_bytes(&again),
+        page_on_disk(again.handle.generation.lineage, 1)
+    );
+    assert!(!stream_root(dir.path()).join("reader-0/salvage").exists());
+}
+
+/// A reader of a missing stream is refused `not_found`: it never creates one.
+#[test]
+fn a_reader_of_a_missing_stream_is_not_found() {
+    let dir = TempDir::new("driver-reader-missing");
+    let mut w = World::new();
+    let r = w.core();
+    let e = kind(w.open_result(r, reader_spec(dir.path())));
+    assert!(matches!(&*e, OpenError::NotFound), "{e}");
+    assert!(w.sent.iter().all(|s| s.request.method == Method::Head));
+    assert!(w.server.frames(PATH).is_none());
+}
+
+/// An unreachable stream opens a trusted reader generation as it is, the stream as of its last
+/// open. Without one the open waits, and fails `unreachable` at its deadline.
+#[test]
+fn an_unreachable_stream_opens_a_trusted_reader_generation_and_waits_without_one() {
+    let dir = TempDir::new("driver-reader-unreachable");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let first = w.open(r, reader_spec(dir.path()));
+    let generation = first.handle.generation.clone();
+    w.retire(r, &first);
+    w.down[r] = true;
+    let start = w.now;
+    let offline = w.open(r, reader_spec(dir.path()));
+    assert!(w.now - start < 1_000, "{} ms", w.now - start);
+    assert_eq!(offline.handle.attach, Attach::Resumed);
+    assert_eq!(offline.handle.generation, generation);
+    assert_eq!(db_bytes(&offline), page_on_disk(generation.lineage, 1));
+    let empty = TempDir::new("driver-reader-unreachable-none");
+    let start = w.now;
+    let e = kind(w.open_result(r, OpenSpec {
+        timeout_ms: 5_000,
+        ..reader_spec(empty.path())
+    }));
+    assert!(
+        matches!(&*e, OpenError::Unavailable(Unavailable::Unreachable)),
+        "{e}"
+    );
+    assert!(w.now - start >= 5_000, "{} ms", w.now - start);
+}
+
+/// A reader opened and retired on core `r`: its generation.
+fn reader_once(w: &mut World, r: usize, dir: &Path) -> crate::generation::Generation {
+    let first = w.open(r, reader_spec(dir));
+    let generation = first.handle.generation.clone();
+    w.retire(r, &first);
+    generation
+}
+
+/// Retention passed what a reader generation acknowledged: its catch-up meets a `410` and builds
+/// anew from the latest snapshot, the old generation trashed.
+#[test]
+fn a_reader_whose_catch_up_meets_a_410_builds_anew() {
+    let dir = TempDir::new("driver-reader-410");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let old = reader_once(&mut w, r, dir.path());
+    w.commit(o, &owner, 2).unwrap();
+    w.run_for(1_000);
+    snapshot_and_retain(&mut w.server);
+    let again = w.open(r, reader_spec(dir.path()));
+    assert!(
+        matches!(again.handle.attach, Attach::Built {
+            snapshot: Some(_),
+            salvaged: None
+        }),
+        "{:?}",
+        again.handle.attach
+    );
+    assert_ne!(again.handle.generation.dir, old.dir);
+    assert!(!old.dir.exists());
+    let expected = image_of(w.server.frames(PATH).unwrap());
+    assert_eq!(
+        db_bytes(&again),
+        on_disk(again.handle.generation.lineage, expected)
+    );
+}
+
+/// The stream changes history between the reader's HEAD and its catch-up's read: the read meets a
+/// `412`, the HEAD goes again, and the reader rows build anew under the new token.
+#[test]
+fn a_reader_whose_catch_up_meets_a_412_heads_again() {
+    let dir = TempDir::new("driver-reader-412");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let old = reader_once(&mut w, r, dir.path());
+    w.commit(o, &owner, 2).unwrap();
+    w.run_for(1_000);
+    let heads_before = heads(&w, r);
+    w.after_head = Some(Box::new(|s: &mut ModelServer| {
+        s.history_event(HistoryEvent::NewHistory).unwrap();
+    }));
+    let again = w.open(r, reader_spec(dir.path()));
+    // The open's HEAD, the one after the `412`, and the build's own.
+    assert_eq!(heads(&w, r) - heads_before, 3);
+    assert!(matches!(again.handle.attach, Attach::Built { .. }));
+    assert_ne!(again.handle.generation.dir, old.dir);
+    assert_eq!(again.handle.incarnation(), w.server.token(PATH).unwrap());
+    assert_eq!(
+        db_bytes(&again),
+        page_on_disk(again.handle.generation.lineage, 2)
+    );
+}
+
+/// A reader reads a closed stream, which an owner refuses.
+#[test]
+fn a_reader_reads_a_closed_stream() {
+    let dir = TempDir::new("driver-reader-closed");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    w.retire(o, &owner);
+    w.server.close(PATH).unwrap();
+    let r = w.core();
+    let reader = w.open(r, reader_spec(dir.path()));
+    assert!(reader.handle.closed);
+    assert_eq!(
+        db_bytes(&reader),
+        page_on_disk(reader.handle.generation.lineage, 1)
+    );
+    w.retire(r, &reader);
+    let again = w.open(r, reader_spec(dir.path()));
+    assert_eq!(again.handle.attach, Attach::CaughtUp);
+    assert!(again.handle.closed);
+    let e = kind(w.open_result(w.cores.len() - 1, spec(dir.path(), 2)));
+    assert!(
+        matches!(&*e, OpenError::StreamState(StreamState::Closed)),
+        "{e}"
+    );
+}
+
+/// A reader generation whose db file is not its own is built anew, never salvaged.
+#[test]
+fn a_replaced_reader_generation_is_rebuilt_without_salvage() {
+    let dir = TempDir::new("driver-reader-replaced");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let old = reader_once(&mut w, r, dir.path());
+    let db = std::fs::OpenOptions::new()
+        .write(true)
+        .open(old.db())
+        .unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&db, &SQLITE_MAGIC, 0).unwrap();
+    drop(db);
+    let again = w.open(r, reader_spec(dir.path()));
+    assert_eq!(again.handle.attach, Attach::Built {
+        snapshot: None,
+        salvaged: None
+    });
+    assert_ne!(again.handle.generation.dir, old.dir);
+    assert!(!old.dir.exists());
+    assert!(!stream_root(dir.path()).join("reader-0/salvage").exists());
+    assert_eq!(
+        db_bytes(&again),
+        page_on_disk(again.handle.generation.lineage, 1)
+    );
+}
+
+/// A reader binding's connections found it damaged: it resets and retires, its connections keep
+/// its directory locked until the last one closes, and the next reader takes that directory again.
+#[test]
+fn a_reader_resets_and_lets_its_directory_go_with_its_last_connection() {
+    let dir = TempDir::new("driver-reader-reset");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let reader = w.open(r, reader_spec(dir.path()));
+    let now = w.now;
+    w.c(r)
+        .reset_binding(reader.binding, ResetKind::LocalDamage, now);
+    assert_eq!(reader.handle.reset(), Some(ResetKind::LocalDamage));
+    assert_eq!(w.resets(r), vec![ResetKind::LocalDamage]);
+    assert!(
+        w.events(r)
+            .iter()
+            .any(|e| matches!(e, DriverEvent::Retired { binding } if *binding == reader.binding))
+    );
+    let ticket = w.sync(r, reader.binding);
+    assert_eq!(
+        w.outcome(r, ticket),
+        Some(Err(SyncError::Reset(ResetKind::LocalDamage)))
+    );
+    assert!(reader.handle.holds_root());
+    let beside = w.open(r, reader_spec(dir.path()));
+    assert!(
+        beside
+            .handle
+            .generation
+            .dir
+            .starts_with(stream_root(dir.path()).join("reader-1"))
+    );
+    assert!(!reader.handle.disconnect(Holder::Host));
+    assert!(!reader.handle.holds_root());
+    w.retire(r, &beside);
+    let again = w.open(r, reader_spec(dir.path()));
+    assert!(
+        again
+            .handle
+            .generation
+            .dir
+            .starts_with(stream_root(dir.path()).join("reader-0"))
+    );
+}
+
+/// A reader `ursula_open` handed out that no connection opens retires after the hand-out window,
+/// and one a connection opened stays.
+#[test]
+fn an_unconnected_reader_retires_after_the_hand_out_window() {
+    let dir = TempDir::new("driver-reader-unconnected");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let idle = w.open_result(r, reader_spec(dir.path())).unwrap();
+    let now = w.now;
+    w.c(r).unconnected(idle.binding, now);
+    w.run_for(UNCONNECTED_MS - 1_000);
+    assert!(matches!(idle.handle.life(), Life::HandedOut { .. }));
+    w.run_for(2_000);
+    assert_eq!(idle.handle.life(), Life::Retired);
+    assert!(!idle.handle.holds_root());
+    let used = w.open(r, reader_spec(dir.path()));
+    let now = w.now;
+    w.c(r).unconnected(used.binding, now);
+    w.run_for(UNCONNECTED_MS + 1_000);
+    assert_eq!(used.handle.life(), Life::Live);
+    assert!(used.handle.holds_root());
+}
+
+/// A reader's result that nobody took is given up: the binding retires and its directory unlocks.
+#[test]
+fn a_cancelled_reader_result_nobody_took_retires() {
+    let dir = TempDir::new("driver-reader-cancel");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let open = OpenId(w.id());
+    let now = w.now;
+    let ios = w.c(r).open(open, reader_spec(dir.path()), now);
+    w.queue_ios(r, ios);
+    w.run_for(1_000);
+    let binding = w
+        .events(r)
+        .into_iter()
+        .find_map(|e| match e {
+            DriverEvent::Opened {
+                open: o,
+                result: Ok(binding),
+            } if o == open => Some(binding),
+            _ => None,
+        })
+        .expect("the reader bound");
+    let now = w.now;
+    let ios = w.c(r).cancel(open, now);
+    w.queue_ios(r, ios);
+    w.run_for(1_000);
+    assert!(
+        w.events(r)
+            .iter()
+            .any(|e| matches!(e, DriverEvent::Retired { binding: b } if *b == binding))
+    );
+    assert!(w.c(r).take_opened(open).is_none());
+    let root = Root::reader(dir.path(), &canonical_path(URL).unwrap()).unwrap();
+    assert_eq!(root.path(), stream_root(dir.path()).join("reader-0"));
+}
+
+/// Every reader directory held: the open is `in_use`.
+#[test]
+fn a_reader_with_every_reader_directory_held_is_in_use() {
+    let dir = TempDir::new("driver-reader-in-use");
+    let mut w = World::new();
+    let o = w.core();
+    let _owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let name = canonical_path(URL).unwrap();
+    let held: Vec<Root> = (0..64)
+        .map(|_| Root::reader(dir.path(), &name).unwrap())
+        .collect();
+    let r = w.core();
+    let e = kind(w.open_result(r, reader_spec(dir.path())));
+    assert!(matches!(&*e, OpenError::InUse { .. }), "{e}");
+    drop(held);
+    w.open(r, reader_spec(dir.path()));
+}
+
+/// A reader's open in progress works in a reader directory of its own: an owner's reopen beside a
+/// reset binding's connections still shares the root instead of meeting `in_use`.
+#[test]
+fn a_reader_open_in_progress_does_not_keep_an_owner_reopen_from_the_root() {
+    let dir = TempDir::new("driver-reader-busy");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let now = w.now;
+    w.c(o)
+        .reset_binding(owner.binding, ResetKind::LocalDamage, now);
+    // A reader's open on the same core, held at its first disk job.
+    w.hold = Some(|job| matches!(job, DiskJob::Prepare { .. }));
+    let open = OpenId(w.id());
+    let ios = w.c(o).open(open, reader_spec(dir.path()), now);
+    w.queue_ios(o, ios);
+    w.deliver();
+    assert_eq!(w.held.len(), 1);
+    w.hold = None;
+    let reopened = w.open(o, spec(dir.path(), 1));
+    assert_ne!(reopened.handle.generation.dir, owner.handle.generation.dir);
+    w.release_held();
+    w.run_for(1_000);
+    let reader = w.c(o).take_opened(open).unwrap().unwrap();
+    assert_eq!(reader.handle.role, Role::Reader);
 }

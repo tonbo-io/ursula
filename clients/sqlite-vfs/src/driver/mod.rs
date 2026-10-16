@@ -176,6 +176,30 @@ pub(crate) struct BindingHandle {
     /// Opened on an unreachable stream (design §5.5) and no claim of it has applied yet: reads
     /// come from files of unverified freshness, and `synced()` waits for the claim.
     provisional: AtomicBool,
+    /// The owner's binding, or a reader's (design D6).
+    pub(crate) role: Role,
+    /// The open found the stream closed: only a reader's open takes one.
+    pub(crate) closed: bool,
+}
+
+/// Whose binding it is (design D6, D9 `role`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Role {
+    /// The stream's owner: its claim, replicator, commits and snapshots.
+    Owner,
+    /// A reader's, in a `reader-<n>/` directory: the stream as of the open, with no claim and no
+    /// replicator. Its connections are read-only and `synced()` resolves at once.
+    Reader,
+}
+
+impl Role {
+    /// The stable token (`status().role`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Reader => "reader",
+        }
+    }
 }
 
 /// Where a binding stands between its connections and the driver.
@@ -349,6 +373,8 @@ impl BindingHandle {
             attach: bind.attach,
             salvage: OnceLock::new(),
             provisional: AtomicBool::new(bind.provisional),
+            role: bind.role,
+            closed: bind.closed,
         }
     }
 
@@ -742,6 +768,8 @@ pub(crate) struct Bind {
     pub(crate) provisional: bool,
     /// The cache root the open bound under, as its spec named it.
     pub(crate) dir: PathBuf,
+    pub(crate) role: Role,
+    pub(crate) closed: bool,
 }
 
 /// Where an open got its local database, as status reports it (design §9, `attach`).
@@ -752,6 +780,9 @@ pub(crate) enum Attach {
     /// A trusted local generation of another token whose history inherits it, materialized and
     /// re-keyed (design §6.2).
     ReKeyed,
+    /// A reader's trusted local generation of the stream's token, materialized and caught up in
+    /// place to the tail the open's HEAD named.
+    CaughtUp,
     /// A generation built from the stream: from its latest snapshot at `snapshot` and the tail
     /// after it, or from its start when `snapshot` is `None`. `salvaged` names why the local
     /// generation it replaced was salvaged, if it was.

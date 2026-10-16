@@ -11,7 +11,7 @@ import { copyFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, type UrsulaResetError, type UrsulaSalvage } from "../src/index.ts";
-import { Child, directUrl, ext, freshDir, fromStream, killChildren, onModel, rejection, stream } from "./kit.ts";
+import { Child, directUrl, ext, freshDir, fromStream, killChildren, onModel, rejection, retired, stream } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -22,6 +22,7 @@ afterEach(async () => {
 	opened.clear();
 	await killChildren();
 });
+
 
 async function owner(url: string, dir: string, recreate?: boolean): Promise<UrsulaDatabase> {
 	const db = await open(url, recreate === undefined ? { dir } : { dir, recreate });
@@ -155,9 +156,12 @@ describe("salvage", () => {
 		await db.synced();
 		const plain = join(freshDir(), "plain.db");
 		db.exec(`VACUUM INTO '${plain}'`);
-		const gen = dirname(db.status().path);
+		const path = db.status().path;
+		const gen = dirname(path);
 		const segments = readdirSync(join(gen, "log")).sort();
 		db.close();
+		// Replaced only once the binding let its files go: a reopen before then takes it back.
+		await retired(path);
 		copyFileSync(plain, join(gen, "db"));
 
 		const again = await owner(s.url, dir);

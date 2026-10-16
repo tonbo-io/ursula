@@ -814,3 +814,71 @@ fn a_cut_across_a_re_key_segment_restores_the_token_before_it() {
     assert_eq!(r.header.incarnation, header().incarnation);
     assert_eq!(r.pending().len(), 2);
 }
+
+/// The `supersedes` of every segment header of the log in `dir`, in order.
+fn supersedes_of(dir: &std::path::Path) -> Vec<Option<crate::ids::GenId>> {
+    let mut segments: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    segments.sort();
+    segments
+        .iter()
+        .map(|s| {
+            crate::codec::segment::scan(&fs::read(s).unwrap())
+                .unwrap()
+                .header
+                .supersedes
+        })
+        .collect()
+}
+
+// Every segment names the generation directory its generation superseded: a roll, a re-key's
+// included, carries it over, after a reopen too, so a trim never removes it. A copy names the
+// directory it copied in every segment.
+#[test]
+fn every_segment_names_what_its_generation_supersedes() {
+    let dir = TempDir::new("log-supersedes");
+    let log_dir = dir.path().join("log");
+    let old = crate::ids::GenId::parse_hex("0123456789abcdef0123456789abcdef").unwrap();
+    let mut log = Log::create(&log_dir, SegmentHeader {
+        supersedes: Some(old),
+        ..header()
+    })
+    .unwrap();
+    log.set_roll_bytes(256);
+    for n in 0..8 {
+        log.append(&commit(n, 200)).unwrap();
+    }
+    drop(log);
+    let (mut log, _) = Log::open(&log_dir).unwrap();
+    log.set_roll_bytes(256);
+    log.append(&commit(9, 200)).unwrap();
+    log.append(&commit(10, 200)).unwrap();
+    let token = Incarnation::try_from((1 << 52) | 2).unwrap();
+    log.rekey(token, epoch(2), Activation([2; 16])).unwrap();
+    let acked = Position(log.next_position().0 - 1);
+    log.append(&RecordBody::Ack {
+        acked,
+        acked_offset: Offset::from_u64(1),
+        log_bytes: 0,
+    })
+    .unwrap();
+    log.append(&RecordBody::Base { position: acked }).unwrap();
+    log.append(&commit(11, 200)).unwrap();
+    log.sync().unwrap();
+    let all = supersedes_of(&log_dir);
+    assert!(all.len() > 3, "{} segments", all.len());
+    assert!(all.iter().all(|s| *s == Some(old)), "{all:?}");
+    assert!(log.trim().unwrap() > 0);
+    assert!(supersedes_of(&log_dir).iter().all(|s| *s == Some(old)));
+    let copy_dir = dir.path().join("copy");
+    let source = crate::ids::GenId::parse_hex("fedcba9876543210fedcba9876543210").unwrap();
+    super::copy(&log_dir, &copy_dir, source).unwrap();
+    let copied = supersedes_of(&copy_dir);
+    assert_eq!(copied.len(), supersedes_of(&log_dir).len());
+    assert!(copied.iter().all(|s| *s == Some(source)), "{copied:?}");
+    let (_, original) = Log::open(&log_dir).unwrap();
+    let (_, recopied) = Log::open(&copy_dir).unwrap();
+    assert_eq!(records(&original), records(&recopied));
+}

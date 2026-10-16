@@ -30,12 +30,19 @@
 //! the binding takes commits and serves reads from its files, and its replicator defers its claim
 //! behind a HEAD and a pre-check of the stream from the log's acknowledged offset (design §7).
 //! Without a trusted generation, or without a claim to continue, the open retries until its
-//! deadline. Readers come later in M2.
+//! deadline.
+//!
+//! A read-only open ([`Access::Reader`]) runs the same steps in a reader directory of its own
+//! ([`Root::reader`]) and decides by the reader rows ([`table::decide_reader`], [`reader`]): it
+//! builds a reader generation, catches a trusted one of the stream's token up in place, and binds
+//! with no claim ([`OpenStep::Reader`]).
 //!
 //! Module map:
 //!
-//! - [`table`]: the open table of design §5.5, one pure function.
+//! - [`table`]: the open table of design §5.5, one pure function, and its reader rows.
+//! - [`reader`]: a reader's open after its HEAD: its catch-up in place and its unreachable row.
 
+pub(crate) mod reader;
 pub(crate) mod table;
 
 use std::fs::File;
@@ -54,6 +61,9 @@ use ursula_headers::Offset;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 
+use self::reader::Applying;
+use self::reader::CatchUp;
+use self::reader::ReaderReady;
 use self::table::Asked;
 use self::table::HeadSeen;
 use self::table::Local;
@@ -96,6 +106,7 @@ use crate::materialize::ForeignFrame;
 use crate::materialize::LocalError;
 use crate::materialize::Materialized;
 use crate::materialize::holds_data;
+use crate::options::Access;
 use crate::replicator::BlockedReason;
 use crate::replicator::Condition;
 use crate::replicator::LocalState;
@@ -141,9 +152,8 @@ pub(crate) struct OpenSpec {
     pub(crate) max_request_bytes: Option<u64>,
     /// How long the open may take, from its start.
     pub(crate) timeout_ms: u64,
-    /// A missing stream is created again over a trusted generation holding data, which is
-    /// salvaged (`recreated`), instead of refusing `not_found`.
-    pub(crate) recreate: bool,
+    /// An owner's open (with `recreate` or not) or a reader's.
+    pub(crate) access: Access,
 }
 
 /// The condition an open that ran out of time reports (design §8.4, `UrsulaUnavailableError`).
@@ -283,7 +293,9 @@ pub(crate) enum OpenError {
     /// The snapshot the stream names is not one this extension can install.
     #[error("stream_state: the stream's latest snapshot: {0}")]
     Snapshot(#[source] SnapshotError),
-    #[error("not_found: the stream is missing and local commits exist")]
+    /// The stream is missing, and the open does not create it: an owner's over a local generation
+    /// holding data without `recreate`, or a reader's.
+    #[error("not_found: the stream is missing")]
     NotFound,
     #[error("claim_races: every claim lost to another claimant")]
     ClaimRaces,
@@ -913,7 +925,8 @@ impl Build {
     }
 
     /// Disk job: publishes the complete generation by one rename (the one it supersedes is
-    /// trashed or salvaged then) and materializes it.
+    /// trashed or salvaged then) and materializes it. Its log is trimmed only then, once the
+    /// generation it superseded is gone ([`materialize::trim_published`]).
     pub(crate) fn publish(self) -> Result<Published, OpenError> {
         let highest = self.fetch.highest_epoch;
         let salvaged = match &self.fate {
@@ -925,7 +938,8 @@ impl Build {
             salvaged,
         };
         let generation = self.building.publish(self.fate).map_err(local)?;
-        let m = materialize::materialize(&generation).map_err(local)?;
+        let mut m = materialize::materialize(&generation).map_err(local)?;
+        materialize::trim_published(&mut m).map_err(local)?;
         drop(self.root);
         Ok(Published {
             m: Box::new(m),
@@ -1022,14 +1036,19 @@ fn plain_db(dir: &Path) -> bool {
 }
 
 /// Disk job: locks the root (unless `root`, the one a reset binding of this process still holds,
-/// is given), finishes leftovers and materializes the current generation, unless it is replaced
-/// (its db file not its own, its log's first segment header unreadable), which is left as found.
+/// is given), or a reader directory for a reader's open, finishes leftovers and materializes the
+/// current generation, unless it is replaced (its db file not its own, its log's first segment
+/// header unreadable), which is left as found.
 pub(crate) fn prepare(spec: &OpenSpec, root: Option<Arc<Root>>) -> Result<Prepared, OpenError> {
     let root = match root {
         Some(root) => root,
         None => {
             let name = canonical_path(&spec.url)?;
-            let root = Root::lock(&spec.dir, &name).map_err(|e| match e {
+            let locked = match spec.access {
+                Access::Owner { .. } => Root::lock(&spec.dir, &name),
+                Access::Reader => Root::reader(&spec.dir, &name),
+            };
+            let root = locked.map_err(|e| match e {
                 GenerationError::InUse { root } => OpenError::InUse { root },
                 other => local(other),
             })?;
@@ -1234,6 +1253,13 @@ enum Phase {
         cluster_id: ClusterId,
         head: StreamHead,
     },
+    /// A reader's catch-up in place: a read of it, or the timer before one.
+    CatchingUp {
+        m: Box<Materialized>,
+        catch_up: CatchUp,
+    },
+    /// A reader's catch-up in place: a disk job applies a read's frames.
+    CatchUpApplying(Applying),
 }
 
 /// An open before its takeover.
@@ -1278,6 +1304,8 @@ pub(crate) enum OpenStep {
         ready: Box<Ready>,
         claim: (Epoch, Activation),
     },
+    /// A reader's open is done: bind it, with no claim.
+    Reader(Box<ReaderReady>),
     Fail(OpenError),
 }
 
@@ -1330,6 +1358,11 @@ impl Opening {
         &self.name
     }
 
+    /// An owner's open or a reader's.
+    pub(crate) fn access(&self) -> Access {
+        self.spec.access
+    }
+
     pub(crate) fn deadline_ms(&self) -> u64 {
         self.deadline_ms
     }
@@ -1338,9 +1371,12 @@ impl Opening {
     pub(crate) fn expired(&self) -> OpenError {
         let condition = match &self.phase {
             Phase::Reading { build, .. } => build.condition(),
-            Phase::Preparing | Phase::Head | Phase::Create | Phase::Building { .. } => {
-                self.retry.condition()
-            }
+            Phase::Preparing
+            | Phase::Head
+            | Phase::Create
+            | Phase::Building { .. }
+            | Phase::CatchingUp { .. }
+            | Phase::CatchUpApplying(_) => self.retry.condition(),
         };
         OpenError::Unavailable(condition)
     }
@@ -1350,9 +1386,12 @@ impl Opening {
     pub(crate) fn given_up(&self) -> OpenError {
         let seen = match &self.phase {
             Phase::Reading { build, .. } => build.seen(),
-            Phase::Preparing | Phase::Head | Phase::Create | Phase::Building { .. } => {
-                self.retry.seen()
-            }
+            Phase::Preparing
+            | Phase::Head
+            | Phase::Create
+            | Phase::Building { .. }
+            | Phase::CatchingUp { .. }
+            | Phase::CatchUpApplying(_) => self.retry.seen(),
         };
         seen.map_or(OpenError::Cancelled, OpenError::Unavailable)
     }
@@ -1418,7 +1457,18 @@ impl Opening {
                 } = published;
                 // A build that started over after a history change takes over with its token.
                 let head = read.unwrap_or(head);
-                self.takeover(m, cluster_id, &head, highest, attach, None)
+                match self.spec.access {
+                    Access::Owner { .. } => {
+                        self.takeover(m, cluster_id, &head, highest, attach, None)
+                    }
+                    Access::Reader => {
+                        let (incarnation, closed) = (head.incarnation(), head.closed());
+                        self.reader_ready(m, cluster_id.as_str(), incarnation, closed, attach)
+                    }
+                }
+            }
+            (Phase::CatchUpApplying(applying), DiskDone::CaughtUp { m, outcome }) => {
+                self.caught_up(m, applying, outcome)
             }
             (
                 _,
@@ -1518,8 +1568,14 @@ impl Opening {
     ) -> OpenStep {
         let phase = std::mem::replace(&mut self.phase, Phase::Head);
         match phase {
-            Phase::Head => self.head_answered(exchange, lineage, now_ms),
+            Phase::Head => match self.spec.access {
+                Access::Owner { .. } => self.head_answered(exchange, lineage, now_ms),
+                Access::Reader => self.reader_head_answered(exchange, lineage, now_ms),
+            },
             Phase::Create => self.create_answered(exchange, now_ms),
+            Phase::CatchingUp { m, catch_up } => {
+                self.catch_up_answered(m, catch_up, exchange, lineage, now_ms)
+            }
             Phase::Reading {
                 mut build,
                 cluster_id,
@@ -1529,7 +1585,7 @@ impl Opening {
                 self.build_step(build, step, cluster_id, head)
             }
             // No request is out in these.
-            phase @ (Phase::Preparing | Phase::Building { .. }) => {
+            phase @ (Phase::Preparing | Phase::Building { .. } | Phase::CatchUpApplying(_)) => {
                 self.phase = phase;
                 OpenStep::Fail(OpenError::Panicked)
             }
@@ -1621,7 +1677,7 @@ impl Opening {
             content_type: answer.content_type.as_deref(),
         };
         let asked = Asked {
-            recreate: self.spec.recreate,
+            recreate: matches!(self.spec.access, Access::Owner { recreate: true }),
             created: self.created,
         };
         match table::decide(local, asked, seen) {
@@ -1674,19 +1730,7 @@ impl Opening {
                         plain: replaced.plain,
                     }),
                 };
-                let job = DiskJob::NewBuild(NewBuild {
-                    root: Arc::clone(&prepared.root),
-                    name: self.name.clone(),
-                    lineage,
-                    cluster_id: cluster_id.clone(),
-                    incarnation: head.incarnation(),
-                    first: Position(1),
-                    claim: None,
-                    end: head.next_offset(),
-                    fate,
-                });
-                self.phase = Phase::Building { cluster_id, head };
-                OpenStep::Disk { opening: self, job }
+                self.build(lineage, cluster_id, head, fate)
             }
         }
     }
@@ -1741,6 +1785,33 @@ impl Opening {
             }),
             claim,
         }
+    }
+
+    /// Builds a generation of a fresh `lineage` from the stream `head` names (a disk job), the one
+    /// it supersedes meeting `fate` at its publish.
+    fn build(
+        mut self: Box<Self>,
+        lineage: Lineage,
+        cluster_id: ClusterId,
+        head: StreamHead,
+        fate: Fate,
+    ) -> OpenStep {
+        let Some(prepared) = &self.prepared else {
+            return OpenStep::Fail(OpenError::Panicked);
+        };
+        let job = DiskJob::NewBuild(NewBuild {
+            root: Arc::clone(&prepared.root),
+            name: self.name.clone(),
+            lineage,
+            cluster_id: cluster_id.clone(),
+            incarnation: head.incarnation(),
+            first: Position(1),
+            claim: None,
+            end: head.next_offset(),
+            fate,
+        });
+        self.phase = Phase::Building { cluster_id, head };
+        OpenStep::Disk { opening: self, job }
     }
 
     fn takeover(

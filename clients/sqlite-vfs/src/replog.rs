@@ -28,8 +28,14 @@
 //! between them then name a token from before the roll, and the next open salvages a generation
 //! that lost nothing (G18, accepted). A current segment with no record has its header
 //! replaced instead (a temp file renamed over it), since a roll would start at the same position.
-//! [`copy`] copies a log for a copy of its generation: its first segment written again to name the
-//! generation it supersedes, the later ones copied as they are.
+//! [`copy`] copies a log for a copy of its generation: every segment written again to name the
+//! generation it supersedes.
+//!
+//! Every segment's header names the generation directory its generation superseded: a roll, a
+//! re-key's included, carries it over from the segment it leaves. So whatever a trim leaves, the
+//! first remaining segment still names it, and a crash after a publish's rename and before the
+//! superseded generation goes is finished at the next open (`Root::finish_leftovers`). Once that
+//! generation is gone the id names nothing, and nothing reads it.
 
 use std::fs::File;
 use std::fs::{self};
@@ -765,9 +771,9 @@ impl Log {
     /// [`Log::roll`] to a segment whose header names `incarnation`.
     fn roll_to(&mut self, incarnation: Incarnation) -> Result<(), LogError> {
         self.sync()?;
+        // The state carries the header's `supersedes` over to the new segment.
         let mut h = self.state.clone();
         h.first_position = self.next;
-        h.supersedes = None;
         h.incarnation = incarnation;
         let segment = Segment {
             first: self.next,
@@ -890,36 +896,55 @@ fn write_segment(path: &Path, h: &SegmentHeader) -> Result<(File, u64, u32), Log
     Ok((file, u64::try_from(bytes.len()).unwrap_or(u64::MAX), seed))
 }
 
-/// Copies the log in `from` into `to`, created, for a copy of its generation (design §5.6): the
-/// first segment written again with its header naming the generation directory `supersedes` and
-/// its records chained anew from that header, every later segment copied as it is
-/// (`std::fs::copy`, a clone where the filesystem has one). Each segment and the directory are
-/// fsynced. A first segment that ends in a torn record is copied up to it, and the segments after
-/// it are left out, as [`Log::open`] would cut them.
+/// Copies the log in `from` into `to`, created, for a copy of its generation (design §5.6): every
+/// segment written again, its header naming the generation directory `supersedes` and its records
+/// chained anew from that header, so every segment of the copy names what it supersedes, as a
+/// roll keeps them. Each segment and the directory are fsynced. A segment that ends in a torn
+/// record is copied up to it, and the segments after it are left out, as [`Log::open`] would cut
+/// them.
 pub(crate) fn copy(from: &Path, to: &Path, supersedes: GenId) -> Result<(), LogError> {
     let listed = list(from)?;
-    let Some((first, later)) = listed.split_first() else {
+    if listed.is_empty() {
         return Err(LogError::Empty {
             dir: from.to_owned(),
         });
-    };
+    }
     fs::create_dir_all(to).map_err(io("create", to))?;
-    let bytes = fs::read(&first.path).map_err(io("read", &first.path))?;
+    for segment in &listed {
+        if copy_segment(segment, to, supersedes)? == Copied::Torn {
+            break;
+        }
+    }
+    sync_dir(to).map_err(io("fsync", to))
+}
+
+/// How [`copy_segment`] found a segment's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Copied {
+    Clean,
+    /// Cut at a torn record: no later segment is part of the log.
+    Torn,
+}
+
+/// Writes `segment` into `to` again, its header naming `supersedes`, its valid records chained
+/// anew, fsynced.
+fn copy_segment(segment: &Segment, to: &Path, supersedes: GenId) -> Result<Copied, LogError> {
+    let bytes = fs::read(&segment.path).map_err(io("read", &segment.path))?;
     let scanned = scan(&bytes).map_err(|source| LogError::Segment {
-        path: first.path.clone(),
+        path: segment.path.clone(),
         source,
     })?;
     let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-    let torn = match scanned.tail {
-        Tail::Clean => false,
-        Tail::Torn { .. } => true,
+    let copied = match scanned.tail {
+        Tail::Clean => Copied::Clean,
+        Tail::Torn { .. } => Copied::Torn,
         Tail::Gap {
             at,
             expected,
             found,
         } => {
             return Err(LogError::Gap {
-                path: first.path.clone(),
+                path: segment.path.clone(),
                 at: to_u64(at),
                 expected,
                 found,
@@ -927,13 +952,13 @@ pub(crate) fn copy(from: &Path, to: &Path, supersedes: GenId) -> Result<(), LogE
         }
         Tail::Malformed { at, kind } => {
             return Err(LogError::Malformed {
-                path: first.path.clone(),
+                path: segment.path.clone(),
                 at: to_u64(at),
                 kind,
             });
         }
     };
-    let target = segment_path(to, first.first);
+    let target = segment_path(to, segment.first);
     let encode = |source| LogError::Encode {
         path: target.clone(),
         source,
@@ -953,16 +978,7 @@ pub(crate) fn copy(from: &Path, to: &Path, supersedes: GenId) -> Result<(), LogE
         .map_err(io("create", &target))?;
     file.write_all_at(&out, 0).map_err(io("write", &target))?;
     file.sync_all().map_err(io("fsync", &target))?;
-    if !torn {
-        for segment in later {
-            let target = segment_path(to, segment.first);
-            fs::copy(&segment.path, &target).map_err(io("copy", &segment.path))?;
-            File::open(&target)
-                .and_then(|f| f.sync_all())
-                .map_err(io("fsync", &target))?;
-        }
-    }
-    sync_dir(to).map_err(io("fsync", to))
+    Ok(copied)
 }
 
 trait NextPosition {

@@ -58,6 +58,22 @@ export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnl
 	 * `not_found`. By default `false`.
 	 */
 	readonly recreate?: boolean | undefined;
+	/**
+	 * Opens the database read-only and claims nothing, so it never fences the owner, and its writes
+	 * fail with SQLITE_READONLY (8). In a process that owns the stream it is a read-only connection on
+	 * the owner's binding, which sees the owner's latest commits, including ones the stream has not
+	 * acknowledged yet: its `synced()` waits for them, as the owner's does. Otherwise the extension
+	 * builds or catches up a reader cache of its own (`role: "reader"` in `status()`, `reader-<n>` in
+	 * the stream's cache directory, one per reader process) to the stream's tail at the open, and the
+	 * connection reads the stream as of then: it does not follow later commits, and its `synced()`
+	 * resolves at once. A closed stream opens too. A reader cache built on another deployment fails
+	 * with `wrong_cluster`, as an owner's does. A later `readOnly` open in the process
+	 * shares that cache while one of its connections is open, and once they all closed the next one
+	 * catches up again. When the stream is unreachable it opens an earlier reader cache as it is, and
+	 * without one waits until the signal fires. A missing stream fails with `not_found`. Cannot go
+	 * with `recreate`. By default `false`.
+	 */
+	readonly readOnly?: boolean | undefined;
 }
 
 /** `ursula_open`'s answer. */
@@ -107,12 +123,14 @@ const byAbort = new WeakSet<object>();
  * nothing (such as a restart of a single node) and replicate once the stream answers. Without such
  * a cache the open waits for the stream until its signal fires.
  *
+ * With `readOnly` the open claims nothing: see {@link OpenOptions.readOnly}.
+ *
  * Errors say what to do through `action`: {@link UrsulaSetupError} (`fix`, or `retry` for `in_use` and
  * `claim_races`), and {@link UrsulaUnavailableError} when the signal fired first: the last condition
  * the open met, or `cancelled` when it met none.
  */
 export async function open(url: string | URL, options: OpenOptions = {}): Promise<UrsulaDatabase> {
-	const { dir, token, signal, maxPendingBytes, recreate, timeout, ...rest } = options;
+	const { dir, token, signal, maxPendingBytes, recreate, readOnly, timeout, ...rest } = options;
 	const stream = String(url);
 	const settings: Record<string, unknown> = { timeout_ms: EXTENSION_OPEN_MS };
 	if (token !== undefined) settings.token = token;
@@ -128,10 +146,18 @@ export async function open(url: string | URL, options: OpenOptions = {}): Promis
 		}
 		settings.recreate = recreate;
 	}
+	if (readOnly !== undefined) {
+		if (typeof readOnly !== "boolean") {
+			throw new UrsulaSetupError(`invalid_argument: readOnly must be a boolean, not ${String(readOnly)}`, "invalid_argument");
+		}
+		// With `recreate` too, the extension refuses it: `invalid_argument`.
+		settings.read_only = readOnly;
+	}
 	const json = JSON.stringify(settings);
-	const sqlite = { ...rest, timeout: timeout ?? DEFAULT_BUSY_MS };
+	const sqlite = { ...rest, timeout: timeout ?? DEFAULT_BUSY_MS, readOnly: readOnly === true };
 	const until = signal ?? AbortSignal.timeout(DEFAULT_OPEN_MS);
-	const key = `${stream}\n${dir ?? ""}`;
+	// An owner's and a reader's binds of one stream are different binds.
+	const key = `${stream}\n${dir ?? ""}\n${readOnly === true ? "reader" : "owner"}`;
 	for (;;) {
 		if (until.aborted) throw marked(cancelled(stream, until));
 		const shared = inflight.get(key);
@@ -214,7 +240,7 @@ function cancelled(stream: string, signal: AbortSignal): UrsulaUnavailableError 
 
 const reasonOf = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason));
 /** A connection to what `ursula_open` bound, with node:sqlite's `settings`. */
-function connect(binding: Binding, settings: Omit<DatabaseSyncOptions, "open" | "readOnly">): UrsulaDatabase {
+function connect(binding: Binding, settings: Omit<DatabaseSyncOptions, "open">): UrsulaDatabase {
 	try {
 		return new UrsulaDatabase(binding.path, settings, { name: binding.name, path: binding.path });
 	} catch (error) {
