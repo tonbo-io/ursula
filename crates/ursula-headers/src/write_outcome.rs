@@ -3,13 +3,15 @@
 //! as the SQLite VFS or a gateway's embedder.
 //!
 //! A write is an append or a close (with or without producer headers), a
-//! create, a snapshot publish, a parts commit, or a part staged. Its answer
-//! is one of:
+//! create, a snapshot publish, a parts commit, a part staged, or a discard
+//! of the staged parts (`DELETE {stream}/snapshot/parts`). Its answer is one
+//! of:
 //!
 //! - [`WriteOutcome::Applied`]: the write holds, and the answer does not say
 //!   that an earlier request applied it. A keyless write, a create, a
-//!   snapshot publish and a parts commit answer a repeat as they answer the
-//!   first apply, so for them `Applied` means only that the write holds.
+//!   snapshot publish, a parts commit and a discard answer a repeat as they
+//!   answer the first apply, so for them `Applied` means only that the write
+//!   holds.
 //! - [`WriteOutcome::Repeat`]: a typed producer receipt for a write that an
 //!   earlier request with the same key applied: a `204` receipt, or
 //!   `receipt-evicted`. A close-only producer write answers `204` even when
@@ -53,12 +55,16 @@
 //! unexpected `1xx` or `3xx` may come from a load balancer or a proxy after
 //! it forwarded some or all of the request.
 //!
-//! - `2xx` to a producer write ([`Keying::Producer`]): `Applied` for a `200`
-//!   receipt, `Repeat` for a `204` receipt or `receipt-evicted`, and
-//!   `Unknown` without a receipt. Ursula answers every producer write's
-//!   success with its receipt, so only a layer outside Ursula, such as a
-//!   misrouting proxy, sends one without, and it says nothing of the write.
-//! - `2xx` to a keyless write: `Applied`.
+//! - `2xx` to a producer write ([`WriteKind::Producer`]): `Applied` for a
+//!   `200` receipt, `Repeat` for a `204` receipt or `receipt-evicted`, and
+//!   `Unknown` without a receipt.
+//! - `2xx` to any other write: `Applied` with the typed answer Ursula always
+//!   sends for that write, else `Unknown`. A keyless append or close carries
+//!   `Stream-Next-Offset`, a create and a discard `Stream-Incarnation`, a
+//!   snapshot publish or a parts commit the published snapshot, and a part
+//!   `Stream-Snapshot-Part`. Only a layer outside Ursula, such as a
+//!   misrouting proxy, sends a success without it, and that says nothing of
+//!   the write.
 //! - `307`, `308`: `Redirected`. Every other `1xx` and `3xx`: `Unknown`.
 //! - `4xx` but `408`: `Refused`. The code is the producer answer's when the
 //!   answer carries one, else the error body's, else `INVALID_REQUEST` (the
@@ -81,8 +87,8 @@
 //!
 //! Every answer a write can get, one row per decision. A row stands for
 //! every code its status shares a decision with: the `400` row covers every
-//! typed `400`, for one. With the `test-support` feature, [`inventory`] holds
-//! the rows as data. Tests drive each row through a real node router and a
+//! typed `400`, for one. With the `test-support` feature, the `inventory`
+//! module holds the rows as data. Tests drive each row through a real node router and a
 //! real gateway and check that [`classify`] reads it as the row says.
 //!
 //! | Id | From | Status | Code or shape | Outcome |
@@ -96,6 +102,7 @@
 //! | `create-matching` | node | `200` | `Stream-Incarnation` | `Applied` |
 //! | `snapshot-published` | node | `204` | the snapshot (new or repeated) | `Applied` |
 //! | `part-staged` | node | `201` | `Stream-Snapshot-Part` | `Applied` |
+//! | `parts-discarded` | node | `204` | `Stream-Incarnation` | `Applied` |
 //! | `parts-commit-published` | node | `204` | the snapshot (new or repeated) | `Applied` |
 //! | `redirect` | node | `307` | the leader (or, from a node without a replica, the group) | `Redirected` |
 //! | `producer-epoch-closed` | node | `403` | `PRODUCER_EPOCH_CLOSED`, `epoch-closed;by=claim` or `by=history` | `Refused` |
@@ -114,6 +121,7 @@
 //! | `incarnation-mismatch` | node | `412` | `INCARNATION_MISMATCH` | `Refused` |
 //! | `too-large` | node | `413` | `REQUEST_TOO_LARGE` or `SNAPSHOT_TOO_LARGE`, the limit (through a gateway, the gateway's own `413`, which fires first) | `Refused` |
 //! | `producer-limit` | node | `429` | `PRODUCER_LIMIT` | `Refused` |
+//! | `staged-parts-limit` | node | `429` | `STAGED_PARTS_LIMIT`, `Ursula-Max-Staged-Parts` or `Ursula-Max-Staged-Bytes` | `Refused` |
 //! | `no-cold-store` | node | `501` | `NO_COLD_STORE` | `Refused` |
 //! | `no-leader-before-body` | node | `503` | `NO_LEADER`, `x-ursula-raft-group` | `Refused` |
 //! | `no-leader-before-proposal` | node | `503` | `NO_LEADER` after the body, before any proposal | `Refused` |
@@ -128,7 +136,7 @@
 //! | `apply-stopped` | node | `503` | `APPLY_STOPPED` | `Refused` |
 //! | `json-boundary-unverified` | node | `503` | `JSON_BOUNDARY_UNVERIFIED`: a deterministic refusal at apply | `Refused` |
 //! | `snapshot-commits-busy` | node | `503` | `SNAPSHOT_COMMITS_BUSY` | `Refused` |
-//! | `snapshot-commit-in-progress` | node | `503` | `SNAPSHOT_COMMIT_IN_PROGRESS`: an earlier attempt runs | `Unknown` |
+//! | `snapshot-commit-in-progress` | node | `503` | `SNAPSHOT_COMMIT_IN_PROGRESS`: an earlier attempt of the commit, another commit or a discard of the stream runs | `Unknown` |
 //! | `internal` | node | `500` | `INTERNAL`, `CREATED_AT_OUT_OF_RANGE` | `Unknown` |
 //! | `cold-store-failed` | node | `502` | `COLD_STORE_FAILED` | `Unknown` |
 //! | `gateway-invalid-credential` | gateway | `401` | `INVALID_CREDENTIAL`, `CREDENTIAL_EXPIRED` | `Refused` |
@@ -155,7 +163,8 @@
 //! | `foreign-408` | another layer | `408` | no Ursula error code | `Unknown` |
 //! | `foreign-5xx` | another layer | `5xx` | no error body | `Unknown` |
 //! | `keyed-2xx-without-receipt` | another layer | `2xx` | a producer write's success without a receipt | `Unknown` |
-//! | `transport-failure` | none | none | no answer, mid-upload included | `Unknown` ([`WriteOutcome::NO_ANSWER`]) |
+//! | `keyless-2xx-untyped` | another layer | `2xx` | another write's success without its typed answer | `Unknown` |
+//! | `transport-failure` | none | none | no answer, mid-upload included | `Unknown` (`WriteOutcome::NO_ANSWER`) |
 //!
 //! A node's answer reaches a client of a gateway unchanged, but for a
 //! redirect, which the gateway follows and answers `gateway-no-leader` when
@@ -171,6 +180,10 @@ use crate::answer::Outcome;
 use crate::answer::ProducerAnswer;
 use crate::error_body::ErrorBody;
 use crate::error_body::ErrorCode;
+use crate::fields;
+use crate::names;
+use crate::snapshot::PartStaged;
+use crate::snapshot::SnapshotPublishAnswer;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod inventory;
@@ -182,6 +195,8 @@ pub enum WriteOutcome {
     /// applied it.
     Applied,
     /// A typed receipt for a write an earlier request with this key applied.
+    /// A close-only producer write answers `204` even when this request
+    /// applied it, so its first receipt reads `Repeat` too: both hold.
     Repeat,
     /// This request applied nothing of the write and never will.
     Refused(ErrorCode),
@@ -207,46 +222,33 @@ impl WriteOutcome {
     }
 }
 
-/// Whether a write carries a producer key, which decides what its `2xx`
-/// must carry.
+/// What a write is, which decides the typed answer its `2xx` carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Keying {
-    /// A write with `Producer-Id`, `Producer-Epoch` and `Producer-Seq`.
+pub enum WriteKind {
+    /// An append or a close with `Producer-Id`, `Producer-Epoch` and
+    /// `Producer-Seq`: its receipt.
     Producer,
-    /// Any other write.
-    Keyless,
+    /// An append or a close without producer headers: `Stream-Next-Offset`.
+    Append,
+    /// A create: `Stream-Incarnation`.
+    Create,
+    /// A snapshot publish or a parts commit: the published snapshot.
+    Publish,
+    /// A part staged: `Stream-Snapshot-Part`.
+    PartStage,
+    /// A discard of the staged parts: `Stream-Incarnation`.
+    PartsDiscard,
 }
 
-/// Reads the answer to a write of `keying` from its status, its
+/// Reads the answer to a write of `kind` from its status, its
 /// `(name, value)` header pairs and its body (an error body, or anything: a
 /// body that is no error body names no code). The caller bounds the body it
 /// reads. See the module doc for the rules.
 #[must_use]
-pub fn classify<'a, I>(keying: Keying, status: u16, headers: I, body: &[u8]) -> WriteOutcome
+pub fn classify<'a, I>(kind: WriteKind, status: u16, headers: I, body: &[u8]) -> WriteOutcome
 where I: IntoIterator<Item = (&'a str, &'a [u8])> {
     match status {
-        200..=299 => match (keying, ProducerAnswer::parse(status, headers)) {
-            (Keying::Keyless, _) => WriteOutcome::Applied,
-            (
-                Keying::Producer,
-                Ok(Some(ProducerAnswer::Receipt {
-                    delivery: Delivery::Applied,
-                    ..
-                })),
-            ) => WriteOutcome::Applied,
-            (
-                Keying::Producer,
-                Ok(Some(
-                    ProducerAnswer::Receipt {
-                        delivery: Delivery::Repeat,
-                        ..
-                    }
-                    | ProducerAnswer::ReceiptEvicted { .. },
-                )),
-            ) => WriteOutcome::Repeat,
-            // No receipt, or a malformed one: not Ursula's answer.
-            (Keying::Producer, _) => WriteOutcome::Unknown,
-        },
+        200..=299 => success(kind, status, headers),
         307 | 308 => WriteOutcome::Redirected,
         408 => proven(status, body),
         400..=499 => {
@@ -260,6 +262,56 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> {
             WriteOutcome::Refused(code.unwrap_or(ErrorCode::InvalidRequest))
         }
         _ => proven(status, body),
+    }
+}
+
+/// A `2xx`: what its typed answer says, or `Unknown` without one, which only
+/// a layer outside Ursula sends.
+fn success<'a, I>(kind: WriteKind, status: u16, headers: I) -> WriteOutcome
+where I: IntoIterator<Item = (&'a str, &'a [u8])> {
+    let carried = match kind {
+        WriteKind::Producer => {
+            return match ProducerAnswer::parse(status, headers) {
+                Ok(Some(ProducerAnswer::Receipt {
+                    delivery: Delivery::Applied,
+                    ..
+                })) => WriteOutcome::Applied,
+                Ok(Some(
+                    ProducerAnswer::Receipt {
+                        delivery: Delivery::Repeat,
+                        ..
+                    }
+                    | ProducerAnswer::ReceiptEvicted { .. },
+                )) => WriteOutcome::Repeat,
+                // No receipt, or a malformed one: not Ursula's answer.
+                _ => WriteOutcome::Unknown,
+            };
+        }
+        WriteKind::Append => {
+            let Ok([next]) = fields::collect(headers, [names::STREAM_NEXT_OFFSET]) else {
+                return WriteOutcome::Unknown;
+            };
+            matches!(fields::offset(names::STREAM_NEXT_OFFSET, next), Ok(Some(_)))
+        }
+        WriteKind::Create | WriteKind::PartsDiscard => {
+            let Ok([token]) = fields::collect(headers, [names::STREAM_INCARNATION]) else {
+                return WriteOutcome::Unknown;
+            };
+            matches!(
+                fields::incarnation(names::STREAM_INCARNATION, token),
+                Ok(Some(_))
+            )
+        }
+        WriteKind::Publish => matches!(
+            SnapshotPublishAnswer::parse(status, headers),
+            Ok(Some(SnapshotPublishAnswer::Published { .. }))
+        ),
+        WriteKind::PartStage => PartStaged::parse(headers).is_ok(),
+    };
+    if carried {
+        WriteOutcome::Applied
+    } else {
+        WriteOutcome::Unknown
     }
 }
 
@@ -385,14 +437,15 @@ pub fn proves_refusal(status: u16, code: &ErrorCode) -> bool {
         | ErrorCode::RateLimited
         | ErrorCode::LiveReadsExhausted
         | ErrorCode::UploadsExhausted
-        | ErrorCode::UploadBytesExhausted => None,
+        | ErrorCode::UploadBytesExhausted
+        | ErrorCode::StagedPartsLimit => None,
     };
     proving_status == Some(status)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Keying;
+    use super::WriteKind;
     use super::WriteOutcome;
     use super::classify;
     use super::inventory::INVENTORY;
@@ -457,12 +510,12 @@ mod tests {
     fn a_gateway_403_is_told_from_a_producer_403() {
         let gateway = ErrorBody::fixed(ErrorCode::Forbidden).render();
         assert_eq!(
-            classify(Keying::Keyless, 403, [], gateway.as_bytes()),
+            classify(WriteKind::Append, 403, [], gateway.as_bytes()),
             WriteOutcome::Refused(ErrorCode::Forbidden)
         );
         let forged = ErrorBody::fixed(ErrorCode::ProducerKeyConflict).render();
         assert_eq!(
-            classify(Keying::Keyless, 403, [], forged.as_bytes()),
+            classify(WriteKind::Append, 403, [], forged.as_bytes()),
             WriteOutcome::Refused(ErrorCode::InvalidRequest)
         );
         let producer = [
@@ -470,7 +523,7 @@ mod tests {
             (names::PRODUCER_OUTCOME, b"key-conflict".as_slice()),
         ];
         assert_eq!(
-            classify(Keying::Producer, 403, producer, gateway.as_bytes()),
+            classify(WriteKind::Producer, 403, producer, gateway.as_bytes()),
             WriteOutcome::Refused(ErrorCode::ProducerKeyConflict)
         );
     }
@@ -479,22 +532,76 @@ mod tests {
     #[test]
     fn a_producer_success_needs_its_receipt() {
         assert_eq!(
-            classify(Keying::Producer, 200, [], b""),
+            classify(WriteKind::Producer, 200, [], b""),
             WriteOutcome::Unknown
         );
         assert_eq!(
-            classify(Keying::Producer, 204, [], b""),
+            classify(WriteKind::Producer, 204, [], b""),
             WriteOutcome::Unknown
         );
         let malformed = [(crate::names::PRODUCER_EPOCH, b"1".as_slice())];
         assert_eq!(
-            classify(Keying::Producer, 200, malformed, b""),
+            classify(WriteKind::Producer, 200, malformed, b""),
             WriteOutcome::Unknown
         );
-        assert_eq!(
-            classify(Keying::Keyless, 200, [], b""),
-            WriteOutcome::Applied
-        );
+    }
+
+    /// Every other write's success says something only with the typed
+    /// answer Ursula sends for it: a bare `2xx`, such as a misrouting
+    /// proxy's, is unknown.
+    #[test]
+    fn every_success_needs_its_typed_answer() {
+        let token = b"4503599627370497".as_slice();
+        let next = b"00000000000000000003".as_slice();
+        let digest = "07".repeat(32);
+        let snapshot = [
+            (crate::names::STREAM_SNAPSHOT_OFFSET, next),
+            (crate::names::STREAM_SNAPSHOT_DIGEST, digest.as_bytes()),
+            (crate::names::STREAM_INCARNATION, token),
+        ];
+        type Headers<'a> = Vec<(&'a str, &'a [u8])>;
+        let typed: [(WriteKind, u16, Headers<'_>); 5] = [
+            (WriteKind::Append, 204, vec![(
+                crate::names::STREAM_NEXT_OFFSET,
+                next,
+            )]),
+            (WriteKind::Create, 201, vec![(
+                crate::names::STREAM_INCARNATION,
+                token,
+            )]),
+            (WriteKind::PartsDiscard, 204, vec![(
+                crate::names::STREAM_INCARNATION,
+                token,
+            )]),
+            (WriteKind::Publish, 204, snapshot.to_vec()),
+            (WriteKind::PartStage, 201, vec![(
+                crate::names::STREAM_SNAPSHOT_PART,
+                b"part-1".as_slice(),
+            )]),
+        ];
+        for (kind, status, headers) in typed {
+            assert_eq!(
+                classify(kind, status, headers, b""),
+                WriteOutcome::Applied,
+                "{kind:?}"
+            );
+            assert_eq!(
+                classify(kind, status, [], b""),
+                WriteOutcome::Unknown,
+                "{kind:?}"
+            );
+            // A typed header that does not parse is no typed answer.
+            let garbled = [
+                (crate::names::STREAM_NEXT_OFFSET, b"x".as_slice()),
+                (crate::names::STREAM_INCARNATION, b"x".as_slice()),
+                (crate::names::STREAM_SNAPSHOT_PART, b"".as_slice()),
+            ];
+            assert_eq!(
+                classify(kind, status, garbled, b""),
+                WriteOutcome::Unknown,
+                "{kind:?}"
+            );
+        }
     }
 
     /// A `503` code proves a refusal only at `503`, and a code this version
@@ -503,36 +610,36 @@ mod tests {
     fn a_code_proves_a_refusal_at_its_status_only() {
         let no_leader = ErrorBody::fixed(ErrorCode::NoLeader).render();
         assert_eq!(
-            classify(Keying::Keyless, 500, [], no_leader.as_bytes()),
+            classify(WriteKind::Append, 500, [], no_leader.as_bytes()),
             WriteOutcome::Unknown
         );
         assert_eq!(
-            classify(Keying::Keyless, 503, [], no_leader.as_bytes()),
+            classify(WriteKind::Append, 503, [], no_leader.as_bytes()),
             WriteOutcome::Refused(ErrorCode::NoLeader)
         );
         let unknown = ErrorBody::new(ErrorCode::Unknown("NEW_CODE".to_owned()), "x").render();
         assert_eq!(
-            classify(Keying::Keyless, 503, [], unknown.as_bytes()),
+            classify(WriteKind::Append, 503, [], unknown.as_bytes()),
             WriteOutcome::Unknown
         );
         assert_eq!(
-            classify(Keying::Keyless, 429, [], unknown.as_bytes()),
+            classify(WriteKind::Append, 429, [], unknown.as_bytes()),
             WriteOutcome::Refused(ErrorCode::Unknown("NEW_CODE".to_owned()))
         );
         assert_eq!(
-            classify(Keying::Keyless, 503, [], b"<html>busy</html>"),
+            classify(WriteKind::Append, 503, [], b"<html>busy</html>"),
             WriteOutcome::Unknown
         );
         assert_eq!(
-            classify(Keying::Keyless, 100, [], b""),
+            classify(WriteKind::Append, 100, [], b""),
             WriteOutcome::Unknown
         );
         assert_eq!(
-            classify(Keying::Keyless, 303, [], b""),
+            classify(WriteKind::Append, 303, [], b""),
             WriteOutcome::Unknown
         );
         assert_eq!(
-            classify(Keying::Keyless, 308, [], b""),
+            classify(WriteKind::Append, 308, [], b""),
             WriteOutcome::Redirected
         );
         assert!(!proves_refusal(503, &ErrorCode::OutcomeUnknown));

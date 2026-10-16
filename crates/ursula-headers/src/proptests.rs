@@ -62,7 +62,7 @@ use crate::value::Offset;
 use crate::value::ProducerId;
 use crate::value::Seq;
 use crate::value::SnapshotDigest;
-use crate::write_outcome::Keying;
+use crate::write_outcome::WriteKind;
 use crate::write_outcome::WriteOutcome;
 use crate::write_outcome::classify;
 use crate::write_outcome::proves_refusal;
@@ -680,7 +680,7 @@ proptest! {
     }
 
     /// `classify` reads any answer without panicking, and its reading
-    /// follows the status: a `2xx` holds, a `4xx` other than `408` is a
+    /// follows the status: a `2xx` holds or, untyped, is unknown, a `4xx` other than `408` is a
     /// refusal, a `307` or `308` redirects, and anything else is a refusal
     /// only when its code proves one.
     #[test]
@@ -693,9 +693,10 @@ proptest! {
             .and_then(|index| crate::error_body::ErrorCode::ALL.get(index).cloned())
             .map(|code| ErrorBody::fixed(code).render().into_bytes())
             .unwrap_or_default();
-        let outcome = classify(Keying::Keyless, status, fuzz_iter(&headers), &body);
+        let outcome = classify(WriteKind::Append, status, fuzz_iter(&headers), &body);
         match status {
-            200..=299 => prop_assert!(outcome.holds()),
+            // Without its typed answer, a success says nothing.
+            200..=299 => prop_assert!(outcome.holds() || outcome == WriteOutcome::Unknown),
             307 | 308 => prop_assert_eq!(outcome, WriteOutcome::Redirected),
             408 => prop_assert!(!outcome.holds()),
             400..=499 => prop_assert!(matches!(outcome, WriteOutcome::Refused(_))),
@@ -719,7 +720,7 @@ proptest! {
             .cloned()
             .map(|code| ErrorBody::fixed(code).render().into_bytes())
             .unwrap_or_default();
-        let outcome = classify(Keying::Producer, answer.status(), iter(&pairs), &body);
+        let outcome = classify(WriteKind::Producer, answer.status(), iter(&pairs), &body);
         match answer {
             ProducerAnswer::Receipt { delivery: Delivery::Applied, .. } => {
                 prop_assert_eq!(outcome, WriteOutcome::Applied);

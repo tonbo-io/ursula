@@ -29,8 +29,8 @@
 //!   `{"error":{"code":"<code>","message":"<detail>"}}`, with its stable
 //!   code (Section 11);
 //! - what an answer says about a write: [`classify`] reads every write
-//!   answer of the node and the gateway as one [`WriteOutcome`], and
-//!   [`write_outcome::INVENTORY`] lists them;
+//!   answer of the node and the gateway as one [`WriteOutcome`], and, with
+//!   the `test-support` feature, `write_outcome::inventory` lists them;
 //! - immutable reads: the path of a chunk or a snapshot of one incarnation,
 //!   the headers of their answers with the `Stream-Immutable` marker, and the
 //!   deployment's `Stream-Read-Origin` hint (Section 4).
@@ -177,6 +177,6 @@ pub use value::STREAM_SEQ_MAX_BYTES;
 pub use value::Seq;
 pub use value::SnapshotDigest;
 pub use value::StreamSeq;
-pub use write_outcome::Keying;
+pub use write_outcome::WriteKind;
 pub use write_outcome::WriteOutcome;
 pub use write_outcome::classify;

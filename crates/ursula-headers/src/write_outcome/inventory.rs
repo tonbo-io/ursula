@@ -3,7 +3,7 @@
 //! of it rendered as the node or the gateway renders it, and what
 //! [`classify`] reads. Built with the `test-support` feature only.
 
-use super::Keying;
+use super::WriteKind;
 use super::WriteOutcome;
 use super::classify;
 use crate::answer::ClosedEpoch;
@@ -16,6 +16,7 @@ use crate::error::HeaderError;
 use crate::error_body::ErrorBody;
 use crate::error_body::ErrorCode;
 use crate::limit::SizeLimit;
+use crate::limit::StagedPartsLimit;
 use crate::names;
 use crate::refusal::IncarnationMismatch;
 use crate::refusal::StreamClosedConflict;
@@ -62,6 +63,8 @@ pub enum Write {
     SnapshotPublish,
     PartStage,
     PartsCommit,
+    /// `DELETE {stream}/snapshot/parts`.
+    PartsDiscard,
 }
 
 /// The typed headers a row's answer carries beside its error body.
@@ -94,6 +97,8 @@ pub enum Shape {
     IncarnationMismatch,
     /// The limit a `413` applied.
     SizeLimit,
+    /// The staged-parts limit a `429` applied, and `Stream-Incarnation`.
+    StagedPartsLimit,
 }
 
 /// The producer answer of a [`Shape::Producer`] row.
@@ -128,25 +133,24 @@ pub struct Row {
 }
 
 impl Write {
-    /// Whether the write carries a producer key.
-    pub fn keying(self) -> Keying {
+    /// What [`classify`] is told the write is.
+    pub fn kind(self) -> WriteKind {
         match self {
-            Self::ProducerAppend => Keying::Producer,
-            Self::Append
-            | Self::Close
-            | Self::Create
-            | Self::SnapshotPublish
-            | Self::PartStage
-            | Self::PartsCommit => Keying::Keyless,
+            Self::ProducerAppend => WriteKind::Producer,
+            Self::Append | Self::Close => WriteKind::Append,
+            Self::Create => WriteKind::Create,
+            Self::SnapshotPublish | Self::PartsCommit => WriteKind::Publish,
+            Self::PartStage => WriteKind::PartStage,
+            Self::PartsDiscard => WriteKind::PartsDiscard,
         }
     }
 }
 
 /// An answer as it travels: a status, `(name, value)` headers and a body,
-/// to a write of `keying`.
+/// to a write of `kind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sample {
-    pub keying: Keying,
+    pub kind: WriteKind,
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
@@ -162,7 +166,7 @@ impl Sample {
 
     #[must_use]
     pub fn classify(&self) -> WriteOutcome {
-        classify(self.keying, self.status, self.pairs(), &self.body)
+        classify(self.kind, self.status, self.pairs(), &self.body)
     }
 }
 
@@ -186,7 +190,7 @@ impl Row {
             None => Vec::new(),
         };
         Ok(Some(Sample {
-            keying: self.write.keying(),
+            kind: self.write.kind(),
             status: self.status,
             headers,
             body,
@@ -259,6 +263,10 @@ fn render_shape(shape: Shape, emit: &mut dyn FnMut(&'static str, &str)) -> Resul
         }
         .render(emit),
         Shape::SizeLimit => SizeLimit::Request(1024).render(emit),
+        Shape::StagedPartsLimit => {
+            StagedPartsLimit::Parts(8192).render(&mut *emit);
+            emit(names::STREAM_INCARNATION, &incarnation.to_string());
+        }
     }
     Ok(())
 }
@@ -337,6 +345,7 @@ pub const INVENTORY: &[Row] = {
         "create-matching", Node, Create, 200, S::Created, None, Applied;
         "snapshot-published", Node, SnapshotPublish, 204, S::SnapshotPublished, None, Applied;
         "part-staged", Node, PartStage, 201, S::PartStaged, None, Applied;
+    "parts-discarded", Node, PartsDiscard, 204, S::Created, None, Applied;
         "parts-commit-published", Node, PartsCommit, 204, S::SnapshotPublished, None, Applied;
         "redirect", Node, ProducerAppend, 307, S::Redirect, None, Redirected;
         "producer-epoch-closed", Node, ProducerAppend, 403, S::Producer(P::EpochClosed), Some(C::ProducerEpochClosed), Refused(C::ProducerEpochClosed);
@@ -355,6 +364,7 @@ pub const INVENTORY: &[Row] = {
         "incarnation-mismatch", Node, ProducerAppend, 412, S::IncarnationMismatch, Some(C::IncarnationMismatch), Refused(C::IncarnationMismatch);
         "too-large", Node, Append, 413, S::SizeLimit, Some(C::RequestTooLarge), Refused(C::RequestTooLarge);
         "producer-limit", Node, ProducerAppend, 429, S::Plain, Some(C::ProducerLimit), Refused(C::ProducerLimit);
+    "staged-parts-limit", Node, PartStage, 429, S::StagedPartsLimit, Some(C::StagedPartsLimit), Refused(C::StagedPartsLimit);
         "no-cold-store", Node, PartStage, 501, S::Plain, Some(C::NoColdStore), Refused(C::NoColdStore);
         "no-leader-before-body", Node, ProducerAppend, 503, S::NoLeader, Some(C::NoLeader), Refused(C::NoLeader);
         "no-leader-before-proposal", Node, ProducerAppend, 503, S::NoLeader, Some(C::NoLeader), Refused(C::NoLeader);
@@ -396,6 +406,7 @@ pub const INVENTORY: &[Row] = {
         "foreign-408", Foreign, ProducerAppend, 408, S::Plain, None, Unknown;
         "foreign-5xx", Foreign, ProducerAppend, 503, S::Plain, None, Unknown;
         "keyed-2xx-without-receipt", Foreign, ProducerAppend, 200, S::Plain, None, Unknown;
+    "keyless-2xx-untyped", Foreign, Create, 201, S::Plain, None, Unknown;
         "transport-failure", Foreign, ProducerAppend, 0, S::Plain, None, Unknown;
     }
 };
