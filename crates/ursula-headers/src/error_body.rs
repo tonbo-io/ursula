@@ -1,9 +1,10 @@
-//! The one body of every error answer (extensions Section 11): a JSON
-//! object with two string members, `error`, a stable [`ErrorCode`], and
-//! `message`, a human-readable detail.
+//! The one body of every error answer (extensions Section 11), the shape
+//! of the Durable Streams protocol's own error bodies: a JSON object whose
+//! `error` member is an object with two string members, `code`, a stable
+//! [`ErrorCode`], and `message`, a human-readable detail.
 //!
 //! ```text
-//! {"error":"InvalidHeader","message":"stream-ttl must not contain leading zeros"}
+//! {"error":{"code":"INVALID_HEADER","message":"stream-ttl must not contain leading zeros"}}
 //! ```
 //!
 //! The body adds the code to what the status and the typed headers say: a
@@ -12,27 +13,55 @@
 //! [`ErrorBody::render`], so a client matches the code instead of parsing
 //! text. The message is informative only: its text may change in any
 //! release, and a client never matches it.
+//!
+//! The body is extensible inside a minor version: a later version may add
+//! members, which [`ErrorBody::parse`] skips, and codes, which it keeps as
+//! [`ErrorCode::Unknown`].
 
 use crate::error::HeaderError;
 
-/// Defines [`ErrorCode`]: each variant's code is its name.
+/// Defines [`ErrorCode`]: each variant with its wire name and its default
+/// message.
 macro_rules! error_codes {
-    ($($(#[doc = $doc:literal])+ $code:ident,)+) => {
-        /// The stable code of an error answer. Each code is its variant's
-        /// name, so `ErrorCode::StreamNotFound` is `"StreamNotFound"`.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    ($($(#[doc = $doc:literal])+ $code:ident = $name:literal, $message:literal;)+) => {
+        /// The stable code of an error answer. The wire names are fixed
+        /// strings, so renaming a variant changes no code.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
         pub enum ErrorCode {
             $($(#[doc = $doc])+ $code,)+
+            /// A code this version does not know, as the body named it. A
+            /// client acts on the status alone.
+            Unknown(String),
         }
 
         impl ErrorCode {
-            /// Every code, in declaration order.
+            /// Every known code, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$code,)+];
 
             /// The code as it appears in a body.
-            pub const fn as_str(self) -> &'static str {
+            pub fn as_str(&self) -> &str {
                 match self {
-                    $(Self::$code => stringify!($code),)+
+                    $(Self::$code => $name,)+
+                    Self::Unknown(name) => name,
+                }
+            }
+
+            /// The fixed message of the code, for an answer whose detail
+            /// would name the server's internals.
+            pub fn default_message(&self) -> &'static str {
+                match self {
+                    $(Self::$code => $message,)+
+                    Self::Unknown(_) => "the request was refused",
+                }
+            }
+
+            /// The code `name` names: [`ErrorCode::Unknown`] for a name this
+            /// version does not know.
+            pub fn from_name(name: &str) -> Self {
+                match name {
+                    $($name => Self::$code,)+
+                    other => Self::Unknown(other.to_owned()),
                 }
             }
         }
@@ -42,180 +71,173 @@ macro_rules! error_codes {
 error_codes! {
     // Stream state (one code per refusal of the stream state machine).
     /// The bucket id is not a valid bucket id (`400`).
-    InvalidBucketId,
+    InvalidBucketId = "INVALID_BUCKET_ID", "the bucket id is invalid";
     /// The stream id is not a valid stream id (`400`).
-    InvalidStreamId,
+    InvalidStreamId = "INVALID_STREAM_ID", "the stream id is invalid";
     /// No such bucket (`404`).
-    BucketNotFound,
+    BucketNotFound = "BUCKET_NOT_FOUND", "the bucket does not exist";
     /// The bucket was purged and its name is fenced from reuse (`404`).
-    BucketErased,
+    BucketErased = "BUCKET_ERASED", "the bucket was erased";
     /// No such stream (`404`).
-    StreamNotFound,
+    StreamNotFound = "STREAM_NOT_FOUND", "the stream does not exist";
     /// The offset is below the stream's retained offset, or the stream is
     /// gone (`410`).
-    StreamGone,
+    StreamGone = "STREAM_GONE", "the offset is below the stream's retained history";
     /// A create of a stream that exists with other settings (`409`).
-    StreamAlreadyExistsConflict,
+    StreamAlreadyExistsConflict = "STREAM_ALREADY_EXISTS_CONFLICT", "the stream exists with other settings";
     /// A write with a body names no `Content-Type` (`400`).
-    MissingContentType,
+    MissingContentType = "MISSING_CONTENT_TYPE", "a write with a body must include a content type";
     /// The write's `Content-Type` is not the stream's (`409`).
-    ContentTypeMismatch,
+    ContentTypeMismatch = "CONTENT_TYPE_MISMATCH", "the content type does not match the stream's";
     /// An append with no body that does not close the stream (`400`).
-    EmptyAppend,
+    EmptyAppend = "EMPTY_APPEND", "an append must carry a body unless it closes the stream";
     /// The stream is closed (`409`, with `Stream-Closed`).
-    StreamClosed,
+    StreamClosed = "STREAM_CLOSED", "the stream is closed";
     /// `Stream-Seq` is not above the stream's last one (`409`).
-    StreamSeqConflict,
+    StreamSeqConflict = "STREAM_SEQ_CONFLICT", "Stream-Seq is not above the stream's last one";
     /// The producer headers are invalid, or a producer write's epoch was
     /// never claimed (`400`).
-    InvalidProducer,
+    InvalidProducer = "INVALID_PRODUCER", "the producer headers are invalid";
     /// A claim closed the producer's epoch (`403 epoch-closed`).
-    ProducerEpochClosed,
+    ProducerEpochClosed = "PRODUCER_EPOCH_CLOSED", "the producer's epoch is closed";
     /// The stream forgot the producer's epoch (`403 producer-expired`).
-    ProducerExpired,
+    ProducerExpired = "PRODUCER_EXPIRED", "the producer's epoch is not remembered";
     /// The producer's epoch is below its current one (`403 stale-epoch`).
-    ProducerEpochStale,
+    ProducerEpochStale = "PRODUCER_EPOCH_STALE", "the producer's epoch is stale";
     /// The write's key holds another write (`403 key-conflict`).
-    ProducerKeyConflict,
+    ProducerKeyConflict = "PRODUCER_KEY_CONFLICT", "the write's key holds a write with another identity";
     /// The body does not match `Producer-Digest` (`400`).
-    ProducerDigestMismatch,
+    ProducerDigestMismatch = "PRODUCER_DIGEST_MISMATCH", "Producer-Digest does not match the request body";
     /// `Producer-Seq` is not the next one (`409 seq-gap`).
-    ProducerSeqConflict,
+    ProducerSeqConflict = "PRODUCER_SEQ_CONFLICT", "Producer-Seq is out of order";
     /// The retention offset is invalid (`400`).
-    InvalidRetention,
+    InvalidRetention = "INVALID_RETENTION", "the retention offset is invalid";
     /// The offset is beyond the stream's tail (`416`).
-    OffsetOutOfRange,
+    OffsetOutOfRange = "OFFSET_OUT_OF_RANGE", "the offset is beyond the stream's tail";
     /// A snapshot read's `Range` lies outside the snapshot (`416`, with
     /// `Content-Range: bytes */<size>`).
-    RangeNotSatisfiable,
+    RangeNotSatisfiable = "RANGE_NOT_SATISFIABLE", "the range lies outside the snapshot";
     /// A cold flush the stream cannot take (`400`).
-    InvalidColdFlush,
+    InvalidColdFlush = "INVALID_COLD_FLUSH", "the cold flush is invalid";
     /// The snapshot is invalid (`400`).
-    InvalidSnapshot,
+    InvalidSnapshot = "INVALID_SNAPSHOT", "the snapshot is invalid";
     /// No snapshot at that offset (`404`).
-    SnapshotNotFound,
+    SnapshotNotFound = "SNAPSHOT_NOT_FOUND", "no snapshot at that offset";
     /// Another snapshot is the latest at or after the offset, or the
     /// offset is beyond the tail (`409`).
-    SnapshotConflict,
+    SnapshotConflict = "SNAPSHOT_CONFLICT", "another snapshot is the latest, or the offset is beyond the tail";
     /// A JSON body is not valid JSON message text (`400`).
-    InvalidRecordBoundaries,
+    InvalidRecordBoundaries = "INVALID_RECORD_BOUNDARIES", "the body is not valid JSON message text";
     /// Ursula could not check that the offset of a JSON snapshot or
     /// retention request is a message boundary (`503`).
-    JsonBoundaryUnverified,
+    JsonBoundaryUnverified = "JSON_BOUNDARY_UNVERIFIED", "the JSON message boundary could not be verified; retry";
     /// A state import targeted a group that holds data (`409`).
-    ImportConflict,
+    ImportConflict = "IMPORT_CONFLICT", "the import target holds data";
     /// A state import is invalid (`400`).
-    ImportInvalid,
+    ImportInvalid = "IMPORT_INVALID", "the import is invalid";
     /// The stream holds as many producers as it may (`429`).
-    ProducerLimit,
+    ProducerLimit = "PRODUCER_LIMIT", "the stream holds as many producers as it may";
     /// The server's clock is out of range (`500`).
-    CreatedAtOutOfRange,
+    CreatedAtOutOfRange = "CREATED_AT_OUT_OF_RANGE", "the server's clock is out of range";
     /// `Stream-Incarnation` does not match the stream (`412`).
-    IncarnationMismatch,
+    IncarnationMismatch = "INCARNATION_MISMATCH", "Stream-Incarnation does not match the stream";
     /// The stream's group has not applied its history yet (`503`).
-    HistoryPending,
+    HistoryPending = "HISTORY_PENDING", "the stream's group is not ready yet; retry";
 
     // The request.
-    /// The request is malformed in a way no other code names (`400`).
-    InvalidRequest,
+    /// A `4xx` that no other code names: a malformed request, or a refusal
+    /// of a layer in front of the handlers.
+    InvalidRequest = "INVALID_REQUEST", "the request is malformed";
     /// A header value is malformed (`400`).
-    InvalidHeader,
+    InvalidHeader = "INVALID_HEADER", "a header value is malformed";
     /// A query parameter is malformed or does not fit the request (`400`).
-    InvalidQuery,
+    InvalidQuery = "INVALID_QUERY", "a query parameter is malformed";
     /// An offset in the path or query is malformed (`400`).
-    InvalidOffset,
+    InvalidOffset = "INVALID_OFFSET", "the offset is malformed";
     /// The request uses a parameter, header or route that was removed
     /// (`400`, or `405` on the bare snapshot path).
-    Unsupported,
+    Unsupported = "UNSUPPORTED", "the request uses a removed feature";
     /// The request body could not be read (`400`).
-    BodyUnreadable,
+    BodyUnreadable = "BODY_UNREADABLE", "the request body could not be read";
     /// The offset of a JSON snapshot or retention request is not a message
     /// boundary (`400`).
-    NotJsonBoundary,
+    NotJsonBoundary = "NOT_JSON_BOUNDARY", "the offset is not a JSON message boundary";
     /// No route serves the path (`404`).
-    NotFound,
+    NotFound = "NOT_FOUND", "no route serves this path";
     /// The route does not serve the method (`405`).
-    MethodNotAllowed,
+    MethodNotAllowed = "METHOD_NOT_ALLOWED", "the route does not serve this method";
     /// The body is above the request limit, `Ursula-Max-Request-Bytes`
     /// (`413`).
-    RequestTooLarge,
+    RequestTooLarge = "REQUEST_TOO_LARGE", "the request body is above the request limit";
     /// The assembled snapshot is above the snapshot limit,
     /// `Ursula-Max-Snapshot-Bytes` (`413`).
-    SnapshotTooLarge,
+    SnapshotTooLarge = "SNAPSHOT_TOO_LARGE", "the snapshot is above the snapshot limit";
 
     // Snapshot parts.
-    /// The node has no cold store, so it takes no snapshot parts (`501`).
-    NoColdStore,
+    /// The node has no cold store, which the request needs (`501`).
+    NoColdStore = "NO_COLD_STORE", "this node has no cold store";
     /// A parts commit's headers or manifest are malformed (`400`).
-    InvalidPartsCommit,
+    InvalidPartsCommit = "INVALID_PARTS_COMMIT", "the parts commit is malformed";
     /// A manifest names a part that is not staged for the stream (`400`).
-    UnknownPart,
+    UnknownPart = "UNKNOWN_PART", "a part is not staged for this stream";
     /// The assembled snapshot's digest is not `Stream-Snapshot-Digest`
     /// (`400`).
-    SnapshotDigestMismatch,
+    SnapshotDigestMismatch = "SNAPSHOT_DIGEST_MISMATCH", "the assembled snapshot's digest differs from Stream-Snapshot-Digest";
     /// The node copies as many snapshot commits as it may (`503`).
-    SnapshotCommitsBusy,
+    SnapshotCommitsBusy = "SNAPSHOT_COMMITS_BUSY", "this node copies as many snapshot commits as it may; retry";
     /// The node runs this commit now (`503`): repeat it.
-    SnapshotCommitInProgress,
+    SnapshotCommitInProgress = "SNAPSHOT_COMMIT_IN_PROGRESS", "this commit is running; repeat it";
 
     // Node pressure and routing. Each answers `503` with `Retry-After`.
     /// No leader of the stream's group is known.
-    NoLeader,
+    NoLeader = "NO_LEADER", "no leader of the stream's group is known; retry";
     /// The WAL filesystem is below its free-space floor.
-    WalDiskPressure,
+    WalDiskPressure = "WAL_DISK_PRESSURE", "the node is low on WAL disk space; retry";
     /// The node's unsnapshotted Raft log is over its hard limit.
-    RaftLogPressure,
+    RaftLogPressure = "RAFT_LOG_PRESSURE", "the node's Raft log is over its limit; retry";
     /// The node's in-flight request bodies fill its budget.
-    IngressBodyBytesLimitReached,
+    IngressBodyBytesLimitReached = "INGRESS_BODY_BYTES_LIMIT_REACHED", "the node's in-flight request budget is full; retry";
     /// The group's hot bytes wait for the cold tier.
-    ColdBackpressure,
+    ColdBackpressure = "COLD_BACKPRESSURE", "the stream's group waits for the cold tier; retry";
     /// The group's uncommitted Raft bytes are over their limit.
-    RaftUncommittedBackpressure,
+    RaftUncommittedBackpressure = "RAFT_UNCOMMITTED_BACKPRESSURE", "the stream's group has too many uncommitted bytes; retry";
     /// The node serves as many live reads as it may.
-    LiveReadBackpressure,
+    LiveReadBackpressure = "LIVE_READ_BACKPRESSURE", "the node serves as many live reads as it may; retry";
     /// The group stopped applying after a committed apply failure.
-    ApplyStopped,
+    ApplyStopped = "APPLY_STOPPED", "the stream's group stopped applying";
     /// The write may or may not have applied: resolve it by its key.
-    OutcomeUnknown,
+    OutcomeUnknown = "OUTCOME_UNKNOWN", "the write's outcome is unknown; repeat it with its key";
 
     // Server faults.
-    /// The cold store failed (`500` or `502`), or is missing where the
-    /// request needs it (`503`).
-    ColdStoreFailed,
-    /// The server failed (`500`).
-    Internal,
+    /// The cold store failed (`502`).
+    ColdStoreFailed = "COLD_STORE_FAILED", "the cold store failed";
+    /// A `5xx` that no other code names: a server fault.
+    Internal = "INTERNAL", "the server failed";
 
     // The gateway's own answers.
     /// The bearer credential is not valid for this gateway (`401`).
-    InvalidCredential,
+    InvalidCredential = "INVALID_CREDENTIAL", "the bearer credential is invalid";
     /// The bearer credential expired (`401`).
-    CredentialExpired,
+    CredentialExpired = "CREDENTIAL_EXPIRED", "the bearer credential is expired";
     /// The credential verifier is unavailable (`503`).
-    AuthenticationUnavailable,
+    AuthenticationUnavailable = "AUTHENTICATION_UNAVAILABLE", "authentication is unavailable";
     /// The authorizer denied the request (`403`).
-    Forbidden,
+    Forbidden = "FORBIDDEN", "the request is not allowed";
     /// The authorizer could not decide (`503`).
-    AuthorizationUnavailable,
+    AuthorizationUnavailable = "AUTHORIZATION_UNAVAILABLE", "authorization is unavailable";
     /// The tenant's request rate limit is spent (`429`, with
     /// `Retry-After`).
-    RateLimited,
+    RateLimited = "RATE_LIMITED", "the request rate limit is spent";
     /// The tenant holds as many live reads as it may (`429`).
-    LiveReadsExhausted,
+    LiveReadsExhausted = "LIVE_READS_EXHAUSTED", "the live-read limit is spent";
     /// The gateway has no upstream (`503`).
-    NoUpstream,
+    NoUpstream = "NO_UPSTREAM", "no upstream is configured";
     /// No upstream could be reached (`503`, with `Retry-After`).
-    UpstreamUnreachable,
+    UpstreamUnreachable = "UPSTREAM_UNREACHABLE", "the upstream is unreachable; retry";
     /// The upstream sent no response in time (`504`).
-    UpstreamTimeout,
+    UpstreamTimeout = "UPSTREAM_TIMEOUT", "the upstream sent no response in time";
     /// The upstream request failed (`502`).
-    UpstreamFailed,
-}
-
-impl ErrorCode {
-    /// The code `text` names, if any.
-    pub fn from_name(text: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|code| code.as_str() == text)
-    }
+    UpstreamFailed = "UPSTREAM_FAILED", "the upstream request failed";
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -223,6 +245,10 @@ impl std::fmt::Display for ErrorCode {
         f.write_str(self.as_str())
     }
 }
+
+/// The deepest JSON nesting [`ErrorBody::parse`] skips in a member it does
+/// not know.
+const MAX_SKIPPED_DEPTH: usize = 32;
 
 /// The body of an error answer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -244,68 +270,76 @@ impl ErrorBody {
         }
     }
 
-    /// The body: `{"error":"<code>","message":"<message>"}`, with the
-    /// message escaped as a JSON string.
+    /// `code` with its [default message](ErrorCode::default_message).
+    pub fn fixed(code: ErrorCode) -> Self {
+        let message = code.default_message();
+        Self::new(code, message)
+    }
+
+    /// The body: `{"error":{"code":"<code>","message":"<message>"}}`, with
+    /// both strings escaped as JSON strings.
     pub fn render(&self) -> String {
-        let mut out = String::with_capacity(self.message.len().saturating_add(48));
-        out.push_str(r#"{"error":""#);
-        out.push_str(self.code.as_str());
-        out.push_str(r#"","message":""#);
-        for c in self.message.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if u32::from(c) < 0x20 => {
-                    out.push_str(&format!("\\u{:04x}", u32::from(c)));
-                }
-                c => out.push(c),
-            }
-        }
-        out.push_str(r#""}"#);
+        let mut out = String::with_capacity(self.message.len().saturating_add(64));
+        out.push_str(r#"{"error":{"code":"#);
+        push_json_string(&mut out, self.code.as_str());
+        out.push_str(r#","message":"#);
+        push_json_string(&mut out, &self.message);
+        out.push_str("}}");
         out
     }
 
-    /// Parses an error body: one JSON object whose members are `error`, a
-    /// string naming a known code, and `message`, any string, in either
-    /// order, each exactly once and nothing else. JSON whitespace may
-    /// surround each token. `Err` for any other body, such as the plain
-    /// text of a proxy in front of Ursula, or a code this version does not
-    /// know.
+    /// Parses an error body: a JSON object whose `error` member is an object
+    /// with the string members `code` and `message`. Members either object
+    /// does not know are skipped, in any order, and a code this version
+    /// does not know parses as [`ErrorCode::Unknown`] with its message. JSON
+    /// whitespace may surround each token. `Err` for any other body, such as
+    /// the plain text of a proxy in front of Ursula, a repeated member, or
+    /// an unknown member nested deeper than 32 levels.
+    ///
+    /// The parse takes time and memory in proportion to the body, so a
+    /// caller bounds the body it reads.
     pub fn parse(body: &[u8]) -> Result<Self, HeaderError> {
         let mut cursor = Cursor(body);
-        cursor.expect(b'{')?;
-        let mut error = None;
-        let mut message = None;
-        loop {
-            let key = cursor.string()?;
-            cursor.expect(b':')?;
-            let value = cursor.string()?;
-            let slot = match key.as_str() {
-                "error" => &mut error,
-                "message" => &mut message,
-                _ => return Err(HeaderError::InvalidErrorBody),
-            };
-            if slot.replace(value).is_some() {
-                return Err(HeaderError::InvalidErrorBody);
+        let mut parsed = None;
+        cursor.object(|cursor, key| match key {
+            "error" => {
+                let error = cursor.error_member()?;
+                once(&mut parsed, error)
             }
-            match cursor.next()? {
-                b',' => continue,
-                b'}' => break,
-                _ => return Err(HeaderError::InvalidErrorBody),
-            }
-        }
+            _ => cursor.skip_value(MAX_SKIPPED_DEPTH),
+        })?;
         if !cursor.rest().is_empty() {
             return Err(HeaderError::InvalidErrorBody);
         }
-        let (Some(error), Some(message)) = (error, message) else {
-            return Err(HeaderError::InvalidErrorBody);
-        };
-        let code = ErrorCode::from_name(&error).ok_or(HeaderError::UnknownErrorCode)?;
-        Ok(Self { code, message })
+        parsed.ok_or(HeaderError::InvalidErrorBody)
     }
+}
+
+/// Sets `slot` to `value`, unless a repeated member set it already.
+fn once<T>(slot: &mut Option<T>, value: T) -> Result<(), HeaderError> {
+    match slot.replace(value) {
+        None => Ok(()),
+        Some(_) => Err(HeaderError::InvalidErrorBody),
+    }
+}
+
+/// Appends `text` to `out` as a JSON string.
+fn push_json_string(out: &mut String, text: &str) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// The unread rest of an error body.
@@ -321,6 +355,14 @@ impl<'a> Cursor<'a> {
             .unwrap_or(self.0.len());
         self.0 = self.0.get(start..).unwrap_or_default();
         self.0
+    }
+
+    /// The next byte after whitespace, without taking it.
+    fn peek(&mut self) -> Result<u8, HeaderError> {
+        self.rest()
+            .first()
+            .copied()
+            .ok_or(HeaderError::InvalidErrorBody)
     }
 
     /// The next byte after whitespace.
@@ -339,6 +381,101 @@ impl<'a> Cursor<'a> {
         } else {
             Err(HeaderError::InvalidErrorBody)
         }
+    }
+
+    /// An object, handing each member's key to `member`, which reads the
+    /// member's value.
+    fn object(
+        &mut self,
+        mut member: impl FnMut(&mut Self, &str) -> Result<(), HeaderError>,
+    ) -> Result<(), HeaderError> {
+        self.expect(b'{')?;
+        if self.peek()? == b'}' {
+            self.0 = self.0.get(1..).unwrap_or_default();
+            return Ok(());
+        }
+        loop {
+            let key = self.string()?;
+            self.expect(b':')?;
+            member(self, &key)?;
+            match self.next()? {
+                b',' => continue,
+                b'}' => return Ok(()),
+                _ => return Err(HeaderError::InvalidErrorBody),
+            }
+        }
+    }
+
+    /// The `error` member's value: an object with `code` and `message`.
+    fn error_member(&mut self) -> Result<ErrorBody, HeaderError> {
+        let mut code = None;
+        let mut message = None;
+        self.object(|cursor, key| match key {
+            "code" => {
+                let value = cursor.string()?;
+                once(&mut code, value)
+            }
+            "message" => {
+                let value = cursor.string()?;
+                once(&mut message, value)
+            }
+            _ => cursor.skip_value(MAX_SKIPPED_DEPTH),
+        })?;
+        match (code, message) {
+            (Some(code), Some(message)) => Ok(ErrorBody::new(ErrorCode::from_name(&code), message)),
+            _ => Err(HeaderError::InvalidErrorBody),
+        }
+    }
+
+    /// Skips one JSON value of at most `depth` levels of nesting.
+    fn skip_value(&mut self, depth: usize) -> Result<(), HeaderError> {
+        let Some(inner) = depth.checked_sub(1) else {
+            return Err(HeaderError::InvalidErrorBody);
+        };
+        match self.peek()? {
+            b'"' => self.string().map(drop),
+            b'{' => self.object(|cursor, _key| cursor.skip_value(inner)),
+            b'[' => {
+                self.expect(b'[')?;
+                if self.peek()? == b']' {
+                    self.0 = self.0.get(1..).unwrap_or_default();
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value(inner)?;
+                    match self.next()? {
+                        b',' => continue,
+                        b']' => return Ok(()),
+                        _ => return Err(HeaderError::InvalidErrorBody),
+                    }
+                }
+            }
+            _ => self.scalar(),
+        }
+    }
+
+    /// Skips `true`, `false`, `null` or a number.
+    fn scalar(&mut self) -> Result<(), HeaderError> {
+        for word in [b"true".as_slice(), b"false", b"null"] {
+            if let Some(rest) = self.0.strip_prefix(word) {
+                self.0 = rest;
+                return Ok(());
+            }
+        }
+        let len = self
+            .0
+            .iter()
+            .position(|byte| !matches!(byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'))
+            .unwrap_or(self.0.len());
+        let number = self.0.get(..len).unwrap_or_default();
+        let valid = std::str::from_utf8(number)
+            .ok()
+            .is_some_and(|text| !text.is_empty() && text.parse::<f64>().is_ok());
+        if !valid {
+            return Err(HeaderError::InvalidErrorBody);
+        }
+        self.0 = self.0.get(len..).unwrap_or_default();
+        Ok(())
     }
 
     /// A JSON string after whitespace, decoded.
@@ -414,14 +551,142 @@ mod tests {
     use super::ErrorCode;
     use crate::error::HeaderError;
 
+    /// Every code's wire name, pinned: a rename that changes one fails here.
     #[test]
-    fn every_code_round_trips() {
-        for &code in ErrorCode::ALL {
-            let body = ErrorBody::new(code, "why").render();
-            assert_eq!(body, format!(r#"{{"error":"{code}","message":"why"}}"#));
+    fn every_code_keeps_its_wire_name() {
+        let golden = [
+            (ErrorCode::InvalidBucketId, "INVALID_BUCKET_ID"),
+            (ErrorCode::InvalidStreamId, "INVALID_STREAM_ID"),
+            (ErrorCode::BucketNotFound, "BUCKET_NOT_FOUND"),
+            (ErrorCode::BucketErased, "BUCKET_ERASED"),
+            (ErrorCode::StreamNotFound, "STREAM_NOT_FOUND"),
+            (ErrorCode::StreamGone, "STREAM_GONE"),
+            (
+                ErrorCode::StreamAlreadyExistsConflict,
+                "STREAM_ALREADY_EXISTS_CONFLICT",
+            ),
+            (ErrorCode::MissingContentType, "MISSING_CONTENT_TYPE"),
+            (ErrorCode::ContentTypeMismatch, "CONTENT_TYPE_MISMATCH"),
+            (ErrorCode::EmptyAppend, "EMPTY_APPEND"),
+            (ErrorCode::StreamClosed, "STREAM_CLOSED"),
+            (ErrorCode::StreamSeqConflict, "STREAM_SEQ_CONFLICT"),
+            (ErrorCode::InvalidProducer, "INVALID_PRODUCER"),
+            (ErrorCode::ProducerEpochClosed, "PRODUCER_EPOCH_CLOSED"),
+            (ErrorCode::ProducerExpired, "PRODUCER_EXPIRED"),
+            (ErrorCode::ProducerEpochStale, "PRODUCER_EPOCH_STALE"),
+            (ErrorCode::ProducerKeyConflict, "PRODUCER_KEY_CONFLICT"),
+            (
+                ErrorCode::ProducerDigestMismatch,
+                "PRODUCER_DIGEST_MISMATCH",
+            ),
+            (ErrorCode::ProducerSeqConflict, "PRODUCER_SEQ_CONFLICT"),
+            (ErrorCode::InvalidRetention, "INVALID_RETENTION"),
+            (ErrorCode::OffsetOutOfRange, "OFFSET_OUT_OF_RANGE"),
+            (ErrorCode::RangeNotSatisfiable, "RANGE_NOT_SATISFIABLE"),
+            (ErrorCode::InvalidColdFlush, "INVALID_COLD_FLUSH"),
+            (ErrorCode::InvalidSnapshot, "INVALID_SNAPSHOT"),
+            (ErrorCode::SnapshotNotFound, "SNAPSHOT_NOT_FOUND"),
+            (ErrorCode::SnapshotConflict, "SNAPSHOT_CONFLICT"),
+            (
+                ErrorCode::InvalidRecordBoundaries,
+                "INVALID_RECORD_BOUNDARIES",
+            ),
+            (
+                ErrorCode::JsonBoundaryUnverified,
+                "JSON_BOUNDARY_UNVERIFIED",
+            ),
+            (ErrorCode::ImportConflict, "IMPORT_CONFLICT"),
+            (ErrorCode::ImportInvalid, "IMPORT_INVALID"),
+            (ErrorCode::ProducerLimit, "PRODUCER_LIMIT"),
+            (ErrorCode::CreatedAtOutOfRange, "CREATED_AT_OUT_OF_RANGE"),
+            (ErrorCode::IncarnationMismatch, "INCARNATION_MISMATCH"),
+            (ErrorCode::HistoryPending, "HISTORY_PENDING"),
+            (ErrorCode::InvalidRequest, "INVALID_REQUEST"),
+            (ErrorCode::InvalidHeader, "INVALID_HEADER"),
+            (ErrorCode::InvalidQuery, "INVALID_QUERY"),
+            (ErrorCode::InvalidOffset, "INVALID_OFFSET"),
+            (ErrorCode::Unsupported, "UNSUPPORTED"),
+            (ErrorCode::BodyUnreadable, "BODY_UNREADABLE"),
+            (ErrorCode::NotJsonBoundary, "NOT_JSON_BOUNDARY"),
+            (ErrorCode::NotFound, "NOT_FOUND"),
+            (ErrorCode::MethodNotAllowed, "METHOD_NOT_ALLOWED"),
+            (ErrorCode::RequestTooLarge, "REQUEST_TOO_LARGE"),
+            (ErrorCode::SnapshotTooLarge, "SNAPSHOT_TOO_LARGE"),
+            (ErrorCode::NoColdStore, "NO_COLD_STORE"),
+            (ErrorCode::InvalidPartsCommit, "INVALID_PARTS_COMMIT"),
+            (ErrorCode::UnknownPart, "UNKNOWN_PART"),
+            (
+                ErrorCode::SnapshotDigestMismatch,
+                "SNAPSHOT_DIGEST_MISMATCH",
+            ),
+            (ErrorCode::SnapshotCommitsBusy, "SNAPSHOT_COMMITS_BUSY"),
+            (
+                ErrorCode::SnapshotCommitInProgress,
+                "SNAPSHOT_COMMIT_IN_PROGRESS",
+            ),
+            (ErrorCode::NoLeader, "NO_LEADER"),
+            (ErrorCode::WalDiskPressure, "WAL_DISK_PRESSURE"),
+            (ErrorCode::RaftLogPressure, "RAFT_LOG_PRESSURE"),
+            (
+                ErrorCode::IngressBodyBytesLimitReached,
+                "INGRESS_BODY_BYTES_LIMIT_REACHED",
+            ),
+            (ErrorCode::ColdBackpressure, "COLD_BACKPRESSURE"),
+            (
+                ErrorCode::RaftUncommittedBackpressure,
+                "RAFT_UNCOMMITTED_BACKPRESSURE",
+            ),
+            (ErrorCode::LiveReadBackpressure, "LIVE_READ_BACKPRESSURE"),
+            (ErrorCode::ApplyStopped, "APPLY_STOPPED"),
+            (ErrorCode::OutcomeUnknown, "OUTCOME_UNKNOWN"),
+            (ErrorCode::ColdStoreFailed, "COLD_STORE_FAILED"),
+            (ErrorCode::Internal, "INTERNAL"),
+            (ErrorCode::InvalidCredential, "INVALID_CREDENTIAL"),
+            (ErrorCode::CredentialExpired, "CREDENTIAL_EXPIRED"),
+            (
+                ErrorCode::AuthenticationUnavailable,
+                "AUTHENTICATION_UNAVAILABLE",
+            ),
+            (ErrorCode::Forbidden, "FORBIDDEN"),
+            (
+                ErrorCode::AuthorizationUnavailable,
+                "AUTHORIZATION_UNAVAILABLE",
+            ),
+            (ErrorCode::RateLimited, "RATE_LIMITED"),
+            (ErrorCode::LiveReadsExhausted, "LIVE_READS_EXHAUSTED"),
+            (ErrorCode::NoUpstream, "NO_UPSTREAM"),
+            (ErrorCode::UpstreamUnreachable, "UPSTREAM_UNREACHABLE"),
+            (ErrorCode::UpstreamTimeout, "UPSTREAM_TIMEOUT"),
+            (ErrorCode::UpstreamFailed, "UPSTREAM_FAILED"),
+        ];
+        assert_eq!(golden.len(), ErrorCode::ALL.len());
+        for (code, name) in golden {
+            assert_eq!(code.as_str(), name);
+            assert_eq!(ErrorCode::from_name(name), code);
+        }
+    }
+
+    #[test]
+    fn every_code_round_trips_with_a_message() {
+        for code in ErrorCode::ALL {
+            assert!(!code.default_message().is_empty(), "{code}");
+            let body = ErrorBody::new(code.clone(), "why");
             assert_eq!(
-                ErrorBody::parse(body.as_bytes()),
-                Ok(ErrorBody::new(code, "why"))
+                body.render(),
+                format!(r#"{{"error":{{"code":"{code}","message":"why"}}}}"#)
+            );
+            assert_eq!(ErrorBody::parse(body.render().as_bytes()), Ok(body));
+        }
+    }
+
+    #[test]
+    fn codes_are_upper_snake_case() {
+        for code in ErrorCode::ALL {
+            let name = code.as_str();
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte == b'_'),
+                "{name}"
             );
         }
     }
@@ -442,46 +707,49 @@ mod tests {
     }
 
     #[test]
-    fn codes_are_letters_and_digits() {
-        for code in ErrorCode::ALL {
-            let name = code.as_str();
-            assert!(
-                name.bytes().all(|byte| byte.is_ascii_alphanumeric()),
-                "{name}"
-            );
-            assert!(name.starts_with(|c: char| c.is_ascii_uppercase()), "{name}");
-        }
-    }
-
-    #[test]
-    fn any_json_layout_of_the_two_members_parses() {
+    fn unknown_members_and_codes_are_kept_out_of_the_way() {
         assert_eq!(
-            ErrorBody::parse(br#"{"message":"m","error":"SnapshotCommitsBusy"}"#),
-            Ok(ErrorBody::new(ErrorCode::SnapshotCommitsBusy, "m"))
+            ErrorBody::parse(
+                br#"{"v":2,"error":{"current_holder":"w-2","message":"m","generation":7,"code":"ALREADY_CLAIMED","extra":{"a":[1,true,null,{"b":"c"}],"n":-1.5e3}},"trace":[]}"#
+            ),
+            Ok(ErrorBody::new(
+                ErrorCode::Unknown("ALREADY_CLAIMED".to_owned()),
+                "m"
+            ))
         );
         assert_eq!(
-            ErrorBody::parse(b" {\n  \"error\" : \"NoLeader\" ,\n \"message\":\"a\\u00e9\\ud83e\\udd80\\/\"\n}\n"),
+            ErrorBody::parse(
+                b" {\n  \"error\" : { \"message\":\"a\\u00e9\\ud83e\\udd80\\/\" , \"code\" : \"NO_LEADER\" }\n}\n"
+            ),
             Ok(ErrorBody::new(ErrorCode::NoLeader, "aé🦀/"))
         );
     }
 
     #[test]
     fn other_bodies_are_refused() {
+        let deep = format!(
+            r#"{{"x":{}1{},"error":{{"code":"NO_LEADER","message":"m"}}}}"#,
+            "[".repeat(40),
+            "]".repeat(40)
+        );
         for body in [
             b"".as_slice(),
             b"request body is too large",
             b"{}",
-            br#"{"error":"NoLeader"}"#,
-            br#"{"message":"m"}"#,
-            br#"{"error":"NoLeader","message":"m""#,
-            br#"{"error":"NoLeader","message":"m","extra":"x"}"#,
-            br#"{"error":"NoLeader","error":"NoLeader","message":"m"}"#,
-            br#"{"error":NoLeader,"message":"m"}"#,
-            br#"{"error":"NoLeader","message":1}"#,
-            br#"{"error":"NoLeader","message":"m"} trailing"#,
-            br#"{"error":"NoLeader","message":"\x"}"#,
-            br#"{"error":"NoLeader","message":"\ud800"}"#,
-            b"{\"error\":\"NoLeader\",\"message\":\"a\nb\"}",
+            br#"{"error":"NO_LEADER"}"#,
+            br#"{"error":{"code":"NO_LEADER"}}"#,
+            br#"{"error":{"message":"m"}}"#,
+            br#"{"error":{"code":"NO_LEADER","message":"m"}"#,
+            br#"{"error":{"code":"NO_LEADER","code":"NO_LEADER","message":"m"}}"#,
+            br#"{"error":{"code":"NO_LEADER","message":"m"},"error":{"code":"NO_LEADER","message":"m"}}"#,
+            br#"{"error":{"code":NO_LEADER,"message":"m"}}"#,
+            br#"{"error":{"code":"NO_LEADER","message":1}}"#,
+            br#"{"error":{"code":"NO_LEADER","message":"m"}} trailing"#,
+            br#"{"error":{"code":"NO_LEADER","message":"\x"}}"#,
+            br#"{"error":{"code":"NO_LEADER","message":"\ud800"}}"#,
+            br#"{"x":tru,"error":{"code":"NO_LEADER","message":"m"}}"#,
+            b"{\"error\":{\"code\":\"NO_LEADER\",\"message\":\"a\nb\"}}",
+            deep.as_bytes(),
         ] {
             assert_eq!(
                 ErrorBody::parse(body),
@@ -490,9 +758,5 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
-        assert_eq!(
-            ErrorBody::parse(br#"{"error":"NoSuchCode","message":"m"}"#),
-            Err(HeaderError::UnknownErrorCode)
-        );
     }
 }

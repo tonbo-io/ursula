@@ -103,10 +103,9 @@ pub enum HeaderError {
     /// `Content-Range` is not `bytes first-last/total` with `first <= last <
     /// total` on a `206`, or `bytes */total` on a `416`.
     InvalidContentRange,
-    /// An error answer's body is not `{"error":"<code>"}`.
+    /// An error answer's body is not a JSON object whose `error` member
+    /// holds the strings `code` and `message`.
     InvalidErrorBody,
-    /// An error body names a code this version does not know.
-    UnknownErrorCode,
 }
 
 impl fmt::Display for HeaderError {
@@ -239,10 +238,10 @@ impl fmt::Display for HeaderError {
                  `bytes */total` on a 416",
                 names::CONTENT_RANGE
             ),
-            Self::InvalidErrorBody => {
-                write!(f, r#"an error body must be {{"error":"<code>"}}"#)
-            }
-            Self::UnknownErrorCode => write!(f, "an error body names an unknown code"),
+            Self::InvalidErrorBody => write!(
+                f,
+                r#"an error body must be {{"error":{{"code":"<code>","message":"<message>"}}}}"#
+            ),
             Self::DuplicateManifestPart { line } => {
                 write!(
                     f,

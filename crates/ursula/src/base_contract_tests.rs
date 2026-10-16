@@ -422,7 +422,10 @@ async fn temporary_unavailable_answers_carry_retry_after() {
     let response = append(&app, uri, &[], "ab").await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header(&response, "retry-after"), "1");
-    assert!(body_text(response).await.contains("ColdBackpressure"));
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::ColdBackpressure
+    );
 }
 
 fn producer_headers<'a>(id: &'a str, seq: &'a str) -> [(&'static str, &'a str); 3] {

@@ -1,5 +1,5 @@
 //! Every error answer of the client plane carries one JSON body,
-//! `{"error":"<code>","message":"<detail>"}` (extensions Section 11): the handlers' own refusals,
+//! `{"error":{"code":"<code>","message":"<detail>"}}` (extensions Section 11): the handlers' own refusals,
 //! the runtime's, and axum's `404`, `405` and extractor rejections, which
 //! the router renders. The operator paths under `/__ursula/` keep their own
 //! answers.
@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use tower::ServiceExt;
 use ursula_headers::ErrorCode;
@@ -257,4 +258,217 @@ async fn operator_paths_are_left_alone() {
     let response = send(&app, "POST", "/__ursula/metrics", &[]).await;
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert!(response.headers().get(CONTENT_TYPE).is_none());
+}
+
+/// Whether `message` names an internal of the server: an address, an
+/// object key or path, a request id, or the node's placement.
+fn names_internals(message: &str) -> bool {
+    let ipv4 = message
+        .as_bytes()
+        .windows(3)
+        .any(|window| matches!(window, [a, b'.', c] if a.is_ascii_digit() && c.is_ascii_digit()));
+    ipv4 || [
+        "://",
+        "_packs",
+        ".bin",
+        "RequestId",
+        "x-amz",
+        "s3",
+        "core ",
+        "raft group",
+        "BasicNode",
+        "10.",
+        "cluster-",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// M1: no message from any source class names an address, an S3 key or
+/// path, a request id or the node's placement, on an HTTP answer and an SSE
+/// `error` event alike. The full error stays in the server's log.
+#[tokio::test]
+async fn no_message_names_the_servers_internals() {
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::GroupInfraError;
+    use ursula_runtime::RuntimeError;
+    use ursula_runtime::StreamErrorCode;
+    use ursula_shard::BucketStreamId;
+    use ursula_shard::CoreId;
+    use ursula_shard::RaftGroupId;
+
+    let engine = |error| RuntimeError::GroupEngine {
+        core_id: CoreId(3),
+        raft_group_id: RaftGroupId(9),
+        error,
+    };
+    let leader = "http://10.1.2.3:4438";
+    let cases = [
+        // A leadership lost while a write's body was read.
+        (
+            engine(GroupEngineError::forward_to_leader(
+                format!(
+                    "OpenRaft client_write forwarded to leader: has to forward request to: \
+                     Some(2), Some(BasicNode {{ addr: \"{leader}\" }})"
+                ),
+                Some(2),
+                Some(leader.to_owned()),
+            )),
+            ErrorCode::NoLeader,
+        ),
+        // A cold-tier read on GET or bootstrap.
+        (
+            engine(GroupEngineError::Infra(GroupInfraError::ColdStore {
+                detail: "cold object 'tenant/_packs/0/pack-7.bin': NotFound at \
+                         https://tenant-cold.s3.us-east-1.amazonaws.com, RequestId: ABC123, \
+                         x-amz-request-id: ABC123"
+                    .to_owned(),
+            })),
+            ErrorCode::ColdStoreFailed,
+        ),
+        // A forwarded read the leader refused.
+        (
+            engine(GroupEngineError::new(format!(
+                "GroupRead to the group leader at {leader} was refused: version mismatch"
+            ))),
+            ErrorCode::Internal,
+        ),
+        // Pressure, whose detail counts other tenants' bytes.
+        (
+            engine(GroupEngineError::cold_backpressure(
+                BucketStreamId::new("other", "s"),
+                10,
+                20,
+                15,
+            )),
+            ErrorCode::ColdBackpressure,
+        ),
+        (
+            RuntimeError::ColdStoreIo {
+                message: "s3://tenant-cold/_packs/0/pack-7.bin: timed out".to_owned(),
+            },
+            ErrorCode::ColdStoreFailed,
+        ),
+        // A stream refusal: its own text, without the node's placement.
+        (
+            engine(GroupEngineError::stream(
+                StreamErrorCode::StreamClosed,
+                "stream 'errors/s' is closed",
+            )),
+            ErrorCode::StreamClosed,
+        ),
+        (
+            engine(GroupEngineError::stream(
+                StreamErrorCode::StreamNotFound,
+                "stream 'errors/s' does not exist",
+            )),
+            ErrorCode::StreamNotFound,
+        ),
+    ];
+    for (err, code) in cases {
+        let event = crate::render::sse_error_event(&crate::render::runtime_error_body(&err).1);
+        assert!(!names_internals(&event), "{event}");
+        let answer = if code == ErrorCode::NoLeader {
+            crate::leader_unknown_retry_response(err)
+        } else {
+            crate::runtime_error_response(err)
+        };
+        let body = error_body_of(answer).await;
+        assert_eq!(body.code, code);
+        assert!(!names_internals(&body.message), "{code}: {}", body.message);
+    }
+}
+
+/// m6: a node's `404` for a missing stream carries the code's fixed message
+/// and only the headers every error answer carries, so a gateway's
+/// concealing `404` is the same answer.
+#[tokio::test]
+async fn a_missing_streams_404_is_fixed() {
+    let app = app();
+    let created = send_body(&app, "PUT", "/errors/s", &[TEXT], "abc").await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(
+        error_body_of(send(&app, "GET", "/errors/missing", &[]).await).await,
+        ursula_headers::ErrorBody::fixed(ErrorCode::StreamNotFound)
+    );
+    // A bucket nothing created: the answer a concealing gateway gives.
+    let response = send(&app, "GET", "/nobucket/missing", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter(|(name, _)| *name != axum::http::header::CONTENT_LENGTH)
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().expect("text").to_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    assert_eq!(headers, vec![
+        ("cache-control".to_owned(), "no-store".to_owned()),
+        ("content-type".to_owned(), "application/json".to_owned()),
+        (
+            "cross-origin-resource-policy".to_owned(),
+            "cross-origin".to_owned()
+        ),
+        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+    ]);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(
+        body,
+        ursula_headers::ErrorBody::fixed(ErrorCode::BucketNotFound)
+            .render()
+            .as_bytes()
+    );
+}
+
+/// m4: an error answer is never compressed, however long its body, while
+/// a JSON success body is.
+#[test]
+fn error_answers_are_never_compressed() {
+    let error = crate::render::error_response(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidHeader,
+        "x".repeat(1024),
+    );
+    assert!(!crate::finite_record_response(
+        error.status(),
+        error.version(),
+        error.headers(),
+        error.extensions(),
+    ));
+    let json = (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        "[]".repeat(512),
+    )
+        .into_response();
+    assert!(crate::finite_record_response(
+        json.status(),
+        json.version(),
+        json.headers(),
+        json.extensions(),
+    ));
+}
+
+/// m4: the net keeps a response's extensions and adds the one that keeps
+/// compression off.
+#[test]
+fn the_net_keeps_extensions() {
+    #[derive(Debug, Clone, PartialEq)]
+    struct Marker;
+    let mut response = StatusCode::NOT_FOUND.into_response();
+    response.extensions_mut().insert(Marker);
+    crate::render::render_unrendered_error(&mut response);
+    assert_eq!(response.extensions().get::<Marker>(), Some(&Marker));
+    assert!(
+        response
+            .extensions()
+            .get::<crate::render::Uncompressed>()
+            .is_some()
+    );
 }

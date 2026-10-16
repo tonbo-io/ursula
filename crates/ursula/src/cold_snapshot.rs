@@ -92,10 +92,9 @@ pub(crate) async fn receive_snapshot_body(
     }
 
     let Some(cold_store) = state.runtime.cold_store() else {
-        return Err(render::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::ColdStoreFailed,
-            "cold backend must be configured before staging snapshots",
+        return Err(render::fixed_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            ErrorCode::NoColdStore,
         ));
     };
     let path = new_external_payload_path(stream_id);

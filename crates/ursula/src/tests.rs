@@ -247,7 +247,10 @@ fn runtime_error_status_prefers_stream_error_code_over_message_text() {
         ),
     };
 
-    assert_eq!(crate::render::runtime_error_status(&err), StatusCode::GONE);
+    assert_eq!(
+        crate::render::runtime_error_answer(&err).0,
+        StatusCode::GONE
+    );
 }
 
 #[test]
@@ -259,7 +262,7 @@ fn runtime_error_status_does_not_parse_infra_message_as_stream_error() {
     };
 
     assert_eq!(
-        crate::render::runtime_error_status(&err),
+        crate::render::runtime_error_answer(&err).0,
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
@@ -4867,11 +4870,9 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = body_bytes(response).await;
-    assert!(
-        std::str::from_utf8(&body)
-            .expect("utf8 body")
-            .contains("ColdBackpressure")
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::ColdBackpressure
     );
 
     let response = http_get(&app, "/__ursula/metrics").await;
@@ -6069,13 +6070,9 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
     // Refused before the handler ran: nothing was applied, and nothing says
     // so.
     assert_no_not_applied_headers(response.headers(), "ingress budget");
-    let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
-        .await
-        .expect("body");
-    assert!(
-        std::str::from_utf8(&body)
-            .expect("utf8 body")
-            .contains("IngressBodyBytesLimitReached")
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::IngressBodyBytesLimitReached
     );
 }
 
@@ -6741,11 +6738,9 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
     .await;
     assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_no_not_applied_headers(write.headers(), "wal disk pressure");
-    let body = body_bytes(write).await;
-    assert!(
-        std::str::from_utf8(&body)
-            .expect("utf8 response")
-            .contains("WalDiskPressure")
+    assert_eq!(
+        crate::render::error_code_of(write).await,
+        ursula_headers::ErrorCode::WalDiskPressure
     );
     // The marked refusal created nothing. Reads pass admission under pressure.
     assert_eq!(
@@ -6842,11 +6837,9 @@ async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
             .contains_key(axum::http::header::RETRY_AFTER)
     );
     assert_no_not_applied_headers(write.headers(), "raft log pressure");
-    let body = body_bytes(write).await;
-    assert!(
-        std::str::from_utf8(&body)
-            .expect("utf8 response")
-            .contains("RaftLogPressure")
+    assert_eq!(
+        crate::render::error_code_of(write).await,
+        ursula_headers::ErrorCode::RaftLogPressure
     );
     // The marked refusal created nothing.
     assert_eq!(

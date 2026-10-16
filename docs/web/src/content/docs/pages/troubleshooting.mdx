@@ -71,7 +71,7 @@ A 200 response does not certify full redundancy. Keep maintenance blocked until
 `ursulactl wait-ready` succeeds. Alert separately on incomplete voter sets in
 the maintenance report, as described in [Observability](/docs/observability).
 
-### `503` with `ApplyStopped` from one group
+### `503` with `APPLY_STOPPED` from one group
 
 A committed command failed to apply and stopped that group on this replica.
 The node stays ready and serves its other groups. Its maintenance report names
@@ -263,13 +263,13 @@ Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` 
 
 ### `503` with `Retry-After` on append
 
-Inspect the JSON error. `WalDiskPressure` means the WAL filesystem is below
+Inspect the error body's `error.code`. `WAL_DISK_PRESSURE` means the WAL filesystem is below
 `raft.wal.min_available_size` (or its free-space stat failed); the node also
 becomes unready and attempts to yield its leaders. Free space or expand the
 volume. Admission resumes only at `raft.wal.resume_available_size`, preventing
 probe flapping.
 
-`RaftLogPressure` means the node's unsnapshotted Raft log is over twice
+`RAFT_LOG_PRESSURE` means the node's unsnapshotted Raft log is over twice
 `raft.snapshot_log_budget`. The node refuses writes with a body until
 snapshots bring the log below 1.5 times the budget. Before it gets there, the
 snapshot driver runs more snapshot builds at once the further the log is past
@@ -284,23 +284,23 @@ captured state and, while it uploads, the compressed snapshot, so raise the
 builds only as far as the node's memory holds that many builds of its largest
 groups. Set it to `1` to keep one build at a time, as before 0.7.4.
 
-`IngressBodyBytesLimitReached` means the write bodies in flight on the node
+`INGRESS_BODY_BYTES_LIMIT_REACHED` means the write bodies in flight on the node
 leave too little of `server.http_inflight_body_size` for this one.
 
-`SnapshotCommitsBusy` means that the node copies as many snapshot commits from
-parts as it may, two at once. `SnapshotCommitInProgress` means that the node
+`SNAPSHOT_COMMITS_BUSY` means that the node copies as many snapshot commits from
+parts as it may, two at once. `SNAPSHOT_COMMIT_IN_PROGRESS` means that the node
 copies this same commit now: repeat it, and it answers once the commit ends.
 `snapshot_commits_busy` in `/__ursula/metrics` counts the first.
 
-`WalDiskPressure`, `RaftLogPressure` and `IngressBodyBytesLimitReached` are
+`WAL_DISK_PRESSURE`, `RAFT_LOG_PRESSURE` and `INGRESS_BODY_BYTES_LIMIT_REACHED` are
 write admission refusals.
 
-Other `503`s come from the stream's Raft group, and their text names the
-cause. `ColdBackpressure` means that the group's hot ring would exceed
+Other `503`s come from the stream's Raft group, and their code names the
+cause. `COLD_BACKPRESSURE` means that the group's hot ring would exceed
 `storage.cold.max_hot_size_per_group`: cold flush isn't keeping up, or the
 cold backend is slow or erroring out. Raise the per-group ceiling, lower
 `storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or
-fix the cold backend. `RaftUncommittedBackpressure` means that the group's
+fix the cold backend. `RAFT_UNCOMMITTED_BACKPRESSURE` means that the group's
 write bytes that are proposed but not yet applied would exceed
 `raft.max_uncommitted_size_per_group`.
 

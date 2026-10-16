@@ -23,7 +23,7 @@ use ursula_headers::SizeLimit;
 use crate::MAX_HTTP_BODY_BYTES;
 use crate::front_door;
 use crate::limits;
-use crate::render::error_answer;
+use crate::render::fixed_error_answer;
 use crate::wal_disk::WalDiskMonitor;
 
 const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
@@ -102,34 +102,15 @@ pub(crate) enum AdmissionRefusal {
     IngressBodyBytesLimitReached,
 }
 
-impl AdmissionRefusal {
-    /// The refusal's code, in its error body.
-    fn code(self) -> ErrorCode {
-        match self {
-            Self::BodyTooLarge(limit) => limit.error_code(),
-            Self::WalDiskPressure => ErrorCode::WalDiskPressure,
-            Self::RaftLogPressure => ErrorCode::RaftLogPressure,
-            Self::IngressBodyBytesLimitReached => ErrorCode::IngressBodyBytesLimitReached,
-        }
-    }
-}
-
 impl IntoResponse for AdmissionRefusal {
     fn into_response(self) -> Response {
         match self {
             Self::BodyTooLarge(limit) => limits::size_refusal(limit),
-            Self::WalDiskPressure => retry_after_json(
-                self.code(),
-                "the WAL filesystem is below its free-space floor; retry",
-            ),
-            Self::RaftLogPressure => retry_after_json(
-                self.code(),
-                "the node's Raft log is over its hard limit; retry",
-            ),
-            Self::IngressBodyBytesLimitReached => retry_after_json(
-                self.code(),
-                "the node's in-flight request bodies fill its budget; retry",
-            ),
+            Self::WalDiskPressure => retry_after_json(ErrorCode::WalDiskPressure),
+            Self::RaftLogPressure => retry_after_json(ErrorCode::RaftLogPressure),
+            Self::IngressBodyBytesLimitReached => {
+                retry_after_json(ErrorCode::IngressBodyBytesLimitReached)
+            }
         }
     }
 }
@@ -328,12 +309,13 @@ fn is_write_method(method: &Method) -> bool {
     )
 }
 
-/// A `503` with `Retry-After: 1` whose error body names `code`.
-pub(crate) fn retry_after_json(code: ErrorCode, message: impl Into<String>) -> Response {
+/// A `503` with `Retry-After: 1` whose error body names `code`, with its
+/// fixed message.
+pub(crate) fn retry_after_json(code: ErrorCode) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),
     );
-    error_answer(StatusCode::SERVICE_UNAVAILABLE, code, message, headers)
+    fixed_error_answer(StatusCode::SERVICE_UNAVAILABLE, code, headers)
 }

@@ -90,6 +90,7 @@ use crate::front_door::HeadDecision;
 use crate::limits;
 use crate::render::error_answer;
 use crate::render::error_response;
+use crate::render::fixed_error_response;
 use crate::render::insert_default_response_headers;
 use crate::render::insert_header_str;
 use crate::render::insert_offset;
@@ -280,23 +281,18 @@ impl IntoResponse for PartsRefusal {
                 (StatusCode::BAD_REQUEST, ErrorCode::SnapshotDigestMismatch)
             }
             Self::Body(_) => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
-            Self::Busy => {
-                return retry_after_json(ErrorCode::SnapshotCommitsBusy, self.to_string());
-            }
-            Self::InProgress => {
-                return retry_after_json(ErrorCode::SnapshotCommitInProgress, self.to_string());
-            }
+            Self::Busy => return retry_after_json(ErrorCode::SnapshotCommitsBusy),
+            Self::InProgress => return retry_after_json(ErrorCode::SnapshotCommitInProgress),
             Self::ColdStore(err) => {
                 tracing::warn!(error = %err, "snapshot parts in the cold store failed");
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    ErrorCode::ColdStoreFailed,
-                    "snapshot parts in the cold store failed",
-                );
+                return fixed_error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed);
             }
             Self::Invariant(err) => {
                 tracing::error!(error = %err, "a snapshot part value is outside the protocol");
-                (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+                return fixed_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorCode::Internal,
+                );
             }
         };
         error_response(status, code, self.to_string())

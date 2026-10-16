@@ -41,6 +41,7 @@ use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
 use super::GroupHeadStreamFuture;
+use super::GroupInfraError;
 use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
@@ -1083,13 +1084,21 @@ impl InMemoryGroupEngine {
                                         page_id: segment.page_id,
                                     })
                                     .await
-                                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                                    .map_err(|err| {
+                                        GroupEngineError::Infra(GroupInfraError::ColdStore {
+                                            detail: err.to_string(),
+                                        })
+                                    })?;
                                 Self::read_cold_index_segment(cold_store, cache, stream_id, segment)
                                     .await
                             }
                             other => other,
                         }
-                        .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                        .map_err(|err| {
+                            GroupEngineError::Infra(GroupInfraError::ColdStore {
+                                detail: err.to_string(),
+                            })
+                        })?;
                     payload.extend_from_slice(&bytes);
                 }
                 StreamReadSegment::Object(segment) => {
@@ -1108,7 +1117,11 @@ impl InMemoryGroupEngine {
                             segment.len,
                         )
                         .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                        .map_err(|err| {
+                            GroupEngineError::Infra(GroupInfraError::ColdStore {
+                                detail: err.to_string(),
+                            })
+                        })?;
                     payload.extend_from_slice(&bytes);
                 }
             }
@@ -1662,7 +1675,11 @@ impl GroupEngine for InMemoryGroupEngine {
                         object,
                     )
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    .map_err(|err| {
+                        GroupEngineError::Infra(GroupInfraError::ColdStore {
+                            detail: err.to_string(),
+                        })
+                    })?;
                     report.page_entries_clipped =
                         report.page_entries_clipped.saturating_add(clipped);
                 }
@@ -1978,7 +1995,11 @@ impl GroupEngine for InMemoryGroupEngine {
             let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    .map_err(|err| {
+                        GroupEngineError::Infra(GroupInfraError::ColdStore {
+                            detail: err.to_string(),
+                        })
+                    })?;
             if !retention_targets.is_empty() {
                 let (_, completed) = collect_retained_cold_objects(
                     &cold_store,
@@ -2063,7 +2084,11 @@ impl GroupEngine for InMemoryGroupEngine {
                     &request.chunk,
                 )
                 .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                .map_err(|err| {
+                    GroupEngineError::Infra(GroupInfraError::ColdStore {
+                        detail: err.to_string(),
+                    })
+                })?;
                 // The clip rule may have removed stale entries that a cached
                 // page still holds.
                 if clipped_entries(&rollback) > 0
@@ -2080,7 +2105,11 @@ impl GroupEngine for InMemoryGroupEngine {
                     if let Some((store, rollback)) = index_rollback {
                         rollback_cold_index_pages(&store, rollback)
                             .await
-                            .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                            .map_err(|err| {
+                                GroupEngineError::Infra(GroupInfraError::ColdStore {
+                                    detail: err.to_string(),
+                                })
+                            })?;
                     }
                     Err(GroupEngineError::new(format!(
                         "unexpected flush cold write response: {other:?}"

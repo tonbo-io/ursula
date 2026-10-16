@@ -47,16 +47,30 @@ impl IdentityHeaders {
 }
 
 /// Adds the router's answer metadata. `identity` is sent on every answer to
-/// a `HEAD`, when the router serves streams: the client plane, whose error
-/// answers all carry an error body.
+/// a `HEAD`, when the router serves streams. `error_bodies` gives an error
+/// body to every error answer no handler rendered, on the client plane.
 #[derive(Clone)]
 pub(crate) struct ResponseMetadataLayer {
     identity: Option<IdentityHeaders>,
+    error_bodies: bool,
 }
 
 impl ResponseMetadataLayer {
-    pub(crate) fn new(identity: Option<IdentityHeaders>) -> Self {
-        Self { identity }
+    /// The client plane's: identity on `HEAD` and an error body on every
+    /// error answer outside the operator paths.
+    pub(crate) fn client(identity: IdentityHeaders) -> Self {
+        Self {
+            identity: Some(identity),
+            error_bodies: true,
+        }
+    }
+
+    /// The admin plane's: neither, only the typed `413`.
+    pub(crate) fn admin() -> Self {
+        Self {
+            identity: None,
+            error_bodies: false,
+        }
     }
 }
 
@@ -70,6 +84,7 @@ impl<S> Layer<S> for ResponseMetadataLayer {
         ResponseMetadata {
             inner,
             identity: self.identity.clone(),
+            error_bodies: self.error_bodies,
         }
     }
 }
@@ -79,6 +94,7 @@ impl<S> Layer<S> for ResponseMetadataLayer {
 pub(crate) struct ResponseMetadata<S> {
     inner: S,
     identity: Option<IdentityHeaders>,
+    error_bodies: bool,
 }
 
 impl<S> Service<Request<Body>> for ResponseMetadata<S>
@@ -101,7 +117,7 @@ where
             None
         };
         let error_bodies =
-            self.identity.is_some() && !request.uri().path().starts_with(OPERATOR_PATH_PREFIX);
+            self.error_bodies && !request.uri().path().starts_with(OPERATOR_PATH_PREFIX);
         let future = self.inner.call(request);
         Box::pin(async move {
             let mut response = future.await?;

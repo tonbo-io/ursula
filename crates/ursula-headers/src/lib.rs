@@ -23,8 +23,8 @@
 //! - the `412` of the incarnation precondition and the `409` of a closed
 //!   stream;
 //! - the JSON body of every error answer,
-//!   `{"error":"<code>","message":"<detail>"}`, with its stable code
-//!   (Section 11).
+//!   `{"error":{"code":"<code>","message":"<detail>"}}`, with its stable
+//!   code (Section 11).
 //!
 //! Not yet typed: the `400` of a `Producer-Digest` mismatch, the answer of a
 //! retention request (`Stream-Retained-Offset`), and the immutable-read

@@ -3885,11 +3885,17 @@ mod refused_bodies {
 }
 
 /// Every answer the gateway sends itself carries the error body Ursula
-/// renders, `{"error":"<code>"}`, beside its typed headers.
+/// renders, `{"error":{"code":"<code>","message":"<message>"}}`, beside its
+/// typed headers.
 #[tokio::test]
 async fn the_gateways_own_answers_carry_an_error_body() {
     let cases = [
         (Refusal::NotFound.into_response(), 404, ErrorCode::NotFound),
+        (
+            Refusal::Concealed.into_response(),
+            404,
+            ErrorCode::BucketNotFound,
+        ),
         (
             Refusal::Authentication(AuthenticationError::InvalidCredential).into_response(),
             401,
@@ -3999,4 +4005,42 @@ async fn the_gateways_own_answers_carry_an_error_body() {
         // No internal address leaks into a message.
         assert!(!parsed.message.contains("node:4437"), "{code}");
     }
+}
+
+/// A concealing `404` is the node's `404` for a bucket nothing created,
+/// byte for byte: the same status, headers and body (the node side is
+/// pinned by `ursula`'s `error_body_tests`).
+#[tokio::test]
+async fn a_concealing_404_is_the_nodes_missing_bucket_404() {
+    let response = Refusal::Concealed.into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().expect("text").to_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    assert_eq!(headers, vec![
+        ("cache-control".to_owned(), "no-store".to_owned()),
+        ("content-type".to_owned(), "application/json".to_owned()),
+        (
+            "cross-origin-resource-policy".to_owned(),
+            "cross-origin".to_owned()
+        ),
+        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+    ]);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(
+        body,
+        ErrorBody::fixed(ErrorCode::BucketNotFound)
+            .render()
+            .as_bytes()
+    );
 }

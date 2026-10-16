@@ -75,105 +75,12 @@ use crate::limits;
 
 const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
 
-pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
+/// The status and code of a runtime error's answer: the one mapping of a
+/// runtime error to its answer.
+pub(crate) fn runtime_error_answer(err: &RuntimeError) -> (StatusCode, ErrorCode) {
     match err {
         RuntimeError::InvalidRaftGroup { .. } | RuntimeError::SnapshotPlacementMismatch { .. } => {
-            StatusCode::BAD_REQUEST
-        }
-        RuntimeError::InvalidConfig(_)
-        | RuntimeError::ColdStoreConfig { .. }
-        | RuntimeError::StaticMembershipConfig { .. }
-        | RuntimeError::ColdStoreIo { .. }
-        | RuntimeError::MailboxClosed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        RuntimeError::ResponseDropped { .. }
-        | RuntimeError::SpawnCoreThread { .. }
-        | RuntimeError::GroupRestartAborted { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        RuntimeError::LiveReadBackpressure { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
-        // fallback when no routing target is available.
-        RuntimeError::GroupNotHosted { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        RuntimeError::GroupEngine { error, .. }
-            if error.is_backpressure() || error.is_history_pending() =>
-        {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-        RuntimeError::GroupEngine {
-            error:
-                ursula_runtime::GroupEngineError::Infra(
-                    ursula_runtime::GroupInfraError::ApplyStopped { .. }
-                    | ursula_runtime::GroupInfraError::OutcomeUnknown,
-                ),
-            ..
-        } => StatusCode::SERVICE_UNAVAILABLE,
-        // Refused before proposal: nothing was written and a retry fails too.
-        RuntimeError::GroupEngine {
-            error:
-                ursula_runtime::GroupEngineError::Infra(
-                    ursula_runtime::GroupInfraError::InvalidRaftCommand { .. },
-                ),
-            ..
-        } => StatusCode::BAD_REQUEST,
-        RuntimeError::GroupEngine { error, .. } => match error.code() {
-            Some(code) => stream_error_code_status(code),
-            None => StatusCode::INTERNAL_SERVER_ERROR,
-        },
-    }
-}
-
-pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
-    match code {
-        StreamErrorCode::StreamGone => StatusCode::GONE,
-        StreamErrorCode::BucketErased => StatusCode::NOT_FOUND,
-        StreamErrorCode::BucketNotFound
-        | StreamErrorCode::StreamNotFound
-        | StreamErrorCode::SnapshotNotFound => StatusCode::NOT_FOUND,
-        StreamErrorCode::ContentTypeMismatch
-        | StreamErrorCode::StreamAlreadyExistsConflict
-        | StreamErrorCode::StreamClosed
-        | StreamErrorCode::StreamSeqConflict
-        | StreamErrorCode::SnapshotConflict
-        | StreamErrorCode::ProducerSeqConflict
-        | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
-        StreamErrorCode::ProducerEpochClosed
-        | StreamErrorCode::ProducerEpochStale
-        | StreamErrorCode::ProducerExpired
-        | StreamErrorCode::ProducerKeyConflict => StatusCode::FORBIDDEN,
-        StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
-        StreamErrorCode::InvalidBucketId
-        | StreamErrorCode::ProducerDigestMismatch
-        | StreamErrorCode::InvalidStreamId
-        | StreamErrorCode::MissingContentType
-        | StreamErrorCode::EmptyAppend
-        | StreamErrorCode::InvalidProducer
-        | StreamErrorCode::InvalidRetention
-        | StreamErrorCode::InvalidColdFlush
-        | StreamErrorCode::InvalidSnapshot
-        | StreamErrorCode::InvalidRecordBoundaries
-        | StreamErrorCode::ImportInvalid => StatusCode::BAD_REQUEST,
-        // F3 producer cap.
-        StreamErrorCode::ProducerLimit => StatusCode::TOO_MANY_REQUESTS,
-        // The HTTP layer verifies the boundary and proposes again; reaching
-        // a client means the stream changed during the check (fail closed).
-        StreamErrorCode::JsonBoundaryUnverified => StatusCode::SERVICE_UNAVAILABLE,
-        // D12: 412, never 409, so it does not mix with `Stream-Seq` and
-        // producer conflicts.
-        StreamErrorCode::IncarnationMismatch => StatusCode::PRECONDITION_FAILED,
-        // The proposer's clock is about 140,000 years ahead: a server fault
-        // a retry does not fix.
-        StreamErrorCode::CreatedAtOutOfRange => StatusCode::INTERNAL_SERVER_ERROR,
-        // A write that raced its group's genesis applied nothing; a retry
-        // soon succeeds.
-        StreamErrorCode::HistoryPending => StatusCode::SERVICE_UNAVAILABLE,
-    }
-}
-
-/// The code of a runtime error's body. It names what the status names:
-/// the stream's refusal for a stream error, the node's condition for a
-/// `503`, and [`ErrorCode::Internal`] for a fault.
-pub(crate) fn runtime_error_code(err: &RuntimeError) -> ErrorCode {
-    match err {
-        RuntimeError::InvalidRaftGroup { .. } | RuntimeError::SnapshotPlacementMismatch { .. } => {
-            ErrorCode::InvalidRequest
+            (StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest)
         }
         RuntimeError::InvalidConfig(_)
         | RuntimeError::ColdStoreConfig { .. }
@@ -181,31 +88,49 @@ pub(crate) fn runtime_error_code(err: &RuntimeError) -> ErrorCode {
         | RuntimeError::MailboxClosed { .. }
         | RuntimeError::ResponseDropped { .. }
         | RuntimeError::SpawnCoreThread { .. }
-        | RuntimeError::GroupRestartAborted { .. } => ErrorCode::Internal,
-        RuntimeError::ColdStoreIo { .. } => ErrorCode::ColdStoreFailed,
-        RuntimeError::LiveReadBackpressure { .. } => ErrorCode::LiveReadBackpressure,
-        RuntimeError::GroupNotHosted { .. } => ErrorCode::NoLeader,
+        | RuntimeError::GroupRestartAborted { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+        }
+        RuntimeError::ColdStoreIo { .. } => (StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed),
+        RuntimeError::LiveReadBackpressure { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::LiveReadBackpressure,
+        ),
+        // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
+        // fallback when no routing target is available.
+        RuntimeError::GroupNotHosted { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
+        }
         RuntimeError::GroupEngine { error, .. } => match error {
-            GroupEngineError::Stream(_) => {
-                error.code().map_or(ErrorCode::Internal, stream_error_code)
-            }
-            GroupEngineError::Infra(infra) => infra_error_code(infra),
+            GroupEngineError::Stream(_) => error.code().map_or(
+                (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
+                stream_error_answer,
+            ),
+            GroupEngineError::Infra(infra) => infra_error_answer(infra),
             // A forward the caller did not route answers `500`.
-            GroupEngineError::ForwardToLeader { .. } => ErrorCode::Internal,
+            GroupEngineError::ForwardToLeader { .. } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+            }
         },
     }
 }
 
-fn infra_error_code(err: &GroupInfraError) -> ErrorCode {
+fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
+    let unavailable = |code| (StatusCode::SERVICE_UNAVAILABLE, code);
     match err {
-        GroupInfraError::ColdBackpressure { .. } => ErrorCode::ColdBackpressure,
+        GroupInfraError::ColdBackpressure { .. } => unavailable(ErrorCode::ColdBackpressure),
         GroupInfraError::RaftUncommittedBackpressure { .. } => {
-            ErrorCode::RaftUncommittedBackpressure
+            unavailable(ErrorCode::RaftUncommittedBackpressure)
         }
-        GroupInfraError::RecoveryPending { .. } => ErrorCode::HistoryPending,
-        GroupInfraError::ApplyStopped { .. } => ErrorCode::ApplyStopped,
-        GroupInfraError::OutcomeUnknown => ErrorCode::OutcomeUnknown,
-        GroupInfraError::InvalidRaftCommand { .. } => ErrorCode::InvalidRequest,
+        GroupInfraError::RecoveryPending { .. } => unavailable(ErrorCode::HistoryPending),
+        GroupInfraError::ApplyStopped { .. } => unavailable(ErrorCode::ApplyStopped),
+        GroupInfraError::OutcomeUnknown => unavailable(ErrorCode::OutcomeUnknown),
+        // Refused before proposal: nothing was written and a retry fails too.
+        GroupInfraError::InvalidRaftCommand { .. } => {
+            (StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest)
+        }
+        // The same failure a snapshot read answers.
+        GroupInfraError::ColdStore { .. } => (StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed),
         GroupInfraError::RecoveryNodeMismatch { .. }
         | GroupInfraError::RaftGroupNotRegistered { .. }
         | GroupInfraError::RecoveryAlreadyBound { .. }
@@ -216,47 +141,117 @@ fn infra_error_code(err: &GroupInfraError) -> ErrorCode {
         | GroupInfraError::RecoveryPlanFenced { .. }
         | GroupInfraError::OwnerStopped
         | GroupInfraError::Internal { .. }
-        | GroupInfraError::ProtoDecode { .. } => ErrorCode::Internal,
+        | GroupInfraError::ProtoDecode { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+        }
     }
 }
 
-/// The code of a stream refusal: the refusal's own name.
-pub(crate) fn stream_error_code(code: StreamErrorCode) -> ErrorCode {
+/// The status and code of a stream refusal; the code is the refusal's own
+/// name.
+pub(crate) fn stream_error_answer(code: StreamErrorCode) -> (StatusCode, ErrorCode) {
+    use StatusCode as S;
     match code {
-        StreamErrorCode::InvalidBucketId => ErrorCode::InvalidBucketId,
-        StreamErrorCode::InvalidStreamId => ErrorCode::InvalidStreamId,
-        StreamErrorCode::BucketNotFound => ErrorCode::BucketNotFound,
-        StreamErrorCode::BucketErased => ErrorCode::BucketErased,
-        StreamErrorCode::StreamNotFound => ErrorCode::StreamNotFound,
-        StreamErrorCode::StreamGone => ErrorCode::StreamGone,
-        StreamErrorCode::StreamAlreadyExistsConflict => ErrorCode::StreamAlreadyExistsConflict,
-        StreamErrorCode::MissingContentType => ErrorCode::MissingContentType,
-        StreamErrorCode::ContentTypeMismatch => ErrorCode::ContentTypeMismatch,
-        StreamErrorCode::EmptyAppend => ErrorCode::EmptyAppend,
-        StreamErrorCode::StreamClosed => ErrorCode::StreamClosed,
-        StreamErrorCode::StreamSeqConflict => ErrorCode::StreamSeqConflict,
-        StreamErrorCode::InvalidProducer => ErrorCode::InvalidProducer,
-        StreamErrorCode::ProducerEpochClosed => ErrorCode::ProducerEpochClosed,
-        StreamErrorCode::ProducerExpired => ErrorCode::ProducerExpired,
-        StreamErrorCode::ProducerEpochStale => ErrorCode::ProducerEpochStale,
-        StreamErrorCode::ProducerKeyConflict => ErrorCode::ProducerKeyConflict,
-        StreamErrorCode::ProducerDigestMismatch => ErrorCode::ProducerDigestMismatch,
-        StreamErrorCode::ProducerSeqConflict => ErrorCode::ProducerSeqConflict,
-        StreamErrorCode::InvalidRetention => ErrorCode::InvalidRetention,
-        StreamErrorCode::OffsetOutOfRange => ErrorCode::OffsetOutOfRange,
-        StreamErrorCode::InvalidColdFlush => ErrorCode::InvalidColdFlush,
-        StreamErrorCode::InvalidSnapshot => ErrorCode::InvalidSnapshot,
-        StreamErrorCode::SnapshotNotFound => ErrorCode::SnapshotNotFound,
-        StreamErrorCode::SnapshotConflict => ErrorCode::SnapshotConflict,
-        StreamErrorCode::InvalidRecordBoundaries => ErrorCode::InvalidRecordBoundaries,
-        StreamErrorCode::JsonBoundaryUnverified => ErrorCode::JsonBoundaryUnverified,
-        StreamErrorCode::ImportConflict => ErrorCode::ImportConflict,
-        StreamErrorCode::ImportInvalid => ErrorCode::ImportInvalid,
-        StreamErrorCode::ProducerLimit => ErrorCode::ProducerLimit,
-        StreamErrorCode::CreatedAtOutOfRange => ErrorCode::CreatedAtOutOfRange,
-        StreamErrorCode::IncarnationMismatch => ErrorCode::IncarnationMismatch,
-        StreamErrorCode::HistoryPending => ErrorCode::HistoryPending,
+        StreamErrorCode::InvalidBucketId => (S::BAD_REQUEST, ErrorCode::InvalidBucketId),
+        StreamErrorCode::InvalidStreamId => (S::BAD_REQUEST, ErrorCode::InvalidStreamId),
+        StreamErrorCode::BucketNotFound => (S::NOT_FOUND, ErrorCode::BucketNotFound),
+        StreamErrorCode::BucketErased => (S::NOT_FOUND, ErrorCode::BucketErased),
+        StreamErrorCode::StreamNotFound => (S::NOT_FOUND, ErrorCode::StreamNotFound),
+        StreamErrorCode::StreamGone => (S::GONE, ErrorCode::StreamGone),
+        StreamErrorCode::StreamAlreadyExistsConflict => {
+            (S::CONFLICT, ErrorCode::StreamAlreadyExistsConflict)
+        }
+        StreamErrorCode::MissingContentType => (S::BAD_REQUEST, ErrorCode::MissingContentType),
+        StreamErrorCode::ContentTypeMismatch => (S::CONFLICT, ErrorCode::ContentTypeMismatch),
+        StreamErrorCode::EmptyAppend => (S::BAD_REQUEST, ErrorCode::EmptyAppend),
+        StreamErrorCode::StreamClosed => (S::CONFLICT, ErrorCode::StreamClosed),
+        StreamErrorCode::StreamSeqConflict => (S::CONFLICT, ErrorCode::StreamSeqConflict),
+        StreamErrorCode::InvalidProducer => (S::BAD_REQUEST, ErrorCode::InvalidProducer),
+        StreamErrorCode::ProducerEpochClosed => (S::FORBIDDEN, ErrorCode::ProducerEpochClosed),
+        StreamErrorCode::ProducerExpired => (S::FORBIDDEN, ErrorCode::ProducerExpired),
+        StreamErrorCode::ProducerEpochStale => (S::FORBIDDEN, ErrorCode::ProducerEpochStale),
+        StreamErrorCode::ProducerKeyConflict => (S::FORBIDDEN, ErrorCode::ProducerKeyConflict),
+        StreamErrorCode::ProducerDigestMismatch => {
+            (S::BAD_REQUEST, ErrorCode::ProducerDigestMismatch)
+        }
+        StreamErrorCode::ProducerSeqConflict => (S::CONFLICT, ErrorCode::ProducerSeqConflict),
+        StreamErrorCode::InvalidRetention => (S::BAD_REQUEST, ErrorCode::InvalidRetention),
+        StreamErrorCode::OffsetOutOfRange => {
+            (S::RANGE_NOT_SATISFIABLE, ErrorCode::OffsetOutOfRange)
+        }
+        StreamErrorCode::InvalidColdFlush => (S::BAD_REQUEST, ErrorCode::InvalidColdFlush),
+        StreamErrorCode::InvalidSnapshot => (S::BAD_REQUEST, ErrorCode::InvalidSnapshot),
+        StreamErrorCode::SnapshotNotFound => (S::NOT_FOUND, ErrorCode::SnapshotNotFound),
+        StreamErrorCode::SnapshotConflict => (S::CONFLICT, ErrorCode::SnapshotConflict),
+        StreamErrorCode::InvalidRecordBoundaries => {
+            (S::BAD_REQUEST, ErrorCode::InvalidRecordBoundaries)
+        }
+        // The HTTP layer verifies the boundary and proposes again; reaching
+        // a client means the stream changed during the check (fail closed).
+        StreamErrorCode::JsonBoundaryUnverified => {
+            (S::SERVICE_UNAVAILABLE, ErrorCode::JsonBoundaryUnverified)
+        }
+        StreamErrorCode::ImportConflict => (S::CONFLICT, ErrorCode::ImportConflict),
+        StreamErrorCode::ImportInvalid => (S::BAD_REQUEST, ErrorCode::ImportInvalid),
+        // F3 producer cap.
+        StreamErrorCode::ProducerLimit => (S::TOO_MANY_REQUESTS, ErrorCode::ProducerLimit),
+        // The proposer's clock is about 140,000 years ahead: a server fault
+        // a retry does not fix.
+        StreamErrorCode::CreatedAtOutOfRange => {
+            (S::INTERNAL_SERVER_ERROR, ErrorCode::CreatedAtOutOfRange)
+        }
+        // D12: 412, never 409, so it does not mix with `Stream-Seq` and
+        // producer conflicts.
+        StreamErrorCode::IncarnationMismatch => {
+            (S::PRECONDITION_FAILED, ErrorCode::IncarnationMismatch)
+        }
+        // A write that raced its group's genesis applied nothing; a retry
+        // soon succeeds.
+        StreamErrorCode::HistoryPending => (S::SERVICE_UNAVAILABLE, ErrorCode::HistoryPending),
     }
+}
+
+/// The message of a runtime error's answer. A `4xx` stream refusal sends
+/// its own text, which names only what the request named. Every other
+/// answer sends its code's fixed message: a `5xx`, a `503` of pressure or
+/// routing, and the `404`s, whose fixed text a gateway's concealment
+/// repeats. The full error is the server's log's.
+pub(crate) fn runtime_error_message(
+    err: &RuntimeError,
+    status: StatusCode,
+    code: &ErrorCode,
+) -> String {
+    let own_text = status.is_client_error()
+        && status != StatusCode::NOT_FOUND
+        && !matches!(
+            code,
+            ErrorCode::InvalidColdFlush | ErrorCode::ImportConflict | ErrorCode::ImportInvalid
+        );
+    let refusal = match err {
+        RuntimeError::GroupEngine { error, .. } if own_text => error.refusal_text(),
+        _ => None,
+    };
+    refusal.map_or_else(|| code.default_message().to_owned(), str::to_owned)
+}
+
+/// The body of a runtime error's answer, with its status: the one place a
+/// runtime error becomes what a client reads, on an HTTP answer and an SSE
+/// `error` event alike.
+pub(crate) fn runtime_error_body(err: &RuntimeError) -> (StatusCode, ErrorBody) {
+    let (status, code) = runtime_error_answer(err);
+    let message = runtime_error_message(err, status, &code);
+    if status.is_server_error() {
+        tracing::warn!(%status, error = %err, "runtime request failed");
+    } else {
+        tracing::debug!(%status, error = %err, "runtime request refused");
+    }
+    (status, ErrorBody::new(code, message))
+}
+
+/// An SSE `error` event whose data is `body`, the JSON body of an HTTP
+/// error answer, on one line.
+pub(crate) fn sse_error_event(body: &ErrorBody) -> String {
+    format!("event: error\ndata:{}\n\n", sse_safe_line(&body.render()))
 }
 
 /// The code of an error answer's body, for tests: panics unless the
@@ -295,6 +290,18 @@ pub(crate) async fn error_body_of(response: Response) -> ErrorBody {
 #[derive(Debug, Clone, Copy)]
 struct RenderedErrorBody;
 
+/// A response extension that keeps the compression layer off an answer:
+/// a snapshot, whose byte ranges refer to its stored body, and every error
+/// answer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Uncompressed;
+
+/// `response`, which the compression layer leaves alone.
+pub(crate) fn uncompressed(mut response: Response) -> Response {
+    response.extensions_mut().insert(Uncompressed);
+    response
+}
+
 /// [`error_answer`] with no headers of its own.
 pub(crate) fn error_response(
     status: StatusCode,
@@ -304,10 +311,17 @@ pub(crate) fn error_response(
     error_answer(status, code, message, HeaderMap::new())
 }
 
+/// [`error_answer`] with the code's fixed message.
+pub(crate) fn fixed_error_response(status: StatusCode, code: ErrorCode) -> Response {
+    fixed_error_answer(status, code, HeaderMap::new())
+}
+
 /// The one renderer of an error answer on the client plane: `status`, the
 /// default headers, then `headers`, and the JSON body naming `code` with
 /// `message`, a human-readable detail (extensions Section 11). A message
-/// never echoes the request body or a credential.
+/// never echoes the request body or a credential, and names no address,
+/// object key or other internal of the server. Error answers are never
+/// compressed.
 pub(crate) fn error_answer(
     status: StatusCode,
     code: ErrorCode,
@@ -324,12 +338,13 @@ pub(crate) fn error_answer(
     );
     let mut response = (status, all, ErrorBody::new(code, message).render()).into_response();
     response.extensions_mut().insert(RenderedErrorBody);
-    response
+    uncompressed(response)
 }
 
 /// Renders the body of a client-plane error answer that no handler
 /// rendered: axum's `404` of an unknown path, its `405`, its extractor
-/// rejections and its body limit. The code comes from the status alone.
+/// rejections and its body limit. The code comes from the status alone,
+/// and the answer keeps its headers, extensions and version.
 pub(crate) fn render_unrendered_error(response: &mut Response) {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
@@ -337,21 +352,31 @@ pub(crate) fn render_unrendered_error(response: &mut Response) {
     {
         return;
     }
-    let (code, message) = match status {
-        StatusCode::NOT_FOUND => (ErrorCode::NotFound, "no route serves this path"),
-        StatusCode::METHOD_NOT_ALLOWED => (
-            ErrorCode::MethodNotAllowed,
-            "the route does not serve this method",
-        ),
-        StatusCode::PAYLOAD_TOO_LARGE => (
-            ErrorCode::RequestTooLarge,
-            "the request body is above the request limit",
-        ),
-        status if status.is_server_error() => (ErrorCode::Internal, "the server failed"),
-        _ => (ErrorCode::InvalidRequest, "the request is malformed"),
+    let code = match status {
+        StatusCode::NOT_FOUND => ErrorCode::NotFound,
+        StatusCode::METHOD_NOT_ALLOWED => ErrorCode::MethodNotAllowed,
+        StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::RequestTooLarge,
+        status if status.is_server_error() => ErrorCode::Internal,
+        _ => ErrorCode::InvalidRequest,
     };
-    let headers = std::mem::take(response.headers_mut());
-    *response = error_answer(status, code, message, headers);
+    let (parts, _body) = std::mem::take(response).into_parts();
+    let rendered = fixed_error_answer(status, code, parts.headers);
+    let (mut rendered_parts, body) = rendered.into_parts();
+    let mut extensions = parts.extensions;
+    extensions.extend(rendered_parts.extensions);
+    rendered_parts.extensions = extensions;
+    rendered_parts.version = parts.version;
+    *response = Response::from_parts(rendered_parts, body);
+}
+
+/// [`error_answer`] with the code's fixed message.
+pub(crate) fn fixed_error_answer(
+    status: StatusCode,
+    code: ErrorCode,
+    headers: HeaderMap,
+) -> Response {
+    let body = ErrorBody::fixed(code);
+    error_answer(status, body.code, body.message, headers)
 }
 
 /// `Stream-Incarnation` (D12): the opaque token of the stream incarnation
@@ -1280,13 +1305,65 @@ mod tests {
     use ursula_runtime::ClosedEpoch;
     use ursula_runtime::ProducerRefusal;
     use ursula_runtime::RuntimeError;
+    use ursula_runtime::StreamErrorCode;
     use ursula_runtime::StreamErrorContext;
 
     use super::insert_cache_control;
     use super::insert_default_response_headers;
     use super::producer_refusal_answer;
-    use super::runtime_error_status;
-    use super::stream_error_code_status;
+    use super::runtime_error_answer;
+    use super::stream_error_answer;
+
+    /// Each stream refusal's code is its own name in the wire's case, so a
+    /// swapped arm fails here.
+    #[test]
+    fn a_stream_refusals_code_is_its_name() {
+        for code in [
+            StreamErrorCode::InvalidBucketId,
+            StreamErrorCode::InvalidStreamId,
+            StreamErrorCode::BucketNotFound,
+            StreamErrorCode::BucketErased,
+            StreamErrorCode::StreamNotFound,
+            StreamErrorCode::StreamGone,
+            StreamErrorCode::StreamAlreadyExistsConflict,
+            StreamErrorCode::MissingContentType,
+            StreamErrorCode::ContentTypeMismatch,
+            StreamErrorCode::EmptyAppend,
+            StreamErrorCode::StreamClosed,
+            StreamErrorCode::StreamSeqConflict,
+            StreamErrorCode::InvalidProducer,
+            StreamErrorCode::ProducerEpochClosed,
+            StreamErrorCode::ProducerExpired,
+            StreamErrorCode::ProducerEpochStale,
+            StreamErrorCode::ProducerKeyConflict,
+            StreamErrorCode::ProducerDigestMismatch,
+            StreamErrorCode::ProducerSeqConflict,
+            StreamErrorCode::InvalidRetention,
+            StreamErrorCode::OffsetOutOfRange,
+            StreamErrorCode::InvalidColdFlush,
+            StreamErrorCode::InvalidSnapshot,
+            StreamErrorCode::SnapshotNotFound,
+            StreamErrorCode::SnapshotConflict,
+            StreamErrorCode::InvalidRecordBoundaries,
+            StreamErrorCode::JsonBoundaryUnverified,
+            StreamErrorCode::ImportConflict,
+            StreamErrorCode::ImportInvalid,
+            StreamErrorCode::ProducerLimit,
+            StreamErrorCode::CreatedAtOutOfRange,
+            StreamErrorCode::IncarnationMismatch,
+            StreamErrorCode::HistoryPending,
+        ] {
+            let name = format!("{code:?}");
+            let mut wire = String::new();
+            for (index, c) in name.char_indices() {
+                if c.is_ascii_uppercase() && index > 0 {
+                    wire.push('_');
+                }
+                wire.push(c.to_ascii_uppercase());
+            }
+            assert_eq!(stream_error_answer(code).1.as_str(), wire);
+        }
+    }
 
     /// The late path's status comes from the refusal's error code, the
     /// answer's from `ProducerAnswer::status`: they agree for every refusal.
@@ -1307,7 +1384,7 @@ mod tests {
                 .expect("a producer context")
                 .expect("an answer");
             assert_eq!(
-                stream_error_code_status(refusal.code()).as_u16(),
+                stream_error_answer(refusal.code()).0.as_u16(),
                 answer.status(),
                 "{refusal:?}"
             );
@@ -1361,7 +1438,7 @@ mod tests {
                 error: ursula_runtime::GroupEngineError::Infra(error),
             };
             assert_eq!(
-                runtime_error_status(&error),
+                runtime_error_answer(&error).0,
                 StatusCode::SERVICE_UNAVAILABLE
             );
             assert!(!error.to_string().contains("panic payload"));
@@ -1375,6 +1452,9 @@ mod tests {
                 },
             ),
         };
-        assert_eq!(runtime_error_status(&unproposable), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            runtime_error_answer(&unproposable).0,
+            StatusCode::BAD_REQUEST
+        );
     }
 }

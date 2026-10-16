@@ -105,6 +105,7 @@ use tower_http::compression::predicate::SizeAbove;
 use ursula_headers::ByteRange;
 use ursula_headers::ClusterId;
 use ursula_headers::ContentRange;
+use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError as ProducerHeaderError;
 use ursula_headers::IncarnationMismatch;
@@ -175,10 +176,13 @@ use crate::admission::PendingAdmission;
 use crate::admission::ingress_admission_middleware;
 use crate::front_door::BodyState;
 use crate::front_door::HeadDecision;
+use crate::render::Uncompressed;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
 use crate::render::error_answer;
 use crate::render::error_response;
+use crate::render::fixed_error_answer;
+use crate::render::fixed_error_response;
 use crate::render::http_read_content_type;
 use crate::render::insert_cache_control;
 use crate::render::insert_content_type;
@@ -206,12 +210,11 @@ use crate::render::read_response;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
 use crate::render::response_cursor;
-use crate::render::runtime_error_code;
-use crate::render::runtime_error_status;
+use crate::render::runtime_error_body;
 use crate::render::should_base64_encode_sse_data;
 use crate::render::snapshot_head;
 use crate::render::snapshot_published_response;
-use crate::render::sse_safe_line;
+use crate::render::sse_error_event;
 use crate::render::stream_head;
 use crate::response_metadata::IdentityHeaders;
 use crate::response_metadata::ResponseMetadataLayer;
@@ -795,7 +798,14 @@ impl ClientWriteLeaderRouter {
         let location = HeaderValue::from_str(&format!("{base}{request_target}")).ok()?;
         headers.insert(LOCATION, location);
         answer.render(|name, value| insert_header_str(&mut headers, name, value));
-        Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
+        Some(
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                headers,
+                "this node does not lead the stream's group",
+            )
+                .into_response(),
+        )
     }
 }
 
@@ -1164,7 +1174,7 @@ fn admin_ops_router(state: HttpState) -> Router {
             require_admin_incarnation,
         ))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(ResponseMetadataLayer::new(None))
+        .layer(ResponseMetadataLayer::admin())
         .with_state(state)
 }
 
@@ -1493,27 +1503,31 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
     leadership_shed_status(State(state)).await
 }
 
+/// Whether the compression layer may compress an answer: a finite JSON or
+/// NDJSON body, never a snapshot answer, which offers byte ranges of its
+/// identity body, and never an error answer ([`Uncompressed`]).
+pub(crate) fn finite_record_response(
+    _status: StatusCode,
+    _version: Version,
+    headers: &HeaderMap,
+    extensions: &axum::http::Extensions,
+) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            let media_type = content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim();
+            media_type == "application/json" || media_type == "application/x-ndjson"
+        })
+        && !headers.contains_key(names::ACCEPT_RANGES)
+        && extensions.get::<Uncompressed>().is_none()
+}
+
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
-    let finite_record_response =
-        |_status: StatusCode,
-         _version: Version,
-         headers: &HeaderMap,
-         _extensions: &axum::http::Extensions| {
-            headers
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|content_type| {
-                    let media_type = content_type
-                        .split(';')
-                        .next()
-                        .unwrap_or(content_type)
-                        .trim();
-                    media_type == "application/json" || media_type == "application/x-ndjson"
-                })
-                // A snapshot answer offers byte ranges of its identity body,
-                // so it is never compressed.
-                && !headers.contains_key(names::ACCEPT_RANGES)
-        };
     let response_compression = CompressionLayer::new()
         .gzip(true)
         .quality(CompressionLevel::Fastest)
@@ -1557,9 +1571,13 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             admission,
             ingress_admission_middleware,
         ))
-        .layer(ResponseMetadataLayer::new(Some(IdentityHeaders::new(
+        // An unknown path gets its error body from this layer only because
+        // the client router's fallback is the one a merged router keeps: the
+        // node merges the client router last, after the cluster and admin
+        // routers (`error_body_tests` pins it on that composition).
+        .layer(ResponseMetadataLayer::client(IdentityHeaders::new(
             state.cluster_id(),
-        ))))
+        )))
         .layer(response_compression)
         .with_state(state)
 }
@@ -1581,10 +1599,9 @@ pub(crate) async fn stage_external_payload(
     payload: &[u8],
 ) -> Result<ExternalPayloadRef, Response> {
     let Some(cold_store) = state.runtime.cold_store() else {
-        return Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::ColdStoreFailed,
-            "cold backend must be configured before externalizing payloads",
+        return Err(fixed_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            ErrorCode::NoColdStore,
         ));
     };
     let s3_path = new_external_payload_path(stream_id);
@@ -3944,11 +3961,19 @@ async fn verify_json_boundary(
             ErrorCode::NotJsonBoundary,
             format!("offset {offset} is not a JSON message boundary"),
         )),
-        None => Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::JsonBoundaryUnverified,
-            format!("could not verify that offset {offset} is a JSON message boundary"),
-        )),
+        None => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+            Err(error_answer(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::JsonBoundaryUnverified,
+                format!("could not verify that offset {offset} is a JSON message boundary"),
+                headers,
+            ))
+        }
     }
 }
 
@@ -4029,7 +4054,7 @@ pub(crate) async fn advance_retention(
     headers: HeaderMap,
 ) -> Response {
     let (stream_id, retained_offset) = path.into_parts();
-    let retained_offset = match parse_snapshot_offset(&retained_offset) {
+    let retained_offset = match parse_path_offset(&retained_offset, "invalid retention offset") {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
@@ -4221,11 +4246,16 @@ pub(crate) async fn bootstrap_stream(
 }
 
 fn parse_snapshot_offset(raw: &str) -> Result<u64, BoxResponse> {
+    parse_path_offset(raw, "invalid snapshot offset")
+}
+
+/// An offset in a request path: a decimal, never `-1`. `message` names it.
+fn parse_path_offset(raw: &str, message: &'static str) -> Result<u64, BoxResponse> {
     let invalid = || {
         Box::new(error_response(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidOffset,
-            "invalid snapshot offset",
+            message,
         ))
     };
     if raw == "-1" {
@@ -4482,13 +4512,11 @@ pub(crate) fn sse_stream(
                     .http_metrics
                     .sse_error_events
                     .fetch_add(1, Ordering::Relaxed);
-                let event = format!(
-                    "event: error\ndata:{}\n\n",
-                    sse_safe_line(
-                        "the stream was deleted and recreated, or its history was rewritten \
-                         (Stream-Incarnation)"
-                    )
-                );
+                let event = sse_error_event(&ErrorBody::new(
+                    ErrorCode::IncarnationMismatch,
+                    "the stream was deleted and recreated, or its history was rewritten \
+                     (Stream-Incarnation)",
+                ));
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
             Ok(read) => read,
@@ -4497,7 +4525,7 @@ pub(crate) fn sse_stream(
                     .http_metrics
                     .sse_error_events
                     .fetch_add(1, Ordering::Relaxed);
-                let event = format!("event: error\ndata:{}\n\n", sse_safe_line(&err.to_string()));
+                let event = sse_error_event(&runtime_error_body(&err).1);
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
         };
@@ -4828,10 +4856,7 @@ pub(crate) fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a
 }
 
 fn runtime_error_response(err: RuntimeError) -> Response {
-    let status = runtime_error_status(&err);
-    if status.is_server_error() {
-        tracing::warn!(%status, error = %err, "runtime request failed");
-    }
+    let (status, body) = runtime_error_body(&err);
     let mut headers = HeaderMap::new();
     insert_retry_after_for_temporary(&mut headers, &err);
     if let Err(render_err) = insert_producer_error_headers(&mut headers, &err) {
@@ -4840,7 +4865,7 @@ fn runtime_error_response(err: RuntimeError) -> Response {
     }
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
-    error_answer(status, runtime_error_code(&err), err.to_string(), headers)
+    error_answer(status, body.code, body.message, headers)
 }
 
 fn insert_retry_after_for_temporary(headers: &mut HeaderMap, err: &RuntimeError) {
@@ -4948,6 +4973,8 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 /// 503 + `Retry-After: 1` for a request that must reach the group leader but
 /// cannot be redirected (purge) or has no known leader. Retryable.
 fn leader_unknown_retry_response(err: RuntimeError) -> Response {
+    // The error names the leader's address: it stays in the log.
+    tracing::warn!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
     let group = match &err {
         RuntimeError::GroupEngine { raft_group_id, .. }
@@ -4964,10 +4991,9 @@ fn leader_unknown_retry_response(err: RuntimeError) -> Response {
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),
     );
-    error_answer(
+    fixed_error_answer(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::NoLeader,
-        err.to_string(),
         headers,
     )
 }

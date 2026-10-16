@@ -578,7 +578,7 @@ proptest! {
         index in 0..crate::error_body::ErrorCode::ALL.len(),
         message in any::<String>(),
     ) {
-        let code = crate::error_body::ErrorCode::ALL.get(index).copied();
+        let code = crate::error_body::ErrorCode::ALL.get(index).cloned();
         prop_assert!(code.is_some());
         if let Some(code) = code {
             let body = ErrorBody::new(code, message);
