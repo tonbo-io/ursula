@@ -276,10 +276,12 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     let response = match client.rejoin_barrier(request).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
-            network
-                .transport
-                .peer_cluster
-                .observe_refusal(leader_id, &network.endpoint, &status);
+            network.transport.peer_cluster.observe_refusal(
+                leader_id,
+                &network.endpoint,
+                &status,
+                std::time::Instant::now(),
+            );
             return Err(status.into());
         }
     };
@@ -1350,10 +1352,12 @@ impl GrpcRaftNetwork {
         // A peer of another cluster refuses every RPC until an operator fixes
         // a configuration: to OpenRaft it is unreachable, so replication backs
         // off instead of retrying at once.
-        let other_cluster =
-            self.transport
-                .peer_cluster
-                .observe_refusal(self.target, &self.endpoint, &status);
+        let other_cluster = self.transport.peer_cluster.observe_refusal(
+            self.target,
+            &self.endpoint,
+            &status,
+            std::time::Instant::now(),
+        );
         let message = format!(
             "{route} to node {} at {} failed: {}",
             self.target, self.endpoint, status
@@ -1491,7 +1495,13 @@ impl GrpcRaftNetwork {
                 // The append stream's calls only see a refused stream close; the
                 // session recorded the refusal. Like a full queue, it is not a
                 // broken channel.
-                let other_cluster = self.transport.peer_cluster.refuses(self.target);
+                // A peer refused within the last minute keeps a failure from counting
+                // toward a rebuild, a real transport failure just after an operator
+                // fixed it included: tonic reconnects a broken connection on its own.
+                let other_cluster = self
+                    .transport
+                    .peer_cluster
+                    .refuses(self.target, std::time::Instant::now());
                 if !backpressure && !other_cluster {
                     self.note_failure("AppendStream");
                 }
@@ -1729,9 +1739,12 @@ async fn run_append_session(
         }
         Ok(Err(status)) => {
             GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
-            refusals
-                .peer_cluster
-                .observe_refusal(refusals.target, &refusals.address, &status);
+            refusals.peer_cluster.observe_refusal(
+                refusals.target,
+                &refusals.address,
+                &status,
+                std::time::Instant::now(),
+            );
             return;
         }
         Err(_) => {
@@ -2650,18 +2663,21 @@ mod reconnect_tests {
         assert_eq!(peer_cluster.refusals(), 2);
         let test_cluster =
             ursula_headers::ClusterId::new(crate::peer_cluster::TEST_CLUSTER_ID).unwrap();
-        assert_eq!(peer_cluster.mismatches(), vec![
+        assert_eq!(peer_cluster.mismatches(std::time::Instant::now()), vec![
             crate::peer_cluster::PeerClusterMismatch {
                 node_id: 1,
                 cluster_id: test_cluster,
             }
         ]);
-        assert_eq!(registry.peer_cluster().mismatches(), vec![
-            crate::peer_cluster::PeerClusterMismatch {
+        assert_eq!(
+            registry
+                .peer_cluster()
+                .mismatches(std::time::Instant::now()),
+            vec![crate::peer_cluster::PeerClusterMismatch {
                 node_id: 3,
                 cluster_id: other,
-            }
-        ]);
+            }]
+        );
         assert_eq!(registry.peer_cluster().refusals(), 2);
         server.abort();
     }

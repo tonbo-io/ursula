@@ -100,35 +100,8 @@ pub struct ServerConfig {
     /// client can reach. A single node without it generates one at its first
     /// start and keeps it in its WAL. The WAL records the id, and a node whose
     /// configured id differs from its WAL's refuses to start.
-    #[serde(with = "cluster_id_serde", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<ClusterId>,
-}
-
-/// `server.cluster_id`, parsed into a [`ClusterId`] when the configuration
-/// loads.
-mod cluster_id_serde {
-    use serde::Deserialize;
-    use serde::Deserializer;
-    use serde::Serializer;
-    use ursula_headers::ClusterId;
-
-    pub(super) fn serialize<S: Serializer>(
-        id: &Option<ClusterId>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match id {
-            Some(id) => serializer.serialize_some(id.as_str()),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<ClusterId>, D::Error> {
-        Option::<String>::deserialize(deserializer)?
-            .map(|id| ClusterId::new(id).map_err(serde::de::Error::custom))
-            .transpose()
-    }
 }
 
 impl ServerConfig {

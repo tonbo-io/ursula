@@ -476,7 +476,7 @@ async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
     // Refused before the body: nothing was proposed there.
     assert!(purge.is_forward_before_proposal(), "{purge:?}");
     let peer_cluster = follower.peer_cluster.as_ref().expect("a gRPC replica");
-    assert_eq!(peer_cluster.mismatches(), vec![
+    assert_eq!(peer_cluster.mismatches(std::time::Instant::now()), vec![
         crate::peer_cluster::PeerClusterMismatch {
             node_id: leader_id,
             cluster_id: other,

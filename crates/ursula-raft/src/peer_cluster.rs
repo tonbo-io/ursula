@@ -36,6 +36,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
@@ -43,7 +44,6 @@ use tonic::service::Interceptor;
 use ursula_headers::ClusterId;
 
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
-use crate::rt::time::Instant;
 
 /// Request metadata naming the sender's cluster id; on a refusal, the
 /// refusing node's.
@@ -271,12 +271,13 @@ impl PeerCluster {
         ClusterCheck(self.clone())
     }
 
-    /// Admits an inbound request from `remote` whose metadata names this
-    /// node's cluster.
+    /// Admits an inbound request from `remote`, at `now`, whose metadata
+    /// names this node's cluster.
     pub(crate) fn admit(
         &self,
         metadata: &MetadataMap,
         remote: Option<SocketAddr>,
+        now: Instant,
     ) -> Result<(), PeerClusterError> {
         let identity = self.0.identity.load();
         let Some(local) = identity.as_deref() else {
@@ -285,7 +286,7 @@ impl PeerCluster {
         let ip = remote.map(|remote| remote.ip());
         let Some(cluster_value) = metadata.get(CLUSTER_ID_METADATA) else {
             self.0.unidentified_refusals.fetch_add(1, Ordering::Relaxed);
-            if self.record(RefusedPeer::Unidentified { ip }) {
+            if self.record(RefusedPeer::Unidentified { ip }, now) {
                 tracing::error!(
                     peer_address = ?remote,
                     "refusing Raft traffic from a sender that names no cluster id (a node \
@@ -295,32 +296,33 @@ impl PeerCluster {
             }
             return Err(PeerClusterError::MissingClusterId);
         };
-        // The common case compares bytes; only a mismatch is parsed.
-        if cluster_value.as_bytes() == local.0.cluster_value.as_bytes()
-            && metadata.get(NODE_ID_METADATA).is_some()
-        {
-            return Ok(());
-        }
         let malformed = |header| PeerClusterError::MalformedMetadata { header };
-        let cluster_id = cluster_value
-            .to_str()
-            .ok()
-            .and_then(|text| ClusterId::new(text).ok())
-            .ok_or_else(|| malformed(CLUSTER_ID_METADATA))?;
         let peer_node_id = metadata
             .get(NODE_ID_METADATA)
             .and_then(|value| value.to_str().ok())
             .and_then(|text| text.parse::<u64>().ok())
             .ok_or_else(|| malformed(NODE_ID_METADATA))?;
+        // The common case compares bytes; only a mismatch is parsed.
+        if cluster_value.as_bytes() == local.0.cluster_value.as_bytes() {
+            return Ok(());
+        }
+        let cluster_id = cluster_value
+            .to_str()
+            .ok()
+            .and_then(|text| ClusterId::new(text).ok())
+            .ok_or_else(|| malformed(CLUSTER_ID_METADATA))?;
         if cluster_id == local.0.cluster_id {
             return Ok(());
         }
         self.0.refusals.fetch_add(1, Ordering::Relaxed);
-        if self.record(RefusedPeer::Inbound {
-            node_id: peer_node_id,
-            cluster_id: cluster_id.clone(),
-            ip,
-        }) {
+        if self.record(
+            RefusedPeer::Inbound {
+                node_id: peer_node_id,
+                cluster_id: cluster_id.clone(),
+                ip,
+            },
+            now,
+        ) {
             tracing::error!(
                 direction = "inbound",
                 peer_node_id,
@@ -340,21 +342,25 @@ impl PeerCluster {
 
     /// Records `status` when peer `node_id` at `address` refused an outbound
     /// RPC because it is in another cluster. Returns whether it did.
-    pub(crate) fn observe_refusal(
+    pub fn observe_refusal(
         &self,
         node_id: u64,
         address: &str,
         status: &tonic::Status,
+        now: Instant,
     ) -> bool {
         let Some(cluster_id) = refusing_cluster(status) else {
             return false;
         };
         self.0.refusals.fetch_add(1, Ordering::Relaxed);
-        if self.record(RefusedPeer::Outbound {
-            node_id,
-            cluster_id: cluster_id.clone(),
-            address: address.to_owned(),
-        }) {
+        if self.record(
+            RefusedPeer::Outbound {
+                node_id,
+                cluster_id: cluster_id.clone(),
+                address: address.to_owned(),
+            },
+            now,
+        ) {
             tracing::error!(
                 direction = "outbound",
                 peer_node_id = node_id,
@@ -370,8 +376,7 @@ impl PeerCluster {
 
     /// Whether configured peer `node_id` refused this node's traffic for
     /// another cluster id within [`PEER_CLUSTER_MISMATCH_TTL`].
-    pub(crate) fn refuses(&self, node_id: u64) -> bool {
-        let now = Instant::now();
+    pub(crate) fn refuses(&self, node_id: u64, now: Instant) -> bool {
         self.lock().iter().any(|(peer, seen)| {
             matches!(peer, RefusedPeer::Outbound { node_id: id, .. } if *id == node_id)
                 && now.saturating_duration_since(*seen) <= PEER_CLUSTER_MISMATCH_TTL
@@ -389,8 +394,7 @@ impl PeerCluster {
     /// peer, either way, not refused within [`PEER_CLUSTER_MISMATCH_TTL`]),
     /// which the caller logs, so each refused peer is logged once while it
     /// keeps being refused.
-    fn record(&self, peer: RefusedPeer) -> bool {
-        let now = Instant::now();
+    fn record(&self, peer: RefusedPeer, now: Instant) -> bool {
         let mut refused = self.lock();
         refused.retain(|_, seen| now.saturating_duration_since(*seen) <= PEER_CLUSTER_MISMATCH_TTL);
         let fresh = !refused.keys().any(|known| known.same_peer(&peer));
@@ -411,8 +415,7 @@ impl PeerCluster {
     /// [`PEER_CLUSTER_MISMATCH_TTL`], either way, by node id. An inbound
     /// refusal counts when its sender claims a configured node id and, where
     /// that peer's URL names an IP address, sent from that address.
-    pub fn mismatches(&self) -> Vec<PeerClusterMismatch> {
-        let now = Instant::now();
+    pub fn mismatches(&self, now: Instant) -> Vec<PeerClusterMismatch> {
         let peers = self.0.peers.load();
         let mut mismatches = self
             .lock()
@@ -502,7 +505,8 @@ pub struct ClusterCheck(PeerCluster);
 
 impl Interceptor for ClusterCheck {
     fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        self.0.admit(request.metadata(), request.remote_addr())?;
+        self.0
+            .admit(request.metadata(), request.remote_addr(), Instant::now())?;
         Ok(request)
     }
 }
@@ -511,6 +515,8 @@ impl Interceptor for ClusterCheck {
 mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
+    use std::time::Duration;
+    use std::time::Instant;
 
     use super::ClusterCheck;
     use super::ClusterId;
@@ -528,6 +534,11 @@ mod tests {
 
     fn cluster(id: &str) -> ClusterId {
         ClusterId::new(id).unwrap()
+    }
+
+    /// `t0` plus `offset`: the record only compares the instants it is given.
+    fn at(t0: Instant, offset: Duration) -> Instant {
+        t0.checked_add(offset).unwrap()
     }
 
     /// Node `node_id` of cluster `id`, whose peers 1 to 3 listen on
@@ -555,6 +566,14 @@ mod tests {
         ClusterCheck(server.clone()).call(request).err()
     }
 
+    fn stray(node_id: u64) -> RefusedPeer {
+        RefusedPeer::Inbound {
+            node_id,
+            cluster_id: cluster("b"),
+            ip: None,
+        }
+    }
+
     #[test]
     fn the_client_stamps_its_cluster_and_node_id() {
         let request = stamped(&PeerIdentity::new(7, cluster("prod-eu-1")));
@@ -571,16 +590,17 @@ mod tests {
         let server = bound(1, "prod-eu-1");
         let request = stamped(&PeerIdentity::new(2, cluster("prod-eu-1")));
         assert!(refusal(&server, request).is_none());
-        assert!(server.mismatches().is_empty());
+        assert!(server.mismatches(Instant::now()).is_empty());
         assert_eq!(server.refusals(), 0);
     }
 
-    #[tokio::test]
-    async fn a_peer_of_another_cluster_is_refused_counted_and_reported() {
+    #[test]
+    fn a_peer_of_another_cluster_is_refused_counted_and_reported() {
+        let t0 = Instant::now();
         let server = bound(1, "prod-eu-1");
         let sender = PeerIdentity::new(3, cluster("prod-us-1"));
         let error = server
-            .admit(stamped(&sender).metadata(), from_node(3))
+            .admit(stamped(&sender).metadata(), from_node(3), t0)
             .unwrap_err();
         assert_eq!(error, PeerClusterError::Mismatch {
             peer_node_id: 3,
@@ -590,11 +610,11 @@ mod tests {
         // Every refusal counts; the peer is reported once.
         let status = tonic::Status::from(
             server
-                .admit(stamped(&sender).metadata(), from_node(3))
+                .admit(stamped(&sender).metadata(), from_node(3), t0)
                 .unwrap_err(),
         );
         assert_eq!(server.refusals(), 2);
-        assert_eq!(server.mismatches(), vec![PeerClusterMismatch {
+        assert_eq!(server.mismatches(t0), vec![PeerClusterMismatch {
             node_id: 3,
             cluster_id: cluster("prod-us-1"),
         }]);
@@ -604,101 +624,107 @@ mod tests {
         assert!(!is_protocol_mismatch(&status));
         assert_eq!(refusing_cluster(&status), Some(cluster("prod-eu-1")));
         let client = bound(3, "prod-us-1");
-        assert!(client.observe_refusal(1, "http://10.0.0.1:4437", &status));
-        assert!(client.refuses(1));
-        assert!(!client.refuses(2));
-        assert_eq!(client.mismatches(), vec![PeerClusterMismatch {
+        assert!(client.observe_refusal(1, "http://10.0.0.1:4437", &status, t0));
+        assert!(client.refuses(1, t0));
+        assert!(!client.refuses(2, t0));
+        assert!(!client.refuses(1, at(t0, PEER_CLUSTER_MISMATCH_TTL * 2)));
+        assert_eq!(client.mismatches(t0), vec![PeerClusterMismatch {
             node_id: 1,
             cluster_id: cluster("prod-eu-1"),
         }]);
         assert_eq!(client.refusals(), 1);
     }
 
-    #[tokio::test]
-    async fn only_configured_peers_are_reported() {
+    #[test]
+    fn only_configured_peers_are_reported() {
+        let t0 = Instant::now();
         let server = bound(1, "a");
         // Claims node 2 but sends from another address than node 2's.
         let impostor = PeerIdentity::new(2, cluster("b"));
         server
-            .admit(stamped(&impostor).metadata(), from_node(9))
+            .admit(stamped(&impostor).metadata(), from_node(9), t0)
             .unwrap_err();
         // A node id this node does not configure.
         let stranger = PeerIdentity::new(7, cluster("b"));
         server
-            .admit(stamped(&stranger).metadata(), from_node(7))
+            .admit(stamped(&stranger).metadata(), from_node(7), t0)
             .unwrap_err();
-        assert!(server.mismatches().is_empty());
+        assert!(server.mismatches(t0).is_empty());
         assert_eq!(server.refusals(), 2);
         // The same claim from node 2's address is reported.
         server
-            .admit(stamped(&impostor).metadata(), from_node(2))
+            .admit(stamped(&impostor).metadata(), from_node(2), t0)
             .unwrap_err();
-        assert_eq!(server.mismatches(), vec![PeerClusterMismatch {
+        assert_eq!(server.mismatches(t0), vec![PeerClusterMismatch {
             node_id: 2,
             cluster_id: cluster("b"),
         }]);
     }
 
-    #[tokio::test]
-    async fn each_refused_peer_is_fresh_once_until_it_stops_being_refused() {
+    #[test]
+    fn each_refused_peer_is_fresh_once_until_it_stops_being_refused() {
+        let t0 = Instant::now();
         let server = bound(1, "a");
-        let peer = RefusedPeer::Inbound {
-            node_id: 2,
-            cluster_id: cluster("b"),
-            ip: None,
-        };
-        assert!(server.record(peer.clone()), "the first refusal is logged");
-        assert!(!server.record(peer.clone()), "a repeat is not");
+        assert!(server.record(stray(2), t0), "the first refusal is logged");
+        assert!(!server.record(stray(2), t0), "a repeat is not");
         assert!(
-            !server.record(RefusedPeer::Outbound {
-                node_id: 2,
-                cluster_id: cluster("b"),
-                address: "http://10.0.0.2:4437".to_owned(),
-            }),
+            !server.record(
+                RefusedPeer::Outbound {
+                    node_id: 2,
+                    cluster_id: cluster("b"),
+                    address: "http://10.0.0.2:4437".to_owned(),
+                },
+                t0,
+            ),
             "nor the same peer refusing this node"
         );
-        assert!(server.record(RefusedPeer::Inbound {
-            node_id: 2,
-            cluster_id: cluster("c"),
-            ip: None,
-        }));
+        assert!(server.record(
+            RefusedPeer::Inbound {
+                node_id: 2,
+                cluster_id: cluster("c"),
+                ip: None,
+            },
+            t0,
+        ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_peer_drops_out_of_the_report_once_it_stops_being_refused() {
+    #[test]
+    fn a_peer_drops_out_of_the_report_once_it_stops_being_refused() {
+        let t0 = Instant::now();
+        let half = PEER_CLUSTER_MISMATCH_TTL / 2;
         let server = bound(1, "a");
         let sender = PeerIdentity::new(2, cluster("b"));
-        refusal(&server, stamped(&sender)).expect("refused");
-        tokio::time::advance(PEER_CLUSTER_MISMATCH_TTL / 2).await;
-        refusal(&server, stamped(&sender)).expect("refused");
-        tokio::time::advance(PEER_CLUSTER_MISMATCH_TTL / 2).await;
-        assert_eq!(server.mismatches().len(), 1, "refused within the window");
-        tokio::time::advance(PEER_CLUSTER_MISMATCH_TTL).await;
-        assert!(server.mismatches().is_empty());
+        let request = |now| {
+            server
+                .admit(stamped(&sender).metadata(), from_node(2), now)
+                .unwrap_err()
+        };
+        request(t0);
+        request(at(t0, half));
+        assert_eq!(
+            server.mismatches(at(t0, PEER_CLUSTER_MISMATCH_TTL)).len(),
+            1,
+            "refused within the window"
+        );
+        let later = at(t0, half.saturating_add(PEER_CLUSTER_MISMATCH_TTL * 2));
+        assert!(server.mismatches(later).is_empty());
         assert_eq!(server.refusals(), 2);
         // Refused again after the window, the peer is fresh again.
-        assert!(server.record(RefusedPeer::Inbound {
-            node_id: 2,
-            cluster_id: cluster("b"),
-            ip: None,
-        }));
+        assert!(server.record(stray(2), later));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn the_record_is_capped_and_evicts_the_oldest() {
+    #[test]
+    fn the_record_is_capped_and_evicts_the_oldest() {
+        let t0 = Instant::now();
         let server = bound(1, "a");
-        let stray = |node_id| RefusedPeer::Inbound {
-            node_id,
-            cluster_id: cluster("b"),
-            ip: None,
-        };
         for node_id in 0..100 {
-            server.record(stray(node_id));
-            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            server.record(stray(node_id), at(t0, Duration::from_millis(node_id)));
         }
         let refused = server.lock();
         assert_eq!(refused.len(), PEER_CLUSTER_MISMATCH_CAP);
         assert!(!refused.contains_key(&stray(0)), "the oldest went first");
+        assert!(!refused.contains_key(&stray(67)));
+        assert!(refused.contains_key(&stray(68)));
         assert!(refused.contains_key(&stray(99)));
     }
 
@@ -711,7 +737,7 @@ mod tests {
             tonic::Status::unavailable("connect"),
         ] {
             assert!(
-                !client.observe_refusal(2, "http://10.0.0.2:4437", &status),
+                !client.observe_refusal(2, "http://10.0.0.2:4437", &status, Instant::now()),
                 "{status:?}"
             );
         }
@@ -723,26 +749,38 @@ mod tests {
     /// mismatch, and `admit` does not latch this node's format-epoch
     /// readiness (the latch is process-wide, so tests running in parallel
     /// cannot observe its absence here).
-    #[tokio::test]
-    async fn a_sender_without_a_cluster_id_is_refused_without_a_latch() {
+    #[test]
+    fn a_sender_without_a_cluster_id_is_refused_without_a_latch() {
         let server = bound(1, "a");
         let status = refusal(&server, tonic::Request::new(())).expect("refused");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(is_protocol_mismatch(&status), "{status:?}");
         assert_eq!(server.refusals(), 0);
         assert_eq!(server.unidentified_refusals(), 1);
-        assert!(server.mismatches().is_empty());
+        assert!(server.mismatches(Instant::now()).is_empty());
     }
 
     #[test]
     fn malformed_metadata_is_refused_as_invalid() {
         let server = bound(1, "a");
+        let now = Instant::now();
         let mut no_node = tonic::Request::new(());
         no_node
             .metadata_mut()
             .insert(super::CLUSTER_ID_METADATA, "a".parse().unwrap());
         assert_eq!(
-            server.admit(no_node.metadata(), None),
+            server.admit(no_node.metadata(), None, now),
+            Err(PeerClusterError::MalformedMetadata {
+                header: super::NODE_ID_METADATA
+            })
+        );
+        // A node id that does not parse is refused even from this cluster.
+        let mut bad_node = stamped(&PeerIdentity::new(2, cluster("a")));
+        bad_node
+            .metadata_mut()
+            .insert(super::NODE_ID_METADATA, "two".parse().unwrap());
+        assert_eq!(
+            server.admit(bad_node.metadata(), None, now),
             Err(PeerClusterError::MalformedMetadata {
                 header: super::NODE_ID_METADATA
             })
@@ -762,6 +800,7 @@ mod tests {
             .admit(
                 stamped(&PeerIdentity::new(2, cluster("a"))).metadata(),
                 None,
+                Instant::now(),
             )
             .unwrap_err();
         assert_eq!(error, PeerClusterError::NoLocalCluster);

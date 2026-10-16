@@ -419,8 +419,12 @@ where
                 Ok(Ok(response)) => return Ok(response.into_inner()),
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
-                    if peer_cluster.observe_refusal(route.leader_id, address, &status)
-                        && let Some(cluster_id) = refusing_cluster(&status)
+                    if peer_cluster.observe_refusal(
+                        route.leader_id,
+                        address,
+                        &status,
+                        std::time::Instant::now(),
+                    ) && let Some(cluster_id) = refusing_cluster(&status)
                     {
                         ForwardError::OtherCluster {
                             rpc,

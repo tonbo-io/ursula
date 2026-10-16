@@ -536,7 +536,11 @@ impl HttpState {
     /// shape readiness and metrics report them.
     fn peer_cluster_mismatches(&self) -> Vec<ursula_proto::admin::PeerClusterMismatch> {
         self.raft_registry()
-            .map(|registry| registry.peer_cluster().mismatches())
+            .map(|registry| {
+                registry
+                    .peer_cluster()
+                    .mismatches(std::time::Instant::now())
+            })
             .unwrap_or_default()
     }
 
