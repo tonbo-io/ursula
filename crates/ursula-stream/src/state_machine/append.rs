@@ -651,10 +651,13 @@ fn check_stream_seq(stream: &StreamMetadata, incoming: Option<&str>) -> Result<(
     if let Some(last) = stream.last_stream_seq.as_deref()
         && incoming <= last
     {
-        return Err(StreamResponse::error_with_next_offset(
+        return Err(StreamResponse::error_with_next_offset_and_context(
             StreamErrorCode::StreamSeqConflict,
             format!("stream sequence '{incoming}' is not greater than last sequence '{last}'"),
             stream.tail_offset,
+            vec![StreamErrorContext::LastStreamSeq {
+                seq: last.to_owned(),
+            }],
         ));
     }
     Ok(())

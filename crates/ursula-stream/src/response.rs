@@ -211,6 +211,12 @@ pub enum StreamErrorContext {
         offset: u64,
         digest: String,
     },
+    /// The stream's last accepted `Stream-Seq`, which a
+    /// [`StreamErrorCode::StreamSeqConflict`] names, so a client using the
+    /// sequence as a compare-and-set retries from it.
+    LastStreamSeq {
+        seq: String,
+    },
 }
 
 /// What closed an epoch, the `by` of `epoch-closed`.

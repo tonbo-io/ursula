@@ -472,3 +472,72 @@ fn the_net_keeps_extensions() {
             .is_some()
     );
 }
+
+/// A `Stream-Seq` used as a compare-and-set: its `409` has its own code and
+/// echoes the stream's last accepted seq, and a content-type mismatch stays
+/// apart.
+#[tokio::test]
+async fn a_stream_seq_conflict_echoes_the_last_seq() {
+    let app = app();
+    let created = send_body(&app, "PUT", "/errors/cas", &[TEXT], "").await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let first = send_body(
+        &app,
+        "POST",
+        "/errors/cas",
+        &[TEXT, ("stream-seq", "0002")],
+        "a",
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+    let stale = send_body(
+        &app,
+        "POST",
+        "/errors/cas",
+        &[TEXT, ("stream-seq", "0001")],
+        "b",
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let typed = ursula_headers::StreamSeqConflict::parse(
+        409,
+        stale
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )
+    .expect("a well-formed answer")
+    .expect("a Stream-Seq conflict");
+    assert_eq!(typed.last.as_str(), "0002");
+    assert_eq!(error_code_of(stale).await, ErrorCode::StreamSeqConflict);
+
+    // A retry from the echoed seq applies.
+    let retried = send_body(
+        &app,
+        "POST",
+        "/errors/cas",
+        &[TEXT, ("stream-seq", "0003")],
+        "c",
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::NO_CONTENT);
+
+    let mismatch = send_body(
+        &app,
+        "POST",
+        "/errors/cas",
+        &[
+            ("content-type", "application/octet-stream"),
+            ("stream-seq", "0004"),
+        ],
+        "d",
+    )
+    .await;
+    assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+    assert!(mismatch.headers().get(names::STREAM_LAST_SEQ).is_none());
+    assert_eq!(
+        error_code_of(mismatch).await,
+        ErrorCode::ContentTypeMismatch
+    );
+}

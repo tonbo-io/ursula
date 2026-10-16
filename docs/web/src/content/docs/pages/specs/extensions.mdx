@@ -455,6 +455,10 @@ A server that does not lead a stream's writes answers a write `307 Temporary Red
 
 > **Note (informative).** Ursula routes a create, an append or close, and a snapshot publish before its body. The redirect carries `x-ursula-raft-leader-id`, `x-ursula-raft-group` and `x-ursula-raft-term`, so a router can cache the leader per group and discard a hint of an older term. The `503` carries `x-ursula-raft-group`. A node that hosts no replica of the group redirects to a node that does and names only the group, in `x-ursula-raft-group`, since it knows no leader and no term. A `307` that carries `x-ursula-raft-group` without `x-ursula-raft-leader-id` and `x-ursula-raft-term` is such a redirect, and its target answers as any replica does. Every other redirect, of a read as of a write, carries the leader, the group and the term. A node that knows a leader but not its term answers `503` with `Retry-After` and `x-ursula-raft-group` instead, so every `307` it sends parses as one of these two shapes. A node that loses the group's leadership while it reads a body answers `503` with `Retry-After`. Each of these `503`s carries the error body `NO_LEADER` (Section 11).
 
+### 5.8. Stream-Seq Conflicts
+
+A server that refuses an append because its `Stream-Seq` is not greater than the stream's last accepted one (base protocol) answers `409 Conflict` with `Stream-Last-Seq: <seq>`, the stream's last accepted `Stream-Seq`, as it was sent, and the error code `STREAM_SEQ_CONFLICT` (Section 11). A client that uses `Stream-Seq` as a compare-and-set retries from that value. Only a stream that accepted a `Stream-Seq` refuses one, so the answer always carries the header, and no other `409` carries it: a `409` for a content type that differs from the stream's carries `CONTENT_TYPE_MISMATCH` and no `Stream-Last-Seq`. The refusal is decided where the append applies, so the answer is the same on the leader and through any node that forwards the write.
+
 ---
 
 ## 7. Ordinary SSE Compatibility

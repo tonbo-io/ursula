@@ -37,6 +37,8 @@ use ursula_headers::Receipt;
 use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
+use ursula_headers::StreamSeq;
+use ursula_headers::StreamSeqConflict;
 use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
@@ -622,7 +624,8 @@ pub(crate) fn producer_refusal_answer(
         StreamErrorContext::StreamClosed
         | StreamErrorContext::StaleColdFlushCandidate
         | StreamErrorContext::StreamIncarnation { .. }
-        | StreamErrorContext::LatestSnapshot { .. } => None,
+        | StreamErrorContext::LatestSnapshot { .. }
+        | StreamErrorContext::LastStreamSeq { .. } => None,
     })
 }
 
@@ -676,6 +679,24 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
                 _ => None,
             });
         insert_incarnation_mismatch(headers, IncarnationMismatch { current });
+    }
+    // A refused `Stream-Seq` names the stream's last one (extensions
+    // Section 5.8).
+    if let Some(last) = err
+        .stream_error_context()
+        .iter()
+        .find_map(|context| match context {
+            StreamErrorContext::LastStreamSeq { seq } => Some(seq),
+            _ => None,
+        })
+    {
+        match StreamSeq::new(last.as_str()) {
+            Ok(last) => StreamSeqConflict { last }
+                .render(|name, value| insert_header_str(headers, name, value)),
+            Err(err) => {
+                tracing::error!(error = %err, "a stream's last Stream-Seq is not a header value")
+            }
+        }
     }
     // A refused snapshot publish names the latest snapshot (#581 section 3).
     if let Some(latest) = err

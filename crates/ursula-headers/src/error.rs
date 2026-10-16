@@ -106,6 +106,9 @@ pub enum HeaderError {
     /// An error answer's body is not a JSON object whose `error` member
     /// holds the strings `code` and `message`.
     InvalidErrorBody,
+    /// `Stream-Last-Seq` is not 1 to 256 bytes of visible ASCII with inner
+    /// spaces or tabs.
+    InvalidStreamSeq,
 }
 
 impl fmt::Display for HeaderError {
@@ -237,6 +240,11 @@ impl fmt::Display for HeaderError {
                 "{} must be `bytes first-last/total` within the body on a 206, or \
                  `bytes */total` on a 416",
                 names::CONTENT_RANGE
+            ),
+            Self::InvalidStreamSeq => write!(
+                f,
+                "{} must be 1 to 256 bytes of visible ASCII",
+                names::STREAM_LAST_SEQ
             ),
             Self::InvalidErrorBody => write!(
                 f,
