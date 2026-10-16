@@ -1017,7 +1017,7 @@ pub enum GroupInfraError {
     OutcomeUnknown,
     /// A read or write of the cold tier failed. `detail` names the object
     /// and the store's error, for the server's log only.
-    #[error("cold tier failed: {detail}")]
+    #[error("{detail}")]
     ColdStore { detail: String },
     #[error("{message}")]
     Internal { message: String },
