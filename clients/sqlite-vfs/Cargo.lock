@@ -469,7 +469,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sqlite-ursula-vfs"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-headers"
-version = "0.7.5"
+version = "0.8.0"
 
 [[package]]
 name = "utf8-zero"

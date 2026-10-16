@@ -3,13 +3,19 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
-## Unreleased (0.8)
+## 0.8.0
 
 **0.8 is a breaking release.** It changes the storage and protocol format to format epoch 4. A 0.8 node refuses epoch-3 Raft WAL directories and object-storage prefixes at startup, refuses 0.7 peers, snapshots and backups, and `ursulactl restore` refuses 0.7 backups. There is no migration, no in-place upgrade, no rolling upgrade and no rollback.
 
 - **Deploy 0.8 fresh:** empty PVCs and never-used object-storage prefixes, for the cold store, S3 snapshots and the event-time indexer.
 - **Move data by export and re-import.** The applications that own the data read it from 0.7 and write it into 0.8. Ursula provides no converter.
 - **Set `server.cluster_id` on every node of a multi-node cluster.** A node with `raft.peers` and no `server.cluster_id` refuses to start. Use the same value on every node and a different one for every deployment a client can reach. Chart installs must now set `server.clusterId`, a single replica included: the chart always renders the peer list, and it refuses to render without the id.
+- **Lower a gateway's `--max-request-body-bytes` to at most 32 MiB.** That is the protocol's request limit, and a gateway configured above it refuses to start. A larger snapshot goes up in parts.
+- **Clients read write outcomes by one rule.** `x-ursula-not-applied` is gone. A refusal's status and error code say whether its request applied nothing, a leadership loss after a proposal answers `503` with `OUTCOME_UNKNOWN`, and `ursula_headers::classify` implements the rule. A proxy in front of Ursula must not answer a write it forwarded with its own `4xx` other than `408`, or with a redirect, and must not accept a body above the server's request limit ([write outcomes](/docs/specs/extensions#111-write-outcomes)).
+- **Update recovery runbooks.** `accept-unsynced-loss` takes a recovery plan that counts every voter set the replicas report, so it recovers across a rolled-back membership change. A replica whose committed entries a plan dropped waits for an operator to rejoin its node as a wiped node, after checking the other groups on that node ([Recovering after a host crash](/docs/operations#recovering-after-a-host-crash)).
+- **The SQLite VFS has new formats and a new API.** The 0.8 extension refuses 0.7 streams and 0.7 servers. Export each database with 0.7 and import it with 0.8, as described under [SQLite VFS](#sqlite-vfs).
+
+See [Upgrading to 0.8](/docs/operations#upgrading-to-08).
 
 ### Write keys and typed answers
 
@@ -18,6 +24,7 @@ Producer writes now get a typed answer to every repeat, so a client resolves an 
 - **`x-ursula-not-applied` and `x-ursula-not-applied-checked` are removed.** Neither the server nor the gateway sends them. A refusal's status and error code say whether its request applied nothing, by one rule for every client, and `ursula_headers::classify` implements it. Repeat a write whose outcome is unknown with its producer key. See [write outcomes](/docs/specs/extensions#111-write-outcomes).
 - **A leadership loss after a proposal answers `OUTCOME_UNKNOWN`.** A node that loses the leadership after it proposes a write now answers `503` with `OUTCOME_UNKNOWN`, where it used to answer `NO_LEADER` (or redirect). A node answers `NO_LEADER`, or redirects, only for a write it refused before proposing it, so a client reads `NO_LEADER` as a refusal and repeats an `OUTCOME_UNKNOWN` write with its key. A read never gets `OUTCOME_UNKNOWN`: it still redirects or answers `NO_LEADER`. A follower now checks its leadership right before it proposes any write, a delete, a plain create and a batch of appends included, so those still redirect or answer `NO_LEADER`. A parts commit whose key check after its body meets a leadership refusal answers `503`, never a redirect.
 - **A success without its typed answer is unknown.** `classify` reads a `2xx` as applied only with the typed answer Ursula always sends for the write: a producer write's receipt, `Stream-Next-Offset` of another append or close, `Stream-Incarnation` of a create or a discard of staged parts, the published snapshot of a publish or a commit, and `Stream-Snapshot-Part` of a part. A `2xx` without it comes from a layer outside Ursula and says nothing of the write.
+- **Rust library APIs.** `ursula_headers` gains `classify`, `WriteOutcome` and `WriteKind`. `WriteKind` is `#[non_exhaustive]`, since a later 0.8 release may add a kind of write, so a `match` on it needs a wildcard arm.
 - **Gateway embedders can refuse before forwarding.** `Gateway::refuse` answers a request with `PAYMENT_REQUIRED` (`402`), `ACCOUNT_REVOKED` (`403`), `FORBIDDEN` (`403`) or `RATE_LIMITED` (`429`), after reading its body as the gateway's own refusals do, and answers a CORS preflight as `Gateway::handle` does. Clients read it as a refusal, never as a producer answer. `/__ursula/gateway/metrics` counts them in `embedder_refusals`. The gateway no longer uses a system proxy from `HTTP_PROXY` for its upstreams.
 - **One receipt per producer.** The server keeps the receipt of each producer's newest write only. A repeat of that write answers `204` with its receipt. A repeat of an older write of the epoch answers `204` with `Producer-Outcome: receipt-evicted` and no range. 0.7 kept the ranges of up to 1,024 earlier writes per stream.
 - **`Producer-Seq` on `200` and `204` is the epoch's highest applied seq**, the base protocol's meaning. 0.7 echoed the request's seq on a duplicate. Receipts carry `Stream-Offset`, where the write's bytes start, next to `Stream-Next-Offset`, where they end, `Stream-Closed: true` when the write closed the stream, and `Stream-Incarnation`.

@@ -496,6 +496,20 @@ For MinIO or another S3-compatible store, add `--endpoint-url`. The copy must ma
 
 Never point two clusters at one prefix, and never point a new cluster at the source's prefix in place. After a restore both clusters hold the same streams under the same keys, but each one deletes cold objects by its own state alone: the cold GC after a delete, a retention advance or a compaction, the orphan sweep for unreferenced objects older than a day, and the pruning of `snapshots/` by the cluster's own references. Two clusters on one prefix delete objects the other still reads. A copy also leaves the source cluster and its prefix as they were, so the source stays a way back until clients switch.
 
+## Upgrading to 0.8
+
+**0.8.0 is a breaking release.** It changes the storage and protocol format to format epoch 4. A 0.8 node refuses epoch-3 Raft WAL directories and object-storage prefixes at startup, refuses 0.7 peers, snapshots and backups, and `ursulactl restore` refuses 0.7 backups. There is no migration, no in-place upgrade, no rolling upgrade and no rollback.
+
+1. **Install fresh.** Use empty PVCs and never-used prefixes for the cold store, S3 snapshots and the event-time indexer. Never reuse a prefix that 0.7, or a failed upgrade attempt, wrote to.
+2. **Set the cluster id.** Set `server.cluster_id` on every node of a multi-node cluster, the same on every node and different for every deployment a client can reach. The chart requires `server.clusterId` for every install, a single replica included.
+3. **Choose the network planes before the first install.** The chart serves Raft on `server.ports.cluster` (`4439`) by default. Do not change `server.clusterListen` or `server.ports.cluster` on an initialized cluster. Outside the chart, set `server.cluster_listen` and `client_url` together on every node.
+4. **Lower the gateway's request limit.** A gateway whose `--max-request-body-bytes` (`gateway.maxRequestBodyBytes`) is above 33554432 refuses to start. Larger snapshots go up in parts.
+5. **Move data by export and re-import.** The applications that own the data read it from 0.7 and write it into 0.8. For the SQLite VFS, export each database with 0.7 using `VACUUM INTO` and import the file with 0.8 ([Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07)).
+6. **Update clients and proxies.** Error answers have a JSON body, `x-ursula-not-applied` is gone, a leadership loss after a proposal answers `503` with `OUTCOME_UNKNOWN`, and `Stream-Incarnation` changes on a restore or an accepted loss. A proxy in front of Ursula follows the intermediary rules of [write outcomes](/docs/specs/extensions#111-write-outcomes).
+7. **Update recovery runbooks.** `accept-unsynced-loss` takes a recovery plan, and `ursulactl recover-group --accept-loss` computes it. A replica whose committed entries a plan dropped waits for its node to be rejoined as a wiped node. See [Recovering after a host crash](#recovering-after-a-host-crash) for the checks before a wipe.
+
+Every behavior change, with what to change for each area, is listed in the [0.8.0 release notes](/docs/release-notes#080).
+
 ## Upgrading to 0.7
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
@@ -506,7 +520,7 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes#070).
 
-0.7.5 upgrades 0.7.0, 0.7.1, 0.7.2, 0.7.3 or 0.7.4 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.7.5 release notes](/docs/release-notes#075).
+0.7.6 upgrades 0.7.0, 0.7.1, 0.7.2, 0.7.3, 0.7.4 or 0.7.5 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.7.6 release notes](/docs/release-notes#076).
 
 To install 0.7:
 

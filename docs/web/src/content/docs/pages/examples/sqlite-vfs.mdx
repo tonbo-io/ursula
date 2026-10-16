@@ -8,7 +8,7 @@ sidebarTitle: SQLite (VFS)
 Start a single node in a terminal of its own. It keeps nothing across restarts.
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.7.5
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.8.0
 ```
 
 Install the package, which needs Node.js 22.19 or later, and run:
@@ -244,7 +244,7 @@ Operations changes:
 
 ## Layers in front of the stream
 
-Every write the extension sends carries a producer key and a digest of its body. A proxy or a gateway that sends a write again does no harm: the stream answers the repeat as a duplicate of the same write. No answer says that a write applied nothing, and the extension never needs one. 0.8 servers and gateways send no `x-ursula-not-applied` header.
+Every write the extension sends carries a producer key and a digest of its body. A proxy or a gateway that sends a write again does no harm: the stream answers the repeat as a duplicate of the same write. The extension never needs to know that a write applied nothing: it sends the same bytes again until the stream answers them. 0.8 servers and gateways send no `x-ursula-not-applied` header.
 
 Other clients on a shared deployment may send writes without producer headers, which a replayed request applies twice. Keep proxy retries off for stream writes on such a deployment (`proxy-next-upstream: "off"` in the chart's TLS ingress example).
 
