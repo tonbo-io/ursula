@@ -66,7 +66,10 @@ impl Transport for HttpTransport {
         let url = format!("{}{}", self.url, request.target.suffix());
         let agent = match request.target {
             Target::Snapshot { .. } | Target::SnapshotParts { .. } => bulk_agent(),
-            Target::Stream | Target::Read { .. } | Target::Retention { .. } => agent(),
+            Target::Stream
+            | Target::Read { .. }
+            | Target::Retention { .. }
+            | Target::StagedParts => agent(),
         };
         let resend = Resend {
             refresh: attempt.refresh_token,
@@ -93,6 +96,9 @@ impl Transport for HttpTransport {
             Method::Post => limits
                 .apply(with_headers(prepared(agent.post(&url), resend), request))
                 .send(&request.body[..]),
+            Method::Delete => limits
+                .apply(with_headers(prepared(agent.delete(&url), resend), request))
+                .call(),
         };
         let mut response = match sent {
             Ok(response) => response,

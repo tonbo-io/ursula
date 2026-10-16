@@ -194,7 +194,7 @@ function functionError(error: unknown): UrsulaError | undefined {
 	const named = FUNCTION_ERROR.exec(error.message);
 	if (named === null) return undefined;
 	const [, fn, kind] = named as unknown as [string, string, string];
-	return errorOf(kind, error.message, error, fn !== "ursula_open" && fn !== "ursula_cancel");
+	return errorOf(kind, error.message, error, fn !== "ursula_open" && fn !== "ursula_cancel" && fn !== "ursula_import");
 }
 
 /** The fields of `ursula_status` that {@link classify} reads. */

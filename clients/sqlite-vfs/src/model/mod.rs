@@ -97,6 +97,14 @@ pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
 /// How long a staged part waits for a commit before the sweep reclaims it (extensions §2.2).
 const PART_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// The most unused parts a stream holds staged, and their most bytes (#622).
+pub(crate) const MAX_STAGED_PARTS: u64 = 8192;
+pub(crate) const MAX_STAGED_BYTES: u64 = 2 << 30;
+
+/// The headers of the `429` a part past those limits gets: the limit it met.
+const MAX_STAGED_PARTS_HEADER: &str = "ursula-max-staged-parts";
+const MAX_STAGED_BYTES_HEADER: &str = "ursula-max-staged-bytes";
+
 /// The base protocol's content type of a stream created without one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -133,6 +141,9 @@ pub(crate) struct Limits {
     pub(crate) max_snapshot_bytes: Option<u64>,
     /// The most bytes one read returns.
     pub(crate) read_chunk: u64,
+    /// The most unused parts, and bytes of them, a stream holds staged.
+    pub(crate) max_staged_parts: u64,
+    pub(crate) max_staged_bytes: u64,
 }
 
 impl Default for Limits {
@@ -141,6 +152,8 @@ impl Default for Limits {
             max_request_bytes: MAX_REQUEST_BYTES,
             max_snapshot_bytes: None,
             read_chunk: 1 << 20,
+            max_staged_parts: MAX_STAGED_PARTS,
+            max_staged_bytes: MAX_STAGED_BYTES,
         }
     }
 }
@@ -483,6 +496,7 @@ impl ModelServer {
                 None => self.publish(path, request, offset),
             },
             (Method::Post, Target::SnapshotParts { .. }) => self.stage_part(path, request),
+            (Method::Delete, Target::StagedParts) => self.discard_parts(path, request),
             (Method::Get, Target::Snapshot { offset }) => {
                 self.snapshot_read(path, request, offset, ranges)
             }
@@ -758,6 +772,28 @@ impl ModelServer {
             Ok(stream) => stream.token_in(history),
             Err(answer) => return answer,
         };
+        let (count, bytes) = self
+            .parts
+            .values()
+            .filter(|part| part.path == path && part.token == token)
+            .fold((0_u64, 0_u64), |(count, bytes), part| {
+                let len = u64::try_from(part.body.len()).unwrap_or(u64::MAX);
+                (count.saturating_add(1), bytes.saturating_add(len))
+            });
+        let len = u64::try_from(request.body.len()).unwrap_or(u64::MAX);
+        let over = if count >= self.limits.max_staged_parts {
+            Some((MAX_STAGED_PARTS_HEADER, self.limits.max_staged_parts))
+        } else if bytes.saturating_add(len) > self.limits.max_staged_bytes {
+            Some((MAX_STAGED_BYTES_HEADER, self.limits.max_staged_bytes))
+        } else {
+            None
+        };
+        if let Some((name, limit)) = over {
+            let mut answer = RawAnswer::new(429);
+            answer.header(name, limit.to_string());
+            answer.header(names::STREAM_INCARNATION, token.to_string());
+            return answer;
+        }
         self.minted = self.minted.saturating_add(1);
         let part = PartId::new(format!("{now_ms:016x}-{:016x}.part", self.minted))
             .expect("a minted id is visible ASCII within the length");
@@ -769,6 +805,21 @@ impl ModelServer {
         });
         let mut answer = RawAnswer::new(201);
         PartStaged { part }.render(answer.emit());
+        answer
+    }
+
+    /// `DELETE {stream}/snapshot/parts` (#622): discards every part staged under the stream's
+    /// current token, after the precondition; `204` whether any was staged or not.
+    fn discard_parts(&mut self, path: &str, request: &Request) -> RawAnswer {
+        let history = self.history;
+        let token = match self.stream(path, request) {
+            Ok(stream) => stream.token_in(history),
+            Err(answer) => return answer,
+        };
+        self.parts
+            .retain(|_, part| part.path != path || part.token != token);
+        let mut answer = RawAnswer::new(204);
+        answer.header(names::STREAM_INCARNATION, token.to_string());
         answer
     }
 
@@ -825,7 +876,9 @@ impl ModelServer {
             Some(_) | None => {}
         }
         if offset < retained {
-            return RawAnswer::new(410);
+            let mut answer = RawAnswer::new(410);
+            answer.header(names::STREAM_NEXT_OFFSET, retained.to_string());
+            return answer;
         }
         if offset > tail {
             let mut answer = RawAnswer::new(409);

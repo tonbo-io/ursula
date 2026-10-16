@@ -1526,8 +1526,72 @@ fn a_commit_checks_its_key_before_its_parts() {
     let token = other.create();
     other.server().foreign_append(PATH, &[0; 100]).unwrap();
     other.server().streams.get_mut(PATH).unwrap().retained = Offset::from_u64(50);
-    let below = other.send(&commit(token, 40, &[unknown], digest_of(b"x")));
-    assert_eq!(below.status, 410);
+    let below = commit(token, 40, &[unknown], digest_of(b"x"));
+    let raw = other.server().handle(PATH, &below);
+    assert_eq!(raw.status, 410);
+    // As the server's: the retained offset, in `Stream-Next-Offset`.
+    assert!(
+        raw.headers
+            .contains(&(names::STREAM_NEXT_OFFSET, Offset::from_u64(50).to_string())),
+        "{raw:?}"
+    );
+}
+
+// A stream holds at most so many unused parts, and bytes of them (#622): a part past either is
+// 429 naming the limit, with the token. `DELETE {stream}/snapshot/parts` under the token discards
+// them (204), under another is 412, and staging goes on after it.
+#[test]
+fn staged_parts_are_bounded_and_discarded_together() {
+    let world = World::new();
+    with_cold_store(&world);
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 64]).unwrap();
+    let mut limits = world.server().limits();
+    limits.max_staged_parts = 2;
+    limits.max_staged_bytes = 3;
+    world.server().set_limits(limits);
+    stage(&world, token, 64, b"a").unwrap();
+    stage(&world, token, 64, b"b").unwrap();
+    let part = |body: &[u8]| Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        body: Arc::from(body),
+        ..Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(64),
+        })
+    };
+    let full = world.server().handle(PATH, &part(b"c"));
+    assert_eq!(full.status, 429);
+    assert!(
+        full.headers
+            .contains(&("ursula-max-staged-parts", "2".to_owned()))
+    );
+    assert!(
+        full.headers
+            .contains(&(names::STREAM_INCARNATION, token.to_string()))
+    );
+    let discard = |token| Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        ..Request::new(Method::Delete, Target::StagedParts)
+    };
+    let other_token = Incarnation::try_from(token.get() ^ 1).unwrap();
+    assert_eq!(world.send(&discard(other_token)).status, 412);
+    assert_eq!(world.server().staged_parts(), 2);
+    assert_eq!(world.send(&discard(token)).status, 204);
+    assert_eq!(world.server().staged_parts(), 0);
+    stage(&world, token, 64, b"ab").unwrap();
+    let bytes = world.server().handle(PATH, &part(b"cd"));
+    assert_eq!(bytes.status, 429);
+    assert!(
+        bytes
+            .headers
+            .contains(&("ursula-max-staged-bytes", "3".to_owned()))
+    );
 }
 
 // After the key: an unknown or listed-twice part, or a wrong count, is 400 and the parts stay

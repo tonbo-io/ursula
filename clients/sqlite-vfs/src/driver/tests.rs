@@ -144,6 +144,8 @@ struct World {
     sent: Vec<Sent>,
     /// HEADs are answered as a protocol 1 server would.
     legacy: bool,
+    /// HEADs are answered `404` without `Ursula-Protocol`, as a gateway that conceals a stream.
+    concealed: bool,
     /// Disk jobs it matches wait in `held` instead of running.
     hold: Option<fn(&DiskJob) -> bool>,
     held: Vec<(usize, DiskIo)>,
@@ -181,6 +183,7 @@ impl World {
             now: 0,
             sent: Vec::new(),
             legacy: false,
+            concealed: false,
             after_head: None,
             skip_heads: 0,
             every_head: None,
@@ -233,6 +236,9 @@ impl World {
         }
         if self.legacy && request.method == Method::Head {
             return Exchange::Answered(Box::new(RawAnswer::new(200).parse(request)));
+        }
+        if self.concealed && request.method == Method::Head {
+            return Exchange::Answered(Box::new(RawAnswer::new(404).parse(request)));
         }
         if self.misroute_after_heads == Some(0) {
             self.misroute_after_heads = None;
@@ -1393,6 +1399,179 @@ fn a_commit_answered_400_stages_its_parts_again_once() {
     assert_eq!(*always.commits.lock().unwrap(), 2);
 }
 
+/// A transport to the model that rewrites the answers `rewrite` picks.
+struct Rewrite {
+    server: Arc<Mutex<ModelServer>>,
+    rewrite: fn(&Request, RawAnswer) -> RawAnswer,
+}
+
+impl Transport for Rewrite {
+    fn send(&self, request: &Request, _attempt: crate::transport::Attempt) -> Exchange {
+        let raw = self.server.lock().unwrap().handle(PATH, request);
+        Exchange::Answered(Box::new((self.rewrite)(request, raw).parse(request)))
+    }
+}
+
+/// `raw` when `request` is not a publish or commit, else `status` alone.
+fn publish_answered(request: &Request, raw: RawAnswer, status: u16) -> RawAnswer {
+    match (request.method, request.target) {
+        (Method::Put, Target::Snapshot { .. }) => RawAnswer::new(status),
+        _ => raw,
+    }
+}
+
+// A 409 that names our offset and digest as the latest is an earlier attempt's publish: ours,
+// checked before any other conflict, single or in parts.
+#[test]
+fn a_409_naming_our_snapshot_is_published() {
+    let (server, token) = cold_world();
+    let conflict = |request: &Request, raw: RawAnswer| {
+        let answer = raw.parse(request);
+        match (request.method, answer.typed) {
+            (
+                Method::Put,
+                Ok(crate::wire::Typed::Snapshot(
+                    ursula_headers::SnapshotPublishAnswer::Published { snapshot, .. },
+                )),
+            ) => {
+                let latest = ursula_headers::SnapshotPublishAnswer::Conflict { latest: snapshot };
+                let mut raw = RawAnswer::new(latest.status());
+                latest.render(raw.emit());
+                raw
+            }
+            _ => raw,
+        }
+    };
+    for limit in [32 << 20, 4096] {
+        grow(&server);
+        let transport = Rewrite {
+            server: Arc::clone(&server),
+            rewrite: conflict,
+        };
+        let body = body_file(tail_of(&server), 3);
+        assert_eq!(
+            publish_through(&transport, token, limit, &body).unwrap(),
+            crate::snapshotter::Outcome::Published {
+                offset: body.offset
+            },
+            "limit {limit}"
+        );
+    }
+}
+
+// A 501 to a single request at or under the limit is no size refusal: the stream answered 501.
+// To a commit it means the stream takes no parts.
+#[test]
+fn a_501_is_a_size_refusal_only_for_parts() {
+    let (server, token) = cold_world();
+    let transport = Rewrite {
+        server: Arc::clone(&server),
+        rewrite: |request, raw| publish_answered(request, raw, 501),
+    };
+    let e =
+        publish_through(&transport, token, 32 << 20, &body_file(tail_of(&server), 1)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::Status {
+            status: 501,
+            ..
+        }),
+        "{e}"
+    );
+    assert!(!e.to_string().contains("request limit"), "{e}");
+    let e = publish_through(&transport, token, 4096, &body_file(tail_of(&server), 3)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            bound: crate::snapshotter::SizeBound::NoParts { request: 4096 },
+            ..
+        }),
+        "{e}"
+    );
+}
+
+// A 413 to a part names the limit it met: not published, too large.
+#[test]
+fn a_413_to_a_part_is_too_large() {
+    let (server, token) = cold_world();
+    let transport = Rewrite {
+        server: Arc::clone(&server),
+        rewrite: |request, raw| match request.target {
+            Target::SnapshotParts { .. } => {
+                let mut raw = RawAnswer::new(ursula_headers::SizeLimit::STATUS);
+                ursula_headers::SizeLimit::Request(2048).render(raw.emit());
+                raw
+            }
+            _ => raw,
+        },
+    };
+    let e = publish_through(&transport, token, 4096, &body_file(tail_of(&server), 3)).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::TooLarge {
+            bound: crate::snapshotter::SizeBound::Request(2048),
+            ..
+        }),
+        "{e}"
+    );
+}
+
+// A part past the stream's limit of staged parts (429) ends the attempt at once: the staged parts
+// are discarded (DELETE), and a later attempt stages again and publishes.
+#[test]
+fn a_part_past_the_staged_limit_discards_the_parts_and_a_later_attempt_publishes() {
+    let (server, token) = cold_world();
+    let mut limits = server.lock().unwrap().limits();
+    limits.max_staged_parts = 2;
+    server.lock().unwrap().set_limits(limits);
+    let body = body_file(tail_of(&server), 4);
+    let e = publish_file(&server, token, 4096, &body).unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::StagedPartsFull {
+            status: 429
+        }),
+        "{e}"
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0, "discarded");
+    assert_eq!(retention(&server).1, None);
+    limits.max_staged_parts = crate::model::MAX_STAGED_PARTS;
+    server.lock().unwrap().set_limits(limits);
+    assert_eq!(
+        publish_file(&server, token, 4096, &body).unwrap(),
+        crate::snapshotter::Outcome::Published {
+            offset: body.offset
+        }
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0);
+}
+
+// A binding that stops while its parts go up sends no part more, and discards the ones staged.
+#[test]
+fn a_stopped_snapshot_thread_stages_no_more_parts() {
+    let (server, token) = cold_world();
+    let body = body_file(tail_of(&server), 4);
+    let transport = ModelTransport::new(Arc::clone(&server), PATH);
+    let snapper = crate::snapshotter::Snapper::default();
+    snapper.stop();
+    let e = crate::snapshotter::publish(&crate::snapshotter::Publish {
+        remote: crate::snapshotter::Remote {
+            transport: &transport,
+            snapper: &snapper,
+            cluster_id: "cluster-a",
+            incarnation: token,
+        },
+        request_limit: 4096,
+        offset: body.offset,
+        digest: body.digest,
+        body: &body.path,
+        len: body.len,
+    })
+    .unwrap_err();
+    assert!(
+        matches!(e, crate::snapshotter::SnapshotFailure::Reset),
+        "{e}"
+    );
+    assert_eq!(server.lock().unwrap().staged_parts(), 0);
+    assert_eq!(retention(&server).1, None);
+}
+
 // A publish behind a later snapshot is superseded, and moves nothing.
 #[test]
 fn a_publish_behind_a_later_snapshot_is_superseded() {
@@ -2345,6 +2524,45 @@ fn a_server_without_protocol_2_is_refused() {
         matches!(*e, OpenError::ServerTooOld { protocol: None }),
         "{e}"
     );
+}
+
+// A gateway's concealing 404 carries no `Ursula-Protocol`: it is no missing stream. An open over
+// no generation creates nothing, and one with `recreate` over a generation holding data salvages
+// nothing: both are refused server_too_old.
+#[test]
+fn a_head_404_without_the_protocol_is_no_missing_stream() {
+    let dir = TempDir::new("driver-concealed");
+    let mut w = World::new();
+    w.concealed = true;
+    let c = w.core();
+    let e = kind(w.open_result(c, spec(dir.path(), 1)));
+    assert!(
+        matches!(*e, OpenError::ServerTooOld { protocol: None }),
+        "{e}"
+    );
+    assert!(w.server.token(PATH).is_none(), "nothing created");
+
+    let dir = TempDir::new("driver-concealed-data");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    w.retire(c, &bound);
+    let generation = bound.handle.generation.dir.clone();
+    drop(bound);
+    w.concealed = true;
+    let c2 = w.core();
+    let e = kind(w.open_result(c2, OpenSpec {
+        access: Access::Owner { recreate: true },
+        ..spec(dir.path(), 2)
+    }));
+    assert!(
+        matches!(*e, OpenError::ServerTooOld { protocol: None }),
+        "{e}"
+    );
+    assert!(generation.exists(), "the generation stays");
+    assert!(!stream_root(dir.path()).join("salvage").exists());
 }
 
 #[test]

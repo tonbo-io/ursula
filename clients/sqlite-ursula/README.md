@@ -39,6 +39,15 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 
 `UrsulaDatabase` adds `name` (the stream's path, such as `/acme/notes`), `synced({ signal })`, `status()` and `on("reset", listener)` / `off("reset", listener)`.
 
+## Import
+
+`importSqlite(url, file, { token, timeoutMs })` imports a plain SQLite database file into a new stream, as the stream's first snapshot, and returns `{ offset, digest, pages, bytes }`. Then `open(url)` it as any other stream.
+
+- The file must have 4096-byte pages, with no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
+- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published. A failure after the import claimed the stream leaves it holding the claim alone: import into a new stream.
+- A snapshot above the request limit goes up in parts, which needs a cold store on the server. Without one, a file whose compressed snapshot is above the limit fails with `invalid_argument`, naming the limit.
+- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default). An open of the stream while it runs is not prevented.
+
 ## Errors
 
 Every error the package throws for a failure of the extension has a `kind`, an `action` (`retry`, `reopen`, `stop` or `fix`) and a `cause`. Branch on `action`. Network failures never throw from statements or `synced()`.
@@ -48,7 +57,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (retry after `synced()`), `unsupported` (fix) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` when its signal fired first | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
-| `UrsulaSetupError` | `open()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 After a reset, pending `synced()` calls reject first, then the `reset` listeners run once. Every statement of the database throws the reset, reads included, except reads in a read transaction it had open, which keep its snapshot. A write in it still fails. `open()` the stream again, or stop when the action is `stop`. The new open need not wait for the old database to close: it works on a copy of the local cache, which carries every commit the old one made. Close the old database once you no longer need it.
 
@@ -66,7 +75,7 @@ Every transaction and statement resolves only after `synced()`, so a Pi commit r
 
 ## SQL functions
 
-Other hosts call the extension's SQL functions on the connection `loadUrsulaVfs()` returns: `ursula_open`, `ursula_synced`, `ursula_events`, `ursula_cancel`, `ursula_status`, `ursula_stats` and `ursula_set_token`. A host reopens through `ursula_open` after closing: once a database retired, a plain `new DatabaseSync(path)` of its path is refused until `ursula_open` binds it again.
+Other hosts call the extension's SQL functions on the connection `loadUrsulaVfs()` returns: `ursula_open`, `ursula_synced`, `ursula_events`, `ursula_cancel`, `ursula_status`, `ursula_stats`, `ursula_set_token` and `ursula_import(url, file, options_json, timeout_ms)`, whose `timeout_ms` must be positive. A host reopens through `ursula_open` after closing: once a database retired, a plain `new DatabaseSync(path)` of its path is refused until `ursula_open` binds it again.
 
 A cache's files are not SQLite files outside the extension. The db file holds a marker in place of SQLite's header magic, and its WAL is `db-uwal`. The `sqlite3` shell, node:sqlite without the extension and a connection opened before the extension loaded fail with `SQLITE_NOTADB` (`file is not a database`) and change nothing. To read a database with plain SQLite, export it from a connection `open()` returned, with `VACUUM INTO`.
 

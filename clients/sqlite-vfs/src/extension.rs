@@ -165,6 +165,30 @@ unsafe fn fn_open(ctx: *mut ffi::sqlite3_context, argc: c_int, argv: *mut *mut f
     unsafe { result(ctx, "ursula_open", outcome.as_ref().map(Clone::clone)) };
 }
 
+/// `ursula_import(url, file, options_json, timeout_ms)`: `{done, offset, digest, pages, bytes}`
+/// once `file` is the first snapshot of a new stream at `url` (`crate::import`). `timeout_ms` must
+/// be positive: the import blocks.
+unsafe fn fn_import(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    // SAFETY: SQLite calls the function with its arguments.
+    let url = unsafe { arg(argc, argv, 0) };
+    // SAFETY: as above.
+    let file = unsafe { arg(argc, argv, 1) };
+    // SAFETY: as above.
+    let options = unsafe { arg(argc, argv, 2) };
+    // SAFETY: as above.
+    let outcome = unsafe { arg_count(argc, argv, 3, "timeout_ms") }.and_then(|timeout| {
+        crate::import::import(&url, &file, &options, timeout)
+            .map(|imported| status::imported_json(&imported))
+            .map_err(Error::from)
+    });
+    // SAFETY: SQLite calls the function with its context.
+    unsafe { result(ctx, "ursula_import", outcome.as_ref().map(Clone::clone)) };
+}
+
 /// `ursula_synced(path, timeout_ms)` (design §8.2): `{synced, ticket, target, acknowledged}`; with
 /// `synced` false the ticket resolves later, when a `synced` event of its path reaches `through` it
 /// (`ursula_events`). A reset fails it.
@@ -338,6 +362,7 @@ sql_entry!(c_cancel => fn_cancel, "ursula_cancel");
 sql_entry!(c_status => fn_status, "ursula_status");
 sql_entry!(c_stats => fn_stats, "ursula_stats");
 sql_entry!(c_set_token => fn_set_token, "ursula_set_token");
+sql_entry!(c_import => fn_import, "ursula_import");
 
 /// Refuses a host SQLite the extension does not support (`gate`), then registers the "ursula" VFS
 /// over "unix" as the default (once per process) and the SQL functions on `db`, direct-only: a
@@ -424,7 +449,7 @@ unsafe fn init(
     };
     type SqlFn =
         unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
-    let fns: [(&CStr, c_int, SqlFn); 7] = [
+    let fns: [(&CStr, c_int, SqlFn); 8] = [
         (c"ursula_open", 4, c_ursula_open),
         (c"ursula_synced", 2, c_synced),
         (c"ursula_events", 2, c_events),
@@ -432,6 +457,7 @@ unsafe fn init(
         (c"ursula_status", 1, c_status),
         (c"ursula_stats", 1, c_stats),
         (c"ursula_set_token", 2, c_set_token),
+        (c"ursula_import", 4, c_import),
     ];
     for (name, n, f) in fns {
         // SAFETY: `db` is the loading connection, the name is NUL-terminated and static, and the

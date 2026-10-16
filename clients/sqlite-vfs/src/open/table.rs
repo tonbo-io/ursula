@@ -564,6 +564,30 @@ mod tests {
         }
     }
 
+    // A 404 without `Ursula-Protocol` (a gateway concealing a stream) is no missing stream: it
+    // refuses as too old whatever the local generation and `recreate`, never creates.
+    #[test]
+    fn a_404_without_protocol_2_is_too_old_not_missing() {
+        let seen = HeadSeen {
+            identity: None,
+            stream: None,
+            content_type: None,
+        };
+        let too_old = Refused::ServerTooOld { protocol: None };
+        for found in [local(1, 0), NONE, REPLACED] {
+            for asked in [ask(), RECREATE] {
+                assert_eq!(
+                    decide(found.clone(), asked, seen),
+                    refused(too_old.clone(), found.clone())
+                );
+            }
+            assert_eq!(
+                decide_reader(found, seen),
+                ReaderRow::Refuse(too_old.clone())
+            );
+        }
+    }
+
     #[test]
     fn another_cluster_refuses_a_trusted_generation_before_anything_else() {
         let id = identity("cluster-b");

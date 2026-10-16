@@ -64,6 +64,9 @@ const START: &str = "-1";
 /// The path suffix, after the snapshot's, of a part staged for it.
 const PARTS: &str = "/parts";
 
+/// The path suffix of the stream's staged parts, discarded together.
+const STAGED_PARTS: &str = "/snapshot/parts";
+
 /// The rate a parts commit's answer is waited for at: a server copies the parts before it
 /// answers, in time with their total.
 const COMMIT_COPY_BYTES_PER_SECOND: u64 = 16 << 20;
@@ -74,6 +77,7 @@ pub(crate) enum Method {
     Get,
     Put,
     Post,
+    Delete,
 }
 
 #[cfg_attr(
@@ -87,6 +91,7 @@ impl Method {
             "GET" => Some(Self::Get),
             "PUT" => Some(Self::Put),
             "POST" => Some(Self::Post),
+            "DELETE" => Some(Self::Delete),
             _ => None,
         }
     }
@@ -109,6 +114,8 @@ pub(crate) enum Target {
     Snapshot { offset: Offset },
     /// A part of the snapshot at `offset`, staged (`POST`) for a parts commit.
     SnapshotParts { offset: Offset },
+    /// Every part staged under the stream's current token, discarded (`DELETE`).
+    StagedParts,
     /// The retention boundary (`PUT`), monotonic (#581 §3).
     Retention { offset: Offset },
 }
@@ -125,6 +132,7 @@ impl Target {
             }
             Self::Snapshot { offset } => format!("/snapshot/{offset}"),
             Self::SnapshotParts { offset } => format!("/snapshot/{offset}/parts"),
+            Self::StagedParts => STAGED_PARTS.to_owned(),
             Self::Retention { offset } => format!("/retention/{offset}"),
         }
     }
@@ -137,6 +145,9 @@ impl Target {
     )]
     pub(crate) fn split(method: Method, target: &str) -> Result<(&str, Self), WireError> {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if let Some(stream) = path.strip_suffix(STAGED_PARTS) {
+            return Ok((stream, Self::StagedParts));
+        }
         if let Some((stream, offset)) = path
             .strip_suffix(PARTS)
             .and_then(|path| path.rsplit_once("/snapshot/"))
@@ -711,6 +722,7 @@ mod tests {
             (Method::Put, Target::Snapshot { offset }),
             (Method::Get, Target::Snapshot { offset }),
             (Method::Post, Target::SnapshotParts { offset }),
+            (Method::Delete, Target::StagedParts),
             (Method::Put, Target::Retention { offset }),
         ] {
             let path = format!("/v1/stream/b/s{}", target.suffix());

@@ -12,10 +12,12 @@ use crate::driver::Kept;
 use crate::driver::SyncError;
 use crate::driver::runtime::DriverGone;
 use crate::host::HostError;
+use crate::import::ImportError;
 use crate::open::OpenError;
 use crate::options::OptionsError;
 use crate::replicator::ResetKind;
 use crate::salvage::SalvageError;
+use crate::snapshotter::SnapshotFailure;
 
 /// What a caller does about an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +195,54 @@ impl Kept {
     }
 }
 
+impl ImportError {
+    /// The kind callers see.
+    pub(crate) fn kind(&self) -> ErrorKind {
+        match self {
+            ImportError::InvalidArgument { .. } | ImportError::Options(_) => {
+                ErrorKind::InvalidArgument
+            }
+            ImportError::InvalidUrl(_) => ErrorKind::InvalidUrl,
+            ImportError::Source(_) => ErrorKind::InvalidArgument,
+            ImportError::Io { .. } => ErrorKind::LocalSetup,
+            ImportError::ServerTooOld { .. } => ErrorKind::ServerTooOld,
+            ImportError::ContentType { .. } | ImportError::Configuration => ErrorKind::StreamFormat,
+            ImportError::NotNew(_) | ImportError::Refused(_) => ErrorKind::StreamState,
+            ImportError::WrongCluster { .. } => ErrorKind::WrongCluster,
+            ImportError::Rejected { status, .. } => status_kind(*status),
+            ImportError::Unavailable { .. } | ImportError::TimedOut { .. } => {
+                ErrorKind::Unavailable
+            }
+            ImportError::Publish(e) => match e {
+                // The file is too large for the stream as it is set up: no write was refused.
+                SnapshotFailure::TooLarge { .. } => ErrorKind::InvalidArgument,
+                SnapshotFailure::Conflict { .. } | SnapshotFailure::TokenChanged => {
+                    ErrorKind::StreamState
+                }
+                SnapshotFailure::WrongCluster { .. } => ErrorKind::WrongCluster,
+                SnapshotFailure::Status { status, .. } => status_kind(*status),
+                SnapshotFailure::Io { .. } | SnapshotFailure::Body(_) => ErrorKind::LocalSetup,
+                SnapshotFailure::Host(_) | SnapshotFailure::Driver(_) => ErrorKind::Internal,
+                SnapshotFailure::Malformed { .. }
+                | SnapshotFailure::Outage { .. }
+                | SnapshotFailure::StagedPartsFull { .. }
+                | SnapshotFailure::Reset => ErrorKind::Unavailable,
+            },
+        }
+    }
+}
+
+/// The kind of a definite answer an import does not take.
+fn status_kind(status: u16) -> ErrorKind {
+    match status {
+        401 => ErrorKind::Unauthorized,
+        402 => ErrorKind::PaymentRequired,
+        403 => ErrorKind::Forbidden,
+        404 | 409 | 410 | 412 => ErrorKind::StreamState,
+        _ => ErrorKind::Unavailable,
+    }
+}
+
 /// Why a write transaction failed alone, nothing of it written or logged.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WriteRefusal {
@@ -235,6 +285,8 @@ pub(crate) enum Error {
     /// The root's `salvage/` could not be listed.
     #[error(transparent)]
     Salvage(#[from] SalvageError),
+    #[error(transparent)]
+    Import(#[from] ImportError),
 }
 
 impl Error {
@@ -247,6 +299,7 @@ impl Error {
             Error::Host(e) => e.kind(),
             Error::DriverGone(_) | Error::Panicked { .. } => ErrorKind::Internal,
             Error::Salvage(_) => ErrorKind::LocalSetup,
+            Error::Import(e) => e.kind(),
         }
     }
 }
