@@ -55,7 +55,9 @@ answers `400`. `ImmutableResource::parse` accepts a token only as canonical deci
 only as 20 zero-padded digits, the forms the server sends. A chunk read from inside a chunk is a
 second, overlapping URL by design, and percent-encoded digits reach the same resource, which only
 splits a cache key. Anything
-else answers `400`. The path's token is the `Stream-Incarnation` precondition, and the request's
+else answers `400` `INVALID_RESOURCE`, and a query component `400` `QUERY_NOT_ACCEPTED`. A path
+segment that is not valid UTF-8 once percent-decoded never reaches the route: the router's path
+extractor refuses it, and the router's net renders `400` `INVALID_REQUEST`. The path's token is the `Stream-Incarnation` precondition, and the request's
 own header is not read. The read itself evaluates `404`, `410` and `416` first, and `412` comes
 after them, as for every read.
 
@@ -97,8 +99,10 @@ needs no round, and neither does a base-protocol read that succeeds.
 for a JSON stream), `Stream-Incarnation`, `Stream-Offset`, `Stream-Next-Offset`, the marker, and
 `Stream-Closed` at a closed tail. It sends no `Stream-Up-To-Date` and no `Stream-Cursor`. The
 snapshot resource shares `snapshot_answer` with the stream's own snapshot route, which renders
-`ImmutableSnapshotRead` for it: the marker on `200`, `206` and `304`, none on `416`, and never
-`Stream-Up-To-Date`.
+`ImmutableSnapshotRead` for it: the marker on `200`, `206` and `304`, and never
+`Stream-Up-To-Date`. A range past the end answers `416` as a JSON error answer,
+`RANGE_NOT_SATISFIABLE` with `Content-Type: application/json`, that keeps the snapshot headers,
+the `ETag`, `Accept-Ranges` and `Content-Range: bytes */total`, without the marker.
 
 **Validators.** `read_etag` is BLAKE3 over the token, the range, where the read ended, the content
 type and the body, cut to 128 bits. Under one token the range names the bytes (G1), but the body is

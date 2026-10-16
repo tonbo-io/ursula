@@ -1187,8 +1187,11 @@ mod tests {
         );
     }
 
-    /// Seed 920 kills the leader while a chunk read is in flight, and the
-    /// new leader has not applied the chunk another replica marked.
+    /// With the leader's barrier off, seed 920 fails the invariant at
+    /// `before_power_loss`, in the accepted-loss step: the leader cut off
+    /// from the others, deposed without knowing it, answers short of a
+    /// chunk the new leader marked. With every defence on the seed passes
+    /// (`marked_chunks_never_contradict_replays` runs it).
     #[test]
     fn negative_control_a_new_leader_that_skips_the_barrier_contradicts_a_marked_chunk() {
         assert_fails(920, Controls::LEADER_BARRIER_OFF, "before_power_loss");
