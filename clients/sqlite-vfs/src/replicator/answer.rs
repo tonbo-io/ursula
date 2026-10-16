@@ -354,17 +354,37 @@ fn no_answer() -> Common {
 /// The producer answer whose outcome `classify` read: a receipt or `receipt-evicted` (`Applied`,
 /// `Repeat`), or a producer refusal (`Refused` with that answer's code). `None` for every other
 /// answer, which [`decide_status`] decides.
+///
+/// A producer answer comes only to a keyed write, which `classify` reads with the same
+/// `ProducerAnswer::parse`: a receipt is always `Applied` or `Repeat`, and a producer refusal
+/// always `Refused` with its own code. The debug assertions hold that; a release build hands an
+/// answer that broke it to [`decide_status`].
 fn producer_answer(answer: &Answer) -> Option<&ProducerAnswer> {
     let Ok(Typed::Producer(producer)) = &answer.typed else {
         return None;
     };
-    match answer.outcome.as_ref()? {
-        WriteOutcome::Applied | WriteOutcome::Repeat => Some(producer),
-        WriteOutcome::Refused(code) if producer.error_code().as_ref() == Some(code) => {
-            Some(producer)
+    debug_assert!(
+        answer.outcome.is_some(),
+        "a producer answer to a request that is no write: {producer:?}"
+    );
+    let outcome = answer.outcome.as_ref()?;
+    let code = producer.error_code();
+    let read = match outcome {
+        WriteOutcome::Applied | WriteOutcome::Repeat => {
+            debug_assert!(
+                code.is_none(),
+                "classify read the producer refusal {producer:?} as {outcome:?}"
+            );
+            true
         }
-        WriteOutcome::Refused(_) | WriteOutcome::Redirected | WriteOutcome::Unknown => None,
-    }
+        WriteOutcome::Refused(refused) => code.as_ref() == Some(refused),
+        WriteOutcome::Redirected | WriteOutcome::Unknown => false,
+    };
+    debug_assert!(
+        read,
+        "classify read the producer answer {producer:?} as {outcome:?}"
+    );
+    read.then_some(producer)
 }
 
 /// The rows of an answer without a producer answer: a write's by its outcome ([`decide_write`]),

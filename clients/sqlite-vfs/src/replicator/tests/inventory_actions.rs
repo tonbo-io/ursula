@@ -44,6 +44,7 @@ use crate::snapshotter::transient;
 use crate::snapshotter::transient_part;
 use crate::wire::Answer;
 use crate::wire::Exchange;
+use crate::wire::LOCATION;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
 use crate::wire::Request;
@@ -248,11 +249,13 @@ fn follows(outcome: &WriteOutcome, vfs: Vfs) -> bool {
 }
 
 /// Whether a replicator decision is safe for `outcome` at all, by design or not: it never treats
-/// an answer that may have applied as one that did not (after an `Unknown` it sends the identical
-/// request again, at once or every 30 s while blocked), and never acknowledges what did not apply.
+/// an answer that may have applied as one that did not, and never acknowledges what did not
+/// apply. After an `Unknown` it sends the identical request again: at once (`Resend`), every 30 s
+/// while blocked (`Blocked`), or, for a `3xx` but `307` or `308`, as after a redirect it never
+/// follows (`Redirect`): again to the same URL a few times, then blocked.
 fn safe(outcome: &WriteOutcome, vfs: Vfs) -> bool {
     match outcome {
-        WriteOutcome::Unknown => matches!(vfs, Vfs::Resend | Vfs::Blocked),
+        WriteOutcome::Unknown => matches!(vfs, Vfs::Resend | Vfs::Blocked | Vfs::Redirect),
         WriteOutcome::Refused(_) | WriteOutcome::Redirected => vfs != Vfs::Acknowledge,
         WriteOutcome::Applied | WriteOutcome::Repeat => true,
     }
@@ -327,6 +330,19 @@ fn exchange(row: &Row, request: &Request) -> Exchange {
     }
 }
 
+/// The in-flight append `(3, 4)`, expected where the samples' receipts start.
+fn in_flight() -> Sealed {
+    Sealed {
+        epoch: epoch(3),
+        seq: seq(4),
+        first: crate::ids::Position(5),
+        last: crate::ids::Position(6),
+        body: Arc::from(b"batch".to_vec()),
+        expected_start: off(1),
+        part: None,
+    }
+}
+
 /// What the replicator does with `row`'s answer to the in-flight append, or, for a row of
 /// another write, through [`decide_status`].
 fn append_decision(row: &Row) -> Vfs {
@@ -337,17 +353,7 @@ fn append_decision(row: &Row) -> Vfs {
             Exchange::NoAnswer(_) => Vfs::Resend,
         };
     }
-    // The in-flight append `(3, 4)`, expected where the samples' receipts start.
-    let sealed = Sealed {
-        epoch: epoch(3),
-        seq: seq(4),
-        first: crate::ids::Position(5),
-        last: crate::ids::Position(6),
-        body: Arc::from(b"batch".to_vec()),
-        expected_start: off(1),
-        part: None,
-    };
-    match decide_append(&sealed, &exchange) {
+    match decide_append(&in_flight(), &exchange) {
         AppendDecision::Acknowledge { .. } => Vfs::Acknowledge,
         AppendDecision::ContinuationClaim => Vfs::ContinuationClaim,
         AppendDecision::Common(common) => of_common(&common),
@@ -473,6 +479,60 @@ fn the_vfs_maps_every_inventory_row_to_its_action() {
             "{id}: {decisions:?} for {outcome:?} ({reason:?}): a difference is mapped \
              deliberately, with its reason, and an action that follows the outcome is not"
         );
+    }
+}
+
+/// Two answers no inventory row stands for, which `classify` reads as `Unknown` and
+/// `replicator/answer.rs` maps deliberately: a `3xx` but `307` or `308` is a redirect, never
+/// followed, and a `1xx` is no answer of Ursula's, blocked `rejected`. Both send the identical
+/// request again.
+#[test]
+fn a_3xx_but_307_or_308_redirects_and_a_1xx_is_rejected() {
+    let location = "http://elsewhere/s";
+    let redirect = Common::Redirect {
+        location: Some(location.to_owned()),
+    };
+    for (status, expected) in [
+        (300, redirect.clone()),
+        (301, redirect.clone()),
+        (302, redirect.clone()),
+        (303, redirect.clone()),
+        (304, redirect),
+        (
+            100,
+            Common::Blocked(BlockedReason::Rejected { status: 100 }),
+        ),
+        (
+            103,
+            Common::Blocked(BlockedReason::Rejected { status: 103 }),
+        ),
+    ] {
+        for keyed_seq in [4, 0] {
+            let answer = parse_answer(
+                &request_of(Write::ProducerAppend, keyed_seq),
+                status,
+                [(LOCATION, location.as_bytes())],
+                Vec::new(),
+            );
+            assert_eq!(answer.outcome, Some(WriteOutcome::Unknown), "{status}");
+            let exchange = Exchange::Answered(Box::new(answer));
+            let common = if keyed_seq == 0 {
+                match decide_claim(&exchange) {
+                    ClaimDecision::Common(common) => common,
+                    other => panic!("{status}: the claim decided {other:?}"),
+                }
+            } else {
+                match decide_append(&in_flight(), &exchange) {
+                    AppendDecision::Common(common) => common,
+                    other => panic!("{status}: the append decided {other:?}"),
+                }
+            };
+            assert_eq!(common, expected, "{status} at seq {keyed_seq}");
+            assert!(
+                safe(&WriteOutcome::Unknown, of_common(&common)),
+                "{status}: {common:?} is unsafe for an unknown outcome"
+            );
+        }
     }
 }
 

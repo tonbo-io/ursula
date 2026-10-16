@@ -298,9 +298,11 @@ pub(crate) fn new_agent_with<R: ureq::unversioned::resolver::Resolver>(
         .timeout_resolve(Some(CONNECT_TIMEOUT))
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .http_status_as_error(false)
-        // Every redirect comes back to the caller, which sends a 307 again to the same URL and
-        // fails on any other (`redirect_retried`). Followed, a redirect would go out without
-        // the token (ureq drops it on every redirect, to the same host too), and a 301, 302 or 303
+        // Every redirect comes back to the caller, which never follows one: the replicator and
+        // the open send the identical request again to the same URL after any 3xx, a few times,
+        // then block `redirected` (`backoff::REDIRECTS`), and the snapshotter takes a 3xx as a
+        // definite answer that fails its step. Followed, a redirect would go out without the
+        // token (ureq drops it on every redirect, to the same host too), and a 301, 302 or 303
         // would turn an append into a GET.
         .max_redirects(0)
         .max_idle_age(max_idle_age)
