@@ -497,7 +497,13 @@ async fn a_snapshot_above_a_gateways_limit_goes_up_in_parts_through_it() {
         response_header_timeout: std::time::Duration::from_secs(30),
         connect_timeout: std::time::Duration::from_secs(5),
         upstream_tcp_user_timeout_secs: std::num::NonZeroU64::new(30).expect("non-zero"),
-        max_request_body_bytes: GATEWAY_LIMIT,
+        uploads: ursula_gateway::uploads::UploadLimits::try_from(
+            ursula_gateway::uploads::UploadLimitsSpec {
+                max_request_body_bytes: GATEWAY_LIMIT,
+                ..ursula_gateway::uploads::UploadLimitsSpec::default()
+            },
+        )
+        .expect("upload limits"),
         raft_group_count: None,
         cors_allowed_origins: Vec::new(),
         usage_chunk_bytes: None,

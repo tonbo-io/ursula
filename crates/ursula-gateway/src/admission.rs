@@ -6,7 +6,10 @@
 //! - request rate, via a per-bucket token bucket (`429` + `Retry-After`);
 //! - concurrent live reads (SSE / long-poll), released when the response
 //!   body finishes streaming;
-//! - per-tenant request body size (`413`), tightening the gateway-wide cap.
+//! - per-tenant request body size (`413`), tightening the gateway-wide cap;
+//! - large request bodies being read at once, by count and by bytes (`429` +
+//!   `Retry-After`), released once each body is buffered. Bodies within the
+//!   gateway's small-body threshold never count (see [`crate::uploads`]).
 //!
 //! Every limit is optional; an absent limit means unlimited, and a gateway
 //! without an installed provider behaves exactly as before. Ursula enforces
@@ -33,6 +36,15 @@ pub struct TenantLimits {
     pub max_concurrent_live_reads: Option<u32>,
     /// Per-request body bytes, applied under the gateway-wide cap.
     pub max_request_body_bytes: Option<u64>,
+    /// Large request bodies the gateway reads for the bucket at once. A body
+    /// counts from its reservation until the gateway has buffered it, and
+    /// only when it is larger than the gateway's small-body threshold
+    /// (`--small-body-max-bytes`): small writes never count.
+    pub max_concurrent_uploads: Option<u32>,
+    /// Bytes those large bodies may reserve at once. The bucket's only body
+    /// under way always passes, so a cap below a body's size never refuses it
+    /// for good.
+    pub max_upload_bytes: Option<u64>,
 }
 
 /// Supplies per-bucket limits. Implementations may read static
@@ -62,6 +74,8 @@ impl QuotaProvider for UnlimitedQuotaProvider {
 /// id = "tenant-a"
 /// requests_per_sec = 10
 /// max_concurrent_live_reads = 4
+/// max_concurrent_uploads = 4
+/// max_upload_bytes = 67108864
 /// ```
 #[derive(Debug, Default)]
 pub struct StaticQuotaProvider {
@@ -77,6 +91,8 @@ impl StaticQuotaProvider {
             requests_per_sec: Option<u32>,
             max_concurrent_live_reads: Option<u32>,
             max_request_body_bytes: Option<u64>,
+            max_concurrent_uploads: Option<u32>,
+            max_upload_bytes: Option<u64>,
         }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -97,6 +113,8 @@ impl StaticQuotaProvider {
                 requests_per_sec: limits.requests_per_sec,
                 max_concurrent_live_reads: limits.max_concurrent_live_reads,
                 max_request_body_bytes: limits.max_request_body_bytes,
+                max_concurrent_uploads: limits.max_concurrent_uploads,
+                max_upload_bytes: limits.max_upload_bytes,
             }
         }
 
@@ -149,6 +167,12 @@ pub enum AdmissionRejection {
     RateLimited { retry_after_secs: u64 },
     /// The tenant's live-read connection budget is fully in use.
     LiveReadsExhausted,
+    /// The tenant has [`TenantLimits::max_concurrent_uploads`] large bodies
+    /// being read.
+    UploadsExhausted,
+    /// The body would take the tenant's large bodies being read past
+    /// [`TenantLimits::max_upload_bytes`].
+    UploadBytesExhausted,
 }
 
 struct RateBucket {
@@ -171,10 +195,18 @@ const PRUNE_ABOVE_TRACKED_BUCKETS: usize = 10_000;
 /// indistinguishable from retention, and this threshold is far beyond that.
 const RATE_BUCKET_IDLE_TTL: Duration = Duration::from_secs(60);
 
+/// What one bucket's large bodies being read hold now.
+#[derive(Debug, Default)]
+struct UploadUse {
+    uploads: u32,
+    bytes: u64,
+}
+
 #[derive(Default)]
 struct AdmissionState {
     rate: HashMap<String, RateBucket>,
     live_reads: HashMap<String, u32>,
+    uploads: HashMap<String, UploadUse>,
 }
 
 impl AdmissionState {
@@ -276,6 +308,107 @@ impl Admission {
     }
 }
 
+impl Admission {
+    /// Counts a large body of `bytes` against the bucket's upload limits.
+    /// `Ok(None)` when the bucket has neither limit. The returned guard
+    /// releases the count and the bytes when it drops, which the gateway does
+    /// once it has buffered the body.
+    pub fn admit_upload(
+        self: &Arc<Self>,
+        bucket_id: &str,
+        limits: TenantLimits,
+        bytes: u64,
+    ) -> Result<Option<UploadGuard>, AdmissionRejection> {
+        if limits.max_concurrent_uploads.is_none() && limits.max_upload_bytes.is_none() {
+            return Ok(None);
+        }
+        let mut state = self.lock();
+        // Checked before the entry is made, so that a refusal (a limit of 0
+        // uploads included) leaves no empty entry behind.
+        let (uploads, held_bytes) = state
+            .uploads
+            .get(bucket_id)
+            .map_or((0, 0), |held| (held.uploads, held.bytes));
+        if limits
+            .max_concurrent_uploads
+            .is_some_and(|max| uploads >= max)
+        {
+            return Err(AdmissionRejection::UploadsExhausted);
+        }
+        if uploads > 0
+            && limits
+                .max_upload_bytes
+                .is_some_and(|max| held_bytes.saturating_add(bytes) > max)
+        {
+            return Err(AdmissionRejection::UploadBytesExhausted);
+        }
+        let held = state.uploads.entry(bucket_id.to_owned()).or_default();
+        held.uploads = held.uploads.saturating_add(1);
+        held.bytes = held.bytes.saturating_add(bytes);
+        Ok(Some(UploadGuard {
+            admission: Arc::clone(self),
+            bucket_id: bucket_id.to_owned(),
+            limits,
+            bytes,
+        }))
+    }
+
+    /// Buckets with a large body being read under an upload limit now.
+    pub fn upload_buckets(&self) -> usize {
+        self.lock().uploads.len()
+    }
+}
+
+/// A large body's share of its bucket's upload limits
+/// ([`Admission::admit_upload`]), released when it drops.
+pub struct UploadGuard {
+    admission: Arc<Admission>,
+    bucket_id: String,
+    limits: TenantLimits,
+    bytes: u64,
+}
+
+impl UploadGuard {
+    /// Grows the body's share to `bytes`, for a body without a declared
+    /// length that keeps arriving. Refused past
+    /// [`TenantLimits::max_upload_bytes`] unless the body is the bucket's
+    /// only one under way.
+    pub fn grow(&mut self, bytes: u64) -> Result<(), AdmissionRejection> {
+        let more = bytes.saturating_sub(self.bytes);
+        if more == 0 {
+            return Ok(());
+        }
+        let mut state = self.admission.lock();
+        let Some(held) = state.uploads.get_mut(&self.bucket_id) else {
+            return Ok(());
+        };
+        if held.uploads > 1
+            && self
+                .limits
+                .max_upload_bytes
+                .is_some_and(|max| held.bytes.saturating_add(more) > max)
+        {
+            return Err(AdmissionRejection::UploadBytesExhausted);
+        }
+        held.bytes = held.bytes.saturating_add(more);
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        let mut state = self.admission.lock();
+        if let Some(held) = state.uploads.get_mut(&self.bucket_id) {
+            held.bytes = held.bytes.saturating_sub(self.bytes);
+            held.uploads = held.uploads.saturating_sub(1);
+            if held.uploads == 0 {
+                state.uploads.remove(&self.bucket_id);
+            }
+        }
+    }
+}
+
 /// RAII release of a live-read slot.
 pub struct LiveReadGuard {
     admission: Arc<Admission>,
@@ -302,8 +435,84 @@ mod tests {
         TenantLimits {
             requests_per_sec: rate,
             max_concurrent_live_reads: live,
-            max_request_body_bytes: None,
+            ..TenantLimits::default()
         }
+    }
+
+    fn uploads(count: Option<u32>, bytes: Option<u64>) -> TenantLimits {
+        TenantLimits {
+            max_concurrent_uploads: count,
+            max_upload_bytes: bytes,
+            ..TenantLimits::default()
+        }
+    }
+
+    #[test]
+    fn upload_slots_release_on_guard_drop_and_other_buckets_proceed() {
+        let admission = Arc::new(Admission::default());
+        let one = uploads(Some(1), None);
+
+        let guard = admission
+            .admit_upload("tenant-a", one, 10)
+            .expect("first upload admitted")
+            .expect("guard for limited tenant");
+        assert!(matches!(
+            admission.admit_upload("tenant-a", one, 10),
+            Err(AdmissionRejection::UploadsExhausted)
+        ));
+        drop(
+            admission
+                .admit_upload("tenant-b", one, 10)
+                .expect("another bucket proceeds"),
+        );
+        assert_eq!(admission.upload_buckets(), 1);
+
+        drop(guard);
+        assert_eq!(admission.upload_buckets(), 0);
+        drop(
+            admission
+                .admit_upload("tenant-a", one, 10)
+                .expect("admitted once released"),
+        );
+
+        // A limit of 0 refuses every large body and leaves no entry behind.
+        assert!(matches!(
+            admission.admit_upload("tenant-c", uploads(Some(0), None), 10),
+            Err(AdmissionRejection::UploadsExhausted)
+        ));
+        assert_eq!(admission.upload_buckets(), 0);
+    }
+
+    #[test]
+    fn upload_bytes_pass_the_first_body_and_bound_the_rest() {
+        let admission = Arc::new(Admission::default());
+        let capped = uploads(None, Some(100));
+
+        // The bucket's only body passes, whatever its size, and may grow.
+        let mut first = admission
+            .admit_upload("tenant-a", capped, 150)
+            .expect("the first body passes")
+            .expect("a guard");
+        first.grow(300).expect("the only body grows");
+        assert!(matches!(
+            admission.admit_upload("tenant-a", capped, 1),
+            Err(AdmissionRejection::UploadBytesExhausted)
+        ));
+        drop(first);
+
+        let mut first = admission
+            .admit_upload("tenant-a", capped, 40)
+            .expect("admitted")
+            .expect("a guard");
+        let _second = admission
+            .admit_upload("tenant-a", capped, 50)
+            .expect("within the cap")
+            .expect("a guard");
+        assert!(matches!(
+            first.grow(60),
+            Err(AdmissionRejection::UploadBytesExhausted)
+        ));
+        first.grow(50).expect("up to the cap");
     }
 
     #[tokio::test(start_paused = true)]
@@ -359,6 +568,13 @@ mod tests {
                 .expect("admitted")
                 .is_none()
         );
+        assert!(
+            admission
+                .admit_upload("t", TenantLimits::default(), u64::MAX)
+                .expect("admitted")
+                .is_none()
+        );
+        assert_eq!(admission.upload_buckets(), 0);
     }
 
     #[test]
@@ -372,6 +588,8 @@ mod tests {
             id = "tenant-a"
             requests_per_sec = 10
             max_concurrent_live_reads = 4
+            max_concurrent_uploads = 3
+            max_upload_bytes = 1024
             "#,
         )
         .expect("parse policy");
@@ -379,9 +597,12 @@ mod tests {
         let tenant_a = futures_executor(provider.limits_for("tenant-a"));
         assert_eq!(tenant_a.requests_per_sec, Some(10));
         assert_eq!(tenant_a.max_concurrent_live_reads, Some(4));
+        assert_eq!(tenant_a.max_concurrent_uploads, Some(3));
+        assert_eq!(tenant_a.max_upload_bytes, Some(1024));
         let other = futures_executor(provider.limits_for("tenant-b"));
         assert_eq!(other.requests_per_sec, Some(100));
         assert_eq!(other.max_concurrent_live_reads, None);
+        assert_eq!(other.max_upload_bytes, None);
     }
 
     fn futures_executor<T>(future: impl Future<Output = T>) -> T {

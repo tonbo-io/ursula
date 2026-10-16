@@ -26,17 +26,33 @@
 //! 5 s, so that a client that sends its whole body before it reads the answer
 //! gets the refusal instead of a closed connection (#540).
 //!
+//! The bodies the gateway buffers for the requests it forwards are bounded
+//! across requests ([`uploads`]): each reserves its size from a node-wide
+//! budget before any byte of it is read, with headroom only small bodies may
+//! take. With a quota policy, a bucket's large bodies being read are bounded
+//! by count and bytes too ([`admission::TenantLimits`]). A request past a
+//! bucket's upload limits is refused at once (`429`), and one that finds the
+//! budget spent after a short wait (`503`). A body that stops arriving, or
+//! falls below a floor of bytes over one window of the stall timeout, is cut
+//! and refused (`408`) before anything of it is forwarded. Each refusal
+//! carries its own code in the JSON error body. The first two, and the `413`
+//! for a body over a bucket's own limit, read the body first, at the pace a
+//! forwarded body may keep, so that the client gets them on an intact
+//! connection.
+//!
 //! Module map:
 //!
 //! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
-//! - [`admission`]: opt-in per-tenant rate, live-read, and body-size limits.
+//! - [`admission`]: opt-in per-tenant rate, live-read, body-size and upload
+//!   limits.
 //! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
+//! - [`uploads`]: the per-request limit and the node-wide budget for buffered
+//!   request bodies, and the pace a body must keep.
 //! - `ejection`: leaves upstreams that failed at the transport out of selection
 //!   for a backoff window, then lets one request at a time probe them (#454).
 
 use std::collections::HashMap;
-use std::error::Error as _;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -80,6 +96,7 @@ pub mod auth;
 pub mod cors;
 mod ejection;
 pub mod service;
+pub mod uploads;
 pub mod usage;
 
 use std::sync::Arc;
@@ -89,6 +106,7 @@ use crate::admission::AdmissionRejection;
 use crate::admission::LiveReadGuard;
 use crate::admission::QuotaProvider;
 use crate::admission::TenantLimits;
+use crate::admission::UploadGuard;
 use crate::auth::AccessControl;
 use crate::auth::Action;
 use crate::auth::AuthenticationError;
@@ -99,6 +117,10 @@ use crate::auth::Resource;
 use crate::auth::VerifiedPrincipal;
 use crate::ejection::Ejections;
 use crate::ejection::Failed;
+use crate::uploads::BodyPermit;
+use crate::uploads::BudgetExhausted;
+use crate::uploads::UploadLimits;
+use crate::uploads::Uploads;
 use crate::usage::PrincipalRef;
 use crate::usage::UsageClass;
 use crate::usage::UsageCollector;
@@ -133,6 +155,12 @@ const REFUSED_BODY_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// at most. 32 MiB, the default `max_request_body_bytes`, takes this long at
 /// about 9 Mbit/s.
 const REFUSED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// The pace of the reading of a request's body that the gateway refused from
+/// its head alone, before it knew the request may be forwarded.
+const REFUSED_PACE: Pace = Pace::Bounded {
+    stall_timeout: REFUSED_BODY_STALL_TIMEOUT,
+    read_timeout: REFUSED_BODY_DRAIN_TIMEOUT,
+};
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Default)]
@@ -149,6 +177,12 @@ struct GatewayMetrics {
     upstream_ejections: AtomicU64,
     refusal_drains: AtomicU64,
     refusal_drains_cut: AtomicU64,
+    refusal_drain_bytes: AtomicU64,
+    body_bytes_buffered: AtomicU64,
+    upload_refusals_tenant_bytes: AtomicU64,
+    upload_refusals_tenant_uploads: AtomicU64,
+    upload_refusals_budget: AtomicU64,
+    upload_refusals_too_slow: AtomicU64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -187,6 +221,36 @@ struct GatewayMetricsSnapshot {
     /// closes after the refusal, and a client still sending the body may see
     /// that instead of the refusal.
     refusal_drains_cut: u64,
+    /// Bytes of the bodies of refused requests that the gateway read and
+    /// dropped ([`Gateway::refuse_unread`]), counted as each chunk arrives.
+    refusal_drain_bytes: u64,
+    /// Bytes of the bodies of requests the gateway may forward that it read
+    /// to buffer them ([`Gateway::buffer`]), counted as each chunk arrives,
+    /// also of a body cut or refused part way. The rest of a body refused
+    /// part way counts in `refusal_drain_bytes`.
+    body_bytes_buffered: u64,
+    /// Requests refused because their bucket's large bodies being read would
+    /// have gone past [`TenantLimits::max_upload_bytes`] with theirs.
+    upload_refusals_tenant_bytes: u64,
+    /// Requests refused because their bucket had
+    /// [`TenantLimits::max_concurrent_uploads`] large bodies being read.
+    upload_refusals_tenant_uploads: u64,
+    /// Requests refused because the body budget stayed spent for
+    /// [`UploadLimits::budget_wait`].
+    upload_refusals_budget: u64,
+    /// Bodies cut because no byte of them arrived for
+    /// [`UploadLimits::stall_timeout`], or because fewer than
+    /// [`UploadLimits::min_window_bytes`] of them arrived in one window of
+    /// it.
+    upload_refusals_too_slow: u64,
+    /// The body budget in effect, the small-body headroom included: an
+    /// unset `--body-budget-bytes` grows with `--max-request-body-bytes`.
+    upload_budget_bytes: u64,
+    /// Bytes of the body budget reserved now, each body's share rounded up
+    /// to whole KiB.
+    upload_reserved_bytes: u64,
+    /// Buckets with a large body being read under an upload limit now.
+    upload_tenants: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -204,7 +268,10 @@ pub struct GatewayConfig {
     /// after about 15 minutes. 0.7.0 used reqwest's default of 30 s. Idle
     /// connections are probed three times within it (see `UpstreamKeepalive`).
     pub upstream_tcp_user_timeout_secs: NonZeroU64,
-    pub max_request_body_bytes: usize,
+    /// The most the gateway buffers of one request's body, the budget for the
+    /// bodies it buffers across requests, and the pace those bodies must
+    /// keep.
+    pub uploads: UploadLimits,
     /// Raft topology used to share one learned leader across every stream in
     /// the same group. `None` preserves per-stream affinity for standalone
     /// gateways that do not know the server topology.
@@ -233,6 +300,7 @@ pub struct Gateway {
     access_control: Option<AccessControl>,
     quota_provider: Option<Arc<dyn QuotaProvider>>,
     admission: Arc<Admission>,
+    uploads: Arc<Uploads>,
     usage: Option<Arc<UsageCollector>>,
     shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
@@ -265,6 +333,7 @@ impl Gateway {
             config.upstream_tcp_user_timeout_secs.get(),
         ));
         let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
+        let uploads = Arc::new(Uploads::new(&config.uploads));
         Self {
             config,
             client,
@@ -272,6 +341,7 @@ impl Gateway {
             access_control: None,
             quota_provider: None,
             admission: Arc::new(Admission::default()),
+            uploads,
             usage: None,
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
@@ -349,7 +419,7 @@ impl Gateway {
 
         let context = match self.gate(&parts).await {
             Ok(context) => context,
-            Err(refusal) => return self.refuse_unread(refusal, body).await,
+            Err(refusal) => return self.refuse_unread(refusal, body, REFUSED_PACE).await,
         };
         if self.access_control.is_some() {
             // The credential terminates at the gateway. Internal Ursula nodes
@@ -361,26 +431,16 @@ impl Gateway {
         if let Some(context) = &context {
             match self.admit(context) {
                 Ok(guard) => live_guard = guard,
-                Err(refusal) => return self.refuse_unread(refusal, body).await,
+                Err(refusal) => return self.refuse_unread(refusal, body, REFUSED_PACE).await,
             }
         }
 
         let limit = self.request_limit(context.as_ref());
-        let body_bytes =
-            match axum::body::to_bytes(body, usize::try_from(limit).unwrap_or(usize::MAX)).await {
-                Ok(b) => b,
-                Err(err) => {
-                    let refusal = if err
-                        .source()
-                        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-                    {
-                        Refusal::BodyTooLarge { limit }
-                    } else {
-                        Refusal::BodyUnreadable
-                    };
-                    return refusal.into_response();
-                }
-            };
+        // Held until the buffered body is dropped, after it was forwarded.
+        let (body_bytes, _permit) = match self.buffer(body, context.as_ref(), limit).await {
+            Ok(buffered) => buffered,
+            Err(refused) => return refused,
+        };
 
         let upstream = match self.pick_upstream(&parts.uri) {
             Some(u) => u,
@@ -435,10 +495,214 @@ impl Gateway {
     /// The largest body the gateway forwards for a request: the smaller of
     /// `max_request_body_bytes` and the tenant's limit.
     fn request_limit(&self, context: Option<&RequestContext>) -> u64 {
-        let global = u64::try_from(self.config.max_request_body_bytes).unwrap_or(u64::MAX);
+        let global =
+            u64::try_from(self.config.uploads.max_request_body_bytes()).unwrap_or(u64::MAX);
         context
             .and_then(|ctx| ctx.limits.max_request_body_bytes)
             .map_or(global, |tenant| tenant.min(global))
+    }
+
+    /// The pace of the reading of a body the gateway may forward
+    /// ([`Pace::Live`]): [`UploadLimits::stall_timeout`] without a byte, and
+    /// [`UploadLimits::min_bytes_per_sec`] over each window of the stall
+    /// timeout.
+    fn forwarded_pace(&self) -> Pace {
+        Pace::Live {
+            stall_timeout: self.config.uploads.stall_timeout(),
+            min_window_bytes: self.config.uploads.min_window_bytes(),
+        }
+    }
+
+    /// Reads the `body` of a request the gateway forwards whole, within
+    /// `limit` ([`Gateway::request_limit`]), the body budget and the
+    /// bucket's upload limits ([`uploads`]), at the pace
+    /// [`Gateway::forwarded_pace`] sets. Returns the body and its share of
+    /// the budget, which the caller holds until it has forwarded the body,
+    /// or the answer to the request: a refusal.
+    ///
+    /// A body the gateway refuses for its size or for the budget is read to
+    /// its end first, up to `max_request_body_bytes` and at the same pace, so
+    /// that the client gets the refusal on an intact connection: one over the
+    /// bucket's own limit, by its declared length or as it arrives, one that
+    /// a bucket's upload limits refuse, and one that gets no share of the
+    /// budget. Only a body past `max_request_body_bytes` gets its `413` with
+    /// the rest unread, after which the connection closes, as before.
+    async fn buffer(
+        &self,
+        body: Body,
+        context: Option<&RequestContext>,
+        limit: u64,
+    ) -> Result<(bytes::Bytes, Option<BodyPermit>), AxumResponse> {
+        if body.is_end_stream() {
+            return Ok((bytes::Bytes::new(), None));
+        }
+        let pace = self.forwarded_pace();
+        if body.size_hint().lower() > limit {
+            return Err(self
+                .refuse_unread(Refusal::BodyTooLarge { limit }, body, pace)
+                .await);
+        }
+        let declared = body.size_hint().exact();
+        // A body without a declared length starts small, and its reservation
+        // grows as it arrives.
+        let reserve = declared
+            .unwrap_or_else(|| self.uploads.undeclared_start())
+            .min(limit);
+        let mut claim = None;
+        if !self.uploads.is_small(reserve) {
+            match self.claim_upload(context, reserve) {
+                Ok(claimed) => claim = claimed,
+                Err(refusal) => return Err(self.refuse_unread(refusal, body, pace).await),
+            }
+        }
+        let mut permit = match self.uploads.reserve(reserve).await {
+            Ok(permit) => permit,
+            Err(BudgetExhausted) => {
+                // The bucket's upload limits bound bodies the gateway may
+                // forward, not the reading of a refused one.
+                drop(claim);
+                return Err(self
+                    .refuse_unread(self.budget_exhausted(), body, pace)
+                    .await);
+            }
+        };
+
+        let mut reader = BodyReader::new(body, self.config.uploads.max_request_body_bytes(), pace);
+        // Each chunk is copied as it arrives and dropped, so that the body
+        // holds no more than its share of the budget: a chunk can be a
+        // slice of a larger read buffer, which it would keep alive. A
+        // declared body gets all of its share at once, and one without a
+        // declared length grows within its share as it arrives.
+        let mut buffered = BodyBuffer::new(declared.map_or(0, |_| permit.bytes()));
+        loop {
+            let chunk = match reader.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(end) => return Err(self.cut_short(end, buffered.len(), limit)),
+            };
+            self.metrics
+                .body_bytes_buffered
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            let len = buffered.len().saturating_add(chunk.len() as u64);
+            if len > limit {
+                // Past the bucket's own limit, within the gateway's: the
+                // rest is read and dropped, as for a refusal from the head.
+                drop((chunk, buffered, permit, claim));
+                return Err(self
+                    .refuse_rest(Refusal::BodyTooLarge { limit }, reader)
+                    .await);
+            }
+            if len > permit.bytes() {
+                let grown = permit.bytes().saturating_mul(2).max(len).min(limit);
+                if let Err(refusal) = self
+                    .grow_upload(context, &mut claim, &mut permit, grown)
+                    .await
+                {
+                    drop((chunk, buffered, permit, claim));
+                    return Err(self.refuse_rest(refusal, reader).await);
+                }
+            }
+            buffered.push(&chunk, permit.bytes());
+        }
+        // The bucket's upload limits bound bodies while they arrive: a
+        // buffered body no longer counts, while it still holds its share of
+        // the budget.
+        drop(claim);
+        let body_bytes = buffered.finish(&mut permit);
+        Ok((body_bytes, Some(permit)))
+    }
+
+    /// Counts a large body of `bytes` against its bucket's upload limits
+    /// ([`Admission::admit_upload`]). `Ok(None)` without access control or a
+    /// quota policy, or when the bucket has no upload limit.
+    fn claim_upload(
+        &self,
+        context: Option<&RequestContext>,
+        bytes: u64,
+    ) -> Result<Option<UploadGuard>, Refusal> {
+        let Some(context) = context else {
+            return Ok(None);
+        };
+        self.admission
+            .admit_upload(&context.bucket_id, context.limits, bytes)
+            .map_err(|rejection| self.upload_refused(rejection))
+    }
+
+    /// Grows the share of a body without a declared length that arrived past
+    /// it to `bytes`: against its bucket's upload limits, claimed once it no
+    /// longer counts as small, and from the budget.
+    async fn grow_upload(
+        &self,
+        context: Option<&RequestContext>,
+        claim: &mut Option<UploadGuard>,
+        permit: &mut BodyPermit,
+        bytes: u64,
+    ) -> Result<(), Refusal> {
+        if !self.uploads.is_small(bytes) {
+            match claim {
+                Some(claim) => claim
+                    .grow(bytes)
+                    .map_err(|rejection| self.upload_refused(rejection))?,
+                None if self.uploads.is_small(permit.bytes()) => {
+                    *claim = self.claim_upload(context, bytes)?;
+                }
+                None => {}
+            }
+        }
+        self.uploads
+            .grow(permit, bytes)
+            .await
+            .map_err(|BudgetExhausted| self.budget_exhausted())
+    }
+
+    /// Counts a bucket's upload refusal and returns it.
+    fn upload_refused(&self, rejection: AdmissionRejection) -> Refusal {
+        let counter = match rejection {
+            AdmissionRejection::UploadsExhausted => {
+                Some(&self.metrics.upload_refusals_tenant_uploads)
+            }
+            AdmissionRejection::UploadBytesExhausted => {
+                Some(&self.metrics.upload_refusals_tenant_bytes)
+            }
+            AdmissionRejection::RateLimited { .. } | AdmissionRejection::LiveReadsExhausted => None,
+        };
+        if let Some(counter) = counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        debug!(?rejection, "refused an upload");
+        Refusal::Admission(rejection)
+    }
+
+    /// Counts a request that got no share of the body budget, and returns
+    /// its refusal.
+    fn budget_exhausted(&self) -> Refusal {
+        tracing::warn!(
+            reserved_bytes = self.uploads.reserved_bytes(),
+            "the request body budget stayed spent; refusing an upload"
+        );
+        self.metrics
+            .upload_refusals_budget
+            .fetch_add(1, Ordering::Relaxed);
+        Refusal::UploadBudgetExhausted
+    }
+
+    /// The answer to a forwarded request whose body ended before its end:
+    /// past `max_request_body_bytes`, cut for its pace, or failed. `limit`
+    /// is the request's limit ([`Gateway::request_limit`]), which a `413`
+    /// names.
+    fn cut_short(&self, end: ReadEnd, read_bytes: u64, limit: u64) -> AxumResponse {
+        let refusal = match end {
+            ReadEnd::OverLimit => Refusal::BodyTooLarge { limit },
+            ReadEnd::Stalled | ReadEnd::TimedOut | ReadEnd::TooSlow => {
+                self.metrics
+                    .upload_refusals_too_slow
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(read_bytes, ?end, "cut a request body that stopped arriving");
+                Refusal::BodyTooSlow
+            }
+            ReadEnd::Whole | ReadEnd::Failed => Refusal::BodyUnreadable,
+        };
+        refusal.into_response()
     }
 
     /// Classifies and authorizes the request. `Ok(None)` means access control
@@ -521,31 +785,37 @@ impl Gateway {
         Ok(None)
     }
 
-    /// Answers with `refusal`, which the gateway decided from the request's
-    /// head alone ([`Gateway::gate`], [`Gateway::admit`]), once it has read
-    /// the request's `body` to its end, dropping each chunk as it arrives
-    /// (#540). Answered with its body unread, a request over HTTP/1.1 loses
-    /// its connection: hyper reads once more, and closes the connection
-    /// unless that read reached the end of the body. A client that sends its
-    /// whole body before it reads the answer, as ureq (the SQLite extension's
-    /// HTTP client) does, then meets a failed write or a reset instead of the
-    /// refusal, which says nothing about whether the request was applied.
+    /// Answers with `refusal`, which the gateway decided before it read the
+    /// request's body: from the request's head alone ([`Gateway::gate`],
+    /// [`Gateway::admit`]), or before it buffered the body
+    /// ([`Gateway::buffer`]). It first reads the request's `body` to its end
+    /// at `pace`, dropping each chunk as it arrives (#540). Answered with its
+    /// body unread, a request over HTTP/1.1 loses its connection: hyper reads
+    /// once more, and closes the connection unless that read reached the end
+    /// of the body. A client that sends its whole body before it reads the
+    /// answer, as ureq (the SQLite extension's HTTP client) does, then meets
+    /// a failed write or a reset instead of the refusal, which says nothing
+    /// about whether the request was applied.
     ///
-    /// Each request's reading is bounded ([`drain`]): `max_request_body_bytes`
-    /// at most, the most the gateway buffers of a request it forwards,
-    /// [`REFUSED_BODY_STALL_TIMEOUT`] without a chunk, and
-    /// [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. At any bound the refusal goes
-    /// out at once and the connection closes, as after the `413` for a body
-    /// over the limit. A body whose declared length is over the limit is not
-    /// read at all, since the reading would stop at the limit before the
-    /// body's end. Over HTTP/2 the body is read the same way, and a reading
-    /// cut short resets only the request's stream. A reading keeps no
-    /// byte of the body and adds no task: it runs in the request's own
-    /// handler. So the requests under way bound the readings under way, as
-    /// they bound the bodies the gateway buffers whole for the requests it
-    /// forwards. The gateway puts no time limit on those bodies, on a slow
-    /// head or on an idle connection, so the reading gives a refused client
-    /// no new way to hold a connection.
+    /// Each request's reading is bounded ([`BodyReader`]):
+    /// `max_request_body_bytes` at most, the most the gateway buffers of a
+    /// request it forwards, and the two timeouts of `pace`. A refusal from
+    /// the head is read at [`REFUSED_PACE`]: [`REFUSED_BODY_STALL_TIMEOUT`]
+    /// without a chunk, and [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. A refusal
+    /// of a request the gateway would otherwise forward is read at the pace
+    /// of a forwarded body ([`Gateway::forwarded_pace`]), so that a slow
+    /// upload that meets a spent budget gets its refusal too. At any bound
+    /// the refusal goes out at once and the connection closes, as after the
+    /// `413` for a body over the limit. A body whose declared length is over
+    /// the limit is not read at all, since the reading would stop at the
+    /// limit before the body's end. Over HTTP/2 the body is read the same
+    /// way, and a reading cut short resets only the request's stream. A
+    /// reading keeps no byte of the body, holds no share of the body budget
+    /// and adds no task: it runs in the request's own handler. So the
+    /// requests under way bound the readings under way. A refused client
+    /// holds its connection no longer than a forwarded body may take, and the
+    /// gateway puts no time limit on a slow head or on an idle connection, so
+    /// the reading gives a refused client no new way to hold a connection.
     ///
     /// Reading the body of a request that carries `Expect: 100-continue` has
     /// hyper send `100 Continue`, so such a client sends its body before it
@@ -554,19 +824,37 @@ impl Gateway {
     /// (ureq 3, curl) and then sends the body anyway, and a decision that
     /// waits on the token issuer or the authorizer can take longer: the client
     /// would then meet the closed connection again.
-    async fn refuse_unread(&self, refusal: Refusal, body: Body) -> AxumResponse {
-        if !body.is_end_stream() {
-            self.metrics.refusal_drains.fetch_add(1, Ordering::Relaxed);
-            // Counted as cut unless the body was read to its end, also when
-            // the request is dropped while its body is read.
-            let mut cut = CutUnlessWhole {
-                cut: &self.metrics.refusal_drains_cut,
-                whole: false,
-            };
-            let drained = drain(body, self.config.max_request_body_bytes).await;
-            cut.whole = drained == Drained::Whole;
-            debug!(?drained, "read the body of a refused request");
+    async fn refuse_unread(&self, refusal: Refusal, body: Body, pace: Pace) -> AxumResponse {
+        if body.is_end_stream() {
+            return refusal.into_response();
         }
+        let limit = self.config.uploads.max_request_body_bytes();
+        if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
+            // Counted as a reading cut short, without one.
+            self.metrics.refusal_drains.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .refusal_drains_cut
+                .fetch_add(1, Ordering::Relaxed);
+            debug!("refused a request whose body is declared over the limit, unread");
+            return refusal.into_response();
+        }
+        self.refuse_rest(refusal, BodyReader::new(body, limit, pace))
+            .await
+    }
+
+    /// Answers with `refusal` once `reader` has read the rest of the body to
+    /// its end, dropping each chunk ([`Gateway::refuse_unread`]).
+    async fn refuse_rest(&self, refusal: Refusal, reader: BodyReader) -> AxumResponse {
+        self.metrics.refusal_drains.fetch_add(1, Ordering::Relaxed);
+        // Counted as cut unless the body was read to its end, also when the
+        // request is dropped while its body is read.
+        let mut cut = CutUnlessWhole {
+            cut: &self.metrics.refusal_drains_cut,
+            whole: false,
+        };
+        let drained = reader.discard(&self.metrics.refusal_drain_bytes).await;
+        cut.whole = drained == ReadEnd::Whole;
+        debug!(?drained, "read the body of a refused request");
         refusal.into_response()
     }
 
@@ -1053,6 +1341,24 @@ impl Gateway {
             upstream_ejected: self.ejections.active(Instant::now()),
             refusal_drains: self.metrics.refusal_drains.load(Ordering::Relaxed),
             refusal_drains_cut: self.metrics.refusal_drains_cut.load(Ordering::Relaxed),
+            refusal_drain_bytes: self.metrics.refusal_drain_bytes.load(Ordering::Relaxed),
+            body_bytes_buffered: self.metrics.body_bytes_buffered.load(Ordering::Relaxed),
+            upload_refusals_tenant_bytes: self
+                .metrics
+                .upload_refusals_tenant_bytes
+                .load(Ordering::Relaxed),
+            upload_refusals_tenant_uploads: self
+                .metrics
+                .upload_refusals_tenant_uploads
+                .load(Ordering::Relaxed),
+            upload_refusals_budget: self.metrics.upload_refusals_budget.load(Ordering::Relaxed),
+            upload_refusals_too_slow: self
+                .metrics
+                .upload_refusals_too_slow
+                .load(Ordering::Relaxed),
+            upload_budget_bytes: self.config.uploads.budget_bytes(),
+            upload_reserved_bytes: self.uploads.reserved_bytes(),
+            upload_tenants: self.admission.upload_buckets(),
         }
     }
 }
@@ -1271,11 +1577,22 @@ enum Refusal {
     Forbidden,
     /// The authorizer could not decide (`503`).
     Authorization(AuthorizationError),
-    /// A tenant admission limit (`429`).
+    /// A tenant admission limit (`429`), the bucket's upload limits
+    /// included.
     Admission(AdmissionRejection),
     /// The body is larger than the gateway's or the tenant's limit, the
     /// smaller of the two (`413` naming it).
     BodyTooLarge { limit: u64 },
+    /// The body got no share of the body budget within
+    /// [`UploadLimits::budget_wait`] (`503` with `Retry-After`), see
+    /// [`uploads`].
+    UploadBudgetExhausted,
+    /// No byte of the body arrived for [`UploadLimits::stall_timeout`], or
+    /// fewer than [`UploadLimits::min_window_bytes`] arrived in one window of
+    /// it, and it was cut before anything of it was forwarded (`408`). Over
+    /// HTTP/1.1 the connection then closes on the rest of the body: a client
+    /// still sending sees that rather than the `408`.
+    BodyTooSlow,
     /// The body could not be read (`400`).
     BodyUnreadable,
     /// No upstream is configured (`503`).
@@ -1319,6 +1636,25 @@ impl IntoResponse for Refusal {
             Self::Admission(AdmissionRejection::LiveReadsExhausted) => {
                 (StatusCode::TOO_MANY_REQUESTS, ErrorCode::LiveReadsExhausted)
             }
+            Self::Admission(AdmissionRejection::UploadsExhausted) => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::UploadsExhausted)
+            }
+            Self::Admission(AdmissionRejection::UploadBytesExhausted) => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    ErrorCode::UploadBytesExhausted,
+                )
+            }
+            Self::UploadBudgetExhausted => {
+                headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::UploadBudgetExhausted,
+                )
+            }
+            Self::BodyTooSlow => (StatusCode::REQUEST_TIMEOUT, ErrorCode::BodyTooSlow),
             Self::BodyTooLarge { limit } => {
                 let typed = SizeLimit::Request(limit);
                 typed.render(|name, value| {
@@ -1390,20 +1726,25 @@ fn lower_request_limit(headers: &mut HeaderMap, limit: u64) {
     headers.insert(names::URSULA_MAX_REQUEST_BYTES, HeaderValue::from(lowered));
 }
 
-/// How [`drain`] ended.
+/// How a [`BodyReader`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Drained {
+pub enum ReadEnd {
     /// The body ended: the connection can carry the next request.
     Whole,
     /// The body is longer than the limit: by its declared length, and then
-    /// none of it was read, or by the bytes read.
+    /// none of it was read ([`Gateway::refuse_unread`] only), or by the bytes
+    /// read.
     OverLimit,
-    /// No chunk of the body arrived for [`REFUSED_BODY_STALL_TIMEOUT`].
+    /// No chunk of the body arrived for the pace's stall timeout.
     Stalled,
-    /// The body was still arriving after [`REFUSED_BODY_DRAIN_TIMEOUT`].
+    /// The body was still arriving after the read timeout of a
+    /// [`Pace::Bounded`] reading.
     TimedOut,
+    /// Fewer bytes of the body than the floor of a [`Pace::Live`] reading
+    /// arrived in one of its windows.
+    TooSlow,
     /// The body failed, as when the client goes away in the middle of it.
-    /// [`drain`] logs the body's error.
+    /// [`BodyReader::chunk`] logs the body's error.
     Failed,
 }
 
@@ -1422,36 +1763,218 @@ impl Drop for CutUnlessWhole<'_> {
     }
 }
 
-/// Reads `body` to its end and drops each chunk as it arrives: `limit` bytes
-/// at most, the limit `to_bytes` applies to a body the gateway forwards,
-/// [`REFUSED_BODY_STALL_TIMEOUT`] without a chunk, and
-/// [`REFUSED_BODY_DRAIN_TIMEOUT`] in all. Reads none of a body whose declared
-/// length is over `limit`. A node uses it too, for the unread body of a
-/// write it answered from the head alone on HTTP/1.1.
-pub async fn drain(body: Body, limit: usize) -> Drained {
-    if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
-        return Drained::OverLimit;
+/// How long a [`BodyReader`] goes on reading a body.
+#[derive(Clone, Copy, Debug)]
+enum Pace {
+    /// The body of a request refused from its head ([`REFUSED_PACE`]): until
+    /// no chunk arrived for `stall_timeout`, and for `read_timeout` in all.
+    Bounded {
+        stall_timeout: Duration,
+        read_timeout: Duration,
+    },
+    /// The body of a request the gateway may forward
+    /// ([`Gateway::forwarded_pace`]): until no chunk arrived for
+    /// `stall_timeout`, or until fewer than `min_window_bytes` arrived in one
+    /// window of `stall_timeout`, the windows counted from the start of the
+    /// reading. Neither depends on the body's size or on its average rate
+    /// since the start, and nothing bounds the reading in all: a body that
+    /// keeps arriving above the floor is never cut, however long it takes.
+    Live {
+        stall_timeout: Duration,
+        min_window_bytes: u64,
+    },
+}
+
+impl Pace {
+    fn stall_timeout(self) -> Duration {
+        match self {
+            Self::Bounded { stall_timeout, .. } | Self::Live { stall_timeout, .. } => stall_timeout,
+        }
     }
-    let mut body = http_body_util::Limited::new(body, limit);
-    let read = async {
+}
+
+/// `after` past `at`, or a year past it at most: a reading is cut by then
+/// whatever the configuration.
+fn later(at: Instant, after: Duration) -> Instant {
+    const HORIZON: Duration = Duration::from_secs(31_536_000);
+    at.checked_add(after.min(HORIZON)).unwrap_or(at)
+}
+
+/// Reads a request's body chunk by chunk: `limit` bytes at most, the limit
+/// `max_request_body_bytes` sets, for as long as its [`Pace`] allows.
+struct BodyReader {
+    body: http_body_util::Limited<Body>,
+    pace: Pace,
+    started: Instant,
+    last_chunk: Instant,
+    /// The start of the [`Pace::Live`] window under way.
+    window_start: Instant,
+    /// The bytes that arrived in that window.
+    window_bytes: u64,
+}
+
+impl BodyReader {
+    fn new(body: Body, limit: usize, pace: Pace) -> Self {
+        let started = Instant::now();
+        Self {
+            body: http_body_util::Limited::new(body, limit),
+            pace,
+            started,
+            last_chunk: started,
+            window_start: started,
+            window_bytes: 0,
+        }
+    }
+
+    /// Closes the [`Pace::Live`] windows that ended by `now`: each must have
+    /// had its floor of bytes.
+    fn close_windows(&mut self, now: Instant) -> Result<(), ReadEnd> {
+        let Pace::Live {
+            stall_timeout,
+            min_window_bytes,
+        } = self.pace
+        else {
+            return Ok(());
+        };
         loop {
-            match tokio::time::timeout(REFUSED_BODY_STALL_TIMEOUT, body.frame()).await {
-                Err(_stalled) => return Drained::Stalled,
-                Ok(None) => return Drained::Whole,
-                Ok(Some(Ok(_dropped))) => {}
+            let window_end = later(self.window_start, stall_timeout);
+            if now < window_end {
+                return Ok(());
+            }
+            if self.window_bytes < min_window_bytes {
+                return Err(ReadEnd::TooSlow);
+            }
+            self.window_start = window_end;
+            self.window_bytes = 0;
+        }
+    }
+
+    /// When the reading is cut unless a chunk arrives first, and how it then
+    /// ends.
+    fn deadline(&self) -> (Instant, ReadEnd) {
+        let stalled = (
+            later(self.last_chunk, self.pace.stall_timeout()),
+            ReadEnd::Stalled,
+        );
+        let other = match self.pace {
+            Pace::Bounded { read_timeout, .. } => {
+                (later(self.started, read_timeout), ReadEnd::TimedOut)
+            }
+            // A window that has its floor ends after the last chunk's stall
+            // timeout: the next window starts with it, and is checked once a
+            // chunk arrives in it, or the stall cuts the reading first.
+            Pace::Live {
+                stall_timeout,
+                min_window_bytes,
+            } if self.window_bytes < min_window_bytes => {
+                (later(self.window_start, stall_timeout), ReadEnd::TooSlow)
+            }
+            Pace::Live { .. } => return stalled,
+        };
+        if stalled.0 <= other.0 { stalled } else { other }
+    }
+
+    /// The next data chunk, `Ok(None)` at the body's end, or how the reading
+    /// ended short of it.
+    async fn chunk(&mut self) -> Result<Option<bytes::Bytes>, ReadEnd> {
+        loop {
+            self.close_windows(Instant::now())?;
+            let (deadline, cut) = self.deadline();
+            match tokio::time::timeout_at(deadline, self.body.frame()).await {
+                Err(_elapsed) => return Err(cut),
+                Ok(None) => return Ok(None),
+                Ok(Some(Ok(frame))) => {
+                    let now = Instant::now();
+                    self.close_windows(now)?;
+                    self.last_chunk = now;
+                    if let Ok(chunk) = frame.into_data() {
+                        self.window_bytes = self.window_bytes.saturating_add(chunk.len() as u64);
+                        return Ok(Some(chunk));
+                    }
+                }
                 Ok(Some(Err(error))) if error.is::<http_body_util::LengthLimitError>() => {
-                    return Drained::OverLimit;
+                    return Err(ReadEnd::OverLimit);
                 }
                 Ok(Some(Err(error))) => {
-                    debug!(%error, "the body of a refused request failed");
-                    return Drained::Failed;
+                    debug!(%error, "a request body failed");
+                    return Err(ReadEnd::Failed);
                 }
             }
         }
-    };
-    tokio::time::timeout(REFUSED_BODY_DRAIN_TIMEOUT, read)
+    }
+
+    /// Reads the rest of the body to its end, dropping each chunk as it
+    /// arrives and counting its bytes in `read`.
+    async fn discard(mut self, read: &AtomicU64) -> ReadEnd {
+        loop {
+            match self.chunk().await {
+                Ok(Some(dropped)) => {
+                    read.fetch_add(dropped.len() as u64, Ordering::Relaxed);
+                }
+                Ok(None) => return ReadEnd::Whole,
+                Err(end) => return end,
+            }
+        }
+    }
+}
+
+/// Reads `body` to its end and drops each chunk as it arrives, as the
+/// gateway reads the body of a request it refused from its head: `limit`
+/// bytes at most, at [`REFUSED_PACE`]. Reads none of a body whose declared
+/// length is over `limit`. A node uses it for the unread body of a write it
+/// answered from the head alone on HTTP/1.1.
+pub async fn drain(body: Body, limit: usize) -> ReadEnd {
+    if body.size_hint().lower() > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return ReadEnd::OverLimit;
+    }
+    BodyReader::new(body, limit, REFUSED_PACE)
+        .discard(&AtomicU64::new(0))
         .await
-        .unwrap_or(Drained::TimedOut)
+}
+
+/// The body of a request the gateway forwards whole, as it arrives
+/// ([`Gateway::buffer`]): one buffer that never holds more than the body's
+/// share of the budget.
+struct BodyBuffer {
+    bytes: Vec<u8>,
+}
+
+impl BodyBuffer {
+    /// A buffer of `capacity` bytes: a declared body's share of the budget,
+    /// or nothing for a body without a declared length.
+    fn new(capacity: u64) -> Self {
+        Self {
+            bytes: Vec::with_capacity(usize::try_from(capacity).unwrap_or(0)),
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn capacity(&self) -> u64 {
+        self.bytes.capacity() as u64
+    }
+
+    /// Copies `chunk` into the buffer, growing it, when it must grow, to
+    /// twice its size at most and never past `share`, the bytes the body's
+    /// share of the budget covers, which holds the chunk.
+    fn push(&mut self, chunk: &[u8], share: u64) {
+        let needed = self.len().saturating_add(chunk.len() as u64);
+        if needed > self.capacity() {
+            let grown = self.capacity().saturating_mul(2).max(needed).min(share);
+            let more = usize::try_from(grown.saturating_sub(self.len())).unwrap_or(usize::MAX);
+            self.bytes.reserve_exact(more);
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    /// The body, after `permit` has shrunk to the buffer's capacity, the
+    /// memory the body holds until it is forwarded.
+    fn finish(self, permit: &mut BodyPermit) -> bytes::Bytes {
+        permit.settle(self.capacity());
+        bytes::Bytes::from(self.bytes)
+    }
 }
 
 /// Rides the response body: counts egress bytes and, on drop, records the
