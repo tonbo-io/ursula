@@ -648,6 +648,7 @@ pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic
             | ursula_runtime::GroupInfraError::RecoveryCutting { .. }
             | ursula_runtime::GroupInfraError::CommittedOverwrite { .. }
             | ursula_runtime::GroupInfraError::UnrelatedHistory { .. }
+            | ursula_runtime::GroupInfraError::LogBehindCommit { .. }
             | ursula_runtime::GroupInfraError::RecoveryPlanFenced { .. }
             | ursula_runtime::GroupInfraError::OwnerStopped
             | ursula_runtime::GroupInfraError::ApplyStopped { .. }

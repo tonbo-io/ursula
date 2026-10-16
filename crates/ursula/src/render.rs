@@ -144,6 +144,7 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::RecoveryCutting { .. }
         | GroupInfraError::CommittedOverwrite { .. }
         | GroupInfraError::UnrelatedHistory { .. }
+        | GroupInfraError::LogBehindCommit { .. }
         | GroupInfraError::RecoveryPlanFenced { .. }
         | GroupInfraError::OwnerStopped
         | GroupInfraError::Internal { .. }

@@ -1004,6 +1004,20 @@ pub enum GroupInfraError {
         committed: u64,
         index: u64,
     },
+    /// OpenRaft committed or applied entry `committed`, above the last entry
+    /// `held` that this replica's log store holds: the store has not yet
+    /// recorded an install OpenRaft admitted (#613). The commit screen cannot
+    /// compare anything until it has, so the replica takes nothing from the
+    /// sender meanwhile. Retryable.
+    #[error(
+        "raft group {raft_group_id:?}: committed index {committed} is above the last entry \
+         {held:?} its log store holds; replication waits until the store catches up"
+    )]
+    LogBehindCommit {
+        raft_group_id: RaftGroupId,
+        committed: u64,
+        held: Option<u64>,
+    },
     /// A snapshot of history `history`, which replaced history `replaced`,
     /// while this replica's commit marker lies in history `local` (`None`
     /// when its log could not be read): nothing shows that the snapshot

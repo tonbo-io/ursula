@@ -4104,7 +4104,8 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
     let gate = Arc::new(
         GroupRejoin::durable(gated, group, &gate_store)
             .await
-            .unwrap(),
+            .unwrap()
+            .over_foreign_store(),
     );
     assert!(!gate.vote_gate_open());
     let gated_registry = RaftGroupHandleRegistry::default();
@@ -4187,7 +4188,8 @@ async fn registry_handoff_to_a_gated_follower_is_refused_by_the_follower() {
     let gate = Arc::new(
         GroupRejoin::durable(gated, group, &gate_store)
             .await
-            .unwrap(),
+            .unwrap()
+            .over_foreign_store(),
     );
     gate.establish_vote_floor(vote).await.unwrap();
     assert!(!gate.vote_gate_open());

@@ -1193,9 +1193,13 @@ impl RaftGroupHandleRegistry {
                 if let Some(refusal) = rejoin.replication_refusal(&request.vote) {
                     return Err(refusal);
                 }
-                let marker = rejoin.effective_marker(
-                    &openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()),
-                );
+                let marker = rejoin
+                    .effective_marker(&openraft::rt::WatchReceiver::borrow_watched(
+                        &raft.metrics(),
+                    ))
+                    .inspect_err(|refusal| {
+                        tracing::warn!(%refusal, "recovery: refused an append while the log lags");
+                    })?;
                 if let Some(refusal) =
                     rejoin.committed_overwrite(crate::rejoin::Incoming::Append(&request), marker)
                 {
@@ -1324,6 +1328,12 @@ impl RaftGroupHandleRegistry {
                                 metrics.last_applied.map(|applied| applied.index),
                             )
                         };
+                        let marker = marker.inspect_err(|refusal| {
+                            tracing::warn!(
+                                %refusal,
+                                "recovery: refused a snapshot install while the log lags"
+                            );
+                        })?;
                         let local = rejoin
                             .history_at_marker(history.applied(), applied_index, marker)
                             .await;
