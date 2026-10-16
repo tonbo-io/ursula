@@ -994,6 +994,8 @@ impl Core {
                     incarnation,
                     cluster_id,
                 } => {
+                    let max_request_bytes =
+                        b.replicator.ctx().and_then(|ctx| ctx.limits.configured);
                     let lineage = self.lineage();
                     let salvage = salvage.then_some(incarnation);
                     self.rebuild(
@@ -1012,6 +1014,7 @@ impl Core {
                             claim: Some((epoch, activation)),
                             end: to,
                             fate,
+                            max_request_bytes,
                         },
                     );
                 }
@@ -1136,9 +1139,14 @@ impl Core {
                     wake_at: Some(at),
                 };
             }
-            BuildStep::Install(body) => {
+            BuildStep::Download { chunk, bytes } => {
                 *local = Local::Busy;
-                self.disk(Owner::Disk(binding), DiskJob::Install { build, body }, ios);
+                let job = DiskJob::Download {
+                    build,
+                    chunk,
+                    bytes,
+                };
+                self.disk(Owner::Disk(binding), job, ios);
             }
             BuildStep::Restart => {
                 *local = Local::Busy;

@@ -243,18 +243,33 @@ pub fn read_header(body: &[u8]) -> Result<(SnapshotHeader, usize), SnapshotError
     Ok((header, HEADER))
 }
 
-/// Checks a snapshot body read from the stream before anything uses it: its digest under
-/// `content_type` against the `digest` the stream names, its header's checksum, and the offset
-/// the header names against the stream's `offset`. Returns the header and where the compressed
-/// image starts; [`read_image`] checks the image's checksum as it decompresses it.
-pub fn check_body(
+/// Checks a snapshot body read from the stream before anything uses it, streamed from `body` (a
+/// build's downloaded file) so the body is never in memory whole: its digest under
+/// `content_type`, computed as it is read, against the `digest` the stream names, its header's
+/// checksum, and the offset the header names against the stream's `offset`. Returns the header
+/// and where the compressed image starts; [`read_image`] checks the image's checksum as it
+/// decompresses it.
+pub fn check_file(
     content_type: &str,
-    body: &[u8],
+    body: &mut impl Read,
     offset: Offset,
     digest: &SnapshotDigest,
 ) -> Result<(SnapshotHeader, usize), SnapshotError> {
     let mut digester = super::digest::SnapshotDigester::new(content_type);
-    digester.update(body);
+    let mut head = Vec::with_capacity(HEADER);
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = match body.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(SnapshotError::Read(e)),
+        };
+        let chunk = buf.get(..n).unwrap_or_default();
+        digester.update(chunk);
+        let want = HEADER.saturating_sub(head.len()).min(chunk.len());
+        head.extend_from_slice(chunk.get(..want).unwrap_or_default());
+    }
     let found = digester.finalize();
     if found != *digest {
         return Err(SnapshotError::Digest {
@@ -262,7 +277,7 @@ pub fn check_body(
             found,
         });
     }
-    let (header, at) = read_header(body)?;
+    let (header, at) = read_header(&head)?;
     if header.fields.offset != offset {
         return Err(SnapshotError::Offset {
             expected: offset,

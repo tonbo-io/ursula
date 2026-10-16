@@ -21,9 +21,12 @@ use super::PAGE;
 use super::SnapshotError;
 use super::SnapshotFields;
 use super::SnapshotHeader;
+use super::check_file;
 use super::read_header;
 use super::read_image;
 use super::write_body;
+use crate::codec::digest::SnapshotDigester;
+use crate::codec::frame::CONTENT_TYPE;
 use crate::ids::CommitId;
 use crate::ids::Lineage;
 use crate::ids::Position;
@@ -251,4 +254,61 @@ fn an_epoch_out_of_range_is_refused() {
     let crc = crc32c::crc32c(&body[..52]);
     body[52..56].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(read_header(&body), Err(SnapshotError::Epoch(_))));
+}
+
+/// A reader that hands out at most `step` bytes per read, so the header straddles reads.
+struct Trickle<'a> {
+    rest: &'a [u8],
+    step: usize,
+}
+
+impl Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.step.min(buf.len()).min(self.rest.len());
+        buf[..n].copy_from_slice(&self.rest[..n]);
+        self.rest = &self.rest[n..];
+        Ok(n)
+    }
+}
+
+#[test]
+fn a_streamed_body_checks_its_digest_header_and_offset() {
+    let fields = fields();
+    let (body, header) = body(&fields, &image(40));
+    let mut digester = SnapshotDigester::new(CONTENT_TYPE);
+    digester.update(&body);
+    let digest = digester.finalize();
+    for step in [1, 7, HEADER, 4096, usize::MAX] {
+        let mut from = Trickle { rest: &body, step };
+        let found = check_file(CONTENT_TYPE, &mut from, fields.offset, &digest).unwrap();
+        assert_eq!(found, (header, HEADER), "step {step}");
+    }
+    // The digest covers every byte: one byte off past the header fails it.
+    let mut bad = body.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert!(matches!(
+        check_file(CONTENT_TYPE, &mut bad.as_slice(), fields.offset, &digest),
+        Err(SnapshotError::Digest { .. })
+    ));
+    // A cut body fails it too.
+    assert!(matches!(
+        check_file(
+            CONTENT_TYPE,
+            &mut &body[..body.len() / 2],
+            fields.offset,
+            &digest
+        ),
+        Err(SnapshotError::Digest { .. })
+    ));
+    // The stream names another offset: not this snapshot.
+    assert!(matches!(
+        check_file(
+            CONTENT_TYPE,
+            &mut body.as_slice(),
+            Offset::from_u64(1),
+            &digest
+        ),
+        Err(SnapshotError::Offset { .. })
+    ));
 }

@@ -23,6 +23,7 @@ use crate::materialize::ForeignFrame;
 use crate::materialize::LocalError;
 use crate::materialize::Materialized;
 use crate::open::Build;
+use crate::open::Chunk;
 use crate::open::OpenError;
 use crate::open::OpenSpec;
 use crate::open::Prepared;
@@ -46,6 +47,8 @@ pub(crate) struct NewBuild {
     pub(crate) end: Offset,
     /// What becomes of the generation the build replaces when it publishes.
     pub(crate) fate: Fate,
+    /// `URSULA_VFS_MAX_REQUEST_BYTES`, which bounds the build's snapshot chunks.
+    pub(crate) max_request_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -57,10 +60,12 @@ pub(crate) enum DiskJob {
         root: Option<Arc<Root>>,
     },
     NewBuild(NewBuild),
-    /// The latest snapshot's body into a build; done as a [`DiskDone::Chunk`].
-    Install {
+    /// One chunk of the latest snapshot's body into a build's download, installed once it
+    /// completes the body; done as a [`DiskDone::Chunk`].
+    Download {
         build: Box<Build>,
-        body: Vec<u8>,
+        chunk: Chunk,
+        bytes: Vec<u8>,
     },
     /// A build started over in a fresh `.tmp`; done as a [`DiskDone::Built`].
     Restart(Box<Build>),
@@ -117,8 +122,12 @@ impl DiskJob {
         match self {
             Self::Prepare { spec, root } => DiskDone::Prepared(prepare(&spec, root)),
             Self::NewBuild(job) => DiskDone::Built(new_build(job).map(Box::new)),
-            Self::Install { mut build, body } => {
-                let result = build.install(&body);
+            Self::Download {
+                mut build,
+                chunk,
+                bytes,
+            } => {
+                let result = build.download(chunk, &bytes);
                 DiskDone::Chunk { build, result }
             }
             Self::Restart(build) => DiskDone::Built(build.restart().map(Box::new)),

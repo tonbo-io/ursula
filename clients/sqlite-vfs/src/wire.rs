@@ -15,6 +15,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ursula_headers::ByteRange;
+use ursula_headers::ByteSpan;
+use ursula_headers::ContentRange;
 use ursula_headers::HeaderError;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
@@ -44,11 +47,14 @@ pub(crate) const RETRY_AFTER: &str = "retry-after";
 /// `Location` header name.
 pub(crate) const LOCATION: &str = "location";
 
-/// `Range`, which only a snapshot header read sends.
-pub(crate) const RANGE: &str = "range";
-
 /// A `USS3` header's length, which a header read asks for.
 const SNAPSHOT_HEADER: u64 = crate::codec::snapshot::HEADER as u64;
+
+/// The `Range` of a header read: the `USS3` header alone.
+const HEADER_RANGE: ByteRange = ByteRange::Bounded {
+    first: 0,
+    last: SNAPSHOT_HEADER - 1,
+};
 
 /// The base protocol's read offset for the start of a stream.
 const START: &str = "-1";
@@ -174,8 +180,6 @@ pub(crate) enum WireError {
     Header(#[from] HeaderError),
     #[error("unknown query parameter `{0}`")]
     Query(String),
-    #[error("a `Range` other than `bytes=0-<n>`: {0}")]
-    Range(String),
 }
 
 /// One request to a stream. The transport adds the stream URL, `Content-Length`, the bearer token
@@ -195,9 +199,9 @@ pub(crate) struct Request {
     /// The largest answer body the caller expects (a read's chunk, a snapshot): it scales the
     /// time the answer's body may take. Not sent.
     pub(crate) answer_bytes: u64,
-    /// Only the body's first bytes: `Range: bytes=0-{n - 1}`. A server may answer the whole
-    /// body anyway (`200`), or just these (`206`).
-    pub(crate) head_bytes: Option<u64>,
+    /// `Range` of a snapshot read: a server answers these bytes (`206`), or the whole body
+    /// (`200`) when it ignores `Range`.
+    pub(crate) range: Option<ByteRange>,
 }
 
 /// Which part of a snapshot a read asks for.
@@ -205,15 +209,9 @@ pub(crate) struct Request {
 pub(crate) enum SnapshotPart {
     /// The `USS3` header alone, which verifies without the body (design §4.11).
     Header,
-    /// The whole body, at most `limit` bytes.
-    Body { limit: u64 },
-}
-
-/// The most a snapshot body published under `head` may hold: the single-request limit, or the
-/// limit in parts when the stream takes parts.
-pub(crate) fn snapshot_limit(head: &StreamHead) -> u64 {
-    head.max_snapshot_bytes()
-        .unwrap_or(head.max_request_bytes())
+    /// The bytes `first..=last` of the body (`first <= last`). A server that ignores `Range`
+    /// answers the whole body instead, in the time these bytes take.
+    Chunk { first: u64, last: u64 },
 }
 
 impl Request {
@@ -229,7 +227,7 @@ impl Request {
             closes: false,
             body: Arc::from(Vec::new()),
             answer_bytes: 0,
-            head_bytes: None,
+            range: None,
         }
     }
 
@@ -248,9 +246,12 @@ impl Request {
         incarnation: Incarnation,
         part: SnapshotPart,
     ) -> Self {
-        let (answer_bytes, head_bytes) = match part {
-            SnapshotPart::Header => (SNAPSHOT_HEADER, Some(SNAPSHOT_HEADER)),
-            SnapshotPart::Body { limit } => (limit, None),
+        let (answer_bytes, range) = match part {
+            SnapshotPart::Header => (SNAPSHOT_HEADER, HEADER_RANGE),
+            SnapshotPart::Chunk { first, last } => (
+                last.saturating_sub(first).saturating_add(1),
+                ByteRange::Bounded { first, last },
+            ),
         };
         Self {
             keys: ProducerRequestHeaders {
@@ -258,9 +259,15 @@ impl Request {
                 precondition: Some(IncarnationPrecondition { incarnation }),
             },
             answer_bytes,
-            head_bytes,
+            range: Some(range),
             ..Self::new(Method::Get, Target::Snapshot { offset })
         }
+    }
+
+    /// How much of a `200` body the client keeps: a header read keeps the `USS3` header of a
+    /// whole body that a server ignoring `Range` sends, every other request the whole body.
+    pub(crate) fn whole_answer_cut(&self) -> Option<u64> {
+        (self.range == Some(HEADER_RANGE)).then_some(SNAPSHOT_HEADER)
     }
 
     /// Emits every header of the request this module owns, as `(lowercase name, value)`.
@@ -275,8 +282,8 @@ impl Request {
         if self.closes {
             emit(names::STREAM_CLOSED, "true");
         }
-        if let Some(n) = self.head_bytes {
-            emit(RANGE, &format!("bytes=0-{}", n.saturating_sub(1)));
+        if let Some(range) = &self.range {
+            range.render(&mut emit);
         }
     }
 
@@ -298,15 +305,7 @@ impl Request {
         let keys = ProducerRequestHeaders::parse(headers.clone())?;
         let content_type = text(headers.clone(), CONTENT_TYPE)?.map(str::to_owned);
         let closes = flag(headers.clone(), names::STREAM_CLOSED)?;
-        let head_bytes = text(headers.clone(), RANGE)?
-            .map(|range| {
-                range
-                    .strip_prefix("bytes=0-")
-                    .and_then(|last| last.parse::<u64>().ok())
-                    .and_then(|last| last.checked_add(1))
-                    .ok_or_else(|| WireError::Range(range.to_owned()))
-            })
-            .transpose()?;
+        let range = ByteRange::parse(headers.clone());
         let snapshot_digest = text(headers, names::STREAM_SNAPSHOT_DIGEST)?
             .map(|digest| SnapshotDigest::parse(names::STREAM_SNAPSHOT_DIGEST, digest))
             .transpose()?;
@@ -319,7 +318,7 @@ impl Request {
             closes,
             body: Arc::from(body),
             answer_bytes: 0,
-            head_bytes,
+            range,
         })
     }
 }
@@ -349,8 +348,12 @@ pub(crate) enum Typed {
     Created { incarnation: Incarnation },
     /// `204` or `409` to a snapshot publish.
     Snapshot(SnapshotPublishAnswer),
-    /// `200` to a snapshot read.
-    SnapshotRead(SnapshotRead),
+    /// `200` or `206` to a snapshot read: `range` is the `Content-Range` of a `206`, `None` for
+    /// the whole body of a `200`.
+    SnapshotRead {
+        read: SnapshotRead,
+        range: Option<ByteSpan>,
+    },
     /// `200` to a read: the bytes in the body end at `next`.
     Read {
         next: Offset,
@@ -434,9 +437,10 @@ impl RawAnswer {
         )
     )]
     pub(crate) fn parse(&self, request: &Request) -> Answer {
-        // A client asking for the body's first bytes reads no more, whether the server honored
-        // `Range` (`206`) or not (`200`), as the HTTP transport does.
-        let body = match request.head_bytes {
+        // A header read keeps the header alone of a whole body (`200`), as the HTTP transport
+        // does.
+        let cut = request.whole_answer_cut().filter(|_| self.status == 200);
+        let body = match cut {
             Some(n) => self
                 .body
                 .get(..usize::try_from(n).unwrap_or(usize::MAX))
@@ -526,7 +530,18 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
             SnapshotPublishAnswer::parse(status, headers)?.map_or(Typed::Untyped, Typed::Snapshot)
         }
         (Method::Get, Target::Snapshot { .. }) if matches!(status, 200 | 206) => {
-            Typed::SnapshotRead(SnapshotRead::parse(headers)?)
+            let range = match ContentRange::parse(status, headers.clone())? {
+                None => None,
+                Some(ContentRange::Partial(span)) => Some(span),
+                // `parse` takes `bytes */total` only with a `416`.
+                Some(ContentRange::Unsatisfied { .. }) => {
+                    return Err(HeaderError::InvalidContentRange);
+                }
+            };
+            Typed::SnapshotRead {
+                read: SnapshotRead::parse(headers)?,
+                range,
+            }
         }
         (Method::Get, Target::Read { .. }) if status == 200 => Typed::Read {
             next: required(names::STREAM_NEXT_OFFSET, headers.clone(), Offset::parse)?,
@@ -596,6 +611,7 @@ mod tests {
     use std::sync::Arc;
 
     use ursula_headers::BodyDigest;
+    use ursula_headers::ByteRange;
     use ursula_headers::Epoch;
     use ursula_headers::HeaderError;
     use ursula_headers::Incarnation;
@@ -674,6 +690,10 @@ mod tests {
             snapshot_digest: Some(SnapshotDigest::from_bytes([9; 32])),
             closes: true,
             body: Arc::from(b"frame".to_vec()),
+            range: Some(ByteRange::Bounded {
+                first: 65_536,
+                last: 131_071,
+            }),
             ..Request::new(Method::Post, Target::Stream)
         };
         let headers = rendered(&request);
@@ -743,6 +763,50 @@ mod tests {
             RawAnswer::new(204).parse(&unkeyed).typed,
             Ok(Typed::Untyped)
         );
+    }
+
+    #[test]
+    fn a_ranged_snapshot_answer_names_its_bytes() {
+        let read = Request::snapshot_read(
+            Offset::from_u64(64),
+            Incarnation::try_from(1 << 52).unwrap(),
+            super::SnapshotPart::Chunk { first: 4, last: 7 },
+        );
+        assert_eq!(read.answer_bytes, 4);
+        assert_eq!(read.whole_answer_cut(), None);
+        let mut raw = RawAnswer::new(206);
+        raw.header("stream-snapshot-offset", Offset::from_u64(64).to_string());
+        raw.header(
+            "stream-snapshot-digest",
+            SnapshotDigest::from_bytes([9; 32]).to_string(),
+        );
+        raw.header("stream-next-offset", Offset::from_u64(64).to_string());
+        raw.header("stream-incarnation", (1u64 << 52).to_string());
+        raw.body = b"abcd".to_vec();
+        // A `206` names its bytes; without `Content-Range` it is malformed.
+        assert_eq!(
+            raw.parse(&read).typed,
+            Err(HeaderError::Missing {
+                name: "content-range"
+            })
+        );
+        raw.header("content-range", "bytes 4-7/12");
+        let answer = raw.parse(&read);
+        let Ok(Typed::SnapshotRead {
+            range: Some(span), ..
+        }) = answer.typed
+        else {
+            panic!("{answer:?}");
+        };
+        assert_eq!((span.first(), span.last(), span.total()), (4, 7, 12));
+        assert_eq!(answer.body, b"abcd");
+        // A header read keeps the header alone of a whole body, and all of a `206`.
+        let header = Request::snapshot_read(
+            Offset::from_u64(64),
+            Incarnation::try_from(1 << 52).unwrap(),
+            super::SnapshotPart::Header,
+        );
+        assert_eq!(header.whole_answer_cut(), Some(56));
     }
 
     #[test]

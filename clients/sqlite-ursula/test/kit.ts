@@ -262,9 +262,9 @@ export class Child {
 	}
 }
 
-/** The rows `sql` returns from a fresh build of the stream: a new process with a new cache root. */
-export async function fromStream(url: string, sql: string): Promise<unknown[]> {
-	const reader = new Child(url, freshDir());
+/** The rows `sql` returns from a fresh build of the stream: a new process with a new cache root, and `env`. */
+export async function fromStream(url: string, sql: string, env: NodeJS.ProcessEnv = {}): Promise<unknown[]> {
+	const reader = new Child(url, freshDir(), env);
 	await reader.opened();
 	const rows = await reader.rows(sql);
 	await reader.stop();

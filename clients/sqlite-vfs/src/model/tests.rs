@@ -990,17 +990,39 @@ fn snapshots_are_keyed_by_offset_and_digest() {
     let (mut bad, _) = publish(token, 64, b"image at 64");
     bad.body = Arc::from(b"tampered".to_vec());
     assert_eq!(world.send(&bad).status, 400);
-    // The snapshot reads back with its headers.
-    let read = world.send(&Request::snapshot_read(
-        Offset::from_u64(64),
-        token,
-        crate::wire::SnapshotPart::Body { limit: 1 << 20 },
-    ));
-    let Ok(Typed::SnapshotRead(snapshot)) = read.typed else {
+    // The snapshot reads back with its headers: a range past the end is cut to it.
+    let chunk = |first, last| {
+        world.send(&Request::snapshot_read(
+            Offset::from_u64(64),
+            token,
+            crate::wire::SnapshotPart::Chunk { first, last },
+        ))
+    };
+    let read = chunk(0, 1 << 20);
+    assert_eq!(read.status, 206);
+    let Ok(Typed::SnapshotRead {
+        read: snapshot,
+        range: Some(span),
+    }) = read.typed
+    else {
         panic!("{read:?}");
     };
     assert!(snapshot.up_to_date);
+    assert_eq!((span.first(), span.last(), span.total()), (0, 10, 11));
     assert_eq!(read.body, b"image at 64");
+    // A range inside the body: those bytes alone.
+    let middle = chunk(6, 7);
+    assert_eq!(middle.status, 206);
+    assert!(matches!(
+        middle.typed,
+        Ok(Typed::SnapshotRead { range: Some(span), .. }) if (span.first(), span.total()) == (6, 11)
+    ));
+    assert_eq!(middle.body, b"at");
+    // A range that starts past the end: `416`, naming the length.
+    let past = chunk(11, 20);
+    assert_eq!(past.status, 416);
+    assert_eq!(past.typed, Ok(Typed::Untyped));
+    assert!(past.body.is_empty());
     // A header read asks for the first bytes alone (`Range`), answered `206`.
     let header = world.send(&Request::snapshot_read(
         Offset::from_u64(64),
@@ -1008,8 +1030,21 @@ fn snapshots_are_keyed_by_offset_and_digest() {
         crate::wire::SnapshotPart::Header,
     ));
     assert_eq!(header.status, 206);
-    assert!(matches!(header.typed, Ok(Typed::SnapshotRead(_))));
+    assert!(matches!(header.typed, Ok(Typed::SnapshotRead { .. })));
     assert_eq!(header.body, b"image at 64");
+    // Under the scripted `ignore-range`, the whole body as `200`.
+    world.server().inject(Scripted {
+        method: Some(Method::Get),
+        fault: Fault::IgnoreRange,
+        times: 1,
+    });
+    let whole = chunk(6, 7);
+    assert_eq!(whole.status, 200);
+    assert!(matches!(
+        whole.typed,
+        Ok(Typed::SnapshotRead { range: None, .. })
+    ));
+    assert_eq!(whole.body, b"image at 64");
 }
 
 #[test]
