@@ -570,8 +570,12 @@ pub(crate) struct MetricsResponse {
     /// Raft RPCs refused since start because the peer is in another
     /// cluster, inbound and outbound.
     pub raft_grpc_peer_cluster_refusals: u64,
-    /// The peers refused for another cluster id within the last minute.
-    pub peer_cluster_mismatch: Vec<ursula_proto::admin::PeerClusterMismatch>,
+    /// Inbound Raft RPCs refused since start because they named no cluster
+    /// id (a node before format epoch 4, or a stray client).
+    pub raft_grpc_unidentified_peer_refusals: u64,
+    /// The configured peers refused for another cluster id within the last
+    /// minute.
+    pub peer_cluster_mismatches: Vec<ursula_proto::admin::PeerClusterMismatch>,
 }
 
 #[derive(serde::Serialize)]

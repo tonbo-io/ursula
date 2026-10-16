@@ -138,10 +138,10 @@ impl DurableRaftGroupEngineFactory {
     pub fn with_registry(mut self, registry: RaftGroupHandleRegistry) -> Self {
         // A single node has no peers, but its Raft gRPC plane still refuses a
         // node of another cluster by the id of its WAL root.
-        registry.peer_cluster().bind(PeerIdentity::new(
-            SINGLE_NODE_ID,
-            self.log_stores.cluster_id().clone(),
-        ));
+        registry.peer_cluster().bind(
+            PeerIdentity::new(SINGLE_NODE_ID, self.log_stores.cluster_id().clone()),
+            BTreeMap::new(),
+        );
         self.registry = Some(registry);
         self
     }
@@ -252,13 +252,21 @@ impl StaticGrpcRaftGroupEngineFactory {
         log_stores: RaftWal,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
+        let peers = peers.into_iter().collect::<BTreeMap<_, _>>();
         let identity = PeerIdentity::new(node_id, log_stores.cluster_id().clone());
-        registry.peer_cluster().bind(identity.clone());
+        registry.peer_cluster().bind(
+            identity.clone(),
+            peers
+                .iter()
+                .filter(|(peer, _)| **peer != node_id)
+                .map(|(peer, url)| (*peer, url.clone()))
+                .collect(),
+        );
         Self {
             transports: Arc::default(),
             node_id,
             identity,
-            peers: peers.into_iter().collect(),
+            peers,
             per_group_voters: BTreeMap::new(),
             initialize_membership,
             initialize_membership_per_group: false,
@@ -509,7 +517,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         .map(|(_, fault)| fault),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                     recovery: Some(rejoin.clone()),
-                    peer_identity: Some(self.identity.clone()),
+                    peer_cluster: Some(self.registry.peer_cluster().clone()),
                 },
                 health.clone(),
             )

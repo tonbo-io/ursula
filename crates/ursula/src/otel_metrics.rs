@@ -43,7 +43,20 @@ pub(crate) fn register_cluster(
             "Raft RPCs refused since start because the peer is in another cluster; check \
              server.cluster_id and raft.peers",
         )
-        .with_callback(move |observer| observer.observe(registry.peer_cluster().refusals(), &[]))
+        .with_callback({
+            let registry = registry.clone();
+            move |observer| observer.observe(registry.peer_cluster().refusals(), &[])
+        })
+        .build();
+    let _ = global::meter("ursula-raft")
+        .u64_observable_counter("ursula.raft.unidentified_peer_refusals")
+        .with_description(
+            "Raft RPCs refused since start because they named no cluster id: a node before \
+             format epoch 4, or a stray client",
+        )
+        .with_callback(move |observer| {
+            observer.observe(registry.peer_cluster().unidentified_refusals(), &[]);
+        })
         .build();
 }
 

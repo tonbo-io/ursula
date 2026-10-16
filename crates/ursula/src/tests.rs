@@ -12166,3 +12166,47 @@ async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejection
         assert!(!body.transferred);
     }
 }
+
+/// Readiness names the first cause that applies, in a fixed order, and a
+/// peer of another cluster is none of them: it is reported beside the
+/// reason, so it neither hides a stall or a closed gate nor fails a healthy
+/// node.
+#[test]
+fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
+    use ursula_proto::admin::ServingReadinessReason as Reason;
+
+    use crate::ReadinessFacts;
+    use crate::readiness_reason;
+    let healthy = ReadinessFacts {
+        recovery_ready: true,
+        raft_ready: true,
+        ..ReadinessFacts::default()
+    };
+    assert_eq!(readiness_reason(healthy), None);
+    let mut facts = ReadinessFacts {
+        format_epoch_mismatch: true,
+        wal_disk_pressure: true,
+        recovery_stalled: true,
+        recovery_ready: false,
+        raft_ready: false,
+    };
+    let mut order = Vec::new();
+    while let Some(reason) = readiness_reason(facts) {
+        order.push(reason.clone());
+        match reason {
+            Reason::FormatEpochMismatch => facts.format_epoch_mismatch = false,
+            Reason::WalDiskPressure => facts.wal_disk_pressure = false,
+            Reason::RecoveryStalled => facts.recovery_stalled = false,
+            Reason::RecoveryGateClosed => facts.recovery_ready = true,
+            Reason::RaftReplicaUnready => facts.raft_ready = true,
+            Reason::Unknown => panic!("the server never names an unknown reason"),
+        }
+    }
+    assert_eq!(order, vec![
+        Reason::FormatEpochMismatch,
+        Reason::WalDiskPressure,
+        Reason::RecoveryStalled,
+        Reason::RecoveryGateClosed,
+        Reason::RaftReplicaUnready,
+    ]);
+}

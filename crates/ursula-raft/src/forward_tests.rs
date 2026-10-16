@@ -26,7 +26,6 @@ use ursula_runtime::RuntimeError;
 use super::*;
 use crate::raft_internal_proto as pb;
 use crate::raft_internal_proto::raft_internal_server::RaftInternal;
-use crate::raft_internal_proto::raft_internal_server::RaftInternalServer;
 
 /// How long a forwarded RPC to a silent leader may take, with slack for a
 /// loaded test host: the HTTP/2 keepalive interval plus its timeout.
@@ -285,7 +284,10 @@ async fn a_forwarded_read_to_a_wedged_leader_ends_at_the_deadline() {
     );
     let server = tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(RaftInternalServer::new(WedgedPeer))
+            .add_service(crate::grpc::raft_grpc_server(
+                WedgedPeer,
+                &crate::peer_cluster::test_peer_cluster(1),
+            ))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     let (mut engines, leader_index, stream_id, _wal_roots) =
@@ -421,5 +423,68 @@ async fn a_forwarded_read_waiting_on_a_silent_leader_does_not_hold_the_group_act
     assert_runtime_leader_unknown("runtime HEAD", &head, &peer.url);
     assert!(started.elapsed() < SILENT_LEADER_BOUND);
 
+    shutdown_all(&engines).await;
+}
+
+/// A follower's forwards to a leader of another cluster (a node replaced at
+/// the leader's address with another `server.cluster_id`) are refused
+/// before anything runs there. The client gets the retryable 503 of a
+/// leader this node cannot use, the purge included, and the follower
+/// records the leader under its node id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the foreign peer");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("foreign peer address")
+    );
+    let other = ursula_headers::ClusterId::new("other-cluster").unwrap();
+    let foreign = crate::peer_cluster::PeerCluster::default();
+    foreign.bind(
+        crate::peer_cluster::PeerIdentity::new(9, other.clone()),
+        std::collections::BTreeMap::new(),
+    );
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            // A wedged peer: only the cluster-id check answers.
+            .add_service(crate::grpc::raft_grpc_server(WedgedPeer, &foreign))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let (mut engines, leader_index, stream_id, _wal_roots) =
+        cluster_advertising("forward-other-cluster", &url).await;
+    let leader_id = u64::try_from(leader_index).unwrap() + 1;
+    let follower = &mut engines[(leader_index + 1) % 3];
+    wait_for_leader(follower).await;
+
+    let read = follower
+        .read_stream(
+            ReadStreamRequest {
+                leader_only: true,
+                ..read_req(stream_id.clone(), 64)
+            },
+            placement(),
+        )
+        .await
+        .expect_err("a leader of another cluster serves nothing");
+    assert!(read.is_forward_before_proposal(), "{read:?}");
+    let purge = follower
+        .purge_bucket(stream_id.bucket_id.clone(), placement())
+        .await
+        .expect_err("a leader of another cluster serves nothing");
+    // Refused before the body: nothing was proposed there.
+    assert!(purge.is_forward_before_proposal(), "{purge:?}");
+    let peer_cluster = follower.peer_cluster.as_ref().expect("a gRPC replica");
+    assert_eq!(peer_cluster.mismatches(), vec![
+        crate::peer_cluster::PeerClusterMismatch {
+            node_id: leader_id,
+            cluster_id: other,
+        }
+    ]);
+    assert_eq!(peer_cluster.refusals(), 2);
+    assert_eq!(foreign.refusals(), 2);
+
+    server.abort();
     shutdown_all(&engines).await;
 }

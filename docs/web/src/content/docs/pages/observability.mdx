@@ -106,7 +106,7 @@ Two surfaces expose the same counters:
   `ursula.mutations.applied`, `ursula.raft_apply.ns`, `ursula.wal.records`,
   `ursula.group_mailbox.depth`, …), ready for Prometheus/Grafana via a
   collector.
-- **Cluster id**: `ursula.cluster.info` is `1` with the node's `server.cluster_id` as its `cluster_id` label, so dashboards and alerts tell deployments apart. `ursula.raft.peer_cluster_refusals` counts the Raft RPCs refused because the peer is in another cluster, both ways. Alert on any increase (see [Peers of another cluster](/docs/operations#peers-of-another-cluster)).
+- **Cluster id**: `ursula.cluster.info` is `1` with the node's `server.cluster_id` as its `cluster_id` label, so dashboards and alerts tell deployments apart. `ursula.raft.peer_cluster_refusals` counts the Raft RPCs refused because the peer is in another cluster, both ways, and `ursula.raft.unidentified_peer_refusals` those refused because they named no cluster id. Alert on any increase (see [Peers of another cluster](/docs/operations#peers-of-another-cluster)).
 - **JSON**: `GET /__ursula/metrics` returns the full per-core/per-group
   snapshot for quick inspection and is what `ursulactl status` reads.
 

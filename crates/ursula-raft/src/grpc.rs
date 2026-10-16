@@ -273,7 +273,16 @@ pub(crate) async fn probe_rejoin_vote_barrier(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
     });
     request.set_timeout(timeout);
-    let response = client.rejoin_barrier(request).await?.into_inner();
+    let response = match client.rejoin_barrier(request).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            network
+                .transport
+                .peer_cluster
+                .observe_refusal(leader_id, &network.endpoint, &status);
+            return Err(status.into());
+        }
+    };
     let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
     if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
         return Err(RecoveryProbeError::NotLeader);
@@ -984,7 +993,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             });
             let apply_health = entry.apply_health.clone();
             let history = entry.history.clone();
-            let peer_identity = self.registry.peer_cluster().identity();
+            let peer_cluster = Some(self.registry.peer_cluster().clone());
             let result = raft
                 .call(move |raft| async move {
                     let mut engine = RaftGroupEngine {
@@ -1002,7 +1011,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         // apply-time invalidation reaches; a request-scoped cache only
                         // when none was registered.
                         cold_index_cache,
-                        peer_identity,
+                        peer_cluster,
                     };
                     let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
                     let result = match required(request.read, "group_read.read")
@@ -1330,30 +1339,33 @@ impl GrpcRaftNetwork {
         // injects its own context (see `crate::forward`).
     }
 
+    /// The OpenRaft error for a failed call, and whether the peer refused it
+    /// for another cluster id.
     pub(crate) fn map_tonic_status(
         &self,
         route: &str,
         status: tonic::Status,
-    ) -> RPCError<UrsulaRaftTypeConfig> {
+    ) -> (RPCError<UrsulaRaftTypeConfig>, bool) {
         observe_outbound_status(route, &status);
         // A peer of another cluster refuses every RPC until an operator fixes
         // a configuration: to OpenRaft it is unreachable, so replication backs
         // off instead of retrying at once.
-        let other_cluster = self
-            .transport
-            .peer_cluster
-            .observe_refusal(self.target, &status);
+        let other_cluster =
+            self.transport
+                .peer_cluster
+                .observe_refusal(self.target, &self.endpoint, &status);
         let message = format!(
             "{route} to node {} at {} failed: {}",
             self.target, self.endpoint, status
         );
-        match status.code() {
+        let error = match status.code() {
             tonic::Code::Unavailable | tonic::Code::Cancelled => {
                 RPCError::Unreachable(Unreachable::from_string(message))
             }
             _ if other_cluster => RPCError::Unreachable(Unreachable::from_string(message)),
             _ => raft_rpc_network_error(message),
-        }
+        };
+        (error, other_cluster)
     }
 
     /// Shared client-call path for every outbound raft RPC: build the tonic
@@ -1383,8 +1395,12 @@ impl GrpcRaftNetwork {
                 Ok(response.into_inner())
             }
             Err(err) => {
-                let mapped = self.map_tonic_status(route, err);
-                self.note_failure(route);
+                let (mapped, other_cluster) = self.map_tonic_status(route, err);
+                // A refusal for another cluster id is a final answer over a
+                // working channel: rebuilding the channel would not change it.
+                if !other_cluster {
+                    self.note_failure(route);
+                }
                 Err(mapped)
             }
         }
@@ -1471,8 +1487,12 @@ impl GrpcRaftNetwork {
                 // the channel would not drain it.
                 let backpressure = status.code() == tonic::Code::Unavailable
                     && status.message().starts_with(APPEND_STREAM_BACKLOG_FULL);
-                let mapped = self.map_tonic_status("AppendStream", status);
-                if !backpressure {
+                let (mapped, _) = self.map_tonic_status("AppendStream", status);
+                // The append stream's calls only see a refused stream close; the
+                // session recorded the refusal. Like a full queue, it is not a
+                // broken channel.
+                let other_cluster = self.transport.peer_cluster.refuses(self.target);
+                if !backpressure && !other_cluster {
                     self.note_failure("AppendStream");
                 }
                 Err(mapped)
@@ -1588,6 +1608,7 @@ fn shared_append_session(
     let refusals = PeerRefusals {
         peer_cluster: transport.peer_cluster.clone(),
         target,
+        address: endpoint.to_owned(),
     };
     let task = tokio::spawn(run_append_session(client, receiver, refusals));
     let session = SharedAppendSession {
@@ -1679,6 +1700,7 @@ type WireFrame = (
 struct PeerRefusals {
     peer_cluster: PeerCluster,
     target: u64,
+    address: String,
 }
 
 async fn run_append_session(
@@ -1709,7 +1731,7 @@ async fn run_append_session(
             GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
             refusals
                 .peer_cluster
-                .observe_refusal(refusals.target, &status);
+                .observe_refusal(refusals.target, &refusals.address, &status);
             return;
         }
         Err(_) => {
@@ -2117,9 +2139,10 @@ mod reconnect_tests {
             .expect("bind test raft grpc listener");
         let address = listener.local_addr().expect("read test listener address");
         let registry = RaftGroupHandleRegistry::default();
-        registry
-            .peer_cluster()
-            .bind(crate::peer_cluster::test_identity(1));
+        registry.peer_cluster().bind(
+            crate::peer_cluster::test_identity(1),
+            std::collections::BTreeMap::new(),
+        );
         let service_registry = registry.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -2590,6 +2613,11 @@ mod reconnect_tests {
     #[tokio::test]
     async fn a_peer_of_another_cluster_is_recorded_from_its_refusals() {
         let (endpoint, registry, server) = spawn_append_stream_server().await;
+        // The server lists node 3, at loopback, among its peers.
+        registry.peer_cluster().bind(
+            crate::peer_cluster::test_identity(1),
+            std::collections::BTreeMap::from([(3, "http://127.0.0.1:4437".to_owned())]),
+        );
         let other = ursula_headers::ClusterId::new("other-cluster").unwrap();
         let peer_cluster = PeerCluster::default();
         let transport = Arc::new(CoreRaftTransport::new(

@@ -354,8 +354,8 @@ mod tests {
                             axum::Json(ursula_proto::admin::ServingReadiness {
                                 ready,
                                 reason: (!ready).then_some(ServingReadinessReason::WalDiskPressure),
-                                cluster_id: "test".to_owned(),
-                                peer_cluster_mismatch: vec![],
+                                cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
+                                peer_cluster_mismatches: vec![],
                                 format_epoch_mismatch: false,
                                 recovery_barriers_ready: true,
                                 raft_maintenance: None,
@@ -489,8 +489,8 @@ mod tests {
                     axum::Json(ursula_proto::admin::ServingReadiness {
                         ready: true,
                         reason: None,
-                        cluster_id: "test".to_owned(),
-                        peer_cluster_mismatch: vec![],
+                        cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
+                        peer_cluster_mismatches: vec![],
                         format_epoch_mismatch: false,
                         recovery_barriers_ready: true,
                         raft_maintenance: None,

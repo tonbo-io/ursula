@@ -11,7 +11,12 @@ description = "Typed HTTP headers of the Ursula protocol, shared by the server a
 
 # Standard library only: the standalone client workspaces (clients/sqlite-vfs)
 # depend on this crate by path, so it must not pull the server's dependencies.
+# `serde` is opt-in, for the server's admin types.
 [dependencies]
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
 
 # Dev-dependencies of a path dependency do not reach its dependents.
 [dev-dependencies]

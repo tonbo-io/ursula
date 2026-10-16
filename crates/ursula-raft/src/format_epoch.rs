@@ -193,7 +193,9 @@ mod tests {
             .expect("bind test raft grpc listener");
         let address = listener.local_addr().expect("listener address");
         let registry = RaftGroupHandleRegistry::default();
-        registry.peer_cluster().bind(identity);
+        registry
+            .peer_cluster()
+            .bind(identity, std::collections::BTreeMap::new());
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(crate::grpc::raft_grpc_service(registry))

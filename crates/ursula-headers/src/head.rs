@@ -45,6 +45,22 @@ impl ClusterId {
     }
 }
 
+/// A cluster id travels as its text and is validated when it is read.
+#[cfg(feature = "serde")]
+impl serde::Serialize for ClusterId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ClusterId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(text).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for ClusterId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

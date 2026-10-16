@@ -1569,7 +1569,7 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
     }
     let mut children = configs
         .iter()
-        .map(|config| spawn_node_with_cluster_config(binary, config))
+        .map(|config| spawn_node_logging_info(binary, config))
         .collect::<Vec<_>>();
     let client = reqwest::Client::new();
     for (_, base_url) in &peers {
@@ -1598,44 +1598,44 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
     );
     assert_ne!(config, other, "node 3's config names the cluster id");
     std::fs::write(&configs[2], other).expect("write node 3 config");
-    children.push(spawn_node_with_cluster_config(binary, &configs[2]));
+    children.push(spawn_node_logging_info(binary, &configs[2]));
     wait_until_ready(&client, &peers[2].1, &mut children).await;
 
-    let mismatch = |node_id: u64, cluster_id: &str| ursula_proto::admin::PeerClusterMismatch {
+    let cluster = |id: &str| ursula_headers::ClusterId::new(id).unwrap();
+    let mismatch = |node_id: u64, id: &str| ursula_proto::admin::PeerClusterMismatch {
         node_id,
-        cluster_id: cluster_id.to_owned(),
+        cluster_id: cluster(id),
     };
-    // A leader's appends to node 3 are refused there, so both report the
-    // other. Either of nodes 1 and 2 may lead the groups.
-    let (leader, _, leader_ready) =
-        wait_any_peer_cluster_mismatch(&client, &peers[..2], &mut children, |ready| {
-            ready.peer_cluster_mismatch.contains(&mismatch(3, OTHER))
+    // The leader of group 0, from the metrics of a node of the cluster. Its
+    // appends to node 3 are refused there.
+    let leader_id = wait_group_leader(&client, &peers[0].1, &mut children).await;
+    let leader = peers
+        .iter()
+        .position(|(node_id, _)| *node_id == leader_id)
+        .unwrap();
+    assert!(leader < 2, "node 3 cannot lead: {leader_id}");
+    let (_, status, leader_ready) =
+        wait_any_peer_cluster_mismatch(&client, &peers[leader..=leader], &mut children, |ready| {
+            ready.peer_cluster_mismatches.contains(&mismatch(3, OTHER))
         })
         .await;
-    assert_eq!(leader_ready.cluster_id, CLUSTER);
+    assert_eq!(leader_ready.cluster_id, cluster(CLUSTER));
     let (_, other_status, other_ready) =
         wait_any_peer_cluster_mismatch(&client, &peers[2..], &mut children, |ready| {
-            !ready.peer_cluster_mismatch.is_empty()
+            ready
+                .peer_cluster_mismatches
+                .contains(&mismatch(leader_id, CLUSTER))
         })
         .await;
-    assert_eq!(other_ready.cluster_id, OTHER);
+    assert_eq!(other_ready.cluster_id, cluster(OTHER));
+    // Node 3 is unready, and readiness names its own cause: a peer of
+    // another cluster is never the reason.
     assert_eq!(
         other_status,
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
         "{other_ready:?}"
     );
-    assert_eq!(
-        other_ready.reason,
-        Some(ursula_proto::admin::ServingReadinessReason::PeerClusterMismatch),
-        "{other_ready:?}"
-    );
-    assert!(
-        other_ready
-            .peer_cluster_mismatch
-            .iter()
-            .all(|peer| peer.cluster_id == CLUSTER && peer.node_id != 3),
-        "{other_ready:?}"
-    );
+    assert!(other_ready.reason.is_some(), "{other_ready:?}");
 
     // Nodes 1 and 2 are a quorum of their own cluster and keep serving:
     // the misconfigured peer does not take them out of service.
@@ -1650,50 +1650,95 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
     )
     .await;
     assert_eq!(replicated, b"same-cluster-still-serving");
-    let leader_node = &peers[leader..=leader];
-    let (_, status, _) =
-        wait_any_peer_cluster_mismatch(&client, leader_node, &mut children, |ready| {
-            ready.ready && ready.peer_cluster_mismatch.contains(&mismatch(3, OTHER))
+    let (_, leader_status, _) =
+        wait_any_peer_cluster_mismatch(&client, &peers[leader..=leader], &mut children, |ready| {
+            ready.ready && ready.peer_cluster_mismatches.contains(&mismatch(3, OTHER))
         })
         .await;
-    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(leader_status, reqwest::StatusCode::OK, "{status}");
 
-    // Metrics name each node's cluster and count the refusals.
-    for (node, cluster) in [(leader, CLUSTER), (2, OTHER)] {
-        let metrics: serde_json::Value = client
-            .get(format!("{}/__ursula/metrics", peers[node].1))
-            .send()
-            .await
-            .expect("metrics")
-            .json()
-            .await
-            .expect("metrics JSON");
-        assert_eq!(metrics["cluster_id"], cluster, "{metrics}");
-        assert!(
-            metrics["raft_grpc_peer_cluster_refusals"]
-                .as_u64()
-                .is_some_and(|refusals| refusals > 1),
-            "{metrics}"
-        );
-        assert!(
-            metrics["peer_cluster_mismatch"]
-                .as_array()
-                .is_some_and(|peers| !peers.is_empty()),
-            "{metrics}"
-        );
+    // Node 3 never took any of the cluster's Raft traffic: it applied
+    // nothing, and it serves none of the stream.
+    let other_metrics: ursula_proto::admin::NodeMetrics = client
+        .get(format!("{}/__ursula/metrics", peers[2].1))
+        .send()
+        .await
+        .expect("node 3 metrics")
+        .json()
+        .await
+        .expect("node 3 metrics JSON");
+    assert!(
+        other_metrics
+            .groups
+            .iter()
+            .all(|group| group.last_applied_index.unwrap_or(0) == 0
+                && group.last_log_index.unwrap_or(0) == 0),
+        "{other_metrics:?}"
+    );
+    let read = client
+        .get(format!(
+            "{}/benchcmp/cli-cluster-id?offset=0&max_bytes=64",
+            peers[2].1
+        ))
+        .send()
+        .await
+        .expect("read on node 3");
+    let read_status = read.status();
+    let body = read.bytes().await.expect("read body on node 3");
+    assert!(
+        !body
+            .windows(b"same-cluster".len())
+            .any(|window| window == b"same-cluster"),
+        "node 3 served the cluster's data: {read_status}"
+    );
+
+    // Metrics name each node's cluster, and the refusals keep coming while
+    // the peer is misconfigured.
+    for (node, id) in [(leader, CLUSTER), (2, OTHER)] {
+        let refusals = || async {
+            let metrics: serde_json::Value = client
+                .get(format!("{}/__ursula/metrics", peers[node].1))
+                .send()
+                .await
+                .expect("metrics")
+                .json()
+                .await
+                .expect("metrics JSON");
+            assert_eq!(metrics["cluster_id"], id, "{metrics}");
+            assert!(
+                metrics["peer_cluster_mismatches"]
+                    .as_array()
+                    .is_some_and(|peers| !peers.is_empty()),
+                "{metrics}"
+            );
+            metrics["raft_grpc_peer_cluster_refusals"].as_u64().unwrap()
+        };
+        let first = refusals().await;
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .unwrap();
+        while refusals().await <= first {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} counted no new refusal",
+                peers[node].1
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
-    // Each node logs a refused peer once, however often it retries.
-    let leader_log =
-        strip_ansi(&std::fs::read_to_string(&children[leader].stderr_path).expect("leader stderr"));
-    let logged = leader_log
-        .lines()
-        .filter(|line| {
-            line.contains("refusing Raft traffic with a peer of another cluster")
-                && line.contains("peer_node_id=3")
-        })
-        .count();
-    assert_eq!(logged, 1, "{leader_log}");
+    // Each side logs the other once, however often it retries.
+    for (node, peer_id) in [(leader, 3), (2, leader_id)] {
+        let log = strip_ansi(&std::fs::read_to_string(&children[node].stderr_path).unwrap());
+        let logged = log
+            .lines()
+            .filter(|line| {
+                line.contains("refusing Raft traffic with a peer of another cluster")
+                    && line.contains(&format!("peer_node_id={peer_id} "))
+            })
+            .count();
+        assert_eq!(logged, 1, "{}:\n{log}", peers[node].1);
+    }
 
     drop(children);
     std::fs::remove_dir_all(&root).expect("remove temp root");
@@ -1716,6 +1761,55 @@ fn strip_ansi(text: &str) -> String {
         }
     }
     plain
+}
+
+/// A node whose log filter is `info` whatever this process inherits, for a
+/// test that reads its log.
+fn spawn_node_logging_info(binary: &str, config_path: &Path) -> ChildGuard {
+    let mut command = Command::new(binary);
+    command
+        .arg("server")
+        .arg("--config")
+        .arg(config_path)
+        .env("RUST_LOG", "info");
+    spawn_child(command, child_label("durable-node", config_path))
+}
+
+/// The leader of group 0 as `base_url`'s metrics report it, once known.
+async fn wait_group_leader(
+    client: &reqwest::Client,
+    base_url: &str,
+    children: &mut [ChildGuard],
+) -> u64 {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .unwrap();
+    loop {
+        if let Some(report) = exited_child_report(children) {
+            panic!("a node exited while waiting for a leader:\n{report}");
+        }
+        let metrics: ursula_proto::admin::NodeMetrics = client
+            .get(format!("{base_url}/__ursula/metrics"))
+            .send()
+            .await
+            .expect("metrics")
+            .json()
+            .await
+            .expect("metrics JSON");
+        if let Some(leader) = metrics
+            .groups
+            .iter()
+            .find(|group| group.raft_group_id == 0)
+            .and_then(|group| group.current_leader)
+        {
+            return leader;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group 0 has no leader: {metrics:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Polls the readiness of `nodes` until one's answer satisfies `done`, and
