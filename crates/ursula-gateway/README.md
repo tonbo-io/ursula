@@ -286,9 +286,9 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
     both planes on one port. Never use a cluster port (server.cluster_listen),
     which serves no client route. A leader redirect names the leader by its
     client URL, and the gateway follows one that names another address only
-    by trying the upstreams it has not tried yet. A proxy, service-mesh sidecar or another gateway in between
-    must not resend requests: a resent write without producer headers
-    applies twice.
+    by trying the upstreams it has not tried yet. A proxy, service-mesh
+    sidecar or another gateway in between must not resend requests: a resent
+    write without producer headers applies twice.
 
 --response-header-timeout <SECONDS>
     Timeout for sending the upstream request and receiving response headers.
