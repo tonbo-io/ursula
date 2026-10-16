@@ -717,7 +717,7 @@ A code says what refused the request. For a `408` or a `5xx` it also says whethe
 
 A client reads every answer to a write as one of five outcomes:
 
-- **Applied**: a `2xx`, which for a write with producer headers carries its receipt. The write holds.
+- **Applied**: a `2xx` that carries the typed answer of its write. The write holds.
 - **Repeat**: a producer `204` with its receipt, or with `Producer-Outcome: receipt-evicted` (Section 5.3). An earlier request with the same key applied the write. A close-only producer write answers `204` even when it applies now, so its receipt reads as a repeat either way, and both hold.
 - **Refused**: this request applied nothing of the write and never will. Either the server refused it before proposing it, or it was proposed and its apply refused it deterministically.
 - **Redirected**: a `307` or `308`. This target applied nothing and names another (Section 5.7).
@@ -725,9 +725,9 @@ A client reads every answer to a write as one of five outcomes:
 
 `NO_LEADER` and `OUTCOME_UNKNOWN` follow from these definitions (Section 5.7). A refusal speaks for its own request only: whether an earlier attempt under the same key applied, only a receipt or a producer `403` says.
 
-One rule decides an answer that carries no error code this document defines: it is unknown, unless its status alone proves an outcome. A `2xx` proves an apply, but for a write with producer headers only with its receipt: Ursula always sends one, so a `2xx` without it comes from a layer outside Ursula and says nothing of the write. A `307` or `308` proves a redirect. A `4xx` other than `408` proves a refusal, by the requirement on intermediaries below. A `408`, a `5xx`, and a `1xx` or `3xx` other than a redirect prove nothing: a load balancer or a proxy may send one after it forwarded some or all of the request. A request that got no answer, such as one whose connection failed during its upload, is unknown.
+One rule decides an answer that carries no error code this document defines: it is unknown, unless its status alone proves an outcome. A `2xx` proves an apply only with the typed answer a server always sends for its write: the receipt of a write with producer headers, `Stream-Next-Offset` of any other append or close, `Stream-Incarnation` of a create or of a discard of the staged parts (`DELETE {stream_url}/snapshot/parts`), the published snapshot of a publish or a parts commit, and `Stream-Snapshot-Part` of a part. A `2xx` without it comes from a layer outside the server, such as a misrouting proxy, and says nothing of the write. A `307` or `308` proves a redirect. A `4xx` other than `408` proves a refusal, by the requirement on intermediaries below. A `408`, a `5xx`, and a `1xx` or `3xx` other than a redirect prove nothing: a load balancer or a proxy may send one after it forwarded some or all of the request. A request that got no answer, such as one whose connection failed during its upload, is unknown.
 
-An intermediary in front of an Ursula server or gateway MUST NOT answer a write with a `4xx` other than `408` after it forwarded any of the request, and MUST NOT resend a write. An intermediary that limits request bodies MUST NOT accept a body larger than the server's request limit (`Ursula-Max-Request-Bytes`, Section 10), so that its own `413` refuses every body the server would refuse before reading it.
+An intermediary in front of an Ursula server or gateway MUST NOT answer a write with a `4xx` other than `408`, a `307` or a `308` after it forwarded any of the request, and MUST NOT resend a write. An intermediary that limits request bodies MUST NOT accept a body larger than the server's request limit (`Ursula-Max-Request-Bytes`, Section 10), so that its own `413` refuses every body the server would refuse before reading it.
 
 A `408` or a `5xx` is a refusal only when its code proves one. Each of these codes is sent only when nothing of the write applied:
 
