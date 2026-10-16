@@ -636,7 +636,7 @@ pub enum SimEvent {
     /// The routing invariants held across `leader_changes` leader changes:
     /// `keys` keys applied once each, `redirects` writes were redirected
     /// before their body, and `refused_after_body` writes whose body was
-    /// read were refused without a redirect.
+    /// read were refused with `503` and `Retry-After`.
     RoutingBeforeBodyVerified {
         stream: BucketStreamId,
         keys: u64,

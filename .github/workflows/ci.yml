@@ -292,6 +292,13 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             strict_replay --nocapture
 
+      # Outcome-level replay: the routing-before-the-body scenario runs twice
+      # per fixed seed and must produce the same report.
+      - name: Run routing-before-the-body replay
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            routing_before_the_body_under_leader_churn_replays --nocapture
+
       - name: Verify expected-failure replay and minimization
         run: |
           assert_minimized_failure_trace() {
