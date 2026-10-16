@@ -146,6 +146,20 @@ message ReadStreamReadV1 {
   // `consistency=leader`: the leader linearizes the read (ReadIndex) before
   // serving it.
   bool leader_only = 6;
+  // What the receiver may serve when it no longer leads the group.
+  FollowerReadV1 follower = 7;
+}
+
+// `ursula_runtime::FollowerRead`: what a follower may serve of a read from
+// its own applied state. A receiver refuses a value it does not know, so a
+// new value may be sent only once every peer of the same minor version
+// knows it.
+enum FollowerReadV1 {
+  // Any applied prefix (a base-protocol catch-up read).
+  FOLLOWER_READ_V1_PREFIX = 0;
+  // Only an answer the server marks immutable (an immutable-read chunk);
+  // anything else goes to the leader.
+  FOLLOWER_READ_V1_IMMUTABLE = 1;
 }
 
 message GroupReadResponseV1 {

@@ -36,6 +36,8 @@ use ursula_runtime::CreateStreamRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::FlushColdRequest;
 #[cfg(not(madsim))]
+use ursula_runtime::FollowerRead;
+#[cfg(not(madsim))]
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupWriteCommand;
 #[cfg(not(madsim))]
@@ -83,6 +85,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         now_ms: 0,
         leader_only: false,
         read_index: None,
+        follower: FollowerRead::Prefix,
     }
 }
 

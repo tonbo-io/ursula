@@ -44,6 +44,7 @@ use ursula_raft::wal::diagnostics::GroupLogState;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
@@ -571,6 +572,7 @@ impl JournalCluster {
                             now_ms: 0,
                             leader_only: false,
                             read_index: None,
+                            follower: FollowerRead::Prefix,
                         },
                         group_placement(group),
                     )

@@ -997,13 +997,30 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     }
 }
 
-/// ACKs are quorum-replicated, not necessarily applied on the third replica.
-/// A catch-up cursor ahead of that replica must be checked at the leader.
-#[tokio::test]
-async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
+/// Three replicas over gRPC, led by the second (`engines[1]`), whose
+/// first (`engines[0]`) a test can make lag with its service's
+/// `pause_replication`.
+struct ThreeReplicas {
+    engines: Vec<RaftGroupEngine>,
+    services: Vec<RecoveryTestService>,
+    servers: Vec<tokio::task::JoinHandle<()>>,
+    _gates: Vec<Arc<GroupRejoin>>,
+    _wal_roots: Vec<tempfile::TempDir>,
+}
+
+impl ThreeReplicas {
+    async fn shutdown(self) {
+        shutdown_all(&self.engines).await;
+        for server in self.servers {
+            server.abort();
+        }
+    }
+}
+
+async fn three_replicas_led_by_the_second(cluster_name: &str) -> ThreeReplicas {
     let config = Arc::new(
         Config {
-            cluster_name: "stale-follower-cursor-grpc".to_owned(),
+            cluster_name: cluster_name.to_owned(),
             heartbeat_interval: 10,
             election_timeout_min: 100,
             election_timeout_max: 200,
@@ -1032,10 +1049,9 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
         gates.push(gate);
         wal_roots.push(wal_root);
     }
-    let nodes = endpoints
-        .iter()
-        .enumerate()
-        .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
+    let nodes = (1_u64..)
+        .zip(&endpoints)
+        .map(|(id, endpoint)| (id, BasicNode::new(endpoint)))
         .collect::<BTreeMap<_, _>>();
     for gate in &gates {
         gate.establish_vote_floor(UrsulaVote::new(0, 0))
@@ -1045,12 +1061,40 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     gates[1].allow_fresh_bootstrap().await.unwrap();
     engines[1].raft.runtime_config().elect(true);
     engines[1].raft.initialize(nodes).await.unwrap();
-    engines[1]
+    // Ticks are off, so an election that a loaded host lets time out is not
+    // retried on its own: trigger another until the second replica leads.
+    let mut attempts = 0_u32;
+    while engines[1]
         .raft
         .wait(Some(Duration::from_secs(5)))
         .current_leader(2, "initial leader")
         .await
-        .unwrap();
+        .is_err()
+    {
+        attempts = attempts.saturating_add(1);
+        assert!(attempts < 6, "the second replica never won an election");
+        engines[1].raft.trigger().elect(false).await.unwrap();
+    }
+    ThreeReplicas {
+        engines,
+        services,
+        servers,
+        _gates: gates,
+        _wal_roots: wal_roots,
+    }
+}
+
+/// ACKs are quorum-replicated, not necessarily applied on the third replica.
+/// A catch-up cursor ahead of that replica must be checked at the leader.
+#[tokio::test]
+async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
+    let ThreeReplicas {
+        mut engines,
+        services,
+        servers,
+        _gates,
+        _wal_roots,
+    } = three_replicas_led_by_the_second("stale-follower-cursor-grpc").await;
     let stream_id = bsid("ack-cursor");
     create_stream_via_raft(&engines[1], stream_id.clone()).await;
     let initial = engines[1]
@@ -1179,6 +1223,320 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
     for server in servers {
         server.abort();
     }
+}
+
+/// A follower answers an immutable-read chunk only when the answer can be
+/// marked (#581 section 5.3). A chunk that reaches the lagging follower's own
+/// tail goes to the leader, so a client never takes a lagging replica's short
+/// or tail-ending answer for the stream's.
+#[tokio::test]
+async fn lagging_follower_forwards_immutable_chunks_it_cannot_mark() {
+    let mut cluster = three_replicas_led_by_the_second("immutable-chunk-follower").await;
+    let stream_id = bsid("immutable-chunk");
+    create_stream_via_raft(&cluster.engines[1], stream_id.clone()).await;
+    let initial = cluster.engines[1]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"old-prefix"))
+        .await
+        .unwrap();
+    cluster.engines[1].raft.trigger().heartbeat().await.unwrap();
+    for engine in &cluster.engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(initial.log_id.index()), "initial prefix applied")
+            .await
+            .unwrap();
+    }
+    // The first replica stops at offset 10; the stream grows to 18.
+    cluster.services[0]
+        .pause_replication
+        .store(true, Ordering::SeqCst);
+    cluster.engines[1]
+        .raft
+        .client_write(append_command(stream_id.clone(), b"-gap-ACK"))
+        .await
+        .unwrap();
+    let chunk = |max_len, follower| ReadStreamRequest {
+        follower,
+        ..read_req(stream_id.clone(), max_len)
+    };
+
+    // A base-protocol read is served from the follower's own prefix.
+    let prefix = read_through_first(&mut cluster, chunk(12, FollowerRead::Prefix)).await;
+    assert_eq!(prefix.payload, b"old-prefix");
+    assert!(!prefix.is_immutable(12));
+
+    // The same range as a chunk: the leader answers it, whole and markable.
+    let forwarded = read_through_first(&mut cluster, chunk(12, FollowerRead::Immutable)).await;
+    assert_eq!(forwarded.payload, b"old-prefix-g");
+    assert_eq!(forwarded.next_offset, 12);
+    assert!(forwarded.is_immutable(12));
+
+    // A chunk that ends exactly at the follower's tail: the follower cannot
+    // tell it from the stream's tail, so the leader answers.
+    let at_follower_tail =
+        read_through_first(&mut cluster, chunk(10, FollowerRead::Immutable)).await;
+    assert_eq!(at_follower_tail.payload, b"old-prefix");
+    assert!(
+        at_follower_tail.is_immutable(10),
+        "the leader's tail is beyond it: {at_follower_tail:?}"
+    );
+
+    // A chunk below the follower's tail is the follower's to answer.
+    let below = read_through_first(&mut cluster, chunk(4, FollowerRead::Immutable)).await;
+    assert_eq!(below.payload, b"old-");
+    assert!(below.is_immutable(4));
+
+    cluster.services[0]
+        .pause_replication
+        .store(false, Ordering::SeqCst);
+    cluster.shutdown().await;
+}
+
+/// A follower that has not applied a delete and recreate still holds the
+/// old incarnation, whose retained offset may be above an offset the new
+/// one serves. Its `410` would be for the old stream, so it forwards the
+/// read as it forwards a `404` or `416`, and the leader answers for the new
+/// one.
+#[tokio::test]
+async fn lagging_follower_forwards_a_gone_offset_of_a_recreated_stream() {
+    let mut cluster = three_replicas_led_by_the_second("gone-after-recreate").await;
+    let stream_id = bsid("gone-after-recreate");
+    create_stream_via_raft(&cluster.engines[1], stream_id.clone()).await;
+    let mut last = None;
+    for command in [
+        append_command(stream_id.clone(), b"old-prefix"),
+        GroupWriteCommand::from(ursula_runtime::PublishSnapshotRequest {
+            stream_id: stream_id.clone(),
+            snapshot_offset: 10,
+            content_type: "application/octet-stream".to_owned(),
+            payload: bytes::Bytes::from_static(b"snapshot"),
+            cold_body: None,
+            now_ms: 0,
+            expected_incarnation: None,
+            if_incarnation: None,
+        }),
+        GroupWriteCommand::from(ursula_runtime::AdvanceRetentionRequest {
+            stream_id: stream_id.clone(),
+            retained_offset: 10,
+            now_ms: 0,
+            expected_incarnation: None,
+            if_incarnation: None,
+        }),
+    ] {
+        last = Some(cluster.engines[1].raft.client_write(command).await.unwrap());
+    }
+    let retained = last.expect("written");
+    cluster.engines[1].raft.trigger().heartbeat().await.unwrap();
+    for engine in &cluster.engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(retained.log_id.index()), "retention applied")
+            .await
+            .unwrap();
+    }
+    let old = read_through_first(&mut cluster, ReadStreamRequest {
+        offset: 10,
+        ..read_req(stream_id.clone(), 4)
+    })
+    .await
+    .incarnation;
+
+    // The first replica stops before the delete.
+    cluster.services[0]
+        .pause_replication
+        .store(true, Ordering::SeqCst);
+    for command in [
+        GroupWriteCommand::from(ursula_runtime::DeleteStreamRequest {
+            stream_id: stream_id.clone(),
+            if_incarnation: None,
+        }),
+        create_command(stream_id.clone()),
+        append_command(stream_id.clone(), b"new"),
+    ] {
+        cluster.engines[1].raft.client_write(command).await.unwrap();
+    }
+    for follower in [FollowerRead::Prefix, FollowerRead::Immutable] {
+        let read = read_through_first(&mut cluster, ReadStreamRequest {
+            follower,
+            ..read_req(stream_id.clone(), 3)
+        })
+        .await;
+        assert_eq!(read.payload, b"new", "{follower:?}");
+        assert_ne!(read.incarnation, old, "{follower:?}");
+    }
+    // The leader's `416` comes back through the follower with the token of
+    // the stream that decided it.
+    let new = read_through_first(&mut cluster, read_req(stream_id.clone(), 3))
+        .await
+        .incarnation;
+    let mut beyond = None;
+    for _ in 0..50 {
+        match cluster.engines[0]
+            .read_stream(
+                ReadStreamRequest {
+                    offset: 99,
+                    ..read_req(stream_id.clone(), 3)
+                },
+                placement(),
+            )
+            .await
+        {
+            Err(error) if error.code() == Some(StreamErrorCode::OffsetOutOfRange) => {
+                beyond = Some(error);
+                break;
+            }
+            Err(_transient) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Ok(read) => panic!("a read beyond the tail answered {read:?}"),
+        }
+    }
+    let beyond = beyond.expect("the leader's 416");
+    assert!(
+        beyond
+            .context()
+            .contains(&ursula_runtime::StreamErrorContext::StreamIncarnation { incarnation: new }),
+        "{beyond:?}"
+    );
+    cluster.services[0]
+        .pause_replication
+        .store(false, Ordering::SeqCst);
+    cluster.shutdown().await;
+}
+
+/// A leader answers an immutable-read chunk it cannot mark, and a read that
+/// would answer `404`, `410` or `416`, only after a ReadIndex round (#581
+/// section 5.3): a leader that cannot reach a quorum may lag the group, as a
+/// just-elected one may not have applied a recreate yet, so it refuses
+/// rather than answer from that state. A chunk it can mark, and a
+/// base-protocol read that succeeds, need no round.
+#[tokio::test]
+async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
+    let mut cluster = three_replicas_led_by_the_second("immutable-leader-barrier").await;
+    let stream_id = bsid("immutable-leader-barrier");
+    create_stream_via_raft(&cluster.engines[1], stream_id.clone()).await;
+    let mut last = None;
+    for command in [
+        append_command(stream_id.clone(), b"old-prefix-tail-bytes"),
+        GroupWriteCommand::from(ursula_runtime::PublishSnapshotRequest {
+            stream_id: stream_id.clone(),
+            snapshot_offset: 10,
+            content_type: "application/octet-stream".to_owned(),
+            payload: bytes::Bytes::from_static(b"snapshot"),
+            cold_body: None,
+            now_ms: 0,
+            expected_incarnation: None,
+            if_incarnation: None,
+        }),
+        GroupWriteCommand::from(ursula_runtime::AdvanceRetentionRequest {
+            stream_id: stream_id.clone(),
+            retained_offset: 10,
+            now_ms: 0,
+            expected_incarnation: None,
+            if_incarnation: None,
+        }),
+    ] {
+        last = Some(cluster.engines[1].raft.client_write(command).await.unwrap());
+    }
+    let retained = last.expect("written");
+    cluster.engines[1].raft.trigger().heartbeat().await.unwrap();
+    cluster.engines[1]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(Some(retained.log_id.index()), "retention applied")
+        .await
+        .unwrap();
+    // The leader can no longer reach a quorum.
+    for service in [&cluster.services[0], &cluster.services[2]] {
+        service.pause_replication.store(true, Ordering::SeqCst);
+    }
+    let leader = &mut cluster.engines[1];
+    let below = leader
+        .read_stream(
+            ReadStreamRequest {
+                offset: 10,
+                follower: FollowerRead::Immutable,
+                ..read_req(stream_id.clone(), 4)
+            },
+            placement(),
+        )
+        .await
+        .expect("a markable chunk needs no round");
+    assert_eq!(below.payload, b"-tai");
+    assert!(below.is_immutable(4));
+    let prefix = leader
+        .read_stream(
+            ReadStreamRequest {
+                offset: 10,
+                ..read_req(stream_id.clone(), 64)
+            },
+            placement(),
+        )
+        .await
+        .expect("a base-protocol read needs no round");
+    assert_eq!(prefix.payload, b"-tail-bytes");
+    for (name, request) in [
+        ("an unmarkable chunk", ReadStreamRequest {
+            offset: 10,
+            follower: FollowerRead::Immutable,
+            ..read_req(stream_id.clone(), 64)
+        }),
+        ("a 416", ReadStreamRequest {
+            offset: 99,
+            follower: FollowerRead::Immutable,
+            ..read_req(stream_id.clone(), 4)
+        }),
+        ("a 410", read_req(stream_id.clone(), 4)),
+        ("a 404", read_req(bsid("never-created"), 4)),
+    ] {
+        let refused = leader
+            .read_stream(request, placement())
+            .await
+            .expect_err("waits for a quorum");
+        assert!(refused.leader_hint().is_some(), "{name}: {refused:?}");
+        assert!(
+            !may_hold_only_for_a_lagging_state(&refused),
+            "{name}: {refused:?}"
+        );
+    }
+    for service in [&cluster.services[0], &cluster.services[2]] {
+        service.pause_replication.store(false, Ordering::SeqCst);
+    }
+    // With a quorum again, the same reads answer.
+    let mut gone = None;
+    for _ in 0..50 {
+        match cluster.engines[1]
+            .read_stream(read_req(stream_id.clone(), 4), placement())
+            .await
+        {
+            Err(error) if error.code() == Some(StreamErrorCode::StreamGone) => {
+                gone = Some(error);
+                break;
+            }
+            Err(_transient) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Ok(read) => panic!("a read below the retained offset answered {read:?}"),
+        }
+    }
+    assert!(gone.is_some(), "the leader's 410 once it reaches a quorum");
+    cluster.shutdown().await;
+}
+
+/// `request` read through the first replica, retried while a leader proof
+/// is transiently refused.
+async fn read_through_first(
+    cluster: &mut ThreeReplicas,
+    request: ReadStreamRequest,
+) -> ReadStreamResponse {
+    let replicas = replica_watches(&cluster.engines, &cluster.services);
+    let engine = &mut cluster.engines[0];
+    retry_transient("read through the first replica", &replicas, async |_| {
+        engine
+            .read_stream(request.clone(), placement())
+            .await
+            .map_err(read_attempt_error)
+    })
+    .await
 }
 
 #[tokio::test]

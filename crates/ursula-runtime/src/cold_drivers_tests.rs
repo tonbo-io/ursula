@@ -18,6 +18,7 @@ use crate::ColdStore;
 use crate::ColdStoreFaultEffect;
 use crate::ColdStoreOperation;
 use crate::CreateStreamRequest;
+use crate::FollowerRead;
 use crate::InMemoryGroupEngineFactory;
 use crate::PlanGroupColdFlushRequest;
 use crate::PublishSnapshotRequest;
@@ -103,6 +104,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read stream")
@@ -316,6 +318,7 @@ async fn f2_driver_deletes_the_replacement_of_a_rejected_compaction() {
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read retained suffix");

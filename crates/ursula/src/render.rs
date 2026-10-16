@@ -1,7 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
-
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::http::header::CACHE_CONTROL;
@@ -22,6 +18,8 @@ use chrono::Utc;
 #[cfg(test)]
 use serde_json::Value;
 use ursula_headers::ACCEPT_RANGES_BYTES;
+use ursula_headers::ChunkMark;
+use ursula_headers::ChunkRead;
 use ursula_headers::ClosedEpoch;
 use ursula_headers::ContentRange;
 use ursula_headers::CurrentEpoch;
@@ -30,11 +28,13 @@ use ursula_headers::EpochClosure;
 use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
+use ursula_headers::ImmutableSnapshotRead;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::Inherited;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
 use ursula_headers::SnapshotPublishAnswer;
+use ursula_headers::SnapshotRead;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
 use ursula_headers::StreamSeq;
@@ -57,6 +57,7 @@ use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::ProducerAck;
 use ursula_runtime::ProducerDelivery;
 use ursula_runtime::ProducerRefusal;
+use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotResponse;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
@@ -73,6 +74,7 @@ use crate::HEADER_STREAM_EXPIRES_AT;
 use crate::HEADER_STREAM_TTL;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
+use crate::SnapshotResource;
 use crate::limits;
 
 const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
@@ -305,8 +307,9 @@ pub(crate) async fn error_body_of(response: Response) -> ErrorBody {
 struct RenderedErrorBody;
 
 /// A response extension that keeps the compression layer off an answer:
-/// a snapshot, whose byte ranges refer to its stored body, and every error
-/// answer.
+/// a snapshot, whose byte ranges refer to its stored body, an immutable
+/// chunk, which has one representation per `ETag` (extensions Section 4.3),
+/// and every error answer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Uncompressed;
 
@@ -462,10 +465,6 @@ pub(crate) fn insert_snapshot_offset(headers: &mut HeaderMap, snapshot_offset: u
     insert_padded_offset(headers, names::STREAM_SNAPSHOT_OFFSET, snapshot_offset);
 }
 
-pub(crate) fn insert_snapshot_digest(headers: &mut HeaderMap, digest: &str) {
-    insert_header_str(headers, names::STREAM_SNAPSHOT_DIGEST, digest);
-}
-
 pub(crate) fn insert_cursor(headers: &mut HeaderMap, cursor: u64) {
     insert_padded_offset(headers, HEADER_STREAM_CURSOR, cursor);
 }
@@ -496,8 +495,8 @@ pub(crate) fn insert_default_response_headers(headers: &mut HeaderMap) {
     // A stream read carries an `ETag` and no cache directive would make it
     // *heuristically* cacheable, so a shared cache could store private stream
     // bytes and serve them on a URL match. Default to refusing storage and let
-    // a path opt into something weaker after this call — the SSE handler does
-    // exactly that with `no-cache`.
+    // a path change it after this call: the SSE handler sends
+    // `no-cache, no-store`, which the base protocol's `no-cache` asks for.
     //
     // This also forecloses caching a `public_read` stream at a CDN, which would
     // be a legitimate thing to want. Relaxing it belongs to the gateway: it is
@@ -719,6 +718,27 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
                 _ => None,
             });
         insert_incarnation_mismatch(headers, IncarnationMismatch { current });
+    }
+    // A `410` or `416` of a read, and the `404` of a snapshot that is not
+    // the latest, come before the `Stream-Incarnation` precondition, so they
+    // name the token of the stream that decided them (extensions Section
+    // 2.4). A missing stream has none.
+    if matches!(
+        err.stream_error_code(),
+        Some(
+            StreamErrorCode::StreamGone
+                | StreamErrorCode::OffsetOutOfRange
+                | StreamErrorCode::SnapshotNotFound
+        )
+    ) && let Some(token) = err
+        .stream_error_context()
+        .iter()
+        .find_map(|context| match context {
+            StreamErrorContext::StreamIncarnation { incarnation } => Some(*incarnation),
+            _ => None,
+        })
+    {
+        insert_incarnation(headers, token);
     }
     // A refused snapshot publish names the latest snapshot (#581 section 3).
     if let Some(latest) = err
@@ -1002,18 +1022,87 @@ pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {
     !(content_type.starts_with("text/") || content_type == "application/json")
 }
 
-/// The token is part of the tag (#581 section 4.7), so a `304` never
-/// matches across a recreate or a history event with equal bytes.
+/// The smallest body the compression layer compresses.
+pub(crate) const COMPRESS_MIN_BYTES: u16 = 256;
+
+/// Whether the compression layer may compress an answer of `content_type`
+/// (JSON and NDJSON) that is not [`Uncompressed`] and holds at least
+/// [`COMPRESS_MIN_BYTES`]. The layer and the read `ETag` share it, so a
+/// strong tag never covers two representations.
+pub(crate) fn compressible_media(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    media_type == "application/json" || media_type == "application/x-ndjson"
+}
+
+/// The `ETag` of a stream read or an immutable chunk: the first 128 bits,
+/// in lowercase hex and quoted, of BLAKE3 over the token, the range, where
+/// the read ended, the stored content type and the body.
+///
+/// - The body is hashed although under one token the range names the bytes
+///   (G1): a deployment that breaks G1 without a history event, such as one
+///   restored from volume snapshots, then gets a `200` with the bytes it now
+///   serves at revalidation instead of a `304` for bytes it no longer has.
+/// - The token is part of the tag (#581 section 4.7), so a `304` never
+///   matches across a recreate or a history event.
+/// - Closure counts only at the tail ([`ReadEnd`]), where a reader sees it,
+///   so closing a stream keeps the tag of every chunk below the tail
+///   (extensions Section 4.3).
+/// - BLAKE3 is fixed, so every node and every release tags one answer
+///   alike, and a cache revalidates against any of them.
+///
+/// The tag is strong. [`read_response`] weakens it where the compression
+/// layer may send another representation of the same bytes.
 pub(crate) fn read_etag(response: &ReadStreamResponse) -> String {
-    let mut hasher = DefaultHasher::new();
-    response.incarnation.hash(&mut hasher);
-    response.offset.hash(&mut hasher);
-    response.next_offset.hash(&mut hasher);
-    response.content_type.hash(&mut hasher);
-    response.payload.hash(&mut hasher);
-    response.up_to_date.hash(&mut hasher);
-    response.closed.hash(&mut hasher);
-    format!("\"{:016x}\"", hasher.finish())
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&response.incarnation.to_le_bytes());
+    hasher.update(&response.offset.to_le_bytes());
+    hasher.update(&response.next_offset.to_le_bytes());
+    hasher.update(&[match response.end() {
+        ReadEnd::BelowTail => 0,
+        ReadEnd::OpenTail => 1,
+        ReadEnd::ClosedTail => 2,
+    }]);
+    let content_type = response.content_type.as_bytes();
+    hasher.update(
+        &u64::try_from(content_type.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(content_type);
+    hasher.update(&response.payload);
+    let hex = hasher.finalize().to_hex();
+    format!("\"{}\"", hex.as_str().get(..32).unwrap_or(hex.as_str()))
+}
+
+/// The strong `ETag` of a snapshot answer, for both snapshot resources and
+/// every range of one: its digest, quoted. The digest covers the content
+/// type and the whole body, which never change at one offset of one token.
+pub(crate) fn snapshot_etag(digest: &str) -> String {
+    format!("\"{digest}\"")
+}
+
+/// Whether `If-None-Match` names `etag`: the request revalidates a stored
+/// answer, and gets `304`. The comparison is weak (RFC 9110 Section
+/// 8.8.3.2), as `If-None-Match` requires: `W/"x"` and `"x"` match, so a
+/// layer that weakens a tag still revalidates. `*` is not supported.
+pub(crate) fn if_none_match(request_headers: &HeaderMap, etag: &str) -> bool {
+    let opaque = |tag: &str| {
+        tag.trim()
+            .strip_prefix("W/")
+            .unwrap_or(tag.trim())
+            .to_owned()
+    };
+    let wanted = opaque(etag);
+    request_headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|tag| opaque(tag) == wanted)
 }
 
 pub(crate) fn read_response(
@@ -1026,22 +1115,23 @@ pub(crate) fn read_response(
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
     insert_incarnation(&mut headers, response.incarnation);
-    let etag = read_etag(&response);
+    // The compression layer may gzip this answer for one client and not for
+    // another: one strong tag must not cover both, so the tag is weak.
+    let strong = read_etag(&response);
+    let etag = if compressible_media(http_read_content_type(&response.content_type))
+        && response.payload.len() >= usize::from(COMPRESS_MIN_BYTES)
+    {
+        format!("W/{strong}")
+    } else {
+        strong
+    };
     if let Ok(value) = HeaderValue::from_str(&etag) {
         headers.insert(ETAG, value);
-    }
-    if request_headers
-        .get(IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|part| part.trim() == etag))
-    {
-        return (StatusCode::NOT_MODIFIED, headers).into_response();
     }
     if response.up_to_date {
         insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
     }
-    let closed_at_tail = response.closed && response.up_to_date;
-    if closed_at_tail {
+    if response.end() == ReadEnd::ClosedTail {
         insert_static(&mut headers, names::STREAM_CLOSED, "true");
     } else if request_cursor.is_some() {
         insert_cursor(
@@ -1049,37 +1139,132 @@ pub(crate) fn read_response(
             response_cursor(response.next_offset, request_cursor),
         );
     }
+    // A `304` carries every header of the `200` it stands for.
+    if if_none_match(request_headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, headers).into_response();
+    }
     (StatusCode::OK, headers, response.payload).into_response()
+}
+
+/// The answer of an immutable chunk (extensions Section 4.1) that asked for
+/// `requested_len` bytes, to the end of its chunk: `200`, or `304` with the
+/// same headers when `If-None-Match` names its `ETag`. It is marked when the
+/// read is immutable ([`ReadStreamResponse::is_immutable`]), and carries no
+/// `Stream-Up-To-Date` and no `Stream-Cursor`. Never compressed.
+pub(crate) fn chunk_response(
+    response: ReadStreamResponse,
+    requested_len: usize,
+    request_headers: &HeaderMap,
+) -> Response {
+    let mark = match (response.is_immutable(requested_len), response.end()) {
+        (false, _) => ChunkMark::Unmarked,
+        (true, ReadEnd::ClosedTail) => ChunkMark::ClosedTail,
+        (true, ReadEnd::BelowTail | ReadEnd::OpenTail) => ChunkMark::Immutable,
+    };
+    // A marked answer is cached for its lifetime: never send a body that
+    // is not exactly the range its headers name.
+    if u64::try_from(response.payload.len()).ok()
+        != response.next_offset.checked_sub(response.offset)
+    {
+        tracing::error!(
+            offset = response.offset,
+            next_offset = response.next_offset,
+            len = response.payload.len(),
+            "a chunk's body does not hold its range"
+        );
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "chunk body does not hold its range",
+        );
+    }
+    let chunk = Incarnation::try_from(response.incarnation).and_then(|incarnation| {
+        ChunkRead::new(
+            incarnation,
+            Offset::from_u64(response.offset),
+            Offset::from_u64(response.next_offset),
+            mark,
+        )
+    });
+    let chunk = match chunk {
+        Ok(chunk) => chunk,
+        Err(err) => {
+            tracing::error!(error = %err, "a chunk answer outside the protocol's range");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorCode::Internal,
+                "chunk answer outside the protocol's range",
+            );
+        }
+    };
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_content_type(&mut headers, http_read_content_type(&response.content_type));
+    chunk.render(|name, value| insert_header_str(&mut headers, name, value));
+    let etag = read_etag(&response);
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        headers.insert(ETAG, value);
+    }
+    if if_none_match(request_headers, &etag) {
+        return uncompressed((StatusCode::NOT_MODIFIED, headers).into_response());
+    }
+    uncompressed((StatusCode::OK, headers, response.payload).into_response())
 }
 
 /// The status and headers of a snapshot read: `200`, or for a request with
 /// a byte range `206` or `416` with its `Content-Range`. The snapshot
-/// headers describe the whole snapshot either way: its digest covers the
-/// whole body, never the range (extensions Section 2.5).
+/// headers and the `ETag` describe the whole snapshot either way: its
+/// digest covers the whole body, never the range (extensions Section 2.5).
+/// The immutable resource marks every success (`200`, `206`, and the `304`
+/// built from them) and sends no `Stream-Up-To-Date`. `Err` only for a
+/// digest or token outside the protocol's range, which the state machine
+/// never stores.
 pub(crate) fn snapshot_head(
     response: &ReadSnapshotResponse,
     range: Option<ContentRange>,
-) -> (StatusCode, HeaderMap) {
+    resource: SnapshotResource,
+) -> Result<(StatusCode, HeaderMap), HeaderError> {
+    let snapshot = snapshot_ref(response.snapshot_offset, &response.snapshot_digest)?;
+    let incarnation = Incarnation::try_from(response.incarnation)?;
+    let status = match range {
+        None => StatusCode::OK,
+        Some(ContentRange::Partial(_)) => StatusCode::PARTIAL_CONTENT,
+        Some(ContentRange::Unsatisfied { .. }) => StatusCode::RANGE_NOT_SATISFIABLE,
+    };
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, &response.content_type);
-    insert_snapshot_offset(&mut headers, response.snapshot_offset);
-    insert_snapshot_digest(&mut headers, &response.snapshot_digest);
-    insert_offset(&mut headers, response.next_offset);
-    insert_incarnation(&mut headers, response.incarnation);
-    if response.up_to_date {
-        insert_static(&mut headers, names::STREAM_UP_TO_DATE, "true");
+    let mut emit = |name, value: &str| insert_header_str(&mut headers, name, value);
+    match resource {
+        SnapshotResource::Stream => SnapshotRead {
+            snapshot,
+            incarnation,
+            up_to_date: response.up_to_date,
+        }
+        .render(&mut emit),
+        SnapshotResource::Immutable if status.is_success() => {
+            ImmutableSnapshotRead {
+                snapshot,
+                incarnation,
+            }
+            .render(&mut emit);
+        }
+        // A `416` is no answer for the URL, so it carries no marker.
+        SnapshotResource::Immutable => SnapshotRead {
+            snapshot,
+            incarnation,
+            up_to_date: false,
+        }
+        .render(&mut emit),
+    }
+    if let Ok(value) = HeaderValue::from_str(&snapshot_etag(&response.snapshot_digest)) {
+        headers.insert(ETAG, value);
     }
     insert_static(&mut headers, names::ACCEPT_RANGES, ACCEPT_RANGES_BYTES);
-    let Some(range) = range else {
-        return (StatusCode::OK, headers);
-    };
-    range.render(|name, value| insert_header_str(&mut headers, name, value));
-    let status = match range {
-        ContentRange::Partial(_) => StatusCode::PARTIAL_CONTENT,
-        ContentRange::Unsatisfied { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
-    };
-    (status, headers)
+    if let Some(range) = range {
+        range.render(|name, value| insert_header_str(&mut headers, name, value));
+    }
+    Ok((status, headers))
 }
 
 pub(crate) fn bootstrap_response(response: BootstrapStreamResponse) -> Response {
@@ -1295,7 +1480,7 @@ pub(crate) fn render_sse_read(
     request_cursor: Option<&str>,
 ) -> String {
     let mut body = String::new();
-    let closed_at_tail = read.closed && read.up_to_date;
+    let closed_at_tail = read.end() == ReadEnd::ClosedTail;
     if !read.payload.is_empty() {
         body.push_str("event: data\n");
         let payload = if encode_base64 {
@@ -1451,18 +1636,18 @@ mod tests {
         );
     }
 
-    /// The SSE handler needs `no-cache`, not `no-store`, and gets it by calling
-    /// the default helper first and overriding after. Reversing that order would
-    /// silently restore `no-store` on live tails, so the contract is asserted
-    /// rather than left to call-site discipline.
+    /// The SSE handler needs `no-cache` beside `no-store`, and gets it by
+    /// calling the default helper first and overriding after. Reversing that
+    /// order would silently drop `no-cache` on live tails, so the contract is
+    /// asserted rather than left to call-site discipline.
     #[test]
     fn a_later_cache_directive_overrides_the_default() {
         let mut headers = HeaderMap::new();
 
         insert_default_response_headers(&mut headers);
-        insert_cache_control(&mut headers, "no-cache");
+        insert_cache_control(&mut headers, "no-cache, no-store");
 
-        assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-cache");
+        assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-cache, no-store");
     }
     #[test]
     fn stopped_apply_and_uncertain_write_render_service_unavailable() {

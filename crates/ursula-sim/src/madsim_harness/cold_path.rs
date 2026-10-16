@@ -14,6 +14,7 @@ use super::CreateStreamRequest;
 use super::DeleteStreamRequest;
 use super::Duration;
 use super::FlushColdRequest;
+use super::FollowerRead;
 use super::GroupEngine;
 use super::InMemoryGroupEngineFactory;
 use super::InProcessRaftRegistry;
@@ -306,6 +307,7 @@ pub(super) async fn run_cold_read_fault_inner(
                 now_ms: 0,
                 leader_only: false,
                 read_index: None,
+                follower: FollowerRead::Prefix,
             },
             placement(),
         )
@@ -644,6 +646,7 @@ pub(super) async fn run_cold_delete_fault_inner(
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read recreated stream after cold cleanup delete fault");
@@ -798,6 +801,7 @@ pub(super) async fn run_cold_read_truncate_inner(
                 now_ms: 0,
                 leader_only: false,
                 read_index: None,
+                follower: FollowerRead::Prefix,
             },
             placement(),
         )

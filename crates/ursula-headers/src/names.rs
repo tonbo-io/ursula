@@ -34,7 +34,9 @@ pub const STREAM_PREVIOUS_INCARNATION: &str = "stream-previous-incarnation";
 /// The offset below which the bytes under the current and the previous token
 /// are the same. HEAD, after a history event.
 pub const STREAM_INHERITED_OFFSET: &str = "stream-inherited-offset";
-/// Where a receipt's bytes start.
+/// The first offset a response is about: where a receipt's bytes start, and
+/// the first byte of an immutable chunk's body, equal to the offset in its
+/// path.
 pub const STREAM_OFFSET: &str = "stream-offset";
 /// Where a receipt's bytes end; the stream's tail on HEAD and on a `409` of
 /// a closed stream; the snapshot's offset on a snapshot read, where the
@@ -52,6 +54,12 @@ pub const STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 /// The digest of the snapshot at [`STREAM_SNAPSHOT_OFFSET`]; on a parts
 /// commit, the digest of the whole snapshot.
 pub const STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
+/// `true` on an answer of an immutable resource that no later successful
+/// answer for the same URL contradicts (extensions Section 4.3).
+pub const STREAM_IMMUTABLE: &str = "stream-immutable";
+/// The origin that serves a stream's immutable resources at the same paths.
+/// HEAD, sent by a deployment, never by an Ursula node.
+pub const STREAM_READ_ORIGIN: &str = "stream-read-origin";
 /// The id of a staged snapshot part. `201` of a part upload.
 pub const STREAM_SNAPSHOT_PART: &str = "stream-snapshot-part";
 /// The number of parts a snapshot commit lists. Request.

@@ -179,6 +179,7 @@ async fn wait_raft_state_machine_payload(
                                     now_ms: 0,
                                     leader_only: false,
                                     read_index: None,
+                                    follower: FollowerRead::Prefix,
                                 },
                                 placement,
                             )
@@ -3485,6 +3486,163 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
         &read.bytes().await.expect("follower local read body")[..],
         b"read-without-leader"
     );
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+/// A follower answers an immutable chunk from its own state only when it can
+/// mark it (#581 section 5.3): a chunk below its tail is its own to answer,
+/// even with the leader gone, and a chunk that holds the open tail is the
+/// leader's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_follower_answers_only_the_chunks_it_can_mark() {
+    const GRID: usize = 4 * 1024 * 1024;
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                node_id == 1,
+                1,
+                StaticGrpcTestNodeStorage::default(),
+            )
+            .await,
+        );
+    }
+    for node in nodes.iter().skip(1).chain(nodes.iter().take(1)) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("warm group timed out")
+            .expect("warm group");
+    }
+    for node in &nodes {
+        let raft = node.registry.get(RaftGroupId(0)).expect("registered group");
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "static gRPC Raft cluster should elect node 1")
+            .await
+            .expect("wait for shared leader");
+    }
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build reqwest client");
+    let stream = BucketStreamId::new("benchcmp", "follower-chunks");
+    let content: Vec<u8> = (0..GRID + 10)
+        .map(|index| u8::try_from(index % 251).expect("byte"))
+        .collect();
+    let create = http_client
+        .put(format!("{}/benchcmp/follower-chunks", peers[0].1))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(content.clone())
+        .send()
+        .await
+        .expect("create stream through leader");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let token = ursula_headers::value::Incarnation::try_from(
+        create
+            .headers()
+            .get(names::STREAM_INCARNATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("token"),
+    )
+    .expect("a token");
+    let placement = nodes[1].runtime.locate(&stream);
+    wait_raft_state_machine_payload(
+        &nodes[1].registry,
+        placement,
+        &stream,
+        &content,
+        "follower replicated the stream",
+    )
+    .await;
+
+    let follower = peers[1].1.clone();
+    let chunk_url = |offset: u64| {
+        format!(
+            "{follower}/benchcmp/follower-chunks{}",
+            ursula_headers::ImmutableResource {
+                kind: ursula_headers::ResourceKind::Chunk,
+                incarnation: token,
+                offset: ursula_headers::value::Offset::from_u64(offset),
+            }
+            .path()
+        )
+    };
+    let chunk = async |offset: u64| {
+        let response = http_client
+            .get(chunk_url(offset))
+            .send()
+            .await
+            .expect("chunk through follower");
+        let status = response.status();
+        let read = ursula_headers::ChunkRead::parse(
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        );
+        let body = response.bytes().await.expect("chunk body");
+        (status, read, body)
+    };
+
+    let (status, read, body) = chunk(0).await;
+    assert_eq!(status, StatusCode::OK);
+    let read = read.expect("a chunk answer");
+    assert_eq!(read.mark(), ursula_headers::ChunkMark::Immutable);
+    assert_eq!(&body[..], &content[..GRID]);
+    // The tail of the open stream lies in this chunk: the leader answers it,
+    // and only the leader can.
+    let (status, read, body) = chunk(u64::try_from(GRID).expect("grid")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        read.expect("a chunk answer").mark(),
+        ursula_headers::ChunkMark::Unmarked
+    );
+    assert_eq!(&body[..], &content[GRID..]);
+
+    let leader = nodes.remove(0);
+    leader.shutdown().await;
+    let (status, read, body) = chunk(0).await;
+    assert_eq!(status, StatusCode::OK, "a marked chunk needs no leader");
+    assert_eq!(
+        read.expect("a chunk answer").mark(),
+        ursula_headers::ChunkMark::Immutable
+    );
+    assert_eq!(&body[..], &content[..GRID]);
+    // The follower never answers a chunk it cannot mark: it has no leader
+    // to ask (`503`), or, once the survivors elected one, that leader
+    // answers the whole tail chunk, unmarked.
+    let (status, read, body) = chunk(u64::try_from(GRID).expect("grid")).await;
+    match status {
+        StatusCode::SERVICE_UNAVAILABLE => {}
+        StatusCode::OK => {
+            assert_eq!(
+                read.expect("a chunk answer").mark(),
+                ursula_headers::ChunkMark::Unmarked
+            );
+            assert_eq!(&body[..], &content[GRID..]);
+        }
+        other => panic!("the tail chunk without the old leader answered {other}"),
+    }
 
     for node in nodes {
         node.shutdown().await;
@@ -10313,6 +10471,53 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     .await;
     assert!(response.status().is_success());
 
+    // Tenant A: a byte stream of more than one chunk, so its first chunk is
+    // marked below the tail.
+    let response = http_put(
+        &source,
+        "/tenant-a/blob",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from(vec![7_u8; 4 * 1024 * 1024 + 10]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Record a marked chunk and a closed tail, as a cache would keep them.
+    let mut recorded = Vec::new();
+    for (stream, expected) in [
+        ("/tenant-a/blob", ursula_headers::ChunkMark::Immutable),
+        ("/tenant-b/journal", ursula_headers::ChunkMark::ClosedTail),
+    ] {
+        let response = http_head(&source, stream).await;
+        let head = ursula_headers::StreamHead::parse(
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .expect("a stream head");
+        let chunk = format!(
+            "{stream}{}",
+            ursula_headers::ImmutableResource {
+                kind: ursula_headers::ResourceKind::Chunk,
+                incarnation: head.incarnation(),
+                offset: ursula_headers::value::Offset::ZERO,
+            }
+            .path()
+        );
+        let response = http_get(&source, &chunk).await;
+        assert_eq!(response.status(), StatusCode::OK, "{chunk}");
+        let read = ursula_headers::ChunkRead::parse(
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .expect("a chunk answer");
+        assert_eq!(read.mark(), expected, "{chunk}");
+        recorded.push((stream, head, chunk));
+    }
+
     // Export every group, checking transfer checksums like ursulactl does.
     let info = http_get(&source, "/__ursula/backup/info").await;
     assert_eq!(info.status(), StatusCode::OK);
@@ -10392,6 +10597,44 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    // A restore is a history event: the recorded URLs name the source's
+    // tokens, so the restored cluster answers them `412`, even after the
+    // stream grows again, and HEAD traces the new token to the recorded one
+    // (#581 section 5.5). Nothing a cache kept needs purging.
+    let response = http_post(
+        &restored,
+        "/tenant-a/blob",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("regrown"),
+    )
+    .await;
+    assert!(response.status().is_success());
+    for (stream, source_head, chunk) in &recorded {
+        let response = http_get(&restored, chunk).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "{chunk}"
+        );
+        let response = http_head(&restored, stream).await;
+        let head = ursula_headers::StreamHead::parse(
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .expect("a stream head");
+        assert_ne!(head.incarnation(), source_head.incarnation());
+        assert_eq!(
+            head.inherited(),
+            Some(ursula_headers::Inherited {
+                previous_incarnation: source_head.incarnation(),
+                offset: source_head.next_offset(),
+            }),
+            "{stream}"
+        );
+    }
 
     // Tenant boundary: a bucket that never existed stays absent.
     let response = http_get(&restored, "/tenant-c/orders?offset=0").await;

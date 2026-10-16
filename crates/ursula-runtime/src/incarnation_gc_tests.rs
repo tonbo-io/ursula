@@ -13,6 +13,7 @@ use crate::ColdStore;
 use crate::CreateStreamExternalRequest;
 use crate::CreateStreamRequest;
 use crate::DeleteStreamRequest;
+use crate::FollowerRead;
 use crate::HeadStreamRequest;
 use crate::InMemoryGroupEngineFactory;
 use crate::PlanColdFlushRequest;
@@ -83,6 +84,7 @@ async fn read(runtime: &ShardRuntime, stream: &BucketStreamId, len: usize) -> Ve
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read stream")

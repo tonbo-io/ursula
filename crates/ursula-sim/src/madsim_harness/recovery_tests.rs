@@ -32,6 +32,7 @@ use ursula_raft::wal::diagnostics::RecoveryReason;
 use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::RaftGroupId;
@@ -184,6 +185,7 @@ async fn read_local(cluster: &JournalCluster, group: u32, node_id: u64) -> Vec<u
                 now_ms: 0,
                 leader_only: false,
                 read_index: None,
+                follower: FollowerRead::Prefix,
             },
             group_placement(group),
         )

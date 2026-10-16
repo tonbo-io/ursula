@@ -20,6 +20,7 @@ use crate::ColdIndexPageStore;
 use crate::ColdStore;
 use crate::ColdStoreColdIndexPageStore;
 use crate::CreateStreamRequest;
+use crate::FollowerRead;
 use crate::InMemoryGroupEngineFactory;
 use crate::OffloadColdRefsRequest;
 use crate::ReadStreamRequest;
@@ -108,6 +109,7 @@ async fn read_all(runtime: &ShardRuntime, stream_id: &BucketStreamId) -> Vec<u8>
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         })
         .await
         .expect("read stream")

@@ -41,6 +41,7 @@ use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendFuture;
@@ -87,6 +88,7 @@ use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::PublishSnapshotRequest;
+use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RepairColdIndexRequest;
@@ -101,6 +103,7 @@ use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::collect_retained_cold_objects;
 use ursula_runtime::default_snapshot_store;
+use ursula_runtime::immutable_read;
 use ursula_runtime::repair_cold_index_response;
 use ursula_runtime::repair_cold_index_streams;
 use ursula_runtime::replace_cold_chunk_index_pages_with_rollback_in_generation;
@@ -110,6 +113,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::StreamCommand;
+use ursula_stream::StreamReadPlan;
 
 use crate::GroupLeadership;
 use crate::forward::LeaderRoute;
@@ -171,15 +175,22 @@ pub struct RaftGroupEngine {
     pub(crate) peer_cluster: Option<crate::PeerCluster>,
 }
 
-pub(crate) fn should_forward_stale_follower_read_error(
-    is_leader: bool,
-    error: &GroupEngineError,
-) -> bool {
-    !is_leader
-        && matches!(
-            error.code(),
-            Some(StreamErrorCode::StreamNotFound | StreamErrorCode::OffsetOutOfRange)
+/// Whether a read's error may hold only for a replica's lagging state: a
+/// missing stream, an offset beyond the tail and an offset below the
+/// retained offset may all be the answer of an incarnation the replica has
+/// not seen replaced, or of a tail it has not applied yet. A follower
+/// forwards such a read to the leader, and the leader answers it only after
+/// a ReadIndex round, so none of these comes from a state that lags. They
+/// are rare, and the rounds coalesce.
+pub(crate) fn may_hold_only_for_a_lagging_state(error: &GroupEngineError) -> bool {
+    matches!(
+        error.code(),
+        Some(
+            StreamErrorCode::StreamNotFound
+                | StreamErrorCode::OffsetOutOfRange
+                | StreamErrorCode::StreamGone
         )
+    )
 }
 
 impl RaftGroupEngine {
@@ -831,6 +842,23 @@ impl RaftGroupEngine {
             .map(|_| ())
     }
 
+    /// The plan of `request` against this replica's applied state. The
+    /// outer error is the state machine's; the inner one is the read's.
+    async fn plan_read(
+        &self,
+        request: &ReadStreamRequest,
+    ) -> Result<Result<StreamReadPlan, GroupEngineError>, GroupEngineError> {
+        let read_request = request.clone();
+        self.with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                state_machine
+                    .engine
+                    .read_stream_plan_after_access(&read_request)
+            })
+        })
+        .await
+    }
+
     /// [`Self::require_linearizable_leader_read`] that also returns the
     /// read index the read is served at: `read_index` itself when it was
     /// already confirmed and applied, otherwise the index of a new round.
@@ -1149,20 +1177,56 @@ impl GroupEngine for RaftGroupEngine {
                 }
             }
             let stream_id = request.stream_id.clone();
+            // The barrier below for what may hold only for a lagging state,
+            // which this check's 404 is too.
+            let linearize = !original_request.leader_only
+                && !owner_pinned
+                && !ursula_stream::sim_controls::off(
+                    ursula_stream::sim_controls::Defence::ImmutableLeaderBarrier,
+                );
             if self.raft.is_leader() {
-                self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
-                    .await?;
+                match self
+                    .ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if linearize && may_hold_only_for_a_lagging_state(&error) => {
+                        self.require_linearizable_leader_read("read_stream", None)
+                            .await?;
+                        self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
+                            .await?;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            let read_request = request.clone();
-            let plan = self
-                .with_state_machine(move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .engine
-                            .read_stream_plan_after_access(&read_request)
-                    })
-                })
-                .await?;
+            let mut plan = self.plan_read(&request).await?;
+            // A leader answers a read that may hold only for a lagging state
+            // (a 404, 410 or 416), and an immutable-read chunk it cannot
+            // mark, only from state that reflects every acknowledged write
+            // (#581 section 5.3): one that was just elected, or was deposed
+            // without knowing it, may not have applied them yet. Its 404 or
+            // 410 could be for the stream before a recreate, and its chunk
+            // short of one another replica marked. A markable answer holds
+            // committed bytes and needs no round.
+            if self.raft.is_leader()
+                && linearize
+                && match &plan {
+                    Ok(plan) => {
+                        original_request.follower == FollowerRead::Immutable
+                            && !immutable_read(
+                                plan.offset,
+                                plan.next_offset,
+                                original_request.max_len,
+                                ReadEnd::of(plan.up_to_date, plan.closed),
+                            )
+                    }
+                    Err(error) => may_hold_only_for_a_lagging_state(error),
+                }
+            {
+                self.require_linearizable_leader_read("read_stream", None)
+                    .await?;
+                plan = self.plan_read(&request).await?;
+            }
             let plan = match plan {
                 Ok(plan) => plan,
                 // A follower may be behind a write that the leader has
@@ -1171,10 +1235,8 @@ impl GroupEngine for RaftGroupEngine {
                 // instead of exposing a false permanent boundary error.
                 Err(error)
                     if !owner_pinned
-                        && should_forward_stale_follower_read_error(
-                            self.raft.is_leader(),
-                            &error,
-                        ) =>
+                        && !self.raft.is_leader()
+                        && may_hold_only_for_a_lagging_state(&error) =>
                 {
                     if let Some(route) = self.leader_route().await {
                         // A stale local boundary is not authoritative. Confirm
@@ -1198,13 +1260,41 @@ impl GroupEngine for RaftGroupEngine {
             if owner_pinned && !self.raft.is_leader() {
                 return Err(self.not_leader_for_read("live read_stream").await);
             }
-            if !self.raft.is_leader() && parts.up_to_date && !parts.closed {
-                if parts.payload_is_empty()
-                    && let Some(route) = self.leader_route().await
-                {
-                    return Ok(leader_read(route, placement, original_request));
+            if !self.raft.is_leader() {
+                match original_request.follower {
+                    FollowerRead::Prefix => {
+                        if parts.end() == ReadEnd::OpenTail {
+                            if parts.payload_is_empty()
+                                && let Some(route) = self.leader_route().await
+                            {
+                                return Ok(leader_read(route, placement, original_request));
+                            }
+                            parts.up_to_date = false;
+                        }
+                    }
+                    // A follower answers an immutable-read chunk only when
+                    // the answer is marked (#581 section 5.3): a chunk that
+                    // reaches the follower's own open tail, or stops short of
+                    // its end, may hold fewer bytes than the leader's, so the
+                    // leader answers it. The leader never forwards.
+                    FollowerRead::Immutable
+                        if ursula_stream::sim_controls::off(
+                            ursula_stream::sim_controls::Defence::FollowerMarkCheck,
+                        ) =>
+                    {
+                        if parts.end() == ReadEnd::OpenTail {
+                            parts.up_to_date = false;
+                        }
+                    }
+                    FollowerRead::Immutable => {
+                        if !parts.is_immutable(original_request.max_len) {
+                            if let Some(route) = self.leader_route().await {
+                                return Ok(leader_read(route, placement, original_request));
+                            }
+                            return Err(self.not_leader_for_read("immutable read_stream").await);
+                        }
+                    }
                 }
-                parts.up_to_date = false;
             }
             Ok(GroupReadRoute::Local(parts))
         })

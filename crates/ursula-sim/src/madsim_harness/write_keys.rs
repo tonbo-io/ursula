@@ -181,7 +181,7 @@ fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: Strin
 /// leadership view.
 pub(super) struct Cluster {
     pub(super) app: Router,
-    policy: InProcessRaftNetworkPolicy,
+    pub(super) policy: InProcessRaftNetworkPolicy,
     pub(super) runtime: ShardRuntime,
     pub(super) factory: MadsimRuntimeRaftNetworkFactory,
     pub(super) placement: ShardPlacement,

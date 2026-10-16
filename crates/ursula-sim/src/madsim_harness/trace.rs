@@ -679,6 +679,23 @@ pub enum SimEvent {
         leader_first: bool,
         guard_refusals: u64,
     },
+    /// `marked_chunks_never_contradict` held: the observer kept `marked`
+    /// chunk URLs from `answers` answers, and `checked` later answers for a
+    /// marked URL agreed with it, across `leader_kills` kills.
+    MarkedChunksVerified {
+        stream: BucketStreamId,
+        marked: u64,
+        answers: u64,
+        checked: u64,
+        /// Chunks the HTTP route marked, and later route answers checked.
+        http_marked: u64,
+        http_checked: u64,
+        /// Later immutable snapshot answers checked against the first.
+        snapshots_checked: u64,
+        /// Answers checked across the accepted loss's recovery plan.
+        loss_checked: u64,
+        leader_kills: u64,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

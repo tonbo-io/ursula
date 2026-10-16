@@ -72,6 +72,7 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "api/head-stream": { group: "API Reference", order: 6 },
   "api/publish-snapshot": { group: "API Reference", order: 8 },
   "api/read-snapshot": { group: "API Reference", order: 9 },
+  "api/immutable-reads": { group: "API Reference", order: 9.5 },
   "api/bootstrap": { group: "API Reference", order: 10 },
   "api/delete-stream": { group: "API Reference", order: 11 },
 

@@ -49,6 +49,7 @@ use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
 use ursula_runtime::GroupBucketUsageFuture;
@@ -160,6 +161,7 @@ pub enum SimScenario {
     RecoveryPlanCutUnderRestarts,
     RecoveryPlanSurvivorCampaigns,
     RoutingBeforeBodyUnderLeaderChurn,
+    MarkedChunksNeverContradict,
 }
 
 #[derive(Clone)]
@@ -208,6 +210,7 @@ impl SimScenario {
             Self::RecoveryPlanCutUnderRestarts => "recovery-plan-cut-under-restarts",
             Self::RecoveryPlanSurvivorCampaigns => "recovery-plan-survivor-campaigns",
             Self::RoutingBeforeBodyUnderLeaderChurn => "routing-before-body-under-leader-churn",
+            Self::MarkedChunksNeverContradict => "marked-chunks-never-contradict",
         }
     }
 }
@@ -549,6 +552,8 @@ use cold_path::run_cold_write_fault_inner;
 mod accepted_loss;
 mod history;
 mod http;
+mod immutable_reads;
+mod immutable_reads_loss;
 mod journal_cluster;
 mod leader_reads;
 mod recovery_wiring;
@@ -707,6 +712,20 @@ pub(super) fn assert_http_protocol_surface_randomized_live_backpressure(
         panic!(
             "invariant `http_protocol_randomized_live_waiter_backpressure` failed after `http_protocol_surface_randomized_live_limit_metrics`: {message}"
         );
+    }
+}
+
+/// A base-protocol catch-up read of `stream` from `offset`, at most
+/// `max_len` bytes, served from any replica's applied state.
+fn catch_up_read(stream: &BucketStreamId, offset: u64, max_len: usize) -> ReadStreamRequest {
+    ReadStreamRequest {
+        stream_id: stream.clone(),
+        offset,
+        max_len,
+        now_ms: 0,
+        leader_only: false,
+        read_index: None,
+        follower: FollowerRead::Prefix,
     }
 }
 
@@ -1245,14 +1264,7 @@ pub(super) async fn verify_runtime_raft_partial_read(
         expected_slice.push(b'!');
     }
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: offset as u64,
-            max_len,
-            now_ms: 0,
-            leader_only: false,
-            read_index: None,
-        })
+        .read_stream(catch_up_read(&stream, offset as u64, max_len))
         .await
         .expect("runtime raft partial read");
     if read.payload != expected_slice {
@@ -1293,14 +1305,7 @@ pub(super) async fn verify_runtime_raft_tail_read(
 ) {
     let request_offset = expected_next_offset;
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: request_offset,
-            max_len: 8,
-            now_ms: 0,
-            leader_only: false,
-            read_index: None,
-        })
+        .read_stream(catch_up_read(&stream, request_offset, 8))
         .await
         .expect("runtime raft tail read");
     let expected_next_offset = expected_next_offset + u64::from(corrupt_expectation);
@@ -1362,14 +1367,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
     }
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: expected_payload.len().max(64),
-            now_ms: 0,
-            leader_only: false,
-            read_index: None,
-        })
+        .read_stream(catch_up_read(&stream, 0, expected_payload.len().max(64)))
         .await
         .expect("read closed runtime raft stream");
     let expected_closed = !corrupt_expectation;
@@ -1763,17 +1761,7 @@ pub(super) async fn read_local_payload_eventually(
     let mut last_payload = Vec::new();
     for attempt in 0..50 {
         let read = engine
-            .sim_read_local_stream(
-                ReadStreamRequest {
-                    stream_id: stream.clone(),
-                    offset,
-                    max_len,
-                    now_ms: 0,
-                    leader_only: false,
-                    read_index: None,
-                },
-                placement(),
-            )
+            .sim_read_local_stream(catch_up_read(&stream, offset, max_len), placement())
             .await
             .unwrap_or_else(|err| panic!("{description}: {err}"));
         SimTrace::record(SimEvent::ReadAttempt {

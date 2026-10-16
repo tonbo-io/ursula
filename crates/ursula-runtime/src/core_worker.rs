@@ -65,6 +65,7 @@ use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
 use crate::request::PurgeBucketResponse;
+use crate::request::ReadEnd;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
@@ -872,8 +873,7 @@ impl CoreWorker {
         match parts {
             Ok(parts)
                 if parts.payload_is_empty()
-                    && parts.up_to_date
-                    && !parts.closed
+                    && parts.end() == ReadEnd::OpenTail
                     && watcher.waits_on(parts.incarnation) =>
             {
                 if watcher.response_tx.is_closed() {
@@ -1796,7 +1796,7 @@ impl CoreWorker {
                 .await
                 .map_err(|err| RuntimeError::group_engine(placement, err));
             match parts {
-                Ok(parts) if parts.payload_is_empty() && parts.up_to_date && !parts.closed => {
+                Ok(parts) if parts.payload_is_empty() && parts.end() == ReadEnd::OpenTail => {
                     // A watcher pinned to another incarnation is released
                     // with this read: its stream was recreated (D12).
                     let (waiting, recreated): (Vec<_>, Vec<_>) = watchers

@@ -326,6 +326,10 @@ fn generate_routing_before_body_under_leader_churn(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::RoutingBeforeBodyUnderLeaderChurn)
 }
 
+fn generate_marked_chunks_never_contradict(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::MarkedChunksNeverContradict)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -353,6 +357,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 979,
         kind: "routing-before-body-under-leader-churn",
         generate: generate_routing_before_body_under_leader_churn,
+    },
+    SeedFamily {
+        name: "marked-chunks-never-contradict",
+        start: 395,
+        end: 399,
+        kind: "marked-chunks-never-contradict",
+        generate: generate_marked_chunks_never_contradict,
+    },
+    SeedFamily {
+        name: "marked-chunks-never-contradict-extended",
+        start: 920,
+        end: 949,
+        kind: "marked-chunks-never-contradict",
+        generate: generate_marked_chunks_never_contradict,
     },
     SeedFamily {
         name: "history-rewind-under-leader-churn",

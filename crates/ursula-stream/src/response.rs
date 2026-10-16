@@ -198,9 +198,13 @@ pub enum StreamErrorContext {
         expected_seq: u64,
         received_seq: u64,
     },
-    /// The stream's token (`Stream-Incarnation`) a
+    /// The stream's token (`Stream-Incarnation`) that a
     /// [`StreamErrorCode::JsonBoundaryUnverified`] or
-    /// [`StreamErrorCode::IncarnationMismatch`] refusal saw.
+    /// [`StreamErrorCode::IncarnationMismatch`] refusal saw, or that decided
+    /// a read's [`StreamErrorCode::StreamGone`] or
+    /// [`StreamErrorCode::OffsetOutOfRange`], or the `SnapshotNotFound` of a
+    /// stream that exists. The read answers render it as
+    /// `Stream-Incarnation`.
     StreamIncarnation {
         incarnation: u64,
     },

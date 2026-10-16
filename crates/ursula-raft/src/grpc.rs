@@ -43,6 +43,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -1075,7 +1076,9 @@ pub(crate) fn head_stream_request_from_v1(
 
 /// Server half of a forwarded read: the engine request with the follower's
 /// `leader_only` flag, so a forwarded `consistency=leader` read is
-/// linearized on the leader.
+/// linearized on the leader, and its follower policy, so a receiver that no
+/// longer leads still serves an immutable-read chunk only when it can mark
+/// it.
 /// `Err` names the invalid field.
 pub(crate) fn read_stream_request_from_v1(
     stream_id: BucketStreamId,
@@ -1084,6 +1087,11 @@ pub(crate) fn read_stream_request_from_v1(
 ) -> Result<ReadStreamRequest, &'static str> {
     let max_len = usize::try_from(read.max_len)
         .map_err(|_overflow| "group_read.read_stream.max_len too large")?;
+    let follower = match raft_internal_proto::FollowerReadV1::try_from(read.follower) {
+        Ok(raft_internal_proto::FollowerReadV1::Prefix) => FollowerRead::Prefix,
+        Ok(raft_internal_proto::FollowerReadV1::Immutable) => FollowerRead::Immutable,
+        Err(_unknown) => return Err("group_read.read_stream.follower unknown"),
+    };
     Ok(ReadStreamRequest {
         stream_id,
         offset: read.offset,
@@ -1091,6 +1099,7 @@ pub(crate) fn read_stream_request_from_v1(
         now_ms,
         leader_only: read.leader_only,
         read_index: None,
+        follower,
     })
 }
 

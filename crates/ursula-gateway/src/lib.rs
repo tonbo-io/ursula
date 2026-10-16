@@ -69,6 +69,7 @@ use tracing::error;
 use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
 use ursula_headers::SizeLimit;
+use ursula_headers::immutable;
 use ursula_headers::lowered_request_limit;
 use ursula_headers::names;
 use ursula_shard::BucketStreamId;
@@ -1614,6 +1615,19 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
             Action::PublishSnapshot
         }
         [suffix, _offset] if suffix == "retention" && *method == Method::PUT => Action::Update,
+        // The immutable resources of one incarnation (extensions Section 4):
+        // a chunk of the stream is a read, a snapshot of it a snapshot read,
+        // by `GET` or `HEAD`.
+        [incarnation, _token, kind, _offset]
+            if incarnation == immutable::INCARNATION_SEGMENT
+                && matches!(*method, Method::GET | Method::HEAD) =>
+        {
+            match kind.as_str() {
+                immutable::CHUNK_SEGMENT => Action::Read,
+                immutable::SNAPSHOT_SEGMENT => Action::ReadSnapshot,
+                _ => return None,
+            }
+        }
         _ => return None,
     };
 

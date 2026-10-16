@@ -109,6 +109,16 @@ pub enum HeaderError {
     /// `Stream-Last-Seq` is not 1 to 256 bytes of visible ASCII with inner
     /// spaces or tabs.
     InvalidStreamSeq,
+    /// A chunk answer's `Stream-Next-Offset` is below its `Stream-Offset`.
+    ChunkRangeInverted { offset: Offset, next: Offset },
+    /// A chunk answer below the tail is marked immutable and holds no byte.
+    EmptyImmutableChunk { offset: Offset },
+    /// A chunk answer carries `Stream-Closed: true` without
+    /// `Stream-Immutable: true`.
+    ClosedWithoutMarker,
+    /// `Stream-Read-Origin` is not an origin: a scheme of `https` or `http`,
+    /// a host and an optional port, and nothing else.
+    InvalidReadOrigin,
 }
 
 impl fmt::Display for HeaderError {
@@ -256,6 +266,28 @@ impl fmt::Display for HeaderError {
                     "line {line} of a parts manifest repeats an earlier part id"
                 )
             }
+            Self::ChunkRangeInverted { offset, next } => write!(
+                f,
+                "{} {offset} is above {} {next}",
+                names::STREAM_OFFSET,
+                names::STREAM_NEXT_OFFSET
+            ),
+            Self::EmptyImmutableChunk { offset } => write!(
+                f,
+                "a chunk at {offset} below the tail holds no byte, so it cannot carry {}",
+                names::STREAM_IMMUTABLE
+            ),
+            Self::ClosedWithoutMarker => write!(
+                f,
+                "a chunk carries {} only together with {}",
+                names::STREAM_CLOSED,
+                names::STREAM_IMMUTABLE
+            ),
+            Self::InvalidReadOrigin => write!(
+                f,
+                "{} must be an https or http origin with no path",
+                names::STREAM_READ_ORIGIN
+            ),
             Self::ManifestPartCount { declared } => write!(
                 f,
                 "a parts manifest must list exactly {declared} parts, as {} says",

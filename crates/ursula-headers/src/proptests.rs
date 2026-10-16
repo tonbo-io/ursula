@@ -25,6 +25,13 @@ use crate::head::ClusterId;
 use crate::head::Inherited;
 use crate::head::ServerIdentity;
 use crate::head::StreamHead;
+use crate::immutable::ChunkMark;
+use crate::immutable::ChunkRead;
+use crate::immutable::ImmutableResource;
+use crate::immutable::ImmutableSnapshotRead;
+use crate::immutable::OriginScheme;
+use crate::immutable::ReadOrigin;
+use crate::immutable::ResourceKind;
 use crate::limit::SizeLimit;
 use crate::names;
 use crate::refusal::IncarnationMismatch;
@@ -263,6 +270,35 @@ fn stream_head() -> impl Strategy<Value = StreamHead> {
         )
 }
 
+fn chunk_read() -> impl Strategy<Value = ChunkRead> {
+    (incarnation(), offset(), 0_u64..(1 << 23), prop_oneof![
+        Just(ChunkMark::Unmarked),
+        Just(ChunkMark::Immutable),
+        Just(ChunkMark::ClosedTail),
+    ])
+        .prop_map(|(incarnation, offset, len, mark)| {
+            let next = Offset::from_u64(offset.get().saturating_add(len));
+            let mark = if next == offset && mark == ChunkMark::Immutable {
+                ChunkMark::ClosedTail
+            } else {
+                mark
+            };
+            ChunkRead::new(incarnation, offset, next, mark).unwrap()
+        })
+}
+
+fn read_origin() -> impl Strategy<Value = ReadOrigin> {
+    (
+        prop_oneof![Just(OriginScheme::Https), Just(OriginScheme::Http)],
+        prop_oneof![
+            "[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?){0,3}",
+            "\\[[0-9a-f]{1,4}(:[0-9a-f]{0,4}){1,7}\\]",
+        ],
+        option::of(1_u16..),
+    )
+        .prop_map(|(scheme, host, port)| ReadOrigin::new(scheme, host, port).unwrap())
+}
+
 fn routing_answer() -> impl Strategy<Value = RoutingAnswer> {
     let group = any::<u32>().prop_map(RaftGroup::from_u32);
     prop_oneof![
@@ -282,7 +318,7 @@ fn routing_answer() -> impl Strategy<Value = RoutingAnswer> {
 
 // Fuzz strategies.
 
-const NAMES: [&str; 31] = [
+const NAMES: [&str; 33] = [
     names::PRODUCER_ID,
     names::PRODUCER_EPOCH,
     names::PRODUCER_SEQ,
@@ -304,6 +340,8 @@ const NAMES: [&str; 31] = [
     names::STREAM_SNAPSHOT_DIGEST,
     names::STREAM_SNAPSHOT_PART,
     names::STREAM_SNAPSHOT_PARTS,
+    names::STREAM_IMMUTABLE,
+    names::STREAM_READ_ORIGIN,
     names::URSULA_PROTOCOL,
     names::URSULA_CLUSTER_ID,
     names::URSULA_MAX_REQUEST_BYTES,
@@ -350,6 +388,8 @@ fn fuzz_value() -> impl Strategy<Value = Vec<u8>> {
                 "9007199254740991",
                 "9007199254740992",
                 "18446744073709551616",
+                "https://reads.example.com",
+                "https://[::1]:8443",
             ][..]
         )
         .prop_map(|value| value.as_bytes().to_vec()),
@@ -470,6 +510,32 @@ proptest! {
     }
 
     #[test]
+    fn immutable_reads_round_trip(
+        chunk in chunk_read(),
+        snapshot in (snapshot_ref(), incarnation())
+            .prop_map(|(snapshot, incarnation)| ImmutableSnapshotRead { snapshot, incarnation }),
+        origin in read_origin(),
+        resource in (
+            prop_oneof![Just(ResourceKind::Chunk), Just(ResourceKind::Snapshot)],
+            incarnation(),
+            offset(),
+        ).prop_map(|(kind, incarnation, offset)| ImmutableResource { kind, incarnation, offset }),
+    ) {
+        let pairs = rendered(|emit| chunk.render(emit));
+        prop_assert_eq!(ChunkRead::parse(iter(&pairs)), Ok(chunk));
+        let pairs = rendered(|emit| snapshot.render(emit));
+        prop_assert_eq!(ImmutableSnapshotRead::parse(iter(&pairs)), Ok(snapshot));
+        let pairs = rendered(|emit| origin.render(emit));
+        prop_assert_eq!(ReadOrigin::parse_header(iter(&pairs)), Ok(Some(origin)));
+        let path = resource.path();
+        let segments: Vec<&str> = path.split('/').collect();
+        prop_assert_eq!(
+            ImmutableResource::parse(resource.kind, segments[2], segments[4]),
+            Ok(resource)
+        );
+    }
+
+    #[test]
     fn manifests_round_trip(parts in proptest::collection::hash_set(part_id(), 1..64)) {
         let manifest = PartsManifest::new(parts.into_iter().collect()).unwrap();
         let body = manifest.render();
@@ -517,6 +583,15 @@ proptest! {
             prop_assert_eq!(StreamHead::parse(iter(&pairs)), Ok(parsed));
         }
         let _read = SnapshotRead::parse(fuzz_iter(&headers));
+        if let Ok(parsed) = ChunkRead::parse(fuzz_iter(&headers)) {
+            let pairs = rendered(|emit| parsed.render(emit));
+            prop_assert_eq!(ChunkRead::parse(iter(&pairs)), Ok(parsed));
+        }
+        let _snapshot = ImmutableSnapshotRead::parse(fuzz_iter(&headers));
+        if let Ok(Some(parsed)) = ReadOrigin::parse_header(fuzz_iter(&headers)) {
+            let pairs = rendered(|emit| parsed.render(emit));
+            prop_assert_eq!(ReadOrigin::parse_header(iter(&pairs)), Ok(Some(parsed)));
+        }
         let _publish = SnapshotPublishAnswer::parse(status, fuzz_iter(&headers));
         let _staged = PartStaged::parse(fuzz_iter(&headers));
         let _commit = PartsCommit::parse(fuzz_iter(&headers));

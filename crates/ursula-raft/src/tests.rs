@@ -58,6 +58,7 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::EarlyAnswerQuery;
 #[cfg(not(madsim))]
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 #[cfg(not(madsim))]
@@ -219,15 +220,24 @@ async fn raft_file_log_store_passes_openraft_conformance_suite() {
 }
 
 #[test]
-fn follower_forwards_stale_read_visibility_errors() {
-    let missing = GroupEngineError::stream(StreamErrorCode::StreamNotFound, "missing");
-    assert!(should_forward_stale_follower_read_error(false, &missing));
-    assert!(!should_forward_stale_follower_read_error(true, &missing));
-    let beyond = GroupEngineError::stream(StreamErrorCode::OffsetOutOfRange, "beyond local tail");
-    assert!(should_forward_stale_follower_read_error(false, &beyond));
-    assert!(!should_forward_stale_follower_read_error(true, &beyond));
-    let gone = GroupEngineError::stream(StreamErrorCode::StreamGone, "retained prefix gone");
-    assert!(!should_forward_stale_follower_read_error(false, &gone));
+fn reads_that_may_hold_only_for_a_lagging_state() {
+    for code in [
+        StreamErrorCode::StreamNotFound,
+        StreamErrorCode::OffsetOutOfRange,
+        StreamErrorCode::StreamGone,
+    ] {
+        assert!(may_hold_only_for_a_lagging_state(
+            &GroupEngineError::stream(code, "lagging")
+        ));
+    }
+    for code in [
+        StreamErrorCode::StreamClosed,
+        StreamErrorCode::IncarnationMismatch,
+    ] {
+        assert!(!may_hold_only_for_a_lagging_state(
+            &GroupEngineError::stream(code, "final")
+        ));
+    }
 }
 
 #[test]
@@ -373,6 +383,7 @@ fn read_req(stream_id: ursula_shard::BucketStreamId, max_len: usize) -> ReadStre
         now_ms: 0,
         leader_only: false,
         read_index: None,
+        follower: FollowerRead::Prefix,
     }
 }
 
@@ -3408,6 +3419,7 @@ async fn a_history_event_ends_a_live_read_pinned_to_the_old_token() {
             now_ms: 0,
             leader_only: false,
             read_index: None,
+            follower: FollowerRead::Prefix,
         };
         let pinned = before.incarnation;
         tokio::spawn(async move { runtime.wait_read_stream_pinned(request, Some(pinned)).await })
@@ -3621,10 +3633,11 @@ async fn openraft_snapshot_round_trips_group_state() {
 }
 
 /// A forwarded read carries `leader_only` (field 6) to the leader over gRPC,
-/// so the leader linearizes a forwarded `consistency=leader` read, and so
-/// does `HeadStreamReadV1.applied_state_only`
-/// (field 1), so the leader linearizes a forwarded client HEAD and not an
-/// internal one.
+/// so the leader linearizes a forwarded `consistency=leader` read, and its
+/// follower policy (field 7), so a receiver that no longer leads still
+/// serves an immutable chunk only when it can mark it. So does
+/// `HeadStreamReadV1.applied_state_only` (field 1), so the leader
+/// linearizes a forwarded client HEAD and not an internal one.
 #[test]
 fn forwarded_reads_carry_linearizability_over_grpc() {
     use prost::Message;
@@ -3636,15 +3649,33 @@ fn forwarded_reads_carry_linearizability_over_grpc() {
         now_ms: 77,
         leader_only: true,
         read_index: None,
+        follower: FollowerRead::Prefix,
     };
-    let wire = crate::forward::read_stream_read_v1(&request)
-        .expect("wire read")
-        .encode_to_vec();
-    let decoded =
-        crate::raft_internal_proto::ReadStreamReadV1::decode(wire.as_slice()).expect("decode");
-    let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
-        .expect("served request");
-    assert_eq!(served, request);
+    for request in [request.clone(), ursula_runtime::ReadStreamRequest {
+        leader_only: false,
+        follower: FollowerRead::Immutable,
+        ..request.clone()
+    }] {
+        let wire = crate::forward::read_stream_read_v1(&request)
+            .expect("wire read")
+            .encode_to_vec();
+        let decoded =
+            crate::raft_internal_proto::ReadStreamReadV1::decode(wire.as_slice()).expect("decode");
+        let served =
+            crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
+                .expect("served request");
+        assert_eq!(served, request);
+    }
+    let unknown = crate::raft_internal_proto::ReadStreamReadV1 {
+        offset: 0,
+        max_len: 1,
+        leader_only: false,
+        follower: 9,
+    };
+    assert_eq!(
+        crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, unknown),
+        Err("group_read.read_stream.follower unknown")
+    );
 
     // A forwarded client HEAD stays linearizable on the leader; an internal
     // one does not.

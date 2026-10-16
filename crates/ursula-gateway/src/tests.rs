@@ -791,6 +791,24 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             Action::PublishSnapshot,
             Some("orders"),
         ),
+        (
+            "GET",
+            "/owner-a/orders/incarnation/4503599627370497/chunk/00000000000004194304",
+            Action::Read,
+            Some("orders"),
+        ),
+        (
+            "HEAD",
+            "/owner-a/orders/incarnation/4503599627370497/chunk/00000000000004194304",
+            Action::Read,
+            Some("orders"),
+        ),
+        (
+            "GET",
+            "/owner-a/orders/incarnation/4503599627370497/snapshot/00000000000000000042",
+            Action::ReadSnapshot,
+            Some("orders"),
+        ),
     ];
 
     for (method, uri, expected_action, expected_stream) in cases {
@@ -808,6 +826,36 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             "{method} {uri}"
         );
         assert_eq!(classified.action, expected_action, "{method} {uri}");
+    }
+}
+
+#[test]
+fn request_classifier_refuses_other_immutable_paths() {
+    for (method, uri) in [
+        (
+            "PUT",
+            "/owner-a/orders/incarnation/4503599627370497/chunk/00000000000000000000",
+        ),
+        (
+            "POST",
+            "/owner-a/orders/incarnation/4503599627370497/snapshot/00000000000000000000",
+        ),
+        (
+            "GET",
+            "/owner-a/orders/incarnation/4503599627370497/bytes/00000000000000000000",
+        ),
+        ("GET", "/owner-a/orders/incarnation/4503599627370497/chunk"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(
+            classify_request(request.method(), request.uri(), request.headers()),
+            None,
+            "{method} {uri}"
+        );
     }
 }
 

@@ -32,6 +32,8 @@ There is no bucket metadata read, stream listing, or bucket delete. Removing a b
 | `GET` | `/{bucket}/{stream}/bootstrap` | [Snapshot + tail replay](/docs/api/bootstrap) |
 | `GET` | `/{bucket}/{stream}/snapshot/{offset}` | [Read snapshot at offset](/docs/api/read-snapshot) |
 | `PUT` | `/{bucket}/{stream}/snapshot/{offset}` | [Publish a snapshot](/docs/api/publish-snapshot) |
+| `GET` | `/{bucket}/{stream}/incarnation/{token}/chunk/{offset}` | [Read a chunk a cache can store](/docs/api/immutable-reads) |
+| `GET` | `/{bucket}/{stream}/incarnation/{token}/snapshot/{offset}` | [Read a snapshot a cache can store](/docs/api/immutable-reads) |
 
 ## Common request patterns
 
