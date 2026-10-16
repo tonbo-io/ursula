@@ -6210,10 +6210,7 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
             "/write",
             post(|_body: Bytes| async { StatusCode::NO_CONTENT }),
         )
-        .layer(middleware::from_fn_with_state(
-            admission_with_body_budget(4),
-            ingress_admission_middleware,
-        ));
+        .layer(admission_with_body_budget(4));
 
     let response = http_post(
         &app,
@@ -6255,10 +6252,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
                 }
             }),
         )
-        .layer(middleware::from_fn_with_state(
-            admission_with_body_budget(4),
-            ingress_admission_middleware,
-        ));
+        .layer(admission_with_body_budget(4));
 
     let first = tokio::spawn({
         let app = app.clone();
@@ -11604,7 +11598,7 @@ async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() 
 }
 
 fn executor_fence_test_state() -> HttpState {
-    let mut state = HttpState::with_raft_registry(
+    HttpState::with_raft_registry(
         spawn_runtime(
             &test_config(1, 1),
             Persistence::InMemory,
@@ -11615,9 +11609,8 @@ fn executor_fence_test_state() -> HttpState {
         .expect("runtime")
         .runtime,
         RaftGroupHandleRegistry::default(),
-    );
-    state.configured_node_id = Some(1);
-    state
+    )
+    .with_configured_node_id(1)
 }
 
 fn executor_token(generation: u64) -> MaintenanceFence {

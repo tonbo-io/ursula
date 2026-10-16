@@ -104,6 +104,7 @@ use futures_util::stream;
 use openraft::BasicNode;
 use openraft::error::Fatal;
 use openraft::rt::WatchReceiver;
+use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::CompressionLevel;
 use tower_http::compression::predicate::Predicate;
@@ -184,7 +185,6 @@ use ursula_shard::RaftGroupId;
 use wal_disk::WalDiskMonitor;
 
 use crate::admission::PendingAdmission;
-use crate::admission::ingress_admission_middleware;
 use crate::front_door::BodyState;
 use crate::front_door::HeadDecision;
 use crate::render::COMPRESS_MIN_BYTES;
@@ -329,8 +329,30 @@ impl WallClock for SystemWallClock {
     }
 }
 
+/// The node's HTTP state, shared by every handler. Cloning it is one
+/// reference count: the router clones it for every request (#602), so its
+/// fields live behind one `Arc` rather than as many reference counts as it
+/// has fields.
 #[derive(Clone)]
-pub struct HttpState {
+pub struct HttpState(Arc<HttpStateFields>);
+
+impl std::ops::Deref for HttpState {
+    type Target = HttpStateFields;
+
+    fn deref(&self) -> &HttpStateFields {
+        &self.0
+    }
+}
+
+impl From<HttpStateFields> for HttpState {
+    fn from(fields: HttpStateFields) -> Self {
+        Self(Arc::new(fields))
+    }
+}
+
+/// The fields of [`HttpState`].
+#[derive(Clone)]
+pub struct HttpStateFields {
     process_incarnation: ProcessIncarnation,
     admin_fence: admin_fence::AdminMutationFence,
     configured_node_id: Option<u64>,
@@ -358,6 +380,12 @@ pub struct HttpState {
 }
 
 impl HttpState {
+    /// The fields, while the state is built: before the router holds it,
+    /// the state is its only owner and this clones nothing.
+    fn fields_mut(&mut self) -> &mut HttpStateFields {
+        Arc::make_mut(&mut self.0)
+    }
+
     /// The static topology is the expected inventory. Observed metrics cannot
     /// establish which groups or voters are missing after a restart. A
     /// single-node durable runtime has no static inventory and creates its
@@ -415,7 +443,7 @@ impl HttpState {
         staged_parts.lead_by(self.raft_registry.clone());
         self.runtime
             .observe_swept_parts(Arc::new(staged_parts.clone()));
-        self.staged_parts = staged_parts;
+        self.fields_mut().staged_parts = staged_parts;
     }
 
     /// This node's id, when it has one: configured, or named by its static
@@ -518,7 +546,7 @@ impl HttpState {
     }
 
     pub(crate) fn with_process_incarnation(mut self, boot: ProcessIncarnation) -> Self {
-        self.process_incarnation = boot;
+        self.fields_mut().process_incarnation = boot;
         self
     }
 
@@ -526,18 +554,18 @@ impl HttpState {
         mut self,
         fence: ursula_proto::admin::MaintenanceFenceState,
     ) -> Self {
-        self.admin_fence = admin_fence::AdminMutationFence::from_startup(fence);
+        self.fields_mut().admin_fence = admin_fence::AdminMutationFence::from_startup(fence);
         self
     }
 
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
-        self.configured_node_id = Some(node_id);
+        self.fields_mut().configured_node_id = Some(node_id);
         self
     }
 
     pub fn new(runtime: ShardRuntime) -> Self {
         let staged_parts = staged_parts::StagedParts::observing(&runtime, None);
-        Self {
+        HttpStateFields {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
@@ -555,6 +583,7 @@ impl HttpState {
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
+        .into()
     }
 
     pub fn with_raft_registry(
@@ -563,7 +592,7 @@ impl HttpState {
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
-        Self {
+        HttpStateFields {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
@@ -581,6 +610,7 @@ impl HttpState {
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
+        .into()
     }
 
     pub fn with_static_raft_cluster(
@@ -606,7 +636,7 @@ impl HttpState {
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
-        Self {
+        HttpStateFields {
             runtime,
             raft_registry: Some(raft_registry),
             client_write_router: Some(ClientWriteLeaderRouter::with_static_topology(
@@ -628,26 +658,27 @@ impl HttpState {
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
+        .into()
     }
 
     pub fn with_wall_clock(mut self, wall_clock: impl WallClock) -> Self {
-        self.wall_clock = Arc::new(wall_clock);
+        self.fields_mut().wall_clock = Arc::new(wall_clock);
         self
     }
 
     pub fn with_wall_clock_handle(mut self, wall_clock: Arc<dyn WallClock>) -> Self {
-        self.wall_clock = wall_clock;
+        self.fields_mut().wall_clock = wall_clock;
         self
     }
 
     pub fn with_external_payload_min_bytes(mut self, min_bytes: usize) -> Self {
-        self.external_payload_min_bytes = min_bytes;
+        self.fields_mut().external_payload_min_bytes = min_bytes;
         self
     }
 
     /// Record the raft WAL backend so it appears in the metrics JSON.
     pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
-        self.wal_disk = monitor;
+        self.fields_mut().wal_disk = monitor;
         self
     }
 
@@ -655,9 +686,9 @@ impl HttpState {
     /// the server shuts it down cleanly, and its root holds the cluster id.
     pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
         if let Some(wal) = &raft_wal {
-            self.cluster_id = Arc::new(wal.cluster_id().clone());
+            self.fields_mut().cluster_id = Arc::new(wal.cluster_id().clone());
         }
-        self.raft_wal = raft_wal;
+        self.fields_mut().raft_wal = raft_wal;
         self
     }
 
@@ -666,7 +697,7 @@ impl HttpState {
     /// which is the configured id when one is set.
     pub fn with_configured_cluster_id(mut self, cluster_id: Option<ClusterId>) -> Self {
         if let Some(cluster_id) = cluster_id {
-            self.cluster_id = Arc::new(cluster_id);
+            self.fields_mut().cluster_id = Arc::new(cluster_id);
         }
         self
     }
@@ -707,7 +738,7 @@ impl HttpState {
         mut self,
         mismatch: ursula_raft::FormatEpochMismatch,
     ) -> Self {
-        self.format_epoch_mismatch = mismatch;
+        self.fields_mut().format_epoch_mismatch = mismatch;
         self
     }
 
@@ -719,8 +750,10 @@ impl HttpState {
     /// client plane ([`PeerPlanes`]).
     #[must_use]
     pub fn with_peer_planes(mut self, planes: PeerPlanes) -> Self {
-        self.client_write_router = self
+        let fields = self.fields_mut();
+        fields.client_write_router = fields
             .client_write_router
+            .take()
             .map(|router| router.with_planes(planes));
         self
     }
@@ -729,9 +762,9 @@ impl HttpState {
     /// from the typed configuration.  Replaces the hard-coded defaults set by
     /// the constructors.
     pub fn with_runtime_config(mut self, config: &ursula_config::RuntimeConfig) -> Self {
-        self.node_memory = NodeMemoryMonitor::new(config);
+        self.fields_mut().node_memory = NodeMemoryMonitor::new(config);
         if let Some(min_size) = &config.external_payload_min_size {
-            self.external_payload_min_bytes = usize::try_from(min_size.as_bytes())
+            self.fields_mut().external_payload_min_bytes = usize::try_from(min_size.as_bytes())
                 .expect("config validation ensures payload size fits usize");
         }
         self
@@ -1726,19 +1759,24 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .delete(delete_stream)
                 .head(head_stream),
         )
-        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(middleware::from_fn_with_state(
-            admission,
-            ingress_admission_middleware,
-        ))
-        // An unknown path gets its error body from this layer only because
-        // the client router's fallback is the one a merged router keeps: the
-        // node merges the client router last, after the cluster and admin
-        // routers (`error_body_tests` pins it on that composition).
-        .layer(ResponseMetadataLayer::client(IdentityHeaders::new(
-            state.cluster_id(),
-        )))
-        .layer(response_compression)
+        // One layer of the router, so a request crosses one boxed route
+        // rather than one per layer: the router clones a boxed route, and
+        // every route below it, for every request it calls (#602). Outermost
+        // first.
+        .layer(
+            ServiceBuilder::new()
+                .layer(response_compression)
+                // An unknown path gets its error body from this layer only
+                // because the client router's fallback is the one a merged
+                // router keeps: the node merges the client router last, after
+                // the cluster and admin routers (`error_body_tests` pins it on
+                // that composition).
+                .layer(ResponseMetadataLayer::client(IdentityHeaders::new(
+                    state.cluster_id(),
+                )))
+                .layer(admission)
+                .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES)),
+        )
         .with_state(state)
 }
 
@@ -4772,9 +4810,9 @@ pub(crate) fn sse_stream(
         max_len.max(4)
     };
     let sse_state = SseState {
-        runtime: state.runtime,
-        http_metrics: state.http_metrics,
-        wall_clock: state.wall_clock,
+        runtime: state.runtime.clone(),
+        http_metrics: state.http_metrics.clone(),
+        wall_clock: state.wall_clock.clone(),
         stream_id,
         offset,
         max_len: sse_max_len,
