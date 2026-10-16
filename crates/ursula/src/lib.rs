@@ -4708,6 +4708,16 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
 /// `Retry-After`, and the write's key resolves the outcome.
 pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> Response {
     count_refusal(state, &err);
+    // Only a DST negative control turns the rule off, to show the
+    // simulation catches a redirect after the body (its `Location` names
+    // the leader's base URL); every other build has no switch.
+    if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::NoRedirectAfterBody)
+        && let Some(redirect) = state
+            .client_write_router()
+            .and_then(|router| router.redirect_response(&err, ""))
+    {
+        return redirect;
+    }
     if is_forward_to_leader(&err) || matches!(err, RuntimeError::GroupNotHosted { .. }) {
         return leader_unknown_retry_response(err);
     }
