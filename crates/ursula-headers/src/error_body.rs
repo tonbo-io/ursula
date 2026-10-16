@@ -192,7 +192,11 @@ error_codes! {
     /// The node copies as many snapshot commits as it may (`503`).
     SnapshotCommitsBusy = "SNAPSHOT_COMMITS_BUSY", "this node copies as many snapshot commits as it may; retry";
     /// The node runs this commit now (`503`): repeat it.
-    SnapshotCommitInProgress = "SNAPSHOT_COMMIT_IN_PROGRESS", "this commit is running; repeat it";
+    SnapshotCommitInProgress = "SNAPSHOT_COMMIT_IN_PROGRESS", "a commit or discard of this stream is running; repeat it";
+    /// The stream holds as many staged, unused snapshot parts, or bytes of
+    /// them, as it may (`429`, naming `Ursula-Max-Staged-Parts` or
+    /// `Ursula-Max-Staged-Bytes`).
+    StagedPartsLimit = "STAGED_PARTS_LIMIT", "the stream holds as many staged snapshot parts as it may";
 
     // Node pressure and routing. Each answers `503` with `Retry-After`.
     /// No leader of the stream's group is known.
@@ -648,6 +652,7 @@ mod tests {
                 ErrorCode::SnapshotCommitInProgress,
                 "SNAPSHOT_COMMIT_IN_PROGRESS",
             ),
+            (ErrorCode::StagedPartsLimit, "STAGED_PARTS_LIMIT"),
             (ErrorCode::NoLeader, "NO_LEADER"),
             (ErrorCode::WalDiskPressure, "WAL_DISK_PRESSURE"),
             (ErrorCode::RaftLogPressure, "RAFT_LOG_PRESSURE"),

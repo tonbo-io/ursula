@@ -17,7 +17,9 @@
 //!   (Section 2.2);
 //! - byte ranges on a snapshot read: the one `Range` it honors and the
 //!   `Content-Range` of its `206` or `416` (Section 2.5);
-//! - the typed `413`, which names the limit it applied (Section 10);
+//! - the typed `413`, which names the limit it applied, and the `429` of a
+//!   stream that holds as many staged snapshot parts as it may (Sections
+//!   2.2 and 10);
 //! - the routing answers a node sends before it reads the body (Section
 //!   5.7);
 //! - the `412` of the incarnation precondition, the `409` of a closed
@@ -71,7 +73,8 @@
 //!   answers, and [`ReadOrigin`], the read-origin hint.
 //! - [`range`]: [`ByteRange`], the range a snapshot read honors, and
 //!   [`ContentRange`], its answer.
-//! - [`limit`]: [`SizeLimit`], the limit a `413` applied, and
+//! - [`limit`]: [`SizeLimit`], the limit a `413` applied,
+//!   [`StagedPartsLimit`], the staged-parts limit a `429` applied, and
 //!   [`lowered_request_limit`], the request limit an intermediary forwards.
 //! - [`routing`]: [`RoutingAnswer`], the `307` or `503` of a node that does
 //!   not lead the stream's group.
@@ -125,6 +128,7 @@ pub use immutable::OriginScheme;
 pub use immutable::ReadOrigin;
 pub use immutable::ResourceKind;
 pub use limit::SizeLimit;
+pub use limit::StagedPartsLimit;
 pub use limit::lowered_request_limit;
 pub use range::ACCEPT_RANGES_BYTES;
 pub use range::ByteRange;

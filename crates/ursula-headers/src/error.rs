@@ -66,8 +66,11 @@ pub enum HeaderError {
     /// `Stream-Snapshot-Part` is not 1 to [`PART_ID_MAX_BYTES`] visible
     /// ASCII characters.
     InvalidPartId,
-    /// A `413` names both limits; it must name the one it applied.
-    AmbiguousLimit,
+    /// A refusal names two limits; it must name the one it applied.
+    AmbiguousLimit {
+        first: &'static str,
+        second: &'static str,
+    },
     /// A receipt starts after it ends.
     ReceiptRangeInverted { start: Offset, next: Offset },
     /// A claim closed an epoch that is not below the producer's current
@@ -193,11 +196,9 @@ impl fmt::Display for HeaderError {
                 "{} must be 1 to {PART_ID_MAX_BYTES} visible ASCII characters",
                 names::STREAM_SNAPSHOT_PART
             ),
-            Self::AmbiguousLimit => write!(
+            Self::AmbiguousLimit { first, second } => write!(
                 f,
-                "a 413 must name one limit, not both {} and {}",
-                names::URSULA_MAX_REQUEST_BYTES,
-                names::URSULA_MAX_SNAPSHOT_BYTES
+                "a refusal must name the one limit it applied, not both {first} and {second}"
             ),
             Self::ReceiptRangeInverted { start, next } => write!(
                 f,

@@ -75,6 +75,12 @@ pub const URSULA_MAX_REQUEST_BYTES: &str = "ursula-max-request-bytes";
 /// The largest snapshot the server accepts in parts. HEAD with a cold store,
 /// and a `413` that applied it.
 pub const URSULA_MAX_SNAPSHOT_BYTES: &str = "ursula-max-snapshot-bytes";
+/// The most snapshot parts a stream may hold staged and unused. A `429` that
+/// applied it.
+pub const URSULA_MAX_STAGED_PARTS: &str = "ursula-max-staged-parts";
+/// The most bytes of snapshot parts a stream may hold staged and unused. A
+/// `429` that applied it.
+pub const URSULA_MAX_STAGED_BYTES: &str = "ursula-max-staged-bytes";
 
 /// The node that leads the stream's Raft group. `307` of a node that does
 /// not lead it; the same name as 0.7.

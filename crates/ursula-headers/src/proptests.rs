@@ -33,6 +33,7 @@ use crate::immutable::OriginScheme;
 use crate::immutable::ReadOrigin;
 use crate::immutable::ResourceKind;
 use crate::limit::SizeLimit;
+use crate::limit::StagedPartsLimit;
 use crate::names;
 use crate::refusal::IncarnationMismatch;
 use crate::refusal::StreamClosedConflict;
@@ -318,7 +319,7 @@ fn routing_answer() -> impl Strategy<Value = RoutingAnswer> {
 
 // Fuzz strategies.
 
-const NAMES: [&str; 33] = [
+const NAMES: [&str; 35] = [
     names::PRODUCER_ID,
     names::PRODUCER_EPOCH,
     names::PRODUCER_SEQ,
@@ -346,6 +347,8 @@ const NAMES: [&str; 33] = [
     names::URSULA_CLUSTER_ID,
     names::URSULA_MAX_REQUEST_BYTES,
     names::URSULA_MAX_SNAPSHOT_BYTES,
+    names::URSULA_MAX_STAGED_PARTS,
+    names::URSULA_MAX_STAGED_BYTES,
     names::X_URSULA_RAFT_LEADER_ID,
     names::X_URSULA_RAFT_GROUP,
     names::X_URSULA_RAFT_TERM,
@@ -554,6 +557,16 @@ proptest! {
     ) {
         let pairs = rendered(|emit| limit.render(emit));
         prop_assert_eq!(SizeLimit::parse(SizeLimit::STATUS, iter(&pairs)), Ok(Some(limit)));
+        let staged = if limit.bytes() % 2 == 0 {
+            StagedPartsLimit::Parts(limit.bytes())
+        } else {
+            StagedPartsLimit::Bytes(limit.bytes())
+        };
+        let pairs = rendered(|emit| staged.render(emit));
+        prop_assert_eq!(
+            StagedPartsLimit::parse(StagedPartsLimit::STATUS, iter(&pairs)),
+            Ok(Some(staged))
+        );
         let pairs = rendered(|emit| routing.render(emit));
         prop_assert_eq!(RoutingAnswer::parse(routing.status(), iter(&pairs)), Ok(Some(routing)));
         let mismatch = IncarnationMismatch { current };
@@ -596,6 +609,7 @@ proptest! {
         let _staged = PartStaged::parse(fuzz_iter(&headers));
         let _commit = PartsCommit::parse(fuzz_iter(&headers));
         let _limit = SizeLimit::parse(status, fuzz_iter(&headers));
+        let _staged_limit = StagedPartsLimit::parse(status, fuzz_iter(&headers));
         let _routing = RoutingAnswer::parse(status, fuzz_iter(&headers));
         let _mismatch = IncarnationMismatch::parse(status, fuzz_iter(&headers));
         let _closed = StreamClosedConflict::parse(status, fuzz_iter(&headers));
