@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, snapshot upload in parts, byte ranges on snapshot reads, multipart bootstrap delivery, write keys with typed answers, server metadata, error bodies, a JSON message text rule, and read path parameters.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, snapshot upload in parts, byte ranges on snapshot reads, multipart bootstrap delivery, immutable reads that a shared cache can serve, write keys with typed answers, server metadata, error bodies, a JSON message text rule, and read path parameters.
 
 The snapshot and bootstrap design in sections 2 and 3 is based on a proposal by [Loro](https://loro.dev/). Ursula implements part of it: there is no latest-snapshot redirect, no snapshot deletion and no conditional publish.
 
@@ -26,6 +26,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - [1. Buckets](#1-buckets)
 - [2. Snapshots](#2-snapshots)
 - [3. Bootstrap](#3-bootstrap)
+- [4. Immutable Reads](#4-immutable-reads)
 - [5. Write Keys and Typed Answers](#5-write-keys-and-typed-answers)
 - [7. Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
 - [8. URL Encoding](#8-url-encoding)
@@ -78,9 +79,9 @@ This section describes Ursula's server profile. Earlier drafts of this document 
 
 ### 1.6. Stream Operations
 
-All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`. A path segment after `{stream_id}` names a stream subresource (Sections 2 and 3), never another stream. Ursula answers `404 Not Found` for any other path with three or more segments under a bucket (paths under `/__ursula/` are operational endpoints, not buckets).
+All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`. A path segment after `{stream_id}` names a stream subresource (Sections 2, 3 and 4), never another stream. Ursula answers `404 Not Found` for any other path with three or more segments under a bucket (paths under `/__ursula/` are operational endpoints, not buckets).
 
-The names `$transaction`, `append-batch`, `attrs`, `bootstrap`, `retention` and `snapshot` are reserved for any future co-location form and stream subresource; apart from the `$` rule in Section 1.1 they remain valid stream IDs. Earlier drafts defined a three-segment path-affinity form and a group-local `$transaction` endpoint in Sections 1.7 and 1.8; those features are removed and the section numbers stay unused.
+The names `$transaction`, `append-batch`, `attrs`, `bootstrap`, `incarnation`, `retention` and `snapshot` are reserved for any future co-location form and stream subresource; apart from the `$` rule in Section 1.1 they remain valid stream IDs. Earlier drafts defined a three-segment path-affinity form and a group-local `$transaction` endpoint in Sections 1.7 and 1.8; those features are removed and the section numbers stay unused.
 
 ---
 
@@ -194,11 +195,11 @@ A client that holds token `T` and finds `Stream-Previous-Incarnation: T` keeps w
 
 **`Stream-Incarnation` on responses:**
 
-A server implementing this extension MUST send `Stream-Incarnation` on every successful response of a request that addresses a stream: create (`201` and `200`), append and close, every read (catch-up, the long-poll `204`, and the SSE response), `HEAD`, bootstrap, snapshot publish and read, and retention. A client learns the token from its first request, without a separate `HEAD`.
+A server implementing this extension MUST send `Stream-Incarnation` on every successful response of a request that addresses a stream: create (`201` and `200`), append and close, every read (catch-up, the long-poll `204`, and the SSE response), `HEAD`, bootstrap, snapshot publish and read, retention, and the resources of Section 4. It MUST also send it, naming the token of the stream that answered, on every `410` and `416` of a read (catch-up, long-poll, the resources of Section 4, and a snapshot range that cannot be satisfied) and on a `404` of a snapshot read when the stream exists but the snapshot is not its latest. These answers come before the precondition (below), so the token tells a client whether the stream it holds state for answered them. It is absent when the stream does not exist. A client learns the token from its first request, without a separate `HEAD`.
 
 **`Stream-Incarnation` as a request precondition:**
 
-Requests address streams by URL only, so a client holding state from a deleted incarnation (offsets, producer state, a local cache) would otherwise act on a stream recreated at the same URL, including one recreated by TTL expiry and a later create, without any delete. Every request that addresses a stream MAY carry `Stream-Incarnation`: create (`PUT`), append (`POST`, including close), every read (catch-up, long-poll, SSE), `HEAD`, `DELETE`, bootstrap, snapshot publish and read, and retention.
+Requests address streams by URL only, so a client holding state from a deleted incarnation (offsets, producer state, a local cache) would otherwise act on a stream recreated at the same URL, including one recreated by TTL expiry and a later create, without any delete. Every request that addresses a stream MAY carry `Stream-Incarnation`: create (`PUT`), append (`POST`, including close), every read (catch-up, long-poll, SSE), `HEAD`, `DELETE`, bootstrap, snapshot publish and read, and retention. The resources of Section 4 carry it in their path instead.
 
 - **Absent:** the request behaves as the base protocol and this extension define it, unchanged.
 - **Present:** the server compares the value for equality with the stream's current incarnation, atomically with the operation. A write is compared when it is applied: a write that was accepted before a delete and recreate but applied after it is refused. A read is compared against the same stream state that serves it. A live read (long-poll or SSE) ends when the stream it was opened against is deleted or recreated: a long-poll answers `404` or `412`, and an SSE stream ends with an `error` event.
@@ -223,6 +224,9 @@ Returns the snapshot blob at the specified offset.
 - `Stream-Snapshot-Digest`: The snapshot digest returned at publish time.
 - `Stream-Next-Offset`: The next offset after the snapshot.
 - `Stream-Up-To-Date: true`: Present when no update follows the snapshot (the snapshot offset is the stream's tail); absent otherwise. Clients then read on from `Stream-Next-Offset`.
+- `ETag`: A strong tag of the whole snapshot. A request whose `If-None-Match` names it answers `304 Not Modified` with the same headers, before any byte range.
+
+> **Note (informative).** Ursula's snapshot `ETag` is the snapshot's digest in quotes.
 
 **Byte Ranges:**
 
@@ -232,7 +236,7 @@ A server MAY honor a single byte range [RFC9110] on a snapshot read: `Range: byt
 - MUST answer a range that starts at or past the end of the snapshot with `416 Range Not Satisfiable` and `Content-Range: bytes */total`;
 - answers a request with several ranges, a range it cannot parse, or `If-Range` with the whole snapshot as `200`;
 - decides `404`, `410` and `412` before it looks at the range;
-- sends the same `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Next-Offset` and `Stream-Incarnation` as for the whole body. The digest always covers the whole snapshot, never the range.
+- sends the same `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Next-Offset`, `Stream-Incarnation` and `ETag` as for the whole body. The digest always covers the whole snapshot, never the range.
 
 Stream reads keep their offset protocol and ignore `Range`.
 
@@ -242,6 +246,7 @@ Stream reads keep their offset protocol and ignore `Range`.
 
 - `200 OK`: Snapshot exists.
 - `206 Partial Content`: The requested byte range of the snapshot.
+- `304 Not Modified`: `If-None-Match` names the snapshot's `ETag`.
 - `404 Not Found`: Snapshot does not exist or has been garbage-collected.
 - `416 Range Not Satisfiable`: The requested byte range starts at or past the end of the snapshot.
 
@@ -359,6 +364,113 @@ Bootstrap is one-shot only:
 - When a server returns `410 Gone` for a read (because retention has advanced), clients SHOULD call `/bootstrap` to rebuild state, then continue tailing from the returned `Stream-Next-Offset` through the ordinary read APIs.
 - If a server has begun returning `410 Gone` for a stream (i.e., earliest retained offset > `-1`), the server MUST ensure `/bootstrap` is available and can provide a snapshot covering that earliest retained offset.
 - Clients MUST parse `/bootstrap` as an ordered sequence of parts. For a JSON stream each update part is one message; for any other stream, clients MUST NOT treat a part boundary as a message boundary.
+
+---
+
+## 4. Immutable Reads
+
+Most of a stream can no longer change: every byte below the tail and every published snapshot. This section lets a shared cache, such as a CDN, serve those parts while the server keeps serving the tail. It is independent of the application: any reader that starts behind the tail benefits, such as a subscriber replaying history or a replica that attaches from a snapshot.
+
+It adds four pieces:
+
+- two resources per incarnation, a chunk of the stream's bytes and a snapshot, named by the incarnation token and an offset in the path (Section 4.1);
+- a fixed chunk grid, so that independent readers request the same URLs (Section 4.2);
+- a response header that marks a response as immutable (Section 4.3);
+- a hint naming a separate origin for these resources (Section 4.4).
+
+A client that uses none of them sees no change.
+
+### 4.1. Immutable Resources
+
+```
+GET {stream_url}/incarnation/{token}/chunk/{offset}
+GET {stream_url}/incarnation/{token}/snapshot/{snapshot_offset}
+```
+
+`{token}` is a `Stream-Incarnation` value (Section 2.4). `{offset}` and `{snapshot_offset}` are offsets, encoded as Section 8 requires. The token in the path is the `Stream-Incarnation` precondition of Section 2.4, with the same evaluation: when the stream's current token differs, the server answers `412 Precondition Failed` with the current `Stream-Incarnation`, after `404`, `410` and `416`, which take precedence. Because the token and the offset are in the path, every cache key tells them apart. A `Stream-Incarnation` request header has no effect on these resources: the path names the token.
+
+- A chunk request returns the stream's bytes from `offset` to the end of the chunk that contains it (Section 4.2), or to the tail when the tail comes first.
+- A snapshot request returns the snapshot published at `snapshot_offset` (Section 2.5), or `404 Not Found` when it is not the latest visible snapshot. It honors a byte range as Section 2.5 describes.
+- These resources define `GET` and `HEAD` only. A request with a query component, or with a token or offset that is not in the form the server issues them, MUST be rejected with `400 Bad Request`.
+
+**Response headers** on `200 OK`, on a snapshot's `206 Partial Content`, and on a `304 Not Modified` that stands for one of them:
+
+- Chunk: `Content-Type` (the stream's read representation, Section 9.4), `Stream-Incarnation`, `Stream-Offset` (the first offset the body holds, equal to the requested offset), `Stream-Next-Offset` (the offset after the last byte), `Stream-Closed: true` when the response ends at the tail of a closed stream, `Stream-Immutable: true` when marked (Section 4.3), and `ETag`.
+- Snapshot: `Content-Type` (stored at publish), `Stream-Incarnation`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Next-Offset` (equal to the snapshot offset), `Stream-Immutable: true` and `ETag`, with the byte-range headers of Section 2.5.
+
+The body of a chunk response MUST be exactly the stream's bytes in `[Stream-Offset, Stream-Next-Offset)`. Responses of these resources MUST NOT carry `Stream-Up-To-Date` or `Stream-Cursor`.
+
+> **Note (informative).** Ursula's chunk `ETag` is a strong tag over the token, the range, where the response ends (below the tail, at an open tail or at a closed tail), the content type and the body. The body is hashed although the token and range name the bytes, so that a deployment that broke the incarnation guarantee without changing the token, such as one restored from volume snapshots, gets new bytes at revalidation instead of a `304`. Its snapshot `ETag` is the snapshot's digest in quotes, the same on `200`, `206` and both snapshot resources. Ursula compares `If-None-Match` weakly, as RFC 9110 requires, so a tag a layer weakened still revalidates. A layer in front forwards tags unchanged otherwise.
+
+### 4.2. Chunk Grid
+
+The server partitions each stream's offsets into chunks. A reader that starts anywhere and continues from `Stream-Next-Offset` reaches a chunk boundary after one response, and from then on requests exactly the URLs every other reader of the stream requests.
+
+- A chunk MUST NOT be larger than the server's response cap (Section 9.3).
+- A server SHOULD NOT change its grid. Responses for one URL from before and after a change hold different but correct byte ranges (Section 4.3), and caches miss once.
+- On a JSON stream a chunk MAY end inside a message (Section 9.4).
+
+Ursula's chunk boundaries are the multiples of 4 MiB (4,194,304) in its offset space.
+
+### 4.3. Immutable Responses
+
+A server marks a response with
+
+```
+Stream-Immutable: true
+```
+
+when every later successful response for the same URL carries the same body and the same `Content-Type`, `Stream-Incarnation`, `Stream-Offset`, `Stream-Next-Offset`, `Stream-Closed`, `Stream-Snapshot-Offset` and `Stream-Snapshot-Digest`. The one exception is a change of the server's chunk grid, after which a chunk response for the URL still holds exactly the incarnation's bytes in `[Stream-Offset, Stream-Next-Offset)`.
+
+The server MUST send the marker only on:
+
+- a chunk response that reaches the end of the chunk holding its offset and ends strictly below the tail of the stream state that serves it;
+- a chunk response that ends at the tail of a closed stream, including an empty one whose offset is that tail;
+- a snapshot response, `200` or `206`.
+
+A chunk response that ends at the tail of an open stream MUST NOT be marked, even when it reaches the end of its chunk, because the stream can still be closed at that offset. A server that serves from a replica that may not hold the tail SHOULD obtain a chunk it cannot mark from one that does, so that a response without the marker means that the stream's tail lies within the chunk. The server SHOULD send the marker whenever these rules allow it.
+
+> **Note (informative).** An Ursula follower serves a chunk only when it can mark it. Otherwise it forwards the request to the stream's Raft leader. The leader answers a chunk it cannot mark, and a `404`, `410` or `416` of a read, only after it confirmed with a majority of voters that it still leads and applied everything committed (Raft ReadIndex), so a leader that was just elected, or deposed without knowing it, never answers short of a chunk another replica marked, nor for a stream a recreate replaced. A follower forwards these answers to the leader.
+
+A later request for the same URL MAY fail instead: `404` after the stream is deleted or the snapshot is superseded, `410` once retention passes the offset, `412` once the token is retired, or `416` once the token is retired and the stream now at the URL ends before the offset, since `416` takes precedence over `412` (Section 2.4). Each of these, when the stream exists, carries the stream's current `Stream-Incarnation`, so a client or cache tells a retired URL from a stream that changed under it without another `HEAD`. A cache that keeps serving a stored marked response serves bytes that were correct for that incarnation and history. The token in the URL keeps them apart from any later stream at the URL and from any later history of the stream, because a server changes the token (Section 2.4) before it serves a stream after any operation that may have rewritten it.
+
+A `304 Not Modified` that revalidates a marked response MUST carry the marker and the headers of Section 4.1. Closing a stream MUST NOT change the `ETag` of a marked chunk response that ends below the tail. A server MUST NOT send two representations of a marked response under one strong `ETag`, for example by compressing some of them.
+
+The marker states a fact about the stream. It does not make a response storable: `Cache-Control` still governs that (base protocol Sections 8 and 10.7). A layer that knows who may read a stream MAY replace `Cache-Control` on a marked response with a directive that a shared cache stores and reuses for the requests it authorizes, for example `public, max-age=86400, immutable` for a stream that every client may read, or `s-maxage=86400` for a private stream behind authorization before the cache lookup (Section 4.5). The lifetime MUST respect the bound of Section 4.5.
+
+> **Note (informative).** Ursula's node sends `Cache-Control: no-store` on every response, marked or not, because it cannot tell a private stream from a public one. Relaxing it is left to the layer in front. The node never compresses these resources, so their responses carry no `Content-Encoding` and no `Vary`.
+
+### 4.4. Read Origin Hint
+
+```
+Stream-Read-Origin: https://reads.example.com
+```
+
+A server MAY send `Stream-Read-Origin` on a successful `HEAD`. Its value is an origin: a scheme, a host and an optional port, with no path. It suggests that the client request the resources of Section 4.1 for this stream at the same paths on that origin, typically a CDN in front of the same server. The stream's own origin keeps every other request.
+
+A server MUST NOT send it unless requests to that origin reach the same streams at the same paths and are authorized the same way. A read origin MAY act on an authorization decision for a bounded time after it was made, so a revoked grant or a deleted stream stops being served there within that bound rather than at once. The deployment MUST document the bound.
+
+> **Note (informative).** An Ursula node never sends `Stream-Read-Origin`. A deployment that runs a read origin adds it in the layer in front.
+
+**Client rules:**
+
+- A client MAY ignore the hint. A read origin the client is configured with, including a setting that turns the hint off, takes precedence.
+- A client learns the token from `HEAD` at the stream's own origin, never from the read origin.
+- A client MUST send only requests for the resources of Section 4.1 to the read origin.
+- A client MUST ignore a hint that is not `https`, and MUST NOT send credentials to a read origin outside the stream URL's site (its registrable domain) unless configured to.
+- A client MUST accept a chunk response from the read origin only when its status is `200`; its `Stream-Incarnation` equals the token in the URL; its `Stream-Offset` equals the offset in the URL; its `Stream-Next-Offset` is greater than its `Stream-Offset`, or equal only in a response without the marker or in one that carries `Stream-Closed: true`; the length of its body equals `Stream-Next-Offset` minus `Stream-Offset`; its `Content-Type` is the stream's read representation; `Stream-Closed: true` appears only together with the marker; and the body passes the client's own checks.
+- A client MUST accept a snapshot response from the read origin only when its status is `200`, or `206` whose `Content-Range` names exactly the range it asked for, resolved against the size the `Content-Range` states, and whose body is exactly that long; its `Stream-Incarnation` equals the token in the URL; its `Stream-Snapshot-Offset` equals the offset in the URL and the one `HEAD` reported; its `Stream-Snapshot-Digest` equals the one `HEAD` reported; and the body passes the client's own checks, which SHOULD include computing the digest over a whole body when the client knows the server's digest function.
+- On any other response or a transport error, the client repeats the request at the stream's own origin. A `412`, `404` or a different token from the read origin is not evidence that the stream was deleted or recreated: only the stream's own origin answers that.
+- A client that used bytes from the read origin and later finds them wrong MUST discard what it built from them and read them again from the stream's own origin.
+- After a response without the marker, the client continues at the stream's own origin from `Stream-Next-Offset`.
+
+> **Note (informative).** Ursula's snapshot digest is the lowercase hexadecimal BLAKE3 hash of the content type's length (a little-endian 64-bit integer), the content type, and the body.
+
+### 4.5. Security Considerations
+
+- A shared cache keeps an immutable response after the stream is deleted, until the entry expires. A deployment that stores private stream bytes in a shared cache MUST authorize every request before the cache lookup, and SHOULD bound the lifetime of entries to how long the bytes of a deleted stream may stay reachable. An authorization decision it reuses for a later request is subject to the bound of Section 4.4.
+- The cache key MUST include whatever the authorization depends on beyond the URL.
+- Reads served from a cache do not reach the server and do not renew a stream's sliding TTL (base protocol Section 5.1).
 
 ---
 
@@ -565,7 +677,7 @@ An intermediary that implements this section renders its own error answers with 
 
 | Status | Codes |
 | ------ | ----- |
-| `400` | `INVALID_REQUEST`, `INVALID_HEADER`, `INVALID_QUERY`, `INVALID_OFFSET`, `INVALID_BUCKET_ID`, `INVALID_STREAM_ID`, `INVALID_PRODUCER`, `PRODUCER_DIGEST_MISMATCH`, `MISSING_CONTENT_TYPE`, `EMPTY_APPEND`, `INVALID_RECORD_BOUNDARIES`, `NOT_JSON_BOUNDARY`, `INVALID_RETENTION`, `INVALID_SNAPSHOT`, `INVALID_COLD_FLUSH`, `IMPORT_INVALID`, `INVALID_PARTS_COMMIT`, `UNKNOWN_PART`, `SNAPSHOT_DIGEST_MISMATCH`, `BODY_UNREADABLE`, `UNSUPPORTED` |
+| `400` | `INVALID_REQUEST`, `INVALID_HEADER`, `INVALID_QUERY`, `INVALID_OFFSET`, `QUERY_NOT_ACCEPTED` and `INVALID_RESOURCE` (the immutable resources of Section 4), `INVALID_BUCKET_ID`, `INVALID_STREAM_ID`, `INVALID_PRODUCER`, `PRODUCER_DIGEST_MISMATCH`, `MISSING_CONTENT_TYPE`, `EMPTY_APPEND`, `INVALID_RECORD_BOUNDARIES`, `NOT_JSON_BOUNDARY`, `INVALID_RETENTION`, `INVALID_SNAPSHOT`, `INVALID_COLD_FLUSH`, `IMPORT_INVALID`, `INVALID_PARTS_COMMIT`, `UNKNOWN_PART`, `SNAPSHOT_DIGEST_MISMATCH`, `BODY_UNREADABLE`, `UNSUPPORTED` |
 | `401` | `INVALID_CREDENTIAL`, `CREDENTIAL_EXPIRED` (an intermediary) |
 | `403` | `PRODUCER_EPOCH_CLOSED`, `PRODUCER_EPOCH_STALE`, `PRODUCER_EXPIRED`, `PRODUCER_KEY_CONFLICT`, and `FORBIDDEN` (an intermediary) |
 | `404` | `STREAM_NOT_FOUND`, `BUCKET_NOT_FOUND`, `BUCKET_ERASED`, `SNAPSHOT_NOT_FOUND`, `NOT_FOUND` (no such route) |
