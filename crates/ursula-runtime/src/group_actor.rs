@@ -763,9 +763,14 @@ impl GroupActor {
         let Some(history) = self.history.as_mut() else {
             return Some(self.next_command().await);
         };
+        // Biased, so the branch polled first is fixed rather than drawn from
+        // tokio's thread RNG, which a process-wide counter seeds (#638). A
+        // history change goes first: it re-reads every token, and
+        // `changed` is ready only once per change, so commands still run.
         let command = crate::rt::select! {
-            command = self.rx.recv() => command,
+            biased;
             () = history.changed() => return None,
+            command = self.rx.recv() => command,
         };
         if command.is_some() {
             self.metrics

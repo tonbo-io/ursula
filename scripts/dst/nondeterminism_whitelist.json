@@ -11,7 +11,7 @@
     "path": "crates/ursula-runtime/src/cold_store.rs",
     "snippet_contains": "SystemTime::now()",
     "reason": "already-cfg-gated",
-    "plan": "no action: cold_object_unix_nanos() is split — cfg(not(madsim)) calls SystemTime::now(); cfg(madsim) returns 0. Cold object uniqueness under cfg(madsim) is provided by COLD_CHUNK_SEQUENCE, and reset_cold_chunk_sequence_for_sim() lets the simulator clear the counter between scenarios for Runtime::check_determinism replay."
+    "plan": "no action: cold_object_unix_nanos() is split: cfg(not(madsim)) calls SystemTime::now(), cfg(madsim) returns 0. Under cfg(madsim) the per-thread object sequence keeps names unique within a run, and a run's fresh thread numbers its objects from zero (#638)."
   },
   {
     "category": "system_time_now",
@@ -103,5 +103,82 @@
     "snippet_contains": "SystemTime::now()",
     "reason": "gateway-not-in-sim-surface",
     "plan": "no action: converting a credential's absolute `exp` (unix seconds) into a `tokio::time::sleep` deadline requires reading the wall clock exactly once, and there is no relative lifetime available at that point. The read happens only for responses that stream indefinitely and only when a credential was presented; the resulting timer is a tokio::time::Instant, so tests drive it with paused time. The gateway crate is not part of the madsim simulation surface, so this cannot perturb simulated core scheduling. Deliberately placed here rather than in auth/jwt.rs, which is already whitelisted by path and would have absorbed the decision silently."
+  },
+  {
+    "category": "std_thread_spawn",
+    "path": "crates/ursula-raft/src/sim_runtime.rs",
+    "snippet_contains": "std::thread::Builder::new()",
+    "reason": "run-isolation",
+    "plan": "no action: run_isolated starts each simulation's madsim runtime on a fresh, scoped OS thread and joins it before returning, so no run inherits an earlier run's thread-locals (#638). The thread runs the whole simulation; nothing runs beside it."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula/src/bootstrap/store_health.rs",
+    "snippet_contains": "use tokio::sync::watch;",
+    "reason": "single-receiver",
+    "plan": "no action: the verdict channel has one receiver, the StoreHealthGate, so the Notify slot tokio's RNG picks cannot reorder wakes. The second import is the module's tests."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula/src/snapshot_parts.rs",
+    "snippet_contains": "tokio::sync::watch",
+    "reason": "test-only",
+    "plan": "no action: the `ended` counter and its accessor are #[cfg(test)] pause points for snapshot_parts_tests.rs and do not exist in a simulation build's library."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula-raft/src/registry.rs",
+    "snippet_contains": "use tokio::sync::watch;",
+    "reason": "not-sim-reachable",
+    "plan": "no action: transport_shutdown is subscribed only by the gRPC append-stream server (grpc.rs), which simulations do not run: they replicate over InProcessRaftNetwork. Its send_replace at shutdown wakes no receiver there."
+  },
+  {
+    "category": "unbiased_select",
+    "path": "crates/ursula/src/server.rs",
+    "snippet_contains": "tokio::select! {",
+    "reason": "not-sim-reachable",
+    "plan": "no action: the select sits in spawn_shutdown_signal_task, which waits for SIGTERM or Ctrl-C in the ursula binary. Simulations drive the router through HttpState and never start the server."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula-gateway/src/service.rs",
+    "snippet_contains": "tokio::sync::watch::channel(false)",
+    "reason": "gateway-not-in-sim-surface",
+    "plan": "no action: the gateway crate is not part of the madsim simulation surface."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula-gateway/src/usage.rs",
+    "snippet_contains": "tokio::sync::watch::Receiver<bool>",
+    "reason": "gateway-not-in-sim-surface",
+    "plan": "no action: the gateway crate is not part of the madsim simulation surface."
+  },
+  {
+    "category": "unbiased_select",
+    "path": "crates/ursula-gateway/src/usage.rs",
+    "snippet_contains": "tokio::select! {",
+    "reason": "gateway-not-in-sim-surface",
+    "plan": "no action: the gateway crate is not part of the madsim simulation surface."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula-index/src/service.rs",
+    "snippet_contains": "use tokio::sync::watch;",
+    "reason": "not-sim-reachable",
+    "plan": "no action: the event index service runs its sync and worker loops in its own process with real storage and HTTP clients. No simulation starts it."
+  },
+  {
+    "category": "unbiased_select",
+    "path": "crates/ursula-index/src/service.rs",
+    "snippet_contains": "tokio::select! {",
+    "reason": "not-sim-reachable",
+    "plan": "no action: wait_or_shutdown belongs to the event index service loops, which no simulation starts."
+  },
+  {
+    "category": "unbiased_select",
+    "path": "crates/ursula-observability/src/serve.rs",
+    "snippet_contains": "tokio::select! {",
+    "reason": "not-sim-reachable",
+    "plan": "no action: shutdown_signal and the axum serve loop run only in the binaries; simulations call the router directly and never serve a listener."
   }
 ]

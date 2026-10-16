@@ -3,15 +3,6 @@ use std::ops::Add;
 use std::ops::AddAssign;
 use std::ops::Sub;
 use std::ops::SubAssign;
-use std::pin::pin;
-use std::sync::Arc;
-use std::sync::PoisonError;
-use std::sync::RwLock;
-use std::sync::RwLockReadGuard;
-use std::sync::RwLockWriteGuard;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -34,10 +25,83 @@ use openraft_rt::TryRecvError;
 use openraft_rt::Watch;
 use openraft_rt::WatchReceiver;
 use openraft_rt::WatchSender;
-use sim_tokio::sync::Notify;
 use sim_tokio::sync::mpsc;
 
+use crate::sim_watch as watch;
+
 pub type MadsimOpenRaftRuntime = openraft_rt::deterministic_rng::DeterministicRng<MadsimRuntime>;
+
+/// The stack of a simulation's thread: the 8 MiB of the main thread the
+/// `ursula-sim` subcommands ran their seeds on before each run got a thread
+/// of its own.
+const SIM_THREAD_STACK_BYTES: usize = 8 << 20;
+
+/// Runs the future `workload` builds under a fresh madsim runtime for
+/// `seed`, on a fresh OS thread, then runs `after` on that thread, whether
+/// the workload returned or panicked. Returns both to the caller, the
+/// workload's panic as `Err`.
+///
+/// Every simulation goes through here (`ursula-sim`'s `run_with_madsim`,
+/// this crate's madsim tests, as the `nondeterminism` audit enforces), so no
+/// run starts on a thread an earlier run used. A run leaves state in its
+/// thread's thread-locals that madsim does not reset: lazily seeded ones
+/// such as `rand`'s thread RNG and std's `RandomState` keys draw from
+/// madsim's intercepted `getrandom` only on their first use on a thread, so
+/// a second run on that thread would not spend those draws and every later
+/// draw of madsim's RNG would shift (#638). `after` reads the run's own
+/// thread-locals before the thread ends.
+pub fn run_isolated<W, Fut, A, R>(
+    seed: u64,
+    time_limit: Option<Duration>,
+    workload: W,
+    after: A,
+) -> (std::thread::Result<Fut::Output>, R)
+where
+    W: FnOnce() -> Fut + Send,
+    Fut: Future,
+    Fut::Output: Send,
+    A: FnOnce() -> R + Send,
+    R: Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(format!("madsim-seed-{seed}"))
+            .stack_size(SIM_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                // The runtime comes first: nothing on this thread may draw
+                // a lazily seeded thread-local before madsim intercepts it.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut runtime =
+                        madsim::runtime::Runtime::with_seed_and_config(seed, Default::default());
+                    if let Some(limit) = time_limit {
+                        runtime.set_time_limit(limit);
+                    }
+                    runtime.block_on(workload())
+                }));
+                (result, after())
+            })
+            .expect("spawn the simulation thread")
+            .join()
+            .expect("the simulation thread catches the run's panic")
+    })
+}
+
+/// [`run_isolated`] for a test: the workload's output, its panic resumed on
+/// the caller.
+#[cfg(test)]
+pub(crate) fn run_seeded<W, Fut>(
+    seed: u64,
+    time_limit: Option<Duration>,
+    workload: W,
+) -> Fut::Output
+where
+    W: FnOnce() -> Fut + Send,
+    Fut: Future,
+    Fut::Output: Send,
+{
+    let (result, ()) = run_isolated(seed, time_limit, workload, || ());
+    result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
 
 pin_project_lite::pin_project! {
     pub struct MadsimTimeout<T> {
@@ -307,108 +371,36 @@ where T: OptionalSend + 'static
     }
 }
 
-/// OpenRaft's watch channel under madsim.
-///
-/// `tokio::sync::watch` parks each waiting receiver on one of eight `Notify`s
-/// picked by tokio's thread-local RNG and wakes them slot by slot. tokio seeds
-/// that RNG from a process-wide counter, so when one send wakes several
-/// receivers (a leader's commit reaching every replication stream) the wake
-/// order, and with it the simulated schedule, differs between two runs of one
-/// seed in the same process, as `Runtime::check_determinism` runs them. This
-/// channel parks every receiver on one `Notify`, which wakes them in the order
-/// they started waiting.
+/// OpenRaft's watch channel under madsim: [`crate::sim_watch`], which wakes
+/// its receivers in the order they started waiting instead of in an order
+/// tokio's process-seeded RNG picks. The wrappers expose only OpenRaft's
+/// traits.
 pub struct MadsimWatch;
 
-struct WatchShared<T> {
-    value: RwLock<T>,
-    /// Bumped by every notifying change, under the value's write lock.
-    version: AtomicU64,
-    senders: AtomicUsize,
-    receivers: AtomicUsize,
-    changed: Notify,
-}
+pub struct MadsimWatchSender<T>(watch::Sender<T>);
 
-impl<T> WatchShared<T> {
-    fn read(&self) -> RwLockReadGuard<'_, T> {
-        self.value.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn write(&self) -> RwLockWriteGuard<'_, T> {
-        self.value.write().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Bumps the version while `value` is still locked, then wakes every
-    /// waiting receiver.
-    fn publish(&self, value: RwLockWriteGuard<'_, T>) {
-        self.version.fetch_add(1, Ordering::SeqCst);
-        drop(value);
-        self.changed.notify_waiters();
-    }
-
-    fn subscribe(self: &Arc<Self>) -> MadsimWatchReceiver<T> {
-        self.receivers.fetch_add(1, Ordering::SeqCst);
-        MadsimWatchReceiver {
-            shared: Arc::clone(self),
-            seen: self.version.load(Ordering::SeqCst),
-        }
-    }
-}
-
-pub struct MadsimWatchSender<T>(Arc<WatchShared<T>>);
-
-pub struct MadsimWatchReceiver<T> {
-    shared: Arc<WatchShared<T>>,
-    /// The version this receiver last marked seen.
-    seen: u64,
-}
+pub struct MadsimWatchReceiver<T>(watch::Receiver<T>);
 
 impl<T> Clone for MadsimWatchSender<T> {
     fn clone(&self) -> Self {
-        self.0.senders.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<T> Drop for MadsimWatchSender<T> {
-    fn drop(&mut self) {
-        if self.0.senders.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // The last sender is gone: waiting receivers see the channel closed.
-            self.0.changed.notify_waiters();
-        }
+        Self(self.0.clone())
     }
 }
 
 impl<T> Clone for MadsimWatchReceiver<T> {
     fn clone(&self) -> Self {
-        self.shared.receivers.fetch_add(1, Ordering::SeqCst);
-        Self {
-            shared: Arc::clone(&self.shared),
-            seen: self.seen,
-        }
-    }
-}
-
-impl<T> Drop for MadsimWatchReceiver<T> {
-    fn drop(&mut self) {
-        self.shared.receivers.fetch_sub(1, Ordering::SeqCst);
+        Self(self.0.clone())
     }
 }
 
 impl Watch for MadsimWatch {
     type Sender<T: OptionalSend + OptionalSync> = MadsimWatchSender<T>;
     type Receiver<T: OptionalSend + OptionalSync> = MadsimWatchReceiver<T>;
-    type Ref<'a, T: OptionalSend + 'a> = RwLockReadGuard<'a, T>;
+    type Ref<'a, T: OptionalSend + 'a> = watch::Ref<'a, T>;
 
     fn channel<T: OptionalSend + OptionalSync>(init: T) -> (Self::Sender<T>, Self::Receiver<T>) {
-        let shared = Arc::new(WatchShared {
-            value: RwLock::new(init),
-            version: AtomicU64::new(0),
-            senders: AtomicUsize::new(1),
-            receivers: AtomicUsize::new(0),
-            changed: Notify::new(),
-        });
-        let rx = shared.subscribe();
-        (MadsimWatchSender(shared), rx)
+        let (tx, rx) = watch::channel(init);
+        (MadsimWatchSender(tx), MadsimWatchReceiver(rx))
     }
 }
 
@@ -416,31 +408,22 @@ impl<T> WatchSender<MadsimWatch, T> for MadsimWatchSender<T>
 where T: OptionalSend + OptionalSync
 {
     fn send(&self, value: T) -> Result<(), openraft_rt::watch::SendError<T>> {
-        if self.0.receivers.load(Ordering::SeqCst) == 0 {
-            return Err(openraft_rt::watch::SendError(value));
-        }
-        let mut current = self.0.write();
-        *current = value;
-        self.0.publish(current);
-        Ok(())
+        self.0
+            .send(value)
+            .map_err(|watch::error::SendError(value)| openraft_rt::watch::SendError(value))
     }
 
     fn send_if_modified<F>(&self, modify: F) -> bool
     where F: FnOnce(&mut T) -> bool {
-        let mut current = self.0.write();
-        let modified = modify(&mut current);
-        if modified {
-            self.0.publish(current);
-        }
-        modified
+        self.0.send_if_modified(modify)
     }
 
     fn borrow_watched(&self) -> <MadsimWatch as Watch>::Ref<'_, T> {
-        self.0.read()
+        self.0.borrow()
     }
 
     fn subscribe(&self) -> <MadsimWatch as Watch>::Receiver<T> {
-        self.0.subscribe()
+        MadsimWatchReceiver(self.0.subscribe())
     }
 }
 
@@ -448,61 +431,14 @@ impl<T> WatchReceiver<MadsimWatch, T> for MadsimWatchReceiver<T>
 where T: OptionalSend + OptionalSync
 {
     async fn changed(&mut self) -> Result<(), RecvError> {
-        loop {
-            // Register before checking, so a send between the check and the
-            // wait still wakes this receiver.
-            let mut notified = pin!(self.shared.changed.notified());
-            notified.as_mut().enable();
-            let version = self.shared.version.load(Ordering::SeqCst);
-            if version != self.seen {
-                self.seen = version;
-                return Ok(());
-            }
-            if self.shared.senders.load(Ordering::SeqCst) == 0 {
-                return Err(RecvError(()));
-            }
-            notified.await;
-        }
+        self.0.changed().await.map_err(|_closed| RecvError(()))
     }
 
     fn borrow_watched(&self) -> <MadsimWatch as Watch>::Ref<'_, T> {
-        self.shared.read()
+        self.0.borrow()
     }
 
     fn borrow_and_update(&mut self) -> <MadsimWatch as Watch>::Ref<'_, T> {
-        // Publishers advance the version under this same value lock. Mark
-        // exactly the value being returned seen, including sends after changed().
-        let value = self.shared.read();
-        self.seen = self.shared.version.load(Ordering::SeqCst);
-        value
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use futures_util::FutureExt;
-    use openraft_rt::RecvError;
-    use openraft_rt::Watch;
-    use openraft_rt::WatchReceiver;
-    use openraft_rt::WatchSender;
-
-    use super::MadsimWatch;
-
-    #[test]
-    fn borrowed_watch_update_is_not_delivered_twice() {
-        madsim::runtime::Runtime::new().block_on(async {
-            let (tx, mut rx) = MadsimWatch::channel(0);
-            tx.send(1).unwrap();
-            rx.changed().await.unwrap();
-            // A new command arrives after changed() but before borrowing it.
-            tx.send(2).unwrap();
-            assert_eq!(*rx.borrow_and_update(), 2);
-            assert!(rx.changed().now_or_never().is_none());
-            tx.send(3).unwrap();
-            rx.changed().await.unwrap();
-            assert_eq!(*rx.borrow_and_update(), 3);
-            drop(tx);
-            assert!(matches!(rx.changed().await, Err(RecvError(()))));
-        });
+        self.0.borrow_and_update()
     }
 }

@@ -85,7 +85,7 @@ async fn install(machine: &mut RaftGroupStateMachine, index: u64) -> std::io::Re
 #[test]
 fn snapshot_metadata_acknowledged_pointer_survives_power_loss() {
     for seed in [1, 7, 19, 42, 60, 64] {
-        madsim::runtime::Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+        crate::sim_runtime::run_seeded(seed, None, move || async move {
             let root = SimDisk::provision_dir("snapshot-ack").unwrap();
             // New parent directories must be durable along with the pointer.
             let path = root.join("new/nested/group-7.snapshot.json");
@@ -124,8 +124,8 @@ fn snapshot_metadata_failed_publication_restores_a_complete_pointer() {
             PublicationFailure::DirectorySync,
         ] {
             for host_crash in [false, true] {
-                madsim::runtime::Runtime::with_seed_and_config(seed, Default::default()).block_on(
-                    async {
+                crate::sim_runtime::run_seeded(seed, None, move || {
+                    async move {
                         let root = SimDisk::provision_dir("snapshot-fault").unwrap();
                         let path = root.join("group-7.snapshot.json");
                         let mut state = machine(&path);
@@ -191,8 +191,8 @@ fn snapshot_metadata_failed_publication_restores_a_complete_pointer() {
                             3,
                             "seed {seed} phase {phase:?} host_crash {host_crash}"
                         );
-                    },
-                );
+                    }
+                });
             }
         }
     }
@@ -346,7 +346,7 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
 
     for seed in [1, 7, 42] {
         for restore_sync_fails in [false, true] {
-            madsim::runtime::Runtime::with_seed_and_config(seed, Default::default()).block_on(async {
+            crate::sim_runtime::run_seeded(seed, None, move || async move {
                 let root = SimDisk::provision_dir("snapshot-pins").unwrap();
                 let path = root.join("group-7.snapshot.json");
                 let objects = Arc::new(PinnedObjects::default());
@@ -355,23 +355,58 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
                 let references = coordinator.references(7);
                 let mut state = external_machine(&path, store.clone(), coordinator);
                 install(&mut state, 1).await.unwrap();
-                state.get_snapshot_builder().await.build_snapshot().await.unwrap();
+                state
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap();
                 let durable = visible_pointer(&path);
                 SimDisk::inject_fault(&root, SimDiskFault::Sync).unwrap();
-                state.get_snapshot_builder().await.build_snapshot().await.unwrap_err();
+                state
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+                    .unwrap_err();
                 let candidate = visible_pointer(&path);
-                assert_ne!(candidate.encode_binary().unwrap(), durable.encode_binary().unwrap());
+                assert_ne!(
+                    candidate.encode_binary().unwrap(),
+                    durable.encode_binary().unwrap()
+                );
                 let current = state.get_current_snapshot().await.unwrap().unwrap();
-                assert_eq!(*current.snapshot.get_ref(), durable.encode_binary().unwrap());
-                let expected = [durable.location.clone(), candidate.location.clone()].into_iter().map(|location| {
-                    let SnapshotLocation::S3 { key, .. } = location else { panic!("external pointer"); }; key
-                }).collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    *current.snapshot.get_ref(),
+                    durable.encode_binary().unwrap()
+                );
+                let expected = [durable.location.clone(), candidate.location.clone()]
+                    .into_iter()
+                    .map(|location| {
+                        let SnapshotLocation::S3 { key, .. } = location else {
+                            panic!("external pointer");
+                        };
+                        key
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
                 // A later build still prepares an object, but the terminal
                 // metadata latch must prevent it from overwriting the visible candidate.
                 for _ in 0..3 {
-                    let error = state.get_snapshot_builder().await.build_snapshot().await.unwrap_err();
-                    assert!(error.get_ref().unwrap().is::<super::SnapshotMetadataStopped>());
-                    assert_eq!(visible_pointer(&path).encode_binary().unwrap(), candidate.encode_binary().unwrap());
+                    let error = state
+                        .get_snapshot_builder()
+                        .await
+                        .build_snapshot()
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error
+                            .get_ref()
+                            .unwrap()
+                            .is::<super::SnapshotMetadataStopped>()
+                    );
+                    assert_eq!(
+                        visible_pointer(&path).encode_binary().unwrap(),
+                        candidate.encode_binary().unwrap()
+                    );
                     references.publish_current(&store, 7).await.unwrap();
                     objects.collect_unreferenced();
                     assert_eq!(objects.pins(), expected);
@@ -379,26 +414,49 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
                 drop(state);
                 references.publish_current(&store, 7).await.unwrap();
                 objects.collect_unreferenced();
-                assert_eq!(objects.pins(), expected, "engine drop cannot release an uncertain pointer");
+                assert_eq!(
+                    objects.pins(),
+                    expected,
+                    "engine drop cannot release an uncertain pointer"
+                );
                 SimDisk::process_crash(&root).unwrap();
-                let mut restored = external_machine(&path, store.clone(), SnapshotInstallCoordinator::default());
+                let mut restored =
+                    external_machine(&path, store.clone(), SnapshotInstallCoordinator::default());
                 if restore_sync_fails {
                     SimDisk::inject_fault(&root, SimDiskFault::Sync).unwrap();
                     let error = restored.restore_persisted_snapshot().await.unwrap_err();
-                    assert!(matches!(error.get_ref().and_then(|error| error.downcast_ref::<SimDiskError>()),
-                        Some(SimDiskError::Injected { path, fault: SimDiskFault::Sync }) if path == &root));
-                    assert_eq!(objects.pins(), expected, "failed restart fsync must not reconcile either pin");
+                    assert!(
+                        matches!(error.get_ref().and_then(|error| error.downcast_ref::<SimDiskError>()),
+                        Some(SimDiskError::Injected { path, fault: SimDiskFault::Sync }) if path == &root)
+                    );
+                    assert_eq!(
+                        objects.pins(),
+                        expected,
+                        "failed restart fsync must not reconcile either pin"
+                    );
                 } else {
                     restored.restore_persisted_snapshot().await.unwrap();
                     objects.collect_unreferenced();
                 }
                 drop(restored);
                 SimDisk::power_loss_losing_unsynced(&root).unwrap();
-                let mut after_power_loss = external_machine(&path, store.clone(), SnapshotInstallCoordinator::default());
+                let mut after_power_loss =
+                    external_machine(&path, store.clone(), SnapshotInstallCoordinator::default());
                 after_power_loss.restore_persisted_snapshot().await.unwrap();
-                let current = after_power_loss.get_current_snapshot().await.unwrap().unwrap();
-                let expected_pointer = if restore_sync_fails { durable } else { candidate };
-                assert_eq!(*current.snapshot.get_ref(), expected_pointer.encode_binary().unwrap());
+                let current = after_power_loss
+                    .get_current_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let expected_pointer = if restore_sync_fails {
+                    durable
+                } else {
+                    candidate
+                };
+                assert_eq!(
+                    *current.snapshot.get_ref(),
+                    expected_pointer.encode_binary().unwrap()
+                );
             });
         }
     }

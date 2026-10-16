@@ -405,7 +405,11 @@ impl SnapshotBuildCoordinator {
             if running < slots.max(1) {
                 return self.acquire().await.map(Some);
             }
+            // Biased, so the branch polled first is fixed rather than drawn
+            // from tokio's thread RNG, which a process-wide counter seeds
+            // (#638).
             crate::rt::select! {
+                biased;
                 changed = builds.changed() => {
                     changed.map_err(|_closed| SnapshotPermitError::RegistryClosed)?;
                 }
@@ -3081,6 +3085,7 @@ mod tests {
                 let built = builder.build_snapshot();
                 tokio::pin!(built);
                 tokio::select! {
+                    biased;
                     _built = &mut built => panic!("{stuck:?} never ends"),
                     () = entered.notified() => {}
                 }

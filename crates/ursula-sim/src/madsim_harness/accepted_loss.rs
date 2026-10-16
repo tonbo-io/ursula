@@ -712,6 +712,7 @@ mod tests {
     use super::CUT_INVARIANT;
     use super::Controls;
     use super::UNPLANNED_LEADER_INVARIANT;
+    use crate::madsim_harness::SimEvent;
     use crate::madsim_harness::SimScenario;
     use crate::madsim_harness::SimTrace;
     use crate::madsim_harness::ThreeNodeRaftSim;
@@ -724,7 +725,6 @@ mod tests {
     }
 
     fn assert_fails(scenario: SimScenario, seed: u64, controls: Controls, invariant: &str) {
-        SimTrace::clear_recorded();
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(|| {
@@ -840,6 +840,18 @@ mod tests {
     /// sent leader last, some run counts a vote that a member refused the
     /// unplanned leader for its entry above the point at or below the plan
     /// term, a refusal only the log guard makes.
+    ///
+    /// The guard alone keeps out the unplanned leader, but under the
+    /// leader-last order it does not always let the plan finish (#643). On
+    /// seeds 393 and 403 a member that took the plan elects the plan's
+    /// leader below the plan term before the leader took it. The leader
+    /// keeps leading there while the survivor campaigns at a higher term,
+    /// and the plan's history event never applies. Those seeds check safety
+    /// only: no leader without the plan is ever elected (G1), and the run
+    /// ends, if at all, in the wait for the plan. The tool and the runbook
+    /// always send the plan to its leader first, so the stall needs a
+    /// hand-built `follow` sent before the `lead`. Before #638, seed 393
+    /// passed only after other simulations on the same thread.
     #[test]
     fn either_defence_against_an_unplanned_leader_alone_suffices() {
         let _guard = sim_test_guard();
@@ -860,7 +872,7 @@ mod tests {
                 .events
                 .iter()
                 .find_map(|event| match event {
-                    crate::madsim_harness::SimEvent::RecoveryPlanVerified {
+                    SimEvent::RecoveryPlanVerified {
                         leader_first,
                         guard_refusals,
                         ..
@@ -870,7 +882,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("seed {seed} {controls:?}: no plan verified"))
         };
         let mut guard_fired = false;
-        for seed in 390..=394 {
+        for seed in 394..=398 {
             let (leader_first, _) = verified(Controls::NO_LOG_GUARD, seed);
             assert!(
                 leader_first,
@@ -883,6 +895,35 @@ mod tests {
             guard_fired,
             "no seed counted a vote the log guard refused: the guard alone was never shown"
         );
+        for seed in [393, 403] {
+            let (leader_first, _) = verified(Controls::NO_LOG_GUARD, seed);
+            assert!(
+                leader_first,
+                "seed {seed}: a member took the plan before its leader"
+            );
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let result = std::panic::catch_unwind(|| {
+                ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
+                    config(seed, scenario),
+                    scenario,
+                    leader_last_only,
+                )
+            });
+            std::panic::set_hook(previous_hook);
+            let failed = SimTrace::last_recorded()
+                .events
+                .into_iter()
+                .find(|event| matches!(event, SimEvent::InvariantFailed { .. }));
+            assert!(failed.is_none(), "seed {seed}: {failed:?}");
+            if let Err(payload) = result {
+                let panic = crate::madsim_harness::introspect::panic_payload_to_string(payload);
+                assert!(
+                    panic.contains("the recovery plan's history event never applied everywhere"),
+                    "seed {seed}: {panic}"
+                );
+            }
+        }
     }
 
     #[test]

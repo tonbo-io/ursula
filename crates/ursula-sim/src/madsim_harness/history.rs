@@ -828,7 +828,6 @@ mod tests {
     /// failed.
     fn assert_fails(scenario: SimScenario, seed: u64, controls: Controls, invariant: &str) {
         let _guard = sim_test_guard();
-        SimTrace::clear_recorded();
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(|| {

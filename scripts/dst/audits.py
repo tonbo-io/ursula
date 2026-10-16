@@ -92,6 +92,28 @@ NONDET_CATEGORIES: tuple[NondetCategory, ...] = (
         description="std::thread::sleep — blocks the madsim scheduler thread",
         pattern=re.compile(r"\bthread::sleep\b|std::thread::sleep"),
     ),
+    NondetCategory(
+        name="tokio_watch",
+        description=(
+            "tokio::sync::watch — parks receivers on Notify slots tokio's thread RNG picks, "
+            "and a process-wide counter seeds that RNG, so the wake order of several "
+            "receivers depends on the process (#638). Use `crate::rt::sync::watch` "
+            "(ursula-raft's sim_watch under cfg(madsim))."
+        ),
+        pattern=re.compile(r"\b(?:sim_)?tokio::sync::watch\b"),
+    ),
+)
+
+# A tokio `select!` without `biased;` starts at a branch tokio's thread RNG
+# draws, and a process-wide counter seeds that RNG (#638). futures' `select!`
+# is patched (third_party/futures-macro) and not matched here.
+UNBIASED_SELECT = NondetCategory(
+    name="unbiased_select",
+    description=(
+        "tokio `select!` without `biased;` — its first branch comes from tokio's "
+        "process-seeded thread RNG (#638). Add `biased;`."
+    ),
+    pattern=re.compile(r"\b(?:sim_tokio|tokio|rt)::select!\s*\{(?!\s*biased\s*;)"),
 )
 
 
@@ -144,7 +166,50 @@ def _scan_nondeterminism() -> list[NondetFinding]:
                         NondetFinding(category.name, rp, lineno, stripped)
                     )
                     break
+        for m in UNBIASED_SELECT.pattern.finditer(text):
+            lineno = text.count("\n", 0, m.start()) + 1
+            line = text.splitlines()[lineno - 1].strip()
+            if line.startswith("//"):
+                continue
+            findings.append(NondetFinding(UNBIASED_SELECT.name, rp, lineno, line))
     return findings
+
+
+# A madsim runtime starts only on a fresh thread: `run_isolated` in
+# ursula-raft's sim_runtime.rs, which `ursula-sim`'s `run_with_madsim` and the
+# crate's madsim tests call (#638). madsim's own `Runtime::check_determinism`
+# and `#[madsim::test]` spawn a thread per run and are not matched.
+MADSIM_RUNTIME_RE = re.compile(
+    r"\bRuntime\s*::\s*with_seed_and_config\b|madsim::runtime::Runtime\s*::\s*new\b"
+)
+MADSIM_RUNTIME_HOMES: dict[str, set[str]] = {
+    "crates/ursula-raft/src/sim_runtime.rs": {
+        "run_isolated",
+        # OpenRaft's `AsyncRuntime::block_on`, which only OpenRaft's runtime
+        # suite calls (`madsim_openraft_runtime_passes_the_openraft_runtime_suite`).
+        "block_on",
+    },
+}
+FN_RE = re.compile(r"\bfn\s+(\w+)")
+
+
+def _misplaced_madsim_runtimes() -> list[str]:
+    """Every madsim runtime built outside its homes, as `path:line  snippet`."""
+    misplaced = []
+    for path in sorted((ROOT / "crates").rglob("*.rs")):
+        rp = path.relative_to(ROOT).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        for m in MADSIM_RUNTIME_RE.finditer(text):
+            lineno = text.count("\n", 0, m.start()) + 1
+            line = lines[lineno - 1].strip()
+            if line.startswith("//"):
+                continue
+            enclosing = FN_RE.findall(text[: m.start()])
+            if enclosing and enclosing[-1] in MADSIM_RUNTIME_HOMES.get(rp, set()):
+                continue
+            misplaced.append(f"  {rp}:{lineno}  {line}")
+    return misplaced
 
 
 @dataclass(frozen=True)
@@ -193,7 +258,7 @@ def _render_nondet_markdown(findings: list[NondetFinding]) -> str:
     by_cat: dict[str, list[NondetFinding]] = {}
     for f in findings:
         by_cat.setdefault(f.category, []).append(f)
-    for cat in NONDET_CATEGORIES:
+    for cat in (*NONDET_CATEGORIES, UNBIASED_SELECT):
         hits = by_cat.get(cat.name, [])
         lines.append(f"## {cat.name} ({len(hits)})")
         lines.append("")
@@ -270,10 +335,23 @@ def audit_nondeterminism(argv: list[str]) -> int:
             print(f"  [{w.category}] {w.path}  contains={w.snippet_contains!r}")
         return 1
 
+    misplaced = _misplaced_madsim_runtimes()
+    if misplaced:
+        print("ERROR: madsim runtimes built outside `run_isolated` (ursula-raft sim_runtime.rs):")
+        for line in misplaced:
+            print(line)
+        print()
+        print(
+            "A runtime on a thread an earlier run used inherits its thread-locals (#638).\n"
+            "Run the workload through `ursula_raft::run_isolated` (ursula-sim: `run_with_madsim`)."
+        )
+        return 1
+
     print(
         f"OK: {len(findings)} nondeterminism finding(s), all covered by "
         f"{len(whitelist)} whitelist entr{'y' if len(whitelist) == 1 else 'ies'}."
     )
+    print("OK: every madsim runtime starts in `run_isolated`.")
     return 0
 
 

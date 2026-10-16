@@ -69,3 +69,32 @@ def test_corpus_files_exist():
 def test_sim_patches_audit_rejects_a_dropped_patch(monkeypatch, packages):
     monkeypatch.setattr(audits, "_lock_packages", lambda: packages)
     assert audits.audit_sim_patches([]) == 1
+
+
+def _crate_file(root, rel_path: str, body: str) -> None:
+    path = root / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+def test_nondeterminism_flags_an_unbiased_tokio_select(monkeypatch, tmp_path):
+    _crate_file(tmp_path, "crates/demo/src/lib.rs", (
+        "async fn a() { tokio::select! { _ = x() => {} } }\n"
+        "async fn b() { crate::rt::select! {\n    biased;\n    _ = x() => {}\n} }\n"
+        "async fn c() { futures::select! { _ = x() => {} } }\n"
+    ))
+    monkeypatch.setattr(audits, "ROOT", tmp_path)
+    findings = audits._scan_nondeterminism()
+    assert [(f.category, f.line) for f in findings] == [("unbiased_select", 1)]
+
+
+def test_nondeterminism_flags_a_madsim_runtime_outside_run_isolated(monkeypatch, tmp_path):
+    _crate_file(tmp_path, "crates/ursula-raft/src/sim_runtime.rs", (
+        "pub fn run_isolated() { madsim::runtime::Runtime::with_seed_and_config(1, c); }\n"
+    ))
+    _crate_file(tmp_path, "crates/demo/src/tests.rs", (
+        "fn helper() { madsim::runtime::Runtime::with_seed_and_config(1, c).block_on(f); }\n"
+    ))
+    monkeypatch.setattr(audits, "ROOT", tmp_path)
+    misplaced = audits._misplaced_madsim_runtimes()
+    assert len(misplaced) == 1 and "crates/demo/src/tests.rs:1" in misplaced[0]

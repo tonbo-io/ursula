@@ -2514,12 +2514,8 @@ fn run_madsim_three_node_raft_with_policy_once(
     seed: u64,
     policy: InProcessRaftNetworkPolicy,
 ) -> (u64, u64) {
-    let mut runtime =
-        madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
-    runtime.set_time_limit(Duration::from_secs(10));
-    runtime.block_on(crate::sim_runtime::MadsimOpenRaftRuntime::scope(
-        seed,
-        async move {
+    crate::sim_runtime::run_seeded(seed, Some(Duration::from_secs(10)), move || {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(seed, async move {
             let (_, engines, leader_id) =
                 build_madsim_three_node_raft_cluster_with_policy(seed, policy).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
@@ -2560,18 +2556,14 @@ fn run_madsim_three_node_raft_with_policy_once(
             let result = (leader_id, appended_log_index);
             shutdown_all(&engines).await;
             result
-        },
-    ))
+        })
+    })
 }
 
 #[cfg(madsim)]
 fn run_madsim_three_node_raft_with_fault_script_once(seed: u64) -> (u64, u64, u64) {
-    let mut runtime =
-        madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
-    runtime.set_time_limit(Duration::from_secs(10));
-    runtime.block_on(crate::sim_runtime::MadsimOpenRaftRuntime::scope(
-        seed,
-        async move {
+    crate::sim_runtime::run_seeded(seed, Some(Duration::from_secs(10)), move || {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(seed, async move {
             let policy = InProcessRaftNetworkPolicy::default();
             let (_, engines, leader_id) =
                 build_madsim_three_node_raft_cluster_with_policy(seed, policy.clone()).await;
@@ -2634,8 +2626,8 @@ fn run_madsim_three_node_raft_with_fault_script_once(seed: u64) -> (u64, u64, u6
             assert_eq!(read.payload, b"simulated");
             assert_eq!(script.seed(), seed);
             (leader_id, isolated_id, appended_log_index)
-        },
-    ))
+        })
+    })
 }
 
 #[cfg(madsim)]
@@ -4423,31 +4415,87 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
     use openraft::rt::WatchReceiver;
     for seed in [7, 19, 42] {
         let _guard = madsim_test_guard();
-        madsim::runtime::Runtime::with_seed_and_config(seed, Default::default()).block_on(
+        crate::sim_runtime::run_seeded(seed, None, move || {
             crate::sim_runtime::MadsimOpenRaftRuntime::scope(seed, async move {
-                let (_network, engines, leader_id) = build_madsim_three_node_raft_cluster(seed).await;
-                let leader = engines.iter().find(|engine| engine.raft.metrics().borrow_watched().id == leader_id).unwrap();
+                let (_network, engines, leader_id) =
+                    build_madsim_three_node_raft_cluster(seed).await;
+                let leader = engines
+                    .iter()
+                    .find(|engine| engine.raft.metrics().borrow_watched().id == leader_id)
+                    .unwrap();
                 let stream = bsid("apply-re-election");
                 create_stream_via_raft(leader, stream.clone()).await;
-                let before = leader.with_state_machine(|state| Box::pin(async move { state.last_applied_log_id.unwrap() })).await.unwrap();
+                let before = leader
+                    .with_state_machine(|state| {
+                        Box::pin(async move { state.last_applied_log_id.unwrap() })
+                    })
+                    .await
+                    .unwrap();
                 let index = before.index.checked_add(1).unwrap();
-                leader.with_state_machine(move |state| Box::pin(async move {
-                    state.apply_fault = Some(if seed == 19 { crate::apply_failure::ApplyFault::InvariantAfterMutation { index } } else { crate::apply_failure::ApplyFault::PanicAfterMutation { index } });
-                })).await.unwrap();
-                let error = leader.write(append_command(stream.clone(), b"committed-poison")).await.unwrap_err();
-                assert!(matches!(error, GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)));
-                let refused = leader.write(append_command(stream.clone(), b"after-stop")).await.unwrap_err();
-                assert!(matches!(refused, GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index: failed, .. }) if failed == index));
-                let candidates = engines.iter().filter(|engine| engine.raft.metrics().borrow_watched().id != leader_id).map(|engine| Box::pin(async move {
-                    engine.raft.wait(Some(Duration::from_secs(5))).metrics(|m| m.state == openraft::ServerState::Leader, "replacement elected").await.map(|_| engine)
-                })).collect::<Vec<_>>();
-                let replacement = futures_util::future::select_all(candidates).await.0.unwrap();
-                replacement.raft.ensure_linearizable(openraft::ReadPolicy::ReadIndex).await.unwrap();
-                replacement.write(append_command(stream, b"after-re-election")).await.unwrap();
-                assert_eq!(leader.raft.metrics().borrow_watched().last_applied, Some(before));
+                leader
+                    .with_state_machine(move |state| {
+                        Box::pin(async move {
+                            state.apply_fault = Some(if seed == 19 {
+                                crate::apply_failure::ApplyFault::InvariantAfterMutation { index }
+                            } else {
+                                crate::apply_failure::ApplyFault::PanicAfterMutation { index }
+                            });
+                        })
+                    })
+                    .await
+                    .unwrap();
+                let error = leader
+                    .write(append_command(stream.clone(), b"committed-poison"))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
+                ));
+                let refused = leader
+                    .write(append_command(stream.clone(), b"after-stop"))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(refused, GroupEngineError::Infra(ursula_runtime::GroupInfraError::ApplyStopped { index: failed, .. }) if failed == index)
+                );
+                let candidates = engines
+                    .iter()
+                    .filter(|engine| engine.raft.metrics().borrow_watched().id != leader_id)
+                    .map(|engine| {
+                        Box::pin(async move {
+                            engine
+                                .raft
+                                .wait(Some(Duration::from_secs(5)))
+                                .metrics(
+                                    |m| m.state == openraft::ServerState::Leader,
+                                    "replacement elected",
+                                )
+                                .await
+                                .map(|_| engine)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let replacement = futures_util::future::select_all(candidates)
+                    .await
+                    .0
+                    .unwrap();
+                replacement
+                    .raft
+                    .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+                    .await
+                    .unwrap();
+                replacement
+                    .write(append_command(stream, b"after-re-election"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    leader.raft.metrics().borrow_watched().last_applied,
+                    Some(before)
+                );
                 assert_eq!(leader.apply_health.failure().unwrap().index, index);
                 shutdown_all(&engines).await;
             })
-        );
+        });
     }
 }

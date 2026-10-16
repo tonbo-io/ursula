@@ -6,8 +6,6 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 #[cfg(not(madsim))]
 use std::time::SystemTime;
@@ -15,7 +13,6 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
-use crossbeam_utils::CachePadded;
 use futures_util::TryStreamExt;
 use opendal::EntryMode;
 use opendal::Operator;
@@ -80,11 +77,47 @@ impl ColdObjectWriter {
         }
     }
 }
-// Keep this global atomic isolated from unrelated statics. This does not remove
-// contention on the counter itself, but avoids accidental false sharing with
-// adjacent data without adding a per-core sequence scheme to this low-frequency
-// object-key path.
-static COLD_CHUNK_SEQUENCE: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+/// The sequence component of every new cold object name (chunks, packs,
+/// external payloads, snapshot parts).
+#[cfg(not(madsim))]
+mod object_sequence {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use crossbeam_utils::CachePadded;
+
+    // Keep this global atomic isolated from unrelated statics. This does not
+    // remove contention on the counter itself, but avoids accidental false
+    // sharing with adjacent data without adding a per-core sequence scheme to
+    // this low-frequency object-key path.
+    static SEQUENCE: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+
+    pub(super) fn next() -> u64 {
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// The sequence component of every new cold object name, per thread. madsim
+/// runs a simulation on one thread, and the harness runs each one on a fresh
+/// thread, so every run numbers its objects from zero. A process-wide counter
+/// would carry over from one run to the next and rename the objects of a
+/// later seed (#638).
+#[cfg(madsim)]
+mod object_sequence {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static SEQUENCE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn next() -> u64 {
+        SEQUENCE.with(|sequence| {
+            let next = sequence.get();
+            sequence.set(next.wrapping_add(1));
+            next
+        })
+    }
+}
 
 /// Applies the configured server-side encryption to an S3 builder and returns
 /// the label recorded in [`ColdStoreInfo`]. Shared by the cold store and the
@@ -1697,7 +1730,7 @@ pub fn new_cold_chunk_path_in_generation(
     end_offset: u64,
 ) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = object_sequence::next();
     format!(
         "{}{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin",
         cold_chunk_dir(stream_id, generation)
@@ -1752,7 +1785,7 @@ fn hex_fields_with_suffix(name: &str, suffix: &str, widths: &[usize]) -> bool {
 
 pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = object_sequence::next();
     format!(
         "{}{unix_nanos:032x}-{sequence:016x}.bin",
         cold_pack_dir(bucket_id, raft_group_id)
@@ -1778,7 +1811,7 @@ pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
 
 pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = object_sequence::next();
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
@@ -1788,7 +1821,7 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
 /// its commit can never remove data.
 pub fn new_snapshot_part_id() -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = object_sequence::next();
     format!("{unix_nanos:032x}-{sequence:016x}{SNAPSHOT_PART_SUFFIX}")
 }
 
@@ -1842,15 +1875,6 @@ pub fn snapshot_part_path(
 /// replicated state ever references one.
 pub fn is_snapshot_part_object_name(name: &str) -> bool {
     hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[16, 32, 16])
-}
-
-/// Reset the global cold-object sequence counter. Only available under
-/// `cfg(madsim)` so the simulator can clear state between scenarios when
-/// running multiple seeds in one process (e.g. `Runtime::check_determinism`).
-#[cfg(madsim)]
-#[allow(dead_code)]
-pub fn reset_cold_chunk_sequence_for_sim() {
-    COLD_CHUNK_SEQUENCE.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
