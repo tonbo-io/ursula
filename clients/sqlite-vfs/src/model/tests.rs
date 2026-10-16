@@ -1,6 +1,6 @@
 //! The model through its production entry point, the in-process transport: every answer is
 //! rendered with `ursula_headers` and parsed back by `wire`, as a client reads it. Rows cite
-//! #581 §2.3.1.
+//! the producer rules (extensions: Producer Write Answers).
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1095,7 +1095,8 @@ fn retention_is_monotonic() {
 
 #[test]
 fn w5_a_history_event_reports_the_previous_token_and_the_tail() {
-    // §4.8: no write since the event: the previous token and the current tail.
+    // extensions: Snapshot Metadata on HEAD and Stream Incarnation: no write since the event: the
+    // previous token and the current tail.
     let world = World::new();
     let old = world.create();
     world.server().foreign_append(PATH, &[1; 30]).unwrap();
@@ -1206,7 +1207,7 @@ fn s4_8_row_11_closes_the_epoch_at_its_last_seq_after_the_412() {
         .history_event(HistoryEvent::NewHistory)
         .unwrap();
     let new = world.server().token(PATH).unwrap();
-    // The old token gets 412 first (G2).
+    // The old token gets 412 first (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
     assert_eq!(world.send(&write(tokened(old), 1, 2, b"two")).status, 412);
     // Row 11 under the new token: the epoch is closed at its surviving last seq.
     let ProducerAnswer::EpochClosed(closure) = world.producer(&write(tokened(new), 1, 2, b"two"))

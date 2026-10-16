@@ -1,7 +1,8 @@
-//! Re-keys (design §6.2, W5): a HEAD that names another token whose history inherits the
-//! generation rolls the log to the new token and claims under it, from streaming, during a
-//! continuation claim (D4's repeat rule), during a takeover and during a provisional open's claim,
-//! and what the claim's reconcile finds after it.
+//! Re-keys (design: History; extensions: Snapshot Metadata on HEAD and Stream Incarnation): a HEAD
+//! that names another token whose history inherits the generation rolls the log to the new token
+//! and claims under it, from streaming, during a continuation claim (the repeat rule, design:
+//! History), during a takeover and during a provisional open's claim, and what the claim's
+//! reconcile finds after it.
 
 use ursula_headers::ClosedEpoch;
 use ursula_headers::Delivery;
@@ -221,7 +222,8 @@ fn decide_head_rows() {
         HeadDecision::Rewound
     );
     // A re-key whose claim has not landed still inherits from the token before it: two history
-    // events with no write between them name it (#581 §4.8).
+    // events with no write between them name it (extensions: Snapshot Metadata on HEAD and Stream
+    // Incarnation).
     assert_eq!(
         decide(&head(other_token(), 40, Some((new_token(), 40))), None),
         HeadDecision::Rewound
@@ -566,9 +568,9 @@ fn rekeyed_takeover(pending: Vec<crate::replicator::Pending>) -> (Harness, u64) 
 
 /// Bound under T0; event 1 (T1) re-keys and claims epoch 2, which applies under T1 with its
 /// answer lost. Event 2 (T2) names T1: the generation re-keys from T1 and resends epoch 2, a
-/// repeat, so D4 claims epoch 3, which is lost before it applies. Event 3 (T3) still names T1, the
-/// generation's own token with every acknowledged byte kept: it re-keys, never resets `rewound`,
-/// after a pre-check, since claim 2 was never streamed in.
+/// repeat, so the repeat rule (design: History) claims epoch 3, which is lost before it applies.
+/// Event 3 (T3) still names T1, the generation's own token with every acknowledged byte kept: it
+/// re-keys, never resets `rewound`, after a pre-check, since claim 2 was never streamed in.
 #[test]
 fn a_third_event_after_an_unknown_claim_outcome_re_keys_from_the_token_it_names() {
     let (mut h, batch) = streaming(1);
@@ -605,7 +607,7 @@ fn a_third_event_after_an_unknown_claim_outcome_re_keys_from_the_token_it_names(
     let actions = h.answer(&head(t(10), tail2, Some((t(8), tail2))));
     assert_eq!(reset_of(&actions), None, "{actions:?}");
     // Claim 2 was never streamed in, and its frame lies past the acknowledged offset: the event
-    // may have lost it, so the re-key pre-checks under T3 first (design §7).
+    // may have lost it, so the re-key pre-checks under T3 first (design: Pre-check).
     assert_eq!(rekey_of(&actions), None, "{actions:?}");
     assert_eq!(h.last_request().method, Method::Head);
     let actions = h.answer(&head(t(10), tail2, Some((t(8), tail2))));
@@ -683,9 +685,9 @@ fn a_takeover_with_commits_pending_resets_before_it_re_keys() {
     assert_eq!(rekey_of(&actions), None);
 }
 
-/// D4's follow-up claim closes only the repeated claim's epoch, so its reconcile checks the epoch
-/// the binding streamed in against what the repeat said it closed: a batch found above that seq
-/// resets `stream_state`.
+/// The repeat rule's follow-up claim (design: History) closes only the repeated claim's epoch, so
+/// its reconcile checks the epoch the binding streamed in against what the repeat said it closed: a
+/// batch found above that seq resets `stream_state`.
 #[test]
 fn a_follow_up_after_a_repeat_cross_checks_the_streamed_epoch() {
     let (mut h, batch) = streaming(2);
@@ -746,7 +748,7 @@ fn a_416_on_a_read_sends_head() {
 }
 
 /// A takeover re-keyed at open whose reconcile finds a foreign commit where its pending commit
-/// should be discards the pending tail only with a salvage of the generation (design §6.2): the
+/// should be discards the pending tail only with a salvage of the generation (design: History): the
 /// open re-keys only with nothing pending, so this is the defence behind that gate. A takeover
 /// that did not re-key rebuilds with no salvage.
 #[test]
@@ -804,7 +806,7 @@ fn a_rebuild_that_discards_after_a_rekey_at_open_salvages() {
 /// The activation of the open that logged a provisional open's claim.
 const PRIOR: Activation = Activation([0x5a; 16]);
 
-/// A provisional open (design §5.5) of a generation whose log's latest claim is `(3, PRIOR)`,
+/// A provisional open (design: Open) of a generation whose log's latest claim is `(3, PRIOR)`,
 /// acknowledged up to the claim at `0..37`, with `pending`: its pre-check's HEAD goes out first.
 fn provisional(pending: Vec<crate::replicator::Pending>) -> Harness {
     let mut state = local(pending, CLAIM);
@@ -910,10 +912,10 @@ fn a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expi
 }
 
 /// The pre-check finds another owner's claim after the log's acknowledged offset: it resets
-/// `fenced` with nothing sent. One followed by a claim of its own is superseded (N1), and a foreign
-/// commit resets `stale`. A `410` sends a HEAD first (a read of another history gets its `410`
-/// before its `412`): our token still there, retention passed the acknowledged offset, `stale`.
-/// A new token that inherits the generation pre-checks again under it, from its HEAD.
+/// `fenced` with nothing sent. One followed by a claim of its own is superseded (design: Claims),
+/// and a foreign commit resets `stale`. A `410` sends a HEAD first (a read of another history gets
+/// its `410` before its `412`): our token still there, retention passed the acknowledged offset,
+/// `stale`. A new token that inherits the generation pre-checks again under it, from its HEAD.
 #[test]
 fn a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent() {
     let foreign = frame::encode_claim(epoch(4), FOREIGN);
@@ -981,9 +983,9 @@ fn a_provisional_pre_check_re_keys_and_claims_once_more_after_its_claim() {
     assert_eq!(claim_of(&actions), Some((4, ACTIVATION)), "{actions:?}");
 }
 
-/// The B2 stopgap holds for a provisional open as for a takeover: its log's ACK may trail what
-/// the stream acknowledged of the commits after it, so an inheriting history resets `rewound`
-/// before anything is logged or sent.
+/// The history gate (design: History) holds for a provisional open as for a takeover: its log's ACK
+/// may trail what the stream acknowledged of the commits after it, so an inheriting history resets
+/// `rewound` before anything is logged or sent.
 #[test]
 fn a_provisional_pre_check_with_commits_after_its_ack_resets_before_it_re_keys() {
     let mut h = provisional(vec![commit(LINEAGE, 1, 1)]);

@@ -1,7 +1,7 @@
 //! The outstanding request ([`Link`]): what to do with an answer that decides nothing about the
-//! request itself (design §4.6, §4.7). It resends the identical request after backoff, doubling
-//! from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped at
-//! 60 s); retries a blocked request every 30 s; and parks the request while a HEAD checks the
+//! request itself (design: Appends, Answers). It resends the identical request after backoff,
+//! doubling from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped
+//! at 60 s); retries a blocked request every 30 s; and parks the request while a HEAD checks the
 //! stream's token, cluster and limit. A HEAD naming a history that inherits the generation hands
 //! the re-key to the replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight
 //! hands it the re-cut ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a
@@ -63,7 +63,7 @@ pub(crate) enum Hit {
     None,
 }
 
-/// What the answer to the HEAD a request waits on leads to (design §4.7, §6.2).
+/// What the answer to the HEAD a request waits on leads to (design: Answers, History).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeadOutcome {
     /// The request waits: retried after backoff, blocked, or the HEAD itself is retried.

@@ -10,8 +10,7 @@
 //! the `synced()` probe) and everything else, so a stream's probe never waits behind its append,
 //! and no stream waits behind another's. Each disk job runs on a thread of its own, so one
 //! database's catch-up never stalls the others. A panic in the core is contained: inside a
-//! binding's step it resets that binding `internal`. M3 replaces the workers with an async
-//! transport, not the core.
+//! binding's step it resets that binding `internal`.
 //!
 //! The driver keeps every thread's `JoinHandle` and joins them when it drops.
 
@@ -531,7 +530,7 @@ impl Threads {
     /// request no worker takes is answered as lost, so the core retries it.
     ///
     /// Lanes are not removed: two idle threads per stream URL the process opened, a bound set by
-    /// the streams an application opens. M3's async transport replaces them.
+    /// the streams an application opens.
     fn http(&mut self, io: HttpIo) {
         let mut io = io;
         for _ in 0..2 {

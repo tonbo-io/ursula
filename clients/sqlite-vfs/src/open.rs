@@ -1,4 +1,4 @@
-//! Opening a stream (design §5.5): from the URL to a takeover ready to claim. The driver's core
+//! Opening a stream (design: Open): from the URL to a takeover ready to claim. The driver's core
 //! runs it as a step machine: every request and every disk job goes out through the core, and
 //! their outcomes come back to [`Opening::answered`] and [`Opening::disk_done`].
 //!
@@ -7,30 +7,30 @@
 //! reset bindings' connections still hold, finishes what a crash left, and materializes the
 //! current generation when there is one (a gap under valid checksums is `internal`). A generation
 //! the connections of a reset binding still hold is never materialized under them: the open copies
-//! it, publishes the copy in its place and materializes the copy ([`Root::copy`], design §5.6). A
-//! generation whose db file is not its own, or whose log's first segment header is unreadable, is
-//! left as found and salvaged as `replaced` by the build that replaces it. Then
-//! a HEAD without a precondition decides, before any claim, by the table of design §5.5
+//! it, publishes the copy in its place and materializes the copy ([`Root::copy`], design:
+//! Materialize). A generation whose db file is not its own, or whose log's first segment header is
+//! unreadable, is left as found and salvaged as `replaced` by the build that replaces it. Then a
+//! HEAD without a precondition decides, before any claim, by the open table (design: Open)
 //! ([`table::decide`]): it creates the stream, builds a generation from the latest snapshot and the
 //! tail, takes over with the generation's token, re-keys a generation whose history the stream
-//! inherits and takes over, or refuses. A build that replaces a generation holding data salvages
-//! it ([`crate::salvage`]) in the same publish: a generation of another token the history does not
+//! inherits and takes over, or refuses. A build that replaces a generation holding data salvages it
+//! ([`crate::salvage`]) in the same publish: a generation of another token the history does not
 //! inherit, or does while its log holds commits after its latest ACK (`history_changed`), one over
 //! whose missing stream the open created another (`recreate`, `recreated`), or a replaced one.
 //!
 //! Every refusal keeps the local files and sends nothing to the stream. A request that gets no
 //! answer is sent again under the replicator's retry [`Policy`] until the open's deadline, which
 //! then fails with the last condition (`unreachable` when nothing ever went out). A fresh build
-//! whose stream changes history while it reads starts over under the new token (design D8),
-//! bounded like its restarts after a `410`.
+//! whose stream changes history while it reads starts over under the new token (design:
+//! Materialize), bounded like its restarts after a `410`.
 //!
 //! When the first HEAD gets no answer with nothing sent (the name lookup or the connect failed,
 //! or took longer than its 5 s limit) and the trusted generation holds a CLAIM record, the open
 //! resolves at once, provisionally ([`table::decide_unreachable`], [`OpenStep::Provisional`]):
 //! the binding takes commits and serves reads from its files, and its replicator defers its claim
-//! behind a HEAD and a pre-check of the stream from the log's acknowledged offset (design §7).
-//! Without a trusted generation, or without a claim to continue, the open retries until its
-//! deadline.
+//! behind a HEAD and a pre-check of the stream from the log's acknowledged offset (design:
+//! Pre-check). Without a trusted generation, or without a claim to continue, the open retries until
+//! its deadline.
 //!
 //! A read-only open ([`Access::Reader`]) runs the same steps in a reader directory of its own
 //! ([`Root::reader`]) and decides by the reader rows ([`table::decide_reader`], [`reader`]): it
@@ -39,7 +39,7 @@
 //!
 //! Module map:
 //!
-//! - [`table`]: the open table of design §5.5, one pure function, and its reader rows.
+//! - [`table`]: the open table (design: Open), one pure function, and its reader rows.
 //! - [`reader`]: a reader's open after its HEAD: its catch-up in place and its unreachable row.
 
 pub(crate) mod reader;
@@ -160,7 +160,7 @@ pub(crate) struct OpenSpec {
     pub(crate) access: Access,
 }
 
-/// The condition an open that ran out of time reports (design §8.4, `UrsulaUnavailableError`).
+/// The condition an open that ran out of time reports (design: Errors, `UrsulaUnavailableError`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unavailable {
     /// Nothing went out: no connection was made.
@@ -263,7 +263,7 @@ pub(crate) enum LocalSetup {
     OtherStream { found: String, expected: String },
 }
 
-/// Why an open failed (design §8.4: `UrsulaSetupError` and `UrsulaUnavailableError`).
+/// Why an open failed (design: Errors, `UrsulaSetupError` and `UrsulaUnavailableError`).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpenError {
     #[error("invalid_url: {0}")]
@@ -533,9 +533,9 @@ impl Fetch {
     }
 }
 
-/// A generation built from the stream in `gen-<id32>.tmp` (design §5.6): the open's build, or
-/// a takeover's rebuild. It is published by one rename only once complete ([`Build::publish`]), so
-/// the generation it supersedes stays whole until then, and a failed build leaves it in place. A
+/// A generation built from the stream in `gen-<id32>.tmp` (design: Materialize): the open's build,
+/// or a takeover's rebuild. It is published by one rename only once complete ([`Build::publish`]),
+/// so the generation it supersedes stays whole until then, and a failed build leaves it in place. A
 /// crash midway leaves only the `.tmp`, which the next open deletes (`finish_leftovers`).
 ///
 /// A HEAD names the latest snapshot. Its body is read in byte ranges of the HEAD's request limit,
@@ -553,8 +553,8 @@ impl Fetch {
 /// frames are logged as COMMIT records with an ACK and fsynced before they are applied
 /// ([`materialize::catch_up_files`]), so memory stays bounded by one read. A `410` while the tail
 /// is read (retention passed the installed snapshot) deletes the `.tmp` and starts over from the
-/// HEAD ([`Build::restart`]), and so does a history change while a fresh build reads (design D8),
-/// under the new token.
+/// HEAD ([`Build::restart`]), and so does a history change while a fresh build reads (design:
+/// Materialize), under the new token.
 #[derive(Debug)]
 pub(crate) struct Build {
     building: Building,
@@ -964,9 +964,9 @@ impl Build {
     }
 
     /// The stream changed history while the build read it. A fresh build starts over in a fresh
-    /// `.tmp`, under the token the HEAD named (design D8), at most [`MAX_BUILD_RESTARTS`] times. A
-    /// takeover's rebuild reads up to its claim, which the new history may not hold: the takeover
-    /// resets `rewound`, and the reopen goes through the open table.
+    /// `.tmp`, under the token the HEAD named (design: Materialize), at most [`MAX_BUILD_RESTARTS`]
+    /// times. A takeover's rebuild reads up to its claim, which the new history may not hold: the
+    /// takeover resets `rewound`, and the reopen goes through the open table.
     fn history_changed(&mut self, incarnation: Incarnation) -> BuildStep {
         if self.header.claim.is_some() {
             return BuildStep::Fail(OpenError::Reset(ResetKind::Rewound));
@@ -1349,7 +1349,7 @@ fn unacked(m: &Materialized) -> Unacked {
 }
 
 /// The manifest of a salvage of the trusted generation `m` for `reason`, decided now against
-/// a stream of token `stream` (design D3).
+/// a stream of token `stream` (design: History).
 pub(crate) fn salvage_manifest(
     m: &Materialized,
     reason: Reason,
@@ -1409,7 +1409,7 @@ fn local_state(
         highest_epoch,
         max_request_bytes,
         configured_max_request_bytes: spec.max_request_bytes,
-        // A catch-up in place larger than the database rebuilds instead (design §5.6).
+        // A catch-up in place larger than the database rebuilds instead (design: Materialize).
         db_bytes: m.db.metadata().map_or(u64::MAX, |meta| meta.len()),
         rekey_from,
         unacked: unacked(m),
@@ -1493,7 +1493,7 @@ pub(crate) enum OpenStep {
     Takeover(Box<Ready>),
     /// The stream is unreachable and the trusted generation holds a CLAIM record: bind now, and
     /// send the log's latest claim `claim` again once the stream answered and the pre-check found
-    /// nothing foreign (design §5.5, §7).
+    /// nothing foreign (design: Open, Pre-check).
     Provisional {
         ready: Box<Ready>,
         claim: (Epoch, Activation),
@@ -1933,7 +1933,7 @@ impl Opening {
         }
     }
 
-    /// The first HEAD got no answer with nothing sent: the unreachable rows of design §5.5.
+    /// The first HEAD got no answer with nothing sent: the unreachable rows (design: Open).
     fn unreachable(mut self: Box<Self>, exchange: &Exchange, now_ms: u64) -> OpenStep {
         let Some(prepared) = &mut self.prepared else {
             return OpenStep::Fail(OpenError::Panicked);

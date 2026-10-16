@@ -1,8 +1,8 @@
-// The pump (design §8.7): this thread's view of the extension's events. Calls into the extension on
-// this thread never wait (timeout 0): `ursula_open` and `ursula_synced` either answer at once or hand
-// back a request or a ticket, which an event later resolves. One worker per JavaScript thread
-// (pump-worker.ts) waits for those events and posts them here, where they complete `open()`, resolve
-// or reject `synced()` and fire the `reset` listeners.
+// The pump (design: Pump): this thread's view of the extension's events. Calls into the extension
+// on this thread never wait (timeout 0): `ursula_open` and `ursula_synced` either answer at once or
+// hand back a request or a ticket, which an event later resolves. One worker per JavaScript thread
+// (pump-worker.ts) waits for those events and posts them here, where they complete `open()`,
+// resolve or reject `synced()` and fire the `reset` listeners.
 //
 // `synced()` tickets resolve through their binding's watermark (`synced {path, through}`): every
 // ticket of the path up to `through` resolved. The extension keeps only the latest watermark of a

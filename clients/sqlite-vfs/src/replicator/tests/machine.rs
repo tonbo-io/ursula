@@ -490,7 +490,7 @@ fn a_probe_that_finds_a_frame_fences_and_undecodable_bytes_reset_stream_state() 
             frame::encode_claim(epoch(2), Activation([9; 16])),
             ResetKind::Fenced,
         ),
-        // A copy's claim or commit under our activation and lineage fences too (design §7).
+        // A copy's claim or commit under our activation and lineage fences too (design: Clones).
         (frame::encode_claim(epoch(2), ACTIVATION), ResetKind::Fenced),
         (commit(LINEAGE, 50, 3).frame.to_vec(), ResetKind::Fenced),
         (b"not a frame".to_vec(), ResetKind::StreamState),
@@ -691,7 +691,7 @@ fn a_probe_that_succeeds_beside_a_blocked_append_keeps_its_condition() {
 
 /// The probe meets a history that inherits everything acknowledged: its HEAD re-keys the
 /// generation, the blocked append and the probe go, and a continuation claims `own + 1` under the
-/// new token (design §6.2).
+/// new token (design: History).
 #[test]
 fn a_probe_whose_head_names_an_inheriting_history_re_keys() {
     let (mut h, tail) = blocked_with_a_probe();
@@ -796,8 +796,8 @@ fn a_commit_logged_while_catching_up_resets_internal() {
 
 /// The world's counterexample: a continuation's reconcile acknowledges a record read by read, and
 /// a `synced()` call between two reads must not resolve a ticket on that record before the
-/// replicator announces it. Outputs wait for the claim and its reconcile (design §5.5, §7), so
-/// the ticket resolves at the bind, after the `Wake` that covers it.
+/// replicator announces it. Outputs wait for the claim and its reconcile (design: Open, Pre-check),
+/// so the ticket resolves at the bind, after the `Wake` that covers it.
 #[test]
 fn a_ticket_waits_for_the_continuation_reconcile_to_finish() {
     let mut h = streaming(2);

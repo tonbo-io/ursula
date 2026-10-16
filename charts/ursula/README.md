@@ -61,7 +61,8 @@ kind load docker-image ursula:dev
 From the published OCI chart:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.7.5
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.8.0 \
+  --set server.clusterId=my-cluster
 ```
 
 For a local image loaded into the cluster:

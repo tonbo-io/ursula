@@ -1,5 +1,5 @@
-//! `ursula_open`'s `options_json` (design §8.6): one flat JSON object, parsed at the boundary into
-//! [`OpenOptions`].
+//! `ursula_open`'s `options_json` (design: SQL functions): one flat JSON object, parsed at the
+//! boundary into [`OpenOptions`].
 
 use crate::codec::frame::IMPORT_ACTIVATION;
 use crate::ids::Activation;
@@ -8,11 +8,11 @@ use crate::json::Value;
 use crate::json::parse_object;
 use crate::json::whole;
 
-/// The default backlog bound: 64 MiB of compressed frames (design §4.4).
+/// The default backlog bound: 64 MiB of compressed frames (design: Backpressure).
 pub(crate) const DEFAULT_MAX_PENDING_BYTES: u64 = 64 << 20;
 
 /// Whether an open makes this process the stream's owner or opens a read-only snapshot of it
-/// (design §5.5, D6).
+/// (design: Open, Readers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Access {
     /// Claims the stream. With `recreate`, a missing stream whose trusted local generation holds
@@ -30,9 +30,9 @@ pub(crate) struct OpenOptions {
     pub(crate) max_pending_bytes: u64,
     /// The platform activation id, 32 hex digits; a random one per process otherwise.
     pub(crate) activation: Option<Activation>,
-    /// The bearer token (one per process in M1).
+    /// The bearer token (one per process).
     pub(crate) token: Option<String>,
-    /// The SDK's User-Agent token, accepted and unused until M3's transport.
+    /// The SDK's User-Agent token: accepted, and not sent.
     pub(crate) agent: Option<String>,
     /// How long an open started with `timeout_ms` 0 may take: the caller's deadline, 30 s when
     /// absent.

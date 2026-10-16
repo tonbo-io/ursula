@@ -1,4 +1,4 @@
-//! The open table of design §5.5 as one pure function: what the open does with the local
+//! The open table (design: Open) as one pure function: what the open does with the local
 //! generation it found and the HEAD it got. [`decide`] does no I/O; the open carries out its
 //! [`OpenRow`].
 //!
@@ -38,8 +38,8 @@
 //! refuses a stream holding anything, so such a generation cannot lie below an import's snapshot,
 //! and if it does, its reconcile meets the import's claim and resets `stream_state`.
 //!
-//! When the open's first HEAD got no answer with nothing sent (the stream is unreachable, design
-//! §5.5), [`decide_unreachable`] decides instead:
+//! When the open's first HEAD got no answer with nothing sent (the stream is unreachable, design:
+//! Open), [`decide_unreachable`] decides instead:
 //!
 //! | local generation | row |
 //! | --- | --- |
@@ -47,11 +47,11 @@
 //! | trusted, without one | wait: retry until the open's signal fires |
 //! | none | wait |
 //!
-//! A reader's open (design D6) decides by [`decide_reader`] instead, after the same checks of the
-//! HEAD ([`check_head`]). A reader generation holds no commit of its own, only what it read, so it
-//! is never salvaged and never re-keyed: anything the stream no longer extends is built anew. A
-//! trusted reader generation of another cluster is refused as an owner's is (the stream it reads
-//! is not the one it caught up with), and a reader with none builds, having nothing to compare. A
+//! A reader's open (design: Readers) decides by [`decide_reader`] instead, after the same checks of
+//! the HEAD ([`check_head`]). A reader generation holds no commit of its own, only what it read, so
+//! it is never salvaged and never re-keyed: anything the stream no longer extends is built anew. A
+//! trusted reader generation of another cluster is refused as an owner's is (the stream it reads is
+//! not the one it caught up with), and a reader with none builds, having nothing to compare. A
 //! closed stream is read like any other: a reader writes nothing to it.
 //!
 //! | reader generation | HEAD | row |
@@ -100,10 +100,10 @@ pub(crate) struct LocalSummary {
     pub(crate) acked_offset: Offset,
     /// Whether the log holds a commit of the generation after its latest ACK.
     pub(crate) pending: Unacked,
-    /// Whether the generation holds data ([`crate::materialize::holds_data`], design D2).
+    /// Whether the generation holds data ([`crate::materialize::holds_data`], design: Open).
     pub(crate) holds_data: bool,
     /// The log's latest CLAIM record: the claim a provisional open sends again once the stream
-    /// answered and its pre-check found nothing foreign (design §7).
+    /// answered and its pre-check found nothing foreign (design: Pre-check).
     pub(crate) claim: Option<(Epoch, Activation)>,
 }
 
@@ -185,7 +185,7 @@ pub(crate) enum OpenRow<L, R> {
         head: StreamHead,
     },
     /// The generation has another token whose history inherits it: re-key from `from`, then take
-    /// over (design §6.2).
+    /// over (design: History).
     ReKey {
         local: L,
         from: Incarnation,
@@ -232,7 +232,7 @@ impl From<Refused> for OpenError {
 }
 
 /// What the open does when its first HEAD got no answer and nothing went out: the stream is
-/// unreachable (design §5.5).
+/// unreachable (design: Open).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnreachableRow<L, R> {
     /// Open now on the trusted generation `local`, its claim deferred: once the stream answers
@@ -247,7 +247,7 @@ pub(crate) enum UnreachableRow<L, R> {
     Wait { local: Local<L, R> },
 }
 
-/// The unreachable rows of design §5.5, on the local generation the open found.
+/// The unreachable rows (design: Open), on the local generation the open found.
 pub(crate) fn decide_unreachable<L, R>(local: Local<L, R>) -> UnreachableRow<L, R> {
     match local {
         Local::Trusted(
@@ -275,8 +275,8 @@ pub(crate) fn behind_snapshot(summary: &LocalSummary, head: &StreamHead) -> bool
         .is_some_and(|snapshot| snapshot.offset > summary.acked_offset)
 }
 
-/// The identity a HEAD named, checked (design §6.3): protocol 2, and the cluster id `ours` when a
-/// generation names one. The open table and a build's HEADs share it.
+/// The identity a HEAD named, checked (design: Identity): protocol 2, and the cluster id `ours`
+/// when a generation names one. The open table and a build's HEADs share it.
 pub(crate) fn check_identity<'a>(
     identity: Option<&'a ServerIdentity>,
     ours: Option<&str>,
@@ -331,8 +331,8 @@ fn check_head<L, R>(
     Ok(Some((identity.cluster_id.clone(), *stream)))
 }
 
-/// What a reader's open does (design D6), carrying the trusted reader generation when a row uses
-/// it. Every other local generation is dropped: a build replaces it, trashed.
+/// What a reader's open does (design: Readers), carrying the trusted reader generation when a row
+/// uses it. Every other local generation is dropped: a build replaces it, trashed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReaderRow<L> {
     /// Build a reader generation from the stream, the local one trashed.
@@ -350,7 +350,7 @@ pub(crate) enum ReaderRow<L> {
     Refuse(Refused),
 }
 
-/// The reader rows of design D6, on the reader generation the open found and the HEAD it got.
+/// The reader rows (design: Readers), on the reader generation the open found and the HEAD it got.
 pub(crate) fn decide_reader<L, R>(local: Local<L, R>, head: HeadSeen<'_>) -> ReaderRow<L> {
     let (cluster_id, head) = match check_head(&local, head, OnClosed::Read) {
         Ok(Some(stream)) => stream,
@@ -373,7 +373,8 @@ pub(crate) fn decide_reader<L, R>(local: Local<L, R>, head: HeadSeen<'_>) -> Rea
     }
 }
 
-/// What a reader's open does when its first HEAD got no answer and nothing went out (design D6).
+/// What a reader's open does when its first HEAD got no answer and nothing went out (design:
+/// Readers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReaderUnreachableRow<L, R> {
     /// Open the trusted reader generation `local` as it is: the stream as of its last open.
@@ -382,7 +383,7 @@ pub(crate) enum ReaderUnreachableRow<L, R> {
     Wait { local: Local<L, R> },
 }
 
-/// The unreachable reader rows of design D6, on the reader generation the open found.
+/// The unreachable reader rows (design: Readers), on the reader generation the open found.
 pub(crate) fn decide_reader_unreachable<L, R>(local: Local<L, R>) -> ReaderUnreachableRow<L, R> {
     match local {
         Local::Trusted(_, local) => ReaderUnreachableRow::Open { local },
@@ -390,7 +391,7 @@ pub(crate) fn decide_reader_unreachable<L, R>(local: Local<L, R>) -> ReaderUnrea
     }
 }
 
-/// The table of design §5.5 for an owner's open, on the local generation it found, what was
+/// The open table (design: Open) for an owner's open, on the local generation it found, what was
 /// asked, and the HEAD it got.
 pub(crate) fn decide<L, R>(local: Local<L, R>, asked: Asked, head: HeadSeen<'_>) -> OpenRow<L, R> {
     let refuse = |refused, local| OpenRow::Refuse { refused, local };

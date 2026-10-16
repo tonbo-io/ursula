@@ -45,7 +45,7 @@ export interface UrsulaSalvage {
 }
 
 /**
- * `ursula_status` (design §9, the part built so far): one snake_case JSON for every host.
+ * `ursula_status` (design: Status): one snake_case JSON for every host.
  */
 export interface UrsulaStatus {
 	/** The stream's path, such as `/acme/notes`. */
@@ -183,7 +183,7 @@ export class UrsulaDatabase extends DatabaseSync implements ResetTarget {
 
 	/**
 	 * Resolves once the stream holds every commit this process logged before the call, and a round
-	 * trip that started after the call found this process still the owner (design §8.2). Await it
+	 * trip that started after the call found this process still the owner (design: Synced). Await it
 	 * before anything outside the process acts on what you wrote or read. It does not block the event
 	 * loop, and it keeps the process alive while it waits. It rejects with an {@link UrsulaResetError}
 	 * on a reset, and with `signal.reason` when `signal` fires (the commits keep replicating).
@@ -210,7 +210,7 @@ export class UrsulaDatabase extends DatabaseSync implements ResetTarget {
 		});
 	}
 
-	/** `ursula_status` of the database (design §9). */
+	/** `ursula_status` of the database (design: Status). */
 	status(): UrsulaStatus {
 		return call<UrsulaStatus>("SELECT ursula_status(?)", this.boundPath);
 	}

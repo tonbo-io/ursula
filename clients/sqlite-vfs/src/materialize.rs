@@ -1,5 +1,5 @@
-//! Materialize and catch up (design §5.6): bring a trusted generation's db file to the end of its
-//! log before any connection opens it.
+//! Materialize and catch up (design: Materialize): bring a trusted generation's db file to the end
+//! of its log before any connection opens it.
 //!
 //! [`materialize`] runs at every open of a trusted generation: check page 1 (a db file that is not
 //! this generation's, an empty one included, is refused before anything is written, and the open
@@ -171,7 +171,7 @@ pub(crate) struct Materialized {
 }
 
 /// Whether a trusted generation holds data a missing stream or a history change would lose
-/// (design D2): its db file is longer than one page (every published db holds page 1), or its
+/// (design: Open): its db file is longer than one page (every published db holds page 1), or its
 /// valid log holds a COMMIT record. A generation without data is replaced with no salvage.
 pub(crate) fn holds_data(m: &Materialized) -> bool {
     let longer =

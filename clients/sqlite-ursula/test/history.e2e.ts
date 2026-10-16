@@ -1,7 +1,8 @@
-// History events (design §6.2, W5) against the model server (E2E_SERVER=model): a history change
-// of the stream that keeps every byte this owner acknowledged keeps its generation. The owner
-// re-keys to the stream's new token and claims the next epoch under it, with no reset, while bound
-// and at the next open. A restore that lost an acknowledged commit resets the owner `rewound`.
+// History events (design: History; extensions: Snapshot Metadata on HEAD and Stream Incarnation)
+// against the model server (E2E_SERVER=model): a history change of the stream that keeps every byte
+// this owner acknowledged keeps its generation. The owner re-keys to the stream's new token and
+// claims the next epoch under it, with no reset, while bound and at the next open. A restore that
+// lost an acknowledged commit resets the owner `rewound`.
 //
 // The model's history events and restores apply to every stream it holds, so this file runs its
 // tests one after another on the shared model, as every file does.

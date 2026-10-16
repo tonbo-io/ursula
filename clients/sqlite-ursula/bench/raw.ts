@@ -1,6 +1,6 @@
-// The raw append floor (B3 in docs/architecture/sqlite-vfs.md §9): closed-loop writers, one stream
-// each, 5 to 7 KiB random bodies (the VFS's compressed frames are about that size) with producer
-// headers, no SQLite.
+// The raw append floor (B3 in docs/architecture/sqlite-vfs.md, Performance): closed-loop
+// writers, one stream each, 5 to 7 KiB random bodies (the VFS's compressed frames are about that
+// size) with producer headers, no SQLite.
 //
 //   node bench/raw.ts <base url> <label> <writers> <warm-up s> <duration s> <out dir> [leader]
 //

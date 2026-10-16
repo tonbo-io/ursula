@@ -4,8 +4,8 @@
 //! `5xx`/`429`/`408`/`307`/`401`/`402`/`403` and untyped `413` answers, a lowered request limit
 //! (typed `413`), the clock moved past idle expiry, history events (a new history that loses
 //! nothing, and restores of checkpoints), requests misrouted to another deployment, foreign
-//! appends and claims, retention (and with it `410`s), clones, restarts (through the open table of
-//! design §5.5: a restart whose history does not inherit the log, or may have lost commits it
+//! appends and claims, retention (and with it `410`s), clones, restarts (through the open table
+//! (design: Open): a restart whose history does not inherit the log, or may have lost commits it
 //! holds after its latest ACK, salvages it and continues as a fresh takeover), provisional
 //! restarts (the open's first HEAD unanswered: a continuation of the log's latest claim, bound
 //! before it applies), owners cut off from the network, power losses that drop a log's unsynced
@@ -34,7 +34,7 @@
 //! 12. no append carries a frame the owner caught up;
 //! 13. an owner resets `fenced` or `stale` only when another writer, owner or clone was on the
 //!     stream, or `stale` at the first claim of a provisional instance after a power loss dropped
-//!     commits from its log that may have reached the stream (design §8.3), `stale` when a claim
+//!     commits from its log that may have reached the stream (design: Resets), `stale` when a claim
 //!     sent again after a pre-check met `producer-expired`, or `fenced` when a provisional
 //!     instance's log holds no claim that ever applied;
 //! 14. a boundary's receipt names the end of its record's frame in the stream with only claims
@@ -52,8 +52,9 @@
 //!     commit at one commit id, and commits a power loss dropped from a log before an fsync);
 //! 20. a background claim (a continuation's, a provisional open's) never applies above a claim an
 //!     explicit open of another owner made past the background owner's acknowledged offset and its
-//!     own latest claim (design §4.8's last paragraph), unless that claim landed after a
-//!     provisional instance's pre-check read the tail (the round trip design §7 accepts).
+//!     own latest claim (design: Claims, its last paragraph), unless that claim landed after a
+//!     provisional instance's pre-check read the tail (the round trip the pre-check accepts,
+//!     design: Pre-check).
 //!
 //! Snapshots carry real `USS3` headers (the owner's lineage, an acknowledged position and its
 //! offset): the `410` rule reads them.
@@ -62,9 +63,9 @@
 //! without `Producer-Digest`), a replicator that re-seals its in-flight batch on resend, one that
 //! re-keys on any other token, one that binds on a repeat receipt for a claim sent again after a
 //! re-key, one that takes another cluster's HEAD for a deleted stream, one that re-keys a log
-//! holding commits after its latest ACK (the #611 B2 gate undone), one that settles `synced()`
-//! tickets while activating (as before #604), and a provisional open that claims at once, above its
-//! log's highest CLAIM record, with no pre-check.
+//! holding commits after its latest ACK (the #611 history gate undone, design: History), one that
+//! settles `synced()` tickets while activating (as before #604), and a provisional open that claims
+//! at once, above its log's highest CLAIM record, with no pre-check.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -200,7 +201,7 @@ enum Op {
     Clone(u8),
     Restart(u8, u8),
     /// The owner restarts and its open's first HEAD gets no answer with nothing sent: the open
-    /// table's unreachable rows decide (design §5.5), with the ACK it reads lagging by `lag`.
+    /// table's unreachable rows decide (design: Open), with the ACK it reads lagging by `lag`.
     ProvisionalRestart(u8, u8),
     /// The owner's requests fail before connecting while `on`.
     Partition(u8, bool),
@@ -346,7 +347,7 @@ struct Instance {
     /// A rebuild's generation, published when its `CaughtUp` is delivered: only then do the
     /// discarded tail (from this position) and the new lineage replace the old generation. A
     /// restart before that finds the old generation whole, as a crash before the publishing
-    /// rename does (design §5.1, §5.6).
+    /// rename does (design: Layout, Materialize).
     unpublished: Option<Option<Position>>,
     /// The token a rebuild reads under, and the stream's bytes up to its claim, which its
     /// generation holds once published.
@@ -932,9 +933,9 @@ impl World {
     }
 
     /// The owner's process restarts and its open's first HEAD gets no answer with nothing sent
-    /// (design §5.5): a log with a CLAIM record binds at once under the log's token, and once the
-    /// stream answers its pre-check (design §7) decides whether that claim goes out again. A log
-    /// without one waits, and the open's signal fires: no replicator runs.
+    /// (design: Open): a log with a CLAIM record binds at once under the log's token, and once the
+    /// stream answers its pre-check (design: Pre-check) decides whether that claim goes out again.
+    /// A log without one waits, and the open's signal fires: no replicator runs.
     fn provisional_restart(&mut self, index: usize, lag: u8) {
         let activation = self.activation();
         let family = self.owners[index].family;
@@ -1032,7 +1033,7 @@ impl World {
     }
 
     /// Whether a connection can commit or call `synced()`. A takeover runs inside `open()`,
-    /// before any connection opens the generation (design §5.5), so the driver logs no commit
+    /// before any connection opens the generation (design: Open), so the driver logs no commit
     /// and takes no `synced()` call for a binding still opening.
     fn bound(&self, index: usize) -> bool {
         self.live(index)
@@ -1273,7 +1274,7 @@ impl World {
                 }
                 Action::Reset(kind @ (ResetKind::Fenced | ResetKind::Stale)) => {
                     let owner = &self.owners[index];
-                    // A power loss dropped commits the stream may hold (design §8.3).
+                    // A power loss dropped commits the stream may hold (design: Resets).
                     let lost =
                         kind == ResetKind::Stale && owner.power_lost && owner.inst.provisional;
                     // A claim a pre-check sent again met `producer-expired` without its frame found:
@@ -1304,7 +1305,7 @@ impl World {
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                // The retiring binding fsyncs its ACK (design §6.2, D5).
+                // The retiring binding fsyncs its ACK (design: History, Log).
                 Action::Reset(ResetKind::Rewound) => {
                     self.coverage.rewound.fetch_add(1, Ordering::Relaxed);
                     self.owners[index].log.sync();
@@ -1653,7 +1654,7 @@ impl World {
                 if owner.log.claims.iter().any(|(_, a)| a == activation))
         };
         // A claim of its own after a foreign one, other than the claim it binds with at the end,
-        // applied after it (design §4.9, superseded).
+        // applied after it (design: Reconcile, superseded).
         let superseder = frames
             .iter()
             .take(frames.len().saturating_sub(1))
@@ -2663,7 +2664,8 @@ fn negative_control_re_keying_on_any_token_drops_acknowledged_records() {
 /// Owner 0's continuation claim (after idle expiry) applies and its answer is lost; a history
 /// event that loses nothing follows, and the resent claim meets the new token. The re-key sends
 /// it again, same epoch, under the new token, and gets a repeat receipt: it applied before the
-/// history event, so the producer record stays history-fenced (#581 §2.3.1 rows 9 and 11).
+/// history event, so the producer record stays history-fenced (extensions: Producer Write Answers,
+/// `epoch-closed;by=history`).
 fn repeat_after_a_rekey() -> Vec<Op> {
     vec![
         Op::Flush,
@@ -2831,9 +2833,9 @@ fn history_events_re_key_or_reset_rewound() {
 /// Owner 0 acknowledges a commit after a checkpoint (its ACK record not durable), the stream is
 /// restored to that checkpoint and another writer commits, and owner 0 restarts with the lagging
 /// ACK, under which the history inherits its log, and restarts again before its takeover binds.
-/// With the #611 B2 gate the first restart salvages the log; undone, it re-keys the log with the
-/// acknowledged commit pending, the second restart resumes the re-keyed log, and its takeover
-/// discards the commit with no salvage.
+/// With the #611 history gate (design: History) the first restart salvages the log; undone, it
+/// re-keys the log with the acknowledged commit pending, the second restart resumes the re-keyed
+/// log, and its takeover discards the commit with no salvage.
 fn crash_after_a_rekey_at_open() -> Vec<Op> {
     vec![
         Op::Flush,
@@ -3099,8 +3101,8 @@ fn a_lagging_takeover_below_retention_rebuilds() {
 
 /// A takeover's reconcile meets a `410` below retention and rebuilds, discarding the record whose
 /// append was lost, and the process restarts before the rebuilt generation is published. The old
-/// generation stays whole until the publishing rename (design §5.1, §5.6), so the restart finds
-/// the record still pending, and a `synced()` call after it waits for that record.
+/// generation stays whole until the publishing rename (design: Layout, Materialize), so the restart
+/// finds the record still pending, and a `synced()` call after it waits for that record.
 #[test]
 fn a_restart_before_a_rebuild_publishes_keeps_the_old_generation() {
     let ops = vec![
@@ -3123,7 +3125,7 @@ fn a_restart_before_a_rebuild_publishes_keeps_the_old_generation() {
 /// discarded the commit is published. The last calls `synced()` while the takeover is opening,
 /// and the ticket resolved between two reads of a later continuation's reconcile. The world no
 /// longer commits or calls `synced()` during a takeover (the driver takes neither before the
-/// bind, design §5.5), so the scripts now pass without reaching those steps: the test above and
+/// bind, design: Open), so the scripts now pass without reaching those steps: the test above and
 /// `machine::a_ticket_waits_for_the_continuation_reconcile_to_finish` keep both rules.
 #[test]
 fn the_proptests_shrunk_counterexamples_pass() {
@@ -3466,9 +3468,9 @@ fn a_probe_answered_410_after_a_restore_takes_the_history_path() {
 
 /// Owner 0, cut off, restarts provisionally and commits once offline; a history that loses
 /// nothing replaces the stream meanwhile (a single voter's unclean restart). That commit was never
-/// sent, so it does not hold the re-key back (B2 counts the log's commits at the open, none after
-/// its ACK): once the partition heals the owner re-keys, its offline commit replicates under the
-/// new token, and nothing is salvaged or reset.
+/// sent, so it does not hold the re-key back (the history gate, design: History, counts the log's
+/// commits at the open, none after its ACK): once the partition heals the owner re-keys, its
+/// offline commit replicates under the new token, and nothing is salvaged or reset.
 #[test]
 fn an_offline_commit_survives_a_history_that_keeps_everything() {
     let ops = vec![
@@ -3748,10 +3750,11 @@ fn a_provisional_clone_never_fences_the_owner_that_bound() {
     assert_eq!(world.violations, Vec::<String>::new());
 }
 
-/// Probe F of #615's review (N1): a takeover's claim applied after a foreign one, and the process
-/// crashed before the bind, so the log's acknowledged offset lies before both. The provisional
-/// reopen's pre-check finds the foreign claim followed by its own: superseded, and it goes live.
-/// With a foreign commit there instead, which the generation never caught up, it resets `stale`.
+/// Probe F of #615's review (design: Claims): a takeover's claim applied after a foreign one, and
+/// the process crashed before the bind, so the log's acknowledged offset lies before both. The
+/// provisional reopen's pre-check finds the foreign claim followed by its own: superseded, and it
+/// goes live. With a foreign commit there instead, which the generation never caught up, it resets
+/// `stale`.
 #[test]
 fn a_crash_before_the_bind_supersedes_a_foreign_claim_and_goes_stale_on_a_foreign_commit() {
     for (foreign, stale) in [(2, false), (1, true)] {

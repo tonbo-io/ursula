@@ -4,15 +4,15 @@
 //! [`HttpTransport`] sends a [`Request`] once and hands back what came of it. It never retries and
 //! never follows a redirect: the retry policy belongs to the replicator. Every request with a body
 //! carries `Content-Length`, so a node can answer `413` or an early answer before the body
-//! (#581 §2.5, §6.1). A failure is [`NoAnswer::NotSent`] only when `net` proves nothing went out
-//! (the resolver or the connector failed, `net::NotSent`): decided by where it failed, never by
-//! its kind. Any other failure is [`NoAnswer::Lost`].
+//! (extensions: Answers Before the Body). A failure is [`NoAnswer::NotSent`] only when `net` proves
+//! nothing went out (the resolver or the connector failed, `net::NotSent`): decided by where it
+//! failed, never by its kind. Any other failure is [`NoAnswer::Lost`].
 //!
-//! Each attempt's time limits scale with its size (design §4.12, #566): connecting 5 s, sending
-//! the request head 5 s, sending the body `5 s + n / rate` (`URSULA_VFS_MIN_UPLOAD_KBPS`, 256 KiB/s by default), the answer's
-//! head 15 s (plus `t / 16 MiB/s` for a parts commit of `t` bytes, which the server copies before
-//! it answers), and its body `10 s + m / 256 KiB/s` for the `m` bytes the caller expects. A
-//! timeout is only another lost attempt.
+//! Each attempt's time limits scale with its size (design: Transport, #566): connecting 5 s,
+//! sending the request head 5 s, sending the body `5 s + n / rate` (`URSULA_VFS_MIN_UPLOAD_KBPS`,
+//! 256 KiB/s by default), the answer's head 15 s (plus `t / 16 MiB/s` for a parts commit of `t`
+//! bytes, which the server copies before it answers), and its body `10 s + m / 256 KiB/s` for the
+//! `m` bytes the caller expects. A timeout is only another lost attempt.
 
 use std::fs;
 use std::net::IpAddr;
@@ -163,7 +163,7 @@ fn no_answer_from(e: ureq::Error) -> NoAnswer {
 /// The rate the answer's body time limit assumes, in KiB/s.
 const MIN_DOWNLOAD_KBPS: u64 = 256;
 
-/// One attempt's time limits (design §4.12).
+/// One attempt's time limits (design: Transport).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Timeouts {
     connect: Duration,

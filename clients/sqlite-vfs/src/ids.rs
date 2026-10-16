@@ -10,7 +10,7 @@ use std::io::Read;
 /// The device read for random identifiers.
 pub const URANDOM: &str = "/dev/urandom";
 
-/// 16 random bytes per local generation: tells one local history from another (design §5.1).
+/// 16 random bytes per local generation: tells one local history from another (design: Layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lineage(pub [u8; 16]);
 
@@ -45,7 +45,7 @@ impl GenId {
     }
 }
 
-/// 16 bytes per activation of a host, carried by CLAIM frames (design §4.8, §7).
+/// 16 bytes per activation of a host, carried by CLAIM frames (design: Claims, Clones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Activation(pub [u8; 16]);
 

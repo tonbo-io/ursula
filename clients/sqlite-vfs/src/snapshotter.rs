@@ -1,4 +1,4 @@
-//! The snapshot thread of a bound database (design §4.11): snapshots published keyed by offset
+//! The snapshot thread of a bound database (design: Snapshots): snapshots published keyed by offset
 //! and digest, and retention one snapshot behind.
 //!
 //! A snapshot is due when the frame bytes acknowledged since the latest one exceed the db file's
@@ -43,8 +43,8 @@
 //!
 //! A failed attempt waits before the next ([`SnapshotFailing`]): from 100 ms, doubling, up to five
 //! minutes, or an hour when the body is too large. Requests carry the binding's token as it is
-//! when they go out, so snapshots go on under the new token after a re-key (design §6.2). A HEAD
-//! or a publish that finds another token, and a HEAD of another cluster, are failures like any
+//! when they go out, so snapshots go on under the new token after a re-key (design: History). A
+//! HEAD or a publish that finds another token, and a HEAD of another cluster, are failures like any
 //! other: the binding re-keys, resets or blocks meanwhile, and the next attempt finds out which.
 //! Each attempt sends its HEAD before the checkpoint, so a binding left idle across a history
 //! change copies and compresses nothing, and a token found changed makes the replicator probe.
@@ -239,7 +239,7 @@ impl Snapper {
     }
 }
 
-/// What status reports of a binding's snapshots (design §9).
+/// What status reports of a binding's snapshots (design: Status).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SnapshotStatus {
     /// The latest snapshot this binding published, and when.
@@ -505,7 +505,7 @@ pub(crate) enum SnapshotFailure {
     #[error("the stream answered under another token")]
     TokenChanged,
     /// A HEAD answered as another deployment: the binding blocks `wrong_cluster` until a routing
-    /// fix (design §6.3).
+    /// fix (design: Identity).
     #[error("wrong_cluster: the stream answers as cluster {found}, not {expected}")]
     WrongCluster { expected: String, found: ClusterId },
     #[error("unavailable: the {what} got no definite answer: {cause}")]
@@ -705,7 +705,7 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
         out.flush().map_err(io("write", &image_path.0))?;
     }
     conn.exec(c"COMMIT")?;
-    // F2 for BASE(k): the db file holds every commit up to `k` durably (design §4.3).
+    // F2 for BASE(k): the db file holds every commit up to `k` durably (design: Fsyncs).
     if let Err(e) = conn.sync_db() {
         b.reset(ResetKind::LocalDamage, &format_args!("snapshot: {e}"));
         return Err(SnapshotFailure::Reset);
@@ -728,7 +728,7 @@ fn attempt(b: &Binding) -> Result<Outcome, SnapshotFailure> {
         return Ok(Outcome::Skipped);
     };
     // The snapshot never runs ahead of the durable acknowledged position: the 410 rule trusts a
-    // snapshot of our lineage only at or below it (design §4.9).
+    // snapshot of our lineage only at or below it (design: Reconcile).
     durable_ack(b, k, offset, receipt.log_bytes)?;
     image.rewind().map_err(io("rewind", &image_path.0))?;
     let fields = SnapshotFields {

@@ -1,4 +1,4 @@
-//! `synced()` tickets (design §8.2). A ticket resolves when (1) every commit at or below its
+//! `synced()` tickets (design: Synced). A ticket resolves when (1) every commit at or below its
 //! target is acknowledged and (2) a round trip that started after the call found no foreign frame past
 //! this owner's acknowledged offset: an append applied by that attempt (`200`, its receipt
 //! contiguous with the expected tail), a claim applied by that attempt whose reconcile completed,

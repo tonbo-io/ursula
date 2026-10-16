@@ -1,8 +1,9 @@
 // Reopens beside a reset database's connections, against the e2e server (test/stack.ts): `open()`
-// after a reset need not wait for the old connections (design §5.6, §8.3). It builds from a copy of
-// their generation, so their open read transaction keeps its snapshot, their new statements fail,
-// and the new database carries every commit the old one logged. Another process still gets
-// `in_use` while either holds the cache, and a crash during the copy leaves one generation.
+// after a reset need not wait for the old connections (design: Materialize, Resets). It builds from
+// a copy of their generation, so their open read transaction keeps its snapshot, their new
+// statements fail, and the new database carries every commit the old one logged. Another process
+// still gets `in_use` while either holds the cache, and a crash during the copy leaves one
+// generation.
 import { readdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";

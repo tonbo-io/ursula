@@ -1,6 +1,6 @@
-// The errors the package throws (design §8.4), the SQLite result codes they map from, and the one
-// mapping from a failure of the extension to them (`classify`). Shared by the root entry and the Pi
-// adapter (pi.ts). The error classes and the types of their fields are public.
+// The errors the package throws (design: Errors), the SQLite result codes they map from, and the
+// one mapping from a failure of the extension to them (`classify`). Shared by the root entry and
+// the Pi adapter (pi.ts). The error classes and the types of their fields are public.
 
 /** SQLITE_ERROR: a SQL error, and every error of an Ursula SQL function. */
 export const SQLITE_ERROR = 1;
@@ -33,7 +33,7 @@ export type UrsulaErrorAction = "retry" | "reopen" | "stop" | "fix";
 
 /** The kinds of an {@link UrsulaWriteRefusedError}. */
 export type WriteRefusedKind = "backlog_full" | "unsupported";
-/** The kinds of an {@link UrsulaResetError} (design §8.3). */
+/** The kinds of an {@link UrsulaResetError} (design: Resets). */
 export type ResetKind = "fenced" | "stale" | "rewound" | "deleted" | "local_damage" | "stream_state" | "internal";
 /** The kinds of an {@link UrsulaUnavailableError}: the last condition the open met, or `cancelled` when its signal fired first. */
 export type UnavailableKind = "unreachable" | "unavailable" | "rate_limited" | "unauthorized" | "payment_required" | "forbidden" | "wrong_cluster" | "cancelled";
@@ -139,7 +139,7 @@ export class UrsulaWriteRefusedError extends UrsulaError {
 }
 
 /**
- * The database was reset (design §8.3): every statement of it throws this, reads included,
+ * The database was reset (design: Resets): every statement of it throws this, reads included,
  * `synced()` rejects with it, and the `reset` listeners get it. `fenced` (`stop`): another owner took
  * the stream over. The other kinds say to `reopen` (a new `open()` of the URL) or to `fix` the stream
  * first.

@@ -471,8 +471,8 @@ fn two_directories_of_one_lineage_resolve_by_supersedes() {
 }
 
 // A generation nothing was applied to is published with the page 1 of an empty database, marked
-// (design D7): no published db file is empty or unmarked. One a commit or a snapshot wrote keeps
-// its pages.
+// (design: Layout): no published db file is empty or unmarked. One a commit or a snapshot wrote
+// keeps its pages.
 #[test]
 fn a_generation_is_published_with_page_one_written() {
     let dir = TempDir::new("gen-empty");

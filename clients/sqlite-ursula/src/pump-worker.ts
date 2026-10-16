@@ -1,8 +1,8 @@
-// The pump's worker thread (design §8.7): loads the extension the process already holds, so it shares
-// its registry and driver, and loops on `SELECT ursula_events(cursor, 1000)`, which blocks this thread
-// for at most a second, never the one that started it. It posts every batch of events to that thread
-// (pump.ts) as `{ events }`, or `{ error }` once if the extension fails, then stops. It also stops
-// within a second of its starting thread's exit.
+// The pump's worker thread (design: Pump): loads the extension the process already holds, so it
+// shares its registry and driver, and loops on `SELECT ursula_events(cursor, 1000)`, which blocks
+// this thread for at most a second, never the one that started it. It posts every batch of events
+// to that thread (pump.ts) as `{ events }`, or `{ error }` once if the extension fails, then stops.
+// It also stops within a second of its starting thread's exit.
 //
 // Standalone on purpose: Node runs it as its own module (from the built .js, or from this .ts with
 // Node's type stripping under the tests), so it imports nothing of the package.

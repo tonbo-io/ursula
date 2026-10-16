@@ -1,6 +1,7 @@
-//! The replicator of one bound database (design §4.6 to §4.10, §8.2): a pure state machine that
-//! turns logged commits into appends under the producer key `(epoch, seq)`, claims epochs, reads
-//! back what landed before its claims, and resolves `synced()` tickets.
+//! The replicator of one bound database (design: Appends, Answers, Claims, Reconcile, Replicator,
+//! Synced): a pure state machine that turns logged commits into appends under the producer key
+//! `(epoch, seq)`, claims epochs, reads back what landed before its claims, and resolves `synced()`
+//! tickets.
 //!
 //! [`Replicator::on`] takes one [`Event`] and the time, and returns the [`Action`]s the driver
 //! carries out, in order. It does no I/O and draws no randomness: backoff jitter is the driver's
@@ -12,37 +13,36 @@
 //! At most one append or claim is outstanding at a time, beside at most one `synced()` probe, and
 //! an answer whose id is not an outstanding one (a late duplicate, an earlier attempt) is ignored.
 //!
-//! A `410` in a reconcile follows design §4.9's rule: a HEAD names the latest snapshot, its header
-//! alone is read and its checksum verified, and when its last commit is of our lineage at or below
-//! the acknowledged position, the reconcile reads on from its offset. Clones share a lineage, so
-//! a snapshot above it is never trusted: a takeover diverges and rebuilds, and a continuation
-//! resets `stale`.
+//! A `410` in a reconcile follows its rule (design: Reconcile): a HEAD names the latest snapshot,
+//! its header alone is read and its checksum verified, and when its last commit is of our lineage
+//! at or below the acknowledged position, the reconcile reads on from its offset. Clones share a
+//! lineage, so a snapshot above it is never trusted: a takeover diverges and rebuilds, and a
+//! continuation resets `stale`.
 //!
 //! A snapshot asks for a batch ending exactly at its `k` ([`Event::Boundary`]); once `k` is
 //! acknowledged, [`Action::Boundary`] hands back `W`, the end offset of that batch's receipt.
 //!
-//! A HEAD naming another token whose history inherits the generation ([`answer::inherits`], design
-//! §6.2) re-keys it: [`Action::ReKey`] rolls the log to a segment naming the new token with the
+//! A HEAD naming another token whose history inherits the generation ([`answer::inherits`], design:
+//! History) re-keys it: [`Action::ReKey`] rolls the log to a segment naming the new token with the
 //! CLAIM record of the claim that follows, and the replicator claims as after any fence. A
 //! takeover claims above every epoch seen. While bound, a continuation claims `own + 1` from
 //! streaming, and an unconfirmed continuation claim is sent again, same epoch and body, under the
 //! new token: claiming higher at once would fence an owner that claimed `own + 1` meanwhile, since
 //! every owner shares the producer id. A repeat receipt for that claim (or `receipt-evicted`)
 //! means it applied before the history event, so the record stays history-fenced and the next
-//! append would be refused (#581 §2.3.1 rows 9 and 11): one more continuation claim follows. A
-//! continuation whose latest claim applied past its acknowledged offset (its reconcile not done,
-//! a claim out over an epoch it never streamed in, or a provisional open before its bind) first
-//! pre-checks under the new token (a HEAD, then the
-//! reads from that offset to the tail): the new history may have lost that claim while an
-//! explicit open claimed in it, and a background claim must never fence that owner. A takeover
-//! re-keys only with nothing pending
-//! ([`answer::takeover_may_rekey`]): otherwise it resets `rewound` before the log rolls, and the
-//! next open salvages the generation, since the log's acknowledged offset may trail
-//! acknowledgements the pending tail holds. A rebuild that discards pending records after a
-//! re-key at open salvages the generation it replaces ([`Action::Rebuild`]'s `salvage`), so a
-//! history change never discards a local commit without a salvage.
+//! append would be refused (extensions: Producer Write Answers, `epoch-closed;by=history`): one
+//! more continuation claim follows. A continuation whose latest claim applied past its acknowledged
+//! offset (its reconcile not done, a claim out over an epoch it never streamed in, or a provisional
+//! open before its bind) first pre-checks under the new token (a HEAD, then the reads from that
+//! offset to the tail): the new history may have lost that claim while an explicit open claimed in
+//! it, and a background claim must never fence that owner. A takeover re-keys only with nothing
+//! pending ([`answer::takeover_may_rekey`]): otherwise it resets `rewound` before the log rolls,
+//! and the next open salvages the generation, since the log's acknowledged offset may trail
+//! acknowledgements the pending tail holds. A rebuild that discards pending records after a re-key
+//! at open salvages the generation it replaces ([`Action::Rebuild`]'s `salvage`), so a history
+//! change never discards a local commit without a salvage.
 //!
-//! A provisional open (design §5.5) defers its claim behind resume's sequence (design §7,
+//! A provisional open (design: Open) defers its claim behind the pre-check (design: Pre-check,
 //! [`Replicator::provisional`]): a HEAD first, which learns the token, the cluster and the request
 //! limit, then a pre-check that reads from the log's acknowledged offset to the tail the HEAD
 //! named. Any foreign frame there resets it with nothing sent. A `410` sends a HEAD first: our
@@ -77,14 +77,13 @@
 //! [`backoff::LOST_HEAD_BYTES`] send a HEAD before the next resend, since a layer that refuses a
 //! large body without reading it looks like a lost answer.
 //!
-//! Left for later milestones: resume (M4).
-//!
 //! Module map:
 //!
-//! - [`answer`]: the answer tables of §4.7 as one decide function each, and the HEAD check.
+//! - [`answer`]: the answer tables (design: Answers) as one decide function each, and the HEAD
+//!   check.
 //! - [`backoff`]: the outstanding request, its retries, backoff and the HEAD it may wait on.
 //! - [`batch`]: sealing pending records into one append.
-//! - [`reconcile`]: the reconcile of §4.9, after every claim.
+//! - [`reconcile`]: the reconcile (design: Reconcile), after every claim.
 //! - [`sync`]: `synced()` tickets.
 
 pub(crate) mod answer;
@@ -163,7 +162,7 @@ use crate::wire::SnapshotPart;
 use crate::wire::Target;
 use crate::wire::Typed;
 
-/// The largest batch, whatever the request limit (design §4.6).
+/// The largest batch, whatever the request limit (design: Appends).
 pub(crate) const MAX_BATCH_BYTES: u64 = 4 << 20;
 
 /// The smallest request limit the replicator cuts for: a limit below it blocks
@@ -174,7 +173,7 @@ pub(crate) const MIN_REQUEST_BYTES: u64 = 4 << 10;
 /// body may take.
 pub(crate) const READ_ANSWER_BYTES: u64 = 4 << 20;
 
-/// A takeover gives up after this many lost claims (`claim_races`, design §4.8).
+/// A takeover gives up after this many lost claims (`claim_races`, design: Claims).
 pub(crate) const TAKEOVER_ROUNDS: u8 = 16;
 
 /// Names one attempt of a request: ids grow with every attempt sent.
@@ -193,7 +192,7 @@ pub(crate) struct Pending {
 pub(crate) enum ClaimKind {
     /// `open()` with the stream answering: above every epoch seen, retried higher after a lost
     /// claim, at most [`TAKEOVER_ROUNDS`] rounds. `round` counts from 1. `rekeyed`: the
-    /// generation re-keyed in this open (design §6.2).
+    /// generation re-keyed in this open (design: History).
     Takeover { round: u8, rekeyed: bool },
     /// After `producer-expired`, a re-key while bound, or a provisional open's pre-check: exactly
     /// `own + 1`, lost at the first answer but its receipt. `resent`: the claim went out again
@@ -216,7 +215,7 @@ enum Holding {
     Reconciling(Epoch),
 }
 
-/// Why requests wait for something other than the network to change (design §4.7).
+/// Why requests wait for something other than the network to change (design: Answers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlockedReason {
     RequestTooLarge,
@@ -228,7 +227,7 @@ pub(crate) enum BlockedReason {
     Rejected { status: u16 },
 }
 
-/// The replication condition status reports (design §9).
+/// The replication condition status reports (design: Status).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Condition {
     /// The outstanding request got no definite answer and is sent again after backoff.
@@ -237,7 +236,7 @@ pub(crate) enum Condition {
     Blocked(BlockedReason),
 }
 
-/// The resets of design §8.3, one enum for the replicator and the driver.
+/// The resets (design: Resets), one enum for the replicator and the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResetKind {
     Fenced,
@@ -250,7 +249,7 @@ pub(crate) enum ResetKind {
     Internal,
 }
 
-/// What ends a takeover at open without binding, and is no reset (design §8.4 setup kinds).
+/// What ends a takeover at open without binding, and is no reset (design: Errors, the setup kinds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// [`TAKEOVER_ROUNDS`] claims lost to racing claimants.
@@ -266,7 +265,7 @@ pub(crate) enum Event {
     Answer { id: RequestId, exchange: Exchange },
     /// The time moved; timers that are due fire.
     Tick,
-    /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11): once it is
+    /// A batch must end exactly at `position` (a snapshot's `k`, design: Snapshots): once it is
     /// acknowledged, [`Action::Boundary`] reports it.
     Boundary(Position),
     /// A snapshot published (or found superseded) covers `log_bytes` of the frame bytes counted
@@ -305,7 +304,7 @@ pub(crate) enum Action {
         epoch: Epoch,
         activation: Activation,
     },
-    /// Re-key the generation (design §6.2): roll the log to a new segment naming `incarnation`,
+    /// Re-key the generation (design: History): roll the log to a new segment naming `incarnation`,
     /// append the CLAIM record of `(epoch, activation)` and fsync it, all before carrying out any
     /// later action, the claim's send among them. Every request after it carries `incarnation`.
     ReKey {
@@ -325,7 +324,7 @@ pub(crate) enum Action {
         acked: Position,
         offset: Offset,
     },
-    /// The ticket resolved (design §8.2). Only a streaming replicator resolves one, after the
+    /// The ticket resolved (design: Synced). Only a streaming replicator resolves one, after the
     /// [`Action::Wake`] that covers its target.
     Synced {
         ticket: u64,
@@ -345,12 +344,12 @@ pub(crate) enum Action {
     Apply(Vec<ForeignFrame>),
     /// Takeover only: drop every record from `discard_from` on, if any, and rebuild the
     /// generation from the stream (its latest snapshot and tail) up to `to`, the claim's end
-    /// (design §5.6: a divergence, or a `410`). The rebuilt generation's first segment names
-    /// `incarnation` and `cluster_id`, its positions continue above the last one logged, and
+    /// (design: Materialize; a divergence, or a `410`). The rebuilt generation's first segment
+    /// names `incarnation` and `cluster_id`, its positions continue above the last one logged, and
     /// it holds the CLAIM record of `(epoch, activation)`. With `salvage`, the generation it
     /// replaces is salvaged (`history_changed`) rather than trashed: the takeover re-keyed it at
-    /// open and the pending records it discards may hold commits acknowledged under the old
-    /// token (design §6.2). Then answer with [`Event::CaughtUp`].
+    /// open and the pending records it discards may hold commits acknowledged under the old token
+    /// (design: History). Then answer with [`Event::CaughtUp`].
     Rebuild {
         discard_from: Option<Position>,
         salvage: bool,
@@ -370,7 +369,7 @@ pub(crate) enum Action {
     Boundary(BoundaryReceipt),
 }
 
-/// What came of a boundary `position` (design §4.11).
+/// What came of a boundary `position` (design: Snapshots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BoundaryReceipt {
     pub(crate) position: Position,
@@ -411,7 +410,7 @@ pub(crate) struct LocalState {
     /// `URSULA_VFS_MAX_REQUEST_BYTES`.
     pub(crate) configured_max_request_bytes: Option<u64>,
     /// The db file's size: a takeover's catch-up in place whose frames grow past it rebuilds
-    /// instead (design §5.6).
+    /// instead (design: Materialize).
     pub(crate) db_bytes: u64,
     /// A takeover at open whose generation was built under this token and whose history the
     /// open's HEAD found inheriting: the replicator re-keys before it claims, and `incarnation`
@@ -422,7 +421,7 @@ pub(crate) struct LocalState {
     pub(crate) unacked: Unacked,
 }
 
-/// The request limit `L` (design §4.6): the latest HEAD's, any limit a typed `413` named since,
+/// The request limit `L` (design: Appends): the latest HEAD's, any limit a typed `413` named since,
 /// and the configured one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
@@ -458,7 +457,7 @@ impl Limits {
 }
 
 /// A batch this binding sent in its current epoch, for the cross-check against
-/// `Producer-Closed-Seq` (design §4.8).
+/// `Producer-Closed-Seq` (design: Claims).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SentBatch {
     pub(crate) epoch: Epoch,
@@ -511,8 +510,9 @@ pub(crate) struct Ctx {
     /// loss), so whatever its receipt one more claim follows it, and no key of that epoch is used
     /// twice.
     log_claim: Option<Epoch>,
-    /// What the repeat before D4's follow-up claim said it closed: the epoch the binding streamed
-    /// in, which the follow-up's own receipt (closing the repeated claim's epoch) no longer names.
+    /// What the repeat before the repeat rule's follow-up claim (design: History) said it closed:
+    /// the epoch the binding streamed in, which the follow-up's own receipt (closing the repeated
+    /// claim's epoch) no longer names.
     repeat_closed: Option<ClosedEpoch>,
     /// `Producer-Id`, checked once when the replicator starts.
     producer: ProducerId,
@@ -536,7 +536,8 @@ pub(crate) struct Knobs {
     pub(crate) misroute_as_deleted: bool,
     /// Take a HEAD of another cluster's stream for a history that inherits the generation.
     pub(crate) misroute_as_rekey: bool,
-    /// Re-key a takeover whose log holds commits after its latest ACK: the #611 B2 gate undone.
+    /// Re-key a takeover whose log holds commits after its latest ACK: the #611 history gate
+    /// (design: History) undone.
     pub(crate) rekey_with_pending: bool,
     /// Settle `synced()` tickets while activating too, as before #604: a claim's reconcile
     /// acknowledges records before it announces them.
@@ -821,14 +822,15 @@ pub(crate) enum Step {
     /// [`Event::CaughtUp`].
     CatchingUp(Box<Done>),
     /// A provisional open's pre-check before it sends `claim`, its log's latest claim, again
-    /// (design §7): the HEAD, then the reads up to the tail it named.
+    /// (design: Pre-check): the HEAD, then the reads up to the tail it named.
     PreCheck {
         claim: (Epoch, Activation),
         check: PreCheck,
         link: Link,
     },
-    /// A read of the reconcile met a `410`: the rule of design §4.9 reads the latest snapshot's
-    /// header. `snapshot` is `None` while the HEAD that names it is out, then the snapshot read.
+    /// A read of the reconcile met a `410`: the rule (design: Reconcile) reads the latest
+    /// snapshot's header. `snapshot` is `None` while the HEAD that names it is out, then the
+    /// snapshot read.
     Gone {
         reconcile: Box<Reconcile>,
         link: Box<Link>,
@@ -866,7 +868,7 @@ pub(crate) enum Work {
     },
 }
 
-/// A leader read at the expected tail, for `synced()` (design §8.2). It goes out beside the
+/// A leader read at the expected tail, for `synced()` (design: Synced). It goes out beside the
 /// append slot, so tickets covered by acknowledgements do not wait on a blocked append.
 #[derive(Debug, Clone)]
 pub(crate) struct Probe {
@@ -874,7 +876,7 @@ pub(crate) struct Probe {
     link: Box<Link>,
 }
 
-/// The replicator (design §4.10). Every non-terminal state carries the [`Ctx`].
+/// The replicator (design: Replicator). Every non-terminal state carries the [`Ctx`].
 #[derive(Debug, Clone)]
 pub(crate) enum Replicator {
     Activating {
@@ -940,8 +942,9 @@ impl Replicator {
         (state, actions)
     }
 
-    /// A provisional open (design §5.5) of a generation whose log's latest claim is `claim`: the
-    /// pre-check of design §7 starts with a HEAD, and nothing is logged until the stream answered.
+    /// A provisional open (design: Open) of a generation whose log's latest claim is `claim`: the
+    /// pre-check (design: Pre-check) starts with a HEAD, and nothing is logged until the stream
+    /// answered.
     pub(crate) fn provisional(
         local: LocalState,
         claim: (Epoch, Activation),
@@ -1067,10 +1070,10 @@ fn send_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
     Link::send(request, ctx, actions)
 }
 
-/// A HEAD named `incarnation`, another token whose history inherits the generation (design
-/// §6.2): the generation re-keys to it and claims under it, as after any fence. A takeover claims
-/// above every epoch seen. A continuation sends an unconfirmed claim again, same epoch and body,
-/// and claims `own + 1` over a claim it holds. Whatever was outstanding goes: the claim's
+/// A HEAD named `incarnation`, another token whose history inherits the generation (design:
+/// History): the generation re-keys to it and claims under it, as after any fence. A takeover
+/// claims above every epoch seen. A continuation sends an unconfirmed claim again, same epoch and
+/// body, and claims `own + 1` over a claim it holds. Whatever was outstanding goes: the claim's
 /// reconcile reads what landed.
 fn rekey(
     kind: ClaimKind,
@@ -1095,7 +1098,7 @@ fn rekey(
     // bind) may be lost with the old history while an explicit open
     // claimed in the new one, which saw no claim of ours above the one before: the latest claim
     // goes out again only after a pre-check under the new token found no other owner past that
-    // offset (design §7), so a background claim never fences that owner.
+    // offset (design: Pre-check), so a background claim never fences that owner.
     let past_acked = match (kind, holding) {
         (_, Holding::Reconciling(_)) => true,
         // A claim over the epoch it streamed in: that claim's frame is acknowledged.
@@ -1234,7 +1237,8 @@ fn common_event(
             Ok(None)
         }
         // Only the streaming state settles: a claim's reconcile acknowledges records before it
-        // announces them, and outputs wait for the claim and its reconcile (design §5.5, §7).
+        // announces them, and outputs wait for the claim and its reconcile (design: Open,
+        // Pre-check).
         Event::Sync { ticket, target } => {
             let after = ctx.upcoming_id();
             ctx.tickets.add(ticket, target, after);
@@ -1787,7 +1791,7 @@ impl PreChecking {
     }
 }
 
-/// The `410` rule of design §4.9 while its HEAD or snapshot read is out.
+/// The `410` rule (design: Reconcile) while its HEAD or snapshot read is out.
 struct Gone {
     kind: ClaimKind,
     reconcile: Box<Reconcile>,
@@ -1901,7 +1905,7 @@ impl Gone {
                     && range.is_none_or(|span| span.first() == 0) =>
             {
                 ctx.set_condition(None, actions);
-                // The header verifies without the body (design §4.11).
+                // The header verifies without the body (design: Snapshots).
                 match read_header(&answer.body) {
                     Ok((header, _))
                         if header.fields.offset == snapshot.offset
@@ -2033,7 +2037,7 @@ fn claim_answered(
             };
             if follow_up && matches!(kind, ClaimKind::Continuation { resent: true, .. }) {
                 // The claim applied before the history event, so the record stays
-                // history-fenced: one more claim over it (design §6.2, D4). So does a provisional
+                // history-fenced: one more claim over it (design: History). So does a provisional
                 // open's claim, whatever its receipt.
                 let Some(next) = next_epoch(epoch) else {
                     return reset(ResetKind::Internal, actions);
@@ -2052,8 +2056,9 @@ fn claim_answered(
             // Every claim but a repeat after a re-key (handled above) only ever went out under the
             // current token: it landed under it, and a later history event begins from it.
             ctx.rekey_from = None;
-            // D4's follow-up closes only the repeated claim's epoch, at seq 0: the reconcile
-            // cross-checks the epoch the binding streamed in against what the repeat named.
+            // The repeat rule's follow-up (design: History) closes only the repeated claim's epoch,
+            // at seq 0: the reconcile cross-checks the epoch the binding streamed in against what
+            // the repeat named.
             let repeated = ctx.repeat_closed.take();
             let closed = match (closed, repeated) {
                 (Some(own), Some(repeated))
@@ -2087,7 +2092,7 @@ fn claim_answered(
         }
         // A claim sent again whose record retired, its frame not found in the pre-check: the
         // retired record may be another claimant's, and the only safe next step is a reopen, which
-        // takes over (design §8.3: `stale`, action `reopen`).
+        // takes over (design: Resets; `stale`, action `reopen`).
         ClaimDecision::Lost { epoch: Some(named) }
             if named == epoch
                 && expired(exchange)
@@ -2098,7 +2103,7 @@ fn claim_answered(
         }
         // A claim sent again that applied before (its receipt evicted by later writes under it,
         // or its record retired with its frame found in the pre-check): one continuation claim
-        // above it follows, as after a repeat (design §4.8).
+        // above it follows, as after a repeat (design: Claims).
         ClaimDecision::Lost { epoch: Some(named) }
             if named == epoch
                 && matches!(kind, ClaimKind::Continuation { resent: true, .. })

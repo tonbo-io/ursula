@@ -1,13 +1,13 @@
-// Provisional opens (design §5.5): the stream is out of reach behind test/gate.mjs in `refuse` mode,
-// so every connection to it fails at once. An open with a trusted local cache that claimed the
-// stream before resolves at once, `provisional`: reads come from the cache, commits are local, and
-// `synced()` waits with the condition `retrying`. Once the gate forwards again, a HEAD and a
+// Provisional opens (design: Open): the stream is out of reach behind test/gate.mjs in `refuse`
+// mode, so every connection to it fails at once. An open with a trusted local cache that claimed
+// the stream before resolves at once, `provisional`: reads come from the cache, commits are local,
+// and `synced()` waits with the condition `retrying`. Once the gate forwards again, a HEAD and a
 // check of the stream from the cache's acknowledged state to the tail find no other owner there
-// (design §7), the claim applies, `synced()` resolves and the database is `live`. If another owner
-// took the stream over meanwhile, the database resets `fenced` with nothing sent, none of its
-// provisional commits reaches the stream, and that owner goes on, however many offline opens came
-// before. Without a cache the open waits for the stream and fails `unreachable` when its signal
-// fires.
+// (design: Pre-check), the claim applies, `synced()` resolves and the database is `live`. If
+// another owner took the stream over meanwhile, the database resets `fenced` with nothing sent,
+// none of its provisional commits reaches the stream, and that owner goes on, however many offline
+// opens came before. Without a cache the open waits for the stream and fails `unreachable` when its
+// signal fires.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, type UrsulaResetError, UrsulaUnavailableError } from "../src/index.ts";
 import { Child, directUrl, ext, freshDir, fromStream, gate, killChildren, rejection, stream } from "./kit.ts";

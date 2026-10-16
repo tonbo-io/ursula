@@ -1,5 +1,5 @@
-//! The JSON the SQL functions return: `ursula_status` (the subset of design §9 built so far),
-//! `ursula_stats`, `ursula_events` and the results of `ursula_open` and `ursula_synced`.
+//! The JSON the SQL functions return: `ursula_status` (design: Status), `ursula_stats`,
+//! `ursula_events` and the results of `ursula_open` and `ursula_synced`.
 
 use crate::db::Binding;
 use crate::db::Opened;
@@ -23,7 +23,7 @@ use crate::salvage::Salvaged;
 use crate::stats::Drained;
 use crate::stats::Dropped;
 
-/// The token of a replication condition (design §4.7, §9).
+/// The token of a replication condition (design: Answers, Status).
 fn condition(c: &Condition) -> &'static str {
     match c {
         Condition::Retrying => "retrying",
@@ -39,8 +39,8 @@ fn condition(c: &Condition) -> &'static str {
     }
 }
 
-/// The `state` status reports (D9): a reset, else the binding's life, a live one `provisional`
-/// until a claim of it applied (design §5.5).
+/// The `state` status reports (design: Status): a reset, else the binding's life, a live one
+/// `provisional` until a claim of it applied (design: Open).
 fn state(reset: bool, life: Life, provisional: bool) -> &'static str {
     match (reset, life) {
         (true, _) => "reset",

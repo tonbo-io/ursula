@@ -1,6 +1,6 @@
-//! The process-wide driver (design §4.10, §4.12, §8.2, §8.6): it runs a [`Replicator`] per bound
-//! database and the opens that lead to them, carries out their actions, and reports what came of
-//! them as [`DriverEvent`]s.
+//! The process-wide driver (design: Replicator, Transport, Synced, SQL functions): it runs a
+//! [`Replicator`] per bound database and the opens that lead to them, carries out their actions,
+//! and reports what came of them as [`DriverEvent`]s.
 //!
 //! The work splits in two. [`core::Core`] is deterministic and single-threaded: it takes calls
 //! and outcomes with the time, executes every replicator action, writes the small log records
@@ -58,13 +58,13 @@ use crate::snapshotter::Snapshots;
 use crate::transport::Attempt;
 use crate::wire::Request;
 
-/// The bounded event queue's length (design §8.6).
+/// The bounded event queue's length (design: SQL functions).
 pub(crate) const EVENTS: usize = 4096;
 
 /// How long a binding `ursula_open` handed out waits for a connection before it retires.
 pub(crate) const UNCONNECTED_MS: u64 = 60_000;
 
-/// How often, at most, a bound database writes an ACK record (design §5.2).
+/// How often, at most, a bound database writes an ACK record (design: Log).
 pub(crate) const ACK_INTERVAL_MS: u64 = 1_000;
 
 /// One open, from the call to its outcome.
@@ -108,7 +108,7 @@ pub(crate) struct DiskIo {
 }
 
 impl ResetKind {
-    /// The stable kind token (design §8.3).
+    /// The stable kind token (design: Resets).
     pub(crate) fn kind(self) -> &'static str {
         match self {
             Self::Fenced => "fenced",
@@ -131,13 +131,13 @@ pub(crate) enum SyncError {
 }
 
 /// A bound database's state that its connections share with the driver: the generation, the log
-/// the commit path appends to, the pending bytes admission reads (design §4.4), the reset the
-/// connections refuse their work on, what status reports of the replicator, and the root. The
+/// the commit path appends to, the pending bytes admission reads (design: Backpressure), the reset
+/// the connections refuse their work on, what status reports of the replicator, and the root. The
 /// root is released when the binding retires with no connection left. A binding that resets with
 /// connections open holds its generation ([`Root::hold`]) until the last of them closes, and the
-/// root with it: the root stays locked against other processes, and a reopen in this process
-/// shares it and builds from a copy of the held generation, never materializing the files the
-/// old connections still read (design §5.6).
+/// root with it: the root stays locked against other processes, and a reopen in this process shares
+/// it and builds from a copy of the held generation, never materializing the files the old
+/// connections still read (design: Materialize).
 #[derive(Debug)]
 pub(crate) struct BindingHandle {
     pub(crate) generation: Generation,
@@ -146,7 +146,7 @@ pub(crate) struct BindingHandle {
     pub(crate) name: CanonicalPath,
     /// The stream's cluster id.
     pub(crate) cluster_id: String,
-    /// The stream's token: the one it bound with, then the one of each re-key (design §6.2).
+    /// The stream's token: the one it bound with, then the one of each re-key (design: History).
     incarnation: Mutex<Incarnation>,
     log: Mutex<Log>,
     pending_bytes: AtomicU64,
@@ -171,16 +171,16 @@ pub(crate) struct BindingHandle {
     /// salvages, and none runs beside a live binding of it in this process, nor in another while
     /// the root is locked. A reopen beside a reset binding may, so a reset binding lists them anew.
     salvage: OnceLock<Arc<[Salvaged]>>,
-    /// Opened on an unreachable stream (design §5.5) and no claim of it has applied yet: reads
+    /// Opened on an unreachable stream (design: Open) and no claim of it has applied yet: reads
     /// come from files of unverified freshness, and `synced()` waits for the claim.
     provisional: AtomicBool,
-    /// The owner's binding, or a reader's (design D6).
+    /// The owner's binding, or a reader's (design: Readers).
     pub(crate) role: Role,
     /// The open found the stream closed: only a reader's open takes one.
     pub(crate) closed: bool,
 }
 
-/// Whose binding it is (design D6, D9 `role`).
+/// Whose binding it is (design: Readers, Status `role`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Role {
     /// The stream's owner: its claim, replicator, commits and snapshots.
@@ -307,7 +307,7 @@ pub(crate) enum Kept {
     Opening,
 }
 
-/// What status reports of a binding's replicator (design §9).
+/// What status reports of a binding's replicator (design: Status).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Replication {
     pub(crate) state: &'static str,
@@ -317,7 +317,7 @@ pub(crate) struct Replication {
     pub(crate) pending: usize,
     /// Frame bytes acknowledged since the latest snapshot.
     pub(crate) log_bytes: u64,
-    /// The request limit `L` (design §4.6).
+    /// The request limit `L` (design: Appends).
     pub(crate) request_limit: u64,
 }
 
@@ -331,7 +331,7 @@ const RESETS: [ResetKind; 7] = [
     ResetKind::Internal,
 ];
 
-/// A write transaction refused at admission (design §4.4).
+/// A write transaction refused at admission (design: Backpressure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("backlog_full: {pending} bytes pending, at most {max}")]
 pub(crate) struct BacklogFull {
@@ -753,7 +753,7 @@ pub(crate) struct Bind {
     pub(crate) max_pending_bytes: u64,
     pub(crate) acked: Position,
     pub(crate) attach: Attach,
-    /// Bound before its claim: the stream was unreachable at the open (design §5.5).
+    /// Bound before its claim: the stream was unreachable at the open (design: Open).
     pub(crate) provisional: bool,
     /// The cache root the open bound under, as its spec named it.
     pub(crate) dir: PathBuf,
@@ -761,13 +761,13 @@ pub(crate) struct Bind {
     pub(crate) closed: bool,
 }
 
-/// Where an open got its local database, as status reports it (design §9, `attach`).
+/// Where an open got its local database, as status reports it (design: Status, `attach`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Attach {
     /// A trusted local generation, materialized.
     Resumed,
     /// A trusted local generation of another token whose history inherits it, materialized and
-    /// re-keyed (design §6.2).
+    /// re-keyed (design: History).
     ReKeyed,
     /// A reader's trusted local generation of the stream's token, materialized and caught up in
     /// place to the tail the open's HEAD named.
@@ -788,7 +788,8 @@ pub(crate) struct Bound {
     pub(crate) handle: Arc<BindingHandle>,
 }
 
-/// What the driver reports (design §8.6): completions, acknowledgements, conditions, resets.
+/// What the driver reports (design: SQL functions): completions, acknowledgements, conditions,
+/// resets.
 #[derive(Debug, Clone)]
 pub(crate) enum DriverEvent {
     /// The open resolved; its outcome, with the handle when it bound, is taken once from
