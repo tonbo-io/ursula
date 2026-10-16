@@ -14,6 +14,11 @@ on:
         required: true
         default: main
         type: string
+      branch:
+        description: Cloudflare Pages branch to deploy to (main is production, anything else is a preview)
+        required: false
+        default: main
+        type: string
 
 permissions:
   contents: read
@@ -45,12 +50,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build docs
-        run: npm run build
+      - name: Build docs (latest and archived versions)
+        run: npm run build:all
+
+      - name: Verify versioned output
+        run: node scripts/docs-versions.mjs verify
 
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_PAGES_PROJECT_NAME: ${{ secrets.CLOUDFLARE_PAGES_PROJECT_NAME }}
-        run: npx wrangler pages deploy dist --project-name "$CLOUDFLARE_PAGES_PROJECT_NAME" --branch main
+          DEPLOY_BRANCH: ${{ inputs.branch || 'main' }}
+        run: npx wrangler pages deploy dist --project-name "$CLOUDFLARE_PAGES_PROJECT_NAME" --branch "$DEPLOY_BRANCH"

@@ -14,6 +14,7 @@ import {
   CHAOS_TEST_PATH,
   DOCS_PAGE_PREFIX,
   DOCS_PATH,
+  DOCS_TITLE_SUFFIX,
   HOME_PATH,
   getCurrentAppPath,
 } from "./utils/navigation";
@@ -67,7 +68,7 @@ function App({ initialUrl }: AppProps) {
 
     const slug = resolveDocsSlug(currentPath);
     const page = getDocsPageBySlug(slug);
-    document.title = page ? `${page.title} | Ursula` : "Ursula";
+    document.title = page ? `${page.title} | ${DOCS_TITLE_SUFFIX}` : DOCS_TITLE_SUFFIX;
   }, [currentPath]);
 
   if (currentPath === HOME_PATH) {

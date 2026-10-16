@@ -3,6 +3,11 @@
 //   dist/llms.txt         - index with summaries
 //   dist/llms-full.txt    - every page concatenated
 //
+// With `--version <id>` it reads the archived pages that
+// `scripts/docs-versions.mjs fetch` pulled for that version and writes
+// /docs/<id>/<slug>.md, /docs/<id>/llms.txt and /docs/<id>/llms-full.txt into
+// that version's build (archived-docs/<id>/dist), with links kept in-version.
+//
 // Runs after `vite build` in webpages/package.json. The transform unwraps
 // the JSX components we use (Card / CardGroup / Steps / Step / Note / Tip /
 // Warning / Info / CodeGroup / AccordionGroup / Accordion) into plain
@@ -10,16 +15,34 @@
 // real headings instead of JSX attributes.
 
 import { readdir, readFile, writeFile, mkdir, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
-const PAGES_DIR = join(REPO_ROOT, "src/content/docs/pages");
-const PUBLIC_DIR = join(REPO_ROOT, "public");
-const DIST_DIR = join(REPO_ROOT, "dist");
 const ORIGIN = "https://ursula.tonbo.io";
+const ARCHIVED = JSON.parse(readFileSync(join(REPO_ROOT, "docs-versions.json"), "utf8")).archived;
+const versionArg = process.argv.indexOf("--version");
+const VERSION = versionArg === -1 ? null : ARCHIVED.find((v) => v.id === process.argv[versionArg + 1]);
+if (versionArg !== -1 && !VERSION) {
+  throw new Error(`--version ${process.argv[versionArg + 1]} is not listed in docs-versions.json`);
+}
+const PAGES_DIR = VERSION
+  ? join(REPO_ROOT, "archived-docs", VERSION.id, "pages")
+  : join(REPO_ROOT, "src/content/docs/pages");
+const PUBLIC_DIR = join(REPO_ROOT, "public");
+const DIST_DIR = VERSION
+  ? join(REPO_ROOT, "archived-docs", VERSION.id, "dist")
+  : join(REPO_ROOT, "dist");
+// Public folder of the docs being generated, relative to the site root.
+const DOCS_DIR = VERSION ? `docs/${VERSION.id}` : "docs";
+// llms.txt and llms-full.txt sit at the root for latest, under DOCS_DIR otherwise.
+const LLMS_DIR = VERSION ? `${DOCS_DIR}/` : "";
+const VERSION_NOTE = VERSION
+  ? `These docs are for Ursula ${VERSION.id}.x (${VERSION.ref.replace(/^v/, "")}). ` +
+    `The latest docs are at ${ORIGIN}/llms.txt.`
+  : null;
 
 const GROUP_ORDER = [
   "Getting Started",
@@ -204,6 +227,11 @@ function transformMdxToMarkdown(body) {
   // <CodeGroup>X</CodeGroup>  →  unwrap + dedent (inner code fences keep their **Title**)
   text = text.replace(/<CodeGroup>\s*([\s\S]*?)\s*<\/CodeGroup>/g, (_m, inner) => dedent(inner));
 
+  // Keep an archived version's site links inside that version.
+  if (VERSION) {
+    text = text.replace(/(\]\(|href=")\/docs(?=[/#)"])/g, `$1/${DOCS_DIR}`);
+  }
+
   // Collapse runs of blank lines.
   text = text.replace(/\n{3,}/g, "\n\n");
 
@@ -243,12 +271,14 @@ async function main() {
   await stat(DIST_DIR).catch(() => {
     throw new Error(`dist/ does not exist; run "vite build" first.`);
   });
-  const outputRoots = [
-    { label: "dist", dir: DIST_DIR },
-    { label: "public", dir: PUBLIC_DIR },
-  ];
+  const outputRoots = VERSION
+    ? [{ label: `archived-docs/${VERSION.id}/dist`, dir: DIST_DIR }]
+    : [
+        { label: "dist", dir: DIST_DIR },
+        { label: "public", dir: PUBLIC_DIR },
+      ];
   for (const output of outputRoots) {
-    await ensureDir(join(output.dir, "docs"));
+    await ensureDir(join(output.dir, DOCS_DIR));
   }
 
   const files = await listMdxFiles(PAGES_DIR);
@@ -284,11 +314,12 @@ async function main() {
   // Per-page .md files at /docs/<slug>.md
   for (const p of pages) {
     const out =
+      (VERSION_NOTE ? `> ${VERSION_NOTE}\n\n` : "") +
       `# ${p.title}\n\n` +
       (p.description ? `> ${p.description}\n\n` : "") +
       p.markdown;
     for (const output of outputRoots) {
-      await writeOutputFile(output.dir, `docs/${p.slug}.md`, out);
+      await writeOutputFile(output.dir, `${DOCS_DIR}/${p.slug}.md`, out);
     }
   }
 
@@ -301,14 +332,19 @@ async function main() {
   }
 
   const llmsIndex = [
-    `# Ursula`,
+    VERSION ? `# Ursula ${VERSION.id}` : `# Ursula`,
     ``,
     `> ${SUMMARY}`,
     ``,
+    ...(VERSION_NOTE ? [VERSION_NOTE, ``] : []),
     `Customer-facing documentation. Each page is also available as raw markdown at`,
-    `${ORIGIN}/docs/<slug>.md (e.g. ${ORIGIN}/docs/quick-start.md). For all docs`,
-    `concatenated, fetch ${ORIGIN}/llms-full.txt.`,
+    `${ORIGIN}/${DOCS_DIR}/<slug>.md (e.g. ${ORIGIN}/${DOCS_DIR}/quick-start.md). For all docs`,
+    `concatenated, fetch ${ORIGIN}/${LLMS_DIR}llms-full.txt.`,
     ``,
+    ...(VERSION
+      ? []
+      : ARCHIVED.map((v) => `Older versions: Ursula ${v.id} at ${ORIGIN}/docs/${v.id}/llms.txt.`)),
+    ...(VERSION || ARCHIVED.length === 0 ? [] : [``]),
   ];
   for (const groupName of GROUP_ORDER) {
     const list = grouped.get(groupName);
@@ -316,20 +352,21 @@ async function main() {
     llmsIndex.push(`## ${groupName}`, ``);
     for (const p of list) {
       const desc = p.description ? `: ${p.description}` : "";
-      llmsIndex.push(`- [${p.title}](${ORIGIN}/docs/${p.slug}.md)${desc}`);
+      llmsIndex.push(`- [${p.title}](${ORIGIN}/${DOCS_DIR}/${p.slug}.md)${desc}`);
     }
     llmsIndex.push(``);
   }
   for (const output of outputRoots) {
-    await writeOutputFile(output.dir, "llms.txt", llmsIndex.join("\n"));
+    await writeOutputFile(output.dir, `${LLMS_DIR}llms.txt`, llmsIndex.join("\n"));
   }
 
   // llms-full.txt - every page concatenated.
   const llmsFull = [
-    `# Ursula - full documentation`,
+    VERSION ? `# Ursula ${VERSION.id} - full documentation` : `# Ursula - full documentation`,
     ``,
     `> ${SUMMARY}`,
     ``,
+    ...(VERSION_NOTE ? [VERSION_NOTE, ``] : []),
     `Source: ${ORIGIN}`,
     ``,
   ];
@@ -339,14 +376,14 @@ async function main() {
     llmsFull.push(p.markdown.trim(), ``);
   }
   for (const output of outputRoots) {
-    await writeOutputFile(output.dir, "llms-full.txt", llmsFull.join("\n"));
+    await writeOutputFile(output.dir, `${LLMS_DIR}llms-full.txt`, llmsFull.join("\n"));
   }
 
   console.log(`build-llm-docs:`);
   for (const output of outputRoots) {
-    console.log(`  ${output.label}/llms.txt`);
-    console.log(`  ${output.label}/llms-full.txt`);
-    console.log(`  ${output.label}/docs/<slug>.md (${pages.length} pages)`);
+    console.log(`  ${output.label}/${LLMS_DIR}llms.txt`);
+    console.log(`  ${output.label}/${LLMS_DIR}llms-full.txt`);
+    console.log(`  ${output.label}/${DOCS_DIR}/<slug>.md (${pages.length} pages)`);
   }
 }
 

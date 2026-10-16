@@ -2650,6 +2650,45 @@ a.docs-card:focus-visible {
   }
 }
 
+/* ========== Docs versions ========== */
+
+.docs-version-switcher {
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  display: flex;
+  font-size: 13px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+
+.docs-version-link {
+  color: var(--text-soft);
+  flex: 1;
+  padding: 6px 10px;
+  text-align: center;
+  text-decoration: none;
+}
+
+.docs-version-link + .docs-version-link {
+  border-left: 1px solid var(--border-muted);
+}
+
+.docs-version-link:hover,
+.docs-version-link:focus-visible {
+  background: rgba(69, 133, 136, 0.08);
+  color: var(--text-secondary);
+}
+
+.docs-version-link-active {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+
+.docs-version-banner {
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
 /* ========== Docs search (Pagefind) ========== */
 
 .docs-search-trigger {

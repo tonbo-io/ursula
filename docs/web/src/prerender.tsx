@@ -9,8 +9,12 @@ import {
   CHAOS_TEST_PATH,
   DOCS_PAGE_PREFIX,
   DOCS_PATH,
+  DOCS_TITLE_SUFFIX,
+  DOCS_VERSION,
   HOME_PATH,
   STATUS_PATH,
+  buildAppHref,
+  getCurrentAppPath,
 } from "./utils/navigation";
 
 const ORIGIN = "https://ursula.tonbo.io";
@@ -26,13 +30,17 @@ type HeadData = {
   ogType: "website" | "article";
   ogImage: string;
   canonical: string;
+  noindex?: boolean;
 };
 
+// Pages serves every route as <route>/index.html at <route>/, so the
+// canonical carries the trailing slash.
 function absoluteUrl(path: string) {
-  return `${ORIGIN}${path === HOME_PATH ? "/" : path}`;
+  return `${ORIGIN}${path === HOME_PATH ? "/" : `${path.replace(/\/+$/, "")}/`}`;
 }
 
-function getHeadForUrl(url: string): HeadData {
+// `url` is the public path being rendered, `path` the in-app route.
+function getHeadForUrl(url: string, path: string): HeadData {
   const canonical = absoluteUrl(url);
 
   if (url === HOME_PATH) {
@@ -46,18 +54,21 @@ function getHeadForUrl(url: string): HeadData {
     };
   }
 
-  if (url === DOCS_PATH || url.startsWith(DOCS_PAGE_PREFIX)) {
+  if (path === DOCS_PATH || path.startsWith(DOCS_PAGE_PREFIX)) {
     const slug =
-      url === DOCS_PATH ? "introduction" : url.slice(DOCS_PAGE_PREFIX.length) || "overview";
+      path === DOCS_PATH ? "introduction" : path.slice(DOCS_PAGE_PREFIX.length) || "overview";
     const page = getDocsPageBySlug(slug);
 
     if (page) {
+      // Archived versions keep a self canonical (their content differs from
+      // the latest page) and stay out of search indexes.
       return {
-        title: `${page.title} | Ursula`,
+        title: `${page.title} | ${DOCS_TITLE_SUFFIX}`,
         description: page.description ?? DEFAULT_DESCRIPTION,
         ogType: "website",
         ogImage: DEFAULT_OG_IMAGE,
         canonical,
+        noindex: DOCS_VERSION !== null,
       };
     }
   }
@@ -117,6 +128,9 @@ function getHeadForUrl(url: string): HeadData {
 
 function buildHeadElements(head: HeadData) {
   return new Set([
+    ...(head.noindex
+      ? [{ type: "meta", props: { name: "robots", content: "noindex, follow" } }]
+      : []),
     { type: "meta", props: { name: "description", content: head.description } },
     { type: "link", props: { rel: "canonical", href: head.canonical } },
     { type: "meta", props: { property: "og:type", content: head.ogType } },
@@ -133,20 +147,25 @@ function buildHeadElements(head: HeadData) {
 }
 
 export async function prerender(data: { url: string }) {
-  const head = getHeadForUrl(data.url);
+  const head = getHeadForUrl(data.url, getCurrentAppPath(data.url));
   const html = renderToString(<App initialUrl={data.url} />);
 
-  const docsPageLinks = getAllDocsPages().map((page) => `${DOCS_PAGE_PREFIX}${page.slug}`);
+  const docsPageLinks = getAllDocsPages().map((page) =>
+    buildAppHref(`${DOCS_PAGE_PREFIX}${page.slug}`),
+  );
   const blogPostLinks = getAllBlogPosts().map((post) => `${BLOG_PAGE_PREFIX}${post.slug}`);
-  const links = new Set<string>([
-    DOCS_PATH,
-    BENCHMARK_PATH,
-    CHAOS_TEST_PATH,
-    STATUS_PATH,
-    BLOG_PATH,
-    ...docsPageLinks,
-    ...blogPostLinks,
-  ]);
+  // An archived build renders only its own docs pages.
+  const links = DOCS_VERSION
+    ? new Set<string>([buildAppHref(DOCS_PATH), ...docsPageLinks])
+    : new Set<string>([
+        DOCS_PATH,
+        BENCHMARK_PATH,
+        CHAOS_TEST_PATH,
+        STATUS_PATH,
+        BLOG_PATH,
+        ...docsPageLinks,
+        ...blogPostLinks,
+      ]);
 
   return {
     html,
