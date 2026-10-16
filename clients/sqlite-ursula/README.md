@@ -2,8 +2,6 @@
 
 SQLite databases replicated through [Ursula](https://ursula.tonbo.io) streams, for Node.js 22.19 or later.
 
-This is the 0.8 development line.
-
 ```ts
 import { open } from "@tonbo/sqlite-ursula";
 

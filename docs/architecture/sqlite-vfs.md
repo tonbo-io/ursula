@@ -1,1140 +1,1365 @@
 # SQLite on Ursula: the replicating VFS
 
-The VFS runs an unmodified SQLite application (Pi Durable's official node `SqliteStorage` is the
-reference user) with an Ursula stream as the source of truth. A commit is durable once the stream
-acknowledges it. The local files are a non-durable cache of the stream (§6).
+The VFS runs an unmodified SQLite application with an Ursula stream as the source of truth. A
+commit is local: at SQLite's commit point the VFS appends the transaction's final pages to a log it
+owns, and a process-wide driver replicates the log to the stream in the background. A commit is
+durable once the stream acknowledges it, and `await db.synced()` is the output gate.
 
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
-`clients/sqlite-ursula` (TypeScript: the loader, `attach` and `open` in the root entry, which has no
-runtime dependencies, the error classes and the one mapping to them from a failure of the
-extension, the Pi helper `openUrsulaPiStorage` in the `/pi` entry, whose
-`@earendil-works/pi-durable` is an optional peer dependency, the e2e suites and the benchmark tools). User docs: `docs/web/src/content/docs/pages/examples/sqlite-vfs.mdx`.
+`clients/sqlite-ursula` (TypeScript: the loader, `open`, `importSqlite`, the error classes, the
+event pump, the Pi Durable adapter in the `/pi` entry, the e2e suites and the benchmark). The
+server contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx).
+User docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
-## 1. Shape
+Each heading below is a label. Code comments cite `design: <Heading>` for a heading here and
+`extensions: <Heading>` for a heading of the extensions specification. Tests are named by file and
+test name: Rust paths are relative to `clients/sqlite-vfs/src/`, TypeScript paths to
+`clients/sqlite-ursula/`.
 
-The extension registers a shim VFS named `ursula` over SQLite's `unix` VFS and makes it the
-default. `SELECT ursula_attach(path, stream_url)` binds one database file to one stream. From then
-on every connection that opens the file, in this process, is replicated without knowing it: each
-WAL commit is appended to the stream *before* any of the transaction's frames reach the local
-`-wal`. The local db file and WAL are a cache of the stream.
+## Model
 
-- One stream per database, `application/octet-stream`. Each append is one self-delimiting frame:
-  `"USQ1" | u32 len | u32 crc32c | zstd(record)`. A record is a **commit** (the database size after
-  it and the transaction's final page images) or a **claim** (a producer epoch and a 128-bit
-  random nonce).
-- The local file's position in the stream is the sidecar `<db>-ursula`. It holds the stream offset
-  after the last frame the file reflects, the owner's epoch, the sidecar's format (`v=2`), the log
-  since the latest snapshot in bytes (§4.1), the kernel boot id it was written in, the stream's
-  path and its `Stream-Incarnation`, the db file's inode, and its claim on the local WAL
-  (generation and last commit frame, §6). It is replaced atomically against a process crash (temp
-  file, then rename, no fsync).
-- Offsets are opaque. The VFS keeps every offset as the string the server wrote
-  (`Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Retained-Offset`), compares offsets only
-  as strings (the protocol orders them lexicographically), and never computes one. `-1`, the
-  protocol's "beginning of the stream", also stands for "none" (no snapshot, no local state). A
-  read without `Stream-Next-Offset` is an error. `ursula_attach`, `ursula_status`, `ursula_stats`
-  and the TypeScript API return offsets as these strings.
-- One owner per file per host: attach takes `flock` on `<db>-ursula.lock` for the process
-  lifetime, and refuses while any connection to the file is open in the process, any descriptor of
-  the process on the db file, its `-wal`, `-shm` or `-journal` outside the extension included (§3,
-  step 1).
-- A db file with a sidecar is the cache of a stream. It opens through the VFS only while an attach
-  of it has succeeded in this process. Before that (a process that never attached it, including a
-  restarted one) opening it fails with `SQLITE_CANTOPEN`. Passed through to `unix`, its commits
-  would never reach the stream. A file without a sidecar passes through, unless its last attach in
-  this process failed: after a failed attach the path opens through the VFS only once an attach
-  succeeds, sidecar or not. An attach refused for the file as it stands, before it changed
-  anything, changes nothing and is no failed attach: `in_use` (connections of the VFS open,
-  another thread attaching, another process attached to the file or holding it open, a descriptor
-  outside the extension), `unreplicated_file` and `other_stream` (§3, steps 1 and 2).
+```ts
+import { open } from "@tonbo/sqlite-ursula";
 
-### Errors
+const db = await open("https://streams.example.com/acme/notes");
+db.prepare("INSERT INTO notes(body) VALUES (?)").run("hello"); // committed on this host
+await db.synced();                                             // in the stream, still the owner
+res.end("saved");
+```
 
-Every failure has a kind, a stable token that callers branch on instead of the message's text, and
-each kind one action. `Error::kind` maps every error, `Error::poison_kind` the reason of a poison,
-and `WriteRefusal::error_kind` a write refused before it reached the stream, all in `error.rs`.
+**The one rule:** before anything outside the process acts on what you wrote or read (a response,
+a queue acknowledgement, a call to another service), `await db.synced()`.
 
-- A SQL function's error message is `<function>: <kind>: <message>`, such as
-  `ursula_attach: invalid_name: head http://h/s2/kv1: 400 ... bucket_id must be 4 to 64 bytes, got
-  2 bytes`. Its result code is `SQLITE_ERROR`, `SQLITE_AUTH` for an attach refused with `402`, and
-  `SQLITE_IOERR_AUTH` for one refused before it reached the stream in another way.
-- `ursula_status` of an attached file has `error`: `null` while writes go through, otherwise
-  `{"kind", "action", "message"}`. A poisoned file reports `fenced` and `stop` once a fence was
-  seen, and otherwise its first reason's kind and that kind's action, with the first reason as the
-  message (the `reason` field's text). A write refused before it reached the stream reports the
-  refusal's kind and action (`refused_kind` says what refused it).
-- `ursula_status` of a path that is not attached fails. Its kind is `not_attached` for a path
-  never attached in this process, and `attach_failed` for one whose last attach in this process
-  failed, followed by that failure's kind in a fixed place:
-  `ursula_status: attach_failed: <kind>: <path> is not attached: its last attach failed
-  (<message>)`. `attach_failed` has no action of its own: the wrapped kind's action applies.
-- A file method cannot choose SQLite's message, so a commit or read that fails names nothing by
-  itself: the caller reads `ursula_status` right after it. A commit refused before it reached the
-  stream fails with `SQLITE_IOERR_AUTH` (7178), and the file stays usable. A poisoned commit fails
-  with `SQLITE_IOERR_WRITE` (778), and `error.kind` tells an unknown outcome from a fence. A read
-  transaction of a fenced file fails with `SQLITE_IOERR_READ` (266, §3, fencing). An open refused
-  because the path is not attached fails with `SQLITE_CANTOPEN` (14).
+| the application | what happens |
+| --- | --- |
+| runs a statement or COMMIT | local work: SQLite, plus capture, compression and one log write |
+| awaits `synced()` | one append round trip while writing, one leader read when idle |
+| loses the stream | commits continue, `synced()` waits, status says `retrying`, past `maxPendingBytes` writes fail with `backlog_full` |
+| is taken over | statements and `synced()` throw `UrsulaResetError` (`fenced`), `reset` listeners run |
+| crashes | unacknowledged commits come back from the log at the next open and are resent |
 
-| kind | what failed | `action` |
+Every commit ends acknowledged or discarded, and only an unacknowledged commit is ever discarded,
+together with a reset. Only an `open()` that reaches the stream takes it over. Every claim the
+replicator makes on its own is conditional and loses to any newer owner. Unacknowledged commits do
+not survive a power loss before the next log fsync, and there is no local durability mode.
+
+## Shape
+
+```text
+ application connections (node:sqlite, Pi's driver, any host of the SQL functions)
+          SQLite pager and WAL
+                |  xWrite xRead xShmLock xFileControl xOpen xAccess xDelete
+          ursula VFS (vfs.rs): capture, PHASETWO confirmation, page-1 marker,
+                |               WAL name, reset fences, fsync hooks
+   generation directory: db, db-uwal, db-shm, log segments (replog.rs)
+                |
+   process-wide driver (driver/): a deterministic core with a replicator per database
+   (replicator/, a pure state machine), blocking HTTP workers, disk-job threads,
+   and a snapshot thread per binding (snapshotter.rs)
+                |
+   gateway or single node --> the stream's leader
+```
+
+- The extension registers a VFS named `ursula` over SQLite's `unix` VFS and makes it the default.
+  The registry (`db.rs`) keeps one binding per stream per process, shared by its connections.
+- The replicator is `Replicator::on(event, now_ms) -> Vec<Action>`: no I/O, no randomness, time
+  passed in. The driver's core (`driver/core.rs`) executes its actions and is itself
+  deterministic, so tests drive it with a virtual clock.
+- The runtime (`driver/runtime.rs`) runs the core on one driver thread. Each stream has two
+  request queues with a blocking ureq worker each: reads (the reconcile's, a build's, the
+  `synced()` probe) and everything else, so a probe never waits behind an append and no stream
+  waits behind another. Each disk job (materialize, catch-up, build, publish) runs on a thread of
+  its own. Calls into the driver return at once, and callers wait on a table of outcomes.
+- Every bound database has a snapshot thread with a private connection through the `ursula` VFS.
+
+## Commit path
+
+### Capture
+
+The VFS tracks the WAL write lock in `xShmLock` and records, for each frame a write transaction
+writes, its page number and offset. The commit point is the write of the page data of the frame
+whose header carries a non-zero database size. There:
+
+1. Admission ([Backpressure](#backpressure)) already ran at the transaction's first WAL write.
+2. The commit waits while another connection's logged commit is undecided
+   ([Publication](#publication)) or the snapshot window is open, at most 1 s for each.
+3. The VFS reads the final image of every page the transaction wrote back from the WAL file and
+   checks each against the crc32c of what this process wrote. It takes the commit frame's own page
+   from the buffer and drops pages above the commit's size. A commit that leaves WAL mode or
+   4096-byte pages fails alone as `unsupported`.
+4. It encodes one `USQ2` COMMIT frame ([Frames](#frames)), zstd-compressed.
+5. It appends a COMMIT record to the log ([Log](#log)): one positioned write, no fsync. The
+   position becomes `logged`.
+6. It forwards the commit frame's page data and returns. SQLite publishes and releases the lock.
+
+The log write precedes the commit frame's page data, so every commit SQLite could recover is in
+the log (L2). A failed log write fails the write before that page exists, so the frame's checksum
+cannot match, and the partial record is cut. Failures before step 5 roll back with nothing logged.
+WAL writes go straight to the WAL file. A WAL write without the WRITE shm lock (EXCLUSIVE locking
+mode) is refused as `unsupported`.
+
+Tests:
+
+- Pages and shapes: `capture/tests.rs` `one_commit_captures_every_page`,
+  `in_place_rewrites_inside_a_transaction_capture_the_newest_image`,
+  `a_commit_frame_after_spilled_frames_of_its_page_takes_the_buffer`,
+  `pages_above_the_commit_size_are_dropped`,
+  `a_savepoint_rollback_that_rewrites_a_frame_drops_what_it_undid`,
+  `a_commit_leaving_wal_mode_or_4096_byte_pages_is_refused`, and `test/core.e2e.ts` "captures a
+  spilled transaction rolled back to a savepoint: only what it committed reaches the stream".
+- Read-backs: `capture/tests.rs` `a_read_back_that_differs_is_a_lost_write`, `vfs/tests.rs`
+  `pages_read_back_are_checked_against_what_was_written`.
+- A failed log write: `replog/tests.rs` `an_injected_write_failure_cuts_the_segment_back`.
+- EXCLUSIVE mode: `vfs/tests.rs` `a_wal_write_without_the_write_lock_is_unsupported`,
+  `publication/tests.rs` `exclusive_locking_mode_is_refused`, `test/core.e2e.ts` "refuses a write
+  in EXCLUSIVE locking mode alone, as unsupported".
+- The steps under SIGKILL: `test/crash.e2e.ts`, steps `admission`, `capture`, `encode` (the commit
+  never happened) and `logged`, `forward`, `phasetwo` (the reopen replays it).
+
+### Publication
+
+A logged commit is final: shipped, and replayed whatever happens next. What remains is whether
+SQLite published it locally, since nothing built without it may be logged after it.
+
+- SQLite sends `SQLITE_FCNTL_COMMIT_PHASETWO` on the committing connection's main db handle right
+  after it releases the WAL write lock of a committed transaction, and only then. When it is the
+  very next call on that handle after the unlock, the commit is **confirmed**.
+- Any other call there first (a read-mark unlock, a file lock, a new write lock, a close) leaves it
+  **unconfirmed**: the binding resets `local_damage`, and the reopen replays the log, which commits
+  it.
+- While a logged commit is undecided, another connection reaching its commit point waits at most
+  1 s, then the binding resets. Nothing is logged on top of an undecided commit.
+- The PHASETWO handler never returns an error, since SQLite reports a published commit as failed
+  when it gets one.
+
+The rule is a pure state machine over a handle's calls (`publication.rs` `HandleState`). It reads
+no wal-index state and holds no SQLite lock past its release.
+
+Tests: `publication/tests.rs` `a_commit_is_confirmed_only_by_phase_two_right_after_its_write_unlock`,
+`a_published_commit_without_phase_two_is_unconfirmed`, `an_unpublished_commit_is_unconfirmed`,
+`a_new_write_lock_before_phase_two_leaves_the_commit_unconfirmed`,
+`a_close_after_a_logged_commit_leaves_it_unconfirmed`, `the_phase_two_handler_never_fails`, and
+against node:sqlite in `test/core.e2e.ts` "basic: one connection", "spill: a transaction that
+outgrows the page cache before its commit", "multi: two connections committing in turn" and
+"attachfail: a commit published locally whose attached database fails phase one is unconfirmed,
+and the reopen commits it". The reopen after the reset: `test/reopen.e2e.ts` "replays the
+unconfirmed commit after a local_damage reset".
+
+### Fsyncs
+
+Nothing is fsynced per commit. `xSync` of a bound file is a no-op whatever `PRAGMA synchronous`
+says.
+
+- **F1, log before db:** at `SQLITE_FCNTL_CKPT_START`, sent before a checkpoint copies its first
+  page, the VFS fdatasyncs the log if it holds unsynced records. Every page that reaches the db
+  file comes from a durable record. The snapshot thread's private connection takes the same hook.
+- **F2, db before a base:** before a new WAL generation and a WAL truncate to nothing, the VFS
+  fsyncs the db file, then a BASE record names the last confirmed commit the db holds.
+- **F3, before trimming:** segments are deleted only after the log is fsynced with the BASE and ACK
+  records that make them unnecessary.
+- **Claims:** a CLAIM record is fsynced before its claim is sent ([Claims](#claims)).
+
+A failed fsync resets `local_damage`. The cost is one log fdatasync per checkpoint and one db
+fsync per WAL wrap.
+
+Tests: `test/crash.e2e.ts`, steps `checkpoint_start`, `checkpoint_synced`, `checkpoint_page` (F1)
+and `base_start`, `base_synced`, `based` (F2), each under autocheckpoint and TRUNCATE checkpoints,
+and `trim_unlinked` (F3). Claims: `driver/tests.rs` `a_failed_claim_write_sends_no_claim`. Trims:
+`replog/tests.rs` `a_roll_carries_the_state_and_trim_deletes_what_base_and_ack_cover`,
+`a_failed_unlink_in_a_trim_keeps_the_log_contiguous`.
+
+### Backpressure
+
+`pending_bytes` counts compressed frame bytes logged and not acknowledged. At `maxPendingBytes`
+(64 MiB by default) a write transaction fails at its first WAL write with `backlog_full`
+(`SQLITE_IOERR_AUTH`, action `retry` after `synced()`), nothing written, the database usable. Any
+commit is admitted while nothing is pending, whatever its size. This is the only admission rule: a
+`402`, an authorizer's `403` or a refused token is a replication condition in status, and commits
+continue until the backlog fills. The bound also caps what a reset discards.
+
+Tests: `driver/tests.rs` `admission_counts_commits_the_driver_thread_has_not_seen`,
+`test/open.e2e.ts` "refuses a write past maxPendingBytes with nothing committed, and keeps the
+error across a helper", `test/outage.e2e.ts` (commits go on, nothing resets, `backlog_full` past a
+small bound, then a full catch-up).
+
+## Replication
+
+### Frames
+
+Stream frames are `USQ2`, little-endian, under the stream content type
+`application/vnd.ursula.sqlite-vfs.v2`.
+
+```text
+frame  = "USQ2" | u8 kind | u32 body_len | u32 crc32c(kind | body) | body
+kind 1 CLAIM   body = u64 epoch | [16] activation
+kind 2 COMMIT  body = [16] lineage | u64 position | zstd(record)
+kind 3 PART    body = [16] lineage | u64 position | u32 index | u32 count | chunk
+record = u32 db_pages_after | u32 n | n x (u32 pgno | [4096] image)      (pgno ascending)
+```
+
+- The commit id `(lineage, position)` is in the clear, so a reconcile matches without
+  decompressing. `lineage` is 16 random bytes per local lineage, `position` the record's place in
+  its log. Positions continue across rebuilds.
+- Frames carry no epoch, seq or stream identity. Bytes logged at commit time go out under any
+  epoch, so a resend needs no re-encoding and nothing relies on zstd being deterministic.
+- zstd frames declare their content size, carry a checksum and use a window of at most 2^22. No
+  frame body exceeds 4 MiB.
+- A commit above the batch limit ([Appends](#appends)) goes out as a run of PART frames,
+  consecutive slices of the COMMIT body's compressed record (`count >= 2`), one append each.
+- Readers apply a COMMIT, and a complete PART run `0..count-1` as one COMMIT. Any other frame
+  inside a run voids it: its owner resends the commit whole after a claim.
+
+Tests: `codec/frame/tests.rs` `frames_round_trip`, `every_strict_prefix_is_partial`,
+`a_flipped_bit_is_never_another_frame`, `a_complete_run_is_the_commit`,
+`a_foreign_frame_voids_the_run`, `a_part_of_the_same_commit_out_of_turn_voids_the_run`,
+`a_run_restarted_whole_completes`, `part_frames_cut_a_commit_and_join_back_to_it`,
+`a_huge_declared_size_fails_fast_with_bounded_memory`, `a_frame_with_a_larger_window_is_refused`.
+Frozen bytes: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_frozen`,
+`the_part_frames_are_frozen`.
+
+### Appends
+
+```text
+POST {stream}
+Content-Type: application/vnd.ursula.sqlite-vfs.v2
+Content-Length: <n>
+Stream-Incarnation: <token>
+Producer-Id: sqlite-ursula-vfs/2
+Producer-Epoch: <E>
+Producer-Seq: <s>
+Producer-Digest: <64 hex digits>     BLAKE3-256 of the body, on every write, claims included
+User-Agent: sqlite-ursula-vfs/<version>
+body = one CLAIM frame, or one sealed batch
+```
+
+- **Offsets** are the `u64` the server renders, compared numerically everywhere: receipts, reads,
+  HEAD, the log and snapshot headers.
+- **Limits.** The request limit `L` is the smallest of `Ursula-Max-Request-Bytes` from the latest
+  HEAD, any limit a typed `413` named after it, and `URSULA_VFS_MAX_REQUEST_BYTES`. A limit below
+  4 KiB blocks `request_too_large`. The batch limit is `min(L, 4 MiB)`.
+- **One append in flight per database.** With none in flight, the replicator seals whole frames of
+  consecutive pending records from the first unacknowledged one, at most the batch limit, ending
+  exactly at a position the snapshot thread asked for ([Snapshots](#snapshots)). A seal fixes
+  `seq = last + 1`, the body and its digest until a definite answer. Commits made meanwhile ride in
+  the next append.
+- **Receipt contiguity.** A receipt's `Stream-Offset` must equal the end of the previous
+  acknowledged write or of this owner's claim.
+- **Run tail.** `acked_offset` stays a commit boundary. Progress inside a PART run is the run tail
+  (`Ctx::tail`), which the next part's receipt and a `synced()` probe check against, so a probe
+  never reads the owner's own parts as foreign.
+- **Retries** resend the identical request with no budget, on a fresh connection after a request
+  that got no answer. Backoff doubles from 25 ms to 5 s with full jitter and never comes before
+  `Retry-After`, capped at 60 s. A blocked condition retries every 30 s.
+
+Tests:
+
+- Batches and the ACK: `replicator/tests/machine.rs`
+  `a_batch_takes_every_pending_record_and_the_ack_advances`,
+  `a_batch_ends_exactly_at_a_boundary_and_within_the_limit`.
+- Identical retries: `replicator/tests/machine.rs`
+  `a_lost_answer_resends_the_identical_request_on_a_fresh_connection_after_backoff`,
+  `retry_after_is_a_floor_capped_at_a_minute`, `late_and_duplicate_answers_are_ignored`, and the
+  world's property 3 (`replicator/tests/world.rs`
+  `the_replicator_keeps_its_properties_against_the_model`, with
+  `negative_control_a_renumbering_replicator_sends_two_bodies_under_one_key`).
+- Across a crash: `driver/tests.rs`
+  `an_append_applied_before_a_crash_is_acknowledged_by_the_reopen_and_not_resent`,
+  `an_append_never_applied_before_a_crash_is_resent_identically_under_the_new_epoch`.
+- Outages and failover: `driver/tests.rs`
+  `a_ten_minute_outage_ends_in_full_catch_up_without_a_reset`, `test/outage.e2e.ts`,
+  `test/failover.e2e.ts` "kills the stream's leader with commits unacknowledged: commits go on, no
+  reset, a full catch-up on the new leader".
+- PART runs and the run tail: `replicator/tests/parts.rs`
+  `seal_cuts_a_frame_above_the_batch_limit_into_a_run`,
+  `a_frame_above_the_batch_limit_goes_out_as_parts_acknowledged_with_the_last`,
+  `a_probe_inside_a_run_reads_from_the_run_tail_and_never_fences`, and `test/parts.e2e.ts` "a 1 MiB
+  transaction above a 64 KiB request limit commits in parts", "a 9 MiB transaction at the default
+  limit commits in 4 MiB parts", "a crash between parts leaves no part of the transaction applied,
+  and the reopen sends it whole".
+- Content-Length: `transport/http/tests.rs` `every_body_carries_content_length`.
+
+### Answers
+
+The replicator reads `Producer-Outcome` before `Producer-Epoch` and decides by what was in flight.
+Rows match in order (`replicator/answer.rs`).
+
+| answer to the in-flight append `(E, s)` | meaning | next |
 | --- | --- | --- |
-| `invalid_argument` | an argument of a SQL function (an attach mode, a NUL byte in a path) | `fix` |
-| `invalid_url` | the URL does not parse, or answers with a redirect the extension does not follow | `fix` |
-| `invalid_name` | the server answered the stream's `HEAD` or create with `400`, refusing its bucket or stream id | `fix` |
-| `not_found` | the stream is missing (or hidden from the credentials) | `fix` |
-| `in_use` | connections of the VFS open, another thread or process attaching or holding the file, or a descriptor of this process outside the extension on the db file, its `-wal`, `-shm` or `-journal` (§3, step 1) | `fix` |
-| `unreplicated_file` | the db file holds data but has no readable sidecar: it was never replicated (§3, step 2) | `fix` |
-| `other_stream` | the local files are the cache of another stream | `fix` |
-| `too_large` | a commit's frame is over the frame limit, or a vouched `413` refused it: the same transaction never goes through (§7) | `fix` |
-| `unsupported` | the application left WAL mode, changed the page size, or used `locking_mode=EXCLUSIVE` | `fix` |
-| `stream_state` | the stream holds or answers something the extension cannot follow (an undecodable frame, lost acknowledged data, no incarnation) | `fix` |
-| `not_attached` | the path was never attached in this process | `fix` |
-| `local_setup` | the local file system refuses an operation on the local files as it is set up: no permission, a read-only file system, a missing or misnamed directory, no space left | `fix` |
-| `unreachable` | no answer: no lookup, no connection, a timeout, or a write whose every attempt failed before it went out | `retry` |
-| `unavailable` | answered `429`, `408`, `307` or 5xx until the retry budget ran out | `retry` |
-| `unauthorized` | `401`, or a `403` that is no fence, on a request that applies nothing | `retry` |
-| `refused` | a write refused before it reached the stream (§2) | `retry` |
-| `outcome_unknown` | an append whose outcome is unknown: no answer within the retry budget, or an answer that does not prove that nothing was applied (§2), or an attach that failed after its claim (§3) | `reattach` |
-| `local_damage` | a page read back other bytes than written, or an fsync failed (§6) | `reattach` |
-| `local_state` | any other I/O error on the local files | `reattach` |
-| `internal` | a panic in the extension, or a missing routine of the host's SQLite | `reattach` |
-| `fenced` | another owner claimed the stream, it was recreated, or a writer outside the protocol appended | `stop` |
-| `attach_failed` | the path's last attach in this process failed | the wrapped kind's |
+| `200` at the expected tail | applied | acknowledge |
+| `204` at the expected tail | an earlier attempt applied this body (the server compared digests) | acknowledge |
+| `200` or `204` at another offset | bytes landed between our writes | reset `stream_state` |
+| `403 key-conflict`, or `204 receipt-evicted` | another body holds our key, or a write past `s` in our epoch | reset `fenced` |
+| `403 producer-expired` | the server forgot our epoch | continuation claim at own + 1 ([Claims](#claims)) |
+| `403 epoch-closed`, or another `403` with `Producer-Epoch` | a newer claim or a history event closed our epoch | reset `fenced` |
+| `409` or `400` with `Producer-Expected-Seq` | the server lost acknowledged state under one token | reset `stream_state` |
+| `409` with `Stream-Closed` | someone closed the stream | reset `stream_state` |
+| `412` or `404` | another history, a deleted stream, or misrouting | HEAD without a precondition ([History](#history), [Identity](#identity)) |
+| `413` with `Ursula-Max-Request-Bytes` | a named limit | lower `L`, and below the body a continuation claim and a re-cut, below 4 KiB blocked `request_too_large` |
+| `413` without a limit header | a layer outside the specification | HEAD, then the same as a named limit |
+| `401` | token refused | reread it and resend, the same token refused twice blocks `unauthorized` |
+| `402`, or `403` without `Producer-Epoch` | quota, or an authorizer | blocked `payment_required` or `forbidden` |
+| a 3xx | a redirect, never followed | resent 3 times, then blocked `redirected` |
+| no answer, a reset, a timeout, a 5xx, `429`, `408` | not acknowledged | resend identically after backoff |
+| any other status | a request the server cannot take | blocked `rejected` |
 
-The actions:
+A claim is answered by the same rules, except that `200`, or `204` with `Stream-Offset`, means our
+claim holds `E` and its reconcile follows ([Reconcile](#reconcile)), and any `403` with
+`Producer-Epoch` or `204 receipt-evicted` means the claim lost. `receipt-evicted` on a claim
+implies our digest, since a key conflict is decided first.
 
-- `retry`: the same handle works again later, since nothing reached the stream. A refused commit
-  leaves the file usable, and the next commit is sent as usual.
-- `reattach`: close the file's connections and attach it again. The attach replays what the stream
-  holds, and rebuilds local files it does not trust (§6).
-- `stop`: another owner holds the stream. Stop writing. Attaching again takes the stream back from
-  that owner, which only a deliberate takeover does.
-- `fix`: the request cannot succeed as made. Fix the URL, the name, the setup, the files or the
-  transaction, then try again. Nothing tells a caller to delete a file that may hold data: the
-  refusals that keep the local files say how to copy their rows into a newly attached file, or to
-  move the db file and its `-wal` aside to attach the path.
+- No refusal is read as "not applied". Each leads to an identical retry, a claim, or a reset. A
+  reset after a typed fence keeps pending records for the next open's reconcile.
+- `epoch-closed` never acknowledges: the server checks the epoch before identity, so
+  `Producer-Closed-Seq` at or above `s` proves that a write under our key applied, not that our
+  body did.
+- An idle owner's `producer-expired`, when the pre-check could not find the owner's own claim
+  frame, resets `stale` (action `reopen`) instead of `fenced`, and the reopen takes over with the
+  pending commits.
+- A HEAD follows three lost answers in a row for a body above 64 KiB, since a layer that refuses a
+  large body without reading it looks like a lost answer.
+- A `synced()` probe or a pre-check answered `410` sends a HEAD before it fences: our token still
+  there fences, another token takes the history path.
 
-The three ways a commit fails: refused before it reached the stream (7178, `refused` or
-`unreachable` or `too_large`, file usable), an unknown outcome (778, `outcome_unknown`, poisoned,
-`fenced: false`), and fenced (778, `fenced`, poisoned, `fenced: true`). A poison is never retried on
-the same handle, so a poison whose reason is of a `retry` kind (a re-claim's read that the endpoint
-put off) reports `outcome_unknown`. An append's `403` that is neither the fence nor vouched, and a
-`401` after an attempt that may have reached the stream, are `outcome_unknown` themselves, for a
-commit and for an attach's claim alike. An attach that fails after its claim, with a failure of a
-`retry` kind, reports `outcome_unknown` too, unless the claim was refused before it reached the
-stream: the claim may be in the stream, fencing every earlier owner.
+Tests: `replicator/tests/answer_rows.rs`, one test per row (`append_row_1_a_200_at_the_expected_tail_acknowledges`
+through `append_row_16_any_other_status_blocks_rejected`) and per claim row
+(`claim_row_1_a_receipt_wins_and_names_what_it_closed`,
+`claim_row_2_any_epoch_403_or_receipt_evicted_loses`,
+`claim_rows_otherwise_follow_the_append_rules`). Also `replicator/tests/machine.rs`
+`a_401_rereads_the_token_once_then_blocks`, `redirects_are_resent_a_few_times_then_block`,
+`a_typed_413_below_the_smallest_limit_lowers_it_and_blocks`,
+`a_410_on_a_fresh_probe_fences_once_head_shows_our_token`, `replicator/tests/parts.rs`
+`a_413_inside_a_run_claims_the_next_epoch_and_seals_again_smaller`,
+`three_lost_answers_for_a_large_body_send_a_head_whose_limit_recuts`, and
+`replicator/tests/rekey.rs`
+`a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expiry_goes_stale`.
 
-The TypeScript package maps these failures to error classes in one place (`classify` in
-`clients/sqlite-ursula/src/errors.ts`), which `open`'s database, `attach`, `status` and the Pi
-helper share. Every class is an `UrsulaError` carrying `kind` and `action`, with the failure's error
-as `cause`. A SQL function's error is mapped from the kind its message names. A statement's error
-is mapped only when it is an I/O error (`SQLITE_FULL` too, on a poisoned file), and only then does
-the mapping read `ursula_status`: a poisoned file maps to `UrsulaFencedError` (`stop`),
-`UrsulaReattachError` (`reattach`), or `UrsulaReplicationError` with `fix`, all of them
-`UrsulaReplicationError`s, and a commit that failed with 7178 maps to `UrsulaWriteRefusedError`,
-whose `kind` is `refused_kind`, when the file's status names a refusal of its own (a refused commit
-of another file used through SQL `ATTACH DATABASE` fails with the same code and stays SQLite's
-error). Any other error, such as a constraint violation, stays the error it is. The Pi helper also looks behind the errors Pi wraps (an AggregateError, a `cause`), so a
-failure of the extension inside Pi's `StorageRejected` maps too. The database `open` returns is a
-subclass of `node:sqlite`'s `DatabaseSync` whose `exec`, `prepare` and `applyChangeset`, and whose
-statements' `run`, `get`, `all` and `iterate`, throw what the mapping makes of their errors, for the
-file `open` attached. `open` resolves that file to an absolute path before it attaches it (and
-refuses `:memory:`, `""` and `file:` URIs, which SQLite would open as another database), and after
-opening it checks that `location()` is that file, by device and inode. A file named after the URL
-is attached with one spelling of the stream URL (its path percent-decoded and encoded again, `.`
-segments resolved, no trailing `/`), since the sidecar records the URL and refuses another spelling
-as `other_stream`. An I/O error makes SQLite roll the whole
-transaction back, so the database remembers an `UrsulaError` after which no transaction is open,
-until a statement succeeds: a transaction helper's ROLLBACK that then finds no transaction does not
-replace it (a prepared ROLLBACK succeeds, and one through `exec`, or a ROLLBACK TO or RELEASE that
-finds no savepoint, throws the remembered error).
+### Claims
 
-## 2. Writes
-
-WAL writes of an attached database go to a per-transaction overlay, which reads and the file size
-see. The write of the commit frame's page data (the frame whose header has a non-zero "db size
-after commit") is the commit point. The transaction's final page images become one commit frame,
-appended with the idempotent producer: `Producer-Id` `sqlite-ursula-vfs/<Stream-Incarnation>`,
-`Producer-Epoch` per owner, `Producer-Seq` per append. The incarnation is an opaque token compared
-for equality only, and the owners of one incarnation fence each other by epoch. Every request
-after attach's first `HEAD` (appends, reads, snapshot and retention `PUT`s, snapshot `GET`s) also
-carries the incarnation as the `Stream-Incarnation` request precondition. The server checks it
-atomically with the request (an append at Raft apply), so a stream recreated at the same path
-refuses everything of an owner of the deleted one with `412` (§6, wrong stream).
-
-### Outcomes
-
-A commit ends in one of three ways. It is **acknowledged**. It **fails alone**: SQLite gets
-`SQLITE_IOERR_AUTH` (an extended code SQLite reserves for extensions), rolls the transaction back,
-nothing of it reaches the local WAL, and the database stays usable. Or it **poisons**: SQLite gets
-`SQLITE_IOERR_WRITE`, rolls the transaction back, nothing of it reaches the local WAL, and the
-database refuses every write until it is attached again.
-
-| answer to an append attempt | outcome | `refused_kind` |
+| | takeover | continuation |
 | --- | --- | --- |
-| 2xx with a `Stream-Next-Offset` past the owner's offset | acknowledged | |
-| 2xx without one, or with one not past the owner's offset | poison | |
-| a duplicate (`204`) answered without its receipt | fenced, poison | |
-| no answer after the request went out (timeout, reset), a `307`, a 5xx without a vouched marker | unknown: retried, poison when the budget runs out | |
-| an attempt that never went out (no lookup, no connection, failed TLS handshake) | retried, fail alone when the budget runs out | `unreachable` |
-| `401` | retried with the token read again, fail alone when the budget runs out | `unauthorized` |
-| `429` | retried, fail alone when the budget runs out | `rate_limited` |
-| a vouched 5xx | retried, fail alone when the budget runs out | `not_applied` |
-| `402` | fail alone at once | `payment_required` |
-| a vouched `403` | fail alone at once | `forbidden` |
-| a vouched `413` | fail alone at once | `too_large` |
-| any other vouched 4xx | fail alone at once | `not_applied` |
-| `403` with `Producer-Epoch` | fenced, poison | |
-| any other 4xx, a redirect other than `307` | poison | |
-| (a frame over `URSULA_VFS_MAX_FRAME_BYTES`, §7, never sent) | fail alone | `too_large` |
+| made by | `open()` with the stream answering | the replicator: `producer-expired`, a re-cut, a re-key while bound, a provisional open after its pre-check |
+| epoch | above every epoch seen (own CLAIM records, the snapshot's epoch, a `403`'s `Producer-Epoch`), higher after any answer but its receipt, at most 16 rounds | exactly own + 1 |
+| loses | after 16 racing rounds (`claim_races`) | at the first answer but its receipt, or a foreign frame in its reconcile: reset `fenced` |
 
-"Vouched" means the answer carries both `x-ursula-not-applied` and `x-ursula-not-applied-checked`
-(below). A commit fails alone only while none of its attempts can have reached the stream. After
-an attempt whose outcome is unknown, refusals say nothing about it: a `402` is retried like an
-unknown outcome until an answer settles it (the duplicate's receipt once the layer forwards the
-append again), a vouched `403` poisons, and a budget that runs out on refusals poisons as unknown.
+- Before sending a claim the VFS appends a CLAIM record `(epoch, activation)` and fsyncs it, so a
+  claim frame whose activation is in the log is ours whether or not its answer arrived.
+- A claim's identity is its `Producer-Digest`. The server keeps a claim's digest for its epoch's
+  lifetime, so another claimant of the same epoch gets `403 key-conflict` and a repeat of ours gets
+  its receipt.
+- A claim's answer reports the epoch it closed in `Producer-Closed-Epoch` and
+  `Producer-Closed-Seq`. When that is the epoch the binding streamed in, the reconcile cross-checks
+  it: a batch the binding sent above `Producer-Closed-Seq` found in the stream resets
+  `stream_state`.
+- The activation id is 16 random bytes per open, or the `activation` option of `ursula_open`, and
+  the CLAIM frame carries it. Claims of one epoch from different activations have different
+  digests.
+- The epoch floor refuses every tokened claim at or below the highest retired epoch. A
+  continuation at own + 1 after idle expiry applies when own is the floor. A takeover learns the
+  floor from `Producer-Epoch` and goes above it.
 
-- **Acknowledged.** The overlay goes to the local WAL, later writes of the transaction (checksum
-  rewrites of spilled frames, padding) go straight to it, and when the write transaction ends the
-  sidecar advances. Nothing is fsynced, except the db file before a commit that starts a new WAL
-  generation (§6). The new `Stream-Next-Offset` becomes the owner's offset. The VFS does not check
-  where its frame landed, which would need offset arithmetic.
-- **A duplicate without a receipt** is never this owner's own retry: the owner is the only writer
-  of its producer at its epoch, retries only its newest append, and the server never evicts a
-  producer's newest receipt. So another writer holds the producer past this sequence.
-- **Outcome unknown.** The attempt is retried with the same sequence for up to
-  `URSULA_VFS_RETRY_MS` (30 s), no sooner than any `Retry-After`. The server deduplicates.
-- **Redirects** are never followed, by any request. Followed, a request would go out without the
-  token, and a `301`, `302` or `303` would turn an append into a `GET`. Ursula's gateway follows a
-  server's leader redirect itself and answers `503` with `Retry-After: 1` when it finds no leader
-  within three redirects and 5 s, so a `307` comes from a node the URL names directly or from
-  another layer. The VFS sends it again to the same URL like a `503`. For an append it is an
-  unknown outcome, because a leader that loses its leadership answers so after it may have
-  proposed the write. Any other redirect fails the write and the error names its `Location`, a
-  `308` from a proxy that redirects `http://` to `https://` among them (§7).
-- **401.** The token is read again before each retry (§7). A token that expires refuses the commit
-  once the budget runs out, and the application commits again after it sets a fresh one.
-- **403.** Only the server's fence carries `Producer-Epoch`. A `403` without it is an authorizer's
-  denial: it fails the commit alone when vouched, and poisons otherwise, because a filtering proxy
-  (a web application firewall that inspects responses) can answer `403` in place of the stream's
-  own answer after the stream applied the write. One classifier, `refused`, tells these apart.
+A claim nobody timed never takes a stream over: a process back from a partition cannot fence the
+owner an explicit open installed.
 
-### Refused before it reached the stream
+#### Pre-check
 
-One function, `client::applied_nothing`, decides for every answer whether it proves that the
-attempt applied nothing. A `401`, `402` or `429` does by its status alone. Any refusal (a 4xx or
-5xx) does when it carries both the marker `x-ursula-not-applied: <reason>`, which says the request
-was refused before it reached the stream and names why, and the vouch
-`x-ursula-not-applied-checked`, which says a gateway checked the marker. Any other answer proves
-nothing: a `403`, `413` or `503` with only one of the two headers, and a redirect or a success
-whatever headers it carries.
+A provisional open ([Open](#open)) and a re-key of a continuation whose latest claim applied past
+its acknowledged offset do not claim at once. They first:
 
-An attempt that failed before any byte of it went out applied nothing too: its host did not
-resolve, or no connection to it was made, the TLS handshake included. The client's resolver and
-connector mark the failures they return (`net::NotSent`), so this is decided by where the failure
-happened, not by its kind. A failure on a connection that was made, a pooled one included, stays an
-unknown outcome.
+1. Send a HEAD, which gives the token, the cluster id and the request limit.
+2. Read from the log's acknowledged offset to the tail that HEAD named, with `consistency=leader`
+   and the incarnation precondition. Any foreign frame resets with nothing sent. A `410` sends a
+   HEAD first: our token still there resets `stale`, another token takes the history path.
+3. Only then send the log's latest claim again, same epoch and body. Nothing is logged before. A
+   repeat receipt, or `receipt-evicted`, means that claim applied before, and one continuation
+   claim of the next epoch follows.
 
-A commit that fails alone leaves the owner its epoch, producer sequence and offset. Reads go on
-from the local files. The next commit is sent as usual, with the sequence the refused append never
-used, and is acknowledged once the refusals stop, without a new attach. `ursula_status` reports
-`writes_refused`, `refused_kind` (the table above) and `refused_reason` until a commit is
-acknowledged or the database is poisoned. `refused_reason` is the refusing layer's response body
-(its first 256 bytes followed by `...` when it is longer), or the marker's value when the body is
-empty. It is always the marker's value for `not_applied`. For `too_large` it is the frame's size
-and limit, or the marker's value of the `413`. For `unreachable` it is the last attempt's failure.
-A `402` also shows in `payment_required` and `payment_reason`. The extension logs
-`writes_refused` (`payment_required` for a `402`) when refusals of a kind start, and
-`writes_resumed` at the first acknowledged commit after them.
+A provisional open thus claims at most one above the latest claim of its own the stream applied,
+and never above an owner an explicit open installed before the pre-check read the tail. A
+generation whose log holds no CLAIM record has nothing to continue and does not open
+provisionally.
 
-A layer's refusal is recorded as `layer_refused`, and while it stands no snapshot is taken (§4.3).
-A transaction over the frame limit is refused unsent (`Append::Unsent`, `Db::refuse_unsent`). It
-leaves `layer_refused` as it was and neither sets nor clears the next-commit check below, since the
-stream cannot hold a frame that was never sent. A vouched `413` also leaves `layer_refused` as it
-was, but sets the check like any refusal a layer answered.
+Tests:
 
-### The requirement on layers in front of the stream
+- Claims: `replicator/tests/machine.rs`
+  `producer_expired_claims_exactly_own_plus_one_after_persisting_it`,
+  `a_takeover_retries_above_every_epoch_seen_then_gives_up`,
+  `a_batch_found_above_the_closed_seq_resets_stream_state`, `driver/tests.rs`
+  `idle_expiry_claims_own_plus_one_and_carries_on`,
+  `a_continuation_after_another_owners_claim_loses_and_fences`,
+  `a_failed_claim_write_sends_no_claim`, model `model/tests.rs`
+  `a_second_claimant_of_an_epoch_gets_key_conflict_and_a_clone_too`, `idle_expiry_raises_the_floor`.
+- Background claims never fence an explicit owner: the world's properties 4 and 20, and
+  `replicator/tests/world.rs` `offline_restarts_never_fence_an_owner_an_explicit_open_installed`,
+  `an_unapplied_claim_in_the_log_never_fences_an_explicit_owner`,
+  `a_re_key_while_reconciling_never_fences_an_explicit_owner`, `test/provisional.e2e.ts` "never
+  fences an owner an explicit open installed, after two offline opens in a row".
+- Pre-check: `replicator/tests/rekey.rs`
+  `a_provisional_open_sends_its_logs_claim_again_after_the_pre_check`,
+  `a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent`,
+  `a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry`, `driver/tests.rs`
+  `a_provisional_open_after_another_owners_takeover_is_fenced`, `test/provisional.e2e.ts` "resets
+  `fenced` when another owner took the stream over during the outage, and its commits never reach
+  the stream".
 
-The VFS takes these answers to mean that the attempt applied nothing, and cannot check it. Every
-layer in front of the stream must answer `401`, `402` or `429`, or send a vouched marker, only on
-requests the stream did not apply: it refuses them before it passes them on, or relays such an
-answer from the layer behind it. A layer that passes an append on and then answers so (a `402` from
-metering after the response, say) breaks the rule. So does a layer that sends one request upstream
-more than once, because it retries or follows a redirect, and relays such an answer to a later
-exchange, since an earlier exchange may have applied the request.
+### Reconcile
 
-The rule for deployments: **turn off retries and redirect following for writes** in every proxy,
-load balancer and service mesh in front of Ursula, on the routes to the gateway and on those from
-the gateway to the servers. Some service meshes retry a `503`, POSTs included, unless a route says
-otherwise (in Istio, `retries: attempts: 0`).
+One routine runs after every claim. It reads from the durable acknowledged offset to the claim's
+start, with `consistency=leader` and the incarnation precondition, and sorts every frame by
+activation and by commit id plus bytes, never by `(epoch, seq)` (`replicator/reconcile.rs`).
 
-When the rule breaks, the stream holds the refused transaction, which the local file lacks, and
-the next commit goes out with the producer sequence the refused one used.
+| frame | takeover | continuation |
+| --- | --- | --- |
+| a CLAIM with an activation in the log | skip | skip |
+| a COMMIT or complete PART run with the next pending record's commit id and bytes | acknowledged | acknowledged |
+| a foreign CLAIM | skip | reset `fenced`, unless a CLAIM of our own follows it in the range, which supersedes it |
+| a foreign COMMIT, or our commit id with other bytes | divergence: the pending tail is discarded, the generation caught up or rebuilt ([Materialize](#materialize)) | reset `stale` |
+| undecodable bytes | refuse `stream_state` | reset `stream_state` |
+| `410` at the start | the latest snapshot's header: our lineage at or below our durable acknowledged position continues from its offset, else a divergence | the same, except it never skips unread bytes: the snapshot's offset must equal the reconcile's start, else reset `stale` |
 
-### The next-commit check
+The remaining pending records then go out under the new epoch from seq 1, in order, same bytes.
+Once a claim at `E'` applies, no older-epoch frame of the producer can apply, and the read sees
+every frame applied before the claim, so each inherited record has landed or never will. Clones
+share a lineage, so a snapshot above the durable acknowledged position is never trusted.
 
-The server answers a fresh producer append `200` and a duplicate `204` with the receipt of the
-append it duplicates. The next commit after a refused one goes out with the same epoch and
-sequence, so when the refused commit was applied after all, the server answers the next commit as
-its duplicate. A `204` while no earlier attempt of the commit can have reached the stream is a
-duplicate none of its attempts explains, and at the sequence a refused commit left free the VFS
-poisons the database (`reason`: a commit refused as never applied may have been applied after all)
-instead of acknowledging pages that may never reach the stream. The reason names both commits, and
-the attach that follows replays whichever the stream holds. When it is the refused transaction, the
-database then holds it although its commit failed with `SQLITE_IOERR_AUTH`. So a false refusal
-usually poisons at the next commit instead of diverging.
+Tests: `replicator/tests/reconcile_rows.rs`, one test per row:
+`row_1_a_claim_with_our_activation_is_skipped`, `row_2_the_next_pending_commit_is_acknowledged`,
+`row_3_a_foreign_claim_is_skipped_by_a_takeover_and_fences_a_continuation`,
+`row_4_a_foreign_commit_diverges_a_takeover_and_resets_a_continuation_stale`,
+`row_5_undecodable_bytes_end_a_takeover_and_a_continuation_with_stream_state`,
+`row_6_a_410_at_the_start_rebuilds_a_takeover_and_resets_a_continuation_stale`,
+`row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked`,
+`row_6_a_410_with_a_snapshot_that_does_not_cover_us_diverges`. Superseded claims:
+`replicator/tests/world.rs`
+`a_crash_before_the_bind_supersedes_a_foreign_claim_and_goes_stale_on_a_foreign_commit`. Clones:
+`replicator/tests/world.rs` `a_clones_snapshot_never_covers_the_originals_commit`. Takeovers:
+`driver/tests.rs` `a_takeover_fences_the_owner_which_keeps_its_tail_then_discards_it_and_rebuilds`,
+`a_410_at_a_takeover_with_a_pending_commit_rebuilds_from_the_snapshot`.
 
-The check has known gaps:
+### Replicator
 
-- **An earlier attempt of the next commit proved nothing.** When an attempt of the next commit got
-  no answer, or an answer that proves nothing (a timeout, a `307`, a 5xx without a vouched marker),
-  before the `204`, the `204` is taken for that attempt's own duplicate, as every retry's is. The
-  commit is acknowledged without its pages and the database diverges from the stream with no
-  error. The VFS logs `refused_commit_unchecked`, with the commit and its receipt, when it
-  acknowledges a commit that way at the sequence a refused commit left free.
-- **The owner attaches again first.** After a restart, or when the refused commit was the process's
-  last, the attach replays the refused commit into the database with no error, and no later commit
-  meets its sequence. An application that runs the refused transaction again applies it twice.
-- **The producer expired** before the next commit (7 idle days): the re-claim finds the refused
-  commit past the owner's offset (`producer expired and the stream moved past ...`). When the
-  refused request was a re-claim's claim, the owner keeps its epoch and its next commit meets the
-  epoch the refused claim took (`superseded`). Both poison, and `ursula_status` reports `fenced`
-  with no second owner behind it.
-- **The commit's own `204`.** A gateway follows a leader redirect that a server can send after it
-  proposed the write, and the new leader answers a later exchange as the duplicate of the first.
-  At a sequence no refused commit used that is the only explanation, so the commit is acknowledged.
-  At the sequence a refused commit left free it poisons too, which costs an attach but loses
-  nothing.
+```rust
+enum Replicator {
+    Activating { kind: ClaimKind, step: Step, ctx },   // claim, reconcile, apply, rebuild, pre-check, 410 rule
+    Streaming { epoch, seq, work: Work, probe: Option<Probe>, ctx },
+    Reset(ResetKind),
+    Refused(Refusal),                                  // claim_races at open
+    Stopped,
+}
+enum ClaimKind { Takeover { round, rekeyed }, Continuation { own, resent } }
+enum Condition { Retrying, Blocked(BlockedReason) }
+enum BlockedReason { RequestTooLarge, Unauthorized, PaymentRequired, Forbidden, Redirected, WrongCluster, Rejected }
+enum ResetKind { Fenced, Stale, Rewound, Deleted, LocalDamage, StreamState, Internal }
+// events:  Logged, Answer, Tick, Boundary, Snapshotted, Sync, CaughtUp, Stop
+// actions: Send, PersistClaim, ReKey, PersistAck, Wake, Synced, Abandoned, Timer, Condition,
+//          Apply, Rebuild, Bound, Reset, Refuse, Boundary
+```
 
-### What Ursula's gateway and server guarantee
+A blocked condition is a `Condition` of a streaming replicator, not a state of its own. The driver
+makes `PersistClaim` and `ReKey` durable before it carries out the actions that follow them.
 
-Ursula's own components meet the requirement.
+A proptest world (`replicator/tests/world.rs`) runs owners against the model server over a network
+that delays, reorders, loses and duplicates requests and answers, with scripted faults, idle
+expiry, history events, misrouting, foreign writers, retention, clones, restarts, provisional
+restarts and power losses, then heals. Its monitors check twenty properties, among them:
+acknowledged never regresses (1), acknowledged records are a log prefix in stream order (2), one
+lineage never sends two bodies under one key (3), a continuation lands exactly one above the
+latest applied claim (4), no older key applies after a claim (5), a typed fence keeps pending
+records (6), every run ends acknowledged, retrying, blocked or reset (7), of two divergent clone
+commits at most one is acknowledged (8), `Synced` never fires past a foreign frame (9), a re-key
+happens only when the history inherits the generation (15), nothing applies on another deployment
+(16), no acknowledged commit is lost (19), and a background claim never applies above an explicit
+owner's (20). Negative controls must fail them.
 
-- **The gateway** answers `401`, `403` and `429` before it forwards a request, marks every refusal
-  it makes before forwarding, and vouches for every answer it returns, after removing any vouch
-  from upstream. It follows leader redirects, which a server can send after it proposed the write,
-  so it keeps the final answer's marker only if every redirect carried the marker too. On the same
-  condition it marks its `503` for a node it could not connect to, and its `503` when it finds no
-  leader.
-- **The server** never vouches, so its markers count only behind the gateway, and without a
-  gateway only a `401`, `402` or `429` proves anything. It marks writes its ingress admission
-  refuses (`503` with `RaftLogPressure`, `WalDiskPressure` or `IngressBodyBytesLimitReached`, and
-  `413` with `RequestBodyTooLarge`), and a create, append, close or delete it refuses before it
-  proposes the write (`503` with `NotLeader`, `GroupNotHosted`, `RaftUncommittedBackpressure` or
-  `ColdBackpressure`, and a redirect with `NotLeader` or `GroupNotHosted`). It never answers `401`
-  or `402`, answers `403` only as the fence, and `429` only to a new producer over the stream's
-  producer limit. Neither applies anything.
+Tests: `replicator/tests/world.rs` `the_replicator_keeps_its_properties_against_the_model`,
+`negative_controls_fail_the_proptest_too`, `the_proptests_shrunk_counterexamples_pass`, and each
+`negative_control_*` test there.
 
-A `401`, `402` or `429` counts by its status alone, so the gateway's redirect rule does not guard
-it. It is safe because a server's only `429` refuses the first append (sequence 0) of a producer
-the stream does not hold, and a replay of an append whose first exchange was committed is answered
-as its duplicate (`204`), never `429`. So no layer between the gateway and the servers may answer
-`401`, `402` or `429`. A third-party rate limiter or authorizer there is unsupported.
+### Snapshots
+
+A snapshot is due when the frame bytes acknowledged since the latest one exceed `max(database
+size, 8 MiB)`. The snapshot thread:
+
+1. Opens its private connection through the `ursula` VFS and checkpoints passively.
+2. Opens the window once no logged commit is undecided and no other connection checkpoints
+   (commit points wait while it is open, at most a second).
+3. Takes `k`, the last logged commit, and asks the replicator for a batch ending exactly at `k`.
+4. Checkpoints every frame, begins a read that sees exactly `k` and closes the window.
+5. Copies the pages into a temp file 256 pages at a time, fsyncs the db and appends BASE(`k`).
+6. Waits for `k`'s acknowledgement, whose receipt names `W`, fsyncs ACK(`k`, `W`) before the
+   publish, and writes the `USS3` body to a temp file while its digest is computed.
+7. Publishes, keyed by `(W, digest)`: a body of at most `L` in one `PUT {stream}/snapshot/{W}`, a
+   larger one in parts when HEAD's `Ursula-Max-Snapshot-Bytes` holds it in at most 4096 parts of
+   size `L`.
+8. Moves retention to the snapshot the stream held before, one behind, monotonic, after the `204`.
+
+`USS3` is a 56-byte header (`"USS3" | u64 W | u64 highest epoch claimed before W | [16] lineage |
+u64 last position | u32 pages | u32 crc32c(image) | u32 crc32c(header)`) that verifies on its own,
+then the zstd image. ACK(`k`, `W`) is durable first, so the owner's own snapshot never runs ahead
+of the durable acknowledged position the `410` rule compares with.
+
+- **Parts.** Each part is staged with `POST {stream}/snapshot/{W}/parts` and answered `201` with a
+  part id the server mints. A part whose answer was lost is staged again under a new id. The
+  commit `PUT {stream}/snapshot/{W}` carries `Stream-Snapshot-Parts` and the digest and lists its
+  ids. A `400` stages every part again once. A `429` to a part is the stream's staged-parts limit:
+  the attempt discards the stream's staged parts (`DELETE {stream}/snapshot/parts`) and fails as
+  transient. An attempt that fails before its commit is decided discards them too, once, best
+  effort. Nothing of a staging survives the attempt.
+- **Answers.** Only a `204` naming `W` and the digest, or a `409` naming them as the latest,
+  confirms. A commit whose answer is lost or retryable (a timeout, `502`, `503`) is repeated
+  unchanged for up to 30 minutes, and its answer head may take `t / 16 MiB/s` longer for `t`
+  bytes. A `409` with a later offset means superseded. One at `W` with another digest stops
+  snapshots (`stream_state`).
+- **Not published.** A body above `Ursula-Max-Snapshot-Bytes`, or above `L` on a server without a
+  cold store (parts answered `501`), is not published, and status reports `snapshot.error`.
+- **Failures** wait before the next attempt from 100 ms, doubling, up to five minutes, or an hour
+  when the body is too large. Requests carry the binding's current token, so snapshots go on after
+  a re-key.
+- **Builds** read a snapshot in byte ranges sized from HEAD's limit, and a chunk that does not
+  continue the download restarts the build.
+
+Tests:
+
+- Boundaries and the ACK: `driver/tests.rs`
+  `a_boundary_seals_a_batch_ending_at_k_and_hands_back_its_receipt_end`,
+  `a_410_with_our_lineages_snapshot_past_the_durable_ack_rebuilds`.
+- Publishing: `driver/tests.rs`
+  `publishes_keep_retention_one_snapshot_behind_and_refuse_bodies_above_the_limit`,
+  `a_body_above_the_request_limit_publishes_in_parts`,
+  `a_part_whose_answer_is_lost_is_staged_again_under_a_new_id`,
+  `a_commit_is_repeated_until_a_definite_answer`, `a_commit_answered_400_stages_its_parts_again_once`,
+  `a_part_past_the_staged_limit_discards_the_parts_and_a_later_attempt_publishes`,
+  `a_publish_behind_a_later_snapshot_is_superseded`,
+  `snapshots_publish_under_the_new_token_and_a_stale_token_is_transient`, and `test/core.e2e.ts`
+  "publishes snapshots, keeps retention one behind, and a fresh directory builds from the latest",
+  "publishes a snapshot body above the request limit in parts with a cold store, and reports it in
+  snapshot.error without one".
+- Backoff: `snapshotter.rs` `failures_double_the_wait_up_to_their_kinds_limit`,
+  `a_failure_holds_the_next_attempt_back_until_its_wait_ends_or_the_database_shrinks`.
+- Ranged builds: `driver/tests.rs` `a_build_reads_the_snapshot_in_chunks_of_the_request_limit`,
+  `a_chunk_that_does_not_continue_the_download_restarts_the_build`,
+  `a_whole_body_answer_to_a_ranged_read_installs_it`,
+  `a_416_on_every_chunk_ends_the_build_after_its_rechecks`.
+- The body: `codec/snapshot/tests.rs` `every_header_bit_flip_is_refused`,
+  `a_streamed_body_checks_its_digest_header_and_offset`, and `codec/vectors/mod.rs`
+  `the_snapshot_header_is_frozen`.
+
+### Transport
+
+- One attempt of a request is a blocking HTTP/1.1 request through ureq with rustls
+  (`transport/http.rs`). Appends, claims, reads and HEADs share one agent that keeps a connection
+  90 s after its last request (`URSULA_VFS_IDLE_MS`), snapshot transfers use another. Both keep up
+  to 256 idle connections per host and 1,024 in all.
+- Per-attempt limits scale with size: connect 5 s, request head 5 s, request body
+  `5 s + n / 256 KiB/s` (`URSULA_VFS_MIN_UPLOAD_KBPS`), response head 15 s, response body
+  `10 s + m / 256 KiB/s`. A timeout is another lost attempt.
+- A failure is "not sent" only when the resolver or the connector failed, decided by where it
+  failed. Every other failure is lost, and its retry goes out on a fresh connection.
+- Every request with a body carries `Content-Length`, so a node can answer `413` or an early answer
+  before reading it. Over HTTP/1.1 the body is still sent, and the server drains it.
+- No redirect is followed, so the stream URL names a gateway or a single node.
+- The DNS cache serves a host's addresses for 30 s after a lookup, and after a failed lookup keeps
+  the last addresses for up to 10 minutes.
+- One bearer token per process: the last open's `token`, `ursula_set_token`, or the file
+  `URSULA_VFS_TOKEN_FILE` names, re-read when it changes and after a `401`. A private CA bundle
+  goes in `URSULA_VFS_CA_FILE`. A token sent over `http://` to a host that is not a loopback
+  address logs `token_in_clear` once.
+
+Tests: `transport/http/tests.rs` `a_redirect_is_never_followed`,
+`every_body_carries_content_length`, `time_limits_scale_with_the_body_and_the_answer`,
+`only_a_proven_unsent_failure_is_not_sent`, `a_refused_connection_sent_nothing`,
+`a_connection_closed_after_the_body_is_lost`, `model_answers_round_trip_through_http`. DNS:
+`net.rs` `requests_within_30_s_of_a_lookup_make_none`,
+`a_failed_lookup_uses_the_last_addresses_until_the_retry`,
+`a_failed_lookup_past_the_stale_limit_fails_as_never_sent`. Tokens: `auth.rs`
+`tokens_are_trimmed_printable_ascii`, `a_token_file_without_a_token_keeps_the_last_one`.
+
+## Local state
+
+### Layout
+
+The extension owns its files. `open(url, { dir })` and `ursula_open(url, dir, ...)` derive the
+directory and return the db path.
+
+```text
+<dir>/                                    default <user cache>/sqlite-ursula/0.8
+  <label>-<hash32>/                       BLAKE3 of the canonical stream path, first 32 hex digits
+    lock                                  flock, held with the binding
+    gen-<id32>/                           the current generation
+      db                                  the SQLite file, page 1 marked
+      db-uwal                             the WAL, under a name SQLite never probes
+      db-shm                              the wal-index
+      log/<20-digit first position>.usl   log segments
+    gen-<id32>.tmp/                       a generation being built
+    gen-<id32>.trash/                     a superseded generation being deleted
+    reader-<n>/                           a reader process's lock and generations
+    salvage/<UTC time>-<reason>/          moved-aside generations, with manifest.json
+```
+
+- A generation directory is named by a random id, not by its lineage. The lineage is in the log's
+  segment header, so a copy of a generation keeps its lineage in a directory of its own.
+- A generation is built in `gen-<id32>.tmp`, its db initialized, marked and fsynced there, and
+  published by one rename after the old one's fate is written. No published db file is ever empty
+  or unmarked. Every segment names the directory its generation supersedes, and a roll carries
+  that forward, so a crash that leaves two generations is finished at the next open.
+- A superseded generation is renamed to `.trash` before it is deleted.
+
+Tests: `generation/tests.rs` `the_root_name_is_a_label_and_the_path_hash`,
+`a_second_lock_on_the_root_is_in_use`, `a_built_generation_becomes_current_once_published`,
+`a_crash_after_each_publish_step_converges_to_one_generation`,
+`a_rolled_and_trimmed_build_converges_after_a_crash_at_each_publish_step`,
+`two_directories_of_one_lineage_resolve_by_supersedes`,
+`a_generation_is_published_with_page_one_written`, `ids.rs`
+`generation_ids_spell_as_32_hex_digits`, `db.rs` `the_default_dir_is_versioned`, `replog/tests.rs`
+`every_segment_names_what_its_generation_supersedes`.
+
+### Log
+
+```text
+segment = header | record*                                         rolled at 16 MiB
+header  = "USL1" | u32 version=1 | [16] lineage | u64 first_position | opt16 supersedes
+        | str cluster_id | str stream_path | u64 incarnation
+        | u64 base | u64 acked | u64 acked_offset | u64 log_bytes   carried over
+        | claim                                                    the latest CLAIM, if any
+        | u32 crc32c(header)
+record  = u32 len | u8 kind | u64 position | payload | u32 chain
+chain   = crc32c(previous chain | kind | position | payload)        seeded by the header crc
+str     = u16 len | utf-8
+opt16   = u8 0 | u8 1 [16]
+claim   = u8 0 | u8 1 u64 epoch [16] activation
+```
+
+| kind | payload | written |
+| --- | --- | --- |
+| 1 COMMIT | the frame: our commit, or a stream frame caught up at open | at the commit point, or before catch-up pages are applied |
+| 2 CLAIM | `u64 epoch`, `[16] activation` | before the claim is sent, fsynced |
+| 3 ACK | acked position, acked offset (a commit boundary), log bytes since the latest snapshot | at most once a second, at once during an open, before a snapshot publishes, and when a binding resets or retires |
+| 4 BASE | position | after F2, materialization, or a snapshot copy |
+
+- Positions start at 1. The valid log is the longest prefix whose chain verifies and whose
+  positions grow by one. Open cuts the log at its first broken record, whether or not a
+  chain-valid record follows, and reports the cut. A power loss can keep later unsynced records and
+  lose an earlier one, and a user can store bytes that verify as a later record, so neither may
+  refuse the open. The cut keeps L3, since pages reach the db only after F1 fsyncs the log.
+- A gap or a malformed record under valid chains fails as `internal`. Caught-up stream frames with
+  no ACK after them are cut, since a catch-up applies its frames only once that ACK is fsynced.
+- A binding writes an ACK when it resets or retires. A clean retire and a `rewound` reset fsync
+  it, so a cleanly closed log holds no commit after its latest ACK but ones never acknowledged.
+- A segment goes once all its records are at or below `min(base, acked)` (F3). Disk use is the
+  pending records, the records since the base and one segment.
+- A re-key ([History](#history)) rolls the log to a segment that names the new token, fsynced with
+  the CLAIM record that follows.
+
+Tests: `codec/segment/tests.rs` `segments_round_trip`, `a_chain_break_keeps_the_prefix_before_it`,
+`a_position_gap_under_valid_chains_is_a_gap`, `every_header_bit_flip_is_refused`, `replog/tests.rs`
+`a_torn_tail_is_cut`, `crash_cuts_at_every_byte_keep_the_whole_records`,
+`a_record_lost_before_a_kept_one_is_cut_there`,
+`a_planted_look_alike_record_does_not_refuse_the_open`, `a_gap_under_valid_chains_is_an_error`,
+`caught_up_frames_no_ack_follows_are_cut`, `a_torn_roll_deletes_the_new_segment`,
+`a_rekey_rolls_to_a_segment_naming_the_new_token_with_its_claim`, `driver/tests.rs`
+`acks_are_written_at_most_once_a_second`,
+`a_clean_close_writes_an_exact_ack_so_an_inheriting_history_re_keys`, `test/crash.e2e.ts` step
+`cut_removed`. Frozen bytes: `codec/vectors/mod.rs` `the_log_segment_is_frozen`,
+`a_fresh_builds_segment_header_is_frozen`.
+
+### Marker
+
+On disk, bytes 0 to 16 of the db file hold `Ursula08` and the first 8 bytes of the lineage. On the
+main db file only, the VFS stores the marker where SQLite writes its magic (`xWrite`), returns
+SQLite's magic for a read that finds the marker of this lineage (`xRead`), and resets
+`local_damage` on anything else: the file was replaced or written outside. `xFetch` maps nothing
+over page 1, so SQLite reads it through `xRead`. Frames and snapshots carry plain pages, and the
+Applier stamps the marker.
+
+Tests: `codec/marker/tests.rs` `the_marker_names_the_lineage`,
+`magic_written_reads_back_as_magic`, `another_lineage_is_not_marked`, `vfs/tests.rs`
+`page_one_lands_on_disk_marked_and_reads_back_as_magic`, `a_foreign_marker_resets_local_damage`,
+`fetch_maps_nothing_over_page_one`, `applier.rs` `page_one_written_outside_the_applier_is_stamped`,
+`codec/vectors/mod.rs` `the_page_one_marker_is_frozen`.
+
+### Invariants
+
+- **L1, log:** the log means its longest valid prefix.
+- **L2, record first:** every commit SQLite could recover has a COMMIT record, appended before its
+  commit frame's page data.
+- **L3, base:** with `B` the latest BASE, the db file holds every commit up to `B` durably, and
+  otherwise only pages from records after `B`.
+- **L4, order:** the log is fsynced before a checkpoint copies a page (F1) and the db before a
+  BASE (F2), so any crash-consistent image satisfies L3 with its durable log prefix.
+- **L5, acknowledged prefix:** acknowledged records are a log prefix, and past the acknowledged
+  offset the stream holds this lineage's frames only in log order, among its claims, until another
+  owner's frame.
+
+Re-applying the records after `B` gives exactly the state at the end of the valid log. The WAL
+plays no part.
+
+Tests: L1 to L4 by `materialize/tests.rs`
+`materialization_yields_the_state_at_the_last_valid_record` (a proptest over random commits,
+checkpoints and crashes) and the `test/crash.e2e.ts` matrix. L5 by the world's property 2.
+
+### Open
+
+`open()` checks in-process state, then the first disk job takes the root's `lock` (`in_use` when
+another process holds it), finishes leftovers (`.tmp`, `.trash`, a superseded generation, a salvage
+marked `moving`), checks page 1 and the segment header, and materializes the current generation.
+Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
+
+| local generation | HEAD | the open |
+| --- | --- | --- |
+| any | no `Ursula-Protocol: 2` (a gateway's concealing `404` included) | refuse `server_too_old` |
+| trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
+| none, replaced | `404` | create, take over |
+| trusted, holding no data | `404` | create, take over |
+| trusted, holding data | `404` | refuse `not_found`, or with `recreate` salvage (`recreated`), create, take over |
+| any | another content type (a 0.7 stream) | refuse `stream_format` |
+| any | closed | refuse `stream_state` |
+| none | `200` | build, take over, reconcile |
+| replaced | `200` | build, the generation salvaged (`replaced`) |
+| trusted, same token | `200` | resume: take over, reconcile, catch up or rebuild |
+| trusted, other token, inheriting, nothing pending | `200` | re-key, take over ([History](#history)) |
+| trusted, other token, otherwise, holding data | `200` | build, the generation salvaged (`history_changed`) |
+| trusted, other token, otherwise, holding no data | `200` | build, the generation trashed |
+
+- **Trusted:** the log validates up to its first broken record, the segment header reads, and page
+  1 carries the lineage. A generation whose db file is not its own or whose first segment header is
+  unreadable is **replaced**. No boot id, inode, size or WAL shape enters, and a power loss does
+  not end trust.
+- **Holding data:** the db file is longer than one page, or the valid log holds a COMMIT record.
+- **Nothing moved on a refusal:** no generation is renamed or removed and nothing is sent. Deleting
+  the WAL and `-shm` during materialization is allowed, and so is the copy a reopen beside reset
+  handles publishes ([Materialize](#materialize)), which is equivalent to the original.
+- **Unreachable:** the first request got no answer with nothing sent: the name lookup or the
+  connect failed, or took longer than its 5 s limit. A stream that answers, even with a 5xx, is
+  reachable, and `open()` waits for the takeover, bounded by its signal.
+- **Provisional:** a trusted generation whose log holds a CLAIM record opens at once on an
+  unreachable stream. Reads come from local files, commits are pending, `synced()` waits, and the
+  claim waits for the stream behind the [Pre-check](#pre-check). Without a generation or a claim,
+  the open retries until its signal fires.
+- All db writes at open precede binding. After binding, anything that would rewrite pages under
+  live connections is a reset, never an in-place apply.
+- A stream binds under one `dir` at a time in a process. An open under another `dir` waits for a
+  binding nothing of the host holds to retire, and is refused `bound_elsewhere` otherwise.
+
+Tests: `open/table.rs` `a_server_without_protocol_2_is_too_old`,
+`a_404_without_protocol_2_is_too_old_not_missing`,
+`another_cluster_refuses_a_trusted_generation_before_anything_else`,
+`a_missing_stream_is_created_unless_a_trusted_generation_holds_data`,
+`another_content_type_and_a_closed_stream_are_refused`,
+`no_generation_builds_and_the_same_token_resumes`,
+`a_replaced_generation_is_salvaged_and_built_over`,
+`another_token_whose_history_inherits_the_acknowledged_offset_re_keys`,
+`an_inheriting_history_salvages_a_generation_with_pending_commits`,
+`another_token_that_does_not_inherit_salvages_or_trashes`,
+`an_unreachable_stream_opens_a_trusted_generation_with_a_claim_provisionally`,
+`an_unreachable_stream_waits_without_a_generation_a_claim_to_continue_or_with_a_replaced_one`.
+Driver: `driver/tests.rs` `a_server_without_protocol_2_is_refused`,
+`a_head_404_without_the_protocol_is_no_missing_stream`,
+`a_stream_of_another_content_type_is_refused`, `a_stream_of_usq1_frames_is_refused`,
+`a_missing_stream_with_a_local_generation_holding_data_is_not_found`,
+`recreate_salvages_the_generation_and_creates_the_stream`,
+`a_missing_stream_over_a_generation_holding_no_data_is_created`, `a_root_locked_elsewhere_is_in_use`,
+`an_unreachable_stream_fails_the_open_at_its_deadline`,
+`a_provisional_open_resolves_when_its_first_connect_times_out`,
+`a_stream_that_answered_first_is_reachable_and_the_open_waits`,
+`a_provisional_open_waits_for_its_claim_then_goes_live`. End to end: `test/provisional.e2e.ts`
+"opens a trusted cache provisionally: reads and commits work, synced() waits, then it goes live",
+"goes live after two offline opens in a row, with the commits of both", `test/open.e2e.ts`
+"cancels at its signal: an unavailable error, and the stream is not held", `test/handout.e2e.ts`
+"is refused in another cache while a connection of the host is open, naming the cache it is open
+in".
+
+### Materialize
+
+- **Materialize**, at every open of a trusted generation: cut the log to its valid prefix, fsync
+  it, delete the WAL and `-shm` unread (and a `db-wal` or `db-journal` left by SQLite outside the
+  extension), re-apply the COMMIT records after the latest BASE in batches of final images, fsync
+  the db, append BASE.
+- **Catch up in place**, when a takeover's reconcile found foreign frames and nothing is pending:
+  log each frame as a COMMIT record plus an ACK, fsync the log, apply, fsync the db, append BASE,
+  so a crash midway replays. A catch-up larger than the database rebuilds instead.
+- **Rebuild**, for a fresh host, a token change that does not inherit, a discarded pending tail or
+  a replaced generation: build `gen-<id32>.tmp` from the latest snapshot and the tail, fsync,
+  write its first segment, publish. A discarded tail always rebuilds, since checkpoints may have
+  moved its pages into the db with no earlier images kept. A history change during a fresh build
+  starts the build over under the new token, at most 8 times.
+- **Reopen from a copy:** a reopen after a reset need not wait for old handles. If they still hold
+  the generation, the open copies its db and then its log into a `.tmp` with the same lineage,
+  publishes the copy, and the old connections keep their files. A commit after the reset is
+  refused under the log lock, so none lands in the old log after the copy.
+
+Tests: `materialize/tests.rs` `materialization_yields_the_state_at_the_last_valid_record`,
+`catching_up_logs_applies_and_survives_a_reopen`,
+`catching_up_is_refused_while_our_commits_are_pending`, `stray_sqlite_files_are_deleted`,
+`driver/tests.rs` `a_reopen_without_pending_commits_catches_up_in_place`,
+`a_catch_up_larger_than_the_database_rebuilds`,
+`a_history_change_during_a_fresh_build_starts_it_over`, `a_fresh_build_gives_up_after_its_restarts`,
+`a_reopen_while_old_handles_live_builds_from_a_copy`, `generation/tests.rs`
+`a_copy_keeps_the_lineage_the_marker_and_the_log`,
+`a_crash_during_a_copy_leaves_one_generation_current`, `vfs/tests.rs`
+`a_commit_after_a_reset_is_refused_under_the_log_lock`, `test/reopen.e2e.ts` "succeeds after a
+fenced reset: the old read keeps its snapshot, its new statements fail, the new database commits",
+and its `copy_db` and `copy_log` kills.
+
+### Readers
+
+A `readOnly` open claims nothing and never fences the owner.
+
+- In a process that owns the stream it returns a read-only connection on the owner's binding,
+  which sees the owner's latest commits, acknowledged or not.
+- Otherwise it locks the first free `reader-<n>/` of the root (up to 64) and builds or catches up a
+  reader generation to the stream's tail at the open. Its connections open read-only, its
+  `synced()` resolves at once, and it retires with its last connection.
+- A reader generation holds no commit of its own, so it is never salvaged and never re-keyed:
+  anything the stream no longer extends is built anew. A closed stream opens. A trusted reader
+  generation of another cluster is refused `wrong_cluster`.
+- On an unreachable stream a reader opens a trusted reader generation as it is, and otherwise waits
+  until its signal fires. A missing stream is `not_found`. `readOnly` with `recreate` is
+  `invalid_argument`.
+- The extension does not make a connection on the owner's binding read-only. A host of the SQL
+  functions opens a reader's path with `SQLITE_OPEN_READONLY`, as the TypeScript package does.
+
+Tests: `open/table.rs` `a_reader_refuses_an_old_server_another_cluster_and_a_missing_stream`,
+`a_reader_catches_up_the_same_token_and_builds_over_anything_else`, `a_reader_reads_a_closed_stream`,
+`an_unreachable_reader_opens_a_trusted_generation_and_waits_without_one`, `driver/tests.rs`
+`a_reader_builds_in_a_reader_directory_and_claims_nothing`,
+`a_reader_reopened_catches_its_generation_up_in_place`,
+`a_replaced_reader_generation_is_rebuilt_without_salvage`, `generation/tests.rs`
+`readers_lock_the_first_free_reader_directory_beside_the_owner`,
+`concurrent_readers_and_cleanups_never_share_or_delete_a_held_directory`, and `test/readers.e2e.ts`.
+
+### Crashes
+
+Every row resumes or rebuilds with no manual step.
+
+| failure or crash | next open | relies on | `URSULA_VFS_ABORT_AT` steps |
+| --- | --- | --- | --- |
+| before the COMMIT record | never committed | L1 | `admission`, `capture`, `encode` |
+| after the record | replayed and shipped | L2 | `logged`, `forward`, `phasetwo` |
+| an unconfirmed commit | reset, replayed | [Publication](#publication) | |
+| during a checkpoint | re-applying from the BASE overwrites pages written since | L3, F1 | `checkpoint_start`, `checkpoint_synced`, `checkpoint_page` |
+| around the F2 fsync and its BASE | replays from the older or newer BASE | L3 | `base_start`, `base_synced`, `based` |
+| between the parts of a run | the next claim voids the run, the commit goes out whole | [Frames](#frames) | `part_sent` |
+| during a re-key | the latest segment names the old token or the new one | [History](#history) | `rekey_rolled`, `rekey_claimed` |
+| during a salvaging publish | the publish or the salvage finished from the manifest | [Layout](#layout) | `salvage_marked`, `publish_renamed`, `salvage_moved` |
+| during a copy | one generation current | [Materialize](#materialize) | `copy_db`, `copy_log` |
+| during a trim or a cut | the log reads the same | F3, L1 | `trim_unlinked`, `cut_removed` |
+| during a claim | its CLAIM record marks it ours, the next claim goes higher | [Claims](#claims) | |
+| power loss | the durable log prefix with L3: unacknowledged commits after the last log fsync lost, acknowledged ones return from the stream | L4 | |
+| a failed fsync, a WAL page that reads back other bytes | reset `local_damage`, materialization rewrites pages since the BASE | L3 | |
+
+Tests: `test/crash.e2e.ts` (both matrices, each asserting no manual step, one generation, no lost
+commit and equality with a fresh build), `test/reopen.e2e.ts` "leaves one generation when the
+process dies during the copy", `test/parts.e2e.ts` "a crash between parts leaves no part of the
+transaction applied, and the reopen sends it whole", `test/core.e2e.ts` "keeps every commit a
+SIGKILL interrupts: the reopen sends what never reached the stream", `generation/tests.rs`
+`a_crash_after_each_salvaging_publish_step_converges`, `replog/tests.rs`
+`a_crash_after_the_roll_before_the_claim_leaves_the_new_token`,
+`a_crash_before_the_rename_keeps_the_old_header`. Power loss: the world's restarts after a power
+loss (`replicator/tests/world.rs`
+`a_provisional_restart_after_a_power_loss_of_acknowledged_commits_goes_stale`) and
+`driver/tests.rs` `a_provisional_open_whose_log_lost_acknowledged_commits_goes_stale`.
+
+## Trust
+
+### Outsiders
+
+1. **The page-1 marker** ([Marker](#marker)): SQLite refuses a file whose first 16 bytes are not
+   its magic with `SQLITE_NOTADB` before reading anything else.
+2. **The WAL name:** SQLite opens, probes and deletes the WAL through the VFS, and the `ursula` VFS
+   maps `db-wal` to `db-uwal` in `xOpen`, `xAccess` and `xDelete`. An outside SQLite finds no WAL,
+   stays in rollback mode and fails on page 1.
+
+| outsider | result |
+| --- | --- |
+| a connection opened before the extension loaded, or `?vfs=unix` | `SQLITE_NOTADB`, no file changed |
+| a process without the extension (the `sqlite3` shell, a backup tool) | `SQLITE_NOTADB`, no file changed |
+| byte-level writes that keep the lineage (`dd`, an older copy in place) | unseen, unsupported |
+
+Inspection goes through a bound connection, or `VACUUM INTO` a plain file.
+
+Tests: `test/outsiders.e2e.ts` "finds no database in a cache to read or write, and changes none of
+its files", "finds no database in a cache that holds no commit yet, which the owner then writes",
+"refuses a connection opened before the extension loaded, reads and writes, while the bound one
+works", and `vfs/tests.rs` `the_wal_of_a_bound_db_is_db_uwal`,
+`access_and_delete_map_the_wal_of_a_registered_db_only`.
+
+### History
+
+`Stream-Incarnation` changes whenever bytes at a served offset may differ: a delete and recreate,
+a restore, an accepted loss. Every write and read the VFS bases a decision on carries it. HEAD
+carries none, so it reports the current token and, after a history event,
+`Stream-Previous-Incarnation` and `Stream-Inherited-Offset`.
+
+- **Inherits.** A generation inherits a history when the previous token is its own and its
+  acknowledged offset is at or below the inherited offset. Two events with no write between them
+  report the token from before both.
+- **Re-key.** An inheriting generation re-keys: the log rolls to a segment naming the new token,
+  fsynced with the CLAIM record of the claim that follows. At open the claim is a takeover. While
+  bound it is a continuation at own + 1 with no reset, and `synced()` waits meanwhile. An
+  unconfirmed continuation claim is sent again under the new token, same epoch and body, and a
+  repeat answer is followed by one more claim at the next epoch. A continuation whose latest claim
+  applied past its acknowledged offset pre-checks first ([Pre-check](#pre-check)).
+- **Re-key at open only with nothing at risk.** A takeover re-keys only when no commit after the
+  latest ACK was logged before this open, since only those may have been sent and acknowledged
+  behind a lagging ACK. Otherwise it salvages. Commits logged while provisional were never sent,
+  so a history that loses nothing re-keys them and they replicate.
+- **Otherwise, at open**, a generation holding data is renamed into
+  `salvage/<time>-history_changed/` and the open builds a new generation and continues as owner.
+  A rebuild that discards pending records after a re-key at open salvages too.
+- **Otherwise, while bound**, a `412` confirmed by HEAD resets `rewound` (`reopen`). The retiring
+  binding fsyncs an exact ACK, so the reopen's test fails the same way and salvages.
+- **Salvage.** One rename of the whole generation directory, so it needs no free space. The db
+  gets SQLite's magic back (a replaced one stays as found) and holds every commit of its valid log.
+  `manifest.json` names the path, the cluster id, both tokens, the acknowledged position and
+  offset, and the unacknowledged count. The extension never reads or deletes a salvage, and
+  `status().salvage` lists it. Unacknowledged tails a takeover or a `stale` reset discards within
+  one history are not salvaged, since no gated output showed them.
+- **No history change discards a local commit without a salvage.**
+
+Tests:
+
+- Inheritance and re-keys: `replicator/tests/rekey.rs`
+  `inherits_needs_our_token_and_every_acknowledged_byte`,
+  `a_rekey_from_streaming_acknowledges_a_batch_that_survived`,
+  `a_rekey_from_streaming_resends_a_batch_that_was_lost_from_seq_1`,
+  `a_rekey_during_a_continuation_claim_sends_the_same_claim_again`,
+  `a_repeat_after_a_rekey_claims_once_more`, `a_takeover_with_commits_pending_resets_before_it_re_keys`,
+  `a_rebuild_that_discards_after_a_rekey_at_open_salvages`, the world's properties 15, 18 and 19
+  with `negative_control_re_keying_on_any_token_drops_acknowledged_records` and
+  `negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage`.
+- The driver: `driver/tests.rs` `an_inheriting_history_re_keys_without_a_reset`,
+  `a_lossy_restore_resets_rewound_and_the_reopen_salvages`,
+  `a_reopen_after_an_inheriting_history_salvages_while_commits_are_pending`,
+  `an_acknowledged_commit_behind_a_lagging_ack_is_salvaged`,
+  `an_offline_commit_survives_a_history_that_keeps_everything`,
+  `a_provisional_claim_meeting_an_inheriting_history_re_keys`.
+- Salvage: `salvage/tests.rs` `a_salvage_moves_the_whole_generation_and_restores_the_magic`,
+  `a_replaced_db_is_left_as_it_was_found`, `the_manifest_renders_as_its_golden_json`, and
+  `codec/vectors/mod.rs` `the_salvage_manifest_is_frozen`.
+- End to end, model: `test/history.e2e.ts`, `test/salvage.e2e.ts`. Real server:
+  `test/history-real.e2e.ts` "re-keys a bound owner across a restore that keeps everything: no
+  reset, the new token, the next epoch", "resets `rewound` when a restore lost an acknowledged
+  commit, and the reopen salvages it", "reopens a closed owner's cache as `rekeyed` after two
+  restores with no write between".
+
+### Identity
+
+The database is its canonical stream path: segments percent-decoded and re-encoded one way, dot
+segments resolved, no trailing `/`, a query or fragment refused. Scheme, host, port and userinfo
+are transport, so every host alias of a deployment shares one root. The deployment is checked
+instead of hashed: the segment header keeps the `Ursula-Cluster-Id` HEAD reported when the
+generation was built.
+
+- An open whose HEAD names another cluster id refuses `wrong_cluster` and moves nothing.
+- A bound database whose HEAD names another id, while confirming a `412` or `404`, blocks
+  `wrong_cluster` and retries every 30 s, so a routing fix resumes it with no reopen. A write
+  misrouted to another deployment fails its incarnation precondition and never applies there.
+- A misrouted host alias is refused, never salvaged and adopted. A fresh host has nothing to
+  compare, so a misrouted alias there opens the other deployment's stream ([Limits](#limits)).
+
+Tests: `generation/tests.rs` `every_spelling_of_a_path_is_one_canonical_path`,
+`urls_that_name_no_stream_are_refused`, `open/table.rs`
+`another_cluster_refuses_a_trusted_generation_before_anything_else`, `driver/tests.rs`
+`a_misroute_blocks_and_then_resumes`, `a_build_whose_route_flips_to_another_deployment_is_refused`,
+the world's properties 16 and 17 with
+`negative_control_a_misroute_taken_for_a_deleted_stream_resets` and
+`negative_control_a_misroute_taken_for_a_history_writes_to_the_other_deployment`, and
+`test/cluster.e2e.ts` both tests.
 
 ### Foreign writers
 
-Every commit carries `Stream-Seq`: the owner's epoch and producer sequence, each zero-padded to 20
-digits. Owners claim ever higher epochs and number commits upwards within one, so each commit's
-`Stream-Seq` is above every earlier commit's, retries included (a retry is answered as a duplicate
-before `Stream-Seq` is checked). The server refuses an append whose `Stream-Seq` is not above the
-stream's last one (`409`). A writer outside this protocol that appended with a higher one since the
-owner's last commit therefore fences and poisons the owner at its next commit, and one with a lower
-or equal `Stream-Seq` is refused itself and never lands. One that appends without `Stream-Seq`
-goes unnoticed: its bytes fail every replay that crosses them (the frames no longer decode, so
-attach refuses) until the owner publishes a snapshot past them.
+The server refuses appends of another content type, which stops accidental writers. Receipt
+contiguity detects any append between two of ours at the next acknowledgement, and the reset
+(`stream_state`) stops the owner before it builds on a stream it does not match. Undecodable bytes
+fail every replay closed. Detection rather than prevention is accepted because a writer with
+credentials and the VFS content type could equally claim and take over, which the VFS sees as a
+fence. Prevention belongs to authorization.
 
-### Overlay lifetime and non-WAL writes
+Tests: `driver/tests.rs` `a_foreign_append_breaks_receipt_contiguity_and_resets_stream_state`,
+`model/tests.rs` `a_foreign_append_breaks_receipt_contiguity`, `replicator/tests/machine.rs`
+`a_probe_that_finds_a_frame_fences_and_undecodable_bytes_reset_stream_state`.
 
-The overlay belongs to the write transaction. It is cleared whenever the WAL write lock is taken or
-released, so a rolled-back transaction's spilled frames never shadow a later one's.
+### Clones
 
-Any write to the main db file outside a checkpoint (a rollback journal, `journal_mode=MEMORY`) is
-refused, because it would bypass replication. So is a commit whose page 1 leaves WAL format. With
-the WAL kept (§6), SQLite reopens it and would commit `journal_mode=MEMORY` or `DELETE` through it,
-leaving a stream whose rebuilt copies need a rollback journal to be written.
+A hosting platform may restore a process's memory snapshot once, several times, or on another
+host. Copies share the epoch, next seq, in-flight batch, lineage and activation.
 
-## 3. Attach and fencing
+- Memory is a cache over durable state: the epoch comes from a claim, acknowledgements from the
+  stream, local state from the log on disk.
+- One append is in flight and its bytes and digest never change, so identical retries from two
+  copies are deduplicated. At the first commit where they differ, the second copy's append carries
+  another digest under the same key and gets `403 key-conflict`, and that copy resets `fenced`
+  before anything built on its commit is acknowledged. At most one of two divergent commits is
+  ever acknowledged, and the loser's gate never opened.
+- Host contract: each restored copy gets its own copy-on-write disk, since `flock` in a guest does
+  not exclude another VM on a shared directory.
 
-`ursula_attach`:
+Tests: the world's properties 3 and 8 (`replicator/tests/world.rs`
+`the_replicator_keeps_its_properties_against_the_model`) with
+`negative_control_the_model_without_digests_breaks_clone_safety`, and
+`a_provisional_clone_never_fences_the_owner_that_bound`.
 
-1. Takes the host lock. Refuses if a connection to the file is open in this process. Once the
-   previous attachment's snapshot thread has closed its connection, it also refuses (`in_use`) while
-   any descriptor of the process is open on the db file, its `-wal`, `-shm` or `-journal`, in any
-   access mode (`descriptors::open_in_process`). It lists `/proc/self/fd` (or `/dev/fd` on macOS)
-   and keeps the descriptors whose path, as the kernel records it (`/proc/self/fd` links,
-   `F_GETPATH` on macOS, the case ignored there), is one of those four files', with every symbolic
-   link resolved, or under the directory as the kernel spells it (a macOS firmlink). Only those are
-   compared by device and inode, so no descriptor of a file with another path is stat'ed, which on a
-   hung network mount could block. No connection of the VFS is open then, so such a descriptor is
-   outside the extension: a SQLite connection opened before the extension was loaded, when `unix`
-   was the default VFS, or through another VFS, a read-only one included, or any other open of the
-   file. The `unix` VFS shares its locks and wal-index with the VFS's own connections in the
-   process, so no lock tells such a connection apart. Its commits would never reach the stream, and
-   even a read-only one keeps the wal-index of a WAL that attach deletes. While such a connection
-   holds a lock on the file, the `unix` VFS also keeps open the descriptors of connections closed
-   meanwhile, the extension's own included, so the refusal names any SQLite connection outside the
-   extension. The refusal changes nothing, like the others of this step: a bound path keeps its
-   binding, whose snapshot thread runs again, and the path is no failed attach. Where the
-   descriptors cannot be listed (no `/proc` or `/dev/fd`), their paths cannot be read (other than
-   Linux and macOS), or the db file's directory cannot be resolved, attach does not check them
-   (§7). Other processes are kept off by the lock attach takes before it rewrites the db file
-   (step 3): an attach that meets one before it changed anything fails with `in_use`, which changes
-   nothing either. One that meets it after it changed the files (the `-journal`, `-wal`, `-shm` and
-   sidecar of a db file without data are reset before that lock, step 2) or claimed the stream is a
-   failed attach.
-2. Reads the sidecar of a file with content, then `HEAD`s the stream for its `Stream-Incarnation`
-   (an opaque token that changes when the stream is deleted and recreated at the same path, and a
-   stream without one is refused), before anything opens the file through SQLite. A file with
-   content and no sidecar was never attached and is refused, since its pages may never have been in
-   the stream (`unreplicated_file`): the message says to copy its rows into a newly attached file,
-   or to move it and its `-wal` aside to attach the path. A sidecar for another stream path is
-   refused (`other_stream`). Both refusals come before anything changed, and are no failed attach:
-   the file still opens in the process, so its rows can be copied out. A refused `HEAD` carries the
-   reason a `GET` of the stream gives (§3, reads). A missing stream is created for a file without
-   content, and refused for one with content (§6, wrong stream), because the local files may be the
-   only copy left. The local files are trusted when the sidecar was written in this boot, from this
-   incarnation of the stream, for this db file, and the local WAL holds what the sidecar claims of
-   it (§6). Anything else (another or unknown boot id, another incarnation, a sidecar of another
-   format, a torn one, a replaced db file, a WAL behind its sidecar) means the local files are
-   discarded (§6) and the attach proceeds as on a fresh host. A sidecar of another incarnation is
-   always discarded, whatever the recreated stream's length (logged as a recreate). For one of the
-   same incarnation, a read at its offset first checks that the stream did not lose acknowledged
-   data (§6, wrong stream).
-3. Recovery, when it rewrites pages, never opens the local files through SQLite before replaying
-   onto them. Trust (§6) says every page holds the state at the sidecar's offset or a later
-   commit's, not that SQLite can read the file (a disk image may hold a torn page 1 that replay
-   rewrites). Recovery locks other processes out with a POSIX write lock on the db file's lock
-   bytes. Every SQLite connection on a WAL file holds a read lock there from its first read until
-   it closes, so attach fails while one is open rather than rewriting pages under its cache. The
-   lock is held from before attach first writes the file until it is done writing it, and the file
-   keeps its inode throughout (a discard truncates it, a snapshot is written over it, §4.3). A
-   connection that opened the path meanwhile gets `SQLITE_BUSY` until the lock drops and then reads
-   the rewritten file. Within the process, opens of the main db through the VFS fail with
-   `SQLITE_BUSY` while attach runs, and the path keeps its previous attachment until attach ends.
-   Attach then folds the local WAL into the db file itself (the frames SQLite's recovery would read,
-   up to the last commit, a later frame winning, the file cut to that commit's size), fsyncs it,
-   rewrites the sidecar at the same offset with a `:0` claim, deletes `-wal` and `-shm`, and only
-   then replays onto it. No stale WAL sits next to pages replay has moved past it, which a plain
-   SQLite connection would otherwise checkpoint over them when it closes. An attach in the same
-   boot after a crash midway trusts the files again and replays from the same offset (folded pages
-   hold the state at the WAL's last commit, replayed ones later commits, and replay is idempotent).
-   A crash between that sidecar and the delete leaves commits in a WAL the `:0` claim rejects,
-   which costs a rebuild.
-4. `HEAD`s the stream and compares its `Stream-Incarnation` with step 2's (a change fails the
-   attach round, as in step 6). From here on every request carries step 2's incarnation as the
-   `Stream-Incarnation` precondition. If the stream's latest snapshot is ahead of the file (a fresh
-   host, or a file left below the retention), installs it (§4.3). Then replays frames to the tail.
-5. Claims with the incarnation's `Producer-Id` (§2): appends a claim at (epoch = highest seen + 1,
-   seq 0) and reads it back. A 2xx alone proves nothing, because two owners claiming the same epoch
-   both get one, the second as a duplicate. So the claim counts only if the frame ending at the
-   answered offset is ours (the nonce makes it unique). Offsets are opaque, so its start is not
-   computed from that offset: the reads run from the tail step 4 reached (a frame boundary at or
-   before the claim) to the answered offset, and the frames read are decoded. When the reads run
-   past the answered offset (another owner appended meanwhile, and the offset's place in the bytes
-   is unknown), our claim being among the frames at all suffices: the server applies one append
-   per (producer, epoch, seq 0) and answers every other with its receipt, so our claim is in the
-   stream only if the answer was its own end. Lost: epoch + 1. `403`: the server's epoch + 1.
-6. Replays up to the claim. Every read and the claim carried step 2's incarnation, which the server
-   checked atomically with each. A stream deleted and recreated meanwhile answers `412` to the first
-   of them that reaches it (a read at an offset the recreated stream does not have answers `410` or
-   `416` instead, RFC 9110 §13.2.1, and attach then retries from `HEAD`, or, on a `416`, `HEAD`s to
-   tell a recreate from lost data). The round fails, and attach starts again from step 2 (up to
-   three more rounds). The sidecar still names the old incarnation, so the next round discards
-   whatever this round wrote and rebuilds from the recreated stream. If the replay up to the claim
-   reaches a newer owner's claim (a higher epoch, which the server accepts from this producer only
-   after ours), the attach fails as fenced and the application retries it: this owner is already
-   fenced, and a snapshot it took would record an epoch below the highest one claimed before it
-   (§4.2). Finally, if attach wrote the db file, it fsyncs it, writes the sidecar (with the
-   incarnation), and swaps the path's binding to the new attachment.
+## API
 
-**A failed attach.** An attach that fails after step 1 leaves the path unbound, since its files may
-hold anything between the old attachment's state and the stream's, and the stream may hold a newer
-claim. Steps 2 to 6 may already have discarded local files it did not trust (truncating the db
-file), folded their WAL into the db file and deleted `-wal` and `-shm`, or replayed pages. Opening
-its main db then fails with `SQLITE_CANTOPEN` (§1, the reason is logged, and `ursula_status` names
-it as `attach_failed` with the failure's kind) until an attach succeeds, whether or not the path has
-a sidecar. So it does after a failure before anything changed, such as a `HEAD` refused with `400`:
-the application meant the path to be replicated, and passed through to `unix` its commits would
-never reach the stream. The refusal is keyed by the path as SQLite names it (`xFullPathname`, which
-resolves symbolic links): another spelling of it, such as another case on a case-insensitive volume,
-opens unless a sidecar refuses it, and a hard link of the db file has a sidecar path of its own.
-When the failed attach created the path's sidecar (the path had none) and left the db file without
-data, it removes the sidecar, so nothing of the attach vouches for data written to the path later.
-Removing it never touches the db file, `-wal` or `-shm`. A db file the attach replayed pages into
-keeps the sidecar, so the next attach takes the file for this stream's cache instead of refusing it
-as `unreplicated_file`: it resumes from the sidecar's offset when the sidecar names the db file, and
-discards and rebuilds the file otherwise (a new file's first sidecar is written before the db file
-exists, so it names none). A removal that fails is logged (`attach_restore_failed`). An attach
-refused at step 1 changes nothing, and a bound path stays bound. So does one refused for the file as
-it stands before it changed anything: another process holding it (`in_use`), data without a sidecar
-(`unreplicated_file`), the cache of another stream (`other_stream`). That file is not the stream's
-to take, and opens as before: a plain database passes through, so its rows can be copied into a
-newly attached file in the same process. An attach whose claim or stream create a layer in front
-refuses with `402` reports `SQLITE_AUTH` rather than `SQLITE_ERROR`, so callers can attach
-read-only instead. An attach whose claim is refused before it reached the stream in another way
-(§2) reports `SQLITE_IOERR_AUTH`, the code of a refused commit. Nothing was claimed either way, so
-the attach can be tried again later. Past its claim otherwise, a failure of a `retry` kind (the
-claim's read-back or the replay up to the claim put off, unanswered or refused) reports
-`outcome_unknown` with `SQLITE_ERROR` instead (`Error::AfterClaim`): the claim may be in the
-stream, fencing every earlier owner. SQLite rolls back the calling connection's open
-transaction when a statement that reads a table fails with an I/O error code, so call
-`ursula_attach` without a `FROM` clause, as in `SELECT ursula_attach(?, ?)`.
+```ts
+export function open(url: string | URL, options?: OpenOptions): Promise<UrsulaDatabase>;
+export function importSqlite(url: string | URL, file: string, options?: ImportOptions): Imported;
 
-**Read-only attach.** `ursula_attach(path, stream_url, 'read_only')` runs steps 1 to 4, skips the
-claim and the replay up to it, and ends as step 6 does: it fsyncs the db file if attach wrote it,
-writes the sidecar and binds the file. It never writes the stream (no claim, no commit, no snapshot
-thread, no retention move), so it fences no owner and works while a layer in front refuses writes.
-A missing stream is an error, never created. The file holds the stream as of the attach (attach
-again to catch up), and the sidecar records the highest epoch claimed up to its offset, which a
-later owner's attach claims above. Every WAL write fails with `SQLITE_READONLY` before anything is
-appended or written to the WAL. SQLite does not roll a transaction back on its own for that code.
-A failed `COMMIT` or autocommit statement leaves no transaction open, but in an explicit
-transaction a statement whose changes outgrow the page cache fails before `COMMIT`, when SQLite
-spills them to the WAL. The transaction then stays open, and even reads on that connection fail
-with `SQLITE_READONLY` until the application rolls it back (Pi's transaction helper does). A write
-transaction that changes nothing (`BEGIN IMMEDIATE` then `COMMIT`) writes no WAL frame and
-succeeds, so a library that opens one at startup works. The uses: exporting a database without
-fencing its owner, and reading a database whose owner cannot claim it because a layer refuses its
-writes.
+export interface OpenOptions extends Omit<DatabaseSyncOptions, "open" | "readOnly"> {
+  dir?: string;             // cache root, default <user cache>/sqlite-ursula/0.8
+  token?: string;           // one per process: the last open's applies
+  signal?: AbortSignal;     // bounds the open, 30 s without one
+  maxPendingBytes?: number; // default 64 MiB of compressed frames
+  recreate?: boolean;       // stream missing, local data present: salvage, create, take over
+  readOnly?: boolean;       // claims nothing (Readers)
+}
 
-**Fencing.** The new epoch fences every earlier owner at the server: their next append gets `403`.
-Once an owner knows it is fenced (its own append, or its snapshot thread's request, met the fence),
-new read transactions on the file fail too: every read transaction takes a read-mark lock of the
-wal-index shared when it starts, even one whose pages its connection holds in its cache, and the
-VFS refuses it with `SQLITE_IOERR_READ` while the database is fenced. So from the next read
-transaction on, no connection serves the state the new owner moved past, until the file is
-attached again. A read transaction open already when the fence lands (an explicit `BEGIN`, a
-statement not stepped to its end) keeps its snapshot until it ends. The check reads a flag set with
-the fence (`Db::fence`) without the database's mutex, which a commit holds across its append, so
-starting a read transaction never waits for a commit. Reading WAL frames does: every read of the WAL
-goes through the overlay under that mutex (`x_read`), so a reader whose cache another connection's
-commit made stale waits for a commit in flight, up to the retry budget. An owner that does not write
-never learns of the fence: its reads go on from the state as of its last commit.
+export class UrsulaDatabase extends DatabaseSync {
+  readonly name: string;    // "/acme/notes"
+  synced(options?: { signal?: AbortSignal }): Promise<void>;
+  status(): UrsulaStatus;
+  on(event: "reset", listener: (error: UrsulaResetError) => void): this;
+  off(event: "reset", listener: (error: UrsulaResetError) => void): this;
+}
+```
 
-Replay applies page images per read batch (last image per page, truncate to the batch's smallest
-size first), so replaying from an older offset than the file reflects is idempotent.
+- The first open of a stream in a process binds, catches up and claims ([Open](#open)). Later
+  opens return another connection on the same binding with no claim and no network, concurrent
+  opens share one bind and its outcome, and worker threads call `open` too.
+- `UrsulaDatabase` is a `DatabaseSync` subclass, so drizzle, kysely and Pi's driver take it. It
+  remembers an error after which no transaction is open, so a helper's ROLLBACK does not replace it.
+  node:sqlite's busy `timeout` defaults to 5000 ms, since a binding's connections share its files.
+- `db.close()` is synchronous. After a binding's last connection closes, replication drains in the
+  background, then the lock is released. There is no drain at exit: the log keeps pending commits
+  for the next open.
 
-**Producer expiry.** The server forgets a producer idle for 7 days. The owner's next append gets
-`409` expecting seq 0. It takes the stream back only if the stream still ends at its own offset and
-its new claim (epoch + 1) is the first frame after it (read and decoded from that offset, as in
-step 5), and is fenced otherwise. Both requests carry the incarnation, so a recreated stream, which
-answers `412` before any producer check, fences the owner instead. A new claim refused before it
-reached the stream (§2), or a read of it answered `402`, fails the commit alone.
+Tests: `test/open.e2e.ts` "binds and claims the stream, and returns a DatabaseSync named after
+it", "returns another connection on the same binding for a later open, with no claim", "shares
+one open between concurrent calls", "runs under Kysely, whose errors are the database",
+`test/workers.e2e.ts` "open the stream the main thread holds: one binding, one claim, synced() in
+each thread", `driver/tests.rs` `a_binding_no_connection_opens_retires`.
 
-**Reads.** Reads in recovery use `consistency=leader`, because a follower may lag an acknowledged
-append. Catch-up reads, `HEAD` and snapshot `GET`s retry `429`, `503` (a leader that could not
-confirm its leadership in time) and `307` like appends: no sooner than `Retry-After`, with backoff,
-within `URSULA_VFS_RETRY_MS`. A read that got no answer (its connection reset or closed under it,
-or a timeout) is sent again on a new connection (§7). A refused connection fails it at once. The
-snapshot thread's retries also end at its stop flag. A redirect that lasts the whole budget fails
-the read with its status, so attach never takes it for a missing stream or a superseded snapshot.
-Attach's `HEAD` refused with a 4xx other than `404` carries no explanation (a `HEAD` has no body),
-so the client sends one `GET` of the stream from its beginning and takes that answer's body as the
-reason when it is refused with the same status (`client::head_explained`): the server's `400` names
-the bucket or stream id it refuses. A `HEAD` that only probes the stream (a re-claim's, the snapshot
-thread's) sends no `GET`, and none is sent under the database's mutex.
+### Synced
 
-## 4. Snapshots and retention
+At the call `synced()` takes the target `T`, the last logged commit. Positions are assigned at the
+commit point, before SQLite can publish, so every commit a reader can see is at or below `T`. It
+resolves when every record up to `T` is acknowledged and a stream round trip that started after
+the call found no foreign frame past this owner's acknowledged offset: a receipt contiguous with
+the expected tail, or a `consistency=leader` read at the tail, with the incarnation precondition,
+that returns no bytes.
 
-Without snapshots the log, and so attach time and stored bytes, grows forever. Without a cold tier
-the default per-group hot limit (64 MiB) trips after about 68 MB of frames.
+Concurrent callers share one probe, and under write load appends are the probe, so only an idle
+owner pays one leader read per gated output. There is no freshness window. `synced()` rejects with
+the reset error on a reset and with `signal.reason` on its signal, and the commits keep
+replicating. A provisional database's waits for its claim. A reader's resolves at once. Tickets
+wait while the replicator activates, so none resolves below its target during a re-key.
 
-### 4.1 When
+Tests: `replicator/tests/machine.rs` `synced_waits_for_a_round_trip_that_started_after_the_call`,
+`a_probe_that_finds_our_own_batch_waits_for_its_answer`,
+`a_stale_probe_never_reads_our_own_acknowledged_batch_as_foreign`,
+`a_ticket_waits_for_the_continuation_reconcile_to_finish`, `driver/tests.rs`
+`an_idle_owner_pays_one_probe_per_synced`, `tickets_resolve_in_order_through_one_watermark`,
+`a_sync_ahead_of_its_logged_waits_for_it`, the world's property 9 with
+`negative_control_settling_tickets_while_activating_resolves_below_the_target`, and
+`test/synced.e2e.ts` "resolves once the stream holds every commit made before the call", "rejects
+with its signal's reason, while the commits keep replicating", "resolves thousands of concurrent
+calls through one watermark while the stream holds its answer back".
 
-After a commit is published, if the log since the latest known snapshot exceeds
-`max(database size, URSULA_VFS_SNAPSHOT_MIN_BYTES)` (8 MiB by default), the database's snapshot
-thread is woken. Offsets are opaque, so the log is counted in frame bytes, not taken from offsets.
-Attach counts what it replays after the snapshot it installed (or, from trusted local files, adds
-it to the count the sidecar carries), every acknowledged commit adds its frame, and a snapshot
-taken (or found newer at publish) subtracts what was counted when its window opened. Snapshotting
-never runs on the commit path. Stored log is bounded by about twice the threshold plus what
-accumulates while a snapshot is in flight (§4.3, §4.4).
+### Resets
 
-### 4.2 Taking one
+| kind | trigger | action | unacknowledged commits | next open |
+| --- | --- | --- | --- | --- |
+| `fenced` | `key-conflict`, `epoch-closed` or another producer `403` to an append, `receipt-evicted` for the in-flight seq, a lost continuation claim, a foreign frame in a pre-check | `stop` | kept for the next reconcile | takeover |
+| `stale` | a continuation found the stream moved on, an idle `producer-expired` without the owner's claim frame, a provisional open whose log lost acknowledged commits to a power loss | `reopen` | discarded | takeover, catch-up or rebuild |
+| `rewound` | a `412` confirmed by HEAD when the generation does not inherit | `reopen` | salvaged at the reopen | salvage, rebuild |
+| `deleted` | a `404` confirmed by HEAD with the generation's cluster id | `fix` | kept | `not_found` unless `recreate` |
+| `local_damage` | a failed fsync, a lost WAL page, an uncuttable log write, an unconfirmed commit, a foreign page 1 | `reopen` | kept | materialize |
+| `stream_state` | a foreign append, a closed stream, `Producer-Expected-Seq`, a batch above `Producer-Closed-Seq` | `fix` | kept | refused until fixed |
+| `internal` | a panic in a file method or in the replicator | `reopen` | kept | materialize |
 
-The body must be the stream's state at a frame boundary `W`, page-identical to a replay from the
-stream's start to `W`, so that later page-image frames apply on top of it. `VACUUM INTO` and the
-backup API both rewrite pages, so neither qualifies. The thread:
+After a reset, pending `synced()` calls reject, then `reset` listeners run once. Every statement of
+the binding throws, reads included (a new read transaction fails at its read-mark lock), and
+db-file writes are refused, so no close-time checkpoint moves pages of a commit that may be
+discarded. An open read transaction keeps its snapshot. The binding retires, and the next `open()`
+need not wait for old handles ([Materialize](#materialize)).
 
-1. Opens a private `unix` connection on the file and runs `wal_checkpoint(PASSIVE)` once, so the
-   checkpoint inside the window only covers the frames committed since.
-2. Opens the *window* (under the database's mutex). It waits until no acknowledged commit is
-   unpublished and no other connection holds the checkpoint lock (typically the writer's own
-   auto-checkpoint right after a commit), and records `W` (the offset), the epoch and the page
-   count. While it waits, the next commit to reach its commit point waits there too (for at most
-   1 s) until the window has opened. Otherwise a writer committing back to back would leave the
-   window only the gaps between its transactions and could starve the snapshot indefinitely. So a
-   due snapshot pins a state at most one transaction past the threshold. While the window is open
-   a commit that reaches its commit point waits there, holding SQLite's write lock, which neither
-   step below needs.
-3. Runs `wal_checkpoint(PASSIVE)` on the private connection, retried for up to about 100 ms while
-   another connection's checkpoint keeps it busy (a passive checkpoint gets no busy handler).
-   Unless every WAL frame was checkpointed (a reader pins older frames), it gives up for now and
-   retries shortly (backoff from 10 ms up to 1 s, and a failed attempt waits longer, §4.4).
-4. `BEGIN` and a read: the read transaction starts at `W`. Closes the window.
-5. Copies pages `1..n` of the db file through the private connection's own file handle (a second
-   descriptor's close would drop the process's POSIX locks). While the read transaction lasts no
-   checkpoint can write newer frames into the db file (a reader at mark 0 blocks backfill, and at a
-   later mark it caps it) and no closing connection can checkpoint (that needs an EXCLUSIVE lock),
-   so the pages are those of `W`. Ends the read transaction.
-6. Fsyncs the WAL and the db file through the private connection's own handles, which reports a
-   write-back error of a page the checkpoints or the copy read (§6). A failed fsync poisons the
-   database, and so does a lost write the owner found meanwhile. Either way nothing is published.
+Tests: `error.rs` `resets_say_what_to_do`, `vfs/tests.rs`
+`a_reset_refuses_new_reads_and_every_write`, `driver/tests.rs`
+`a_404_confirmed_by_head_resets_deleted`, `a_closed_stream_resets_stream_state`,
+`test/reset.e2e.ts` "a takeover rejects pending synced() calls, then runs the listeners once, and
+fails every statement", "runs the listeners when a commit's append finds the takeover, with no
+synced() pending", `test/core.e2e.ts` "resets a database another process took over: 266 for reads,
+778 for writes, a fenced event", `test/workers.e2e.ts` "hear a reset in every thread: synced()
+rejects, the listeners run, statements throw".
 
-Commits wait only for steps 3 and 4 (a passive checkpoint of the few frames committed since step 1,
-and the start of a read transaction) and, once a snapshot is due, for the window to open (step 2,
-at most one commit). A re-attach stops the thread: it checks the stop flag between steps and
-retries, and each snapshot request is bounded to 120 s.
+### Errors
 
-The body is `"USS2" | u8 n | W (n bytes, the offset string) | u64 epoch | u32 pages |
-u32 crc32c(image) | zstd(image)`. The epoch is the highest one claimed before `W`. Retention may
-trim every claim frame, and the next owner must still claim above it: after a producer expiry the
-server would accept a lower epoch, and a zombie with a higher one could then fence the new owner.
+Four classes with `kind`, `action` (`retry`, `reopen`, `stop`, `fix`), `message` and `cause`,
+mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
 
-### 4.3 Publishing, retention, and attach
-
-1. `PUT {stream}/snapshot/{W}`, retried while the outcome is unknown since publishing is
-   idempotent, with the `Stream-Incarnation` precondition. A body over 1 MiB is sent twice at most,
-   and the wait after a failed attempt covers the rest (§4.4). `409` or `410`: a newer snapshot
-   exists, so there is nothing to do.
-2. `GET {stream}/snapshot/{W}` until it returns exactly the published bytes.
-3. Only then `PUT {stream}/retention/{P}`, where `P` is the *previous* snapshot's offset (the latest
-   one known at attach, or the one before `W`).
-
-Retention stays one snapshot behind because a host that read the previous snapshot's offset from
-`HEAD` and is fetching it, or whose file sits between `P` and `W`, still finds every frame after
-`P`. Retention at `W` would turn its tail read into `410` and a full re-download. The cost is up to
-one more threshold of retained log. The newer snapshot has read back before any history is
-dropped, so the retained stream always holds a readable snapshot at or above its start. Retention
-never passes the latest snapshot (the server refuses).
-
-Attach installs a snapshot when the file is behind the latest one. It verifies the body (offset,
-size, checksum), locks other processes out of the file (§3), deletes its WAL, writes the image over
-the db file in place (same inode, cut to the image's size), then replays the tail. A crash midway
-leaves a mix of old pages and the image's, and the next attach installs the snapshot again. If the
-sidecar claims no WAL frame, the old pages hold the state at its offset or a later one (the db file
-alone held it) and the files can be trusted. If it claims frames, those went with the deleted WAL
-(the old pages may predate the offset) and the files are rebuilt. A tail read that hits `410`
-(retention moved under a stale `HEAD`), or a snapshot superseded between `HEAD` and `GET` (a `404`,
-or a body cut short when its cold object is deleted after the grace), restarts attach from `HEAD`,
-up to ten times.
-
-A publish or retention move that a layer in front refuses with `402` publishes or moves nothing and
-is not counted as a snapshot failure. It records the refusal (`payment_required`), and the thread
-takes no snapshot until a commit is acknowledged again, which requests one if it is still due.
-While writes are refused no commit adds to the log, and each attempt would copy and compress the
-whole database for nothing.
-
-Any owner may publish a snapshot of its own offset, a fenced one included, since its state at its
-offset is a true prefix of the incarnation it attached to. The snapshot and retention endpoints
-know no producer, so the snapshot `PUT`, its read-back `GET` and the retention `PUT` carry the
-incarnation as the `Stream-Incarnation` precondition. A stream deleted and recreated meanwhile
-answers `412`, and the thread publishes nothing there, moves no retention, and fences the owner
-(§6, wrong stream).
-
-### 4.4 Snapshot bodies on the server, and failed attempts
-
-Every request body is at most 32 MiB. Bodies of at least `runtime.external_payload_min_size`
-(1 MiB) are stored in the cold tier when a cold backend is configured, and inline otherwise. A
-larger snapshot, up to 1 GiB, goes up in parts, which the extension does not send. A
-superseded cold body stays readable for 5 minutes.
-
-Through `ursulagw` a body above its `--max-request-body-bytes` (32 MiB by default) is refused, and so
-is one above a proxy's limit, but the client does not always see the `413`. The gateway stops
-reading the body at its limit, answers `413` and closes the connection with the rest unread. A body
-a little over the limit usually gets the `413`, and one far over it usually meets a failed write,
-whose outcome is unknown. A proxy may also reset the connection or time the upload out.
-
-Each attempt reads, compresses and sends the whole database, and a body over a size limit fails the
-same way every time until the database shrinks. So failed attempts back off:
-
-- Each failure doubles the wait before the next attempt, from 100 ms, up to 1 h when the body is too
-  large and up to 5 min for anything else (an outage, a snapshot that does not read back, a local
-  error). Each wait is spread by a fifth, so owners that failed together do not retry together.
-- **Size.** A body answered `413` is too large. A body over 1 MiB and larger than any this owner
-  published or installed may be too large when its publish got no answer after a connection
-  carried it, a 5xx or a `408`. The thread then sends one `HEAD` (`client::answers`). An answer
-  below 500 that is no redirect means the stream is reachable, so the body is what failed.
-  Anything else is an outage.
-- **Outage.** A 5xx with `Retry-After` or `x-ursula-not-applied` (the server's ingress admission
-  refuses a large body first under pressure) is an outage with no probe, and the next attempt waits
-  at least that `Retry-After`. A connection that never opened says nothing about the body, and
-  neither does a failure of a body of at most 1 MiB, retried within `URSULA_VFS_RETRY_MS`.
-- Within an attempt a body over 1 MiB is sent twice at most while its outcome stays unknown (a
-  refused token does not count, a `307` does).
-- A database that shrank below three quarters of the image that last failed (after a `VACUUM`)
-  starts the attempt at the next commit. After an outage, the first acknowledged commit brings the
-  next attempt forward, once per run, to a random point within the next 30 s.
-- A snapshot published, or found at its offset, ends the run. The run lives in memory, so a new
-  attach starts without a wait.
-- A retention move that fails after the snapshot read back is logged (`retention_failed`) and tried
-  again after the next snapshot. It does not count as a snapshot failure.
-
-`ursula_status` reports the run (`snapshot_failures`, and `snapshot_error`: a `413` with the body's
-size, or the failed write) and the compressed size of the latest body built (`snapshot_bytes`).
-Each failure is logged (`snapshot_failed`) with the wait before the next attempt as `retry_ms` and
-what it failed on as `kind`: `size`, `outage` or `other`. The log keeps growing meanwhile, and a
-rebuild replays all of it.
-
-## 5. Guarantees
-
-- An acknowledged commit (the SQL `COMMIT` returned) is in the stream, and every host that attaches
-  after it sees it, through replay or a snapshot that includes it. Caveat: the owner's later
-  commits are page images read from its local files, so local files that lose a write underneath a
-  running process (the write-back I/O error of §6) could overwrite acknowledged changes in the
-  stream. The VFS checks WAL pages read back against what it wrote, which closes most of that
-  window, and §6 lists what remains. Local files rolled back while no process had them attached (a
-  restored disk image) are caught by attach (§6).
-- Nothing the stream did not acknowledge becomes visible. No frame of a transaction reaches the
-  local WAL before its append is acknowledged, and a fenced, refused or failed commit leaves no
-  trace locally or remotely. The server deduplicates retries, and a refused commit relies on §2's
-  requirement on layers in front of the stream (when a layer breaks it, the next commit poisons,
-  except in the cases §2 names). An append the server applied but whose answer the client never
-  saw is in the stream, and appears after the next attach.
-- Fencing: after a claim at epoch `e` is verified, appends below `e` fail. Snapshots carry the
-  highest epoch, so this survives retention trimming the claims.
-- A snapshot reflects exactly the stream at its offset. Retention advances only past a snapshot that
-  has been read back.
-
-## 6. Failure model
-
-Durability of a commit is Ursula's acknowledgement, nothing else. The local db file, `-wal`, `-shm`
-and sidecar are a cache of the stream. Nothing on the per-commit path is fsynced: `xSync` of an
-attached database is a no-op, the extension's private connections run `synchronous=OFF`, and the
-sidecar is replaced by temp file and rename without fsync. So the application's
-`PRAGMA synchronous` level affects neither correctness nor commit latency.
-
-But the files must never be *trusted* when they do not hold the state the sidecar names. With page
-images, the owner's next commits are built on whatever pages the files hold, so a stale page would
-be written into the stream. Trust is therefore verified against the files, not inferred:
-
-- **The claim.** At every commit the sidecar records `wal=<salts>:<frame>`: the local WAL's
-  generation (the salts of its header, which SQLite changes at every restart) and the frame number
-  of the acknowledged commit frame. `:0` says the WAL holds no commit and the db file alone holds
-  the state.
-- **The check.** Attach trusts the files only when the boot id, the stream's incarnation and the db
-  file's inode match and the WAL, read the way SQLite's recovery reads it (header checksum, then
-  frames in order while their salts match and the cumulative checksum holds), is the claimed
-  generation with valid frames up to at least the claimed one. For `:0`, it must hold no commit
-  frame.
-- **Three fsyncs of the db file**, none per commit, all through SQLite's own handle except at attach
-  (when no connection is open):
-  1. before a commit that starts a new WAL generation is appended (once per WAL wrap, since SQLite
-     starts one only when every frame of the previous one is in the db file),
-  2. before an attached connection truncates the WAL to nothing (only after a complete checkpoint:
-     `wal_checkpoint(TRUNCATE)`, a close with `journal_size_limit`), the sidecar switching to `:0`
-     first. A truncate to a non-zero size (`journal_size_limit` in the commit that starts a
-     generation) cuts only the previous generation's tail, already synced by (1),
-  3. at attach, after folding the WAL and before the sidecar that drops its claim (`:0`, the WAL is
-     deleted after it), and again before the final sidecar whenever attach wrote the db file.
-
-  A failed fsync poisons the database (or fails the attach). The snapshot thread also fsyncs the
-  WAL and the db file after reading them, off the commit path (§4.2, step 6). That reports lost
-  write-backs, and the claim does not rely on it.
-- The attached connections keep the WAL past the last close (`SQLITE_FCNTL_PERSIST_WAL`:
-  checkpointed, not deleted), and so does the snapshot thread's, so a clean shutdown keeps the
-  claim checkable.
-
-**Why this holds** for any crash-consistent image of the files (every write that reached the disk
-before an fsync returned is in it, and any later one may be missing or torn). Take claim `(G, f)` at
-offset `X` and an image whose WAL recovers generation `G` with at least `f` valid frames. The image
-shows `G`'s header, so it holds the db file as of fsync (1), that is every page as of `G`'s start.
-A page in the recovered frames has its state at `X` or later, since every commit up to `X` since
-`G` started is a frame up to `f`. Any other page is unchanged since `G` started up to `X`, so the db
-file has it, unless a checkpoint wrote it from a frame past `f` (a commit after `X`). For `:0` the
-db file's state at `X` is on disk (fsync 2 or 3) and every later write to it comes from a commit
-after `X`. A WAL with commit frames is rejected, since it may be one whose deletion before the
-fsync never reached the disk. Either way every page that differs from the state at `X` belongs to a
-commit after `X`, and attach replays from `X` (final page images, so replay is idempotent). Every
-other image is rejected, discarded and rebuilt.
-
-What attach does in each case:
-
-- **Process crash, same boot** (SIGKILL, OOM kill, abort, a pod rescheduled to the same node with a
-  local volume, a container restart with runtimes that show the host's boot id: Docker,
-  containerd, CRI-O). Every completed `write()` is in the page cache, so the files are exactly what
-  this host wrote and, outside the windows below, the claim holds (the sidecar is written only
-  after the WAL writes return). A killed write leaves a prefix. SQLite's salted, cumulative WAL
-  checksums stop recovery at the last whole commit, `-shm` is rebuilt, and checkpoints are redone
-  from the WAL. Attach trusts the files and replays from the sidecar's offset. A crash in the
-  middle of a WAL truncate (between the `:0` sidecar and the truncate), between the first WAL write
-  of a new generation and the sidecar update, or in a recovery between the `:0` sidecar and
-  deleting the folded WAL, leaves a claim the files do not meet, which only costs a rebuild.
-- **Same boot, files restored from a crash-consistent image**: a block-level snapshot of the volume
-  (EBS, PD or Azure disk snapshots, a CSI VolumeSnapshot or PVC clone) restored or cloned onto a
-  host that has not rebooted since, or a block volume force-detached and reattached. Boot id and
-  inode survive a block copy, so the WAL claim decides. An image whose WAL holds the claimed frames
-  (or more) is used. One whose sidecar ran ahead of its WAL (typical, since the sidecar's rename
-  reaches the disk before the WAL's in-place writes) or names another generation is discarded and
-  rebuilt.
-- **Reboot, power loss, kexec, a volume moved to another host**: the kernel boot id differs (Linux
-  `/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`, and unknown never matches), and
-  a power loss may have left any prefix of any unsynced write in any file. Attach discards the local
-  files and rebuilds from the latest snapshot and the tail. A new random boot id cannot be on disk
-  from before it was generated, so no torn sidecar passes the check. Discarding runs before
-  anything opens the file through SQLite (a torn file could fail any checkpoint), refuses while
-  another process has the file open, truncates the db file under the lock and keeps it locked for
-  the rebuild (§3). Every attach then removes `-journal`, and the fresh path `-wal` and `-shm`, and
-  rewrites the sidecar last, so a crash midway discards again.
-- **Container runtimes with their own boot id**: LXC, LXD, Incus and systemd-nspawn bind-mount a new
-  random boot id at every container start, and gVisor generates one per procfs instance, so a
-  container restart there rebuilds. Sandboxes with their own kernel (Kata, Firecracker, WSL2,
-  Docker Desktop) rebuild on every restart of the sandbox or VM. This is safe, only slower.
-- **Cost of a rebuild**: one snapshot `GET` (the database, held in memory twice while it is decoded,
-  up to 1 GiB compressed) plus the tail since it, at most about twice `max(database size,
-  URSULA_VFS_SNAPSHOT_MIN_BYTES)` while snapshots keep up. Every reboot pays it, clean ones
-  included, so a fleet-wide rolling reboot is a burst of snapshot reads. If snapshots cannot be
-  published (a body over the gateway's 32 MiB, a reader pinning WAL frames), a rebuild replays
-  everything since the last published snapshot, or the whole log if none was ever published.
-  Snapshot health is an availability dependency: watch the log since the latest snapshot.
-- **Wrong stream**: the sidecar names the stream's path and its incarnation, and attaching the file
-  to another stream is refused. A stream deleted and recreated at the same path is another
-  incarnation, so the files are never trusted for it. Whatever its length, they are discarded
-  (logged) and rebuilt from it. A sidecar of the same incarnation whose offset lies beyond the
-  stream's end means the stream lost acknowledged data: attach refuses and keeps the files (delete
-  `<db>` to rebuild, as after an operator restore from backup). A deleted stream (by mistake, by
-  TTL expiry, or by a fresh install that did not carry it over) leaves the local files as possibly
-  the only copy, so attach creates a missing stream only for a file without content. To start over,
-  delete `<db>` or attach a new file under another stream URL. To salvage the data, copy `<db>` and
-  `<db>-wal` to a new name before deleting anything, open the copy, which has no sidecar and so opens
-  as a plain SQLite file, and export its rows into a newly attached database. An empty file attached
-  at the same URL after the delete creates a new incarnation, and the original owner's next attach
-  then discards its files. While attached, the recreated stream answers `412` to the owner's next
-  request of any kind (§2, the precondition is checked when Raft applies an append, so a commit
-  proposed before a delete and recreate and applied after is refused too), nothing of it lands, and
-  the owner is fenced and poisoned. A recreate during attach fails that round (§3).
-- A rollback journal next to an attached file can only be left by a crash while attach switched an
-  empty file to WAL. Attach deletes it in every case, since rolling it back would truncate the file
-  under the pages attach writes next.
-- **An unreachable endpoint**, for every attempt (its host does not resolve, its connections are
-  refused or time out, the TLS handshake fails): commits block up to the retry budget, then fail
-  alone as `unreachable`. Nothing of them went out, so the database is not poisoned, and the first
-  commit after the endpoint is back succeeds with no attach (§2).
-- **A network partition or slow server**, where an attempt went out on a connection and got no
-  answer (a reset, a timeout waiting for the answer): its outcome is unknown, so commits block up to
-  the retry budget, then poison, unless a later attempt's answer settles it. An attach that fails
-  after step 1 leaves a file with a sidecar refusing opens until an attach succeeds (§1, §3). A file
-  whose first attach failed before writing its sidecar is still a plain file and passes through.
-- **DNS.** The client looks a host up at most once every 30 s (`net::DNS_FRESH`), one request at a
-  time, while the host's other requests go on with its last addresses. The request that looks it
-  up waits for the lookup, up to the resolve timeout of 5 s. A failed connection makes the next
-  lookup due. While lookups fail, the last addresses serve for up to 10 minutes after the last
-  successful lookup (`net::DNS_STALE_LIMIT`), with a new lookup 5 s after each failed one
-  (`net::DNS_RETRY`, logged as `dns_stale`). So a DNS outage shorter than 10 minutes delays one
-  request per host by up to 5 s, at most once every 5 s, and fails nothing. Past it, and for a host
-  that has not resolved yet, the host's requests fail before they go out until a lookup succeeds,
-  and commits fail alone as `unreachable`. A pooled connection keeps its old address until it
-  closes.
-- **A server or gateway that refuses writes for a while** (the server's Raft log over its hard limit
-  under sustained write load, its WAL disk full, a gateway whose token issuer is down) marks its
-  refusals `x-ursula-not-applied`, and Ursula's gateway vouches for them. Commits block up to the
-  retry budget. When every attempt was refused that way, the commit fails alone and the first
-  commit after the refusals stop succeeds with no attach. An attempt answered without a vouched
-  marker leaves the outcome unknown, and the commit poisons. That is every such refusal of a server
-  with no gateway in front of it. A gateway drops the marker when it reached the refusing node by
-  following a leader redirect that carried none (§2).
-- **A layer that refuses writes** with `402` (an exhausted quota, a suspended account), or an
-  authorizer that denies them with a vouched `403`: commits fail alone and nothing of them reaches
-  the stream, reads go on, and the first commit after the layer accepts writes again succeeds with
-  no attach. A `403` without both headers poisons. A process that restarts meanwhile cannot attach
-  as the owner, because its claim is refused. It attaches read-only to read (§3).
-- **A layer that breaks §2's requirement** (it retries writes, follows redirects for them, or
-  refuses after it forwarded): the next commit usually poisons with a reason that names both
-  commits the stream may hold, and after the next attach the database holds the refused
-  transaction. §2 lists the cases the check misses.
-- **Two owners**: the later claim wins, and the earlier one's next commit fails cleanly
-  (`UrsulaFencedError`, an `UrsulaReplicationError` with `fenced: true`, through `open`'s database
-  and the Pi helper).
-- **A snapshot that cannot be taken** (a long reader pins WAL frames) or published (body too large):
-  the log grows, nothing is lost, and retention does not advance. A body too large is sent again
-  every 48 to 72 minutes once its failures run long (an hour, give or take a fifth), and at once
-  after the database shrank by more than a quarter (§4.4).
-
-**Write-back errors.** A disk write-back I/O error underneath a running process (EIO from the
-device, a thin-provisioned volume out of space) is reported by nothing when it happens, since the
-commit path never fsyncs the WAL, and the db file only at WAL restarts, truncates and attach. Once
-the dirty page is evicted, a read gets the old block back, and SQLite does not check WAL frames on a
-read. The owner's next commits would append page images built on it, losing acknowledged changes
-from the stream itself, not only from the cache. So the VFS remembers the crc32c of every WAL page
-this process writes in the WAL's current generation, by offset (4 bytes per page), and checks every
-page its connections read back. A page that reads back other bytes fails the read and poisons the
-database before any commit can build on it. An error writing back the db file is reported by the
-next fsync of the db file (Linux reports it to an fsync on any descriptor opened before it). That
-fsync comes before the commit that restarts the WAL, which is normally the first commit after a
-complete checkpoint, the point from which readers read checkpointed pages from the db file instead
-of the WAL.
-
-The snapshot thread's private connection reads the WAL (its checkpoints) and the db file (its page
-copy) outside the VFS, so it does not see that check. A lost page it published would become
-permanent once the next snapshot moves retention past the frames that hold the good one. So after
-reading, it fsyncs both files through its own handles (§4.2, step 6) and publishes nothing when an
-fsync fails (which poisons the database) or the owner is poisoned for a lost write. On Linux an
-fsync reports a write-back error that no fsync has reported yet, from any descriptor, and in the
-process only the owner's fsync of the db file could have reported it first, which poisons too.
-
-Residual risk:
-
-- The snapshot's fsyncs rely on the kernel reporting an earlier write-back error to a later fsync on
-  another descriptor, which Linux does. Elsewhere (macOS) a lost page the checkpoints or the copy
-  read, and no connection of the owner read back, can still be published.
-- A page changed by anything but a failed write-back (unsupported, below) is reported by no fsync.
-  Unless a connection of the owner read it back first, a snapshot can publish it.
-- A commit that cannot restart the WAL, because another connection still reads from it, can read a
-  db page that lost its write-back since the last fsync and append the damage.
-
-**Unsupported**, because they break the model above: a runtime that fakes a fixed boot id, a volume
-swapped or rolled back underneath a running process, edits to the files outside the extension (a
-process that never loaded it, copying a backup over the db in place, while a db file replaced by
-rename is detected and discarded), a file-level copy of the files taken while the process runs
-(`cp`, `rsync`, a file-level backup: each file is copied at another moment, so the copy is not one
-crash-consistent image, whereas a block-level snapshot of the volume is), and network or FUSE
-filesystems for the local files (NFS, EFS, SMB, 9p, virtiofs: no page-cache coherence or reliable
-POSIX locks, and a second host's attach would discard files the first is using). To force a
-rebuild, delete `<db>`.
-
-**Panics.** A panic inside the extension stops at its C entry point (`guard::contain`), because
-unwinding out of an `extern "C"` function would abort the host process. The process goes on, and
-the log names the entry point (`event=panic`, after the Rust runtime's own panic message). What
-fails:
-
-- A file method answers its I/O error, and its database is poisoned (attach it again), since the
-  panic may have left its state half changed. The poison keeps the write transaction's overlay,
-  which may belong to another connection, and that connection's next write fails instead. `xOpen`
-  answers `SQLITE_CANTOPEN`, leaves the file without methods and closes the `unix` file if its own
-  open succeeded. `xClose` takes the file's state and does its bookkeeping (the WAL handles open,
-  the handle with the EXCLUSIVE lock) before the contained body, so a panic poisons nothing, and it
-  closes the `unix` file and still releases the file's open count, so the file can be attached
-  again in the process.
-- A SQL function fails with an error. A panic while `ursula_attach` binds the files is a failed
-  attach: it drops the binding and the attach in progress, and the file opens again only after an
-  attach succeeds.
-- A panic in the extension's init fails the load, with the message "sqlite3_extension_init
-  panicked inside the extension".
-- The snapshot thread is not contained. A panic there ends that thread alone, which the next attach
-  of the file reports (`snapshot_thread_panicked`), and no snapshot is taken until then.
-
-The crate refuses to build with `panic = "abort"`.
-
-## 7. Limits
-
-- 4 KiB pages, WAL mode only, `locking_mode=EXCLUSIVE` unsupported.
-- One owner process per stream at a time. Connections in other processes that load the extension
-  cannot open the file (§1), and processes without it are not replicated (and block recovery).
-- **Writes outside the extension after an attach are not detected.** A connection that bypasses
-  the VFS (`?vfs=unix`, a connection opened while the extension was not the default VFS) or a
-  process without the extension can write the attached file. Its commits never reach the stream,
-  and the owner's later commits and snapshots carry pages built on them, so copies rebuilt from the
-  stream can diverge from the file or be malformed. Attach refuses the connections this process
-  opened on the file before it (§3, step 1), and keeps other processes off while it writes the file
-  (§3, step 3). Nothing checks the files afterwards: the next attach trusts or rebuilds them by the
-  sidecar alone (§6). A descriptor opened through another hard link of the db file, or another
-  mount of it, has another path and is not found (on macOS, `F_GETPATH` can report the hard link
-  looked up last even for a descriptor opened through the db file's own path). Where the process's
-  descriptors cannot be listed (no `/proc` or `/dev/fd`), their paths cannot be read (other than
-  Linux and macOS), or the db file's directory cannot be resolved, attach does not check them.
-- The local files must be on a local filesystem (§6).
-- **A transaction must fit one request.** Its commit frame as sent, a 12-byte header and the
-  transaction's changed pages compressed with zstd, is at most `URSULA_VFS_MAX_FRAME_BYTES`: 32 MiB
-  (33,554,432 bytes) by default, the server's request body limit, which a gateway's
-  `--max-request-body-bytes` matches by default. The setting is in bytes, from 64 KiB to 32 MiB. A
-  value outside is taken to the nearer bound, and one that is not a number of bytes is ignored, both
-  logged once as `setting_adjusted`. 32 MiB is about 8,000 changed pages of incompressible data
-  (random, encrypted or already compressed bytes, such as embeddings or media), and about three
-  times as many of typical text. A larger transaction is never sent. It fails alone as `too_large`
-  with the frame's size and the limit in `refused_reason` (§2), the database stays usable, and
-  snapshots go on. Before it refuses, the extension holds the transaction several times in memory:
-  the changed pages, the record built from them, and its compressed frame. Split bulk imports into
-  smaller transactions. Statements that rewrite a whole table or index run as one transaction too:
-  `CREATE INDEX` on a large table, `REINDEX`, an `ALTER TABLE` that rebuilds the table, and
-  `VACUUM`, which rewrites every page. On a database whose compressed size is above the limit,
-  `VACUUM` fails the same way: delete rows before it, so that what it writes compresses below the
-  limit, or copy the rows into a new database in transactions below the limit.
-- Behind a layer with a lower request limit, set `URSULA_VFS_MAX_FRAME_BYTES` at or below it. A
-  vouched `413` fails the commit alone as `too_large`, and any other `413` poisons at once. The
-  gateway's per-bucket body limit reads the whole body before it answers, so its `413` reaches the
-  client. So do the refusals the gateway decides from a write's head alone (a refused token, an
-  authorizer's denial, a bucket's rate limit): it reads the body before it answers them, up to its
-  `--max-request-body-bytes`, for 30 s at most, which outlasts a commit's 10 s request timeout, and
-  until no data arrived for 5 s. At its `--max-request-body-bytes` the gateway stops reading,
-  answers a vouched `413` and closes the connection with the rest of the body unread. A commit a
-  little over that limit may get the `413` and fail alone. One far over it usually meets a failed
-  write, an unknown outcome, and poisons once the retry budget runs out. The server's limit equals
-  the default frame limit, which the setting cannot raise, so no frame the extension sends is over
-  it.
-- Snapshots hold the database image in memory (twice, briefly: raw and compressed) and are capped
-  by the request limit, 32 MiB compressed: the extension does not send snapshots in parts. `snapshot_bytes` in
-  `ursula_status` is the latest body's compressed size.
-- Producer expiry after 7 idle days. The owner reclaims only if nobody wrote meanwhile.
-- Redirects are never followed (§2), so the stream URL must reach the stream's leader by itself:
-  through a gateway, or on a single-node server. A URL that names one node of a multi-node cluster
-  works only while that node leads the stream's group. A URL that a proxy redirects (from `http://`
-  to `https://`, say, usually with a `308`) fails at once with the redirect's `Location`, so name
-  the address the redirect points to.
-- HTTP, or TLS for `https://` URLs with the bundled Mozilla roots, or only the certificate
-  authorities in `URSULA_VFS_CA_FILE`. One bearer token per process: `ursula_set_token`, else the
-  content of `URSULA_VFS_TOKEN_FILE`, read again when the file changes and after a `401`. A read of
-  the file that finds no token (empty, half-written, missing) keeps the last one it held, since a
-  request sent without one is concealed as a missing stream (`404`). That fails an attach, and
-  fails a commit at once, alone when the `404` is vouched (§2) and with a poison otherwise. A token
-  sent over `http://` to a host that is not loopback is logged once (`token_in_clear`). The SQL
-  functions are direct-only: a trigger or view of an untrusted database cannot call them.
-- Every request carries `User-Agent: sqlite-ursula-vfs/<version>`, the extension's version.
-- A host's addresses are looked up through the system's resolver at most once every 30 s per
-  process, so a stream whose endpoint moves is reached at its new addresses within 30 s, or 5 s
-  after a connection to an old address failed (§6, DNS).
-- **Connections.** Appends, reads and `HEAD`s keep a connection for 90 s after its last request
-  (`URSULA_VFS_IDLE_MS`), so a writer that commits every 15 to 90 s does not open a new TCP and TLS
-  connection per commit, which behind a reverse proxy or a CDN can cost about a second. Snapshot
-  transfers keep 15 s, since a dead connection would hold a transfer for its whole 120 s timeout.
-  Before reusing a connection, the client reads its socket once without blocking and drops one
-  closed while idle. One that a NAT, a load balancer or a firewall dropped silently still looks
-  open, and a request on it fails at once on a reset or after the 10 s request timeout. A request
-  that got no answer is sent again on a new connection, which also drops the other pooled
-  connections idle for more than 1 s. Many such devices drop connections idle for about 4 minutes.
-  Behind one that drops them sooner, set `URSULA_VFS_IDLE_MS` below its limit. On macOS a reset
-  can surface as `EINVAL` (`Invalid argument`) because ureq sets a socket option before each read
-  and write, and macOS refuses options on a reset socket. That `EINVAL` counts as no answer on
-  macOS only (`client::reset_on_macos`).
-
-### Versions
-
-Extensions of different versions meet in a stream and in the local files. They must agree on:
-
-| what | where | now |
+| class | thrown by | kinds |
 | --- | --- | --- |
-| commit and claim frames | the stream | `USQ1` |
-| snapshot bodies | the snapshot store | `USS2` |
-| the sidecar | `<db>-ursula`, on each host | format 2 (`v=2`) |
-| the producer | every append | `Producer-Id: sqlite-ursula-vfs/<Stream-Incarnation>`, and `Stream-Seq` from the epoch and sequence |
+| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`) |
+| `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
+| `UrsulaUnavailableError` | `open()` and `importSqlite()` when the signal or timeout fires | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, `wrong_cluster`, or `cancelled` when none was met |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
-None of these changes within a minor (0.7.x). Any 0.7.x extension attaches a stream another 0.7.x
-wrote, installs its snapshots, resumes from its local files on the same host, and fences its owner,
-and is fenced by it in turn. So upgrading the extension one owner at a time is safe: the new
-owner's attach fences the old one. CI checks this on every change: `test/compat.e2e.ts` runs the
-previous published patch of the minor against the build, both ways, and runs the build against
-itself until a minor has a second patch.
+Network failures never throw from statements or `synced()`. A refused write fails with
+`SQLITE_IOERR_AUTH` (7178), a read after a reset with `SQLITE_IOERR_READ` (266), a write after one
+with `SQLITE_IOERR_WRITE` (778). Other errors stay SQLite's own. Every SQL function's error reads
+`<function>: <kind>: <message>`.
 
-A change to any of them waits for a minor and changes the identifier with it: a new frame or
-snapshot magic, a new sidecar format, a new `Producer-Id` prefix. An extension fails closed on what
-it cannot read. A frame or snapshot of another format stops attach with an error that names the
-magic it found (`frame magic "USQ2": this extension reads "USQ1" frames, ...`) instead of misreading
-it. A sidecar it cannot parse or does not trust is discarded, so attach rebuilds the files from the
-stream. Owners with different `Producer-Id`s do not fence each other, so a minor that changes it
-must say in its release notes to stop every owner of a stream before upgrading.
+Tests: `error.rs` `write_refusals_say_what_to_do`, `resets_say_what_to_do`, `test/open.e2e.ts`
+"refuses a URL it cannot take, as a setup error to fix", "reports the last condition the open met
+when its signal fires", "refuses an unsupported write alone, and leaves SQLite".
 
-## 8. Tests
+### Pi
 
-Rust unit tests run with `cargo test` in `clients/sqlite-vfs` (CI also runs them on macOS, for its
-boot id and its `EINVAL` resets). The e2e suites in `clients/sqlite-ursula/test` run against a real
-single node, and the cluster suites against 3 nodes, a gateway and S3 (AWS S3 in CI, MinIO for fork
-PRs).
+`openUrsulaPiStorage(url, options)` (the `/pi` entry) opens with `open`, runs Pi Durable's official
+node driver unmodified on `db.location()`, and wraps its `transaction`, `run`, `exec`, `get` and
+`all` to resolve only after `await db.synced()`. A Pi commit resolves once the stream holds it,
+which is Pi's `Storage.commit` contract, and a read once what it read is confirmed.
 
-| layer | files | what it proves |
-| --- | --- | --- |
-| unit: encodings | `frame.rs`, `snapshot.rs` | whole frames only, damage refused, another format refused by its magic and named in the error |
-| unit: claims | `claim.rs` | a claim wins only as the frame ending at the answered offset, or anywhere in a read-back that ran past it, and a re-claim only as the first frame after the owner's offset |
-| unit: attach | `attach.rs` | an attach that fails past its acknowledged claim is `outcome_unknown` while one whose claim was refused keeps its kind, and only a refusal of the file as it stands before any change records no failed attach |
-| unit: answers | `client.rs`, `error.rs` | every error's kind and action, attach's refused `HEAD` carries the reason of a `GET` refused the same way, the last `401` keeps its body, `applied_nothing` (status for 401, 402, 429, marker with vouch for other refusals, nothing for a redirect or a success), each answer's outcome and `refused_kind`, mixed attempts, `refused_reason` cut to 256 bytes, no request follows a redirect, a `307` resent with the same sequence, a large snapshot body sent twice at most, the snapshot size probe, idle times, resent requests on new connections, `EINVAL` a reset only on macOS, failures before sending fail alone as `unreachable` |
-| unit: owner state | `db.rs`, `vfs.rs`, `status.rs`, `extension.rs` | a refused commit fails alone with epoch, sequence and offset kept while an unknown one poisons, the next-commit check, an unsent `too_large` leaves `layer_refused` and the check, no snapshot while a layer refuses, WAL pages checked when read back, `ursula_status` fields and the error's kind and action for poisons and refusals, attach error codes and modes, opens refused after a failed attach, a fence raises the read flag |
-| unit: snapshots | `snapshotter.rs` | backoff by kind (size, outage, other), doubling up to each kind's limit, spread by a fifth, `Retry-After` honoured, a shrink of a quarter releases the wait, one brought-forward attempt per run, only a snapshot at the offset ends a run |
-| unit: transport | `net.rs` | DNS freshness, one lookup at a time, the stale limit and retry, `NotSent` for failed lookups, connections and TLS handshakes |
-| unit: local files | `local.rs`, `descriptors.rs` | sidecar trust only in this boot, for this incarnation and db file, with its WAL claim met, folding a WAL keeps the last image and cuts the file, any descriptor on the db file, `-wal`, `-shm` or `-journal` is found by its resolved path in any access mode and one on another file of the same name is not |
-| unit: panics | `guard.rs`, `vfs.rs` | every file method's C entry point contains a panic and poisons, `xClose` and `xOpen` release the open count, the writer's overlay is kept |
-| unit: settings | `config.rs`, `auth.rs`, `log.rs`, `stats.rs` | frame limit bounds, a token file without a token keeps the last one, log format, bounded per-commit measurements |
-| e2e: transparency | `transparency.e2e.ts`, `conformance.e2e.ts` | any schema rebuilds byte-identical, the overlay's write-transaction scope, Pi conformance in three modes (direct, reopen, rebuild every commit) |
-| e2e: crash and recovery | `crash.e2e.ts`, `recovery.e2e.ts` | SIGKILL and abort around the commit point, the cache spill, an unknown append, one owner per host, no connection open while pages are rewritten |
-| e2e: local cache | `reboot.e2e.ts`, `writeback.e2e.ts` | trust only in the same boot with the WAL claim met, rebuild from snapshot and tail otherwise, a changed WAL page fails its read and poisons with the stream intact |
-| e2e: fencing | `fencing.e2e.ts` | a new claim fences every earlier owner, an owner of a deleted stream, a foreign higher `Stream-Seq`, a fenced owner's reads fail, through the Pi storage as `UrsulaReplicationError`, a read refused inside a transaction included |
-| e2e: refusals | `payment.e2e.ts`, `refused.e2e.ts`, `refusal-errors.e2e.ts`, `early-refusal.e2e.ts`, `unreachable.e2e.ts` | every fail-alone row of §2 through `gate.mjs`, read-only attach, the next-commit check and its first gap, `too_large`, a real gateway's head-decided `401` on an 8 MiB commit, refused connections, Pi error mapping |
-| e2e: snapshots | `snapshot.e2e.ts`, `snapshot-backoff.e2e.ts`, `cold-snapshot.e2e.ts` | a run far past the hot limit stays bounded, fresh and lagging hosts rebuild byte-identical, takeover after a trim fences, §4.4's backoff through `gate.mjs` and a real gateway, a 12 MiB body through S3 multipart (cluster only) |
-| e2e: deployment | `auth.e2e.ts`, `redirects.e2e.ts`, `health.e2e.ts` | TLS and gateway-checked tokens, leaderships moved under commits and snapshot read-backs with no `307` reaching the client, `ursula_status` and logs for operators |
-| e2e: panics | `panics.e2e.ts` | every SQL function and init fail with an error and the process goes on, a panic poisons one file alone |
-| e2e: package entries | `entries.e2e.ts` | the root entry, source and built, imports nothing outside Node.js, the `/pi` entry imports Pi Durable |
-| e2e: `open` | `open.e2e.ts`, `classify.e2e.ts` | `open` with a derived and an explicit path, a distinct and safe file name for every stream and one for every spelling of its URL, read-only opens on files of their own, the default directory, WAL mode without a pragma, a typed error for a fence, an unknown outcome, a `402`, a `too_large` refusal, an unreachable endpoint and setup mistakes, SQLite's own errors (a constraint violation while writes are refused included) passing through unchanged, a transaction helper's or drizzle's ROLLBACK after a failure keeping the error, `:memory:` and `file:` paths, a query or a fragment in the URL and wrong `node:sqlite` options refused before anything is attached, a relative path after a chdir, statement options passed on, a connection made through `db.constructor`, and a failure Pi wraps in its `StorageRejected` |
-| e2e: misuse | `misuse.e2e.ts` | any descriptor outside the extension refuses the attach (a connection opened before the extension was loaded, a read descriptor, a read-only connection that keeps closed connections' descriptors open) and keeps the binding, a failed attach names the server's reason, refuses opens, blocks no later attach, and removes the sidecar it created when it wrote nothing, an unreplicated file whose rows copy into a newly attached file in the same process, another process met after the attach changed the files fails it, an unreachable endpoint, a fenced owner's reads fail, a reader with cached pages is not held up by another thread's commit, and refused, unknown and fenced commits report kinds of their own |
-| e2e: versions | `compat.e2e.ts` | same-minor compatibility (§7, versions) |
-| e2e: load | `bench.e2e.ts`, `soak.e2e.ts` | sanity numbers (bytes per turn, pages per commit), server memory under VFS-shaped load (soak, opt-in) |
+- `backlog_full` commits nothing. From Pi 1.2, whose storages retry their own transient failures,
+  the adapter waits for `synced()` and runs the work again. On Pi 1.0 and 1.1 it throws Pi's
+  `StorageRejected`, and the session continues.
+- A reset throws the `UrsulaResetError` itself, unwrapped, so Pi's Session stops and the
+  host reopens or stops.
+- `close` waits up to `closeTimeoutMs` (10 s) for `synced()`, then closes. Pi 1.3's
+  `Session.close` waits for storage calls in flight, and those wait for `synced()`, so closing a
+  Pi session during an outage waits for the stream, and `closeTimeoutMs` applies only once the
+  session reaches the storage's `close`.
+- `@earendil-works/pi-durable` is an optional peer dependency, `>=1.0.0 <1.4.0`.
 
-The suites run the Pi Durable version in the lockfile. The single-node job also installs the oldest
-version in `package.json`'s peer range and runs the typecheck, conformance, `fencing.e2e.ts`,
-`payment.e2e.ts` and `refused.e2e.ts` again, whose Pi cases reach `openUrsulaPiStorage`'s mapping of
-the errors the node driver throws for a failed commit.
+Tests: `test/pi.e2e.ts` "runs a commit refused with backlog_full again once synced() drained the
+backlog (Pi 1.2 on)", "throws backlog_full as Pi's StorageRejected, nothing committed, and the
+storage goes on (Pi up to 1.1)", "throws a reset as the UrsulaResetError itself, and closes",
+"waits for synced() on close, at most closeTimeoutMs", and Pi's storage conformance suite in
+`test/conformance.e2e.ts`, run in CI on Pi 1.0.0 and the newest supported Pi.
 
-## 9. Performance
+### SQL functions
 
-Measured on 2026-10-09 on EKS in us-east-1: three `m6i.xlarge` Ursula nodes, one per AZ (256 groups,
-4 cores, the Raft WAL on gp3 with `raft.wal.fsync = never`), three gateways, one per AZ, S3 for the
-cold tier and snapshots, and `m6i.2xlarge` client pods in one AZ, one process per database, through
-the gateway Service. The extension measured predates the snapshot thread's fsync of the WAL and the
-db file (§4.2, step 6), which can change snapshot publish times. The tools are in
-`clients/sqlite-ursula/bench/`.
+Other hosts call the extension directly. Long calls take `timeout_ms`, where 0 starts the work and
+returns at once.
 
-**Workload** (`bench/owner.ts`): Pi Durable's `SqliteStorage` on the VFS via `openUrsulaPiStorage`,
-a real `Harness` with a faux model, turns of text, text, tool (5 Pi commits per turn). Latency is
-`Storage.commit` wall time after a 30 s warm-up, in 10.5 min cells. Agent pace is one turn per 2 s
-per database. Baselines, B1 and B2 from an earlier run on the same client node type:
+- `ursula_open(url, dir, options_json, timeout_ms)`: open, returning `{done, path, name, state}` or
+  `{done: false, request}`. `options_json` holds `read_only`, `recreate`, `activation` (32 hex
+  digits), `max_pending_bytes`, `token` and `timeout_ms`. A path `ursula_open` handed out stays
+  openable until a connection opens it, or for a minute.
+- `ursula_synced(path, timeout_ms)`: `{synced, ...}`, or the reset error.
+- `ursula_events(cursor, timeout_ms)`: completions, acknowledgements, conditions and resets from a
+  bounded queue of 4,096, acknowledgements coalesced, what was dropped reported.
+- `ursula_import(url, file, options_json, timeout_ms)`: [Import](#import). `timeout_ms` must be
+  positive.
+- `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
+  `ursula_set_token(path, token)`.
 
-- B1: the same workload on Pi's own `openNodeSqliteStorage` on the pod's disk, no extension (WAL,
-  `synchronous=NORMAL`). It involves no server.
-- B2: the same with `synchronous=FULL` (the WAL synced on every commit).
-- B3 (`bench/raw.ts`): raw appends, no SQLite. Closed-loop writers, one stream each, 5 to 7 KiB
-  random bodies with producer headers, through the gateway.
+The extension refuses to load into SQLite older than 3.50.4.
 
-Pi commit latency, ms, p50 / p99 (p99.9 / max), and Pi commits/s:
+Tests: `test/core.e2e.ts` "loads into the running SQLite and registers the 0.8 functions only",
+`options.rs` `every_option`, `refusals_name_the_option`, `extension.rs` `the_floor_is_3_50_4`,
+`driver/tests.rs` `the_event_log_coalesces_acks_and_reports_what_it_dropped`, `test/handout.e2e.ts`.
 
-| cell | B1 local, NORMAL | B2 local, FULL | VFS |
+### Import
+
+`ursula_import` (TypeScript `importSqlite(url, file, { token, timeoutMs })`) makes a plain SQLite
+file the first snapshot of a new stream, page for page:
+
+1. The file is checked and copied into a temp directory before anything is sent: SQLite's magic,
+   4096-byte pages, no `-wal` and no hot journal beside it (before and after the copy), a length of
+   exactly the pages its header counts. Page 1 of the copy is marked WAL.
+2. A HEAD: the stream must be missing, or an empty stream of the VFS content type with no
+   snapshot. Anything else refuses (`server_too_old`, `stream_format`, `stream_state`). A `404`
+   without `Ursula-Protocol: 2` is `server_too_old`, never a missing stream.
+3. The create, then a claim of epoch 1 with a random activation, resent unchanged until a definite
+   answer. Its receipt must start at offset 0. Its end is `W`, above 0, since builds skip a
+   snapshot at offset 0, and the first open then claims above epoch 1.
+4. The `USS3` body at `W`, epoch 1, a fresh lineage, position 0.
+5. A HEAD naming the tail `W`, the publish of [Snapshots](#snapshots) (one `PUT`, or parts with a
+   cold store, otherwise refused naming the limit), then a HEAD again. The import is done only on
+   a `204` naming `(W, digest)` and a HEAD naming that snapshot with the tail still at `W`. Bytes
+   after `W` fail with `stream_state`.
+
+The source file is only read. Nothing is published on a stream that is not new. A failure after
+the claim leaves the stream holding the claim alone: import into a new stream. An open of the
+stream while an import runs is not prevented.
+
+Tests: `import/tests.rs` `a_header_must_name_whole_4096_byte_pages`,
+`a_wal_or_a_hot_journal_beside_the_file_refuses_it`, `a_file_becomes_the_first_snapshot_of_a_new_stream`,
+`a_file_above_the_request_limit_goes_up_in_parts`,
+`a_file_above_the_limit_without_parts_is_refused_naming_it`,
+`only_a_missing_or_empty_stream_is_imported_into`, `a_claim_that_is_not_first_publishes_nothing`,
+`a_claim_whose_answer_is_lost_is_resent_unchanged`, `bytes_after_the_claim_fail_the_import`,
+`a_head_404_without_the_protocol_creates_nothing`, and `test/import.e2e.ts` "imports a plain
+database as the first snapshot of a new stream, in parts under a 64 KiB limit", "refuses a file
+with 8192-byte pages before anything is sent", "refuses a file with a -wal beside it before
+anything is sent".
+
+### Pump
+
+Main-thread calls into the extension return at once (timeout 0). The package starts one unref'd
+worker per JavaScript thread that uses it. The worker loads the extension the process already
+holds, shares its registry, and loops on `SELECT ursula_events(cursor, 1000)`, posting events that
+resolve `synced()`, complete `open()` and fire `reset` listeners. No native addon is needed. What
+still blocks is what blocks plain SQLite: local I/O and the busy handler. `importSqlite` blocks its
+thread for at most its timeout.
+
+Tests: `test/synced.e2e.ts` "waits without blocking the event loop while the stream holds its
+answer back", "asks again for what a gap in the events may have dropped", "keeps the process alive
+while it waits: `await db.synced()` never ends the process unresolved", "lets an idle process exit
+on its own, its database left open", `test/workers.e2e.ts`.
+
+## Status
+
+`db.status()` and `ursula_status(path)` return one snake_case JSON:
+
+```jsonc
+{
+  "name": "/acme/notes", "path": ".../gen-<id32>/db",
+  "state": "live",                  // provisional | live | retiring | retired | reset
+  "role": "owner",                  // owner | reader
+  "closed": false, "epoch": 7, "cluster_id": "...", "incarnation": "...", "lineage": "...",
+  "commits": { "logged": 1234, "confirmed": 1234, "acknowledged": 1231, "pending": 3, "pending_bytes": 14336 },
+  "replication": { "state": "streaming", "condition": null },   // activating | streaming | reset | refused | stopped | none
+  "attach": { "local": "resumed", "snapshot_offset": null },    // resumed | rekeyed | caught_up | built | salvaged
+  "snapshot": { "offset": 1048576, "age_ms": 1000, "failures": 0, "error": null, "log_bytes": 123, "due_bytes": 8388608 },
+  "refused": null,                  // the last write refused with nothing committed
+  "salvage": [],                    // { dir, reason, time, incarnation, stream_incarnation, acknowledged_position, unacknowledged, plain }
+  "reset": null                     // { kind, action }
+}
+```
+
+- `replication.condition` names the retrying or blocked condition of [Answers](#answers):
+  `retrying`, `request_too_large`, `unauthorized`, `payment_required`, `forbidden`, `redirected`,
+  `wrong_cluster`, `rejected`.
+- `ursula_stats(path)` drains per-commit measurements (bytes, pages, time in the log and the VFS),
+  at most 8,192 of each kind between drains, and reports what it dropped.
+- Logs are one logfmt line per event on stderr: `sqlite-ursula-vfs level=warn event=<event> ...`.
+  Events include `open`, `provisional`, `live`, `rekey`, `salvaged`, `reset`, `recut`, `log_cut`,
+  `write_refused`, `snapshot_published`, `snapshot_failed`, `snapshots_stopped`,
+  `retention_failed`, `dns_stale`, `token_in_clear`, `token_file_unreadable`, `setting_adjusted`
+  and `panic`.
+- Alert on a growing `commits.pending_bytes`, any `replication.condition` that stays, refused
+  writes, any reset, and a `snapshot.log_bytes` that stays above a few times `due_bytes`.
+
+Tests: `status.rs` `a_handed_out_binding_reports_live_or_provisional`, `synced_names_its_target`,
+`events_render_as_one_object`, `stats_report_what_was_dropped`, `stats.rs`
+`a_database_nobody_drains_keeps_a_bounded_number_of_each_kind`, `log.rs`
+`values_are_quoted_only_when_needed`.
+
+## Contract
+
+The VFS relies on these server behaviors, each specified in the
+[extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). Every row is
+implemented by the model server (`model/`), which the proptest world and the e2e suites run
+against, and the e2e suites run against a real server in CI.
+
+| # | contract | extensions heading | used in |
 | --- | --- | --- | --- |
-| 1 db, agent pace | 0.11 / 7.6 | 1.8 / 4.6 | 4.7 / 7.9 (11.6 / 11.9) |
-| 1 db, flat out | 0.16 / 8.9, 115/s | 2.2 / 4.9, 100/s | 4.4 / 7.0 (51 / 144), 81/s |
-| 16 dbs, agent pace | 0.11 / 6.5 | 1.6 / 4.8 | 4.1 / 7.4 (13 / 162) |
-| 16 dbs, flat out [1] | 0.20 / 13.1, 651/s | 2.8 / 19.1, 652/s | 8.1 / 28.4 (58 / 199), 541/s |
-| 128 dbs, agent pace [2] | | | 3.9 / 6.0 (13 / 171), 320/s |
-| 128 dbs, flat out [2] | | | 26.7 / 105 (191 / 883), 2,051/s |
+| 1 | `Stream-Incarnation` changes whenever bytes at a served offset may differ, compared at apply for writes and against the serving state for reads (`412` with the current token) | Snapshot Metadata on HEAD and Stream Incarnation | [Appends](#appends), [History](#history) |
+| 2 | A history event changes every token of the group and closes every producer epoch (`epoch-closed`, `by=history`) | Producer Write Answers | [Answers](#answers), [History](#history) |
+| 3 | The epoch floor: a tokened write from a producer without a record at or below the highest retired epoch gets `403 producer-expired` naming the floor | Epoch Floor | [Answers](#answers), [Claims](#claims) |
+| 4 | Definite repeats: a repeat with the same key and digest gets the newest write's receipt, `receipt-evicted`, `epoch-closed` with `Producer-Closed-*`, `key-conflict`, `producer-expired`, or `Producer-Expected-Seq`. The epoch is checked before deduplication, and every producer `403` carries `Producer-Epoch` | Producer Write Answers | [Answers](#answers) |
+| 5 | `Producer-Digest` is the BLAKE3-256 of the body, verified, and another identity under a held key gets `key-conflict` | Write Identity | [Appends](#appends), [Claims](#claims), [Clones](#clones) |
+| 6 | Receipts carry `Stream-Offset` and `Stream-Next-Offset` of the request's own write, and a claim's answer and its repeats carry `Producer-Closed-Epoch` and `Producer-Closed-Seq` | Producer Write Answers | [Appends](#appends), [Claims](#claims) |
+| 7 | Size, routing, repeats and key conflicts are answered before the body, and a node never redirects after reading a body. Over HTTP/1.1 an early answer drains the body | Answers Before the Body, Routing Answers | [Answers](#answers), [Transport](#transport) |
+| 8 | Snapshots are keyed by `(offset, digest)`, `204` or `409` naming the latest. Parts are staged and committed by id, a commit checks its key before its parts, and retention is monotonic | Publish Snapshot | [Snapshots](#snapshots), [Import](#import) |
+| 9 | Snapshot reads honor one byte range | Read Snapshot | [Snapshots](#snapshots) |
+| 10 | HEAD carries the token, tail, snapshot, `Ursula-Protocol: 2`, `Ursula-Cluster-Id` (on every answer, `404` included), `Ursula-Max-Request-Bytes`, `Ursula-Max-Snapshot-Bytes` with a cold store, and after a history event `Stream-Previous-Incarnation` and `Stream-Inherited-Offset`, all in one integer offset space | Server Metadata, Snapshot Metadata on HEAD and Stream Incarnation | [Appends](#appends), [Open](#open), [History](#history), [Identity](#identity) |
+| 11 | Every `413` carries the limit it applied, decided from `Content-Length` | Server Metadata | [Answers](#answers) |
+| 12 | The cluster id is stable across restarts, upgrades, leader changes and history events, and unique among the deployments a client reaches | Server Metadata | [Log](#log), [Identity](#identity) |
+| 13 | Leader-consistent reads with the incarnation precondition | Leader Consistency | [Reconcile](#reconcile), [Synced](#synced) |
 
-[1] 16 processes on one 8-vCPU client node at about 70% CPU, so this row measures the client too.
-[2] Two client nodes, 64 databases each.
+Tests: `model/tests.rs` and `model/producer.rs` (one test per producer row, the floor, digests,
+history events and inheritance, HEAD identity on `200` and `404`, typed `413`s, snapshots, parts
+and ranges), and `transport/http/tests.rs`
+`addendum_4_the_order_is_the_same_over_http_and_in_process`. The CI jobs `sqlite-vfs-e2e-ursula`
+run every e2e suite against one real node with an in-memory cold store and against three nodes
+behind the gateway.
 
-B3, the raw append floor through the gateway: one writer 1.54 / 2.53 ms (p99.9 19.8), 593
-appends/s, and 16 writers 2.94 / 7.53 ms (p99.9 75), 4,662 appends/s. No database was poisoned, no
-commit failed, and none of the 1.85 million commits retried its append.
+## Formats
 
-**The append is the commit.** Where one database's commit goes (1 db at agent pace, p50):
-
-| component | ms |
+| | format |
 | --- | --- |
-| Pi and SQLite outside the VFS's commit | 0.18 |
-| VFS commit hook without the append | 0.12 |
-| the append request | 4.31 |
-| measured Pi commit | 4.66 |
+| stream frames | `USQ2` ([Frames](#frames)) |
+| snapshot bodies | `USS3` ([Snapshots](#snapshots)), digest BLAKE3 of the length-prefixed content type and the body |
+| local state | generation directories ([Layout](#layout)), `USL1` log segments ([Log](#log)), the page-1 marker ([Marker](#marker)), `db-uwal`, `manifest.json` |
+| producer | `Producer-Id: sqlite-ursula-vfs/2`, `Producer-Digest`, receipt contiguity |
+| content type | `application/vnd.ursula.sqlite-vfs.v2` |
 
-What the append costs depends on where the stream's leader and the connection's gateway are. Sent
-to the gateway in the client's AZ, the VFS's append p50 was 1.3 ms with the leader in the same AZ
-and 1.4 to 2.4 ms with it in another, within 0.04 to 0.13 ms of Node's `fetch` sending the same
-bytes to the same stream.
+Within 0.8.x these formats do not change, so owners upgrade one at a time. Golden vectors freeze
+their bytes. The APIs that may only grow within 0.8.x are the `options_json` keys, the
+`ursula_open` result, status keys and values, event shapes, error kinds and actions, the result
+codes 7178, 266 and 778, and the SQL function names and arities.
 
-**Stream sizing.** 7 pages per commit. zstd ratio 9.4 at agent pace and about 6.2 flat out, so
-3.6 KB per commit at agent pace and 4.6 to 4.8 KB flat out. Retention trails one snapshot behind
-(§4.3), so the retained log reaches about twice the snapshot threshold plus what is committed while
-a snapshot is taken: it ended at 16.8 MB in the 16- and 128-database flat-out cells, twice the
-8 MiB minimum. Back-to-back large transactions (`bench/bigtx.ts`: a 5 MB table, 2,000-row updates,
-frames of about 1 MB, no pause, 300 s) committed 3,429 times at p50 91 / p99 182 ms, wrote 3.35 GB
-and took 381 snapshots, and the retained log never exceeded 19.5 MB.
+0.8 refuses 0.7 streams (`stream_format`) and 0.7 servers (`server_too_old`) and never reads 0.7
+caches, since the default directory and the names changed. 0.7 fails closed on 0.8 files.
 
-**Cold start** (`bench/coldstart.ts`): a fresh host attaching new files, best of three, first
-attach in parentheses. A newly built database has no snapshot yet (§4.1), so the first column
-replays the whole log. For the second, rows were rewritten until a snapshot was published:
+Tests: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_frozen`,
+`the_part_frames_are_frozen`, `the_log_segment_is_frozen`, `a_fresh_builds_segment_header_is_frozen`,
+`the_snapshot_header_is_frozen`, `the_page_one_marker_is_frozen`, `the_salvage_manifest_is_frozen`,
+`codec/digest.rs` `snapshot_digests_equal_the_servers`, `producer_digests_are_blake3`.
 
-| database | log only: log replayed, attach | with a snapshot: body (publish time), tail after it, attach |
-| --- | --- | --- |
-| 10 MB | 2.5 MB, 48 ms (77) | |
-| 100 MB | 24.6 MB, 0.28 s (1.11) | 23.8 MB (6.7 s), 11 MB, 0.85 s (1.10) |
-| 1 GB | 246 MB, 8.0 s (12.8) | 237 MB (10.9 s), 74 MB, 15.5 s (18.7) |
+## Verification
 
-Installing a snapshot is slower than replaying as many bytes of log: 237 MB of snapshot and 74 MB of
-tail took 15.5 s, 246 MB of log 8.0 s.
+What CI runs (`.github/workflows/integration.yml`):
 
-**Failover**: 16 databases flat out, and at 120 s a forced delete of the node leading the most groups
-(86 of 256), three runs. No commit failed and no database was poisoned, and afterwards every owner's
-file and a fresh rebuild from its stream were identical, with `integrity_check` ok. Elections took
-up to about 5 s, during which the VFS got `503` and retried. The longest stalls, 10 to 22 s, were
-one or two whole 10 s request timeouts on connections to the killed node, inside the 30 s retry
-budget.
+- `sqlite-vfs`, `sqlite-vfs-macos`: clippy and the extension's unit tests, the proptests among them
+  (the replicator world, the log codec, materialization, the frame and snapshot codecs), on Linux
+  and macOS.
+- `sqlite-vfs-e2e`: every e2e suite against the model server (`E2E_SERVER=model`) on Node 22.19.0
+  and Node 22, and Pi conformance on the oldest supported Pi.
+- `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store
+  (with `test/history-real.e2e.ts`) and three nodes behind the gateway (with
+  `test/failover.e2e.ts`).
+- `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), reported only.
+- `memory-soak.yml` job `vfs-outage`, dispatched by hand: `test/soak.e2e.ts` through a long outage.
+
+Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process at the named step
+([Crashes](#crashes)).
+
+## Limits
+
+- **Commit size is bounded by memory.** Capture holds the whole transaction, and a build holds a
+  joined PART run twice. A commit frame above 4 GiB is `unsupported`.
+- **Two history events and a crash.** Two history events with no write between them, plus a crash,
+  a clean close or a reset between a re-key's log roll and its claim, salvage a generation that
+  lost nothing.
+- **Offline commits after a history event.** Commits logged before an open and after its latest
+  ACK are salvaged after any history event, since they may have been sent and acknowledged. A
+  clean close writes an exact ACK, and commits made while provisional still replicate.
+- **Idle expiry.** An owner idle past producer expiry whose own claim frame the pre-check cannot
+  see resets `stale`.
+- **No resume after a memory restore.** A mismatch between memory and disk goes unseen, and each
+  restored copy needs its own disk ([Clones](#clones)).
+- **Transport.** HTTP/1.1 only, so a retry resends the whole body. ureq tries addresses in turn, so
+  an IPv6 path that connects and then stalls fails every attempt (an IPv4-only hostname works
+  around it). Each database uses two HTTP worker threads and a snapshot thread.
+- **One token per process,** and no separate read origin.
+- **Snapshots** are not published above 1 GiB compressed, or above 32 MiB without a cold store.
+- **Local durability.** A power loss drops unacknowledged commits since the last log fsync.
+  Network filesystems, filesystems that ignore fsync, and a fork after open are unsupported.
+- **Host alias on a fresh host.** With no local cluster id to compare, a misrouted alias opens the
+  other deployment's stream.
+- **Import.** An open of the stream during `ursula_import` is reported, not prevented.
+- **Platforms.** Linux x64 and arm64 with glibc 2.28 or later, Linux x64 with musl, and macOS on
+  Apple silicon. Node.js 22.19 or later.
+
+## Performance
+
+The commit benchmark (`bench/commit.ts`) runs Pi-shaped transactions (an entry row of about 4.5 KB
+and a head row) in one process, alternating rounds of two arms: B1, plain node:sqlite on a local
+file in WAL mode with `synchronous=NORMAL`, and the VFS through `open()`, replicating in the
+background. A last phase times `await db.synced()` after one commit at a time. CI fails the run
+when the VFS's commit p50 exceeds B1's by more than 0.5 ms.
+
+5,000 commits per arm against the model server on the same host (darwin-arm64, Node 22.22.1):
+
+| arm | p50 ms | p90 ms | p99 ms |
+| --- | --- | --- | --- |
+| B1, plain node:sqlite | 0.016 | 0.020 | 0.048 |
+| VFS commit | 0.053 | 0.062 | 0.303 |
+| VFS `synced()` after a commit | 0.124 | 0.137 | 0.186 |
+
+The `synced()` row measures the VFS's own path to a local model server. Against a real deployment
+it adds one append round trip. B3, the raw append floor of a stream, is measured by
+`bench/raw.ts`.

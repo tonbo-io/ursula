@@ -85,7 +85,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
   is bound to pod loopback (`127.0.0.1:4438`) and is reached with
   `kubectl port-forward`.
 - `helm uninstall` leaves the graceful-rollout state ConfigMap (`<statefulset>-rollout-state`, for example `ursula-rollout-state`) behind. Delete it before you install again under the same name, so the rollout hook does not resume a rollout of the old release.
-- Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
+- Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) take its appends of at most 4 MiB at any preset. Its snapshots of up to 32 MiB go in one request, so keep per-group admission caps of at least 64 MiB (`standard` or `large` preset) for them to be admitted. Larger snapshots go up in parts and need a cold backend.
 
 ## Optional: event-time indexer (experimental)
 
