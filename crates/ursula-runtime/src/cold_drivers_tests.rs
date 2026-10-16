@@ -610,15 +610,16 @@ async fn orphan_sweep_reaches_old_parts_behind_young_ones() {
     let day_nanos = 24 * 60 * 60 * 1_000 * 1_000_000_u128;
     let young = crate::runtime::COLD_ORPHAN_SWEEP_MAX_PARTS_PER_DIR + 1;
     for seq in 0..young {
-        let name = format!("{:016x}-{now_nanos:032x}-{seq:016x}.part", 0);
+        let name = format!("{:032x}-{:016x}-{now_nanos:032x}-{seq:016x}.part", 0, 1);
         cold_store
             .write_chunk(&format!("{dir}{name}"), b"y")
             .await
             .expect("young part");
     }
     let old = format!(
-        "{dir}{:016x}-{:032x}-{:016x}.part",
-        u64::MAX,
+        "{dir}{:032x}-{:016x}-{:032x}-{:016x}.part",
+        u128::MAX,
+        1,
         now_nanos - 2 * day_nanos,
         0
     );

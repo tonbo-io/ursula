@@ -125,6 +125,7 @@ async fn stage(app: &Router, uri: &str, body: Vec<u8>) -> PartId {
     let response = send(
         app,
         Request::post(format!("{uri}/snapshot/3/parts"))
+            .header(CONTENT_LENGTH, body.len())
             .body(Body::from(body))
             .expect("request"),
     )
@@ -1289,4 +1290,573 @@ async fn out_of_range_commits_answer_from_their_key() {
         StatusCode::CONFLICT,
         "superseded: 409 before 410"
     );
+}
+
+/// A node whose streams hold at most `parts` staged parts and `bytes` of
+/// them, and lists again at every part it would refuse.
+fn bounded_state(parts: u64, bytes: u64) -> (HttpState, Arc<ColdStore>) {
+    let (mut state, cold_store) = cold_state();
+    state.set_staged_parts(crate::staged_parts::StagedParts::for_test(parts, bytes));
+    (state, cold_store)
+}
+
+/// A part whose stream is at its limit, sent with `Expect: 100-continue`
+/// and a body that panics if the node polls it: the refusal is decided
+/// from the head. Returns the limit the `429` names.
+async fn refused_part(app: &Router, uri: &str, len: usize) -> ursula_headers::StagedPartsLimit {
+    let body = Body::from_stream(futures_util::stream::poll_fn(
+        |_cx| -> std::task::Poll<Option<Result<Bytes, std::convert::Infallible>>> {
+            panic!("the node polled the body of a refused part")
+        },
+    ));
+    let response = send(
+        app,
+        Request::post(format!("{uri}/snapshot/3/parts"))
+            .header(CONTENT_LENGTH, len)
+            .header("expect", "100-continue")
+            .body(body)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get(RETRY_AFTER).is_none());
+    assert!(
+        response.headers().get(names::STREAM_INCARNATION).is_some(),
+        "the 429 names the incarnation whose parts fill the bound"
+    );
+    let limit = ursula_headers::StagedPartsLimit::parse(429, pairs(&response))
+        .expect("typed")
+        .expect("a staged-parts limit");
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::StagedPartsLimit
+    );
+    limit
+}
+
+/// #622: a stream holds a bounded number of staged parts and bytes. The
+/// part past either limit is refused with `429` naming it before its body
+/// is read, and another stream is not affected.
+#[tokio::test]
+async fn staged_parts_are_bounded_before_the_body() {
+    let (state, _cold_store) = bounded_state(2, 100);
+    let app = router_with_http_state(state.clone());
+    create(&app, "/parts/s").await;
+    create(&app, "/parts/other").await;
+    stage(&app, "/parts/s", vec![1; 10]).await;
+    stage(&app, "/parts/s", vec![2; 10]).await;
+    assert_eq!(
+        refused_part(&app, "/parts/s", 1).await,
+        ursula_headers::StagedPartsLimit::Parts(2)
+    );
+    assert_eq!(
+        state
+            .http_metrics
+            .snapshot_parts_staged_limit
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    // Bytes: 60 staged, and a part that declares 50 more.
+    stage(&app, "/parts/other", vec![3; 60]).await;
+    assert_eq!(
+        refused_part(&app, "/parts/other", 50).await,
+        ursula_headers::StagedPartsLimit::Bytes(100)
+    );
+    stage(&app, "/parts/other", vec![4; 40]).await;
+}
+
+/// #622: a commit releases the parts it spent, and the orphan sweep the
+/// parts it reclaimed, so the stream stages again.
+#[tokio::test]
+async fn a_commit_and_the_sweep_release_staged_parts() {
+    let (state, cold_store) = bounded_state(2, 1_000);
+    let app = router_with_http_state(state.clone());
+    let mut ended = state.snapshot_commits.ended();
+    create(&app, "/parts/s").await;
+    let parts = vec![
+        stage(&app, "/parts/s", b"first".to_vec()).await,
+        stage(&app, "/parts/s", b"second".to_vec()).await,
+    ];
+    refused_part(&app, "/parts/s", 1).await;
+    let response = send(
+        &app,
+        commit_request("/parts/s", &parts, digest_of(b"firstsecond")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    ended.wait_for(|ended| *ended >= 1).await.unwrap();
+    assert!(part_names(&cold_store).await.is_empty());
+
+    stage(&app, "/parts/s", b"third".to_vec()).await;
+    stage(&app, "/parts/s", b"fourth".to_vec()).await;
+    refused_part(&app, "/parts/s", 1).await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let swept = state
+        .runtime
+        .sweep_cold_orphans_group_once(ursula_shard::RaftGroupId(0), 16, 0)
+        .await
+        .expect("sweep");
+    assert_eq!(swept.orphans_deleted, 2);
+    assert_eq!(
+        state
+            .staged_parts
+            .counted(&BucketStreamId::new("parts", "s")),
+        Some((0, 0)),
+        "the sweep told the tracker"
+    );
+    stage(&app, "/parts/s", b"fifth".to_vec()).await;
+}
+
+/// #622: a new leader starts with no count. Its first part lists the
+/// stream's parts, so it counts the parts the old leader staged, and refuses
+/// the part past the limit. Two nodes share the stream and the cold store
+/// here: the second stands for the node that leads after a leader change.
+#[tokio::test]
+async fn a_new_leader_counts_the_parts_the_old_one_staged() {
+    let (old_leader, _cold_store) = bounded_state(2, 1_000);
+    let mut new_leader = HttpState::new(old_leader.runtime.clone());
+    new_leader.set_staged_parts(crate::staged_parts::StagedParts::for_test(2, 1_000));
+    let old_app = router_with_http_state(old_leader);
+    let new_app = router_with_http_state(new_leader);
+    create(&old_app, "/parts/s").await;
+    stage(&old_app, "/parts/s", b"first".to_vec()).await;
+    stage(&new_app, "/parts/s", b"second".to_vec()).await;
+    assert_eq!(
+        refused_part(&new_app, "/parts/s", 1).await,
+        ursula_headers::StagedPartsLimit::Parts(2)
+    );
+}
+
+/// B1 of the #622 review: two commits that name the same parts under
+/// different wrong digests. The second one, sent while the first copies,
+/// answers `503 SnapshotCommitInProgress` and spends nothing, so the parts
+/// the first one consumed are given back once, from a listing.
+#[tokio::test]
+async fn a_second_commit_of_a_stream_waits_for_the_first() {
+    let (state, cold_store) = bounded_state(4, 1_000);
+    let app = router_with_http_state(state.clone());
+    let mut ended = state.snapshot_commits.ended();
+    create(&app, "/parts/s").await;
+    let parts = vec![
+        stage(&app, "/parts/s", b"first".to_vec()).await,
+        stage(&app, "/parts/s", b"second".to_vec()).await,
+    ];
+    stage(&app, "/parts/s", b"kept".to_vec()).await;
+    let gate = Gate::on_part_reads(&cold_store);
+    let first = tokio::spawn({
+        let (app, parts) = (app.clone(), parts.clone());
+        async move {
+            send(
+                &app,
+                commit_request("/parts/s", &parts, digest_of(b"wrong")),
+            )
+            .await
+        }
+    });
+    gate.reached(1).await;
+    let response = send(
+        &app,
+        commit_request("/parts/s", &parts, digest_of(b"also wrong")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get(RETRY_AFTER).is_some());
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::SnapshotCommitInProgress
+    );
+    gate.open();
+    let response = first.await.expect("first commit");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a digest mismatch"
+    );
+    ended.wait_for(|ended| *ended >= 1).await.unwrap();
+    assert_eq!(
+        part_names(&cold_store).await.len(),
+        1,
+        "the mismatch used both"
+    );
+    assert_eq!(
+        state
+            .staged_parts
+            .counted(&BucketStreamId::new("parts", "s")),
+        Some((1, 4)),
+        "the count is the listing's: the part kept"
+    );
+}
+
+/// #622 review M5: `DELETE {stream}/snapshot/parts` discards the stream's
+/// staged parts, so a stream at its bound stages again. It honors a
+/// `Stream-Incarnation` precondition and answers with the token.
+#[tokio::test]
+async fn a_client_discards_its_staged_parts() {
+    let (state, cold_store) = bounded_state(2, 1_000);
+    let app = router_with_http_state(state);
+    create(&app, "/parts/s").await;
+    create(&app, "/parts/other").await;
+    stage(&app, "/parts/s", b"first".to_vec()).await;
+    stage(&app, "/parts/s", b"second".to_vec()).await;
+    stage(&app, "/parts/other", b"other".to_vec()).await;
+    refused_part(&app, "/parts/s", 1).await;
+    let response = send(&app, Request::head("/parts/s").body(Body::empty()).unwrap()).await;
+    let token = StreamHead::parse(pairs(&response))
+        .expect("head")
+        .incarnation();
+
+    let response = send(
+        &app,
+        Request::delete("/parts/s/snapshot/parts")
+            .header(names::STREAM_INCARNATION, (token.get() ^ 1).to_string())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(part_names(&cold_store).await.len(), 3);
+
+    let response = send(
+        &app,
+        Request::delete("/parts/s/snapshot/parts")
+            .header(names::STREAM_INCARNATION, token.to_string())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers()[names::STREAM_INCARNATION],
+        token.to_string().as_str()
+    );
+    assert_eq!(part_names(&cold_store).await.len(), 1, "the other stream's");
+    stage(&app, "/parts/s", b"again".to_vec()).await;
+
+    let response = send(
+        &app,
+        Request::delete("/parts/missing/snapshot/parts")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// #622 reviews: a delete of a stream answers first, then deletes the
+/// parts of the incarnation it removed, at any age, in a task the node owns,
+/// so a recreate starts with none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_stream_deletes_its_staged_parts_after_the_answer() {
+    let (state, cold_store) = bounded_state(2, 1_000);
+    let app = router_with_http_state(state.clone());
+    let mut cleaned = state.staged_parts.cleaned();
+    create(&app, "/parts/s").await;
+    stage(&app, "/parts/s", b"first".to_vec()).await;
+    stage(&app, "/parts/s", b"second".to_vec()).await;
+    let gate = crate::staged_parts::tests::ListingGate::on(&cold_store);
+    let response = send(
+        &app,
+        Request::delete("/parts/s").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "before any listing"
+    );
+    gate.reached(1).await;
+    assert_eq!(part_names(&cold_store).await.len(), 2);
+    gate.open();
+    cleaned.wait_for(|cleaned| *cleaned >= 1).await.unwrap();
+    assert!(part_names(&cold_store).await.is_empty());
+    create(&app, "/parts/s").await;
+    stage(&app, "/parts/s", b"new".to_vec()).await;
+    stage(&app, "/parts/s", b"newer".to_vec()).await;
+
+    // A stream this node counts no parts of is deleted without a cleanup.
+    create(&app, "/parts/plain").await;
+    let response = send(
+        &app,
+        Request::delete("/parts/plain").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !state
+            .staged_parts
+            .tracks(&BucketStreamId::new("parts", "plain"))
+            .1
+    );
+}
+
+/// M4 of the #622 re-review: a discard whose delete fails answers `502
+/// COLD_STORE_FAILED`, never `204`.
+#[tokio::test]
+async fn a_discard_whose_delete_fails_answers_502() {
+    let (state, cold_store) = bounded_state(2, 1_000);
+    let app = router_with_http_state(state);
+    create(&app, "/parts/s").await;
+    stage(&app, "/parts/s", b"first".to_vec()).await;
+    cold_store.set_fault_policy(|context| {
+        (context.operation == ursula_runtime::ColdStoreOperation::DeleteChunk
+            && context.path.contains("/_parts/"))
+        .then(|| ursula_runtime::ColdStoreFaultEffect::fail("injected: delete refused"))
+    });
+    let response = send(
+        &app,
+        Request::delete("/parts/s/snapshot/parts")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::ColdStoreFailed
+    );
+    assert_eq!(part_names(&cold_store).await.len(), 1);
+}
+
+async fn usage_report(app: &Router) -> ursula_proto::admin::UsageReport {
+    let response = send(
+        app,
+        Request::get("/__ursula/usage").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&body_of(response).await).expect("typed usage")
+}
+
+/// #639: `/__ursula/usage` reports, per group this node leads, the bytes of
+/// each bucket's staged parts, seeded from a listing of the group's part
+/// directories, so the parts staged before this node started to lead count
+/// too. `/__ursula/metrics` reports their sum. Until the listing finishes the
+/// group says its counting has not finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_reports_staged_part_bytes_per_group() {
+    let (state, cold_store) = bounded_state(10, 1_000);
+    let app = router_with_http_state(state.clone());
+    create(&app, "/parts/s").await;
+    create(&app, "/parts/abandoned").await;
+    let response = send(
+        &app,
+        Request::head("/parts/abandoned")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let token = StreamHead::parse(pairs(&response))
+        .expect("head")
+        .incarnation()
+        .get();
+    // Staged under an earlier leader, and never touched since.
+    cold_store
+        .write_chunk(
+            &ursula_runtime::snapshot_part_path(
+                &BucketStreamId::new("parts", "abandoned"),
+                0,
+                token,
+                &ursula_runtime::new_snapshot_part_id(),
+            ),
+            &[0; 9],
+        )
+        .await
+        .expect("an abandoned part");
+    assert!(usage_report(&app).await.staged_snapshot_parts.is_empty());
+
+    let gate = crate::staged_parts::tests::ListingGate::on(&cold_store);
+    let counting = tokio::spawn({
+        let (state, cold_store) = (state.clone(), cold_store.clone());
+        async move {
+            let cold_store: ursula_runtime::ColdStoreHandle = cold_store;
+            state.count_staged_parts_once(&cold_store).await;
+        }
+    });
+    gate.reached(1).await;
+    let report = usage_report(&app).await;
+    assert_eq!(report.staged_snapshot_parts.len(), 1);
+    assert!(!report.staged_snapshot_parts[0].counting_finished);
+    gate.open();
+    counting.await.expect("counting");
+    cold_store.clear_fault_policy();
+
+    stage(&app, "/parts/s", vec![1; 7]).await;
+    stage(&app, "/parts/s", vec![2; 5]).await;
+    let report = usage_report(&app).await;
+    assert_eq!(report.node_id, None, "a node without an id names none");
+    assert_eq!(report.buckets["parts"].stream_count, 2);
+    let group = &report.staged_snapshot_parts[0];
+    assert_eq!((group.raft_group_id, group.term), (0, 0));
+    assert!(group.counting_finished);
+    assert_eq!(group.bytes.get("parts"), Some(&21));
+    let response = send(
+        &app,
+        Request::get("/__ursula/metrics")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&body_of(response).await).expect("metrics");
+    assert_eq!(metrics["staged_snapshot_part_bytes"], 21);
+}
+
+/// #648 review: reading usage changes nothing a part or a count depends on,
+/// a deleted stream's leftover parts and an emptied bucket included.
+#[tokio::test]
+async fn reading_usage_changes_no_count() {
+    let (state, cold_store) = bounded_state(10, 1_000);
+    let app = router_with_http_state(state.clone());
+    let mut cleaned = state.staged_parts.cleaned();
+    let cold_store: ursula_runtime::ColdStoreHandle = cold_store;
+    state.count_staged_parts_once(&cold_store).await;
+    create(&app, "/parts/s").await;
+    create(&app, "/emptied/s").await;
+    stage(&app, "/parts/s", vec![1; 7]).await;
+    stage(&app, "/emptied/s", vec![2; 5]).await;
+    let response = send(
+        &app,
+        Request::delete("/emptied/s").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    cleaned.wait_for(|cleaned| *cleaned >= 1).await.unwrap();
+    let streams = [
+        BucketStreamId::new("parts", "s"),
+        BucketStreamId::new("emptied", "s"),
+    ];
+    let observe = || {
+        streams
+            .iter()
+            .map(|stream_id| {
+                (
+                    state.staged_parts.tracks(stream_id),
+                    state.staged_parts.counted(stream_id),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = (observe(), state.staged_part_report());
+    let first = usage_report(&app).await;
+    let second = usage_report(&app).await;
+    assert_eq!(first, second);
+    assert_eq!((observe(), state.staged_part_report()), before);
+}
+
+/// #622 review m1 and m7: the term comes from the node's Raft leadership.
+/// A single-node Raft group that elects itself again in a later term lists
+/// the stream's parts again, so it counts a part another leader staged in
+/// between, here written behind the node's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_raft_term_lists_the_stream_again() {
+    let raft_root = std::env::temp_dir().join(format!(
+        "ursula-staged-parts-term-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_nanos()
+    ));
+    crate::tests::remove_test_path(&raft_root);
+    let mut config = ursula_config::UrsulaConfig::default();
+    config.runtime.core_count = 1;
+    config.raft.group_count = 1;
+    config.storage.cold.backend = ursula_config::ColdBackend::Memory;
+    let spawned = spawn_runtime(
+        &config,
+        Persistence::Raft {
+            log_dir: raft_root.as_path().into(),
+        },
+        Topology::static_cluster(
+            1,
+            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            1,
+            true,
+            Default::default(),
+        )
+        .expect("topology"),
+    )
+    .expect("runtime");
+    let runtime = spawned.runtime;
+    let registry = spawned.raft_registry.expect("registry");
+    runtime.warm_all_groups().await.expect("warm");
+    let raft = registry.get(RaftGroupId(0)).expect("group 0");
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "node 1 leads")
+        .await
+        .expect("leader");
+    let cold_store = runtime.cold_store().expect("a memory cold store");
+    let mut state = HttpState::with_raft_registry(runtime, registry.clone());
+    state.set_staged_parts(crate::staged_parts::StagedParts::for_test(3, 1_000));
+    let app = router_with_http_state(state.clone());
+    create(&app, "/parts/s").await;
+    let response = send(&app, Request::head("/parts/s").body(Body::empty()).unwrap()).await;
+    let token = StreamHead::parse(pairs(&response))
+        .expect("head")
+        .incarnation()
+        .get();
+    stage(&app, "/parts/s", b"first".to_vec()).await;
+    cold_store
+        .write_chunk(
+            &ursula_runtime::snapshot_part_path(
+                &BucketStreamId::new("parts", "s"),
+                0,
+                token,
+                &ursula_runtime::new_snapshot_part_id(),
+            ),
+            b"elsewhere",
+        )
+        .await
+        .expect("a part staged by another leader");
+
+    let counting = state.spawn_staged_part_counting().expect("a cold store");
+    let term = registry
+        .leadership(RaftGroupId(0))
+        .expect("leadership")
+        .term;
+    raft.trigger().elect(false).await.expect("elect again");
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.current_term > term && metrics.state == openraft::ServerState::Leader,
+            "node 1 leads a later term",
+        )
+        .await
+        .expect("a later term");
+    // The new term's counting seeds the group's totals from a listing.
+    let new_term = registry
+        .leadership(RaftGroupId(0))
+        .expect("leadership")
+        .term;
+    // The counting task, woken by the group's Raft metrics, seeds it.
+    let groups = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let groups = state.staged_part_report();
+            if groups
+                .first()
+                .is_some_and(|group| group.term == new_term && group.counting_finished)
+            {
+                return groups;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the counting task seeds the new term");
+    drop(counting);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].term, new_term);
+    assert!(groups[0].counting_finished);
+    assert_eq!(
+        groups[0].buckets.get("parts"),
+        Some(&(5 + 9)),
+        "the part staged here and the one staged elsewhere"
+    );
+    stage(&app, "/parts/s", b"third".to_vec()).await;
+    assert_eq!(
+        refused_part(&app, "/parts/s", 1).await,
+        ursula_headers::StagedPartsLimit::Parts(3),
+        "the new term counted the part staged elsewhere"
+    );
+    crate::tests::remove_test_path(&raft_root);
 }

@@ -240,6 +240,7 @@ impl ShardRuntime {
             objects_scanned,
             ..ColdOrphanSweepReport::default()
         };
+        let mut swept_parts = Vec::new();
         for (path, name) in aged {
             if referenced.contains(&path) {
                 continue;
@@ -283,6 +284,12 @@ impl ShardRuntime {
             let bytes = cold_store.object_size(&path).await.unwrap_or(0);
             match cold_store.delete_chunk(&path).await {
                 Ok(()) => {
+                    if is_snapshot_part_object_name(&name) {
+                        swept_parts.push(super::SweptPart {
+                            path: path.clone(),
+                            bytes,
+                        });
+                    }
                     self.metrics.record_cold_orphan_cleanup(bytes, false);
                     report.orphans_deleted = report.orphans_deleted.saturating_add(1);
                     report.orphan_bytes = report.orphan_bytes.saturating_add(bytes);
@@ -299,9 +306,26 @@ impl ShardRuntime {
                 }
             }
         }
+        self.report_swept_parts(&swept_parts);
         report.cycle_completed = listing_plan.next_after.is_none();
         self.set_cold_orphan_sweep_cursor(raft_group_id, listing_plan.next_after)?;
         Ok(report)
+    }
+
+    /// The snapshot part directories of `raft_group_id`, one per bucket
+    /// the group holds, as the orphan sweep lists them at the start of a
+    /// cycle: `None` when this node does not lead the group.
+    pub async fn snapshot_part_dirs(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<Option<Vec<String>>, RuntimeError> {
+        let plan = self
+            .plan_cold_orphan_sweep(raft_group_id, ColdOrphanSweepRequest {
+                after: None,
+                max_streams: 1,
+            })
+            .await?;
+        Ok(plan.leader.then_some(plan.part_dirs))
     }
 
     /// One orphan-sweep step in every group. A failing group is logged and

@@ -122,6 +122,8 @@ curl --fail http://NODE:4437/__ursula/metrics | jq '
   .raft_maintenance | {node_issues, group_issues}'
 ```
 
+Staged snapshot parts are reported separately: the JSON field `staged_snapshot_part_bytes` and the OTLP gauge `ursula.snapshot_parts.staged_bytes` are the bytes of unused parts in the groups the node leads. For a cluster total, read `/__ursula/usage` from every voter and keep the highest term per group (see [usage export](/docs/operations#usage-export)). Bounding or billing staged parts beyond Ursula's per-stream bound is the operator's policy.
+
 Metrics are gathered on the hot path with lock-free per-core counters. The OTLP
 layer is an *export-time bridge*: it reads a snapshot at the collection
 interval rather than calling the metrics SDK per record, so enabling export

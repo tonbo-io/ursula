@@ -119,6 +119,22 @@ pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegi
         .build();
 }
 
+/// Register `ursula.snapshot_parts.staged_bytes`: the bytes of staged,
+/// unused snapshot parts in the streams this node leads and counts. Sum it
+/// across nodes for a cluster's total.
+pub(crate) fn register_staged_snapshot_parts(state: crate::HttpState) {
+    let _ = global::meter("ursula")
+        .u64_observable_gauge("ursula.snapshot_parts.staged_bytes")
+        .with_description(
+            "Bytes of staged, unused snapshot parts in the streams this node leads and counts",
+        )
+        .with_callback(move |observer| {
+            let bytes = state.staged_part_bytes_total();
+            observer.observe(bytes, &[]);
+        })
+        .build();
+}
+
 /// Register observable instruments backed by the runtime metrics snapshot.
 ///
 /// Safe to call unconditionally: with no OTLP meter provider the instruments

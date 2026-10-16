@@ -819,6 +819,12 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             Action::ReadSnapshot,
             Some("orders"),
         ),
+        (
+            "DELETE",
+            "/owner-a/orders/snapshot/parts",
+            Action::PublishSnapshot,
+            Some("orders"),
+        ),
     ];
 
     for (method, uri, expected_action, expected_stream) in cases {

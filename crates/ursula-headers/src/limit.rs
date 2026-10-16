@@ -1,5 +1,7 @@
 //! The typed `413` (extensions Section 10): every size refusal names the
-//! limit it applied, by that limit's header set to its value.
+//! limit it applied, by that limit's header set to its value. The `429` of
+//! a stream that holds as many staged snapshot parts as it may (Section 2.2)
+//! names its limit the same way.
 
 use crate::error::HeaderError;
 use crate::error_body::ErrorCode;
@@ -63,13 +65,83 @@ impl SizeLimit {
             (None, None) => Ok(None),
             (Some(bytes), None) => Ok(Some(Self::Request(bytes))),
             (None, Some(bytes)) => Ok(Some(Self::Snapshot(bytes))),
-            (Some(_), Some(_)) => Err(HeaderError::AmbiguousLimit),
+            (Some(_), Some(_)) => Err(HeaderError::AmbiguousLimit {
+                first: names::URSULA_MAX_REQUEST_BYTES,
+                second: names::URSULA_MAX_SNAPSHOT_BYTES,
+            }),
         }
     }
 
     /// Emits the header that names the limit.
     pub fn render(self, mut emit: impl FnMut(&'static str, &str)) {
         emit(self.header_name(), &self.bytes().to_string());
+    }
+}
+
+/// The staged-parts limit a `429 Too Many Requests` of a part upload
+/// applied (Section 2.2): the stream holds as many staged, unused parts, or
+/// as many bytes of them, as it may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedPartsLimit {
+    /// `Ursula-Max-Staged-Parts`: the stream holds this many parts.
+    Parts(u64),
+    /// `Ursula-Max-Staged-Bytes`: the part would take the stream's staged
+    /// bytes above this.
+    Bytes(u64),
+}
+
+impl StagedPartsLimit {
+    /// The status of a staged-parts refusal.
+    pub const STATUS: u16 = 429;
+
+    /// The limit: a number of parts or of bytes.
+    pub fn value(self) -> u64 {
+        match self {
+            Self::Parts(value) | Self::Bytes(value) => value,
+        }
+    }
+
+    /// The code of the refusal's error body.
+    pub fn error_code(self) -> ErrorCode {
+        ErrorCode::StagedPartsLimit
+    }
+
+    pub fn header_name(self) -> &'static str {
+        match self {
+            Self::Parts(_) => names::URSULA_MAX_STAGED_PARTS,
+            Self::Bytes(_) => names::URSULA_MAX_STAGED_BYTES,
+        }
+    }
+
+    /// Parses the limit a `429` names. `Ok(None)` for any other status, and
+    /// for a `429` that names none: another rule refused, such as the
+    /// producer cap or a gateway's tenant limit.
+    pub fn parse<'a, I>(status: u16, headers: I) -> Result<Option<Self>, HeaderError>
+    where I: IntoIterator<Item = (&'a str, &'a [u8])> {
+        if status != Self::STATUS {
+            return Ok(None);
+        }
+        let [parts, bytes] = fields::collect(headers, [
+            names::URSULA_MAX_STAGED_PARTS,
+            names::URSULA_MAX_STAGED_BYTES,
+        ])?;
+        match (
+            fields::decimal(names::URSULA_MAX_STAGED_PARTS, parts)?,
+            fields::decimal(names::URSULA_MAX_STAGED_BYTES, bytes)?,
+        ) {
+            (None, None) => Ok(None),
+            (Some(parts), None) => Ok(Some(Self::Parts(parts))),
+            (None, Some(bytes)) => Ok(Some(Self::Bytes(bytes))),
+            (Some(_), Some(_)) => Err(HeaderError::AmbiguousLimit {
+                first: names::URSULA_MAX_STAGED_PARTS,
+                second: names::URSULA_MAX_STAGED_BYTES,
+            }),
+        }
+    }
+
+    /// Emits the header that names the limit.
+    pub fn render(self, mut emit: impl FnMut(&'static str, &str)) {
+        emit(self.header_name(), &self.value().to_string());
     }
 }
 
@@ -88,6 +160,7 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> {
 #[cfg(test)]
 mod tests {
     use super::SizeLimit;
+    use super::StagedPartsLimit;
     use super::lowered_request_limit;
     use crate::error::HeaderError;
 
@@ -150,7 +223,10 @@ mod tests {
                     ("ursula-max-request-bytes", "1"),
                     ("ursula-max-snapshot-bytes", "2"),
                 ][..],
-                HeaderError::AmbiguousLimit,
+                HeaderError::AmbiguousLimit {
+                    first: "ursula-max-request-bytes",
+                    second: "ursula-max-snapshot-bytes",
+                },
             ),
             (
                 &[("ursula-max-request-bytes", "032")][..],
@@ -182,6 +258,49 @@ mod tests {
         ] {
             assert_eq!(parse(pairs), Err(expected), "{pairs:?}");
         }
+    }
+
+    #[test]
+    fn staged_parts_limits_round_trip() {
+        for limit in [
+            StagedPartsLimit::Parts(8192),
+            StagedPartsLimit::Bytes(2_147_483_648),
+            StagedPartsLimit::Bytes(0),
+        ] {
+            let mut pairs = Vec::new();
+            limit.render(|name, value| pairs.push((name, value.to_owned())));
+            assert_eq!(pairs.len(), 1);
+            let pairs: Vec<(&str, &[u8])> = pairs
+                .iter()
+                .map(|(name, value)| (*name, value.as_bytes()))
+                .collect();
+            assert_eq!(
+                StagedPartsLimit::parse(429, pairs.iter().copied()),
+                Ok(Some(limit))
+            );
+            assert_eq!(StagedPartsLimit::parse(503, pairs), Ok(None));
+        }
+        // The producer cap and a gateway's tenant limit name no staged limit.
+        assert_eq!(
+            StagedPartsLimit::parse(429, [("retry-after", b"1".as_slice())]),
+            Ok(None)
+        );
+        assert_eq!(
+            StagedPartsLimit::parse(429, [
+                ("ursula-max-staged-parts", b"1".as_slice()),
+                ("Ursula-Max-Staged-Bytes", b"2".as_slice()),
+            ]),
+            Err(HeaderError::AmbiguousLimit {
+                first: "ursula-max-staged-parts",
+                second: "ursula-max-staged-bytes",
+            })
+        );
+        assert_eq!(
+            StagedPartsLimit::parse(429, [("ursula-max-staged-parts", b"08".as_slice())]),
+            Err(HeaderError::NonCanonicalInteger {
+                name: "ursula-max-staged-parts",
+            })
+        );
     }
 
     #[test]
