@@ -11,7 +11,9 @@
 //!   follows it (design §6.2).
 //! - ACK records are written lazily, at most once a second ([`ACK_INTERVAL_MS`]), and whenever a
 //!   binding resets or retires; during an open they are written at once. A `rewound` reset also
-//!   fsyncs its ACK, so the next open tests inheritance against the exact acknowledged offset.
+//!   fsyncs its ACK, so the next open tests inheritance against the exact acknowledged offset, and
+//!   so does a clean retire, so a cleanly closed log holds no commit after its latest ACK but ones
+//!   never acknowledged.
 //!   After an ACK, a log of more than one segment is trimmed (F3).
 //! - A takeover's catch-up in place and its rebuild (after a divergence or a `410`) are disk jobs;
 //!   then [`Event::CaughtUp`] names the last position the frames took, and the replicator binds

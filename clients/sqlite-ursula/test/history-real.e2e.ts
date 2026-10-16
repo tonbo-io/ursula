@@ -3,7 +3,8 @@
 // node, wipes its Raft WAL, starts it again on the same ports and imports the export with its
 // BLAKE3 digest (`x-ursula-backup-blake3`), which starts a new history of every stream in the
 // group. The node is one of this file's own (test/stack.ts's single-node config, `server.cluster_id`
-// set, one group), so its restores touch no other suite's streams.
+// set, one group, and no cold tier, which a wipe would lose if it were in memory), so its restores
+// touch no other suite's streams.
 //
 // - A restore that keeps everything the owner acknowledged re-keys a bound owner, with no reset.
 // - A restore that lost an acknowledged commit resets the owner `rewound`, and the reopen salvages.
@@ -42,7 +43,7 @@ class Node {
 		this.dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-history-"));
 		this.port = await freePort();
 		this.adminPort = await freePort();
-		const toml = singleNodeToml({ port: this.port, adminPort: this.adminPort, dir: this.dir, cores: 1, groups: 1, cold: "memory" });
+		const toml = singleNodeToml({ port: this.port, adminPort: this.adminPort, dir: this.dir, cores: 1, groups: 1, cold: "none" });
 		writeFileSync(join(this.dir, "ursula.toml"), toml);
 		await this.start();
 		const proc = this.proc as Proc;

@@ -6,7 +6,8 @@
 //! the code, never the vector. A format change needs a new minor version with new magics.
 //!
 //! - [`CLAIM`] and [`COMMIT`]: `USQ2` frames.
-//! - [`SEGMENT`]: a `USL1` segment header and one record of each kind.
+//! - [`SEGMENT`]: a `USL1` segment header and one record of each kind, and [`FRESH_HEADER`]: a
+//!   fresh build's header, with no `supersedes` and no claim.
 //! - [`SNAPSHOT_HEADER`]: a `USS3` snapshot body's 56-byte header.
 //! - [`MARKER`] and [`EMPTY_PAGE_ONE_BLAKE3`]: the page-1 marker, and page 1 of an empty
 //!   generation.
@@ -54,18 +55,27 @@ const COMMIT: &str = "\
     28b52ffd640c0f75000028010000005a0200fcc779f1eb888f1b3777";
 
 /// The `USL1` segment of [`header`], then a COMMIT record holding [`COMMIT`] at position 1, a
-/// CLAIM at 2, an ACK at 3 and a BASE at 4.
+/// CLAIM at 2, an ACK at 3 and a BASE at 4. Every carried field is distinct and non-zero, so a
+/// field moved or re-encoded fails.
 const SEGMENT: &str = "\
     55534c31 01000000 11111111111111111111111111111111 0100000000000000\
     01 33333333333333333333333333333333 0200 6331 0400 2f622f73\
-    0100000000001000 0000000000000000 0000000000000000 0000000000000000 0000000000000000\
-    01 0300000000000000 22222222222222222222222222222222 d35878a8\
+    0100000000001000 0700000000000000 0900000000000000 9210000000000000 0903000000000000\
+    01 0300000000000000 22222222222222222222222222222222 a17d8c27\
     41000000 01 0100000000000000\
     555351320234000000de0e765211111111111111111111111111111111050000000000000028b52ffd640c0f75\
-    000028010000005a0200fcc779f1eb888f1b3777 6e507e64\
-    18000000 02 0200000000000000 0300000000000000 22222222222222222222222222222222 9ecd7f67\
-    18000000 03 0300000000000000 0100000000000000 6400000000000000 3200000000000000 3bf5741e\
-    08000000 04 0400000000000000 0100000000000000 1a7ca834";
+    000028010000005a0200fcc779f1eb888f1b3777 d73b805b\
+    18000000 02 0200000000000000 0300000000000000 22222222222222222222222222222222 02da6cc8\
+    18000000 03 0300000000000000 0100000000000000 6400000000000000 3200000000000000 5bc160c9\
+    08000000 04 0400000000000000 0100000000000000 d9fc9a71";
+
+/// The `USL1` header of [`fresh_header`], a fresh build's first segment: no `supersedes`, an
+/// empty cluster id, no claim.
+const FRESH_HEADER: &str = "\
+    55534c31 01000000 11111111111111111111111111111111 0300000000000000\
+    00 0000 0400 2f622f73\
+    0200000000001000 0200000000000000 0200000000000000 6300000000000000 0000000000000000\
+    00 37ffc760";
 
 /// The header of a snapshot at offset 4242, epoch 3, last commit `(11..11, 5)`, of one page whose
 /// bytes are all 0x5a.
@@ -140,11 +150,28 @@ fn header() -> SegmentHeader {
         cluster_id: "c1".to_owned(),
         stream_path: "/b/s".to_owned(),
         incarnation: Incarnation::try_from(4_503_599_627_370_497).unwrap(),
-        base: Position(0),
-        acked: Position(0),
-        acked_offset: Offset::from_u64(0),
-        log_bytes: 0,
+        base: Position(7),
+        acked: Position(9),
+        acked_offset: Offset::from_u64(4242),
+        log_bytes: 777,
         claim: Some((epoch(), activation())),
+    }
+}
+
+/// The first segment of a fresh build: no generation superseded, no claim yet.
+fn fresh_header() -> SegmentHeader {
+    SegmentHeader {
+        lineage: lineage(),
+        first_position: Position(3),
+        supersedes: None,
+        cluster_id: String::new(),
+        stream_path: "/b/s".to_owned(),
+        incarnation: Incarnation::try_from(4_503_599_627_370_498).unwrap(),
+        base: Position(2),
+        acked: Position(2),
+        acked_offset: Offset::from_u64(99),
+        log_bytes: 0,
+        claim: None,
     }
 }
 
@@ -219,6 +246,19 @@ fn the_log_segment_is_frozen() {
         again.extend_from_slice(&record);
         chain = next;
     }
+    assert_eq!(again, bytes);
+}
+
+#[test]
+fn a_fresh_builds_segment_header_is_frozen() {
+    let bytes = unhex(FRESH_HEADER);
+    let scan = segment::scan(&bytes).unwrap();
+    assert_eq!(scan.header, fresh_header());
+    assert_eq!(scan.header_len, bytes.len());
+    assert_eq!(scan.records, []);
+    assert_eq!(scan.tail, Tail::Clean);
+    let (again, seed) = segment::encode_header(&scan.header).unwrap();
+    assert_eq!(seed, scan.seed);
     assert_eq!(again, bytes);
 }
 
