@@ -619,6 +619,26 @@ impl RaftGroupHandleRegistry {
         self.refresh_group_elections(engine.placement.raft_group_id);
     }
 
+    /// Publishes `engine` as this node's replica of its group, as starting
+    /// the group does ([`Self::register_engine`]), for a simulation that
+    /// builds engines itself and serves HTTP through this registry's
+    /// lock-free leadership view ([`Self::leadership`]).
+    #[cfg(madsim)]
+    pub fn register_engine_for_simulation(&self, engine: &crate::RaftGroupEngine) {
+        self.register_engine(engine);
+    }
+
+    /// Forgets this node's replica of `group`, as a node that stopped
+    /// hosting it would: the leadership view no longer knows the group.
+    #[cfg(madsim)]
+    pub fn unregister_group_for_simulation(&self, group: RaftGroupId) {
+        self.groups.rcu(|groups| {
+            let mut groups = (**groups).clone();
+            groups.remove(&group.0);
+            groups
+        });
+    }
+
     pub(crate) fn register_apply_stopped(
         &self,
         group: RaftGroupId,

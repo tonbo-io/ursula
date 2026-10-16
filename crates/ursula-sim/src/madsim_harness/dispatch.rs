@@ -42,6 +42,8 @@ use super::history::run_rewind_applies_exactly_once_inner;
 use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
 use super::leader_reads::run_leader_read_linearizability_inner;
+use super::routing::Controls as RoutingControls;
+use super::routing::run_routing_before_body_inner;
 use super::run_cold_delete_fault_inner;
 use super::run_cold_live_read_inner;
 use super::run_cold_read_delay_inner;
@@ -273,7 +275,23 @@ impl ThreeNodeRaftSim {
                     RecoveryPlanControls::default(),
                 )
             }
+            SimScenario::RoutingBeforeBodyUnderLeaderChurn => {
+                Self::run_routing_with_controls_report(config, RoutingControls::default())
+            }
         }
+    }
+
+    /// Runs the routing-before-the-body scenario (#603) with `controls`.
+    pub(super) fn run_routing_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: RoutingControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::RoutingBeforeBodyUnderLeaderChurn,
+            seed,
+            run_routing_before_body_inner(config, controls),
+        )
     }
 
     /// Runs a history-identity scenario (#581 section 10).

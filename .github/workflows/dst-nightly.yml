@@ -45,6 +45,7 @@ jobs:
             --failure-dir target/ursula-sim-failures \
             --write-artifacts \
             --seed-range 60..=199 \
+            --seed-range 503..=504 \
             --seed-family http-protocol-surface-randomized \
             --seed-family runtime-raft-network-randomized-extended \
             --seed-family runtime-raft-network-cold-live-write-recovery \
@@ -60,7 +61,9 @@ jobs:
             --seed-family recovery-plan-cut-under-restarts \
             --seed-family recovery-plan-cut-under-restarts-extended \
             --seed-family recovery-plan-survivor-campaigns \
-            --seed-family recovery-plan-survivor-campaigns-extended
+            --seed-family recovery-plan-survivor-campaigns-extended \
+            --seed-family routing-before-body-under-leader-churn \
+            --seed-family routing-before-body-under-leader-churn-extended
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

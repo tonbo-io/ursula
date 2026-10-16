@@ -1,5 +1,6 @@
 //! Defences a simulation's negative control turns off, to show that a DST
-//! invariant catches their loss (`crates/ursula-sim`, history scenarios).
+//! invariant catches their loss (`crates/ursula-sim`). The switches live in
+//! this crate, which every crate with a defence depends on.
 //!
 //! Only `cfg(madsim)` builds can turn one off. madsim runs a simulation on
 //! one OS thread, so the switches are thread-local and a simulation sees only
@@ -30,6 +31,11 @@ pub enum Defence {
     /// A replica holding a recovery plan takes replication only from a
     /// leader above the plan term (M1 of the second #581 review).
     PlanReplicationFence,
+    /// A write whose body was read never redirects: a leadership refusal
+    /// after the body answers `503` with `Retry-After` (#581 section 6.1).
+    /// Off, the HTTP front door answers it as it would before the body, with
+    /// a `307` to the leader its hint names.
+    NoRedirectAfterBody,
 }
 
 #[cfg(madsim)]
@@ -39,8 +45,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 6]> = const { Cell::new([false; 6]) };
-        static FIRED: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
+        static OFF: Cell<[bool; 7]> = const { Cell::new([false; 7]) };
+        static FIRED: Cell<[u64; 7]> = const { Cell::new([0; 7]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -51,6 +57,7 @@ mod switches {
             Defence::RecoveryCut => 3,
             Defence::PlanLogGuard => 4,
             Defence::PlanReplicationFence => 5,
+            Defence::NoRedirectAfterBody => 6,
         }
     }
 
@@ -73,7 +80,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 6]));
+        FIRED.with(|fired| fired.set([0; 7]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

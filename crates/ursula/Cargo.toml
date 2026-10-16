@@ -63,6 +63,7 @@ ursula-proto = { workspace = true }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-shard = { workspace = true }
+ursula-stream = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
 madsim = { workspace = true }

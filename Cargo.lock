@@ -4460,6 +4460,7 @@ dependencies = [
  "ursula-raft",
  "ursula-runtime",
  "ursula-shard",
+ "ursula-stream",
 ]
 
 [[package]]
@@ -4718,6 +4719,7 @@ version = "0.7.5"
 dependencies = [
  "axum 0.8.9",
  "blake3",
+ "futures-util",
  "madsim",
  "openraft",
  "rmp-serde",
