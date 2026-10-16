@@ -2,12 +2,8 @@
 //! shared HTTP state, which the router makes several times for every request,
 //! and one tokened producer append of 32 bytes through the whole client
 //! router (layers, routing before the body, the handler) on an in-memory
-//! node with one core.
-
-#![expect(
-    clippy::expect_used,
-    reason = "benchmark setup fails loudly on a broken node"
-)]
+//! node with one core, and one write the admission layer refuses for its
+//! declared size, which measures the router alone.
 
 use std::hint::black_box;
 
@@ -15,6 +11,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::Method;
 use axum::http::Request;
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
 use criterion::Criterion;
 use criterion::criterion_group;
@@ -116,6 +114,23 @@ fn front_door(c: &mut Criterion) {
                 "append: {}",
                 response.status()
             );
+        });
+    });
+
+    // Refused for its declared size by the admission layer before routing
+    // reaches the handler: the router's own per-request cost, without the
+    // core thread.
+    c.bench_function("front_door/oversize_413", |b| {
+        b.iter(|| {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(STREAM_PATH)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_LENGTH, "1099511627776")
+                .body(Body::empty())
+                .expect("request");
+            let response = rt.block_on(call(&router, request));
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         });
     });
 }

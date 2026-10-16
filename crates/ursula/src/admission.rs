@@ -278,14 +278,14 @@ pub(crate) struct AdmissionPermit {
 
 /// The pressure checks of a write routed before its body, which its handler
 /// runs once routing and early answers have passed (#581 section 6.1). The
-/// middleware has checked its size already.
+/// layer has checked its size already.
 #[derive(Clone)]
 pub(crate) struct DeferredAdmission {
     admission: IngressAdmission,
     body_bytes: u64,
 }
 
-/// The [`DeferredAdmission`] the middleware left for a handler, taken out of
+/// The [`DeferredAdmission`] the layer left for a handler, taken out of
 /// the request rather than cloned. `None` when admission does not run.
 pub(crate) struct PendingAdmission(pub(crate) Option<DeferredAdmission>);
 

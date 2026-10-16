@@ -336,6 +336,8 @@ impl WallClock for SystemWallClock {
 #[derive(Clone)]
 pub struct HttpState(Arc<HttpStateFields>);
 
+use http_state_fields::HttpStateFields;
+
 impl std::ops::Deref for HttpState {
     type Target = HttpStateFields;
 
@@ -350,33 +352,54 @@ impl From<HttpStateFields> for HttpState {
     }
 }
 
-/// The fields of [`HttpState`].
-#[derive(Clone)]
-pub struct HttpStateFields {
-    process_incarnation: ProcessIncarnation,
-    admin_fence: admin_fence::AdminMutationFence,
-    configured_node_id: Option<u64>,
-    runtime: ShardRuntime,
-    raft_registry: Option<RaftGroupHandleRegistry>,
-    client_write_router: Option<ClientWriteLeaderRouter>,
-    http_metrics: Arc<HttpMetrics>,
-    wall_clock: Arc<dyn WallClock>,
-    pub node_memory: NodeMemoryMonitor,
-    external_payload_min_bytes: usize,
-    wal_disk: WalDiskMonitor,
-    /// The node's Raft WAL when it runs Raft: how it opened, and the
-    /// clean shutdown at exit.
-    raft_wal: Option<ursula_raft::RaftWal>,
-    /// A Raft protocol (format-epoch) mismatch seen since start: readiness
-    /// answers 503 `format_epoch_mismatch` until restart.
-    format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
-    /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
-    /// drawn for this process when the node runs without a WAL.
-    cluster_id: Arc<ClusterId>,
-    /// The parts commits this node runs (#581 section 3.1).
-    snapshot_commits: snapshot_parts::SnapshotCommits,
-    /// The staged, unused snapshot parts of the streams this node leads.
-    staged_parts: staged_parts::StagedParts,
+/// The fields of [`HttpState`], in a private module: the type is public
+/// only so the state can deref to it, and no caller outside the crate can
+/// name it.
+mod http_state_fields {
+    use std::sync::Arc;
+
+    use ursula_headers::ClusterId;
+    use ursula_proto::admin::ProcessIncarnation;
+    use ursula_raft::RaftGroupHandleRegistry;
+    use ursula_runtime::ShardRuntime;
+
+    use crate::ClientWriteLeaderRouter;
+    use crate::HttpMetrics;
+    use crate::NodeMemoryMonitor;
+    use crate::WallClock;
+    use crate::admin_fence;
+    use crate::snapshot_parts;
+    use crate::staged_parts;
+    use crate::wal_disk::WalDiskMonitor;
+
+    /// The fields of [`HttpState`](crate::HttpState).
+    #[derive(Clone)]
+    pub struct HttpStateFields {
+        pub(crate) process_incarnation: ProcessIncarnation,
+        pub(crate) admin_fence: admin_fence::AdminMutationFence,
+        pub(crate) configured_node_id: Option<u64>,
+        pub(crate) runtime: ShardRuntime,
+        pub(crate) raft_registry: Option<RaftGroupHandleRegistry>,
+        pub(crate) client_write_router: Option<ClientWriteLeaderRouter>,
+        pub(crate) http_metrics: Arc<HttpMetrics>,
+        pub(crate) wall_clock: Arc<dyn WallClock>,
+        pub node_memory: NodeMemoryMonitor,
+        pub(crate) external_payload_min_bytes: usize,
+        pub(crate) wal_disk: WalDiskMonitor,
+        /// The node's Raft WAL when it runs Raft: how it opened, and the
+        /// clean shutdown at exit.
+        pub(crate) raft_wal: Option<ursula_raft::RaftWal>,
+        /// A Raft protocol (format-epoch) mismatch seen since start: readiness
+        /// answers 503 `format_epoch_mismatch` until restart.
+        pub(crate) format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
+        /// `Ursula-Cluster-Id`: the id bound to the node's WAL root, or one
+        /// drawn for this process when the node runs without a WAL.
+        pub(crate) cluster_id: Arc<ClusterId>,
+        /// The parts commits this node runs (#581 section 3.1).
+        pub(crate) snapshot_commits: snapshot_parts::SnapshotCommits,
+        /// The staged, unused snapshot parts of the streams this node leads.
+        pub(crate) staged_parts: staged_parts::StagedParts,
+    }
 }
 
 impl HttpState {
