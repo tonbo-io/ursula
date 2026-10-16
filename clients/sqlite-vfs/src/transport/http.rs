@@ -96,10 +96,11 @@ impl Transport for HttpTransport {
             Ok(response) => response,
             Err(e) => return Exchange::NoAnswer(no_answer_from(e)),
         };
-        // Only the body's first bytes (a snapshot header): a server that ignores `Range` answers
-        // `200` with the whole body, of which no more is read. The connection, its body unread,
-        // is dropped rather than pooled.
-        let read = match request.head_bytes {
+        // A header read of a server that ignores `Range` (`200`, the whole body) keeps the header
+        // alone and reads no more: the connection, its body unread, is dropped rather than pooled.
+        // A `206` body is read whole.
+        let status = response.status().as_u16();
+        let read = match request.whole_answer_cut().filter(|_| status == 200) {
             Some(n) => {
                 let mut head = Vec::new();
                 std::io::Read::read_to_end(
@@ -124,7 +125,6 @@ impl Transport for HttpTransport {
                 });
             }
         };
-        let status = response.status().as_u16();
         let headers: Vec<(&str, &[u8])> = response
             .headers()
             .iter()

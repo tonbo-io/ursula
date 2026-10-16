@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs } from "../src/index.ts";
-import { Child, directUrl, fromStream, frames, freshDir, killChildren, type Opened, stream } from "./kit.ts";
+import { Child, directUrl, fault, fromStream, frames, freshDir, killChildren, onModel, type Opened, stream } from "./kit.ts";
 
 const SQLITE_IOERR_READ = 266;
 const SQLITE_IOERR_WRITE = 778;
@@ -54,6 +54,17 @@ async function retention(path: string): Promise<{ snapshot: number | null; retai
 	const r = await fetch(`${directUrl()}${path}`, { method: "HEAD" });
 	const snapshot = r.headers.get("stream-snapshot-offset");
 	return { snapshot: snapshot === null ? null : Number(snapshot), retained: Number(r.headers.get("stream-retained-offset") ?? "0") };
+}
+
+/** The length of the latest snapshot's body, from the `Content-Range` of a one-byte ranged read. */
+async function snapshotLength(path: string): Promise<number> {
+	const head = await fetch(`${directUrl()}${path}`, { method: "HEAD" });
+	const offset = head.headers.get("stream-snapshot-offset");
+	if (offset === null) throw new Error("no snapshot");
+	const r = await fetch(`${directUrl()}${path}/snapshot/${offset}`, { headers: { range: "bytes=0-0" } });
+	await r.arrayBuffer();
+	expect(r.status).toBe(206);
+	return Number((r.headers.get("content-range") ?? "").split("/")[1]);
 }
 
 /** Polls the child's status until `ready` holds, for at most 20 s. */
@@ -316,6 +327,18 @@ describe("the 0.8 core on node:sqlite", () => {
 		// Below retention, only the snapshot and the tail after it can build a fresh directory.
 		expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
 		expect(await fromStream(s.url, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+		// A reader under a 64 KiB request limit reads the snapshot in ranged chunks: at least two.
+		expect(await snapshotLength(s.path)).toBeGreaterThan(65_536);
+		const ranged = { URSULA_VFS_MAX_REQUEST_BYTES: "65536" };
+		expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x", ranged)).toEqual(rows);
+		expect(await fromStream(s.url, "PRAGMA integrity_check", ranged)).toEqual([{ integrity_check: "ok" }]);
+		if (onModel()) {
+			// A layer that strips `Range`: the build's first GET, its first snapshot read, gets the whole body as `200`.
+			await fault("ignore-range", 1, "GET");
+			expect(await fromStream(s.url, "SELECT x, hex(pad) AS pad FROM t ORDER BY x", ranged)).toEqual(rows);
+			await fault("ignore-range", 1, "GET");
+			expect(await fromStream(s.url, "PRAGMA integrity_check", ranged)).toEqual([{ integrity_check: "ok" }]);
+		}
 	});
 
 	it("does not publish a snapshot body above the request limit and reports it in snapshot.error", async () => {

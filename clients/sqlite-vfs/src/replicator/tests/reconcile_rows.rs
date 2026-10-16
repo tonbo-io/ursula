@@ -363,7 +363,10 @@ fn row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked() {
             let (body, snapshot) = snapshot_body(w, last);
             h.answer(&head_naming(Some(snapshot), 237));
             // Only the header is read.
-            assert_eq!(h.last_request().head_bytes, Some(56));
+            assert_eq!(
+                h.last_request().range,
+                Some(ursula_headers::ByteRange::Bounded { first: 0, last: 55 })
+            );
             let mut actions = h.answer(&snapshot_read(snapshot, body[..56].to_vec()));
             if w < 200 {
                 let own = frame::encode_claim(epoch(1), ACTIVATION);

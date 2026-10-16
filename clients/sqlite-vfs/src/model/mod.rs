@@ -8,7 +8,8 @@
 //! `Producer-Digest`, contiguous receipts, tokens in [2^52, 2^53) that change on history events,
 //! what a stream inherited after one (W5, §4.8), HEAD metadata on every answer (A1), the typed and
 //! untyped `413`, create keyed by configuration, reads with the incarnation precondition (`412`,
-//! `410`), snapshots keyed by offset and digest, monotonic retention, and scripted faults. Out of
+//! `410`), snapshots keyed by offset and digest, snapshot reads in one byte range (`206`, `416`),
+//! monotonic retention, and scripted faults. Out of
 //! scope: immutable reads, snapshot parts, the timing of answers before the body, the producer
 //! cap, SSE and JSON streams.
 //!
@@ -36,7 +37,10 @@ use std::sync::Arc;
 
 pub use http::ServeError;
 pub use http::serve_forever;
+use ursula_headers::ACCEPT_RANGES_BYTES;
+use ursula_headers::ByteRange;
 use ursula_headers::ClusterId;
+use ursula_headers::ContentRange;
 use ursula_headers::CurrentEpoch;
 use ursula_headers::Delivery;
 use ursula_headers::Epoch;
@@ -194,9 +198,14 @@ pub(crate) struct ModelServer {
     streams: BTreeMap<String, Stream>,
     checkpoints: Vec<Checkpoint>,
     faults: Faults,
-    /// Ranged snapshot reads so far: every other one is answered `200` with the whole body, as
-    /// a server that ignores `Range` answers.
-    ranged_reads: u64,
+}
+
+/// Whether a snapshot read honors `Range`: always, but under the scripted `ignore-range` fault,
+/// which answers as a layer that strips `Range` makes the server answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ranges {
+    Honored,
+    Ignored,
 }
 
 impl ModelServer {
@@ -213,7 +222,6 @@ impl ModelServer {
             streams: BTreeMap::new(),
             checkpoints: Vec::new(),
             faults: Faults::default(),
-            ranged_reads: 0,
         };
         server.history = server.draw_history();
         server
@@ -360,14 +368,16 @@ impl ModelServer {
 
     /// A request through the scripted faults, then the server.
     pub(crate) fn exchange(&mut self, path: &str, request: &Request) -> Delivered {
-        self.deliver(request.method, |server| server.handle(path, request))
+        self.deliver(request.method, |server, ranges| {
+            server.answer(path, request, ranges)
+        })
     }
 
     /// A stream request whose `Content-Length` exceeds the request limit, as the HTTP front meets
     /// it before reading the body: through the same faults as [`ModelServer::exchange`], so both
     /// fronts consume a scripted fault alike, then the typed `413`.
     pub(crate) fn exchange_too_large(&mut self, method: Method) -> Delivered {
-        self.deliver(method, Self::too_large)
+        self.deliver(method, |server, _ranges| server.too_large())
     }
 
     /// The typed `413` of the request limit (#581 §6.4).
@@ -381,18 +391,18 @@ impl ModelServer {
     fn deliver(
         &mut self,
         method: Method,
-        handle: impl FnOnce(&mut Self) -> RawAnswer,
+        handle: impl FnOnce(&mut Self, Ranges) -> RawAnswer,
     ) -> Delivered {
         let answered = |answer| Delivered::Answered {
             answer,
             delay_ms: 0,
         };
         match self.faults.take(method) {
-            None => answered(handle(self)),
+            None => answered(handle(self, Ranges::Honored)),
             Some(Fault::Unreachable) => Delivered::Unreachable,
             Some(Fault::DropRequest) => Delivered::DroppedBeforeApply,
             Some(Fault::DropAnswer) => {
-                drop(handle(self));
+                drop(handle(self, Ranges::Honored));
                 Delivered::DroppedAfterApply
             }
             Some(Fault::Status {
@@ -412,15 +422,21 @@ impl ModelServer {
             }
             Some(Fault::UntypedTooLarge) => answered(RawAnswer::new(SizeLimit::STATUS)),
             Some(Fault::Delay { ms }) => Delivered::Answered {
-                answer: handle(self),
+                answer: handle(self, Ranges::Honored),
                 delay_ms: ms,
             },
+            Some(Fault::IgnoreRange) => answered(handle(self, Ranges::Ignored)),
         }
     }
 
     /// The server's answer to `request` for the stream at `path`, decided in #581 §6.1's order:
     /// size, then the route.
     pub(crate) fn handle(&mut self, path: &str, request: &Request) -> RawAnswer {
+        self.answer(path, request, Ranges::Honored)
+    }
+
+    /// [`ModelServer::handle`], a snapshot read honoring `Range` or not.
+    fn answer(&mut self, path: &str, request: &Request, ranges: Ranges) -> RawAnswer {
         let len = u64::try_from(request.body.len()).unwrap_or(u64::MAX);
         if request.method.has_body() && len > self.limits.max_request_bytes {
             return self.too_large();
@@ -431,7 +447,9 @@ impl ModelServer {
             (Method::Post, Target::Stream) => self.append(path, request),
             (Method::Get, Target::Read { from, .. }) => self.read(path, request, from),
             (Method::Put, Target::Snapshot { offset }) => self.publish(path, request, offset),
-            (Method::Get, Target::Snapshot { offset }) => self.snapshot_read(path, request, offset),
+            (Method::Get, Target::Snapshot { offset }) => {
+                self.snapshot_read(path, request, offset, ranges)
+            }
             (Method::Put, Target::Retention { offset }) => self.retain(path, request, offset),
             _ => RawAnswer::new(405),
         }
@@ -691,15 +709,16 @@ impl ModelServer {
         raw
     }
 
-    /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`.
-    fn snapshot_read(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
+    /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`. A single
+    /// `Range` is answered `206` with its bytes, or `416` when it selects none (extensions §2.5).
+    fn snapshot_read(
+        &mut self,
+        path: &str,
+        request: &Request,
+        offset: Offset,
+        ranges: Ranges,
+    ) -> RawAnswer {
         let history = self.history;
-        let honored = request
-            .head_bytes
-            .filter(|_| self.ranged_reads.is_multiple_of(2));
-        if request.head_bytes.is_some() {
-            self.ranged_reads = self.ranged_reads.wrapping_add(1);
-        }
         let stream = match self.stream(path, request) {
             Ok(stream) => stream,
             Err(answer) => return answer,
@@ -711,16 +730,30 @@ impl ModelServer {
         else {
             return RawAnswer::new(404);
         };
-        // A `Range` of the body's first bytes is answered `206` with those bytes, or (every other
-        // time) ignored: `200` with the whole body, as the server does today.
-        let (status, body) = match honored {
-            Some(n) => {
-                let n = usize::try_from(n).unwrap_or(usize::MAX);
-                (206, snapshot.body.get(..n).unwrap_or(&snapshot.body))
-            }
+        let total = u64::try_from(snapshot.body.len()).unwrap_or(u64::MAX);
+        let range = match ranges {
+            Ranges::Honored => request
+                .range
+                .and_then(|range: ByteRange| range.resolve(total)),
+            Ranges::Ignored => None,
+        };
+        let (status, body) = match range {
             None => (200, snapshot.body.as_ref()),
+            Some(ContentRange::Unsatisfied { .. }) => (416, &[][..]),
+            Some(ContentRange::Partial(span)) => {
+                let first = usize::try_from(span.first()).unwrap_or(usize::MAX);
+                let last = usize::try_from(span.last()).unwrap_or(usize::MAX);
+                (206, snapshot.body.get(first..=last).unwrap_or_default())
+            }
         };
         let mut answer = RawAnswer::new(status);
+        if let Some(range) = range {
+            range.render(answer.emit());
+        }
+        if let Some(ContentRange::Unsatisfied { .. }) = range {
+            return answer;
+        }
+        answer.header(names::ACCEPT_RANGES, ACCEPT_RANGES_BYTES);
         SnapshotRead {
             snapshot: snapshot.snapshot,
             incarnation: stream.token_in(history),

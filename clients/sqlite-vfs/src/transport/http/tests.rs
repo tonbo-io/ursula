@@ -18,6 +18,8 @@ use crate::codec::digest::SnapshotDigester;
 use crate::codec::frame::CONTENT_TYPE;
 use crate::model::Limits;
 use crate::model::ModelServer;
+use crate::model::faults::Fault;
+use crate::model::faults::Scripted;
 use crate::model::http;
 use crate::model::tests::close_only;
 use crate::model::tests::create;
@@ -146,7 +148,8 @@ fn script(server: &Mutex<ModelServer>, step: usize) -> Option<Request> {
 }
 
 // A header read gets the body's first bytes alone whether the server honors `Range` (`206`) or
-// answers `200` with the whole body: the transport reads no more and drops the connection.
+// answers `200` with the whole body: the transport reads no more and drops the connection. A
+// chunk read reads its `206` whole, and the whole body of a `200`.
 #[test]
 fn a_header_read_takes_only_the_first_bytes_whether_or_not_range_is_honored() {
     let (server, url) = served();
@@ -170,12 +173,22 @@ fn a_header_read_takes_only_the_first_bytes_whether_or_not_range_is_honored() {
         })
     };
     assert_eq!(send(&publish).status, 204);
+    let ignore_range = || {
+        server.lock().unwrap().inject(Scripted {
+            method: Some(Method::Get),
+            fault: Fault::IgnoreRange,
+            times: 1,
+        });
+    };
     let header = Request::snapshot_read(Offset::ZERO, token, crate::wire::SnapshotPart::Header);
     let statuses: Vec<u16> = (0..4)
-        .map(|_| {
+        .map(|i| {
+            if i % 2 == 1 {
+                ignore_range();
+            }
             let answer = send(&header);
             assert!(
-                matches!(answer.typed, Ok(Typed::SnapshotRead(_))),
+                matches!(answer.typed, Ok(Typed::SnapshotRead { .. })),
                 "{answer:?}"
             );
             assert_eq!(answer.body, vec![0x5a; 56]);
@@ -183,12 +196,21 @@ fn a_header_read_takes_only_the_first_bytes_whether_or_not_range_is_honored() {
         })
         .collect();
     assert_eq!(statuses, [206, 200, 206, 200]);
-    // The whole body still reads in full.
-    let whole = send(&Request::snapshot_read(
-        Offset::ZERO,
-        token,
-        crate::wire::SnapshotPart::Body { limit: 1 << 20 },
+    let chunk = Request::snapshot_read(Offset::ZERO, token, crate::wire::SnapshotPart::Chunk {
+        first: 65_536,
+        last: 131_071,
+    });
+    let ranged = send(&chunk);
+    assert_eq!(ranged.status, 206);
+    assert!(matches!(
+        ranged.typed,
+        Ok(Typed::SnapshotRead { range: Some(span), .. })
+            if (span.first(), span.last(), span.total()) == (65_536, 131_071, 200_000)
     ));
+    assert_eq!(ranged.body.len(), 65_536);
+    ignore_range();
+    let whole = send(&chunk);
+    assert_eq!(whole.status, 200);
     assert_eq!(whole.body.len(), 200_000);
 }
 

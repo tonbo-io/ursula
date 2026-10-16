@@ -131,6 +131,9 @@ type ServerHook = Box<dyn FnOnce(&mut ModelServer)>;
 /// A change to the server after every HEAD it answers.
 type EveryHead = Box<dyn FnMut(&mut ModelServer)>;
 
+/// Rewrites the server's answer to a request before the client reads it.
+type AnswerHook = Box<dyn FnMut(&Request, &mut RawAnswer)>;
+
 /// Cores, the model server, a network each core can lose, and a virtual clock.
 struct World {
     server: ModelServer,
@@ -149,6 +152,8 @@ struct World {
     skip_heads: u32,
     /// Runs on the server after every HEAD it answers.
     every_head: Option<EveryHead>,
+    /// Rewrites every answer of the server.
+    rewrite: Option<AnswerHook>,
     /// Another deployment, which every request reaches while `misrouted`.
     other: ModelServer,
     misrouted: bool,
@@ -179,6 +184,7 @@ impl World {
             after_head: None,
             skip_heads: 0,
             every_head: None,
+            rewrite: None,
             other: ModelServer::new(ClusterId::new("cluster-b").unwrap(), 9),
             misrouted: false,
             misroute_after_heads: None,
@@ -256,7 +262,10 @@ impl World {
             }
         }
         match delivered {
-            Delivered::Answered { answer, .. } => {
+            Delivered::Answered { mut answer, .. } => {
+                if let Some(rewrite) = &mut self.rewrite {
+                    rewrite(request, &mut answer);
+                }
                 Exchange::Answered(Box::new(answer.parse(request)))
             }
             Delivered::Unreachable => Exchange::NoAnswer(NoAnswer::NotSent {
@@ -1381,6 +1390,199 @@ fn foreign_commit(server: &mut ModelServer, salt: u8) {
     server.foreign_append(PATH, &frame).unwrap();
 }
 
+/// Appends a commit of another writer of `pages` pages that do not compress, so a snapshot of it
+/// spans that many 4 KiB chunks and more.
+fn incompressible_commit(server: &mut ModelServer, pages: u32) {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut page = |pgno: u32| {
+        let mut page = Box::new([0u8; 4096]);
+        for byte in page.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        if pgno == 1 { sqlite(page) } else { page }
+    };
+    let frame = frame::encode_commit(
+        CommitId {
+            lineage: crate::ids::Lineage([0x6d; 16]),
+            position: Position(1),
+        },
+        &CommitRecord {
+            db_pages_after: pages,
+            pages: (1..=pages).map(|p| (p, page(p))).collect(),
+        },
+    )
+    .unwrap();
+    server.foreign_append(PATH, &frame).unwrap();
+}
+
+/// A stream whose latest snapshot (retention at it) spans five 4 KiB chunks and more, and a frame
+/// after it: the image a fresh build must end with.
+fn chunked_snapshot(w: &mut World, owner_dir: &Path) -> Vec<u8> {
+    let a = w.core();
+    let bound = w.open(a, spec(owner_dir, 1));
+    w.retire(a, &bound);
+    drop(bound);
+    incompressible_commit(&mut w.server, 5);
+    snapshot_and_retain(&mut w.server);
+    foreign_commit(&mut w.server, 7);
+    image_of(w.server.frames(PATH).unwrap())
+}
+
+/// The ranges of the snapshot reads `core` sent.
+fn snapshot_ranges(w: &World, core: usize) -> Vec<Option<ursula_headers::ByteRange>> {
+    w.sent
+        .iter()
+        .filter(|s| s.core == core && matches!(s.request.target, Target::Snapshot { .. }))
+        .map(|s| s.request.range)
+        .collect()
+}
+
+fn chunked_spec(dir: &Path) -> OpenSpec {
+    OpenSpec {
+        max_request_bytes: Some(4096),
+        ..spec(dir, 3)
+    }
+}
+
+// A fresh build reads the snapshot in chunks of the request limit, each from where the last
+// ended, and installs it once whole: the image, and no downloaded body left in the generation.
+#[test]
+fn a_build_reads_the_snapshot_in_chunks_of_the_request_limit() {
+    let dir = TempDir::new("driver-chunks");
+    let owner = TempDir::new("driver-chunks-owner");
+    let mut w = World::new();
+    let expected = chunked_snapshot(&mut w, owner.path());
+    let c = w.core();
+    let bound = w.open(c, chunked_spec(dir.path()));
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        on_disk(bound.handle.generation.lineage, expected)
+    );
+    assert!(!bound.handle.generation.dir.join("snapshot.body").exists());
+    let ranges = snapshot_ranges(&w, c);
+    assert!(ranges.len() >= 5, "{ranges:?}");
+    for (i, range) in ranges.iter().enumerate() {
+        let first = 4096 * i as u64;
+        let Some(ursula_headers::ByteRange::Bounded { first: f, last }) = *range else {
+            panic!("{range:?}");
+        };
+        assert_eq!(f, first, "{ranges:?}");
+        // Every chunk asks for 4 KiB, the last one up to the body's end.
+        assert!(last <= first + 4095, "{ranges:?}");
+        assert_eq!(last == first + 4095, i + 1 < ranges.len(), "{ranges:?}");
+    }
+}
+
+// A `206` whose `Content-Range` does not continue the download: what was downloaded is not
+// trusted, the build deletes its `.tmp` and starts over from the HEAD, then completes.
+#[test]
+fn a_chunk_that_does_not_continue_the_download_restarts_the_build() {
+    let dir = TempDir::new("driver-chunk-mismatch");
+    let owner = TempDir::new("driver-chunk-mismatch-owner");
+    let mut w = World::new();
+    let expected = chunked_snapshot(&mut w, owner.path());
+    let mut broken = false;
+    w.rewrite = Some(Box::new(move |request, answer| {
+        if broken || answer.status != 206 {
+            return;
+        }
+        let Some(ursula_headers::ByteRange::Bounded { first: 8192, last }) = request.range else {
+            return;
+        };
+        // The second chunk's bytes, named as if they were the first's.
+        broken = true;
+        let total = answer
+            .headers
+            .iter()
+            .find(|(name, _)| *name == "content-range")
+            .and_then(|(_, value)| value.rsplit('/').next())
+            .unwrap()
+            .to_owned();
+        answer.headers.retain(|(name, _)| *name != "content-range");
+        answer.header("content-range", format!("bytes 0-{}/{total}", last - 8192));
+    }));
+    let c = w.core();
+    let bound = w.open(c, chunked_spec(dir.path()));
+    assert_eq!(
+        std::fs::read(bound.handle.generation.db()).unwrap(),
+        on_disk(bound.handle.generation.lineage, expected)
+    );
+    let ranges = snapshot_ranges(&w, c);
+    let starts: Vec<u64> = ranges
+        .iter()
+        .map(|r| match r {
+            Some(ursula_headers::ByteRange::Bounded { first, .. }) => *first,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    // Two chunks, the broken third, then the whole body again from its first byte.
+    assert_eq!(&starts[..4], &[0, 4096, 8192, 0], "{starts:?}");
+    let heads = w
+        .sent
+        .iter()
+        .filter(|s| s.core == c && s.request.method == Method::Head)
+        .count();
+    assert_eq!(
+        heads, 3,
+        "the open's HEAD, the build's, and the restarted build's"
+    );
+}
+
+// A server that ignores `Range` answers `200` with the whole body: the build installs it at
+// once, at the first read or after chunks were downloaded.
+#[test]
+fn a_whole_body_answer_to_a_ranged_read_installs_it() {
+    for after_chunks in [0, 2] {
+        let dir = TempDir::new("driver-chunk-ignored");
+        let owner = TempDir::new("driver-chunk-ignored-owner");
+        let mut w = World::new();
+        let expected = chunked_snapshot(&mut w, owner.path());
+        let c = w.core();
+        let open = OpenId(w.id());
+        if after_chunks == 0 {
+            w.server.inject(Scripted {
+                method: Some(Method::Get),
+                fault: Fault::IgnoreRange,
+                times: 1,
+            });
+            let now = w.now;
+            let ios = w.c(c).open(open, chunked_spec(dir.path()), now);
+            w.queue_ios(c, ios);
+        } else {
+            w.hold = Some(|job| matches!(job, DiskJob::Download { .. }));
+            let now = w.now;
+            let ios = w.c(c).open(open, chunked_spec(dir.path()), now);
+            w.queue_ios(c, ios);
+            // Each chunk's disk job runs alone, so the fault meets the read after the last.
+            for _ in 0..after_chunks {
+                w.deliver();
+                let (core, DiskIo { id, job }) = w.held.pop().unwrap();
+                let done = job.run();
+                let now = w.now;
+                let ios = w.c(core).disk_done(id, done, now);
+                w.queue_ios(core, ios);
+            }
+            w.hold = None;
+            w.server.inject(Scripted {
+                method: Some(Method::Get),
+                fault: Fault::IgnoreRange,
+                times: 1,
+            });
+            w.deliver();
+        }
+        w.run_for(1_000);
+        let bound = w.c(c).take_opened(open).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(bound.handle.generation.db()).unwrap(),
+            on_disk(bound.handle.generation.lineage, expected)
+        );
+        assert_eq!(snapshot_ranges(&w, c).len(), after_chunks + 1);
+    }
+}
+
 // A takeover's rebuild whose HEAD names a snapshot past its claim: another owner wrote after the
 // claim, so the open fails with a fenced reset instead of reading the stream.
 #[test]
@@ -1439,7 +1641,7 @@ fn a_build_that_keeps_meeting_410s_gives_up_after_its_restarts() {
     let mut installs = 0;
     let mut result = None;
     for salt in 10..200u8 {
-        w.hold = Some(|job| matches!(job, DiskJob::Install { .. }));
+        w.hold = Some(|job| matches!(job, DiskJob::Download { .. }));
         w.run_for(100);
         if let Some(r) = w.c(c).take_opened(open) {
             result = Some(r);

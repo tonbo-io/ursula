@@ -26,6 +26,8 @@ pub(crate) enum Fault {
     UntypedTooLarge,
     /// The server's answer comes after `ms` (over HTTP only; in process it comes at once).
     Delay { ms: u64 },
+    /// A layer strips `Range`: a snapshot read gets the whole body, `200`.
+    IgnoreRange,
 }
 
 /// A fault script line that does not parse.
@@ -36,7 +38,7 @@ pub(crate) struct FaultSyntax(pub(crate) String);
 impl Fault {
     /// Parses one fault, as the control route takes it: `unreachable`, `drop-request`,
     /// `drop-answer`, `status <code> [<retry-after seconds>]`, `redirect <location>`,
-    /// `untyped-413` or `delay <ms>`.
+    /// `untyped-413`, `delay <ms>` or `ignore-range`.
     pub(crate) fn parse(text: &str) -> Result<Self, FaultSyntax> {
         let syntax = || FaultSyntax(text.to_owned());
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -46,6 +48,7 @@ impl Fault {
             ["drop-request"] => Ok(Self::DropRequest),
             ["drop-answer"] => Ok(Self::DropAnswer),
             ["untyped-413"] => Ok(Self::UntypedTooLarge),
+            ["ignore-range"] => Ok(Self::IgnoreRange),
             ["status", code, rest @ ..] if rest.len() <= 1 => Ok(Self::Status {
                 status: code.parse().map_err(|_not_a_status| syntax())?,
                 retry_after: match rest.first() {
@@ -129,6 +132,7 @@ mod tests {
             })
         );
         assert_eq!(Fault::parse("delay 20"), Ok(Fault::Delay { ms: 20 }));
+        assert_eq!(Fault::parse("ignore-range"), Ok(Fault::IgnoreRange));
         for bad in ["status x", "status 503 2 3", "explode"] {
             assert_eq!(Fault::parse(bad), Err(FaultSyntax(bad.to_owned())));
         }

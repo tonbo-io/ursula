@@ -1894,8 +1894,11 @@ impl Gone {
             };
         };
         match &answer.typed {
-            Ok(Typed::SnapshotRead(read))
-                if matches!(answer.status, 200 | 206) && read.snapshot == snapshot =>
+            // The header is the body's first bytes: a `206` of other bytes is not it.
+            Ok(Typed::SnapshotRead { read, range })
+                if matches!(answer.status, 200 | 206)
+                    && read.snapshot == snapshot
+                    && range.is_none_or(|span| span.first() == 0) =>
             {
                 ctx.set_condition(None, actions);
                 // The header verifies without the body (design §4.11).

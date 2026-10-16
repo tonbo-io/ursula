@@ -86,6 +86,8 @@ const MAX_READERS: u32 = 64;
 const GEN: &str = "gen-";
 const TMP: &str = ".tmp";
 const TRASH: &str = ".trash";
+/// The snapshot body a build downloads into its `.tmp`, until it is installed.
+const SNAPSHOT_BODY: &str = "snapshot.body";
 
 /// A stream URL's path spelled one way: every segment percent-decoded and encoded again one
 /// fixed way (a segment that does not decode to UTF-8 stays as it is), `.` and `..` resolved, no
@@ -977,6 +979,41 @@ impl Building {
     /// The db file being built.
     pub(crate) fn db_path(&self) -> PathBuf {
         self.tmp.join("db")
+    }
+
+    /// Writes `bytes` of the snapshot body being downloaded at `at`, the file cut to end with
+    /// them. Not fsynced: a crash leaves only the `.tmp`, which the next open deletes.
+    pub(crate) fn write_snapshot_body(&self, at: u64, bytes: &[u8]) -> Result<(), GenerationError> {
+        let path = self.tmp.join(SNAPSHOT_BODY);
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io("open", &path))?;
+        file.write_all_at(bytes, at).map_err(io("write", &path))?;
+        let end = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|len| at.checked_add(len))
+            .ok_or_else(|| {
+                io("write", &path)(std::io::Error::from(std::io::ErrorKind::FileTooLarge))
+            })?;
+        file.set_len(end).map_err(io("truncate", &path))
+    }
+
+    /// The downloaded snapshot body, to read from its start.
+    pub(crate) fn snapshot_body(&self) -> Result<File, GenerationError> {
+        let path = self.tmp.join(SNAPSHOT_BODY);
+        File::open(&path).map_err(io("open", &path))
+    }
+
+    /// Deletes the downloaded snapshot body, if any, so a generation never publishes one.
+    pub(crate) fn remove_snapshot_body(&self) -> Result<(), GenerationError> {
+        let path = self.tmp.join(SNAPSHOT_BODY);
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io("remove", &path)(e)),
+            Ok(()) | Err(_) => Ok(()),
+        }
     }
 }
 
