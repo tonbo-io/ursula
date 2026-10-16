@@ -153,7 +153,7 @@ Known limits of 0.8.0:
 - **Snapshots** are not published above 1 GiB compressed, or above 32 MiB without a cold backend.
 - **Local durability.** A power loss drops unacknowledged commits since the last log fsync. Network filesystems and a fork after open are unsupported.
 - **A misrouted host name on a fresh host** opens the other deployment's stream, since there is no cache yet to compare its cluster id with.
-- **Import.** Open a stream only after its import returned.
+- **Import.** A failed import leaves a stream that refuses opens with `stream_state` until it is deleted or recreated.
 
 ## 0.7.6
 

@@ -190,9 +190,9 @@ const db = await open("https://ursula.example.com/acme/notes");
 ```
 
 - The file must have 4096-byte pages, no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
-- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published. An import that fails after it claimed the stream leaves it holding that claim alone: import into a new stream.
+- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published. While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until you delete or recreate it.
 - A file whose compressed snapshot is above the request limit goes up in parts, which needs a cold backend on the server. Without one it fails with `invalid_argument`, naming the limit.
-- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default). Nothing stops an open of the stream while the import runs, so open it only after the import returns.
+- The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default).
 
 ## Moving from 0.7
 

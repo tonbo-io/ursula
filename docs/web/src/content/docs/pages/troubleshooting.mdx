@@ -468,7 +468,7 @@ The database was reset. Every statement throws an `UrsulaResetError` (`errcode` 
 | `not_found` | The stream is missing and the cache holds data | Open with `recreate: true`, or open another stream |
 | `in_use` | Another process holds the cache | Stop that process, or use another `dir` |
 | `bound_elsewhere` | The stream is open in this process under another `dir` | Close that database, or pass its `dir` |
-| `stream_state` | The stream is closed | Open it read-only, or use another stream |
+| `stream_state` | The stream is closed, or an import into it is running or failed (`the stream up to N is the claim of an import`) | Open a closed stream read-only. Wait for a running import. After a failed import, delete or recreate the stream and import again |
 | `unreachable`, `unavailable` | The signal fired while the stream could not be reached or did not answer | Check the network and the cluster. With a cache that claimed the stream before, `open` resolves provisionally instead |
 
 ### A cache appears in `salvage/`
