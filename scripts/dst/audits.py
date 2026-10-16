@@ -664,10 +664,10 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199", "503..=504"}
 
-# PR ≤ 2 min, Nightly ≤ 30 min at ~70 seeds/min/core conservative
-# (bundled invocation amortises cargo startup). See the `CI` section of
-# docs/architecture/deterministic-simulation-testing.md.
-PR_SEED_BUDGET = 200
+# PR ≤ 2 min at the measured ~0.3 s/seed of the bundled PR sweep on the CI
+# runner; nightly ≤ 30 min at ~70 seeds/min/core conservative. See the `CI`
+# section of docs/architecture/deterministic-simulation-testing.md.
+PR_SEED_BUDGET = 240
 NIGHTLY_SEED_BUDGET = 1500
 
 
