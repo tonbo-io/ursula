@@ -37,6 +37,7 @@ use axum::body::Bytes;
 use axum::http::Response;
 use axum::http::Version;
 use axum::http::header::LOCATION;
+use axum::http::header::RETRY_AFTER;
 use ursula_headers::Delivery;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::RoutingAnswer;
@@ -329,7 +330,14 @@ impl Ledger {
         let answer = match parsed {
             Ok(Some(answer)) => answer,
             Ok(None) | Err(_) => {
-                if *body_polled {
+                // Only the refusal the rule prescribes after the body counts
+                // toward the run's coverage: a `503` with `Retry-After`. Any
+                // other unknown outcome, a `500` included, is resent but
+                // shows nothing about the rule.
+                if *body_polled
+                    && status == StatusCode::SERVICE_UNAVAILABLE
+                    && response.headers().contains_key(RETRY_AFTER)
+                {
                     self.refused_after_body = self.refused_after_body.saturating_add(1);
                 }
                 return None;

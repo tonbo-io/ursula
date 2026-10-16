@@ -292,6 +292,14 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             strict_replay --nocapture
 
+      # Outcome-level replays: every scenario test named `*_replays` runs its
+      # scenario twice per fixed seed and asserts the same report. The
+      # `ci-shape` audit requires this filter to match each of them.
+      - name: Run scenario replays
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            _replays --nocapture
+
       - name: Verify expected-failure replay and minimization
         run: |
           assert_minimized_failure_trace() {

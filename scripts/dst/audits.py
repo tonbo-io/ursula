@@ -395,10 +395,58 @@ MULTI_ELEMENT_SHAPE_RE = re.compile(
 )
 
 
+SIM_TEST_FN_RE = re.compile(
+    r"#\[test\]\s*(?P<attrs>(?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<name>\w+)",
+)
+SIM_CARGO_TEST_RE = re.compile(r"cargo test -p ursula-sim\b(?P<args>[^\n]*)")
+
+
+def _sim_test_filters(path: Path) -> set[str]:
+    """The libtest filters of every `cargo test -p ursula-sim` command in
+    `path`, with `\\` line continuations joined."""
+    text = re.sub(r"\\\n\s*", " ", path.read_text())
+    filters: set[str] = set()
+    for m in SIM_CARGO_TEST_RE.finditer(text):
+        filters.update(
+            token for token in m.group("args").split()
+            if not token.startswith("-") and token != "\\"
+        )
+    return filters
+
+
+def _unwired_replay_tests() -> list[str]:
+    """Every non-ignored `*_replays` test in the simulation harness that no
+    `cargo test -p ursula-sim` filter of the PR workflow matches. libtest
+    matches a filter against the test's path, so the file stem counts."""
+    filters = _sim_test_filters(PR_WORKFLOW)
+    unwired = []
+    for path in sorted(HARNESS_ROOT.rglob("*.rs")):
+        for m in SIM_TEST_FN_RE.finditer(path.read_text()):
+            name = m.group("name")
+            if not name.endswith("_replays") or "#[ignore" in m.group("attrs"):
+                continue
+            test_path = f"{path.stem}::{name}"
+            if not any(f in test_path for f in filters):
+                unwired.append(f"  {rel(path)}: {name}")
+    return unwired
+
+
 def audit_ci_shape(argv: list[str]) -> int:
     """CI workflows must not contain multi-element strict-equality
-    jq assertions on SimFaultAction discriminants."""
+    jq assertions on SimFaultAction discriminants, and the PR workflow must
+    run every non-ignored `*_replays` simulation test."""
     argparse.ArgumentParser(prog="dst ci-shape").parse_args(argv)
+
+    unwired = _unwired_replay_tests()
+    if unwired:
+        print("ERROR: `*_replays` tests no PR workflow filter runs:", file=sys.stderr)
+        for line in unwired:
+            print(line, file=sys.stderr)
+        print(
+            "Fix: keep the `_replays` filter in the PR DST job, or name the test so it matches.",
+            file=sys.stderr,
+        )
+        return 1
 
     violations: list[str] = []
     for path in (PR_WORKFLOW, NIGHTLY_WORKFLOW):
@@ -427,6 +475,7 @@ def audit_ci_shape(argv: list[str]) -> int:
         return 1
 
     print("OK: no multi-element strict-equality step-shape jq assertions found in CI workflows.")
+    print("OK: the PR workflow runs every `*_replays` simulation test.")
     return 0
 
 
