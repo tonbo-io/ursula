@@ -8,8 +8,9 @@
 //! - [`decide_append`], for the in-flight keyed append, which reads a producer answer and hands
 //!   every other answer to [`decide_status`];
 //! - [`decide_claim`], for the in-flight claim (`Producer-Seq: 0`), for the rows of a keyed write;
-//! - the snapshotter's [`transient`] for a publish or a parts commit, and [`transient_part`] for
-//!   a part, which tell an answer to send again from one the snapshotter decides on.
+//! - the snapshotter's [`transient`] for a publish, a parts commit, a discard or a retention
+//!   advance, and [`transient_part`] for a part, which tell an answer to send again from one the
+//!   snapshotter decides on.
 //!
 //! [`EXPECTED`] names what each reader does with each row. Where the append and claim readers do
 //! what `classify` says, the row's reason is empty. Where either differs by design, the reason
@@ -99,6 +100,7 @@ const KEYED_ONLY: &str =
 const NOT_URSULA: &str = "a keyed success without its receipt is no answer of Ursula's: the VFS \
                           blocks, which sends the identical request again every 30 s";
 
+const NO_BUCKETS: &str = "the VFS never creates a bucket: an answer to one is none of its answers";
 const UNTYPED: &str = "a success without the typed answer Ursula sends for the write is no \
                        answer of Ursula's: the VFS rejects it and blocks, which sends the \
                        identical request again every 30 s";
@@ -132,6 +134,9 @@ const EXPECTED: &[Expected] = expected! {
     "snapshot-published" => Blocked, -, Decides, ELSEWHERE;
     "part-staged" => Blocked, -, Decides, ELSEWHERE;
     "parts-discarded" => Blocked, -, Decides, ELSEWHERE;
+    "retention-advanced" => Blocked, -, Decides, ELSEWHERE;
+    "stream-deleted" => Blocked, -, Decides, ELSEWHERE;
+    "bucket-created" => Blocked, -, Decides, NO_BUCKETS;
     "parts-commit-published" => Blocked, -, Decides, ELSEWHERE;
     "redirect" => Redirect, Redirect, Decides, "";
     "producer-epoch-closed" => Reset, Lost, Decides, "";
@@ -261,6 +266,15 @@ fn request_of(write: Write, keyed_seq: u64) -> Request {
             false,
         ),
         Write::PartsDiscard => with(Method::Delete, Target::StagedParts, None, false),
+        Write::Retention => with(
+            Method::Put,
+            Target::Retention { offset: off(3) },
+            None,
+            false,
+        ),
+        Write::DeleteStream => with(Method::Delete, Target::Stream, None, false),
+        // The VFS never creates a bucket: its stream's create stands in.
+        Write::CreateBucket => with(Method::Put, Target::Stream, None, false),
     }
 }
 
@@ -326,6 +340,8 @@ fn claim_decision(row: &Row) -> Option<Vfs> {
 fn snapshot_decision(row: &Row) -> Snap {
     let (request, reader): (Request, fn(&Answer) -> bool) = match row.write {
         Write::PartStage => (request_of(row.write, 0), transient_part),
+        // The snapshotter's own writes, read with their own request.
+        Write::Retention | Write::PartsDiscard => (request_of(row.write, 0), transient),
         _ => (request_of(Write::SnapshotPublish, 0), transient),
     };
     match exchange(row, &request) {

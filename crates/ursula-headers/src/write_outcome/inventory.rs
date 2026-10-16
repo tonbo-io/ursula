@@ -65,6 +65,12 @@ pub enum Write {
     PartsCommit,
     /// `DELETE {stream}/snapshot/parts`.
     PartsDiscard,
+    /// `PUT {stream}/retention/{offset}`.
+    Retention,
+    /// `DELETE {stream}`.
+    DeleteStream,
+    /// `PUT /{bucket}`.
+    CreateBucket,
 }
 
 /// The typed headers a row's answer carries beside its error body.
@@ -99,6 +105,9 @@ pub enum Shape {
     SizeLimit,
     /// The staged-parts limit a `429` applied, and `Stream-Incarnation`.
     StagedPartsLimit,
+    /// `Stream-Retained-Offset` and `Stream-Incarnation` of a retention
+    /// advance.
+    Retained,
 }
 
 /// The producer answer of a [`Shape::Producer`] row.
@@ -142,6 +151,9 @@ impl Write {
             Self::SnapshotPublish | Self::PartsCommit => WriteKind::Publish,
             Self::PartStage => WriteKind::PartStage,
             Self::PartsDiscard => WriteKind::PartsDiscard,
+            Self::Retention => WriteKind::Retention,
+            Self::DeleteStream => WriteKind::DeleteStream,
+            Self::CreateBucket => WriteKind::CreateBucket,
         }
     }
 }
@@ -263,6 +275,13 @@ fn render_shape(shape: Shape, emit: &mut dyn FnMut(&'static str, &str)) -> Resul
         }
         .render(emit),
         Shape::SizeLimit => SizeLimit::Request(1024).render(emit),
+        Shape::Retained => {
+            emit(
+                names::STREAM_RETAINED_OFFSET,
+                &Offset::from_u64(3).to_string(),
+            );
+            emit(names::STREAM_INCARNATION, &incarnation.to_string());
+        }
         Shape::StagedPartsLimit => {
             StagedPartsLimit::Parts(8192).render(&mut *emit);
             emit(names::STREAM_INCARNATION, &incarnation.to_string());
@@ -346,6 +365,9 @@ pub const INVENTORY: &[Row] = {
         "snapshot-published", Node, SnapshotPublish, 204, S::SnapshotPublished, None, Applied;
         "part-staged", Node, PartStage, 201, S::PartStaged, None, Applied;
     "parts-discarded", Node, PartsDiscard, 204, S::Created, None, Applied;
+    "retention-advanced", Node, Retention, 204, S::Retained, None, Applied;
+    "stream-deleted", Node, DeleteStream, 204, S::Plain, None, Applied;
+    "bucket-created", Node, CreateBucket, 201, S::Plain, None, Applied;
         "parts-commit-published", Node, PartsCommit, 204, S::SnapshotPublished, None, Applied;
         "redirect", Node, ProducerAppend, 307, S::Redirect, None, Redirected;
         "producer-epoch-closed", Node, ProducerAppend, 403, S::Producer(P::EpochClosed), Some(C::ProducerEpochClosed), Refused(C::ProducerEpochClosed);

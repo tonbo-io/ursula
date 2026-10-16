@@ -2,16 +2,18 @@
 //! every write answer the node and the gateway send, for every client, such
 //! as the SQLite VFS or a gateway's embedder.
 //!
-//! A write is an append or a close (with or without producer headers), a
-//! create, a snapshot publish, a parts commit, a part staged, or a discard
-//! of the staged parts (`DELETE {stream}/snapshot/parts`). Its answer is one
-//! of:
+//! A write is every request that changes what a stream or a bucket holds
+//! ([`WriteKind`]): an append or a close (with or without producer headers),
+//! a create, a snapshot publish, a parts commit, a part staged, a discard of
+//! the staged parts (`DELETE {stream}/snapshot/parts`), a retention advance
+//! (`PUT {stream}/retention/{offset}`), a delete of a stream, and a create of
+//! a bucket (`PUT /{bucket}`). Its answer is one of:
 //!
 //! - [`WriteOutcome::Applied`]: the write holds, and the answer does not say
 //!   that an earlier request applied it. A keyless write, a create, a
-//!   snapshot publish, a parts commit and a discard answer a repeat as they
-//!   answer the first apply, so for them `Applied` means only that the write
-//!   holds.
+//!   snapshot publish, a parts commit, a discard, a retention advance and a
+//!   create of a bucket answer a repeat as they answer the first apply, so
+//!   for them `Applied` means only that the write holds.
 //! - [`WriteOutcome::Repeat`]: a typed producer receipt for a write that an
 //!   earlier request with the same key applied: a `204` receipt, or
 //!   `receipt-evicted`. A close-only producer write answers `204` even when
@@ -61,10 +63,12 @@
 //! - `2xx` to any other write: `Applied` with the typed answer Ursula always
 //!   sends for that write, else `Unknown`. A keyless append or close carries
 //!   `Stream-Next-Offset`, a create and a discard `Stream-Incarnation`, a
-//!   snapshot publish or a parts commit the published snapshot, and a part
-//!   `Stream-Snapshot-Part`. Only a layer outside Ursula, such as a
-//!   misrouting proxy, sends a success without it, and that says nothing of
-//!   the write.
+//!   snapshot publish or a parts commit the published snapshot, a part
+//!   `Stream-Snapshot-Part`, and a retention advance
+//!   `Stream-Retained-Offset` with `Stream-Incarnation`. Only a layer outside
+//!   Ursula, such as a misrouting proxy, sends a success without it, and
+//!   that says nothing of the write. A delete of a stream and a create of a
+//!   bucket carry no typed answer, so their `2xx` holds by its status.
 //! - `307`, `308`: `Redirected`. Every other `1xx` and `3xx`: `Unknown`.
 //! - `4xx` but `408`: `Refused`. The code is the producer answer's when the
 //!   answer carries one, else the error body's, else `INVALID_REQUEST` (the
@@ -103,6 +107,9 @@
 //! | `snapshot-published` | node | `204` | the snapshot (new or repeated) | `Applied` |
 //! | `part-staged` | node | `201` | `Stream-Snapshot-Part` | `Applied` |
 //! | `parts-discarded` | node | `204` | `Stream-Incarnation` | `Applied` |
+//! | `retention-advanced` | node | `204` | `Stream-Retained-Offset`, `Stream-Incarnation` | `Applied` |
+//! | `stream-deleted` | node | `204` | none: holds by its status | `Applied` |
+//! | `bucket-created` | node | `201` | none: holds by its status | `Applied` |
 //! | `parts-commit-published` | node | `204` | the snapshot (new or repeated) | `Applied` |
 //! | `redirect` | node | `307` | the leader (or, from a node without a replica, the group) | `Redirected` |
 //! | `producer-epoch-closed` | node | `403` | `PRODUCER_EPOCH_CLOSED`, `epoch-closed;by=claim` or `by=history` | `Refused` |
@@ -222,8 +229,10 @@ impl WriteOutcome {
     }
 }
 
-/// What a write is, which decides the typed answer its `2xx` carries.
+/// What a write is, which decides the typed answer its `2xx` carries. A
+/// later 0.8 release may add a kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteKind {
     /// An append or a close with `Producer-Id`, `Producer-Epoch` and
     /// `Producer-Seq`: its receipt.
@@ -238,6 +247,15 @@ pub enum WriteKind {
     PartStage,
     /// A discard of the staged parts: `Stream-Incarnation`.
     PartsDiscard,
+    /// A retention advance: `Stream-Retained-Offset` and
+    /// `Stream-Incarnation`.
+    Retention,
+    /// A delete of a stream: no typed answer, so its `2xx` holds by its
+    /// status.
+    DeleteStream,
+    /// A create of a bucket: no typed answer, so its `2xx` holds by its
+    /// status.
+    CreateBucket,
 }
 
 /// Reads the answer to a write of `kind` from its status, its
@@ -307,6 +325,22 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> {
             Ok(Some(SnapshotPublishAnswer::Published { .. }))
         ),
         WriteKind::PartStage => PartStaged::parse(headers).is_ok(),
+        WriteKind::Retention => {
+            let Ok([retained, token]) = fields::collect(headers, [
+                names::STREAM_RETAINED_OFFSET,
+                names::STREAM_INCARNATION,
+            ]) else {
+                return WriteOutcome::Unknown;
+            };
+            matches!(
+                fields::offset(names::STREAM_RETAINED_OFFSET, retained),
+                Ok(Some(_))
+            ) && matches!(
+                fields::incarnation(names::STREAM_INCARNATION, token),
+                Ok(Some(_))
+            )
+        }
+        WriteKind::DeleteStream | WriteKind::CreateBucket => true,
     };
     if carried {
         WriteOutcome::Applied
@@ -546,6 +580,19 @@ mod tests {
         );
     }
 
+    /// A delete of a stream and a create of a bucket carry no typed answer:
+    /// their success holds by its status.
+    #[test]
+    fn untyped_writes_hold_by_their_status() {
+        for kind in [WriteKind::DeleteStream, WriteKind::CreateBucket] {
+            assert_eq!(
+                classify(kind, 204, [], b""),
+                WriteOutcome::Applied,
+                "{kind:?}"
+            );
+        }
+    }
+
     /// Every other write's success says something only with the typed
     /// answer Ursula sends for it: a bare `2xx`, such as a misrouting
     /// proxy's, is unknown.
@@ -560,7 +607,12 @@ mod tests {
             (crate::names::STREAM_INCARNATION, token),
         ];
         type Headers<'a> = Vec<(&'a str, &'a [u8])>;
-        let typed: [(WriteKind, u16, Headers<'_>); 5] = [
+        let retained = [
+            (crate::names::STREAM_RETAINED_OFFSET, next),
+            (crate::names::STREAM_INCARNATION, token),
+        ];
+        let typed: [(WriteKind, u16, Headers<'_>); 6] = [
+            (WriteKind::Retention, 204, retained.to_vec()),
             (WriteKind::Append, 204, vec![(
                 crate::names::STREAM_NEXT_OFFSET,
                 next,

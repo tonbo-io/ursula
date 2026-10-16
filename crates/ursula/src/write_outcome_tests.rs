@@ -895,6 +895,24 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
             )
             .await
         }
+        "retention-advanced" => {
+            node.create(path, OCTET, b"abcdef").await;
+            let snapshot = format!("{path}/snapshot/3");
+            let answer = node
+                .direct(request("PUT", &snapshot, &[("content-type", OCTET)], b"x"))
+                .await;
+            assert_eq!(answer.status, 204, "{answer:?}");
+            node.send(
+                via,
+                request("PUT", &format!("{path}/retention/3"), &[], b""),
+            )
+            .await
+        }
+        "stream-deleted" => {
+            node.create(path, TEXT, b"").await;
+            node.send(via, request("DELETE", path, &[], b"")).await
+        }
+        "bucket-created" => node.send(via, request("PUT", "/wout", &[], b"")).await,
         "staged-parts-limit" => {
             node.create(path, OCTET, b"abc").await;
             for _ in 0..2 {
