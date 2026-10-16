@@ -200,8 +200,9 @@ client port admits `clientIngressFrom`, plus this release's gateway, indexer
 and Helm test pods. List every other client there, including metrics pollers
 and an `ipBlock` for traffic through a `LoadBalancer` or `NodePort` Service.
 The chart refuses to render the policy while `server.adminListen` is off
-loopback, since the policy would cut that admin plane off. It selects only ingress, so egress stays open. Kubelet probes reach
-the client port from the node, which most CNIs admit whatever the policy says.
+loopback, since the policy would cut that admin plane off. It selects only
+ingress, so egress stays open. Kubelet probes reach the client port from the
+node, which most CNIs admit whatever the policy says.
 
 ## Bootstrap Behavior
 
@@ -421,7 +422,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `global.image.tag` | `""` | Image tag. Empty uses the chart `appVersion`. |
 | `global.image.pullPolicy` | `IfNotPresent` | Kubernetes image pull policy for server, gateway, and test pods. |
 | `global.imagePullSecrets` | `[]` | Optional image pull secret references rendered into server, gateway, and test pods. |
-| `global.clusterDomain` | `cluster.local` | Kubernetes cluster DNS domain used for generated peer FQDNs and gateway upstreams. |
+| `global.clusterDomain` | `cluster.local` | Kubernetes cluster DNS domain used for generated peer FQDNs, the Helm test's cluster manifest, the graceful-rollout manifest and gateway upstreams. Set it before the first install: groups record each peer's Raft URL when they initialize, and a voter whose URL changed afterwards refuses to start. |
 
 ### Cluster And Naming
 

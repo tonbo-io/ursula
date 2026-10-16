@@ -454,6 +454,23 @@ for replicas in 1 3 5; do
   rm -f "${MANIFEST}"
 done
 
+# The chart passes its cluster domain and headless Service name. A manifest
+# naming another host would attach learners at an address peers cannot resolve
+# and the next start refuses as PeerAddressChanged.
+(
+  REPLICAS=3
+  CLUSTER_DOMAIN=corp.example
+  HEADLESS_SERVICE=ursula-hl
+  MANIFEST=$(mktemp)
+  write_manifest
+  grep -q '"http_url": "http://ursula-2.ursula-hl.ursula.svc.corp.example:4439"' "${MANIFEST}"
+  if grep -q 'cluster.local' "${MANIFEST}"; then
+    echo "manifest ignored CLUSTER_DOMAIN" >&2
+    exit 1
+  fi
+  rm -f "${MANIFEST}"
+)
+
 # A replacement serves admin RPCs before it is a caught-up Raft voter.
 # Waiting for final Ready before the catch-up wait and the undrain would
 # deadlock this rollout permanently.

@@ -522,6 +522,38 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 )
                 self.assertIn(f"- name: CLUSTER_PORT\n              value: \"{port}\"", rendered)
 
+    def test_peers_manifest_and_rollout_agree_on_the_peer_host(self) -> None:
+        # A long fullname makes the headless Service name truncate, and a
+        # custom domain replaces cluster.local. Learners join at the rollout
+        # manifest's http_url, so it must name the peers' own address.
+        fullname = "u" * 58
+        values = (
+            *NAMED, "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
+            "--set", "server.gracefulRollout.enabled=true", "--set", "global.clusterDomain=corp.example",
+            "--set", f"fullnameOverride={fullname}",
+        )
+        rendered = render_chart(*values)
+        peers = [peer["url"] for peer in tomllib.loads(render_config(*values))["raft"]["peers"]]
+        manifest = re.search(r"cluster-manifest\.json: \|\n(?P<json>(?: {4}.*\n)+)", rendered)
+        self.assertEqual([node["http_url"] for node in json.loads(manifest.group("json"))["nodes"]], peers)
+        self.assertTrue(all(".svc.corp.example:" in url for url in peers))
+
+        job = documents(rendered, "Job")[f"{fullname}-graceful-rollout"[:63].rstrip("-")]
+        env = dict(re.findall(r"- name: ([A-Z_]+)\n {14}value: \"([^\"]*)\"", job))
+        script = subprocess.run(
+            ["sh", "-c", '. charts/ursula/files/graceful-rollout.sh && MANIFEST=$(mktemp) && write_manifest '
+             '&& cat "${MANIFEST}" && rm -f "${MANIFEST}"'],
+            env={
+                "PATH": "/usr/bin:/bin", "NAMESPACE": "default", "ROLLOUT_SOURCE_ONLY": "1",
+                **{key: env[key] for key in (
+                    "STATEFULSET", "REPLICAS", "EXPECTED_GROUPS", "TARGET_IMAGE", "CLUSTER_PORT",
+                    "CLUSTER_DOMAIN", "HEADLESS_SERVICE",
+                )},
+            },
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual([node["http_url"] for node in json.loads(script.stdout)["nodes"]], peers)
+
     def test_network_policy_is_off_by_default(self) -> None:
         self.assertNotIn("test-ursula", documents(render_chart(*NAMED, "--set", "s3.bucket=bkt"), "NetworkPolicy"))
 

@@ -549,9 +549,6 @@ impl HttpState {
         self.wal_disk.clone()
     }
 
-    /// Apply runtime-level config (memory monitor, payload threshold) derived
-    /// from the typed configuration.  Replaces the hard-coded defaults set by
-    /// the constructors.
     /// Tells the leader router whether peers' Raft addresses serve their
     /// client plane ([`PeerPlanes`]).
     #[must_use]
@@ -562,6 +559,9 @@ impl HttpState {
         self
     }
 
+    /// Apply runtime-level config (memory monitor, payload threshold) derived
+    /// from the typed configuration.  Replaces the hard-coded defaults set by
+    /// the constructors.
     pub fn with_runtime_config(mut self, config: &ursula_config::RuntimeConfig) -> Self {
         self.node_memory = NodeMemoryMonitor::new(config);
         if let Some(min_size) = &config.external_payload_min_size {
