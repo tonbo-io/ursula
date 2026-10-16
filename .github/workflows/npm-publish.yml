@@ -43,6 +43,7 @@ jobs:
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       version: ${{ steps.resolve.outputs.version }}
+      dist_tag: ${{ steps.resolve.outputs.dist_tag }}
       dry_run: ${{ steps.resolve.outputs.dry_run }}
     steps:
       - name: Checkout
@@ -52,8 +53,10 @@ jobs:
           persist-credentials: false
 
       # Every later job builds this commit, even if the ref moves meanwhile. Only an explicit
-      # dry_run=false publishes.
-      - name: Resolve the commit and the version
+      # dry_run=false publishes. The dist-tag is `latest` only for the highest stable release, as
+      # for the `latest` image tag (scripts/release-is-highest.sh), and `release-<major>.<minor>`
+      # otherwise, so a patch to an older line never moves `latest` back.
+      - name: Resolve the commit, the version and the dist-tag
         id: resolve
         env:
           DRY_RUN: ${{ inputs.dry_run }}
@@ -62,14 +65,15 @@ jobs:
           set -euo pipefail
           sha=$(git rev-parse HEAD)
           version=$(jq -r .version clients/sqlite-ursula/package.json)
+          dist_tag=$(git ls-remote --tags --refs origin 'refs/tags/v*' | ./scripts/npm-dist-tag.sh "$version")
           if [ "$DRY_RUN" = false ]; then dry_run=false; else dry_run=true; fi
           # npm provenance names the commit the run was dispatched on as the packages' source.
           if [ "$dry_run" = false ] && [ "$sha" != "$RUN_SHA" ]; then
             echo "::error::ref is $sha, but the run is on $RUN_SHA. Dispatch the workflow on the ref you publish (gh workflow run npm-publish.yml --ref <ref> -f ref=<ref>), so the provenance names the commit the packages are built from."
             exit 1
           fi
-          printf 'sha=%s\nversion=%s\ndry_run=%s\n' "$sha" "$version" "$dry_run" >>"$GITHUB_OUTPUT"
-          echo "@tonbo/sqlite-ursula $version from $sha (dry run: $dry_run)" >>"$GITHUB_STEP_SUMMARY"
+          printf 'sha=%s\nversion=%s\ndist_tag=%s\ndry_run=%s\n' "$sha" "$version" "$dist_tag" "$dry_run" >>"$GITHUB_OUTPUT"
+          echo "@tonbo/sqlite-ursula $version from $sha, dist-tag $dist_tag (dry run: $dry_run)" >>"$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -347,6 +351,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DRY_RUN: ${{ needs.source.outputs.dry_run }}
+          DIST_TAG: ${{ needs.source.outputs.dist_tag }}
         run: |
           set -euo pipefail
           echo "npm $(npm --version)"
@@ -354,12 +359,13 @@ jobs:
           if [ "$DRY_RUN" != false ]; then dry_run=(--dry-run); fi
           # Platform packages first, the main package last (publish-order.txt), so the main
           # package's optional dependencies resolve as soon as it is visible. A version already on
-          # npm is skipped, so a failed run can be run again.
+          # npm is skipped, so a failed run can be run again. Every package goes under DIST_TAG, so
+          # an older line's patch never takes `latest` from the platform packages either.
           while read -r tarball; do
             spec=$(tar -xOzf "$tarball" package/package.json | jq -r '"\(.name)@\(.version)"')
             if npm view "$spec" version >/dev/null 2>&1; then
               echo "::notice::$spec is already on npm, skipped"
               continue
             fi
-            npm publish "./$tarball" --provenance --access public "${dry_run[@]}"
+            npm publish "./$tarball" --provenance --access public --tag "$DIST_TAG" "${dry_run[@]}"
           done <publish-order.txt
