@@ -145,7 +145,7 @@ The SQLite VFS is redesigned for 0.8. A commit is local: the extension appends i
 - **New API.** `open()` is asynchronous and the extension owns its files. `synced()`, `status()` and the `reset` listeners replace `attach`, `setToken`, `status(file)`, `drainStats` and `instrument`. Four error classes replace seven, and network failures never throw. `importSqlite` and `ursula_import` import a plain SQLite file as the first snapshot of a new stream.
 - **Outages are lag.** Commits continue while the stream is unreachable, and writes fail with `backlog_full` only past `maxPendingBytes`. There is no poisoned state, no `outcome_unknown` and no retry budget. A trusted cache opens provisionally on an unreachable stream.
 - **History changes keep or salvage.** A cache whose history the stream kept is kept under the new token, with no reset. Otherwise it is moved aside into `salvage/` as a plain SQLite database. Another cluster id is refused (`wrong_cluster`).
-- **Large commits and snapshots.** A commit above the request limit goes out in parts, and a snapshot above it goes up in parts with a cold backend. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`, and `URSULA_VFS_RETRY_MS` is gone.
+- **Large commits and snapshots.** A commit above the request limit goes out in parts, and a snapshot above it goes up in parts with a cold backend. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`, and `URSULA_VFS_RETRY_MS` and `URSULA_VFS_SNAPSHOT_MIN_BYTES` are gone.
 - **Pi Durable** `>=1.0.0 <1.4.0`. From Pi 1.2 a commit refused with `backlog_full` waits for `synced()` and runs again.
 - **Upgrading:** export each database with 0.7 using `VACUUM INTO`, then import the file into a new stream with 0.8 (`importSqlite` or `ursula_import`). Keep the 0.7 cache until the import is checked. See [Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07).
 
@@ -161,7 +161,7 @@ Known limits of 0.8.0:
 - **Snapshots** are not published above 1 GiB compressed, or above 32 MiB without a cold backend.
 - **Local durability.** A power loss drops unacknowledged commits since the last log fsync. Network filesystems and a fork after open are unsupported.
 - **A misrouted host name on a fresh host** opens the other deployment's stream, since there is no cache yet to compare its cluster id with.
-- **Import.** A failed import leaves a stream that refuses opens with `stream_state` until it is deleted or recreated.
+- **Import.** Opens of a stream fail with `stream_state` while an import into it runs, and a failed import leaves a stream that refuses opens until it is deleted or recreated.
 
 ## 0.7.6
 

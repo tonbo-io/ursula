@@ -1,4 +1,4 @@
-// Commit latency on the VFS against B1 (M1 exit criterion, design: Verification and Performance:
+// Commit latency on the VFS against B1 (design: Verification and Performance, and a CI gate:
 // the VFS's commit p50 within 0.5 ms of B1's, plain SQLite). B1 here is plain node:sqlite with B1's
 // settings: the 0.7 measurements (docs/architecture/sqlite-vfs.md, Performance) ran Pi's own
 // storage with the same settings on an EKS pod, which this bench does not reproduce. Both arms run

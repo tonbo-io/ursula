@@ -38,7 +38,7 @@ db.close();
 | are taken over | statements and `synced()` throw `UrsulaResetError` (`fenced`), and `reset` listeners run |
 | crash | commits the stream never acknowledged come back from the log at the next open and are resent |
 
-The local cache outlives the node. After you restart the node its stream is gone, and `open` refuses to put an empty stream over a cache that holds data (`not_found`). Pass `recreate: true`, which moves the cache aside and creates the stream again, or open another stream.
+The local cache outlives the node. The quick-start node keeps nothing across restarts and sets no `server.cluster_id`, so a restarted node is a new deployment with a new random cluster id, and `open` refuses the old cache with `wrong_cluster`. Open with a fresh `dir`, or delete the stream's directory in the cache root (`demo-notes-*` in `~/Library/Caches/sqlite-ursula/0.8`, `~/.cache/sqlite-ursula/0.8` on Linux). For anything beyond a throwaway quick start, give the server a `server.cluster_id` and a Raft WAL path (see [Configuration](/docs/configuration)), so a restart keeps both the stream and its deployment.
 
 ## How it works
 
@@ -86,8 +86,8 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed (`errcode` 7178) | `backlog_full`, `unsupported` |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
-| `UrsulaUnavailableError` | `open()` when its signal fires first | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, `wrong_cluster`), or `cancelled` |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a closed database | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaUnavailableError` | `open()` when its signal fires first, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a closed database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 `unsupported` is a transaction the extension cannot capture: EXCLUSIVE locking mode, or a commit that leaves WAL mode or 4096-byte pages. Only that transaction fails.
 
@@ -217,19 +217,19 @@ const db = await open("https://ursula.example.com/acme/notes");
 
    From another host, call `SELECT ursula_import(url, file, options_json, timeout_ms)` with a positive `timeout_ms`.
 
-3. **Keep the 0.7 cache** until you have checked the imported database. It may hold the only copy of commits that never reached the 0.7 stream.
+3. **Keep the 0.7 cache** until you have checked the imported database. 0.7 appended every commit to the stream before the local WAL, so the cache holds nothing the 0.7 stream lacks, but once the 0.7 cluster is gone it may be the only copy.
 
 Code changes:
 
 - `open()` is asynchronous: `await open(url, options)`. A commit returns before the stream holds it, so add `await db.synced()` before every external effect.
 - The extension owns its files. The `path` option, `attach`, `setToken`, `status(file)`, `drainStats` and `instrument` are gone. Pass `token` to `open`, or use `URSULA_VFS_TOKEN_FILE`.
-- Seven error classes become four. `UrsulaReattachError`, `UrsulaReplicationError` and `UrsulaFencedError` become `UrsulaResetError`, whose `action` includes `reopen`. A `402` is a replication condition in `status()` instead of `UrsulaPaymentRequiredError`. Network failures no longer throw. There is no poisoned state and no `outcome_unknown`.
+- Six error classes become four. `UrsulaReattachError`, `UrsulaReplicationError` and `UrsulaFencedError` become `UrsulaResetError`, whose `action` includes `reopen`. A `402` is a replication condition in `status()` instead of `UrsulaPaymentRequiredError`. Network failures no longer throw. There is no poisoned state and no `outcome_unknown`.
 - `openUrsulaPiStorage(url, options)` takes no file.
 - `status()` has new fields: see [Status](#status).
 
 Operations changes:
 
-- `URSULA_VFS_RETRY_MS` is gone: appends are resent until a definite answer. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`. Commits of any size go out, in parts above the request limit.
+- `URSULA_VFS_RETRY_MS` is gone: appends are resent until a definite answer. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`. Commits of any size go out, in parts above the request limit. `URSULA_VFS_SNAPSHOT_MIN_BYTES` is gone: a snapshot is due past the database's size or 8 MiB, whichever is larger.
 - The default cache root is `<user cache>/sqlite-ursula/0.8`, and the `sqlite3` shell cannot open a cache.
 - The extension sends `User-Agent: sqlite-ursula-vfs/0.8.0`. Update any proxy, WAF or log rule keyed on it.
 - Multi-node clusters need `server.cluster_id`, and snapshots above 32 MiB compressed need a cold backend (see [What the cluster needs](#what-the-cluster-needs)).
@@ -263,6 +263,18 @@ export URSULA_VFS_TOKEN_FILE=/var/run/secrets/ursula/token
 The token is process-wide in 0.8, and its audience must not depend on the host name, since every host name of a deployment shares one cache. A refused token is reread and the request sent again. A token refused twice blocks replication as `unauthorized` until it changes, and commits continue until the backlog fills. When the file holds no token as it is read, the extension keeps the last token it read and logs `token_file_unreadable`.
 
 Over `http://` the token crosses the network in clear. Use `https://` for any endpoint on another host. The extension logs `token_in_clear` once when it sends a token over `http://` to a host that is not a loopback address.
+
+## Settings
+
+The extension reads these environment variables once per process:
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `URSULA_VFS_TOKEN_FILE` | none | A file holding the bearer token, read again when it changes |
+| `URSULA_VFS_CA_FILE` | the bundled CAs | A PEM bundle of the certificate authorities to trust |
+| `URSULA_VFS_MAX_REQUEST_BYTES` | the server's | A request limit below the one `HEAD` advertises, for a layer in front of the stream that does not advertise its own |
+| `URSULA_VFS_IDLE_MS` | 90000 | How long a connection is kept after its last request. Keep it below the idle timeout of any NAT, load balancer or firewall on the path |
+| `URSULA_VFS_MIN_UPLOAD_KBPS` | 256 | The slowest upload, in KiB/s, an attempt's time limit allows: a request body may take 5 s plus its size at this rate |
 
 ## Platforms
 

@@ -319,8 +319,8 @@ unsafe fn fn_stats(
 }
 
 /// `ursula_set_token(path, token)`: the bearer token requests carry from now on; NULL or `''` goes
-/// back to `URSULA_VFS_TOKEN_FILE`. M1 has one token per process, so a path (which must name a
-/// bound database) sets it as NULL does; M3's token providers make it per database.
+/// back to `URSULA_VFS_TOKEN_FILE`. The token is one per process, so a path (which must name a
+/// bound database) sets it as NULL does.
 unsafe fn fn_set_token(
     ctx: *mut ffi::sqlite3_context,
     argc: c_int,

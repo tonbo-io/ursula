@@ -7,9 +7,9 @@ durable once the stream acknowledges it, and `await db.synced()` is the output g
 
 Code: `clients/sqlite-vfs` (the loadable extension, Rust, a standalone workspace) and
 `clients/sqlite-ursula` (TypeScript: the loader, `open`, `importSqlite`, the error classes, the
-event pump, the Pi Durable adapter in the `/pi` entry, the e2e suites and the benchmark). The
-server contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx).
-User docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
+event pump, the Pi Durable adapter in the `/pi` entry, the e2e suites and the benchmark). The server
+contract is the [extensions specification](../web/src/content/docs/pages/specs/extensions.mdx). User
+docs: [SQLite on Ursula](../web/src/content/docs/pages/examples/sqlite-vfs.mdx).
 
 Each heading below is a label. Code comments cite `design: <Heading>` for a heading here and
 `extensions: <Heading>` for a heading of the extensions specification. Tests are named by file and
@@ -135,15 +135,16 @@ SQLite published it locally, since nothing built without it may be logged after 
 The rule is a pure state machine over a handle's calls (`publication.rs` `HandleState`). It reads
 no wal-index state and holds no SQLite lock past its release.
 
-Tests: `publication/tests.rs` `a_commit_is_confirmed_only_by_phase_two_right_after_its_write_unlock`,
+Tests: `publication/tests.rs`
+`a_commit_is_confirmed_only_by_phase_two_right_after_its_write_unlock`,
 `a_published_commit_without_phase_two_is_unconfirmed`, `an_unpublished_commit_is_unconfirmed`,
 `a_new_write_lock_before_phase_two_leaves_the_commit_unconfirmed`,
 `a_close_after_a_logged_commit_leaves_it_unconfirmed`, `the_phase_two_handler_never_fails`, and
 against node:sqlite in `test/core.e2e.ts` "basic: one connection", "spill: a transaction that
 outgrows the page cache before its commit", "multi: two connections committing in turn" and
-"attachfail: a commit published locally whose attached database fails phase one is unconfirmed,
-and the reopen commits it". The reopen after the reset: `test/reopen.e2e.ts` "replays the
-unconfirmed commit after a local_damage reset".
+"attachfail: a commit published locally whose attached database fails phase one is unconfirmed, and
+the reopen commits it". The reopen after the reset: `test/reopen.e2e.ts` "replays the unconfirmed
+commit after a local_damage reset".
 
 ### Fsyncs
 
@@ -320,8 +321,9 @@ implies our digest, since a key conflict is decided first.
 - A `synced()` probe or a pre-check answered `410` sends a HEAD before it fences: our token still
   there fences, another token takes the history path.
 
-Tests: `replicator/tests/answer_rows.rs`, one test per row (`append_row_1_a_200_at_the_expected_tail_acknowledges`
-through `append_row_16_any_other_status_blocks_rejected`) and per claim row
+Tests: `replicator/tests/answer_rows.rs`, one test per row
+(`append_row_1_a_200_at_the_expected_tail_acknowledges` through
+`append_row_16_any_other_status_blocks_rejected`) and per claim row
 (`claim_row_1_a_receipt_wins_and_names_what_it_closed`,
 `claim_row_2_any_epoch_403_or_receipt_evicted_loses`,
 `claim_rows_otherwise_follow_the_append_rules`). Also `replicator/tests/machine.rs`
@@ -526,7 +528,8 @@ Tests:
   `publishes_keep_retention_one_snapshot_behind_and_refuse_bodies_above_the_limit`,
   `a_body_above_the_request_limit_publishes_in_parts`,
   `a_part_whose_answer_is_lost_is_staged_again_under_a_new_id`,
-  `a_commit_is_repeated_until_a_definite_answer`, `a_commit_answered_400_stages_its_parts_again_once`,
+  `a_commit_is_repeated_until_a_definite_answer`,
+  `a_commit_answered_400_stages_its_parts_again_once`,
   `a_part_past_the_staged_limit_discards_the_parts_and_a_later_attempt_publishes`,
   `a_publish_behind_a_later_snapshot_is_superseded`,
   `snapshots_publish_under_the_new_token_and_a_stale_token_is_transient`, and `test/core.e2e.ts`
@@ -714,6 +717,7 @@ Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
 | any | closed | refuse `stream_state` |
 | none | `200` | build, take over, reconcile |
 | replaced | `200` | build, the generation salvaged (`replaced`) |
+| trusted, same token, holding no data, a snapshot past its ACK | `200` | build, the generation trashed |
 | trusted, same token | `200` | resume: take over, reconcile, catch up or rebuild |
 | trusted, other token, inheriting, nothing pending | `200` | re-key, take over ([History](#history)) |
 | trusted, other token, otherwise, holding data | `200` | build, the generation salvaged (`history_changed`) |
@@ -724,6 +728,10 @@ Then a HEAD without a precondition decides, before any claim (`open/table.rs`):
   unreadable is **replaced**. No boot id, inode, size or WAL shape enters, and a power loss does
   not end trust.
 - **Holding data:** the db file is longer than one page, or the valid log holds a COMMIT record.
+- **Behind a snapshot:** a generation holding no data whose latest ACK is below the stream's
+  latest snapshot is built over, not resumed. It has nothing to keep, and the stream below that
+  snapshot may be an import's claim ([Import](#import)), which no read takes, while a build
+  starts at the snapshot.
 - **Nothing moved on a refusal:** no generation is renamed or removed and nothing is sent. Deleting
   the WAL and `-shm` during materialization is allowed, and so is the copy a reopen beside reset
   handles publishes ([Materialize](#materialize)), which is equivalent to the original.
@@ -745,6 +753,7 @@ Tests: `open/table.rs` `a_server_without_protocol_2_is_too_old`,
 `a_missing_stream_is_created_unless_a_trusted_generation_holds_data`,
 `another_content_type_and_a_closed_stream_are_refused`,
 `no_generation_builds_and_the_same_token_resumes`,
+`an_empty_generation_behind_the_snapshot_is_built_over_not_resumed`,
 `a_replaced_generation_is_salvaged_and_built_over`,
 `another_token_whose_history_inherits_the_acknowledged_offset_re_keys`,
 `an_inheriting_history_salvages_a_generation_with_pending_commits`,
@@ -756,16 +765,15 @@ Driver: `driver/tests.rs` `a_server_without_protocol_2_is_refused`,
 `a_stream_of_another_content_type_is_refused`, `a_stream_of_usq1_frames_is_refused`,
 `a_missing_stream_with_a_local_generation_holding_data_is_not_found`,
 `recreate_salvages_the_generation_and_creates_the_stream`,
-`a_missing_stream_over_a_generation_holding_no_data_is_created`, `a_root_locked_elsewhere_is_in_use`,
-`an_unreachable_stream_fails_the_open_at_its_deadline`,
+`a_missing_stream_over_a_generation_holding_no_data_is_created`,
+`a_root_locked_elsewhere_is_in_use`, `an_unreachable_stream_fails_the_open_at_its_deadline`,
 `a_provisional_open_resolves_when_its_first_connect_times_out`,
 `a_stream_that_answered_first_is_reachable_and_the_open_waits`,
 `a_provisional_open_waits_for_its_claim_then_goes_live`. End to end: `test/provisional.e2e.ts`
 "opens a trusted cache provisionally: reads and commits work, synced() waits, then it goes live",
-"goes live after two offline opens in a row, with the commits of both", `test/open.e2e.ts`
-"cancels at its signal: an unavailable error, and the stream is not held", `test/handout.e2e.ts`
-"is refused in another cache while a connection of the host is open, naming the cache it is open
-in".
+"goes live after two offline opens in a row, with the commits of both", `test/open.e2e.ts` "cancels
+at its signal: an unavailable error, and the stream is not held", `test/handout.e2e.ts` "is refused
+in another cache while a connection of the host is open, naming the cache it is open in".
 
 ### Materialize
 
@@ -811,6 +819,19 @@ A `readOnly` open claims nothing and never fences the owner.
 - A reader generation holds no commit of its own, so it is never salvaged and never re-keyed:
   anything the stream no longer extends is built anew. A closed stream opens. A trusted reader
   generation of another cluster is refused `wrong_cluster`.
+- The reader rows, in order (`open/table.rs` `decide_reader`):
+
+  | reader generation | HEAD | the open |
+  | --- | --- | --- |
+  | any | no `Ursula-Protocol: 2` | refuse `server_too_old` |
+  | trusted | another `Ursula-Cluster-Id` | refuse `wrong_cluster` |
+  | any | `404` | refuse `not_found` |
+  | any | another content type | refuse `stream_format` |
+  | none, replaced | `200`, closed or not | build, the replaced one trashed |
+  | trusted, same token, a snapshot past its ACK | `200`, closed or not | build, the generation trashed |
+  | trusted, same token | `200`, closed or not | catch up in place |
+  | trusted, other token | `200`, closed or not | build, the generation trashed |
+
 - On an unreachable stream a reader opens a trusted reader generation as it is, and otherwise waits
   until its signal fires. A missing stream is `not_found`. `readOnly` with `recreate` is
   `invalid_argument`.
@@ -818,8 +839,11 @@ A `readOnly` open claims nothing and never fences the owner.
   functions opens a reader's path with `SQLITE_OPEN_READONLY`, as the TypeScript package does.
 
 Tests: `open/table.rs` `a_reader_refuses_an_old_server_another_cluster_and_a_missing_stream`,
-`a_reader_catches_up_the_same_token_and_builds_over_anything_else`, `a_reader_reads_a_closed_stream`,
-`an_unreachable_reader_opens_a_trusted_generation_and_waits_without_one`, `driver/tests.rs`
+`a_reader_catches_up_the_same_token_and_builds_over_anything_else`,
+`a_reader_reads_a_closed_stream`,
+`an_unreachable_reader_opens_a_trusted_generation_and_waits_without_one`,
+`a_reader_behind_the_snapshot_builds_from_it`, `driver/tests.rs`
+`a_reader_built_before_an_import_reopens_from_its_snapshot`,
 `a_reader_builds_in_a_reader_directory_and_claims_nothing`,
 `a_reader_reopened_catches_its_generation_up_in_place`,
 `a_replaced_reader_generation_is_rebuilt_without_salvage`, `generation/tests.rs`
@@ -922,7 +946,8 @@ Tests:
   `a_rekey_from_streaming_acknowledges_a_batch_that_survived`,
   `a_rekey_from_streaming_resends_a_batch_that_was_lost_from_seq_1`,
   `a_rekey_during_a_continuation_claim_sends_the_same_claim_again`,
-  `a_repeat_after_a_rekey_claims_once_more`, `a_takeover_with_commits_pending_resets_before_it_re_keys`,
+  `a_repeat_after_a_rekey_claims_once_more`,
+  `a_takeover_with_commits_pending_resets_before_it_re_keys`,
   `a_rebuild_that_discards_after_a_rekey_at_open_salvages`, the world's properties 15, 18 and 19
   with `negative_control_re_keying_on_any_token_drops_acknowledged_records` and
   `negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage`.
@@ -1100,8 +1125,8 @@ mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
 | --- | --- | --- |
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
-| `UrsulaUnavailableError` | `open()` and `importSqlite()` when the signal or timeout fires | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, `wrong_cluster`, or `cancelled` when none was met |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaUnavailableError` | `open()` when its signal fires, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 Network failures never throw from statements or `synced()`. A refused write fails with
 `SQLITE_IOERR_AUTH` (7178), a read after a reset with `SQLITE_IOERR_READ` (266), a write after one
@@ -1171,8 +1196,8 @@ file the first snapshot of a new stream, page for page:
    snapshot. Anything else refuses (`server_too_old`, `stream_format`, `stream_state`). A `404`
    without `Ursula-Protocol: 2` is `server_too_old`, never a missing stream.
 3. The create, then a claim of epoch 1 with the reserved import activation (`ursula-import-v1`),
-   resent unchanged until a definite answer. Its receipt must start at offset 0. Its end is `W`, above 0, since builds skip a
-   snapshot at offset 0, and the first open then claims above epoch 1.
+   resent unchanged until a definite answer. Its receipt must start at offset 0. Its end is `W`,
+   above 0, since builds skip a snapshot at offset 0, and the first open then claims above epoch 1.
 4. The `USS3` body at `W`, epoch 1, a fresh lineage, position 0.
 5. A HEAD naming the tail `W`, the publish of [Snapshots](#snapshots) (one `PUT`, or parts with a
    cold store, otherwise refused naming the limit), then a HEAD again. The import is done only on
@@ -1187,7 +1212,8 @@ after the claim leaves a stream that refuses opens and imports with `stream_stat
 deleted or recreated.
 
 Tests: `import/tests.rs` `a_header_must_name_whole_4096_byte_pages`,
-`a_wal_or_a_hot_journal_beside_the_file_refuses_it`, `a_file_becomes_the_first_snapshot_of_a_new_stream`,
+`a_wal_or_a_hot_journal_beside_the_file_refuses_it`,
+`a_file_becomes_the_first_snapshot_of_a_new_stream`,
 `a_file_above_the_request_limit_goes_up_in_parts`,
 `a_file_above_the_limit_without_parts_is_refused_naming_it`,
 `only_a_missing_or_empty_stream_is_imported_into`, `a_claim_that_is_not_first_publishes_nothing`,
@@ -1195,9 +1221,9 @@ Tests: `import/tests.rs` `a_header_must_name_whole_4096_byte_pages`,
 `a_head_404_without_the_protocol_creates_nothing`, `the_claim_carries_the_import_activation`,
 `codec/stream.rs` `the_claim_of_an_import_stops_the_read`, `driver/tests.rs`
 `an_empty_owner_behind_an_import_builds_from_its_snapshot_and_claims_after`,
-`a_reader_built_before_an_import_reopens_from_its_snapshot`, and `test/import.e2e.ts` "imports a plain
-database as the first snapshot of a new stream, in parts under a 64 KiB limit", "refuses a file
-with 8192-byte pages before anything is sent", "refuses a file with a -wal beside it before
+`a_reader_built_before_an_import_reopens_from_its_snapshot`, and `test/import.e2e.ts` "imports a
+plain database as the first snapshot of a new stream, in parts under a 64 KiB limit", "refuses a
+file with 8192-byte pages before anything is sent", "refuses a file with a -wal beside it before
 anything is sent".
 
 ### Pump
@@ -1301,10 +1327,11 @@ codes 7178, 266 and 778, and the SQL function names and arities.
 caches, since the default directory and the names changed. 0.7 fails closed on 0.8 files.
 
 Tests: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_frozen`,
-`the_part_frames_are_frozen`, `the_log_segment_is_frozen`, `a_fresh_builds_segment_header_is_frozen`,
-`the_snapshot_header_is_frozen`, `the_page_one_marker_is_frozen`, `the_salvage_manifest_is_frozen`,
-`the_import_activation_is_frozen`,
-`codec/digest.rs` `snapshot_digests_equal_the_servers`, `producer_digests_are_blake3`.
+`the_part_frames_are_frozen`, `the_log_segment_is_frozen`,
+`a_fresh_builds_segment_header_is_frozen`, `the_snapshot_header_is_frozen`,
+`the_page_one_marker_is_frozen`, `the_salvage_manifest_is_frozen`,
+`the_import_activation_is_frozen`, `codec/digest.rs` `snapshot_digests_equal_the_servers`,
+`producer_digests_are_blake3`.
 
 ## Verification
 
@@ -1318,8 +1345,10 @@ What CI runs (`.github/workflows/integration.yml`):
 - `sqlite-vfs-e2e-ursula`: every suite against a real server, one node with an in-memory cold store
   (with `test/history-real.e2e.ts`) and three nodes behind the gateway (with
   `test/failover.e2e.ts`).
-- `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)), reported only.
-- `memory-soak.yml` job `vfs-outage`, dispatched by hand: `test/soak.e2e.ts` through a long outage.
+- `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)). It fails when the VFS's
+  commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
+- `memory-soak.yml` job `vfs-outage`: `test/outage.e2e.ts` through a long outage, weekly, on pushes
+  to main that change the extension, and by hand.
 
 Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process at the named step
 ([Crashes](#crashes)).
@@ -1347,8 +1376,8 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   Network filesystems, filesystems that ignore fsync, and a fork after open are unsupported.
 - **Host alias on a fresh host.** With no local cluster id to compare, a misrouted alias opens the
   other deployment's stream.
-- **Import.** A failed import leaves a stream that refuses opens until it is deleted or
-  recreated.
+- **Import.** Opens of the stream fail with `stream_state` while an import runs, and a failed
+  import leaves a stream that refuses opens until it is deleted or recreated.
 - **Platforms.** Linux x64 and arm64 with glibc 2.28 or later, Linux x64 with musl, and macOS on
   Apple silicon. Node.js 22.19 or later.
 

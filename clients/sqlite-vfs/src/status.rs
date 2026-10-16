@@ -1,6 +1,5 @@
-//! The JSON the SQL functions return: `ursula_status` (the subset of the design built so far,
-//! design: Status), `ursula_stats`, `ursula_events` and the results of `ursula_open` and
-//! `ursula_synced`.
+//! The JSON the SQL functions return: `ursula_status` (design: Status), `ursula_stats`,
+//! `ursula_events` and the results of `ursula_open` and `ursula_synced`.
 
 use crate::db::Binding;
 use crate::db::Opened;

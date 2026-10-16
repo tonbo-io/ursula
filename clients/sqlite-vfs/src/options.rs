@@ -30,9 +30,9 @@ pub(crate) struct OpenOptions {
     pub(crate) max_pending_bytes: u64,
     /// The platform activation id, 32 hex digits; a random one per process otherwise.
     pub(crate) activation: Option<Activation>,
-    /// The bearer token (one per process in M1).
+    /// The bearer token (one per process).
     pub(crate) token: Option<String>,
-    /// The SDK's User-Agent token, accepted and unused until M3's transport.
+    /// The SDK's User-Agent token: accepted, and not sent.
     pub(crate) agent: Option<String>,
     /// How long an open started with `timeout_ms` 0 may take: the caller's deadline, 30 s when
     /// absent.
