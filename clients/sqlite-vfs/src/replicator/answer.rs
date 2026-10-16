@@ -5,6 +5,30 @@
 //! the reconcile's reads, the `synced()` probe and the HEAD that a `412`, `404` or untyped `413`
 //! sends.
 //!
+//! A write's answer is classified once, by `ursula_headers::classify` ([`Answer::outcome`]): it
+//! tells a producer answer from any other ([`producer_answer`]), and a refusal from an unknown
+//! outcome. [`decide_status`] maps that outcome to the VFS's action, and where the action is not
+//! the one the outcome asks of a client, the mapping says why, in one place:
+//!
+//! | outcome | VFS action |
+//! | --- | --- |
+//! | `Applied` or `Repeat` without a producer answer | blocked `rejected`: the replicator writes keyed only, and every other write reads its success in its own table |
+//! | `Redirected` | resent a few times, then blocked `redirected` |
+//! | `Unknown`, a `408` or a `5xx` (or no answer at all) | resend identically |
+//! | `Unknown`, a `3xx` but `307`/`308` | as a redirect: never followed, the identical request goes again |
+//! | `Unknown`, otherwise (a `1xx`, a `2xx` without its typed answer) | blocked `rejected`: no answer of Ursula's, and blocked resends every 30 s |
+//! | `Refused`, typed `409 Stream-Closed` | reset `stream_state` |
+//! | `Refused`, typed `412`, a `404` or a `416` | HEAD without a precondition |
+//! | `Refused`, a `413` | a named limit lowers `L`, an untyped one sends a HEAD |
+//! | `Refused`, a `401` | reread the token and resend |
+//! | `Refused`, a `402` or a `403` | blocked `payment_required` or `forbidden` |
+//! | `Refused`, a `408`, `429` or `5xx` | resend identically: a refusal of load or routing passes, and a keyed write's repeat applies once or gets its receipt |
+//! | `Refused`, otherwise | blocked `rejected` |
+//!
+//! A producer answer (a receipt, `receipt-evicted`, or a producer refusal) decides by its own
+//! rows in [`decide_append`] and [`decide_claim`], with its epoch, seq and receipt. A malformed
+//! typed header is a protocol violation, blocked `rejected`, whatever the outcome.
+//!
 //! `stale-epoch` answers an append whose epoch a newer claim superseded, so it fences, and a claim
 //! that a newer epoch outranks, so the claim is lost.
 //!
@@ -23,8 +47,8 @@ use ursula_headers::Incarnation;
 use ursula_headers::Offset;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::Receipt;
-use ursula_headers::RoutingAnswer;
 use ursula_headers::StreamHead;
+use ursula_headers::WriteOutcome;
 
 use super::BlockedReason;
 use super::ResetKind;
@@ -205,9 +229,8 @@ pub(crate) fn decide_append(sealed: &Sealed, exchange: &Exchange) -> AppendDecis
         Exchange::NoAnswer(_) => return AppendDecision::Common(no_answer()),
         Exchange::Answered(answer) => answer,
     };
-    let producer = match &answer.typed {
-        Ok(Typed::Producer(producer)) => producer,
-        _ => return AppendDecision::Common(decide_status(answer)),
+    let Some(producer) = producer_answer(answer) else {
+        return AppendDecision::Common(decide_status(answer));
     };
     match producer {
         ProducerAnswer::Receipt {
@@ -238,9 +261,8 @@ pub(crate) fn decide_claim(exchange: &Exchange) -> ClaimDecision {
         Exchange::NoAnswer(_) => return ClaimDecision::Common(no_answer()),
         Exchange::Answered(answer) => answer,
     };
-    let producer = match &answer.typed {
-        Ok(Typed::Producer(producer)) => producer,
-        _ => return ClaimDecision::Common(decide_status(answer)),
+    let Some(producer) = producer_answer(answer) else {
+        return ClaimDecision::Common(decide_status(answer));
     };
     match producer {
         ProducerAnswer::Receipt {
@@ -329,13 +351,60 @@ fn no_answer() -> Common {
     }
 }
 
-/// The rows of an answer without a producer outcome.
+/// The producer answer whose outcome `classify` read: a receipt or `receipt-evicted` (`Applied`,
+/// `Repeat`), or a producer refusal (`Refused` with that answer's code). `None` for every other
+/// answer, which [`decide_status`] decides.
+fn producer_answer(answer: &Answer) -> Option<&ProducerAnswer> {
+    let Ok(Typed::Producer(producer)) = &answer.typed else {
+        return None;
+    };
+    match answer.outcome.as_ref()? {
+        WriteOutcome::Applied | WriteOutcome::Repeat => Some(producer),
+        WriteOutcome::Refused(code) if producer.error_code().as_ref() == Some(code) => {
+            Some(producer)
+        }
+        WriteOutcome::Refused(_) | WriteOutcome::Redirected | WriteOutcome::Unknown => None,
+    }
+}
+
+/// The rows of an answer without a producer answer: a write's by its outcome ([`decide_write`]),
+/// a read's or a HEAD's by its status ([`decide_unwritten`]). A malformed typed header is a
+/// protocol violation whatever the outcome.
 pub(crate) fn decide_status(answer: &Answer) -> Common {
-    let status = answer.status;
     let typed = match &answer.typed {
-        Err(_malformed) => return Common::Blocked(BlockedReason::Rejected { status }),
+        Err(_malformed) => return rejected(answer),
         Ok(typed) => typed,
     };
+    match &answer.outcome {
+        Some(outcome) => decide_write(answer, typed, outcome),
+        None => decide_unwritten(answer, typed),
+    }
+}
+
+/// The VFS's action for a write's outcome, as `ursula_headers::classify` read it: the module
+/// doc's table.
+fn decide_write(answer: &Answer, typed: &Typed, outcome: &WriteOutcome) -> Common {
+    match outcome {
+        // A success without a producer answer: the replicator writes keyed only, and every other
+        // write reads its success in its own table, so this is no answer it waits for.
+        WriteOutcome::Applied | WriteOutcome::Repeat => rejected(answer),
+        WriteOutcome::Redirected => redirect(answer),
+        WriteOutcome::Unknown => match answer.status {
+            408 | 500..=599 => resend(answer),
+            // A `3xx` but `307` or `308` proves nothing. The VFS never follows a redirect, so it
+            // sends the identical request again, then blocks `redirected`, which still sends it
+            // every 30 s.
+            300..=399 => redirect(answer),
+            // A `1xx`, or a success without the typed answer Ursula sends for the write: no
+            // answer of Ursula's. Blocked `rejected` sends the identical request every 30 s.
+            _ => rejected(answer),
+        },
+        WriteOutcome::Refused(_) => decide_refusal(answer, typed),
+    }
+}
+
+/// A refusal: its typed detail first, then its status.
+fn decide_refusal(answer: &Answer, typed: &Typed) -> Common {
     match typed {
         Typed::StreamClosed(_) => Common::Reset(ResetKind::StreamState),
         Typed::IncarnationMismatch(_) => Common::Head(HeadReason::Precondition),
@@ -343,14 +412,7 @@ pub(crate) fn decide_status(answer: &Answer) -> Common {
             bytes: limit.bytes(),
         },
         Typed::TooLarge(None) => Common::Head(HeadReason::TooLarge),
-        Typed::Routing(RoutingAnswer::NotLeader { .. }) => Common::Redirect {
-            location: answer.location.clone(),
-        },
-        Typed::Routing(RoutingAnswer::NoLeader { .. }) => Common::Resend {
-            retry_after: answer.retry_after,
-            fresh: false,
-        },
-        _ => match status {
+        _ => match answer.status {
             // A `416` answers a read past the tail. Under our token that cannot happen (H1), and the
             // precondition is checked after the range (extensions: Producer Write Answers): the
             // history changed.
@@ -359,16 +421,41 @@ pub(crate) fn decide_status(answer: &Answer) -> Common {
             402 => Common::Blocked(BlockedReason::PaymentRequired),
             // A `403` with `Producer-Epoch` is a producer answer: this one is an authorizer's.
             403 => Common::Blocked(BlockedReason::Forbidden),
-            300..=399 => Common::Redirect {
-                location: answer.location.clone(),
-            },
-            408 | 429 | 500..=599 => Common::Resend {
-                retry_after: answer.retry_after,
-                fresh: false,
-            },
-            // A `2xx` without the producer headers is not a receipt, and anything else is a
-            // request the server cannot take.
-            _ => Common::Blocked(BlockedReason::Rejected { status }),
+            // A refusal of load or routing (a `408` before any of the body was forwarded, a
+            // `429`, a `5xx` whose code proves nothing applied) passes: the identical request
+            // goes again, and a keyed write's repeat applies once or gets its receipt.
+            408 | 429 | 500..=599 => resend(answer),
+            // A request the server cannot take.
+            _ => rejected(answer),
         },
     }
+}
+
+/// A read's or a HEAD's answer that its own table did not read. A read changes nothing, so
+/// whether it applied never matters: a `3xx` is a redirect, and every other status decides as a
+/// write's refusal of that status does (a `5xx` is resent).
+fn decide_unwritten(answer: &Answer, typed: &Typed) -> Common {
+    match answer.status {
+        300..=399 => redirect(answer),
+        _ => decide_refusal(answer, typed),
+    }
+}
+
+fn resend(answer: &Answer) -> Common {
+    Common::Resend {
+        retry_after: answer.retry_after,
+        fresh: false,
+    }
+}
+
+fn redirect(answer: &Answer) -> Common {
+    Common::Redirect {
+        location: answer.location.clone(),
+    }
+}
+
+fn rejected(answer: &Answer) -> Common {
+    Common::Blocked(BlockedReason::Rejected {
+        status: answer.status,
+    })
 }
