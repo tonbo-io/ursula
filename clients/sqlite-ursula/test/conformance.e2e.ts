@@ -166,8 +166,7 @@ describe("a fresh cache", () => {
 			const snapshot = r.headers.get("stream-snapshot-offset");
 			return { snapshot: snapshot === null ? null : Number(snapshot), next: Number(r.headers.get("stream-next-offset")) };
 		};
-		const snapshots = (): { offset: number | null; log_bytes: number; due_bytes: number } =>
-			(status(location(owner)) as unknown as { snapshot: { offset: number | null; log_bytes: number; due_bytes: number } }).snapshot;
+		const snapshots = (): UrsulaStatus["snapshot"] => status(location(owner)).snapshot;
 		let settled = false;
 		for (const deadline = Date.now() + 20_000; !settled && Date.now() < deadline; ) {
 			const s = snapshots();

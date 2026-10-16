@@ -7,15 +7,20 @@
 //   before the extension loads, so it stays on SQLite's own unix VFS.
 // - VFS: the package's `open()` against the model server (ursula-vfs-model, started here), or the
 //   Ursula at BENCH_URL, which it replicates to in the background meanwhile. Its commit is local, so
-//   `synced()` is not timed.
+//   the rounds do not wait for `synced()`.
 // A commit is a Pi-shaped transaction: BEGIN, an entry row of about 4.5 KB of text, its
 // conversation's head row, COMMIT, timed from BEGIN to COMMIT's return.
+//
+// A last phase times `synced()` on the VFS: one commit at a time, each followed by
+// `await db.synced()`, timed from COMMIT's return to `synced()` resolving. This is how long a host
+// waits before an external effect, such as a Pi commit resolving, with nothing else in flight.
 //
 //   SQLITE_URSULA_VFS=<extension> [URSULA_VFS_MODEL=<model binary> | BENCH_URL=<ursula URL>] node bench/commit.ts
 //
 // Settings: BENCH_ROUNDS (10), BENCH_COMMITS per round and arm (500), BENCH_WARMUP commits per arm
-// (300), BENCH_PACE_MS between commits (0, flat out), BENCH_MAX_DELTA_MS (0.5): the run fails when
-// p50_vfs - p50_B1 exceeds it. Prints one JSON summary, and appends a table to GITHUB_STEP_SUMMARY.
+// (300), BENCH_PACE_MS between commits (0, flat out), BENCH_SYNCED commits in the `synced()` phase
+// (500), BENCH_MAX_DELTA_MS (0.5): the run fails when p50_vfs - p50_B1 exceeds it. The `synced()`
+// timings are reported, never a failure. Prints one JSON summary, and appends a table to GITHUB_STEP_SUMMARY.
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdtempSync } from "node:fs";
@@ -30,6 +35,7 @@ const ROUNDS = setting("BENCH_ROUNDS", 10);
 const COMMITS = setting("BENCH_COMMITS", 500);
 const WARMUP = setting("BENCH_WARMUP", 300);
 const PACE_MS = setting("BENCH_PACE_MS", 0);
+const SYNCED = setting("BENCH_SYNCED", 500);
 const MAX_DELTA_MS = setting("BENCH_MAX_DELTA_MS", 0.5);
 const ext = process.env.SQLITE_URSULA_VFS;
 if (ext === undefined || ext.length === 0) throw new Error("set SQLITE_URSULA_VFS to the extension");
@@ -82,18 +88,22 @@ class Arm {
 		this.head = db.prepare("INSERT INTO heads(conv, seq) VALUES (?, ?) ON CONFLICT(conv) DO UPDATE SET seq = excluded.seq");
 		this.commit = db.prepare("COMMIT");
 	}
+	/** Runs one commit, and returns how long it took in ms. */
+	commitOne(): number {
+		this.n += 1;
+		const text = body(this.n);
+		const conv = this.n % 8;
+		const started = performance.now();
+		this.begin.run();
+		this.entry.run(conv, text);
+		this.head.run(conv, this.n);
+		this.commit.run();
+		return performance.now() - started;
+	}
 	/** Runs `count` commits, keeping their latencies unless `warmup`. */
 	async run(count: number, warmup = false): Promise<void> {
 		for (let k = 0; k < count; k++) {
-			this.n += 1;
-			const text = body(this.n);
-			const conv = this.n % 8;
-			const started = performance.now();
-			this.begin.run();
-			this.entry.run(conv, text);
-			this.head.run(conv, this.n);
-			this.commit.run();
-			const elapsed = performance.now() - started;
+			const elapsed = this.commitOne();
 			if (!warmup) this.samples.push(elapsed);
 			if (PACE_MS > 0) await new Promise((r) => setTimeout(r, PACE_MS));
 			else if (k % 50 === 49) await new Promise((r) => setImmediate(r));
@@ -139,6 +149,14 @@ for (let r = 0; r < ROUNDS; r++) {
 	hook.push(...stats().commits);
 }
 await vfsDb.synced({ signal: AbortSignal.timeout(60_000) });
+// The synced() phase: one commit at a time, its synced() timed from COMMIT's return.
+const synced: number[] = [];
+for (let k = 0; k < SYNCED; k++) {
+	vfs.commitOne();
+	const started = performance.now();
+	await vfsDb.synced({ signal: AbortSignal.timeout(60_000) });
+	synced.push(performance.now() - started);
+}
 const { commits, reset } = vfsDb.status();
 if (reset !== null || commits.acknowledged !== commits.logged) throw new Error(`the VFS database did not end acknowledged: ${JSON.stringify(vfsDb.status())}`);
 vfsDb.close();
@@ -151,6 +169,9 @@ const summary = {
 	vfs_ms: dist(vfs.samples),
 	delta_p50_ms: round3(pct(vfs.samples, 50) - pct(b1.samples, 50)),
 	max_delta_p50_ms: MAX_DELTA_MS,
+	// From COMMIT's return to synced() resolving, one commit at a time.
+	synced_commits: synced.length,
+	synced_ms: dist(synced),
 	// The VFS's own part of a commit (capture, encode, the log write), and the log write alone.
 	vfs_hook_ms: dist(hook.map((c) => c.vfs_us / 1000)),
 	log_write_ms: dist(hook.map((c) => c.log_us / 1000)),
@@ -181,6 +202,7 @@ if (out !== undefined && out.length > 0) {
 			row("B1 (plain node:sqlite, WAL, NORMAL)", summary.b1_ms),
 			row("VFS (open(), commit only)", summary.vfs_ms),
 			row("VFS hook (capture, encode, log)", summary.vfs_hook_ms),
+			row(`VFS synced() after a commit (${summary.synced_commits}, one at a time)`, summary.synced_ms),
 			"",
 			`p50_vfs - p50_B1 = ${summary.delta_p50_ms} ms (at most ${MAX_DELTA_MS} ms): ${ok ? "met" : "NOT met"}`,
 			"",
