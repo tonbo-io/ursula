@@ -2411,6 +2411,43 @@ async fn gateway_preserves_path_and_query_with_trailing_upstream_slash() {
     assert_eq!(body_bytes, "/bucket/stream?offset=now&live=sse");
 }
 
+/// A node's answers pass through with their own headers: the gateway adds
+/// `Cache-Control` only to answers it sends itself (#640).
+#[tokio::test]
+async fn a_forwarded_answer_keeps_its_own_cache_control() {
+    let app = Router::new()
+        .route(
+            "/bucket/stream",
+            get(|| async { (StatusCode::NOT_FOUND, "missing") }),
+        )
+        .route(
+            "/bucket/cached",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CACHE_CONTROL, "max-age=60")],
+                    "ok",
+                )
+            }),
+        );
+    let upstream = spawn_upstream(app).await;
+    let gateway = gateway_for_url(upstream.url.clone());
+    for (uri, expected) in [
+        ("/bucket/stream", None),
+        ("/bucket/cached", Some("max-age=60")),
+    ] {
+        let response = gateway.handle(get_path(uri)).await;
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            expected,
+            "{uri}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn gateway_forwards_response_content_encoding_without_decoding() {
     const GZIP_HELLO: &[u8] = &[
@@ -3996,6 +4033,16 @@ async fn the_gateways_own_answers_carry_an_error_body() {
     ];
     for (response, status, code) in cases {
         assert_eq!(response.status().as_u16(), status, "{code}");
+        // #640: no cache in front of the gateway may keep its own answer,
+        // such as a concealing `404`.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "{code}"
+        );
         assert_eq!(
             response
                 .headers()
